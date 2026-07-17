@@ -136,7 +136,10 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Execute a slash command",
         request_model=CommandRequest,
         response_model=StatusResponse,
-        error_codes=[400, 404, 409],
+        # 409 = worker slot busy (deliberate loud refusal); 503 = the
+        # command worker could not be started (thread exhaustion — retry
+        # shortly; the command did NOT run).
+        error_codes=[400, 404, 409, 503],
         tags=["Chat"],
     ),
     EndpointSpec(

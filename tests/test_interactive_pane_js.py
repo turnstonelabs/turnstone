@@ -398,17 +398,21 @@ def test_pane_gates_send_on_cross_user_busy() -> None:
     # ...and drives the composer's hard block, re-run on every busy edge.
     assert "this.composer.setSendBlocked(" in body
     stripped = _strip_comments(body)
-    setbusy = stripped.index("setBusy(b) {")
-    assert "this._reconcileSendBlock();" in stripped[setbusy : setbusy + 600]
+    setbusy = stripped.index("setBusy(b, source) {")
+    assert "this._reconcileSendBlock();" in stripped[setbusy : setbusy + 800]
 
 
 def test_pane_handles_cross_user_409() -> None:
     """The reactive fallback: a 409 (button not yet disabled) surfaces a clean
-    message, not the generic 'Connection error' catch."""
+    message, not the generic 'Connection error' catch.  The pane converts
+    the 409 body at the fetch stage; the status ARM itself lives in the
+    shared settle helper (composer_queue.settleSendResponse) with the rest
+    of the response matrix."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     assert "r.status === 409" in body
     assert 'status: "cross_user_interjection"' in body
-    assert 'data.status === "cross_user_interjection"' in body
+    helper = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(encoding="utf-8")
+    assert 'status === "cross_user_interjection"' in helper
 
 
 def test_sync_approval_state_prunes_orphan_cycles() -> None:
@@ -713,16 +717,40 @@ def test_deferred_send_settle_protocol_pins() -> None:
     # so the SSE settle can beat the POST response's bind(): the controller
     # parks chip-absent settles and bind() reconciles them — without this a
     # raced chip stays flagged deferred and the idle sweep skips it forever.
+    # Expiry is TTL-based: a size cap evicted exactly this tab's raced
+    # settle when a window closed with a burst of deferred sends (ours
+    # parks FIRST, the foreign settles behind it overflow the cap).
     assert "_preBindSettles" in composer_queue
     assert "_preBindSettles.has(msgId)" in composer_queue
-    # Both panes pass the response through the options seam and consume the
-    # pane-tier settle event.
+    assert "PRE_BIND_SETTLE_TTL_MS" in composer_queue
+    assert "_preBindSettles.size" not in composer_queue, "size-cap eviction must stay dead"
+    # The full send-response settle matrix lives ONCE, in the shared
+    # helper — retro-convert (a parked, still-retractable message must not
+    # render as a sent bubble), the deferred busy-undo, and the queue_full
+    # idle-pane cleanup (bubble removed + busy restored: the refusal can
+    # now fire with no worker and no drain alive, so no state event would
+    # ever unstick the composer).
+    assert "export function settleSendResponse(queue, data, ctx)" in composer_queue
+    assert "!queuedEl && data.deferred" in composer_queue
+    assert "deferred: !!data.deferred" in composer_queue
+    assert "attachedCount: (data.attached_ids || []).length" in composer_queue
+    assert "ctx.busyIsOptimistic()" in composer_queue
+    assert composer_queue.count("ctx.optimisticEl.remove()") >= 2, (
+        "both the retro-convert and queue_full arms must clear the optimistic bubble"
+    )
+    # Both panes route their parsed /send response through the helper and
+    # consume the pane-tier settle event; the busy stamp is centralized in
+    # each pane's setBusy (source defaults to "server" — only the send
+    # flow's optimistic flip may ever be undone).
     for name, src in (("interactive.js", interactive), ("coordinator.js", coordinator)):
-        assert "deferred: !!data.deferred" in src, f"{name}: bind must carry the deferred flag"
-        assert "attachedCount: (data.attached_ids || []).length" in src, name
+        assert "settleSendResponse(" in src, f"{name}: settle matrix must be the shared helper"
+        assert "busyIsOptimistic" in src, name
+        assert 'setBusy(true, "optimistic")' in src, f"{name}: optimistic flip must stamp"
+        assert "parsePriority(" in src, f"{name}: shared !!! parse"
         assert 'case "message_dispatched"' in src, f"{name}: settle event not consumed"
         assert "settleDeferred(" in src, name
-        # queuedEl-absent + deferred: the idle-thinking pane must render a
-        # real queued chip (retro-convert), not leave a sent-looking bubble
-        # for a parked, still-retractable message.
-        assert "!queuedEl && data.deferred" in src, f"{name}: idle-pane defer must chip"
+    # /command's degraded statuses are all surfaced: busy, running (the
+    # backstop answer), and error (503 — the worker never spawned; silence
+    # here reads as success).
+    assert 'body.status === "running"' in interactive
+    assert 'body.status === "error"' in interactive

@@ -45,6 +45,11 @@ import {
 } from "/shared/conversation.js";
 import { redactCredentials } from "/shared/redact_credentials.js";
 import {
+  createQueueController,
+  parsePriority,
+  settleSendResponse,
+} from "/shared/composer_queue.js";
+import {
   OVERFLOW_TRIP_COUNT,
   OVERFLOW_TRIP_WINDOW_MS,
   DEGRADED_COOLDOWN_BASE_MS,
@@ -304,6 +309,9 @@ function createCoordinatorPane(root, wsId, opts) {
     },
   });
   let busy = false;
+  // Provenance of the current busy=true (see setBusy): "server" |
+  // "optimistic" | null when idle.
+  let busySource = null;
   // Acting user (turn initiator) of the in-flight turn, from state_change
   // events; drives the shared-workstream cross-user send gate. Carries the
   // owner id even single-user (the gate just no-ops — it equals this viewer);
@@ -1871,8 +1879,15 @@ function createCoordinatorPane(root, wsId, opts) {
   // caller relies on. queue.onIdleEdge runs only on the actual edge
   // (it's the heavier work — querySelectorAll-driven promote sweep
   // plus the cancel-timer cleanup wired via the onIdle hook above).
-  function setBusy(b) {
+  function setBusy(b, source) {
     const next = !!b;
+    // Who asserted busy: "server" (default — state events and every
+    // existing/future writer) or "optimistic" (ONLY coordSend's pre-POST
+    // flip). The deferred/queue_full settle arms may clear busy solely
+    // while it is still this send's own optimistic flip — a server-
+    // stamped busy is a real turn and must never be clobbered.
+    // Centralized HERE so an unstamped future writer fails safe.
+    busySource = next ? source || "server" : null;
     composer.setBusy(next);
     // Greys out the per-message edit/rewind/retry buttons while a generation
     // is in flight (CSS: [data-busy="true"] .msg-action-btn).
@@ -1957,20 +1972,18 @@ function createCoordinatorPane(root, wsId, opts) {
 
     let queuedEl = null;
     let optimisticEl = null;
-    // Server re-parses the !!! prefix to set queue priority — the
-    // optimistic bubble strips it for display. Parsed outside the busy
-    // branch: the queued+deferred response arm needs it too (an idle
-    // pane's send can defer behind a command window / pending list).
-    let displayText = trimmed;
-    let priority = "notice";
-    if (trimmed.startsWith("!!!")) {
-      displayText = trimmed.slice(3).trimStart();
-      priority = "important";
-    }
-    if (busy) {
+    const isBusy = busy;
+    // Display-only strip of the !!! prefix (the server re-parses it
+    // authoritatively); shared parse so the settle helper's retro-convert
+    // renders the same chip either pane would have built pre-POST.
+    const { displayText, priority } = parsePriority(trimmed);
+    if (isBusy) {
       queuedEl = queue.addQueuedMessage(displayText, priority);
     } else {
-      setBusy(true);
+      // "optimistic": no server state event asserted this — the settle
+      // arms may undo it if the send turns out deferred/refused (see
+      // setBusy's busySource contract).
+      setBusy(true, "optimistic");
       // snap.attachments carries the chip metadata (kind + filename)
       // for every stable chip the composer holds; pass it through so
       // the optimistic user bubble shows the same pill cluster the
@@ -2051,71 +2064,22 @@ function createCoordinatorPane(root, wsId, opts) {
         return r.json();
       })
       .then((data) => {
-        if (data && data.status === "queued" && data.msg_id) {
-          // queuedEl-present: bind() handles the known races. queuedEl-
-          // absent + deferred: the pane thought it was idle but the send
-          // parked on the server's deferred list (command window / order
-          // barrier) — a plain sent bubble would present a parked,
-          // still-retractable, restart-droppable message as delivered, so
-          // replace the optimistic bubble with a real queued chip.
-          // queuedEl-absent + undeferred: plain interjection into a live
-          // turn the client hadn't seen yet (SSE state_change race); keep
-          // the historical small-UX-gap behavior (busy flip only).
-          if (!queuedEl && data.deferred) {
-            if (optimisticEl && optimisticEl.isConnected) optimisticEl.remove();
-            queuedEl = queue.addQueuedMessage(displayText, priority);
-          }
-          if (queuedEl) {
-            queue.bind(queuedEl, data.msg_id, {
-              deferred: !!data.deferred,
-              attachedCount: (data.attached_ids || []).length,
-            });
-          } else setBusy(true);
-          attachments.consume(data.attached_ids, data.dropped_attachment_ids);
-        } else if (data && data.status === "busy") {
-          if (queuedEl) queue.remove(queuedEl);
-          appendText("error", "Server is busy. Please wait.", {
-            label: "error",
-          });
-          if (!queuedEl) setBusy(false);
-        } else if (data && data.status === "queue_full") {
-          if (queuedEl) queue.remove(queuedEl);
-          appendText("error", "Message queue full. Please wait.", {
-            label: "error",
-          });
-        } else if (data && data.status === "attachments_busy") {
-          // Attachments can't ride a queued user turn — server held
-          // the reservations long enough to bounce the request and
-          // released them. Chips stay in the composer; user retries
-          // once the assistant finishes.
-          if (queuedEl) queue.remove(queuedEl);
-          appendText(
-            "error",
-            "Attachments can't be sent while the assistant is working. Send a text-only message now, or wait and resend with attachments.",
-            { label: "error" },
-          );
-        } else if (data && data.status === "cross_user_interjection") {
-          // Another participant's turn is in flight; the server refused the
-          // interjection so it can't run under their credentials or be
-          // misattributed. Reactive fallback for the click-beats-event race
-          // (the send gate normally disables the button first).
-          if (queuedEl) queue.remove(queuedEl);
-          appendText(
-            "error",
-            data.error ||
-              "Another participant's turn is in progress. Wait for it to finish, then send your message.",
-            { label: "error" },
-          );
-          if (!queuedEl) setBusy(false);
-        } else {
-          // Unknown / "ok" status (stale-busy race): settle the optimistic
-          // bubble so a pre-bind × can't strand it in the dismissing state.
-          if (queuedEl) queue.promote(queuedEl);
-          attachments.consume(
-            data && data.attached_ids,
-            data && data.dropped_attachment_ids,
-          );
-        }
+        // The full status dispatch (queued/retro-convert, busy,
+        // queue_full, attachments_busy, cross_user, unknown-ok) lives in
+        // the shared helper — ONE settle matrix for both panes; see
+        // settleSendResponse's contract for the arm semantics.
+        settleSendResponse(queue, data || {}, {
+          queuedEl,
+          optimisticEl,
+          isBusy,
+          displayText,
+          priority,
+          setBusy: (b) => setBusy(b),
+          busyIsOptimistic: () => busy && busySource === "optimistic",
+          renderError: (msg) => appendText("error", msg, { label: "error" }),
+          consumeAttachments: (attached, droppedIds) =>
+            attachments.consume(attached, droppedIds),
+        });
       })
       .catch((e) => {
         if (queuedEl) queue.remove(queuedEl);

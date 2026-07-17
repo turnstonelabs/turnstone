@@ -1624,6 +1624,15 @@ async def metrics_endpoint(request: Request) -> Response:
     return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
+# Quick-command completion backstop.  MUST stay strictly below the
+# console proxy's client timeout (console/server.py
+# _PROXY_CLIENT_TIMEOUT_S = 30) or the degraded ``running`` answer can
+# never traverse a proxied pane — the proxy aborts first, the pane's
+# dispatch swallows the 5xx, and the caller sees nothing at all.  The
+# inequality is pinned by a test importing both constants.
+_COMMAND_RESPONSE_BACKSTOP_S = 25
+
+
 def _capture_cancel_forensics(session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]:
     """Snapshot in-flight session state for the cancel response.
 
@@ -1727,7 +1736,7 @@ async def command(request: Request) -> JSONResponse:
 
         session = ws.session
         cmd_ui = ui
-        busy_hit = {"hit": False}
+        busy_hit = False
 
         def _reject_busy() -> None:
             # Worker already running (a turn or another command is in
@@ -1735,7 +1744,8 @@ async def command(request: Request) -> JSONResponse:
             # instead.  Server-side mirror of the composer's client guard,
             # and a strict improvement for API callers: the old inline path
             # let /clear & co. mutate the session mid-turn.
-            busy_hit["hit"] = True
+            nonlocal busy_hit
+            busy_hit = True
 
         def _dispatch_command(
             run: Callable[[], None], thread_name: str, busy_hint: str
@@ -1753,16 +1763,33 @@ async def command(request: Request) -> JSONResponse:
             full-fidelity sends by the pending-send drain when the window
             closes.
             """
-            dispatched = session_worker.send(
-                ws,
-                enqueue=_reject_busy,
-                run=run,
-                thread_name=thread_name,
-                worker_kind="command",
-            )
+            try:
+                dispatched = session_worker.send(
+                    ws,
+                    enqueue=_reject_busy,
+                    run=run,
+                    thread_name=thread_name,
+                    worker_kind="command",
+                )
+            except Exception:
+                # Thread.start failed (exhaustion, MemoryError) — the
+                # dispatcher rolled the slot claim back and re-raised.
+                # Answer 503, NOT the endpoint's generic 200-ok arm: a
+                # command worker that never spawned must be as loud as
+                # the busy 409 below — a status-code-only SDK caller
+                # would otherwise believe its /clear//name//resume
+                # applied and silently run against un-changed state.
+                log.exception("command.worker_spawn_failed ws=%s", ws.id[:8])
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "error": "Command worker could not be started — retry shortly.",
+                    },
+                    status_code=503,
+                )
             if not dispatched:
                 return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-            if busy_hit["hit"]:
+            if busy_hit:
                 # 409, not 200: the refusal is deliberate (mutual exclusion
                 # replaced the old inline mid-turn interleave) but it must
                 # be LOUD — a status-code-only SDK caller treats a 200 as
@@ -1916,14 +1943,14 @@ async def command(request: Request) -> JSONResponse:
         # panes.  Loop-native wait (call_soon_threadsafe from the worker's
         # finally): a thread parked in Event.wait via to_thread would hold
         # a shared default-executor slot for the whole wait per wedged
-        # command.  25s: strictly under the console proxy's 30s client
-        # timeout (console/server.py proxy_client) so the degraded
+        # command.  The bound (_COMMAND_RESPONSE_BACKSTOP_S) sits strictly
+        # under the console proxy's client timeout so the degraded
         # ``running`` answer can actually traverse a proxied pane — at 60s
         # the proxy aborted first, the pane's dispatch swallowed the 5xx,
         # and the user saw nothing at all (the same bounded-caller
         # reasoning that redesigned /send's command-window path).
         try:
-            async with asyncio.timeout(25):
+            async with asyncio.timeout(_COMMAND_RESPONSE_BACKSTOP_S):
                 await done.wait()
         except TimeoutError:
             return JSONResponse({"status": "running"})

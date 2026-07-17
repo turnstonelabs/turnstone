@@ -1261,6 +1261,19 @@ class TestInteractiveEventsLifted:
 # ---------------------------------------------------------------------------
 
 
+def test_command_backstop_sits_under_console_proxy_timeout() -> None:
+    """The /command ``running`` answer only ever traverses a proxied pane
+    while the node-side completion backstop is STRICTLY under the console
+    proxy's client timeout — two constants in two processes whose
+    inequality used to live in a comment.  This is the enforcement: edit
+    either constant past the other and this fails before a proxied
+    deployment silently loses the degraded answer again."""
+    from turnstone.console.server import _PROXY_CLIENT_TIMEOUT_S
+    from turnstone.server import _COMMAND_RESPONSE_BACKSTOP_S
+
+    assert _COMMAND_RESPONSE_BACKSTOP_S < _PROXY_CLIENT_TIMEOUT_S
+
+
 class TestCompactCommandDispatch:
     """Manual /compact runs on the workstream's worker slot: the event loop
     stays free to stream the compaction progress events, and a concurrent
@@ -2161,6 +2174,123 @@ class TestCompactCommandDispatch:
             {"type": "message_dispatched", "msg_id": second["msg_id"], "folded": True},
         ]
         assert [s[0] for s in ws.session.sends] == ["first"]
+
+    def test_deferred_send_list_saturation_returns_queue_full(self, app_client):
+        """The deferred list is bounded (_PENDING_SENDS_MAX = 10, mirroring
+        the interjection queue's cap): the 11th pending send answers
+        queue_full instead of silently pinning message + attachment bytes
+        per entry for a whole command window and then costing one
+        unattended turn each."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        for i in range(10):
+            r = client.post(
+                f"/v1/api/workstreams/{ws_id}/send",
+                json={"message": f"m{i}"},
+                headers=_auth("user-1"),
+            )
+            assert r.json()["status"] == "queued", i
+        r11 = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "one too many"},
+            headers=_auth("user-1"),
+        )
+        body = r11.json()
+        assert body["status"] == "queue_full"
+        assert "msg_id" not in body  # never acknowledged
+        with ws._lock:
+            assert len(ws._pending_sends) == 10
+        gate.set()
+        wait_until(lambda: len(ws.session.sends) == 10, timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == [f"m{i}" for i in range(10)]
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_drain_spawn_failure_rolls_back_and_answers_queue_full(self, app_client, monkeypatch):
+        """Thread.start failing at the drain-spawn site must not leave a
+        phantom acknowledged-nowhere entry (the 500-after-registration
+        class): entry and slot roll back under the same lock, the client
+        gets the retryable queue_full, and a retry once resources return
+        dispatches exactly once — no duplicate turns."""
+        from turnstone.core import session_routes
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+
+        class _ExhaustedThread(threading.Thread):
+            def start(self) -> None:
+                raise RuntimeError("can't start new thread")
+
+        real_factory = session_routes._make_drain_thread
+        monkeypatch.setattr(
+            session_routes,
+            "_make_drain_thread",
+            lambda _ws: _ExhaustedThread(target=lambda: None, daemon=True),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "refused under exhaustion"},
+            headers=_auth("user-1"),
+        )
+        assert r.json()["status"] == "queue_full"
+        with ws._lock:
+            assert ws._pending_sends == []  # rolled back — no phantom
+            assert ws._pending_drain is None
+        # Resources recover: a plain retry defers and dispatches ONCE.
+        monkeypatch.setattr(session_routes, "_make_drain_thread", real_factory)
+        r2 = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "the retry"},
+            headers=_auth("user-1"),
+        )
+        assert r2.json()["status"] == "queued"
+        assert r2.json()["deferred"] is True
+        gate.set()
+        wait_until(lambda: ws.session.sends, timeout=8.0)
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == ["the retry"]
+
+    def test_command_spawn_failure_answers_503_not_ok(self, app_client, monkeypatch):
+        """A command worker that never spawned must not answer 200 ok — the
+        endpoint's generic catch-all used to swallow the dispatcher's
+        Thread.start re-raise, telling SDK callers their /clear ran while
+        the context stayed un-cleared."""
+        from turnstone.core import session_worker
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+
+        def _exhausted(*_a, **_kw):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(session_worker, "send", _exhausted)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/clear", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 503
+        assert resp.json()["status"] == "error"
+        assert ws.session.commands == []  # the command never ran
 
     def test_exit_command_emits_ended_info_and_never_answers(self, app_client):
         """should_exit commands shut the session down — the worker emits

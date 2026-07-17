@@ -807,8 +807,12 @@ Sends a user message to a workstream. Spawns a daemon worker thread that calls
   list (a command window holds the slot, or earlier deferred sends are
   pending) and dispatched as its own full-fidelity send afterwards; see the
   defer contract under `POST /v1/api/command`.
-- `{"status": "queue_full", ...}` — the live worker's queue is at capacity;
-  retry shortly.
+- `{"status": "queue_full", ...}` — the send was refused with retry-shortly
+  semantics: the live worker's interjection queue is at capacity, the
+  deferred-send list hit its saturation bound (10 pending — the same
+  backpressure contract), or the deferred-send drain could not be started
+  under resource exhaustion (the message was **not** accepted; nothing is
+  parked).
 - `{"status": "attachments_busy", ...}` — attachments can't ride a queued
   turn; the staged uploads survive for a retry once the worker idles.
 
@@ -940,11 +944,12 @@ or `{"status": "running"}` as above.
 
 **Error responses:**
 
-| Status | Body                               | Condition                        |
-|--------|------------------------------------|----------------------------------|
-| 400    | `{"error": "Empty command"}`       | Command is empty                 |
-| 404    | `{"error": "Unknown workstream"}`  | `ws_id` not found                |
-| 409    | `{"status": "busy", "error": ...}` | A turn/command holds the worker  |
+| Status | Body                                | Condition                                        |
+|--------|-------------------------------------|--------------------------------------------------|
+| 400    | `{"error": "Empty command"}`        | Command is empty                                 |
+| 404    | `{"error": "Unknown workstream"}`   | `ws_id` not found                                |
+| 409    | `{"status": "busy", "error": ...}`  | A turn/command holds the worker                  |
+| 503    | `{"status": "error", "error": ...}` | The command worker could not be started (resource exhaustion) — the command did **not** run; retry shortly |
 
 ---
 

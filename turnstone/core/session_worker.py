@@ -47,7 +47,7 @@ from turnstone.core.log import get_logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from turnstone.core.workstream import Workstream
+    from turnstone.core.workstream import WorkerKind, Workstream
 
 log = get_logger(__name__)
 
@@ -93,7 +93,7 @@ def send(
     enqueue: Callable[[], None],
     run: Callable[[], None],
     thread_name: str | None = None,
-    worker_kind: str = "turn",
+    worker_kind: WorkerKind = "turn",
 ) -> bool:
     """Dispatch work onto a workstream's worker thread.
 

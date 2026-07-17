@@ -509,6 +509,10 @@ class TestSendMessageAttachments:
         # pending list.
         ws._pending_sends = []
         ws._pending_drain = None
+        # The /send route consults the order barrier as a METHOD — a bare
+        # Mock attr would be a truthy callable result and defer every send
+        # behind a phantom barrier (same class as the fields above).
+        ws.send_barrier_active = lambda: False
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured, session
@@ -712,6 +716,10 @@ class TestQueuedSendWithAttachments:
         # bare Mock attr would defer every send behind a phantom list.
         ws._pending_sends = []
         ws._pending_drain = None
+        # The /send route consults the order barrier as a METHOD — a bare
+        # Mock attr would be a truthy callable result and defer every send
+        # behind a phantom barrier (same class as the fields above).
+        ws.send_barrier_active = lambda: False
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured
@@ -780,6 +788,10 @@ class TestBusyWorkerAttachments:
         # bare Mock attr would defer every send behind a phantom list.
         ws._pending_sends = []
         ws._pending_drain = None
+        # The /send route consults the order barrier as a METHOD — a bare
+        # Mock attr would be a truthy callable result and defer every send
+        # behind a phantom barrier (same class as the fields above).
+        ws.send_barrier_active = lambda: False
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return ws, session

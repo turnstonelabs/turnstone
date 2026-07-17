@@ -17,7 +17,6 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
-from turnstone.core.compaction_render import render_compaction_event_as_info
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.session import ChatSession, SessionUI
 from turnstone.core.session_manager import SessionManager
@@ -329,17 +328,12 @@ class TerminalUI(SessionUI):
         sys.stdout.write(f"{YELLOW}[{label}]{RESET} {content}\n")
         sys.stdout.flush()
 
-    def on_compaction(self, payload: dict[str, Any]) -> int | None:
-        """Render compaction lifecycle events as the terminal's classic text
-        lines — the notice, ``part k/N`` progress, and the token-delta +
-        boxed-summary result the CLI printed before these became structured
-        events (the web UI renders the same payloads as a progress card).
-        Shared with :meth:`ChatSession._compaction_event`'s duck-typed
-        fallback so both render identically; failed-end suppression rides
-        the emitter-stamped ``notice`` field (single policy site).
-        """
-        render_compaction_event_as_info(payload, self.on_info)
-        return None
+    # No on_compaction override: TerminalUI subclasses SessionUI
+    # explicitly, and the inherited protocol default body IS the
+    # terminal's classic rendering (render_compaction_event_as_info via
+    # on_info — see SessionUI.on_compaction).  A byte-identical override
+    # here silently forked the policy site: a future change to the
+    # default stopped applying to the CLI.
 
     def on_state_change(self, state: str) -> None:
         pass  # base TerminalUI ignores state changes

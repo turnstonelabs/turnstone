@@ -588,6 +588,14 @@ _CONSOLE_PROXY_STYLE = (
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
 
+# Client timeout for the REST proxy pool (BOTH constructions: startup and
+# the mTLS re-create).  Node endpoints that answer degraded-but-in-time
+# responses size their backstops strictly UNDER this bound — e.g. the
+# quick-command ``running`` answer (turnstone/server.py
+# _COMMAND_RESPONSE_BACKSTOP_S); a test pins the inequality.  The SSE
+# proxy client's granular Timeout is a separate contract.
+_PROXY_CLIENT_TIMEOUT_S = 30
+
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
 
 
@@ -5322,7 +5330,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     _proxy_verify: Any = _proxy_ssl if _proxy_ssl else True
 
     app.state.proxy_client = httpx.AsyncClient(
-        timeout=30,
+        timeout=_PROXY_CLIENT_TIMEOUT_S,
         limits=httpx.Limits(
             max_connections=fan_out + 50,
             max_keepalive_connections=min(fan_out // 4, 100),
@@ -5464,7 +5472,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 await app.state.proxy_client.aclose()
                 await app.state.proxy_sse_client.aclose()
                 app.state.proxy_client = httpx.AsyncClient(
-                    timeout=30,
+                    timeout=_PROXY_CLIENT_TIMEOUT_S,
                     limits=httpx.Limits(
                         max_connections=app.state.fan_out_limit + 50,
                         max_keepalive_connections=min(app.state.fan_out_limit // 4, 100),

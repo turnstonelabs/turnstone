@@ -2098,6 +2098,77 @@ class TestPreHookUICompat:
         assert _coerce_event_id(None) is None
         assert _coerce_event_id("46") is None
 
+    def test_raising_on_error_still_emits_exactly_one_failed_end(self, session):
+        """A raising on_error (bounded listener queue.Full — the duck-typed
+        embedder class) must not void the exactly-one-end contract: the
+        guard in _compaction_bailed lets the end emit run, so no pane is
+        left holding a frozen progress bar."""
+        ends: list[dict] = []
+
+        def _boom(_msg: str) -> None:
+            raise RuntimeError("listener queue full")
+
+        session.ui = SimpleNamespace(
+            on_thinking_start=lambda: None,
+            on_thinking_stop=lambda: None,
+            on_error=_boom,
+            on_compaction=lambda payload: (
+                ends.append(payload) if payload.get("phase") == "end" else None
+            ),
+        )
+        result = session._compaction_bailed(
+            "error", "summarizer exploded", trigger="manual", my_generation=0
+        )
+        assert result is False  # handled bail, no propagation
+        assert len(ends) == 1
+        assert ends[0]["ok"] is False and ends[0]["reason"] == "error"
+
+    def test_raising_lifecycle_hook_never_propagates(self, session):
+        """_compaction_event is the single raise-proofing site for every
+        lifecycle emission: a raising on_compaction degrades to a lost
+        render (marker id None), never to a propagating exception — a
+        raising failed-END re-created the frozen-bar hole one call deeper,
+        and a raising SUCCESS end after the committed swap made the
+        wrapper backstop fabricate a failed end for a compaction that
+        succeeded."""
+
+        def _boom(_payload: dict) -> int:
+            raise RuntimeError("hook broken")
+
+        session.ui = SimpleNamespace(
+            on_thinking_start=lambda: None,
+            on_thinking_stop=lambda: None,
+            on_error=lambda _m: None,
+            on_compaction=_boom,
+        )
+        # Success end: swallowed, marker id lost, nothing fabricated.
+        assert (
+            session._compaction_event(
+                0, {"phase": "end", "ok": True, "trigger": "manual", "summary": "s"}
+            )
+            is None
+        )
+        # Failed end via the bail path: still returns False, no propagation
+        # (pre-guard, the raise re-entered _compaction_bailed through the
+        # wrapper backstop and no end was ever emitted on either pass).
+        assert (
+            session._compaction_bailed("error", "boom", trigger="manual", my_generation=0) is False
+        )
+        # The duck-type fallback route is guarded by the same try: a
+        # raising on_info must not escape either.
+        session.ui = SimpleNamespace(
+            on_thinking_start=lambda: None,
+            on_thinking_stop=lambda: None,
+            on_error=lambda _m: None,
+            on_info=_boom,
+        )
+        assert (
+            session._compaction_event(
+                0, {"phase": "end", "ok": True, "trigger": "manual", "summary": "s"}
+            )
+            is None
+        )
+
 
 class TestCompactionNoticeStamp:
     """_compaction_event is the single display-policy site: failed ends

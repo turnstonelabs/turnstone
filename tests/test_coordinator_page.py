@@ -687,7 +687,14 @@ def test_coordinator_js_gates_send_on_cross_user_busy():
     assert "actingUserId !== me" in coord_js
     assert "composer.setSendBlocked(" in coord_js
     assert "function reconcileSendBlock()" in coord_js
-    # reactive 409 fallback
+    # reactive 409 fallback — the pane converts the 409 body at the fetch
+    # stage; the status ARM itself lives in the shared settle helper
+    # (composer_queue.settleSendResponse) with the rest of the response
+    # matrix, one implementation for both panes.
     assert "r.status === 409" in coord_js
     assert 'status: "cross_user_interjection"' in coord_js
-    assert 'data.status === "cross_user_interjection"' in coord_js
+    assert "settleSendResponse(" in coord_js
+    helper = (
+        Path(__file__).resolve().parents[1] / "turnstone/shared_static/composer_queue.js"
+    ).read_text(encoding="utf-8")
+    assert 'status === "cross_user_interjection"' in helper

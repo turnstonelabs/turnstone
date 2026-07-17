@@ -146,6 +146,29 @@ def test_enqueue_unexpected_exception_returns_false_logged() -> None:
     assert ws._worker_running is True
 
 
+def test_send_barrier_active_truth_table() -> None:
+    """The two-term order barrier (Workstream.send_barrier_active): list
+    non-empty OR drain alive.  The drain-alive term covers the CLAIMED-
+    entry window (entry popped, dispatch in flight) — the _PendingSend
+    invariant "drain not alive ⇒ nothing claimed" is what makes the pair
+    exhaustive; a one-term copy at any consumer re-opens the wake-jumps-
+    an-acked-send hole."""
+    from types import SimpleNamespace
+
+    ws = _make_ws()
+    assert ws.send_barrier_active() is False  # empty list, no drain
+    ws._pending_sends.append(object())  # type: ignore[arg-type]
+    assert ws.send_barrier_active() is True  # list term
+    ws._pending_drain = SimpleNamespace(is_alive=lambda: True)  # type: ignore[assignment]
+    assert ws.send_barrier_active() is True  # both terms
+    ws._pending_sends.clear()
+    assert ws.send_barrier_active() is True  # drain-alive term alone (claimed window)
+    ws._pending_drain = SimpleNamespace(is_alive=lambda: False)  # type: ignore[assignment]
+    assert ws.send_barrier_active() is False  # dead drain, empty list
+    ws._pending_drain = None
+    assert ws.send_barrier_active() is False
+
+
 def test_spawn_failure_releases_slot_and_reraises(monkeypatch) -> None:
     """``Thread.start`` raising (thread exhaustion, MemoryError) must not
     wedge the slot: the claim ``(worker_thread, _worker_running)`` taken

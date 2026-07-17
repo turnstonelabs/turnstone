@@ -998,17 +998,20 @@
    the progress bar) and the settled result (token delta + summary fold).
    Built by ``buildCompactionProgressCard`` / ``buildCompactionCard``
    (shared conversation.js) for the interactive pane AND the coord viewer.
-   Magenta accent: a memory/infrastructure operation — distinct from the cyan
-   tool surface, the yellow operator bubbles, and the amber user turns. */
+   Blue accent: a system/infrastructure-info operation — distinct from the
+   cyan tool surface, the yellow operator bubbles, and the amber user turns.
+   NOT magenta: that accent is reserved for the MCP surface (.scope-mcp and
+   the admin scope chips); blue's other uses are admin-surface only (model
+   status dots, provider chips) and never co-render with transcript cards. */
 .msg.compaction-card {
-  border-left-color: var(--magenta);
+  border-left-color: var(--blue);
   background: var(--panel);
   padding: 8px 12px;
   margin: 6px 0;
   width: 100%;
 }
 .msg.compaction-card .msg-compaction-header {
-  color: var(--magenta);
+  color: var(--blue);
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 600;
@@ -1030,14 +1033,14 @@
   height: 4px;
   margin-top: 8px;
   border-radius: 2px;
-  background: var(--magenta-glow);
+  background: var(--blue-glow);
   overflow: hidden;
 }
 .msg.compaction-card .msg-compaction-bar-fill {
   height: 100%;
   width: 0;
   border-radius: 2px;
-  background: var(--magenta);
+  background: var(--blue);
   transition: width 300ms ease;
 }
 /* Indeterminate state — a single-batch summarization emits no part-k/N

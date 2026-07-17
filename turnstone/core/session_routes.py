@@ -40,8 +40,11 @@ from starlette.routing import Route
 
 from turnstone.core.log import get_logger
 from turnstone.core.session_ui_base import AutoApproveReason
+from turnstone.core.workstream import _PendingSend
 
 if TYPE_CHECKING:
+    import threading
+
     from starlette.background import BackgroundTask
     from starlette.requests import Request
     from starlette.responses import Response
@@ -3948,54 +3951,40 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
 
 
 # ---------------------------------------------------------------------------
-# Deferred sends (command windows)
+# Deferred sends (command windows / order barrier)
 # ---------------------------------------------------------------------------
 
+# The dataclass and the order-barrier predicate live with the Workstream
+# fields they annotate (turnstone.core.workstream): _PendingSend carries
+# the "drain not alive ⇒ nothing claimed" invariant (imported at module
+# top), and Workstream.send_barrier_active() is the ONE definition of
+# the two-term barrier every dispatch surface consults.
 
-@dataclass
-class _PendingSend:
-    """One send deferred during a command window.
+# Saturation bound for ws._pending_sends — restores the backpressure
+# contract the interjection queue (ChatSession._QUEUE_MAX, same value)
+# enforced for every busy-window send before the defer seam replaced it.
+# Each accepted entry pins its full message text plus materialized
+# attachment bytes for the length of a command window and then costs one
+# unattended turn, so acceptance must be bounded; callers get the
+# standard retryable ``queue_full``.
+_PENDING_SENDS_MAX = 10
 
-    A /send that lands while a slash-command worker holds the slot
-    (``ws.worker_kind == "command"`` — a manual /compact can hold it for
-    minutes) is answered ``{"status": "queued", "msg_id": ...}``
-    immediately and registered here; :func:`_drain_pending_sends`
-    dispatches it full-fidelity when the window closes.  This replaces
-    the parked-POST design, which encoded "client disconnected" as
-    "message retracted" — true only for the web composers' ✕-abort;
-    every bounded caller (the coordinator client and the console proxy
-    at timeout=30, SDKs, curl) times out instead, and its message was
-    deliberately dropped for the whole window.
 
-    ``attempt`` is the prebuilt one-session-capture dispatch closure
-    (:func:`_make_dispatch_attempt` with ``defer_fidelity=True``), so
-    the drain stays endpoint-agnostic — everything kind-specific
-    (attachments, spawn metrics, UI hooks) was captured at defer time.
-    ``retracted`` is flipped under ``ws._lock`` by the DELETE dequeue
-    fall-through; the drain never dispatches a retracted entry.
+def _make_drain_thread(ws: Workstream) -> threading.Thread:
+    """Construct (never start) the pending-send drain thread for *ws*.
 
-    Durability contract (documented in the API reference): node-local
-    and in-memory, the interjection queue's lifetime — entries die with
-    the workstream or the process, so "queued" is at-most-once intake,
-    not durable acceptance.
-
-    Invariant both the route's order barrier and the drain depend on:
-    **drain not alive ⇒ nothing claimed.**  The drain pops an entry only
-    while it lives and re-inserts it at head on ANY non-dispatch outcome
-    (rejection or crash), so a dead/absent drain means every accepted
-    entry is on this list — the route's barrier term pair
-    (``_pending_sends`` non-empty OR drain alive) therefore covers the
-    claimed-entry window with no third state.
-
-    (No ``priority`` field: dispatch is strictly FIFO — arrival order is
-    the contract — and the queued response/event use the route's parsed
-    local.  A deferred entry's ``!!!`` prefix still reaches the model:
-    the full text dispatches as an ordinary send.)
+    A module-level seam so tests can inject spawn failure without
+    touching the global ``threading`` module; ``_defer_send`` owns the
+    slot write, the ``start()`` call, and the rollback discipline.
     """
+    import threading  # matches the file's handler-scope import style
 
-    msg_id: str
-    attempt: Callable[[ChatSession], tuple[bool, dict[str, Any]]]
-    retracted: bool = False
+    return threading.Thread(
+        target=_drain_pending_sends,
+        args=(ws,),
+        name=f"pending-drain-{ws.id[:8]}",
+        daemon=True,
+    )
 
 
 def _emit_send_ui(ws: Workstream, ui: Any, hook_name: str, *args: Any) -> None:
@@ -4394,15 +4383,19 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
       emits the pane-tier ``message_dispatched`` settle event (see
       :func:`_make_dispatch_attempt`).
     - 200 ``{"status": "queue_full", "attached_ids",
-      "dropped_attachment_ids"}`` — live worker's queue at
-      capacity; reservations released. Caller should retry. The
-      ``attached_ids`` list is always empty here (the dispatch
-      didn't take ownership of any reservations).
+      "dropped_attachment_ids"}`` — the send was refused with
+      retry-shortly semantics: the live worker's interjection queue is
+      at capacity, the deferred-send list hit its saturation bound
+      (``_PENDING_SENDS_MAX`` — the same backpressure contract), or the
+      drain thread could not be started under resource exhaustion (the
+      entry is rolled back, never phantom-parked). Reservations
+      released; caller should retry. The ``attached_ids`` list is
+      always empty here (the dispatch didn't take ownership of any
+      reservations).
     - 4xx / 500 — auth / not-found / no-session per the usual
       :class:`SessionEndpointConfig` semantics.
     """
     import asyncio
-    import threading
     import uuid
 
     from turnstone.core.tool_advisory import parse_priority
@@ -4529,59 +4522,131 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         # command-window trigger re-acquires for its append, which is safe
         # because that rejection was reported under the lock the attempt
         # itself held.
-        def _defer_send(*, require_barrier: bool) -> Response | None:
-            # ``send_id`` is minted only when attachments are enabled —
-            # the deferred entry needs a truthy id regardless: it is the
-            # client's dismiss/bind handle and the drain's
-            # queue_msg_id/send_id thread.
-            pending_msg_id = send_id or uuid.uuid4().hex
-            cleaned_display, pending_priority = parse_priority(message)
-            entry = _PendingSend(
-                msg_id=pending_msg_id,
-                attempt=_make_dispatch_attempt(
-                    ws,
-                    cfg,
-                    ui,
-                    message=message,
-                    resolved_atts=resolved_atts,
-                    ordered_taken=ordered_taken,
-                    send_id=pending_msg_id,
-                    acting_uid=acting_uid,
-                    request=None,
-                    defer_fidelity=True,
-                ),
+        def _queue_full_response() -> Response:
+            # Shared refusal shape (see the not-ok arm below for the
+            # rationale): retry-shortly semantics, no ownership taken.
+            return JSONResponse(
+                {
+                    "status": "queue_full",
+                    "attached_ids": [],
+                    "dropped_attachment_ids": list(requested_ids),
+                }
             )
+
+        def _defer_send(*, require_barrier: bool) -> Response | None:
             with ws._lock:
-                if require_barrier:
-                    drain_t = ws._pending_drain
-                    if not ws._pending_sends and not (drain_t is not None and drain_t.is_alive()):
-                        return None  # no barrier — caller dispatches directly
+                # Probe FIRST, before constructing anything: in the
+                # overwhelmingly common no-barrier case this costs two
+                # field reads instead of a discarded closure tree +
+                # parse_priority per ordinary send.
+                if require_barrier and not ws.send_barrier_active():
+                    return None  # no barrier — caller dispatches directly
                 if ws._closed:
                     # Mirror the dispatch-refusal 404 below: a "queued"
                     # answer for a workstream whose next resolution 404s
                     # would promise a dispatch that can never happen.
                     return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+                if len(ws._pending_sends) >= _PENDING_SENDS_MAX:
+                    # Saturation backpressure — restores the contract the
+                    # interjection queue enforced for every busy-window
+                    # send before the defer seam replaced it
+                    # (ChatSession._QUEUE_MAX, session.py): without a
+                    # bound, each acked entry pins its message text plus
+                    # materialized attachment bytes for a whole command
+                    # window and then costs one unattended turn — an
+                    # automated caller could OOM the node with 200s.
+                    # len() deliberately counts retract-marked husks
+                    # awaiting the drain's loop-top purge (DELETE only
+                    # marks): a live-only count would let park/retract
+                    # churn re-open the unbounded-growth hole.  Transient
+                    # over-refusal self-heals at the next purge.
+                    return _queue_full_response()
+                # ``send_id`` is minted only when attachments are enabled
+                # — the deferred entry needs a truthy id regardless: it
+                # is the client's dismiss/bind handle and the drain's
+                # queue_msg_id/send_id thread.  Constructed INSIDE the
+                # lock: closure creation is microsecond-cheap (the same
+                # argument session_worker.send makes for Thread()), and
+                # it keeps probe→append atomic.
+                pending_msg_id = send_id or uuid.uuid4().hex
+                cleaned_display, pending_priority = parse_priority(message)
+                entry = _PendingSend(
+                    msg_id=pending_msg_id,
+                    attempt=_make_dispatch_attempt(
+                        ws,
+                        cfg,
+                        ui,
+                        message=message,
+                        resolved_atts=resolved_atts,
+                        ordered_taken=ordered_taken,
+                        send_id=pending_msg_id,
+                        acting_uid=acting_uid,
+                        request=None,
+                        defer_fidelity=True,
+                    ),
+                )
                 ws._pending_sends.append(entry)
                 drain = ws._pending_drain
                 if drain is None or not drain.is_alive():
-                    # Single drain-spawn site — also the recovery path for
-                    # a drain that died in its last-resort handler.
-                    t = threading.Thread(
-                        target=_drain_pending_sends,
-                        args=(ws,),
-                        name=f"pending-drain-{ws.id[:8]}",
-                        daemon=True,
-                    )
+                    # Single drain-spawn site — also the recovery path
+                    # for a drain that died in its last-resort handler.
+                    # ``t.start()`` stays INSIDE this lock acquisition,
+                    # deliberately unlike session_worker.send's
+                    # outside-lock start (d3028234): that site's readers
+                    # gate on the ``_worker_running`` flag, which is
+                    # valid before start — this slot's only liveness
+                    # signal is ``Thread.is_alive()``, which reads False
+                    # for a constructed-but-unstarted thread, so an
+                    # outside-lock start would let a concurrent defer's
+                    # eligibility check see the pending drain as dead
+                    # and spawn a SECOND dispatcher (FIFO inversion; the
+                    # drain's exit slot-clears are single-flight-only).
+                    # Holding the lock through start makes that state
+                    # unobservable and keeps single-flight structural;
+                    # the cost is thread-spawn latency (~100µs) on a
+                    # cold path.
+                    t = _make_drain_thread(ws)
                     ws._pending_drain = t
-                    t.start()
-            if cfg.emit_message_queued and hasattr(ui, "_enqueue"):
-                ui._enqueue(
+                    try:
+                        t.start()
+                    except Exception:
+                        # Thread creation failed (exhaustion,
+                        # MemoryError).  Roll back BOTH writes — the
+                        # lock was held throughout, so the entry is
+                        # provably the tail and the slot is provably
+                        # ``t`` — and refuse with queue_full: the SDK's
+                        # existing retry-shortly vocabulary.  Never a
+                        # 500 after registration (a phantom entry the
+                        # client can't retract that dispatches later as
+                        # a duplicate), and never a queued ack (it would
+                        # promise a dispatch whose only revival trigger
+                        # is a FUTURE send).  Entries acked by earlier
+                        # successful defers stay parked under the
+                        # next-send-re-ensures policy — no respawn
+                        # attempt here under the same exhaustion that
+                        # just failed.
+                        ws._pending_sends.pop()
+                        ws._pending_drain = None
+                        log.exception(
+                            "ws.send.pending_drain_spawn_failed ws=%s — send refused",
+                            ws.id[:8],
+                        )
+                        return _queue_full_response()
+            # Best-effort ack event — a raising UI hook must not convert
+            # an ACCEPTED deferred send into a 500 (the client would
+            # retry and deliver twice); same never-mask-acceptance rule
+            # as message_dispatched.
+            if cfg.emit_message_queued:
+                _emit_send_ui(
+                    ws,
+                    ui,
+                    "_enqueue",
                     {
                         "type": "message_queued",
                         "message": cleaned_display,
                         "priority": pending_priority,
                         "msg_id": pending_msg_id,
-                    }
+                    },
                 )
             return JSONResponse(
                 {
@@ -4632,7 +4697,9 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 # resolution 404s.  Mirror the resolution miss instead.
                 return JSONResponse({"error": cfg.not_found_label}, status_code=404)
             # queue.Full or session-disappeared race — surface as
-            # queue_full so clients retry rather than 500. ``attached_ids``
+            # queue_full so clients retry rather than 500 (the same shape
+            # _defer_send answers for its saturation cap and drain-spawn
+            # failure). ``attached_ids``
             # is always empty on this path (the dispatch never took
             # ownership); the empty arrays preserve the response-shape
             # guarantee so SDK consumers don't branch on status.
@@ -4677,15 +4744,21 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
 
         dropped = [aid for aid in requested_ids if aid not in taken_set]
         if queue_outcome:
-            # Reused a live worker; ``queue_message`` succeeded.
-            if cfg.emit_message_queued and hasattr(ui, "_enqueue"):
-                ui._enqueue(
+            # Reused a live worker; ``queue_message`` succeeded.  Best-
+            # effort like the defer arm's ack: the message is already
+            # accepted, so a raising UI hook must not 500 this into a
+            # client retry (duplicate delivery).
+            if cfg.emit_message_queued:
+                _emit_send_ui(
+                    ws,
+                    ui,
+                    "_enqueue",
                     {
                         "type": "message_queued",
                         "message": queue_outcome["cleaned"],
                         "priority": queue_outcome["priority"],
                         "msg_id": queue_outcome["msg_id"],
-                    }
+                    },
                 )
             return JSONResponse(
                 {

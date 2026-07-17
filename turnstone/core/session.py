@@ -7861,27 +7861,43 @@ class ChatSession:
         # converge on render_compaction_event_as_info, policy
         # single-sited.
         emit = getattr(self.ui, "on_compaction", None)
-        if emit is None:
-            # Pre-hook UIs get the classic info lines back (an
-            # auto-compaction must never swap history with zero
-            # announcement — the pre-1.8 lines reached every UI
-            # unconditionally).  Invoked for superseded events too: a
-            # superseded OK end announces a swap that really committed,
-            # and failed-end staleness is already encoded in ``notice``.
-            # ``on_info`` is getattr-guarded like the hook itself — the
-            # never-crash property is the floor; a UI with neither hook
-            # keeps compacting silently.  Deliberately NOT dual-emitted
-            # for hook-aware UIs or SSE: pre-1.8 SSE/SDK clients that
-            # ignore unknown `compaction` events lose these lines — a
-            # documented 1.8 breaking change (CHANGELOG); dual emission
-            # would double-render on every current client.
-            info = getattr(self.ui, "on_info", None)
-            if info is not None:
-                from turnstone.core.compaction_render import render_compaction_event_as_info
+        try:
+            if emit is None:
+                # Pre-hook UIs get the classic info lines back (an
+                # auto-compaction must never swap history with zero
+                # announcement — the pre-1.8 lines reached every UI
+                # unconditionally).  Invoked for superseded events too: a
+                # superseded OK end announces a swap that really committed,
+                # and failed-end staleness is already encoded in ``notice``.
+                # ``on_info`` is getattr-guarded like the hook itself — the
+                # never-crash property is the floor; a UI with neither hook
+                # keeps compacting silently.  Deliberately NOT dual-emitted
+                # for hook-aware UIs or SSE: pre-1.8 SSE/SDK clients that
+                # ignore unknown `compaction` events lose these lines — a
+                # documented 1.8 breaking change (CHANGELOG); dual emission
+                # would double-render on every current client.
+                info = getattr(self.ui, "on_info", None)
+                if info is not None:
+                    from turnstone.core.compaction_render import render_compaction_event_as_info
 
-                render_compaction_event_as_info(event, info)
+                    render_compaction_event_as_info(event, info)
+                return None
+            result = emit(event)
+        except Exception:
+            # The single raise-proofing site for EVERY lifecycle emission
+            # (both compat routes, all phases): a raising duck-typed hook
+            # must degrade to a lost render, never to a lost EVENT —
+            # unguarded, a raising failed-END emit voided the
+            # exactly-one-end contract through the wrapper backstop
+            # (frozen progress bar on every pane), and a raising SUCCESS
+            # end after the committed swap made the backstop fabricate a
+            # failed end + red row for a compaction that succeeded.  The
+            # cost on raise is only the marker-stamp id — the receiving
+            # hook was broken anyway.  Same policy as this method's own
+            # getattr guard ("must not wedge every long session") and the
+            # same shape as _emit_send_ui.
+            log.debug("compaction lifecycle hook raised; event dropped for this UI", exc_info=True)
             return None
-        result = emit(event)
         # Duck-typed hooks aren't bound to the protocol's return type; the
         # marker-stamp consumer needs int-or-None, nothing else (and a
         # hook returning True must not stamp a bool — see _coerce_event_id).
@@ -7914,7 +7930,17 @@ class ChatSession:
         Handled bails never propagate, so they always emit.
         """
         if reason == "error" and emit_error:
-            self.ui.on_error(message)
+            try:
+                # Guarded like _record_fatal_error's on_error: a raising
+                # duck-typed hook (bounded listener queue.Full) must not
+                # escape BEFORE the end emit below — that voided the
+                # exactly-one-end contract on both bail passes and left
+                # every pane a frozen progress bar.  Order kept
+                # (on_error first): the panes render the red row from it
+                # and treat the end event as card-teardown only.
+                self.ui.on_error(message)
+            except Exception:
+                log.debug("ui.on_error failed during compaction bail", exc_info=True)
         self._compaction_event(
             my_generation,
             {"phase": "end", "ok": False, "reason": reason, "message": message, "trigger": trigger},

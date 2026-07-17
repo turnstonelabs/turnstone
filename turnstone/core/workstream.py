@@ -13,10 +13,18 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turnstone.core.session import ChatSession, SessionUI
+
+# What KIND of work a worker slot holds.  A Literal (not a free-form str)
+# so a typo'd comparison or a new dispatch caller passing "commands" is a
+# type error instead of a silently never-firing command-window guard —
+# the /send defer keys on exactly these values.
+WorkerKind = Literal["", "turn", "command"]
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +105,61 @@ BULK_CLOSE_STATE_VALUES: frozenset[str] = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# Deferred sends
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PendingSend:
+    """One send deferred while the /send order barrier holds.
+
+    A /send that lands while a slash-command worker holds the slot
+    (``ws.worker_kind == "command"`` — a manual /compact can hold it for
+    minutes) or while earlier deferred entries are still pending is
+    answered ``{"status": "queued", "deferred": true, "msg_id": ...}``
+    immediately and registered here;
+    :func:`turnstone.core.session_routes._drain_pending_sends` dispatches
+    it full-fidelity when the slot frees.  This replaces the parked-POST
+    design, which encoded "client disconnected" as "message retracted" —
+    true only for the web composers' ✕-abort; every bounded caller (the
+    coordinator client and the console proxy at timeout=30, SDKs, curl)
+    times out instead, and its message was deliberately dropped for the
+    whole window.
+
+    ``attempt`` is the prebuilt one-session-capture dispatch closure
+    (:func:`turnstone.core.session_routes._make_dispatch_attempt` with
+    ``defer_fidelity=True``), so the drain stays endpoint-agnostic —
+    everything kind-specific (attachments, spawn metrics, UI hooks) was
+    captured at defer time.  ``retracted`` is flipped under ``ws._lock``
+    by the DELETE dequeue fall-through; the drain never dispatches a
+    retracted entry.
+
+    Durability contract (documented in the API reference): node-local
+    and in-memory, the interjection queue's lifetime — entries die with
+    the workstream or the process, so "queued" is at-most-once intake,
+    not durable acceptance.
+
+    Invariant both the route's order barrier and the drain depend on
+    (and the second term of :meth:`Workstream.send_barrier_active`
+    exists to honor): **drain not alive ⇒ nothing claimed.**  The drain
+    pops an entry only while it lives and re-inserts it at head on ANY
+    non-dispatch outcome (rejection or crash), so a dead/absent drain
+    means every accepted entry is on the list — the barrier term pair
+    (list non-empty OR drain alive) therefore covers the claimed-entry
+    window with no third state.
+
+    (No ``priority`` field: dispatch is strictly FIFO — arrival order is
+    the contract — and the queued response/event use the route's parsed
+    local.  A deferred entry's ``!!!`` prefix still reaches the model:
+    the full text dispatches as an ordinary send.)
+    """
+
+    msg_id: str
+    attempt: Callable[[ChatSession], tuple[bool, dict[str, Any]]]
+    retracted: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Workstream dataclass
 # ---------------------------------------------------------------------------
 
@@ -151,19 +214,19 @@ class Workstream:
     # turn-shaped (length cap, cross-user guard) and must be
     # unreachable during command windows — deferred entries live on
     # ``_pending_sends`` below.
-    worker_kind: str = field(default="", repr=False)
-    # Sends deferred during a command window (full-fidelity pending
-    # entries — see ``session_routes._PendingSend``), dispatched in
-    # arrival order by the per-workstream drain task when the window
-    # closes.  Appends, retract-marks and claims all happen under
+    worker_kind: WorkerKind = field(default="", repr=False)
+    # Sends deferred while the order barrier holds (full-fidelity
+    # pending entries — see :class:`_PendingSend` above), dispatched in
+    # arrival order by the per-workstream drain thread when the slot
+    # frees.  Appends, retract-marks and claims all happen under
     # ``_lock``.  Node-local and in-memory: entries die with the
     # workstream or the process (the interjection queue's lifetime) —
     # the /send contract documents the at-most-once consequence.
-    _pending_sends: list[Any] = field(default_factory=list, repr=False)
+    _pending_sends: list[_PendingSend] = field(default_factory=list, repr=False)
     # Single-flight guard for the drain (a daemon ``threading.Thread``
     # while one is live).  Written under ``_lock``; the drain clears it
     # before exiting so a later deferred send starts a fresh one.
-    _pending_drain: Any = field(default=None, repr=False)
+    _pending_drain: threading.Thread | None = field(default=None, repr=False)
     # True once ``SessionManager.commit_create`` (or the non-deferred
     # path through ``SessionManager.create``) has fired the lifecycle
     # ``emit_created`` event for this workstream. Used by
@@ -183,3 +246,35 @@ class Workstream:
     def __post_init__(self) -> None:
         if not self.name:
             self.name = f"ws-{self.id[:4]}"
+
+    def send_barrier_active(self) -> bool:
+        """True while the /send order barrier holds — the ONE definition.
+
+        The barrier is a two-term pair, and every dispatch surface that
+        must not overtake acknowledged sends consults it here (the /send
+        route's defer probe, ``CoordinatorAdapter.send``'s refusal, the
+        queued-nudge wake gate) instead of hand-copying the terms:
+
+        * ``_pending_sends`` non-empty — acknowledged entries are waiting
+          (retract-marked husks count until the drain's loop-top purge:
+          they still occupy their arrival slot).
+        * the drain is alive — an entry may be CLAIMED (popped, dispatch
+          in flight); the :class:`_PendingSend` invariant ("drain not
+          alive ⇒ nothing claimed") is what makes these two terms
+          exhaustive, with no third state.  The pair also covers the
+          drain-spawn window because ``_defer_send`` appends the entry
+          and starts the thread under one ``_lock`` acquisition — the
+          list term is always set before a not-yet-started drain could
+          be observed.
+
+        Lockless callers (the wake gate, the coordinator adapter) get
+        benign staleness in both directions: a stale True skips once
+        more and the next barrier-clearing path re-runs the gate (every
+        deferred turn's exit backstop, plus the drain's own clean exit);
+        a stale False means the concurrent defer holds no order contract
+        against the caller anyway.  Callers that need the answer atomic
+        with a mutation (the route's probe-then-append) hold ``_lock``
+        around the call.
+        """
+        drain = self._pending_drain
+        return bool(self._pending_sends) or (drain is not None and drain.is_alive())

@@ -175,7 +175,8 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Fixed
 
-- **A failed worker-thread spawn no longer wedges the workstream.** If
+- **A failed worker-thread spawn no longer wedges the workstream — at
+  either spawn site — and never masquerades as success.** If
   `Thread.start()` itself raised (thread exhaustion, out-of-memory), the
   dispatcher had already claimed the worker slot but the flag's only
   clearer lived in the never-started thread — the workstream looked idle
@@ -183,7 +184,14 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   didn't exist, until an operator force-cancel. The claim is now rolled
   back under the lock and the error propagates, so the workstream is
   dispatchable again as soon as resources recover. Affected every
-  dispatch path (sends, wakes, retries, deferred-send drain, init).
+  dispatch path (sends, wakes, retries, deferred-send drain, init). The
+  same failure at the deferred-send drain's own spawn rolls back the
+  just-accepted entry and answers the retryable `queue_full` (previously
+  a 500 landed *after* the entry was registered — an invisible,
+  unretractable phantom that later dispatched as duplicate turns), and a
+  `/command` whose worker never spawned now answers **503**
+  `{"status": "error"}` instead of the generic 200 ok that told SDK
+  callers their `/clear` or `/resume` had applied.
 
 - **Manual `/compact` from the web UI: no phantom user turn, no frozen
   server, cancellable.** A slash command typed into the web composer no
@@ -225,17 +233,28 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   retractable until dispatch via the same `DELETE .../send` used for
   queued interjections (node-local, in-memory — the API reference
   documents the at-most-once durability contract). Deferred responses
-  carry `"deferred": true`, the pending list is the **order authority**
+  carry `"deferred": true`; the pending list is the **order authority**
   (a fresh send — or a coordinator dispatch, or a queued-nudge wake —
-  lines up behind acknowledged entries instead of overtaking them, and
-  the wake gate re-arms at the drain's exit even when everything pending
-  was retracted), a dispatch crash re-queues the entry instead of eating
-  an acknowledged message, and each dispatch emits a pane-tier
+  lines up behind acknowledged entries instead of overtaking them, with
+  the two-term barrier defined once on the workstream so the wake gate
+  also honors a claimed entry whose dispatch is mid-flight, and the gate
+  re-arms at the drain's exit even when everything pending was
+  retracted); acceptance is **bounded** (10 pending per workstream — the
+  interjection queue's own backpressure contract; the 11th answers the
+  retryable `queue_full` instead of pinning attachment bytes without
+  limit and then running one unattended turn per entry); a dispatch
+  crash re-queues the entry instead of eating an acknowledged message,
+  and a drain thread that fails to *start* rolls the acceptance back and
+  answers `queue_full` rather than parking a phantom the client can
+  neither see nor retract; each dispatch emits a pane-tier
   `message_dispatched` event (`folded: true` for interjection fold-ins)
   so queued-bubble UI keeps its retract affordance exactly until the
   message truly leaves — including when the send was accepted by a pane
   that believed the workstream idle, which now renders a real queued
-  chip instead of a sent-looking bubble.
+  chip instead of a sent-looking bubble, releases the composer (a
+  deferred send has no running worker to wait on), and cleans up fully
+  when the send is refused or the chip retracted instead of stranding
+  the pane in Stop mode.
   A `/compact` raced against an in-flight turn is refused with an
   explicit busy response. Every other slash command runs through the same
   worker slot too — mutual exclusion against sends, a running compaction,

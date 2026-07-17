@@ -122,10 +122,17 @@ export function createQueueController(opts) {
   // barrier lets a deferred entry dispatch within milliseconds of its ack,
   // so the SSE message_dispatched can beat the POST response's .then —
   // without this, the chip would stay flagged deferred and the idle sweep
-  // would skip it forever. bind() reconciles and deletes; capped small
-  // because chip-absent settles (other tabs, replays) also land here and
-  // never get consumed.
-  var _preBindSettles = new Map(); // msgId -> folded
+  // would skip it forever. bind() reconciles and deletes. Expiry is
+  // TTL-based, NOT a size cap: when a window closes with many deferred
+  // sends, the drain settles them FIFO in one burst — this tab's own
+  // raced settle parks FIRST and a count cap would evict exactly it as
+  // the foreign settles (other tabs' messages, which never get consumed
+  // here) pile in behind. 30s dominates every path that can still
+  // consume an entry: bind() runs off the send POST, client-aborted at
+  // 15s in both panes. Growth is rate-bounded (settle frequency × TTL);
+  // stale foreign entries expire on the next insert's purge.
+  var PRE_BIND_SETTLE_TTL_MS = 30000;
+  var _preBindSettles = new Map(); // msgId -> {folded, at}
   // Upper bound on the dequeue DELETE so a wedged proxied node (the exact
   // case this flow targets) can't leave a card stuck "dismissing" forever.
   var DELETE_TIMEOUT_MS = 15000;
@@ -366,9 +373,9 @@ export function createQueueController(opts) {
     // fold-in settle → clear the flag, the chip is a normal queued
     // interjection from here.
     if (el.dataset.deferred && _preBindSettles.has(msgId)) {
-      var racedFolded = _preBindSettles.get(msgId);
+      var raced = _preBindSettles.get(msgId);
       _preBindSettles.delete(msgId);
-      if (racedFolded) {
+      if (raced.folded) {
         delete el.dataset.deferred;
       } else {
         _promote(el);
@@ -456,11 +463,13 @@ export function createQueueController(opts) {
     });
     if (!target) {
       // No bound chip yet: either another tab's message (never consumed —
-      // hence the cap) or this tab's bind() is still in the POST
+      // hence the TTL expiry) or this tab's bind() is still in the POST
       // round-trip; park the settle for bind() to reconcile.
-      _preBindSettles.set(msgId, !!folded);
-      if (_preBindSettles.size > 8)
-        _preBindSettles.delete(_preBindSettles.keys().next().value);
+      var now = Date.now();
+      _preBindSettles.forEach(function (v, k) {
+        if (now - v.at > PRE_BIND_SETTLE_TTL_MS) _preBindSettles.delete(k);
+      });
+      _preBindSettles.set(msgId, { folded: !!folded, at: now });
       return;
     }
     if (target.hasAttribute("aria-busy")) return; // dismiss in flight — let it settle
@@ -479,6 +488,120 @@ export function createQueueController(opts) {
     settleDeferred: settleDeferred,
     onIdleEdge: onIdleEdge,
   };
+}
+
+// --- Send-response settle (shared by both panes) -----------------------------
+
+// Strip the "!!!" priority prefix for the optimistic bubble — the server
+// re-parses it authoritatively; this is display-only. Exported here because
+// priority is this module's vocabulary (it feeds addQueuedMessage's badge)
+// and both panes need the identical parse pre-POST.
+export function parsePriority(text) {
+  if (text.startsWith("!!!")) {
+    return { displayText: text.slice(3).trimStart(), priority: "important" };
+  }
+  return { displayText: text, priority: "notice" };
+}
+
+// Settle a parsed /send response against the pane's optimistic state — the
+// ONE implementation of the status dispatch both panes share (the
+// applyCompactionEvent hooks pattern: everything pane-specific arrives via
+// ctx). The fetch-stage concerns (409 pre-parse, network .catch) stay
+// per-pane; this owns everything after a parsed 2xx/handled body.
+//
+// ctx:
+//   queuedEl:     the pre-POST queued chip (busy pane) or null
+//   optimisticEl: the pre-POST sent bubble (idle pane) or null
+//   isBusy:       the pane's busy flag AT SEND TIME
+//   displayText/priority: parsePriority() of the sent text
+//   setBusy(b):   pane busy setter
+//   busyIsOptimistic(): true iff the pane's CURRENT busy came from this
+//                 send flow's optimistic flip and no server state event
+//                 has since asserted it (see the panes' busySource stamp)
+//   renderError(msg): pane error row
+//   consumeAttachments(attached_ids, dropped_ids): composer chip sync
+//
+// Status arms:
+//   queued — bind the chip (retro-converting the idle pane's optimistic
+//     bubble into a REAL queued chip when deferred: a parked,
+//     still-retractable, restart-droppable message must not render as
+//     delivered). For deferred sends the optimistic busy flip is then a
+//     lie — no worker exists for this send — so busy clears under the
+//     busyIsOptimistic guard, AFTER bind() so the false-edge idle sweep
+//     sees dataset.deferred and skips the new chip.
+//   queue_full — the send was NEVER accepted (interjection cap, deferred-
+//     list saturation, or drain-spawn failure): remove the optimistic
+//     bubble too — leaving it renders loss as delivery — and restore busy
+//     under the same guard (no worker and no drain may exist to ever emit
+//     a state event; leaving busy strands the composer in Stop mode).
+//   busy / attachments_busy / cross_user_interjection / unknown-ok —
+//     the panes' historical shapes, verbatim.
+export function settleSendResponse(queue, data, ctx) {
+  var status = data && data.status;
+  if (status === "queued" && data.msg_id) {
+    var queuedEl = ctx.queuedEl;
+    if (!queuedEl && data.deferred) {
+      if (ctx.optimisticEl && ctx.optimisticEl.isConnected)
+        ctx.optimisticEl.remove();
+      queuedEl = queue.addQueuedMessage(ctx.displayText, ctx.priority);
+    }
+    if (queuedEl) {
+      queue.bind(queuedEl, data.msg_id, {
+        deferred: !!data.deferred,
+        attachedCount: (data.attached_ids || []).length,
+      });
+      if (data.deferred && ctx.busyIsOptimistic()) ctx.setBusy(false);
+    } else {
+      // Non-deferred queuedEl-absent: the client thought it was idle but
+      // a live worker interjection-queued the message (SSE state_change
+      // race). A worker provably exists, so its idle edge will arrive —
+      // keep the historical busy flip.
+      ctx.setBusy(true);
+    }
+    ctx.consumeAttachments(data.attached_ids, data.dropped_attachment_ids);
+    return;
+  }
+  if (status === "busy") {
+    if (ctx.queuedEl) queue.remove(ctx.queuedEl);
+    ctx.renderError("Server is busy. Please wait.");
+    if (!ctx.isBusy) ctx.setBusy(false);
+    return;
+  }
+  if (status === "queue_full") {
+    if (ctx.queuedEl) {
+      queue.remove(ctx.queuedEl);
+    } else {
+      if (ctx.optimisticEl && ctx.optimisticEl.isConnected)
+        ctx.optimisticEl.remove();
+      if (ctx.busyIsOptimistic()) ctx.setBusy(false);
+    }
+    ctx.renderError("Message queue full. Please wait.");
+    return;
+  }
+  if (status === "attachments_busy") {
+    if (ctx.queuedEl) queue.remove(ctx.queuedEl);
+    ctx.renderError(
+      "Attachments can't be sent while the assistant is working. " +
+        "Send a text-only message now, or wait and resend with attachments.",
+    );
+    return;
+  }
+  if (status === "cross_user_interjection") {
+    if (ctx.queuedEl) queue.remove(ctx.queuedEl);
+    ctx.renderError(
+      data.error ||
+        "Another participant's turn is in progress. Wait for it to " +
+          "finish, then send your message.",
+    );
+    if (!ctx.isBusy) ctx.setBusy(false);
+    return;
+  }
+  // Unknown / "ok" status (e.g. the stale-busy race: the client
+  // optimistically queued but the server ran the send on a fresh worker).
+  // Settle the optimistic chip as a normal sent message so a pre-bind ×
+  // can't strand it; promote() notifies "already sent" if it was dismissed.
+  if (ctx.queuedEl) queue.promote(ctx.queuedEl);
+  ctx.consumeAttachments(data.attached_ids, data.dropped_attachment_ids);
 }
 
 // --- Legacy window bridge ---------------------------------------------------
