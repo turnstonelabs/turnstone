@@ -587,6 +587,19 @@ class SessionUIBase:
         # Activity tracking for dashboard ("thinking" / "tool" / "").
         self._ws_current_activity: str = ""
         self._ws_activity_state: str = ""
+        # Compaction pill window: while True, on_thinking_start leaves the
+        # activity alone (the impl's own thinking wrap would otherwise
+        # clobber "Compacting context…" with "Thinking…" milliseconds after
+        # the start event set it, for the whole summarize phase).  The end
+        # event restores the pre-compaction pair, so a bail can't strand a
+        # stale "Compacting context…" on an idle workstream either.
+        self._compaction_activity_live: bool = False
+        self._pre_compaction_activity: tuple[str, str] = ("", "")
+        # Which compaction owns the latch (its ``compaction_id``): a
+        # force-abandoned compaction's LATE end event must not restore a
+        # stale pill pair over — or unlatch — a successor compaction that
+        # has since taken the latch over.
+        self._compaction_activity_owner: int = 0
         # Turn-content accumulator: assistant tokens piggybacked onto
         # the ``ws_state:idle`` broadcast so the dashboard renders the
         # turn without an extra storage round-trip. Cleared on IDLE /
@@ -2970,10 +2983,17 @@ class SessionUIBase:
             self._reset_inflight_buffers_locked()
 
     def on_thinking_start(self) -> None:
-        """Track that the model is thinking; broadcast activity + enqueue."""
+        """Track that the model is thinking; broadcast activity + enqueue.
+
+        Inside a compaction window the activity write is skipped —
+        :meth:`on_compaction` owns the pill there ("Compacting context…"
+        must survive the summarize phase's own thinking wrap); the
+        ``thinking_start`` event still flows for the spinner UIs.
+        """
         with self._ws_lock:
-            self._ws_current_activity = "Thinking…"
-            self._ws_activity_state = "thinking"
+            if not self._compaction_activity_live:
+                self._ws_current_activity = "Thinking…"
+                self._ws_activity_state = "thinking"
         self._broadcast_activity()
         self._enqueue({"type": "thinking_start"})
 
@@ -3254,6 +3274,137 @@ class SessionUIBase:
         return self._enqueue(
             {"type": "system_turn", "content": content, "source": source, "meta": meta or None}
         )
+
+    def on_compaction(self, payload: dict[str, Any]) -> int | None:
+        """Surface one compaction lifecycle event (``phase`` = start/progress/end).
+
+        The transcript affordance for context compaction: ``start`` paints
+        the in-progress card, ``progress`` drives its bar (chunked
+        summarization emits ``part``/``total``/``depth``), and ``end``
+        replaces it with the result card (or the failure notice).  The
+        successful ``end`` event's id is returned so ``_compact_messages``
+        stamps the persisted compaction marker row with the matching
+        resume cursor — the same live-event/history-row alignment
+        :meth:`on_system_turn` provides for operator turns, which is what
+        keeps a ``/history`` repaint and an SSE replay from double-rendering
+        the result card.
+
+        Inside a task agent the events are dropped (same rule as
+        :meth:`on_info`): a sub-agent's compaction is progress chatter that
+        carries no ``call_id``, so it cannot nest under the task card and
+        must not paint a top-level compaction card on the pane.
+
+        ``superseded`` (stamped by ``ChatSession._compaction_event``) marks
+        events from a force-abandoned compaction whose generation a
+        successor has since claimed.  Its start/progress events are
+        swallowed — animating a card for a dead compaction, or re-creating
+        one via the panes' defensive-create, is pure corruption — but its
+        END flows WITH the flag on the wire: the pane needs the event to
+        retire the card the abandoned compaction painted while it was
+        live, and the flag to know its failure notice would narrate a
+        compaction nobody is waiting on (a superseded OK end still renders
+        the result card — the history swap really happened).  On the latch
+        side a superseded end unlatches (so the live turn's thinking
+        writes resume) without restoring — its saved pair predates the
+        successor turn and would overwrite the live pill.
+        """
+        if _agent_scope_var.get() > 0:
+            return None
+        payload = dict(payload)
+        superseded = bool(payload.pop("superseded", False))
+        cid = int(payload.get("compaction_id") or 0)
+        phase = payload.get("phase")
+        if phase == "end":
+            # Ends carry the flag on the wire (typed in both SDKs);
+            # start/progress never do — the live ones are by definition
+            # not superseded and the stale ones are swallowed below.
+            payload["superseded"] = superseded
+        if phase == "start" and not superseded:
+            # The activity pill mirrors on_thinking_start's mechanics but
+            # names the actual work — the summarize calls can run for a
+            # while and "Thinking…" undersells what the session is doing.
+            # Save the prior pair for the end-side restore, and latch the
+            # window so the impl's own on_thinking_start can't clobber it.
+            with self._ws_lock:
+                if not self._compaction_activity_live:
+                    # A stale (abandoned) compaction may still hold the
+                    # latch — keep ITS saved pair as the restore target
+                    # rather than capturing the "Compacting context…" it
+                    # wrote.
+                    self._pre_compaction_activity = (
+                        self._ws_current_activity,
+                        self._ws_activity_state,
+                    )
+                self._ws_current_activity = "Compacting context…"
+                self._ws_activity_state = "thinking"
+                self._compaction_activity_live = True
+                self._compaction_activity_owner = cid
+            self._broadcast_activity()
+        elif phase == "end":
+            # Restore whatever the pill showed before the compaction — a
+            # mid-turn auto-compaction hands back to the send loop (whose
+            # next thinking/tool write overwrites anyway); a manual bail
+            # returns the idle session's blank pair instead of stranding
+            # "Compacting context…" on an idle workstream.  Owner-gated:
+            # an abandoned compaction's late end must leave a successor's
+            # latch (and pill) alone.
+            changed = False
+            with self._ws_lock:
+                if self._compaction_activity_live and self._compaction_activity_owner == cid:
+                    # A superseded owner-end only unlatches: its saved pair
+                    # predates the successor turn and must not overwrite the
+                    # live pill (the latch itself isn't in the broadcast
+                    # snapshot, so unlatch-only is also broadcast-free).
+                    changed = self._release_compaction_latch_locked(restore=not superseded)
+            if changed:
+                self._broadcast_activity()
+        if superseded and phase != "end":
+            return None
+        return self._enqueue({"type": "compaction", **payload})
+
+    def _release_compaction_latch_locked(self, *, restore: bool) -> bool:
+        """Unlatch the compaction pill window; optionally restore the pair.
+
+        The shared release half of the latch invariant — called under
+        ``_ws_lock`` by the owner-gated ``end`` arm of :meth:`on_compaction`
+        (restore unless superseded) and by :meth:`on_generation_claimed`
+        (always restore).  Returns whether the broadcast snapshot — the
+        ``(activity, state)`` pair — actually changed.
+        """
+        self._compaction_activity_live = False
+        if restore:
+            (
+                self._ws_current_activity,
+                self._ws_activity_state,
+            ) = self._pre_compaction_activity
+            return True
+        return False
+
+    def on_generation_claimed(self, generation: int) -> None:
+        """Break a stale compaction activity latch at a new generation claim.
+
+        Called by ``ChatSession._claim_generation`` (getattr-guarded, like
+        ``on_aux_usage``).  The claim is the exact moment any live latch is
+        provably stale — the worker slot serializes turns, so a latch held
+        at claim time belongs to a force-abandoned compaction whose late
+        events may be a full summary call away.  Without this, the whole
+        successor turn's ``on_thinking_start`` writes are suppressed and
+        the pill re-broadcasts "Compacting context…" over a live turn.
+
+        Unlatch AND restore the saved pre-compaction pair: restoring keeps
+        ``_pre_compaction_activity`` coherent for a successor compaction's
+        own start (which saves the CURRENT pair as its restore target — a
+        leftover "Compacting context…" here would get re-stranded on an
+        idle workstream after that successor completes).  A send claimer's
+        first thinking/tool write overwrites the restored pair within
+        milliseconds either way.
+        """
+        changed = False
+        with self._ws_lock:
+            if self._compaction_activity_live and self._compaction_activity_owner != generation:
+                changed = self._release_compaction_latch_locked(restore=True)
+        if changed:
+            self._broadcast_activity()
 
     # ------------------------------------------------------------------
     # Broadcast hooks — kind-specific transport.

@@ -15,6 +15,7 @@ for the storage-seeded children rebuild.
 
 from __future__ import annotations
 
+import queue
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core import session_worker
@@ -372,6 +373,16 @@ class CoordinatorAdapter:
             # fresh workstream so the catch is defense-in-depth.  Nothing to
             # release: the staged bytes were peeked, not soft-locked, and a
             # rejected enqueue never drained them.
+            if ws.worker_kind == "command":
+                # A slash-command worker (e.g. a minutes-long /compact aimed
+                # at this workstream from the interactive UI) holds the
+                # raced slot: the interjection queue is turn-shaped and must
+                # stay unreachable during command windows — same rule as the
+                # /send route's park.  Fail the dispatch (returns False, the
+                # caller's retryable-backpressure surface) rather than queue
+                # a message that would be capped and could cross a /resume
+                # identity swap.
+                raise queue.Full()
             att_ids = [a.attachment_id for a in _attachments] if _attachments else None
             session.queue_message(
                 message,

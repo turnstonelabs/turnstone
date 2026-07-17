@@ -23,6 +23,10 @@
 import {
   stripAnsi,
   buildWatchResultCard,
+  buildCompactionCard,
+  applyCompactionEvent,
+  resetCompactionHolder,
+  sendAbortMs,
   buildSystemNudgeMarker,
   buildConvBatchShell,
   buildConvRow,
@@ -261,6 +265,10 @@ class Pane {
     this._scrollPinPending = false;
     this._scrollPinForce = false;
     this._thinkingEl = null;
+    // Compaction lifecycle holder for the shared reducer
+    // (conversation.applyCompactionEvent); `card` is the in-progress card
+    // between start and end, nulled wherever the transcript DOM is wiped.
+    this._compaction = { card: null, cid: null };
     this._retryHolderEl = null;
     this._toolRowIndex = new Map();
     this._streamElIndex = new Map();
@@ -458,6 +466,7 @@ class Pane {
     // Instance ref, not a container query: removeThinkingIndicator runs on
     // EVERY content/reasoning delta, and a class-selector miss walks the
     // whole transcript subtree — O(N) per streamed token at 5000 messages.
+    if (this._compaction.card) return; // the compaction card owns the affordance
     if (this._thinkingEl) return;
     const el = document.createElement("div");
     el.className = "thinking-indicator";
@@ -492,6 +501,15 @@ class Pane {
     // carries structured `meta` (watch_name / command / poll counters) → the
     // richer `.msg.watch-result` card instead of the plain operator bubble.
     this.removeEmptyState();
+    // The /history projection of a persisted compaction marker (an in-place
+    // source="compaction" system row) — render the same result card the live
+    // `compaction` end event paints, so a reload reproduces the transcript.
+    if (source === "compaction") {
+      const card = buildCompactionCard(meta, content || "");
+      this.messagesEl.appendChild(card);
+      this.scrollToBottom(true);
+      return card;
+    }
     if (source === "watch_triggered" && meta && typeof meta === "object") {
       const card = buildWatchResultCard(meta, content || "");
       this.messagesEl.appendChild(card);
@@ -529,6 +547,40 @@ class Pane {
     body.appendChild(labelEl);
     body.appendChild(textEl);
     el.appendChild(body);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom(true);
+    return el;
+  }
+
+  handleCompactionEvent(evt) {
+    // Shared reducer (conversation.applyCompactionEvent) — one lifecycle
+    // state machine for this pane and the coordinator viewer.  The dedup
+    // set is the same one the system_turn path uses: the persisted marker
+    // row is stamped with the ok-end event's id, so whichever of /history
+    // repaint or live/replayed event renders first wins.  reason="error"
+    // ends render through the paired `error` event (red row), not here.
+    this.removeEmptyState();
+    if (!this._renderedSystemEventIds) {
+      this._renderedSystemEventIds = new Set();
+    }
+    applyCompactionEvent(this._compaction, evt, {
+      container: this.messagesEl,
+      renderedIds: this._renderedSystemEventIds,
+      onNotice: (msg) => this.addInfoMessage(msg),
+      scroll: (force) => this.scrollToBottom(force),
+    });
+  }
+
+  addCommandEcho(text) {
+    // A slash command is control-plane input, not a conversational turn —
+    // echo it as a distinct command chip (styled like a prompt line), not a
+    // user bubble.  It is deliberately NOT persisted: commands don't join
+    // the trajectory, so a bubble that vanished on reload was a lie.
+    this.removeEmptyState();
+    const el = document.createElement("div");
+    el.className = "msg command-echo";
+    el.setAttribute("aria-label", "command");
+    el.textContent = text;
     this.messagesEl.appendChild(el);
     this.scrollToBottom(true);
     return el;
@@ -1643,6 +1695,13 @@ class Pane {
           clearTimeout(this._forceTimeout);
           this._forceTimeout = null;
         }
+        // A live in-progress compaction card at stream_end means a FORCE
+        // stop abandoned the compaction worker (the lifecycle wrapper
+        // otherwise always retires the card with an end event before any
+        // stream_end can follow) — remove it now instead of leaving a
+        // frozen bar until the abandoned worker notices at its next
+        // checkpoint.
+        resetCompactionHolder(this._compaction);
         // Reset the segment state BEFORE the finalize render, and guard the
         // render with a plain-text fallback (mirrors coordinator.js).  With
         // the old order a finalize throw skipped these clears, so every
@@ -1878,6 +1937,13 @@ class Pane {
         }
         break;
       }
+
+      case "compaction":
+        // Context-compaction lifecycle: start paints the in-progress card,
+        // progress drives its bar, end swaps it for the result card (or a
+        // failure notice).  See handleCompactionEvent.
+        this.handleCompactionEvent(evt);
+        break;
 
       case "message_queued":
         // Confirmation from server that a queued message was accepted.
@@ -2657,6 +2723,9 @@ class Pane {
     this.currentAssistantBodyEl = null;
     this.currentReasoningEl = null;
     this.contentBuffer = "";
+    // In-progress compaction card: the transcript wipe orphaned it; live
+    // events re-create it defensively (see handleCompactionEvent).
+    resetCompactionHolder(this._compaction);
     // Approval cycles + announce shells point into the wiped subtree too;
     // the replayed history / detail snapshot re-registers live ones.
     this.approvalCycles = new Map();
@@ -3606,7 +3675,11 @@ class Pane {
     if (!text) return;
 
     if (text.startsWith("/")) {
-      if (this.busy) return; // commands not allowed while busy
+      if (this.busy) {
+        // Was a silent return — say why nothing happened.
+        this.addInfoMessage("Session is busy — commands can't run mid-turn.");
+        return;
+      }
       // /rewind and /retry were lifted to path-keyed endpoints (#549);
       // reroute hand-typed ones so they don't 400 against /command.
       const parts = text.split(/\s+/);
@@ -3633,8 +3706,27 @@ class Pane {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: text, ws_id: this.wsId }),
-      });
-      this.addUserMessage(text);
+      })
+        .then((r) =>
+          r.json().then(
+            (b) => b || {},
+            () => ({}),
+          ),
+        )
+        .then((body) => {
+          // /compact dispatched onto an already-busy worker reports
+          // {status: "busy"} — surface it (the optimistic busy guard
+          // above can lose that race).
+          if (body.status === "busy") {
+            this.addInfoMessage(
+              body.error || "Session is busy — try again shortly.",
+            );
+          }
+        })
+        .catch(() => {});
+      // Echo as a command chip, not addUserMessage — a slash command is
+      // control-plane input, not a conversational user turn.
+      this.addCommandEcho(text);
       this.composer.clear();
       return;
     }
@@ -3677,7 +3769,17 @@ class Pane {
     let sendTimer = null;
     if (sendCtrl) {
       sendInit.signal = sendCtrl.signal;
-      sendTimer = setTimeout(() => sendCtrl.abort(), 15000);
+      // Long bound while a compaction card is live (the send is parked
+      // server-side for the command window); wedged-node default
+      // otherwise — see sendAbortMs.
+      sendTimer = setTimeout(
+        () => sendCtrl.abort(),
+        sendAbortMs(this._compaction),
+      );
+      // An × on the queued bubble BEFORE the response arrives (pre-bind)
+      // must also kill the parked POST — otherwise the dismissed message
+      // dispatches anyway when the command window closes, minutes later.
+      if (queuedEl) queuedEl._sendAbort = () => sendCtrl.abort();
     }
     let sendReq = authFetch(
       this._base +

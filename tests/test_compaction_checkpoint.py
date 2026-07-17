@@ -186,6 +186,41 @@ class TestDisplayPath:
         assert "SUMMARY" not in contents
         assert contents == ["q", "a"]  # true transcript, no injected summary
 
+    def test_include_compaction_projects_marker_as_system_row(self, storage_backend):
+        """The /history display path (include_compaction=True) surfaces the
+        marker IN PLACE as a first-class system row — source="compaction",
+        meta = the marker's stored fields — so the UI re-renders its
+        compaction card after a reload.  Export/search (default False)
+        stay on the drop path pinned above."""
+        st = storage_backend
+        ws = _register(st)
+        st.save_message(ws, "user", "q")
+        st.save_message(ws, "assistant", "a")
+        wm = st.get_compaction_watermark(ws, 0)
+        st.save_message(
+            ws,
+            "assistant",
+            "SUMMARY",
+            source="compaction",
+            meta=json.dumps(
+                {"watermark": wm, "before_tokens": 900, "after_tokens": 80, "trigger": "manual"}
+            ),
+        )
+        st.save_message(ws, "user", "later question")
+
+        msgs = st.load_messages(ws, include_compaction=True)
+        assert [m.get("content") for m in msgs] == ["q", "a", "SUMMARY", "later question"]
+        marker = msgs[2]
+        assert marker["role"] == "system"  # display row, not a fake assistant turn
+        assert marker.get("_source") == "compaction"
+        meta = marker.get("_source_meta")
+        assert meta == {
+            "watermark": wm,
+            "before_tokens": 900,
+            "after_tokens": 80,
+            "trigger": "manual",
+        }
+
 
 # ---------------------------------------------------------------------------
 # End-to-end: compaction writes the marker, resume is bounded

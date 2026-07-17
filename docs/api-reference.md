@@ -467,6 +467,43 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 {"type": "info", "message": "Session cleared."}
 ```
 
+**`compaction`** -- context-compaction lifecycle (manual `/compact` and
+auto-compaction). `phase: "start"` opens the operation (`trigger` is
+`"manual"` or `"auto"`; auto adds `where` — e.g. `"mid-turn"` — and, when
+the percentage threshold actually fired, `pct`; the context-overflow retry
+path compacts without a `pct` since no threshold was evaluated).
+`phase: "progress"` reports chunked summarization (`part`/`total`/`depth`,
+where depth 0 summarizes transcript batches and deeper levels merge partial
+summaries), a transient-error retry wait (`retry_in` seconds + `error`), or
+`warning: "summary_truncated"`. `phase: "end"` settles it: `ok: true`
+carries `before_tokens`/`after_tokens` and the produced `summary`;
+`ok: false` carries a `reason`
+(`"not_enough_messages"` / `"irreducible"` / `"empty_summary"` /
+`"cancelled"` / `"error"`) and a human-readable `message` — for
+`reason: "error"` the same message is also emitted as a paired typed
+`error` event (that is the renderable error surface; the end event is
+card-teardown). Every end (ok or failed) carries `trigger`, and every
+event carries `compaction_id` — an opaque integer correlating the
+start/progress/end of one compaction run (a client that force-stopped one
+compaction can use it to ignore stragglers from the abandoned run). End
+events also carry `superseded`: `true` marks a force-abandoned compaction
+retiring after a successor generation took over — skip failure notices for
+those (an OK end's result card still stands: the history swap happened).
+Superseded start/progress events are never emitted.
+Exactly one `start` and one `end` are emitted per attempt,
+so clients can key an in-progress affordance (progress bar) on the pair. A
+successful end is also persisted: the summary replays from `/history` as a
+`role: "system"`, `source: "compaction"` entry whose `meta` carries
+`{watermark, before_tokens, after_tokens, trigger}` and whose `event_id`
+matches the end event's id (dedup across repaint + replay).
+
+```json
+{"type": "compaction", "phase": "start", "compaction_id": 7, "trigger": "auto", "where": "mid-turn", "pct": 80}
+{"type": "compaction", "phase": "progress", "compaction_id": 7, "part": 2, "total": 5, "depth": 0}
+{"type": "compaction", "phase": "end", "ok": true, "compaction_id": 7, "trigger": "auto",
+ "before_tokens": 128400, "after_tokens": 9200, "summary": "## Decisions\n..."}
+```
+
 **`error`** -- an error message.
 
 ```json
@@ -816,7 +853,41 @@ automatically approved without prompting.
 
 ### `POST /v1/api/command`
 
-Executes a slash command in the given workstream.
+Executes a slash command in the given workstream. Commands run on the
+workstream's worker slot (mutual exclusion against sends, a running
+compaction, and each other) — the endpoint is **not** unconditionally
+synchronous:
+
+- **Quick commands** (everything except `/compact`): the endpoint waits for
+  completion, so `{"status": "ok"}` means the command ran. A command still
+  running after 60 s answers `{"status": "running"}` — the worker keeps
+  going, its output reaches the pane via SSE, and the post-command pane
+  refreshes below still fire when it completes.
+- **`/compact`**: dispatched fire-and-forget — `{"status": "ok"}` means the
+  compaction *started*. A large context can legitimately compact for many
+  minutes; progress streams as `compaction` SSE events (see the event
+  reference) and the persisted marker row lands on completion. Do not read
+  `/history` expecting the compacted transcript immediately after the
+  response.
+- **Busy refusal**: if a turn or another command holds the worker slot, the
+  command is refused with HTTP **409** `{"status": "busy", "error": ...}` and
+  did **not** run. Retry after the current turn finishes. (The old inline
+  endpoint executed commands unconditionally mid-turn; the 409 makes the
+  refusal loud for callers that only check the HTTP status.)
+
+While a command holds the slot, `POST .../send` requests **park** server-side
+and dispatch as ordinary full-fidelity sends when the command's window closes
+— they are never routed through the mid-turn interjection queue (no length
+cap, no cross-user rejection). A client that aborts a parked send before the
+window closes abandons it: the message is not dispatched. Clients must
+therefore bound parked sends generously: the bundled web composer uses a
+10-minute abort while a compaction progress card is visible (its usual bound
+is ~15 s, sized for wedged-node detection), and dismissing a queued bubble
+aborts the in-flight POST so a dismissed message can't dispatch later.
+Deployment note: a reverse proxy's read timeout bounds the effective park —
+behind a stock 60 s proxy, sends parked longer than that fail at the proxy
+(the park sees the disconnect and abandons; nothing is dispatched — resend
+after the command completes, or raise the proxy read timeout).
 
 **Request body:**
 
@@ -832,7 +903,9 @@ Executes a slash command in the given workstream.
 If the command is `/clear` or `/new`, the server pushes a `clear_ui` SSE event
 to instruct the client to reset its message display. If the command is
 `/resume`, the server pushes `clear_ui` followed by a `history` event
-containing the resumed session's messages.
+containing the resumed session's messages. These follow-ups are emitted by the
+command worker itself, so they fire even when the endpoint already answered
+`{"status": "running"}`.
 
 **Response:**
 
@@ -840,12 +913,15 @@ containing the resumed session's messages.
 {"status": "ok"}
 ```
 
+or `{"status": "running"}` as above.
+
 **Error responses:**
 
-| Status | Body                               | Condition            |
-|--------|------------------------------------|----------------------|
-| 400    | `{"error": "Empty command"}`       | Command is empty     |
-| 404    | `{"error": "Unknown workstream"}`  | `ws_id` not found    |
+| Status | Body                               | Condition                        |
+|--------|------------------------------------|----------------------------------|
+| 400    | `{"error": "Empty command"}`       | Command is empty                 |
+| 404    | `{"error": "Unknown workstream"}`  | `ws_id` not found                |
+| 409    | `{"status": "busy", "error": ...}` | A turn/command holds the worker  |
 
 ---
 

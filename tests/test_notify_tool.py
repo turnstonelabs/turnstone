@@ -222,7 +222,7 @@ class TestExecNotify:
 
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
-            patch("turnstone.core.session.time.sleep"),
+            patch.object(session, "_backoff_or_cancelled"),
         ):
             call_id, msg = session._exec_notify(item)
 
@@ -293,7 +293,7 @@ class TestExecNotify:
                 side_effect=ConnectionError("refused"),
             ),
             patch.dict("os.environ", {}, clear=False),
-            patch("turnstone.core.session.time.sleep"),
+            patch.object(session, "_backoff_or_cancelled"),
         ):
             # All fail — counter should stay at 0
             for _i in range(3):
@@ -330,7 +330,7 @@ class TestExecNotify:
                 side_effect=ConnectionError("refused"),
             ),
             patch.dict("os.environ", {}, clear=False),
-            patch("turnstone.core.session.time.sleep"),
+            patch.object(session, "_backoff_or_cancelled"),
         ):
             call_id, msg = session._exec_notify(item)
 
@@ -401,7 +401,7 @@ class TestExecNotify:
             patch("turnstone.core.session.get_storage", return_value=storage),
             patch("turnstone.core.session.httpx.post") as mock_post,
             patch.dict("os.environ", {}, clear=False),
-            patch("turnstone.core.session.time.sleep"),
+            patch.object(session, "_backoff_or_cancelled"),
         ):
             call_id, msg = session._exec_notify(item)
 
@@ -456,13 +456,14 @@ class TestExecNotify:
             patch("turnstone.core.session.get_storage", return_value=mock_storage),
             patch("turnstone.core.session.httpx.post", return_value=mock_resp),
             patch.dict("os.environ", {}, clear=False),
-            patch("turnstone.core.session.time.sleep") as mock_sleep,
+            patch.object(session, "_backoff_or_cancelled") as mock_backoff,
         ):
             call_id, msg = session._exec_notify(item)
 
         assert "sent successfully" in msg.lower()
-        # Should have slept twice (retry delays)
-        assert mock_sleep.call_count == 2
+        # Should have backed off twice (retry delays) — via the shared
+        # cancel-aware helper, not a Stop-blind time.sleep.
+        assert mock_backoff.call_count == 2
 
     def test_retry_on_all_gateways_failed(self, tmp_path):
         """Retries when all gateways fail on first attempt but succeed on retry."""
@@ -502,12 +503,12 @@ class TestExecNotify:
             patch("turnstone.core.session.get_storage", return_value=storage),
             patch("turnstone.core.session.httpx.post", side_effect=_post),
             patch.dict("os.environ", {}, clear=False),
-            patch("turnstone.core.session.time.sleep") as mock_sleep,
+            patch.object(session, "_backoff_or_cancelled") as mock_backoff,
         ):
             call_id, msg = session._exec_notify(item)
 
         assert "sent successfully" in msg.lower()
-        assert mock_sleep.call_count == 1
+        assert mock_backoff.call_count == 1
 
     def test_no_services_logs_warning(self, tmp_path):
         """Server-side warning is logged when no services are available."""
@@ -530,7 +531,7 @@ class TestExecNotify:
 
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
-            patch("turnstone.core.session.time.sleep"),
+            patch.object(session, "_backoff_or_cancelled"),
             patch("turnstone.core.session.log") as mock_log,
         ):
             session._exec_notify(item)
@@ -569,7 +570,7 @@ class TestExecNotify:
                 side_effect=ConnectionError("refused"),
             ),
             patch.dict("os.environ", {}, clear=False),
-            patch("turnstone.core.session.time.sleep"),
+            patch.object(session, "_backoff_or_cancelled"),
             patch("turnstone.core.session.log") as mock_log,
         ):
             session._exec_notify(item)
@@ -610,7 +611,7 @@ class TestExecNotify:
             patch("turnstone.core.session.get_storage", return_value=storage),
             patch("turnstone.core.session.httpx.post", return_value=mock_resp),
             patch.dict("os.environ", {}, clear=False),
-            patch("turnstone.core.session.time.sleep"),
+            patch.object(session, "_backoff_or_cancelled"),
         ):
             call_id, msg = session._exec_notify(item)
 

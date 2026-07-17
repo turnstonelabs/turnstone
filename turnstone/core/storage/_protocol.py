@@ -227,7 +227,12 @@ class StorageBackend(Protocol):
         ...
 
     def load_messages(
-        self, ws_id: str, *, limit: int | None = None, repair: bool = True
+        self,
+        ws_id: str,
+        *,
+        limit: int | None = None,
+        repair: bool = True,
+        include_compaction: bool = False,
     ) -> list[dict[str, Any]]:
         """Load messages for a workstream and reconstruct OpenAI message format.
 
@@ -251,6 +256,13 @@ class StorageBackend(Protocol):
         Attachments are resolved to inline content parts (the materialized
         bytes a display/export consumer needs); :meth:`load_message_turns` is
         the unresolved, by-reference counterpart for resume.
+
+        ``include_compaction`` (default False) surfaces persisted compaction
+        checkpoint markers as in-place ``role="system"`` display rows
+        (``_source="compaction"``, ``meta`` = watermark/token counts) instead
+        of dropping them — the ``/history`` display path passes True so the
+        UI can re-render its compaction card after a reload; export/search
+        keep the unannotated transcript.
         """
         ...
 

@@ -297,6 +297,47 @@ class OutputWarningEvent(ServerEvent):
     judge_model: str = ""
 
 
+@dataclass
+class CompactionEvent(ServerEvent):
+    """Context-compaction lifecycle (``phase`` = start / progress / end).
+
+    ``start`` carries ``trigger`` (``"manual"`` / ``"auto"``; auto adds
+    ``where`` + ``pct``); ``progress`` carries chunked-summarization
+    ``part``/``total``/``depth`` (or ``retry_in``/``error`` for a retry
+    wait); ``end`` carries ``ok`` plus either the result
+    (``before_tokens``/``after_tokens``/``summary``) or the failure
+    ``reason``/``message`` — failure ends carry ``trigger`` too.  The
+    successful end's summary is also persisted as a compaction marker
+    row and replays from ``/history`` as a ``role="system"``,
+    ``source="compaction"`` entry.  ``compaction_id`` correlates every
+    event of one compaction run (0 from internal/legacy emitters).  End
+    events additionally carry ``superseded``: True marks a force-abandoned
+    compaction retiring after a successor generation took over — clients
+    should skip failure notices for those (an OK end's result still
+    stands; the history swap happened).
+    """
+
+    type: str = "compaction"
+    phase: str = ""
+    compaction_id: int = 0
+    superseded: bool = False
+    trigger: str = ""
+    where: str = ""
+    pct: int | None = None
+    part: int | None = None
+    total: int | None = None
+    depth: int | None = None
+    retry_in: float | None = None
+    error: str = ""
+    warning: str = ""
+    ok: bool | None = None
+    reason: str = ""
+    message: str = ""
+    before_tokens: int | None = None
+    after_tokens: int | None = None
+    summary: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Server global events  (/v1/api/events/global)
 # ---------------------------------------------------------------------------
@@ -473,6 +514,7 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
         CancelledEvent,
         IntentVerdictEvent,
         OutputWarningEvent,
+        CompactionEvent,
         WsStateEvent,
         WsActivityEvent,
         WsRenameEvent,

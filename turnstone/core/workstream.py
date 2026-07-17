@@ -139,6 +139,18 @@ class Workstream:
     # racing ``Thread.is_alive()``. Used by both interactive and
     # coordinator paths since Stage 2 P1.
     _worker_running: bool = field(default=False, repr=False)
+    # What KIND of work the current worker slot holds: "turn" (a send /
+    # retry / wake — the default) or "command" (a slash-command worker,
+    # including the minutes-long manual /compact).  Written under
+    # ``_lock`` by ``session_worker.send`` in the same acquisition that
+    # sets ``worker_thread``/``_worker_running``, so readers gating on
+    # the running flag see a coherent triple.  A stale value after the
+    # worker exits is harmless — every reader conjoins
+    # ``_worker_running``.  The /send route parks (never queues) while
+    # this reads "command": the mid-turn interjection queue is
+    # turn-shaped (length cap, cross-user guard) and must be
+    # unreachable during command windows.
+    worker_kind: str = field(default="", repr=False)
     # True once ``SessionManager.commit_create`` (or the non-deferred
     # path through ``SessionManager.create``) has fired the lifecycle
     # ``emit_created`` event for this workstream. Used by

@@ -132,6 +132,9 @@ class NullUI:
     def on_system_turn(self, content: str, source: str, meta: dict[str, Any] | None = None) -> None:
         pass
 
+    def on_compaction(self, payload: dict[str, Any]) -> int | None:
+        return None
+
     def on_state_change(self, state: str) -> None:
         pass
 

@@ -28,6 +28,10 @@
 // ---------------------------------------------------------------------------
 import {
   buildWatchResultCard,
+  buildCompactionCard,
+  applyCompactionEvent,
+  resetCompactionHolder,
+  sendAbortMs,
   buildSystemNudgeMarker,
   maxSeverityItem,
   buildConvBatchShell,
@@ -511,6 +515,12 @@ function createCoordinatorPane(root, wsId, opts) {
   // ui/static/app.js's per-pane _renderedSystemEventIds.
   const renderedSystemEventIds = new Set();
 
+  // Compaction lifecycle holder for the shared reducer
+  // (conversation.applyCompactionEvent); `card` is the in-progress card
+  // between start and end, nulled wherever the transcript is wiped — live
+  // events re-create it defensively.
+  const compactionHolder = { card: null, cid: null };
+
   // Cache of judge verdicts keyed by call_id.  intent_verdict and
   // approve_request are async and may arrive in either order; the
   // cache lets each handler apply data to the other without assuming
@@ -600,7 +610,11 @@ function createCoordinatorPane(root, wsId, opts) {
       rows = [parsed];
     }
     if (rows.length === 0) {
-      return "<pre>" + esc(redactCredentials(JSON.stringify(parsed, null, 2))) + "</pre>";
+      return (
+        "<pre>" +
+        esc(redactCredentials(JSON.stringify(parsed, null, 2))) +
+        "</pre>"
+      );
     }
     const lines = rows.map((row) => {
       const safeWs = row.ws_id && WS_ID_RE.test(row.ws_id) ? row.ws_id : null;
@@ -817,6 +831,14 @@ function createCoordinatorPane(root, wsId, opts) {
   // labeled operator bubble.
   function renderSystemTurn(source, content, meta) {
     const m = meta && typeof meta === "object" ? meta : null;
+    // /history projection of a persisted compaction marker — same result
+    // card the live `compaction` end event paints (shared builder).
+    if (source === "compaction") {
+      const card = buildCompactionCard(m, content || "");
+      messagesEl.appendChild(card);
+      _scheduleScroll();
+      return card;
+    }
     if (source === "watch_triggered" && m)
       return appendWatchResult(m, content || "");
     if (source === "output_guard" && m) return appendGuardFinding(m);
@@ -1975,7 +1997,10 @@ function createCoordinatorPane(root, wsId, opts) {
     let sendTimer = null;
     if (sendCtrl) {
       sendInit.signal = sendCtrl.signal;
-      sendTimer = setTimeout(() => sendCtrl.abort(), 15000);
+      // Same policy as the interactive composer: long bound while this
+      // pane's compaction card is live (the send parks server-side for
+      // the command window), wedged-node default otherwise.
+      sendTimer = setTimeout(() => sendCtrl.abort(), sendAbortMs(compactionHolder));
     }
     let sendReq = authFetch(
       "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send",
@@ -2745,6 +2770,11 @@ function createCoordinatorPane(root, wsId, opts) {
         }
         break;
       case "stream_end":
+        // A live in-progress compaction card here means a FORCE stop
+        // abandoned the compaction worker (the lifecycle wrapper otherwise
+        // always retires the card with an end event before any stream_end
+        // can follow) — remove it instead of leaving a frozen bar.
+        resetCompactionHolder(compactionHolder);
         finishAssistantStream();
         break;
       case "stream_overflow":
@@ -2922,6 +2952,19 @@ function createCoordinatorPane(root, wsId, opts) {
         if (sysEid) renderedSystemEventIds.add(sysEid);
         break;
       }
+      case "compaction":
+        // Context-compaction lifecycle — the shared reducer
+        // (conversation.applyCompactionEvent) is the one state machine for
+        // this viewer and the interactive pane, so the two can't drift.
+        // reason="error" ends render via the paired `error` event (red row);
+        // the reducer emits only the non-error failure notices here.
+        applyCompactionEvent(compactionHolder, ev, {
+          container: messagesEl,
+          renderedIds: renderedSystemEventIds,
+          onNotice: (msg) => appendText("info", msg, { label: "info" }),
+          scroll: () => _scheduleScroll(),
+        });
+        break;
       case "connected":
         // First yield from _coord_events_replay — populates the
         // status bar's model cell before any history arrives.  Also
@@ -5009,6 +5052,7 @@ function createCoordinatorPane(root, wsId, opts) {
     toolRows.clear();
     activeBatch = null;
     renderedSystemEventIds.clear();
+    resetCompactionHolder(compactionHolder);
     if (!hist) return;
     // Fresh-connect fast-forward: when the trailing turn is an executing
     // in-flight tool batch the server can replay, /history returns a

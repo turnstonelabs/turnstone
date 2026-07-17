@@ -157,6 +157,43 @@ export interface CancelledEvent {
   type: "cancelled";
 }
 
+/**
+ * Context-compaction lifecycle. `start` carries `trigger` ("manual"/"auto";
+ * auto adds `where` + `pct`); `progress` carries chunked-summarization
+ * `part`/`total`/`depth` (or `retry_in`/`error` for a retry wait); `end`
+ * carries `ok` plus either `before_tokens`/`after_tokens`/`summary` or the
+ * failure `reason`/`message`. The successful end's summary also replays from
+ * `/history` as a `role: "system"`, `source: "compaction"` entry.
+ */
+export interface CompactionEvent {
+  type: "compaction";
+  phase: "start" | "progress" | "end";
+  /** Correlates every event of one compaction run (0 from legacy emitters). */
+  compaction_id?: number;
+  /**
+   * End events only: true marks a force-abandoned compaction retiring
+   * after a successor generation took over — skip failure notices for
+   * those (an OK end's result still stands; the history swap happened).
+   */
+  superseded?: boolean;
+  /** Present on start and on every end (ok or failed). */
+  trigger?: "manual" | "auto";
+  where?: string;
+  pct?: number;
+  part?: number;
+  total?: number;
+  depth?: number;
+  retry_in?: number;
+  error?: string;
+  warning?: string;
+  ok?: boolean;
+  reason?: string;
+  message?: string;
+  before_tokens?: number;
+  after_tokens?: number;
+  summary?: string;
+}
+
 // Global events
 
 export interface WsStateEvent {
@@ -212,6 +249,7 @@ export type ServerEvent =
   | BusyErrorEvent
   | ClearUiEvent
   | CancelledEvent
+  | CompactionEvent
   | WsStateEvent
   | WsActivityEvent
   | WsRenameEvent

@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from starlette.routing import BaseRoute
 
     from turnstone.core.attachments import UploadRejection
+    from turnstone.core.session import ChatSession
     from turnstone.core.session_manager import SessionManager
     from turnstone.core.session_ui_base import SessionUIBase
     from turnstone.core.workstream import Workstream, WorkstreamKind
@@ -1365,6 +1366,18 @@ def make_cancel_handler(
                 # ``session_worker.send`` documents this invariant:
                 # "readers gating on either flag see a coherent
                 # (worker_thread, _worker_running) pair."
+                #
+                # Documented bet — force-cancelling a wedged QUICK command
+                # (worker_kind == "command", e.g. /resume stuck in storage
+                # I/O): clearing the flag releases any parked /send, whose
+                # fresh worker can then run while the abandoned command
+                # thread finishes its in-place mutation — quick commands
+                # have no generation checkpoints to retire them (compact_now
+                # does).  Same blast radius as force-abandoning a send
+                # worker mid-tool; accepted because force-cancel is the
+                # operator escape hatch for an already-wedged session, not a
+                # routine path.  Revisit if commands ever gain generation
+                # discipline.
                 with ws._lock:
                     ws.worker_thread = None
                     ws._worker_running = False
@@ -3444,9 +3457,17 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         cursor: int | None = None
         if storage is not None:
             try:
-                # repair=False — display read; see reconstruct_messages docstring.
+                # repair=False — display read; include_compaction=True so a
+                # persisted compaction marker projects as an in-place
+                # source="compaction" system row and the UI re-renders its
+                # compaction card after a reload.  See the
+                # reconstruct_messages docstring for both flags.
                 messages = await asyncio.to_thread(
-                    storage.load_messages, ws_id, limit=limit, repair=False
+                    storage.load_messages,
+                    ws_id,
+                    limit=limit,
+                    repair=False,
+                    include_compaction=True,
                 )
             except Exception:
                 log.debug("ws.history.load_failed ws=%s", ws_id[:8], exc_info=True)
@@ -4072,32 +4093,96 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         if ws.session is None:
             return JSONResponse({"error": "No session"}, status_code=500)
 
-        session = ws.session
-        # Captured by ``_enqueue`` only when the dispatcher takes the
-        # live-worker reuse path. Empty after a fresh-spawn dispatch.
-        queue_outcome: dict[str, Any] = {}
+        def _dispatch_once(session: ChatSession) -> tuple[bool, dict[str, Any]]:
+            """One atomic queue-or-spawn attempt bound to ONE session capture.
 
-        def _enqueue() -> None:
-            try:
-                cleaned, priority, msg_id = session.queue_message(
-                    message,
-                    attachment_ids=list(ordered_taken),
-                    queue_msg_id=send_id or None,
-                    interjector_user_id=acting_uid,
-                )
-            except AttachmentsNotQueueableError:
-                queue_outcome["rejected"] = "attachments_busy"
-                return
-            except CrossUserInterjectionError:
-                # A different authenticated participant tried to interject into
-                # someone else's in-flight turn; folding it in would borrow the
-                # initiator's credentials and misattribute the message. Reject
-                # so they resend as a fresh turn once the worker idles.
-                queue_outcome["rejected"] = "cross_user_interjection"
-                return
-            queue_outcome["cleaned"] = cleaned
-            queue_outcome["priority"] = priority
-            queue_outcome["msg_id"] = msg_id
+            The park loop below re-captures ``ws.session`` before every
+            attempt — a /resume or /new that ran while we parked swaps the
+            session's workstream identity in place, and closures bound to
+            the pre-swap capture would send the user's message into the
+            wrong workstream's transcript.  Binding happens here, in one
+            place, per attempt.  ``queue_outcome`` is written only when the
+            dispatcher takes the live-worker reuse path; empty after a
+            fresh-spawn dispatch.
+            """
+            queue_outcome: dict[str, Any] = {}
+
+            def _enqueue() -> None:
+                # Runs under ``ws._lock`` (session_worker.send calls it
+                # inside the same acquisition that reads _worker_running),
+                # so this worker_kind read cannot race the spawn write.  A
+                # command window must NEVER reach queue_message — its cap
+                # and cross-user guard are turn semantics — so refuse and
+                # let the route loop back to the park.
+                if ws.worker_kind == "command":
+                    queue_outcome["rejected"] = "command_window"
+                    return
+                try:
+                    cleaned, priority, msg_id = session.queue_message(
+                        message,
+                        attachment_ids=list(ordered_taken),
+                        queue_msg_id=send_id or None,
+                        interjector_user_id=acting_uid,
+                    )
+                except AttachmentsNotQueueableError:
+                    queue_outcome["rejected"] = "attachments_busy"
+                    return
+                except CrossUserInterjectionError:
+                    # A different authenticated participant tried to interject into
+                    # someone else's in-flight turn; folding it in would borrow the
+                    # initiator's credentials and misattribute the message. Reject
+                    # so they resend as a fresh turn once the worker idles.
+                    queue_outcome["rejected"] = "cross_user_interjection"
+                    return
+                queue_outcome["cleaned"] = cleaned
+                queue_outcome["priority"] = priority
+                queue_outcome["msg_id"] = msg_id
+
+            def _run() -> None:
+                me = threading.current_thread()
+                try:
+                    kwargs: dict[str, Any] = {}
+                    if resolved_atts:
+                        kwargs["attachments"] = resolved_atts
+                    if send_id:
+                        kwargs["send_id"] = send_id
+                    # Fresh turn: rebind per-user MCP credentials to the
+                    # authenticated sender. Bound here (not via a send()
+                    # kwarg) so per-kind session stubs with explicit send
+                    # signatures keep working; getattr-guarded for the same
+                    # reason. The queue path above never rebinds.
+                    bind = getattr(session, "bind_acting_user", None)
+                    if acting_uid and callable(bind):
+                        bind(acting_uid)
+                    session.send(message, **kwargs)
+                except GenerationCancelled:
+                    # Safety net — send() normally handles this internally.
+                    # If this thread was force-abandoned, ws.worker_thread
+                    # was set to None — don't emit spurious events.
+                    if ws.worker_thread is me:
+                        _emit_ui("on_stream_end")
+                        _emit_ui("on_state_change", "idle")
+                except Exception:
+                    # Undrained staged uploads aren't locked (the buffer is a peek,
+                    # not a reservation) — they expire on the buffer TTL — so the
+                    # only cleanup owed here is the UI streaming hook.
+                    if ws.worker_thread is me:
+                        # ``session.send()`` already fired ``on_error``
+                        # (with sanitized text), persisted ``last_error``,
+                        # and emitted ``state='error'`` via
+                        # :meth:`ChatSession._record_fatal_error` before
+                        # re-raising.  The route handler only needs the
+                        # streaming-cleanup hook the worker contract owes
+                        # the UI listeners.
+                        _emit_ui("on_stream_end")
+
+            ok = session_worker.send(
+                ws,
+                enqueue=_enqueue,
+                run=_run,
+                thread_name=f"send-worker-{ws.id[:8]}",
+            )
+            return ok, queue_outcome
 
         def _emit_ui(hook_name: str, *args: Any) -> None:
             """Best-effort UI hook dispatch.
@@ -4105,7 +4190,9 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             Each call is wrapped in try/except so a failure in one
             hook (e.g. listener-queue full → on_error raises) doesn't
             suppress the others. Mirrors the pre-P1.5
-            coord_adapter.send per-hook defense.
+            coord_adapter.send per-hook defense.  Defined after
+            ``_dispatch_once`` but resolved late (when a worker runs) —
+            every dispatch happens strictly below this line.
             """
             if ui is None:
                 return
@@ -4122,50 +4209,48 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                     exc_info=True,
                 )
 
-        def _run() -> None:
-            me = threading.current_thread()
-            try:
-                kwargs: dict[str, Any] = {}
-                if resolved_atts:
-                    kwargs["attachments"] = resolved_atts
-                if send_id:
-                    kwargs["send_id"] = send_id
-                # Fresh turn: rebind per-user MCP credentials to the
-                # authenticated sender. Bound here (not via a send()
-                # kwarg) so per-kind session stubs with explicit send
-                # signatures keep working; getattr-guarded for the same
-                # reason. The queue path above never rebinds.
-                bind = getattr(session, "bind_acting_user", None)
-                if acting_uid and callable(bind):
-                    bind(acting_uid)
-                session.send(message, **kwargs)
-            except GenerationCancelled:
-                # Safety net — send() normally handles this internally.
-                # If this thread was force-abandoned, ws.worker_thread
-                # was set to None — don't emit spurious events.
-                if ws.worker_thread is me:
-                    _emit_ui("on_stream_end")
-                    _emit_ui("on_state_change", "idle")
-            except Exception:
-                # Undrained staged uploads aren't locked (the buffer is a peek,
-                # not a reservation) — they expire on the buffer TTL — so the
-                # only cleanup owed here is the UI streaming hook.
-                if ws.worker_thread is me:
-                    # ``session.send()`` already fired ``on_error``
-                    # (with sanitized text), persisted ``last_error``,
-                    # and emitted ``state='error'`` via
-                    # :meth:`ChatSession._record_fatal_error` before
-                    # re-raising.  The route handler only needs the
-                    # streaming-cleanup hook the worker contract owes
-                    # the UI listeners.
-                    _emit_ui("on_stream_end")
-
-        ok = session_worker.send(
-            ws,
-            enqueue=_enqueue,
-            run=_run,
-            thread_name=f"send-worker-{ws.id[:8]}",
-        )
+        # Park-then-dispatch.  While a slash-command worker holds the slot
+        # (a manual /compact can hold it for MINUTES), a send must not take
+        # the interjection-queue path — its 2000-char cap and cross-user
+        # guard are mid-TURN semantics, and a queued message would cross a
+        # /resume//new identity swap into the wrong workstream.  Parking
+        # reproduces the pre-worker-dispatch observable behavior (the
+        # request waited out the then-blocked event loop, then ran as a
+        # normal full-fidelity send under the sender's own identity) with
+        # the loop free: SSE keeps streaming the compaction progress card
+        # while we wait.  The inner park is deliberately unbounded — the
+        # composer bounds its POST at ~15s and aborts, and we poll
+        # ``is_disconnected`` because starlette does NOT cancel a running
+        # handler on client disconnect: dispatching after the client gave
+        # up would surprise the user with a duplicate turn when they
+        # resend.  The outer bound only caps command-window FLAPPING
+        # (back-to-back commands re-claiming the slot between our park
+        # exit and dispatch).
+        ok = False
+        queue_outcome: dict[str, Any] = {}
+        for _ in range(20):
+            while ws._worker_running and ws.worker_kind == "command":
+                if await request.is_disconnected():
+                    # Client abandoned the send mid-park; the response is
+                    # discarded — the status is for the access log only.
+                    return JSONResponse({"status": "abandoned"})
+                await asyncio.sleep(0.25)
+            session_now = ws.session
+            if session_now is None:
+                return JSONResponse({"error": "No session"}, status_code=500)
+            ok, queue_outcome = _dispatch_once(session_now)
+            if queue_outcome.get("rejected") != "command_window":
+                break
+        else:
+            # 20 consecutive command-window collisions — surface the same
+            # retryable backpressure shape as a saturated queue.
+            return JSONResponse(
+                {
+                    "status": "queue_full",
+                    "attached_ids": [],
+                    "dropped_attachment_ids": list(requested_ids),
+                }
+            )
         if not ok:
             if ws._closed:
                 # ``send`` refused because the workstream closed between our

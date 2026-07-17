@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -102,6 +103,9 @@ class _FakeUI:
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
         self._enqueued: list[dict[str, Any]] = []
+        self.states: list[str] = []
+        self.infos: list[str] = []
+        self.errors: list[str] = []
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
         self._pending_approval: dict[str, Any] | None = None
@@ -196,11 +200,14 @@ class _FakeUI:
     def on_stream_end(self) -> None:
         pass
 
-    def on_state_change(self, _state: str) -> None:
-        pass
+    def on_state_change(self, state: str) -> None:
+        self.states.append(state)
 
-    def on_error(self, _msg: str) -> None:
-        pass
+    def on_info(self, msg: str) -> None:
+        self.infos.append(msg)
+
+    def on_error(self, msg: str) -> None:
+        self.errors.append(msg)
 
     def resolve_approval(self, *_a: Any, **_kw: Any) -> None:
         self._approval_event.set()
@@ -217,10 +224,41 @@ class _FakeSession:
         self.messages: list[dict[str, Any]] = []
         self._last_usage: dict[str, int] | None = None
         self._pending_retry: str | None = None
+        # Real sessions always carry one; the /send route's cancel-drain
+        # poll reads it whenever a worker is live at send time.
+        self._cancel_event = threading.Event()
         self.sends: list[tuple[str, Any, Any]] = []
+        self.commands: list[str] = []
+        self.compacts = 0
+        self.compact_raises: BaseException | None = None
+        self.send_raises: BaseException | None = None
+        self.exit_commands: set[str] = set()
+        self.queued_flushes = 0
+        self.queued_text = ""
+        # Gates let a test hold the worker slot open mid-command so a
+        # concurrent /send provably lands in the PARK path.
+        self.compact_gate: threading.Event | None = None
+        self.command_gate: threading.Event | None = None
+        self.command_raises: BaseException | None = None
+        # Every queue_message call — the park invariant is that command
+        # windows NEVER reach the interjection queue.
+        self.queue_calls: list[str] = []
 
     def send(self, text: str, *, attachments: Any = None, send_id: Any = None) -> None:
         self.sends.append((text, attachments, send_id))
+        if self.send_raises is not None:
+            raise self.send_raises
+
+    def queue_message(
+        self,
+        text: str,
+        attachment_ids: Any = None,
+        queue_msg_id: str | None = None,
+        interjector_user_id: str = "",
+    ) -> tuple[str, str, str]:
+        self.queue_calls.append(text)
+        cleaned = text[:2000] + "..." if len(text) > 2000 else text
+        return cleaned, "notice", queue_msg_id or "m1"
 
     def set_watch_runner(self, *_a: Any, **_kw: Any) -> None:
         pass
@@ -234,8 +272,26 @@ class _FakeSession:
     def close(self) -> None:
         pass
 
-    def handle_command(self, _cmd: str) -> bool:
-        return False
+    def handle_command(self, cmd: str) -> bool:
+        self.commands.append(cmd)
+        if self.command_gate is not None:
+            self.command_gate.wait(timeout=10)
+        if self.command_raises is not None:
+            raise self.command_raises
+        return cmd in self.exit_commands
+
+    def compact_now(self) -> bool:
+        self.compacts += 1
+        if self.compact_gate is not None:
+            self.compact_gate.wait(timeout=10)
+        if self.compact_raises is not None:
+            raise self.compact_raises
+        return True
+
+    def flush_queued_messages(self) -> bool:
+        self.queued_flushes += 1
+        had, self.queued_text = bool(self.queued_text), ""
+        return had
 
     def request_title_refresh(self, _title: str) -> None:
         pass
@@ -1177,3 +1233,403 @@ class TestInteractiveEventsLifted:
             headers=_auth("user-1"),
         )
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/api/command — /compact worker dispatch (progress-events fix)
+# ---------------------------------------------------------------------------
+
+
+class TestCompactCommandDispatch:
+    """Manual /compact runs on the workstream's worker slot: the event loop
+    stays free to stream the compaction progress events, and a concurrent
+    send takes the queue path instead of racing the history swap."""
+
+    def _create_ws(self, client) -> str:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "compact-me"},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        return resp.json()["ws_id"]
+
+    def test_compact_dispatches_to_worker(self, app_client):
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        # The compaction runs on the spawned worker — join it (the runner
+        # clears _worker_running before the thread exits, so the join
+        # subsumes the flag).
+        ws.worker_thread.join(timeout=5)
+        assert not ws.worker_thread.is_alive()
+        assert ws.session.compacts == 1
+        assert ws._worker_running is False
+        # The slot was classified as a command window (what the /send
+        # route's park keys on; stale after exit is harmless — every
+        # reader conjoins _worker_running).
+        assert ws.worker_kind == "command"
+        # Exit seam: stranded-text backstop flush only — no drain, no
+        # answering send (sends during the window park in the /send route
+        # and dispatch as their own workers afterwards).
+        assert ws.session.queued_flushes == 1
+        assert ws.session.sends == []
+        # The worker wrapped the run in busy/idle state transitions.
+        assert ws.ui.states == ["thinking", "idle"]
+
+    def test_send_during_compact_window_parks_then_dispatches_fully(self, app_client):
+        """A /send during a manual /compact PARKS and then runs as an
+        ordinary full-fidelity send — it must never enter the interjection
+        queue, whose 2000-char cap silently truncated pasted logs/code and
+        whose cross-user guard locked second participants out for the
+        whole compaction."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.json() == {"status": "ok"}
+        big = "x" * 5000  # over the interjection cap — must survive intact
+        send_result: dict = {}
+
+        def _send() -> None:
+            r = client.post(
+                f"/v1/api/workstreams/{ws_id}/send",
+                json={"message": big},
+                headers=_auth("user-1"),
+            )
+            send_result["status"] = r.status_code
+            send_result["body"] = r.json()
+
+        sender = threading.Thread(target=_send, daemon=True)
+        sender.start()
+        # The send is parked: give it time to have taken the park path,
+        # then prove nothing was dispatched or queued yet.
+        for _ in range(50):
+            if ws.session.queue_calls or ws.session.sends:
+                break
+            time.sleep(0.02)
+        assert ws.session.sends == []
+        assert ws.session.queue_calls == []  # the queue is unreachable
+        gate.set()  # compaction finishes; the park releases
+        sender.join(timeout=10)
+        assert not sender.is_alive()
+        assert send_result["status"] == 200
+        assert send_result["body"]["status"] == "ok"
+        # Full fidelity: the exact 5000-char text, via a normal send.
+        assert [s[0] for s in ws.session.sends] == [big]
+        assert ws.session.queue_calls == []
+
+    def test_cancelled_compact_flushes_queue_without_answering(self, app_client):
+        """A user-stopped compaction must not auto-run a turn they may no
+        longer want — queued text lands in the transcript via the flush
+        drain instead (the cancel-seam precedent)."""
+        from turnstone.core.session import GenerationCancelled
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        ws.session.compact_raises = GenerationCancelled()
+        ws.session.queued_text = "queued mid-compact"
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        ws.worker_thread.join(timeout=5)
+        assert ws.session.compacts == 1
+        assert ws.session.queued_flushes == 1
+        assert ws.session.sends == []
+        assert ws.ui.states == ["thinking", "idle"]
+
+    def test_compact_refused_while_worker_running(self, app_client):
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        with ws._lock:
+            ws._worker_running = True  # a turn is in flight
+        try:
+            resp = client.post(
+                "/v1/api/command",
+                json={"command": "/compact", "ws_id": ws_id},
+                headers=_auth("user-1"),
+            )
+        finally:
+            with ws._lock:
+                ws._worker_running = False
+        assert resp.status_code == 409  # loud refusal for status-code-only callers
+        body = resp.json()
+        assert body["status"] == "busy"
+        assert "busy" in body["error"].lower()
+        # Never ran inline, never queued a phantom compaction.
+        assert ws.session.compacts == 0
+        assert ws.session.commands == []
+
+    def test_non_compact_commands_complete_before_response(self, app_client):
+        """Quick commands dispatch through the same worker slot (mutual
+        exclusion vs sends / a running compaction / each other) but the
+        endpoint awaits completion, preserving the synchronous contract:
+        handle_command has finished by the time the response returns."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/skill", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+        ws = mgr.get(ws_id)
+        # handle_command completed before the response (the done-Event
+        # gates it); join before asserting the slot state (the runner
+        # clears _worker_running before the thread exits, so the join
+        # subsumes the flag; without it this assert races the worker's
+        # last steps).
+        assert ws.session.commands == ["/skill"]
+        ws.worker_thread.join(timeout=5)
+        assert not ws.worker_thread.is_alive()
+        assert ws._worker_running is False
+        # No exit seam work at all for quick commands: no drain, no flush,
+        # no follow-up send, and no state chatter (they never left idle).
+        assert ws.session.queued_flushes == 0
+        assert ws.session.sends == []
+        assert ws.ui.states == []
+
+    def test_parked_send_delivers_attachments_after_release(self, app_client, monkeypatch):
+        """Attachments are peek-resolved BEFORE the park (the bytes ride the
+        request closure), so a send parked through a long compaction still
+        delivers them on dispatch — the pre-park refusal
+        (attachments_busy) must never apply to a command window."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+
+        def fake_resolve(requested_ids, _ws_id, _user_id):
+            assert list(requested_ids) == ["a1"]
+            return (["fake-attachment-bytes"], ["a1"], [])
+
+        monkeypatch.setattr("turnstone.core.attachments.resolve_staged_attachments", fake_resolve)
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        send_result: dict = {}
+
+        def _send() -> None:
+            r = client.post(
+                f"/v1/api/workstreams/{ws_id}/send",
+                json={"message": "with attachment", "attachment_ids": ["a1"]},
+                headers=_auth("user-1"),
+            )
+            send_result["body"] = r.json()
+
+        sender = threading.Thread(target=_send, daemon=True)
+        sender.start()
+        time.sleep(0.3)
+        assert ws.session.sends == []  # still parked
+        gate.set()
+        sender.join(timeout=10)
+        assert not sender.is_alive()
+        assert send_result["body"]["status"] == "ok"
+        assert send_result["body"]["attached_ids"] == ["a1"]
+        text, attachments, _sid = ws.session.sends[0]
+        assert text == "with attachment"
+        assert attachments == ["fake-attachment-bytes"]
+        assert ws.session.queue_calls == []
+
+    def test_send_during_quick_command_window_parks(self, app_client):
+        """The park applies to EVERY command window, not just /compact — a
+        send racing a quick command dispatches after the window with full
+        fidelity instead of entering the interjection queue."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.command_gate = gate
+        cmd_result: dict = {}
+
+        def _cmd() -> None:
+            r = client.post(
+                "/v1/api/command",
+                json={"command": "/skill", "ws_id": ws_id},
+                headers=_auth("user-1"),
+            )
+            cmd_result["body"] = r.json()
+
+        runner = threading.Thread(target=_cmd, daemon=True)
+        runner.start()
+        # Wait until the command worker actually holds the slot.
+        for _ in range(100):
+            if ws._worker_running:
+                break
+            time.sleep(0.02)
+        assert ws._worker_running
+        assert ws.worker_kind == "command"
+        send_result: dict = {}
+
+        def _send() -> None:
+            r = client.post(
+                f"/v1/api/workstreams/{ws_id}/send",
+                json={"message": "mid-command send"},
+                headers=_auth("user-1"),
+            )
+            send_result["body"] = r.json()
+
+        sender = threading.Thread(target=_send, daemon=True)
+        sender.start()
+        time.sleep(0.3)  # long enough for a queue-path regression to show
+        assert ws.session.queue_calls == []
+        assert ws.session.sends == []
+        gate.set()
+        runner.join(timeout=10)
+        sender.join(timeout=10)
+        assert not sender.is_alive()
+        assert cmd_result["body"] == {"status": "ok"}
+        assert send_result["body"]["status"] == "ok"
+        assert [s[0] for s in ws.session.sends] == ["mid-command send"]
+        assert ws.session.queue_calls == []
+
+    def test_clear_ui_rides_the_worker_not_the_endpoint(self, app_client):
+        """The clear_ui follow-up runs on the worker after handle_command —
+        parked after the endpoint's 60s done-wait it was silently skipped
+        for any command that outlived the backstop, leaving every pane
+        rendering a transcript the server no longer holds."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/clear", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        ws = mgr.get(ws_id)
+        ws.worker_thread.join(timeout=5)
+        assert {"type": "clear_ui"} in ws.ui._enqueued
+
+    def _run_abandoned_command(self, client, mgr, ws_id, command="/clear", raises=None):
+        """Dispatch a gated command, force-abandon its worker mid-run, then
+        release the gate so the abandoned thread finishes late.  Returns
+        (endpoint response body, the abandoned worker thread)."""
+        ws = mgr.get(ws_id)
+        gate = threading.Event()
+        ws.session.command_gate = gate
+        ws.session.command_raises = raises
+        result: dict = {}
+
+        def _cmd() -> None:
+            r = client.post(
+                "/v1/api/command",
+                json={"command": command, "ws_id": ws_id},
+                headers=_auth("user-1"),
+            )
+            result["body"] = r.json()
+
+        runner = threading.Thread(target=_cmd, daemon=True)
+        runner.start()
+        for _ in range(100):
+            if ws._worker_running:
+                break
+            time.sleep(0.02)
+        assert ws._worker_running
+        worker = ws.worker_thread
+        # The cancel handler's force path shape: abandon the worker.
+        with ws._lock:
+            ws.worker_thread = None
+            ws._worker_running = False
+        gate.set()  # the wedged command unwedges LATE
+        worker.join(timeout=5)
+        runner.join(timeout=10)
+        assert not worker.is_alive() and not runner.is_alive()
+        return result["body"], worker
+
+    def test_abandoned_command_worker_fires_no_followups(self, app_client):
+        """A force-cancelled wedged command that unwedges minutes later
+        must not fire clear_ui (every pane would wipe its transcript
+        mid-successor-turn) — the owner guard every sibling worker closure
+        applies.  done still fires, so the endpoint never hangs."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        body, _ = self._run_abandoned_command(client, mgr, ws_id, command="/clear")
+        assert not any(e.get("type") == "clear_ui" for e in ws.ui._enqueued)
+        # handle_command genuinely completed, so the (unhung) endpoint's
+        # answer reflects that.
+        assert body["status"] == "ok"
+
+    def test_abandoned_command_worker_swallows_late_error(self, app_client):
+        """The except arm carries the same guard: a stray late 'Command
+        error:' from an abandoned worker must not land mid-successor-turn."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        self._run_abandoned_command(
+            client, mgr, ws_id, command="/skill", raises=RuntimeError("late boom")
+        )
+        assert ws.ui.errors == []
+
+    def test_exit_command_emits_ended_info_and_never_answers(self, app_client):
+        """should_exit commands shut the session down — the worker emits
+        the ended notice and never launches an answering turn (sends
+        during the window park in the /send route and belong to whatever
+        follows the shutdown, not to this worker)."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        ws.session.exit_commands = {"/exit"}
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/exit", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        ws.worker_thread.join(timeout=5)
+        assert ws.session.sends == []
+        assert any("Session ended" in m for m in ws.ui.infos)
+
+    def test_non_compact_command_refused_while_worker_running(self, app_client):
+        """The old inline path was serialized by the event loop itself; the
+        worker-slot dispatch restores that mutual exclusion with an explicit
+        busy answer — /clear can no longer interleave with a live turn or a
+        running compaction."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        with ws._lock:
+            ws._worker_running = True  # a turn / compaction is in flight
+        try:
+            resp = client.post(
+                "/v1/api/command",
+                json={"command": "/clear", "ws_id": ws_id},
+                headers=_auth("user-1"),
+            )
+        finally:
+            with ws._lock:
+                ws._worker_running = False
+        assert resp.status_code == 409
+        assert resp.json()["status"] == "busy"
+        assert ws.session.commands == []

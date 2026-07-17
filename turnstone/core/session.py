@@ -308,23 +308,59 @@ class _CancelRef(list[Any]):
     immediately.  If cancellation was already requested before the stream
     was created (e.g. cancel during retry backoff), the stream is closed
     on arrival so the blocked iteration is unblocked.
+
+    ``my_generation`` scopes a ref to one generation (compaction's summary
+    calls pass theirs; the main loop's long-lived shared ref keeps the
+    default 0 = unconditional).  A superseded ref's late-arriving stream —
+    an abandoned compaction that passed its boundary check just before a
+    force-cancel and opened one final zombie call — must neither hijack
+    ``_cancel_stream`` from the successor generation's live stream nor
+    keep burning tokens, so the append skips the registration and closes
+    the stream on arrival.  The generation check and the register are two
+    lockless statements; the residual bytecode-width TOCTOU (successor
+    claims AND registers between them) is accepted — its harm is one
+    delayed Stop (closes a dead handle; the event arm still cancels at the
+    next chunk), not corruption — versus the model-call-width window this
+    closes.
     """
 
-    __slots__ = ("_session",)
+    __slots__ = ("_session", "_my_generation")
 
-    def __init__(self, session: ChatSession) -> None:
+    def __init__(self, session: ChatSession, my_generation: int = 0) -> None:
         super().__init__()
         self._session = session
+        self._my_generation = my_generation
+
+    def _superseded(self) -> bool:
+        gen = self._my_generation
+        return bool(gen and self._session._generation != gen)
 
     def append(self, stream: Any) -> None:
         super().append(stream)
-        self._session._cancel_stream = stream
+        superseded = self._superseded()
+        if not superseded:
+            self._session._cancel_stream = stream
         # If cancel was requested before the first chunk arrived (the worker
         # thread is blocked inside the provider generator waiting for the HTTP
-        # response), close the stream immediately to unblock it.
-        if self._session._cancel_event.is_set():
+        # response), close the stream immediately to unblock it.  Same for a
+        # superseded ref's zombie stream: nobody will consume it.
+        if superseded or self._session._cancel_event.is_set():
             with contextlib.suppress(Exception):
                 stream.close()
+
+    @property
+    def aborted(self) -> bool:
+        """Whether this ref's stream must not be resurrected.
+
+        ``model_turn`` consults ``cancel_ref.aborted`` before re-issuing a
+        request after a mid-drain transport failure (the deadline daemon's
+        :class:`~turnstone.core.deadline.StreamAbortRef` contract): a
+        stream that died because :meth:`ChatSession.cancel` closed it — or
+        because it belongs to a superseded generation — must not be
+        resurrected behind the user's Stop; the failure surfaces and the
+        caller's own cancel check turns it into ``GenerationCancelled``.
+        """
+        return self._session._cancel_event.is_set() or self._superseded()
 
 
 # Image extensions handled as vision content (SVG excluded — it's XML text)
@@ -1139,6 +1175,21 @@ class SessionUI(Protocol):
     def on_system_turn(
         self, content: str, source: str, meta: dict[str, Any] | None = None
     ) -> int | None: ...
+    def on_compaction(self, payload: dict[str, Any]) -> int | None:
+        """Called through the compaction lifecycle.
+
+        ``payload["phase"]`` is ``"start"`` (fields: ``trigger`` =
+        ``"manual"``/``"auto"``, and for auto ``where``/``pct``),
+        ``"progress"`` (``part``/``total``/``depth``, or ``retry_in``/
+        ``error`` for a retry wait), or ``"end"`` (``ok``, and either
+        ``before_tokens``/``after_tokens``/``summary`` or ``reason``/
+        ``message``).  Returns the UI event id when the transport
+        assigns one (see :meth:`on_system_turn`) so the persisted
+        compaction marker row can be stamped with the matching resume
+        cursor; ``None`` for UIs without an event stream.
+        """
+        ...
+
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
     def on_intent_verdict(self, verdict: dict[str, Any], judge_event: object | None = None) -> None:
@@ -3247,29 +3298,27 @@ class ChatSession:
         my_generation: int = 0,
         carry_spill: bool = False,
     ) -> bool:
-        """Emit the auto-compaction notice, compact, and refresh the status
-        line.  Shared by the mid-turn policy (:meth:`_maybe_compact_midturn`)
-        and the end-of-turn check so the notice wording, the percentage, and
-        the post-compaction status refresh stay in lockstep.  ``where`` is an
-        optional qualifier for the notice (e.g. ``"mid-turn"``); ``preserve_tail``
+        """Run an auto-compaction and refresh the status line.  Shared by the
+        mid-turn policy (:meth:`_maybe_compact_midturn`) and the end-of-turn
+        check so the trigger wording, the percentage, and the post-compaction
+        status refresh stay in lockstep.  The auto notice itself rides the
+        ``on_compaction`` start event (via ``where``/``pct``).  ``where`` is an
+        optional qualifier for that notice (e.g. ``"mid-turn"``); ``preserve_tail``
         is forwarded to :meth:`_compact_messages` (e.g. to keep an in-flight
         tool-call turn during compact-before-truncate); ``my_generation`` is
         forwarded so the message swap aborts if a newer send supersedes this one
-        mid-compaction (0 = the manual /compact path, which has no generation);
+        mid-compaction (the manual path claims its own via :meth:`compact_now`);
         ``carry_spill`` is forwarded so the end-of-turn site can copy the
         model's wind-down turn onto the summary verbatim.
         Returns whether a summary was actually produced (False if compaction
         bailed) so callers can avoid acting on a compaction that did not happen."""
-        qualifier = f" {where}" if where else ""
-        pct_display = round(self.auto_compact_pct * 100)
-        self.ui.on_info(
-            f"\n[Auto-compacting{qualifier}: prompt exceeds {pct_display}% of context window]"
-        )
         compacted = self._compact_messages(
             auto=True,
             preserve_tail=preserve_tail,
             my_generation=my_generation,
             carry_spill=carry_spill,
+            where=where,
+            threshold_pct=round(self.auto_compact_pct * 100),
         )
         self._print_status_line()
         return compacted
@@ -4826,6 +4875,7 @@ class ChatSession:
         max_tokens: int = 4096,
         temperature: float | None = None,
         reasoning_effort: str | None = None,
+        cancel_ref: list[Any] | None = None,
     ) -> ModelTurnResult:
         """Run a lightweight internal completion (title gen, compaction,
         extraction) through ``model_turn`` on the session's primary lane.
@@ -4867,6 +4917,13 @@ class ChatSession:
             max_tokens=clamped,
             temperature=self.temperature if temperature is None else temperature,
             reasoning_effort=reasoning_effort,
+            # The abort seam (default None): compaction passes a fresh
+            # per-attempt _CancelRef so a user Stop closes the in-flight
+            # summary HTTP stream instead of waiting it out.  Title-gen
+            # keeps None (not user-cancellable), and web-fetch extraction
+            # MUST keep None — it runs on parallel tool threads and a
+            # registration would clobber the main stream's _cancel_stream.
+            cancel_ref=cancel_ref,
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
@@ -5264,7 +5321,9 @@ class ChatSession:
                 last_err = e
                 delay = self._RETRY_BASE_DELAY * (2**attempt)
                 self.ui.on_info(f"[Retrying in {delay:.0f}s: {ename}]")
-                time.sleep(delay)
+                # Cancel-aware backoff (event arm only — no generation in
+                # scope here, matching the loop-top _check_cancelled()).
+                self._backoff_or_cancelled(delay)
         assert last_err is not None  # unreachable, but satisfies type checker
         raise last_err
 
@@ -5307,6 +5366,65 @@ class ChatSession:
             raise GenerationCancelled()
         if my_generation and my_generation != self._generation:
             raise GenerationCancelled()
+
+    def _claim_generation(self) -> int:
+        """Claim the next generation and install its fresh cancel event.
+
+        The entry half of the per-generation cancel discipline shared by
+        :meth:`send` and :meth:`compact_now`.  The old event object stays
+        set for any abandoned thread — ``_exec_bash`` captures a local
+        reference so subprocesses from old generations are still killed.
+
+        The claim is also the exact moment any prior compaction becomes
+        provably stale (the worker slot serializes turns), so the UI is
+        told to break a stale compaction activity latch here — otherwise a
+        force-abandoned compaction's latch suppresses the whole successor
+        turn's pill writes, re-broadcasting "Compacting context…" through
+        a live turn.  getattr-guarded like ``on_aux_usage``: minimal UI
+        stubs predate the hook and must not crash a claim.
+        """
+        self._generation += 1
+        self._cancel_event = threading.Event()
+        release = getattr(self.ui, "on_generation_claimed", None)
+        if release is not None:
+            release(self._generation)
+        return self._generation
+
+    def _consume_cancel(self, my_generation: int) -> bool:
+        """Clear this generation's cancel signal on exit; report if one landed.
+
+        The exit half of the per-generation discipline: a cancel that
+        targeted THIS generation must not leak into a later idle operation.
+        Only acts while still the active generation — a successor owns a
+        fresh event that must not be cleared from under it.  Returns
+        whether a cancel had been requested (set-but-unraised), so a
+        caller whose body completed anyway can still honor the stop.
+        """
+        if self._generation != my_generation:
+            return False
+        landed = self._cancel_event.is_set()
+        self._cancel_event.clear()
+        return landed
+
+    def _backoff_or_cancelled(self, delay: float, my_generation: int = 0) -> None:
+        """Sleep out a retry backoff, aborting the instant a Stop lands.
+
+        Waits on the CURRENT cancel event rather than ``time.sleep`` so a
+        cancel during a (possibly minutes-long exponential) backoff aborts
+        immediately instead of burning the delay plus one more model call.
+        Two arms, both required: the event object is replaced per
+        generation, so a wait on a superseded generation's old event can
+        time out without ever seeing the successor's cancel — the
+        ``_check_cancelled`` re-check catches that via its generation arm.
+        ``my_generation=0`` callers keep event-arm-only semantics (same
+        default as ``_check_cancelled``).  Raises
+        :class:`GenerationCancelled` — the shared shape for EVERY retry
+        backoff on this class: a hand-rolled ``time.sleep`` backoff is
+        Stop-blind and burns the full delay plus one more model call.
+        """
+        if self._cancel_event.wait(delay):
+            raise GenerationCancelled() from None
+        self._check_cancelled(my_generation)
 
     def _append_user_turn(
         self,
@@ -5734,12 +5852,7 @@ class ChatSession:
         # would otherwise leave the latch set on the long-lived session and
         # trip a premature, advisory-skipping compaction on the next send.
         self._compaction_advised = False
-        self._generation += 1
-        my_generation = self._generation
-        # Fresh cancel event per generation.  The old event object stays
-        # set for any abandoned thread — _exec_bash captures a local
-        # reference so subprocesses from old generations are still killed.
-        self._cancel_event = threading.Event()
+        my_generation = self._claim_generation()
         self._cancelled_partial_msg = None
         # Fresh per-send attachment wire-part memo (see __init__): bounds the
         # heavy rasterized-page parts to one send and picks up any mid-session
@@ -6333,12 +6446,10 @@ class ChatSession:
             # Consume this generation's cancel signal on exit so a cancel that
             # targeted THIS send can't later abort an unrelated idle operation
             # (e.g. a manual /compact between sends would otherwise inherit the
-            # still-set event).  Only when still the active generation — a newer
-            # send owns a fresh event we must not clear out from under it.  This is
-            # why a manual /compact no longer needs to reset the event itself
-            # (which would have disarmed a cancel aimed at a concurrent send).
-            if self._generation == my_generation:
-                self._cancel_event.clear()
+            # still-set event).  A late-landing cancel needs no extra handling
+            # here — send's exits never auto-run further work (queued messages
+            # are flushed, not answered), unlike compact_now's.
+            self._consume_cancel(my_generation)
 
     def _drain_pending_advisories(self) -> None:
         """Drop the abandoned generation's advisory nudges — not external events.
@@ -7438,7 +7549,7 @@ class ChatSession:
             batches.append(current)
         return batches
 
-    def _summarize_once(self, system_prompt: str, body: str) -> str:
+    def _summarize_once(self, system_prompt: str, body: str, my_generation: int = 0) -> str:
         """Run one summary completion over ``body`` and return the cleaned text.
 
         Owns the retry loop (transient errors only, exponential backoff) and the
@@ -7455,25 +7566,51 @@ class ChatSession:
                 result = self._utility_completion(
                     summary_msgs,
                     max_tokens=self._summary_output_tokens(),
+                    # Fresh per-attempt abort seam: _CancelRef.append
+                    # registers the summary HTTP stream in _cancel_stream
+                    # eagerly (and closes on arrival if a Stop already
+                    # landed), so cancel() aborts the blocked read instead
+                    # of waiting out a whole model call — the force-stop
+                    # orphan window collapses from one summary call to the
+                    # next checkpoint.  A fresh instance (never the shared
+                    # self._cancel_ref) keeps the main loop's per-attempt
+                    # clear and [0]-fallback semantics untouched, and the
+                    # boundary checks in _summarize_batch/_backoff guarantee
+                    # a superseded compaction makes no further calls — so
+                    # it can never clobber a successor's registration.
+                    cancel_ref=_CancelRef(self, my_generation),
                 )
                 break
             except Exception as e:
+                # A closed-by-cancel stream surfaces as a provider error —
+                # map it to the cancel BEFORE the retry policy reads it, so
+                # a Stop on the final attempt ends the compaction as
+                # cancelled, never as a red "Compaction failed" (the main
+                # drain path makes the same closed-stream→GenerationCancelled
+                # translation).
+                self._check_cancelled(my_generation)
                 ename = type(e).__name__
                 if self._stop_retrying(e, attempt, self._provider):
                     # Overflow is deterministic — let _summarize_batch subdivide
                     # instead of retrying an identical oversized call.
                     raise
                 delay = self._RETRY_BASE_DELAY * (2**attempt)
-                self.ui.on_info(f"[Compact retrying in {delay:.0f}s: {ename}]")
-                time.sleep(delay)
+                self._compaction_event(
+                    my_generation, {"phase": "progress", "retry_in": delay, "error": ename}
+                )
+                self._backoff_or_cancelled(delay, my_generation)
         assert result is not None
         # Strip any <think>/<reasoning> tags the summarizer may emit
         summary = self._strip_reasoning(result.content or "")
         if result.finish_reason == "length":
-            self.ui.on_info("[Warning: compaction summary was truncated]")
+            self._compaction_event(
+                my_generation, {"phase": "progress", "warning": "summary_truncated"}
+            )
         return summary
 
-    def _summarize_blocks(self, blocks: list[str], *, depth: int = 0) -> str:
+    def _summarize_blocks(
+        self, blocks: list[str], *, depth: int = 0, my_generation: int = 0
+    ) -> str:
         """Summarize ``blocks`` into one dense summary, chunking + recursing so no
         single model call exceeds the model window.
 
@@ -7502,7 +7639,7 @@ class ChatSession:
             raise _CompactionIrreducibleError
         batches = self._pack_blocks(blocks, self._summary_input_budget_chars())
         if len(batches) == 1:
-            return self._summarize_batch(system_prompt, batches[0], depth)
+            return self._summarize_batch(system_prompt, batches[0], depth, my_generation)
 
         # More than one batch: recurse-merge the per-batch summaries.  A block-count
         # guard would be wrong here — _summarize_batch's binary subdivision can
@@ -7511,11 +7648,18 @@ class ChatSession:
         total = len(batches)
         summaries: list[str] = []
         for k, batch in enumerate(batches, start=1):
-            self.ui.on_info(f"[compacting part {k}/{total}…]")
-            summaries.append(self._summarize_batch(system_prompt, batch, depth))
-        return self._summarize_blocks(summaries, depth=depth + 1)
+            # depth 0 = summarizing transcript batches; depth > 0 = merging
+            # partial summaries.  The web card renders depth 0 as a
+            # determinate part-k-of-N bar and deeper levels as a merge note.
+            self._compaction_event(
+                my_generation, {"phase": "progress", "part": k, "total": total, "depth": depth}
+            )
+            summaries.append(self._summarize_batch(system_prompt, batch, depth, my_generation))
+        return self._summarize_blocks(summaries, depth=depth + 1, my_generation=my_generation)
 
-    def _summarize_batch(self, system_prompt: str, batch: list[str], depth: int) -> str:
+    def _summarize_batch(
+        self, system_prompt: str, batch: list[str], depth: int, my_generation: int = 0
+    ) -> str:
         """Summarize one packed batch, subdividing on a token-window overflow.
 
         The char budget that produced ``batch`` is only an estimate, so the model
@@ -7533,10 +7677,13 @@ class ChatSession:
         # Cooperative cancellation: a cancel mid-compaction aborts here.  It raises
         # GenerationCancelled (a BaseException), so _compact_messages' ``except
         # Exception`` can't swallow it and the message-swap below never runs — the
-        # history is left untouched.
-        self._check_cancelled()
+        # history is left untouched.  my_generation matters for the force-cancel
+        # orphan: a successor's claim REPLACES the cancel event, so the event arm
+        # alone would let an abandoned compaction keep issuing summary calls —
+        # the generation arm is what retires it at the next batch boundary.
+        self._check_cancelled(my_generation)
         try:
-            return self._summarize_once(system_prompt, "\n\n".join(batch))
+            return self._summarize_once(system_prompt, "\n\n".join(batch), my_generation)
         except Exception as e:
             if not _is_ctx_overflow(e):
                 raise
@@ -7547,9 +7694,11 @@ class ChatSession:
                 # as fits — a wide over-window batch costs ~log2(N) calls, not one
                 # model call per block.
                 mid = len(batch) // 2
-                left = self._summarize_batch(system_prompt, batch[:mid], depth)
-                right = self._summarize_batch(system_prompt, batch[mid:], depth)
-                return self._summarize_blocks([left, right], depth=depth + 1)
+                left = self._summarize_batch(system_prompt, batch[:mid], depth, my_generation)
+                right = self._summarize_batch(system_prompt, batch[mid:], depth, my_generation)
+                return self._summarize_blocks(
+                    [left, right], depth=depth + 1, my_generation=my_generation
+                )
             # A lone block overflows by itself: the char budget over-estimated how
             # many tokens it holds.  Shrink progressively — halve the truncation
             # budget and retry, keeping as much of the message as the real window
@@ -7561,7 +7710,7 @@ class ChatSession:
             while True:
                 try:
                     return self._summarize_once(
-                        system_prompt, self._truncate_block(batch[0], budget)
+                        system_prompt, self._truncate_block(batch[0], budget), my_generation
                     )
                 except Exception as e2:
                     if not _is_ctx_overflow(e2):
@@ -7571,6 +7720,134 @@ class ChatSession:
                     budget = max(self._MIN_SUMMARY_BUDGET_CHARS, budget // 2)
 
     def _compact_messages(
+        self,
+        auto: bool = False,
+        preserve_tail: int = 0,
+        my_generation: int = 0,
+        carry_spill: bool = False,
+        where: str = "",
+        threshold_pct: int | None = None,
+    ) -> bool:
+        """Compact conversation history — the lifecycle-event wrapper.
+
+        Owns the cooperative-latch clear and the ``on_compaction`` lifecycle
+        contract: exactly one ``start`` event, then exactly one ``end`` event
+        on EVERY exit — the handled bails inside
+        :meth:`_compact_messages_impl` emit their own failed ``end`` (with a
+        per-site reason), and this wrapper backstops the raising exits
+        (``GenerationCancelled`` from a cancel mid-summary, unexpected
+        errors) so a UI that painted an in-progress card on ``start`` can
+        never be left with a stuck progress bar.  ``where`` is the auto
+        trigger's qualifier (``"mid-turn"`` …) and ``threshold_pct`` the
+        auto-compact percentage — both ride the ``start`` event, and only
+        :meth:`_do_auto_compact` passes the pct: the context-overflow retry
+        path also compacts with ``auto=True`` but never evaluated the
+        threshold, so a pct there would fabricate a trigger explanation
+        contradicting the overflow notice printed a line above it.
+        """
+        # Clear the cooperative latch on every compaction *attempt*, ahead of
+        # the early-return guards in the impl — a bailed compaction (too few/
+        # large messages, summary error) must fall back to the advisory grace
+        # state next cycle rather than retry-storm on the same over-soft
+        # estimate.
+        self._compaction_advised = False
+        trigger = "auto" if auto else "manual"
+        start_payload: dict[str, Any] = {"phase": "start", "trigger": trigger}
+        if auto:
+            start_payload["where"] = where
+            if threshold_pct is not None:
+                start_payload["pct"] = threshold_pct
+        self._compaction_event(my_generation, start_payload)
+        try:
+            return self._compact_messages_impl(auto, preserve_tail, my_generation, carry_spill)
+        except BaseException as e:
+            # GenerationCancelled is a BaseException — the except above the
+            # message swap lets it propagate so history stays untouched; the
+            # UIs still need the end event to retire the in-progress card.
+            # Any OTHER non-Exception BaseException (KeyboardInterrupt at
+            # the CLI, SystemExit) is a deliberate abort too, not a
+            # compaction failure — report cancelled, never a red error row
+            # (str(KeyboardInterrupt()) is "" and would render "Compaction
+            # failed: ").
+            cancelled = isinstance(e, GenerationCancelled) or not isinstance(e, Exception)
+            message = "Compaction cancelled." if cancelled else f"Compaction failed: {e}"
+            # _compaction_bailed is the single failed-end emitter.  The
+            # error notification is trigger-scoped: AUTO raising exits
+            # propagate into send()'s fatal handler, which fires the one
+            # on_error — emitting here too doubled the red rows and the
+            # error metric.  MANUAL raising exits have no downstream
+            # emitter (the web compact worker's runner only logs; the CLI
+            # REPL suppresses below), so the wrapper's is the one red row.
+            self._compaction_bailed(
+                "cancelled" if cancelled else "error",
+                message,
+                trigger=trigger,
+                my_generation=my_generation,
+                emit_error=(trigger == "manual"),
+            )
+            raise
+
+    def _compaction_event(self, my_generation: int, payload: dict[str, Any]) -> int | None:
+        """Emit one compaction lifecycle event stamped with its owning id.
+
+        ``compaction_id`` (the owning generation) ties every progress/end
+        event to the compaction that started it, and ``superseded`` marks
+        events from a generation that is no longer current (a
+        force-abandoned worker running out its last summary call).
+        :meth:`SessionUIBase.on_compaction <turnstone.core.session_ui_base.SessionUIBase.on_compaction>`
+        consumes ``superseded`` (never enqueued): a superseded event must
+        not drive the activity-pill restore or animate a successor's card.
+        ``my_generation`` is 0 on direct test invocations — falsy, so such
+        events are never marked superseded (matching ``_check_cancelled``).
+        """
+        stale = bool(my_generation and my_generation != self._generation)
+        # getattr-guarded like on_generation_claimed/on_aux_usage: a
+        # duck-typed SessionUI predating the hook gets no compaction events
+        # rather than an AttributeError that wedges every long session at
+        # its first auto-compaction.
+        emit = getattr(self.ui, "on_compaction", None)
+        if emit is None:
+            return None
+        result = emit({"compaction_id": my_generation, "superseded": stale, **payload})
+        # Duck-typed hooks aren't bound to the protocol's return type; the
+        # marker-stamp consumer needs int-or-None, nothing else.
+        return result if isinstance(result, int) else None
+
+    def _compaction_bailed(
+        self,
+        reason: str,
+        message: str,
+        *,
+        trigger: str,
+        my_generation: int,
+        emit_error: bool = True,
+    ) -> bool:
+        """Emit a failed-compaction ``end`` event and return ``False``.
+
+        The single failed-end emitter: :meth:`_compact_messages_impl`'s
+        handled bails AND the wrapper's raising backstop both route here —
+        each carries a machine ``reason`` (drives the web card's failure
+        state) and the human ``message``.  ``reason="error"``
+        additionally fires :meth:`on_error` — the typed error event and the
+        Prometheus error counter this path fed before the lifecycle events
+        existed; the panes render the red row from THAT and treat the end
+        event as card-teardown only, so the text isn't shown twice.
+
+        ``emit_error=False`` is the RAISING backstop's auto-trigger arm:
+        those exceptions propagate into ``send()``'s fatal handler, whose
+        ``_record_fatal_error`` fires the single on_error — a second one
+        here doubled every pane's red rows and the node's error metric.
+        Handled bails never propagate, so they always emit.
+        """
+        if reason == "error" and emit_error:
+            self.ui.on_error(message)
+        self._compaction_event(
+            my_generation,
+            {"phase": "end", "ok": False, "reason": reason, "message": message, "trigger": trigger},
+        )
+        return False
+
+    def _compact_messages_impl(
         self,
         auto: bool = False,
         preserve_tail: int = 0,
@@ -7603,14 +7880,16 @@ class ChatSession:
         the summarizer also reads the spill, but its paraphrase must not be
         the only survivor.
         """
-        # Clear the cooperative latch on every compaction *attempt*, ahead of
-        # the early-return guards below — a bailed compaction (too few/large
-        # messages, summary error) must fall back to the advisory grace state
-        # next cycle rather than retry-storm on the same over-soft estimate.
-        self._compaction_advised = False
+        # Presentation label derived from the one semantic flag — deriving
+        # locally makes an auto=True/trigger="manual" drift impossible.
+        trigger = "auto" if auto else "manual"
         if len(self.messages) < 2:
-            self.ui.on_info("Not enough messages to compact.")
-            return False
+            return self._compaction_bailed(
+                "not_enough_messages",
+                "Not enough messages to compact.",
+                trigger=trigger,
+                my_generation=my_generation,
+            )
 
         # Optionally keep the last ``preserve_tail`` messages verbatim — e.g. an
         # in-flight assistant tool-call whose results are about to be appended, or
@@ -7645,24 +7924,37 @@ class ChatSession:
         to_summarize_dicts = dicts_from_turns(to_summarize)
         blocks = self._summary_blocks(to_summarize_dicts)
         if not blocks:
-            self.ui.on_info("Not enough messages to compact.")
-            return False
+            return self._compaction_bailed(
+                "not_enough_messages",
+                "Not enough messages to compact.",
+                trigger=trigger,
+                my_generation=my_generation,
+            )
 
         self.ui.on_thinking_start()
         try:
-            summary = self._summarize_blocks(blocks)
+            summary = self._summarize_blocks(blocks, my_generation=my_generation)
         except _CompactionIrreducibleError:
-            self.ui.on_info("Messages too large to fit in summary context.")
-            return False
+            return self._compaction_bailed(
+                "irreducible",
+                "Messages too large to fit in summary context.",
+                trigger=trigger,
+                my_generation=my_generation,
+            )
         except Exception as e:
-            self.ui.on_error(f"Compaction failed: {e}")
-            return False
+            return self._compaction_bailed(
+                "error", f"Compaction failed: {e}", trigger=trigger, my_generation=my_generation
+            )
         finally:
             self.ui.on_thinking_stop()
 
         if not summary.strip():
-            self.ui.on_info("Compaction produced an empty summary; keeping history.")
-            return False
+            return self._compaction_bailed(
+                "empty_summary",
+                "Compaction produced an empty summary; keeping history.",
+                trigger=trigger,
+                my_generation=my_generation,
+            )
 
         # The verbatim carries: the wind-down spill and the continuation-hint
         # quote of the ask.  Both can fire on the SAME compaction (the
@@ -7772,14 +8064,20 @@ class ChatSession:
                 "total_tokens": after_tokens,
             }
 
-        self.ui.on_info(f"[compacted: ~{before_tokens:,} -> ~{after_tokens:,} tokens]")
-        separator = "\u2500" * 60
-        lines = [separator]
-        for line in summary.splitlines():
-            lines.append(f"  {line}")
-        lines.append(separator)
-        self.ui.on_info("\n".join(lines))
-
+        # The successful end event carries everything a UI needs to paint the
+        # result card (token delta + the summary text); its id stamps the
+        # marker row below so /history and the live stream stay aligned.
+        end_event_id = self._compaction_event(
+            my_generation,
+            {
+                "phase": "end",
+                "ok": True,
+                "trigger": trigger,
+                "before_tokens": before_tokens,
+                "after_tokens": after_tokens,
+                "summary": summary,
+            },
+        )
         # Persist a compaction checkpoint so a reopen rehydrates [summary]+[tail]
         # instead of the full transcript — which, on a long session or one switched
         # to a smaller-context model, can exceed the window and deadlock the first
@@ -7792,13 +8090,27 @@ class ChatSession:
         if self._ws_id:
             watermark = get_compaction_watermark(self._ws_id, preserve_tail)
             if watermark is not None:
+                # ``before_tokens``/``after_tokens``/``trigger`` are display
+                # additions for the /history compaction card; the resume
+                # slice reads only ``watermark`` (parse_checkpoint_watermark
+                # ignores the extra keys).  The row is stamped with the end
+                # event's id so a fresh-connect cursor computed from /history
+                # sits at-or-past the live event — repaint and replay can't
+                # both render the card.
                 save_message(
                     self._ws_id,
                     "assistant",
                     summary,
                     source=COMPACTION_SOURCE,
-                    meta=json.dumps({"watermark": watermark}),
-                    event_id=self._ui_event_id(),
+                    meta=json.dumps(
+                        {
+                            "watermark": watermark,
+                            "before_tokens": before_tokens,
+                            "after_tokens": after_tokens,
+                            "trigger": trigger,
+                        }
+                    ),
+                    event_id=end_event_id if end_event_id is not None else self._ui_event_id(),
                     producer=self._provider.provider_name if self._provider else None,
                 )
         return True
@@ -8724,6 +9036,79 @@ class ChatSession:
             popped = self._queued_messages.pop(msg_id, None)
         return popped is not None
 
+    def flush_queued_messages(self) -> bool:
+        """Drain queued messages into a combined user turn (public seam).
+
+        Defensive backstop for workers that can find text stranded in the
+        queue from BEFORE their window (a dying send worker's closing race)
+        — the /compact worker's exit seam is the caller.  Messages sent
+        DURING a command window never reach this queue: the /send route
+        parks them while ``worker_kind == "command"`` and dispatches them
+        as ordinary sends afterwards.  Must only be called by the thread
+        that owns the worker slot — it mutates ``self.messages``.
+        """
+        return self._flush_queued_messages()
+
+    @staticmethod
+    def _combine_queued_items(items: list[tuple[str, str]]) -> str:
+        """Render drained queue items to one text block ([IMPORTANT] framing)."""
+        from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
+
+        return "\n\n".join(
+            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items
+        )
+
+    def compact_now(self) -> bool:
+        """Manual compaction with send()'s full generation discipline.
+
+        The web /compact worker path.  Mirrors send()'s entry — claim the
+        next generation and install a fresh cancel event — so:
+
+        * an abandoned (force-cancelled) compaction can never swap history
+          under a successor turn: the successor's claim makes this
+          generation stale and the pre-swap ``_check_cancelled`` raises
+          (send() prevents the identical race the identical way);
+        * a cancel that landed while idle (a Stop click between turns)
+          can't instantly abort the next /compact — the stale set event is
+          replaced here, exactly as send() replaces it per generation;
+        * a cancel aimed at THIS compaction is consumed on exit (while
+          still the active generation), so it can't leak into a later idle
+          operation — previously nothing cleared it until the next send,
+          which bricked every /compact retry as instantly \"cancelled\".
+
+        Raises :class:`GenerationCancelled` (after consuming the event) so
+        the caller can distinguish a user stop from a bail; returns whether
+        a summary was produced otherwise.  That raise ALSO covers a Stop
+        that lands after the impl's last cancel check (the swap /
+        marker-persist tail) or during a retry backoff that then bails:
+        the compaction outcome stands, but an explicit Stop must never be
+        silently eaten — the caller must not auto-run anything on the
+        user's behalf after one.  The CLI's ``handle_command`` route
+        delegates here too — the REPL is single-threaded so the discipline
+        is redundant there, but one path means one behaviour.
+        """
+        my_generation = self._claim_generation()
+        cancel_landed = False
+        try:
+            compacted = self._compact_messages(my_generation=my_generation)
+        finally:
+            # Consume this generation's cancel signal (send()'s exit does
+            # the same).  A body raise propagates past this; the landed
+            # flag matters only on the completed-anyway paths below.
+            cancel_landed = self._consume_cancel(my_generation)
+        if compacted:
+            # Refresh the status line/context pill so the freed window is
+            # visible immediately — parity with _do_auto_compact.  BEFORE
+            # honoring a tail-landing Stop: the compaction genuinely
+            # happened (swap + marker + OK card), so the pill must reflect
+            # it either way — the raise below only suppresses follow-up
+            # work, it must not leave the pill claiming a full context
+            # next to a "context compacted" card.
+            self._print_status_line()
+        if cancel_landed:
+            raise GenerationCancelled()
+        return compacted
+
     def _flush_queued_messages(self, prefix: str = "") -> bool:
         """Drain queued messages into a single combined user turn.
 
@@ -8743,21 +9128,19 @@ class ChatSession:
         Returns ``True`` when any user row was appended (prefix or
         items), ``False`` when both were empty.
         """
-        from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
-
         with self._queued_lock:
             items = list(self._queued_messages.values())
             self._queued_messages.clear()
-        if not items and not prefix:
+        queued_text = self._combine_queued_items(items)
+        if not queued_text and not prefix:
             return False
 
-        parts = [f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items]
-        if prefix and parts:
-            content = prefix + "\n\n" + "\n\n".join(parts)
+        if prefix and queued_text:
+            content = prefix + "\n\n" + queued_text
         elif prefix:
             content = prefix
         else:
-            content = "\n\n".join(parts)
+            content = queued_text
         self._append_user_turn(content, ())
         return True
 
@@ -15212,7 +15595,9 @@ class ChatSession:
                     last_err = e
                     delay = self._RETRY_BASE_DELAY * (2**attempt)
                     self.ui.on_info(f"[{label} retrying in {delay:.0f}s: {ename}]")
-                    time.sleep(delay)
+                    # Cancel-aware backoff: a Stop mid-agent-retry aborts
+                    # the run instead of burning the delay + one more call.
+                    self._backoff_or_cancelled(delay)
             assert last_err is not None  # unreachable
             raise last_err
 
@@ -16174,7 +16559,10 @@ class ChatSession:
                         max_retries=self._NOTIFY_MAX_RETRIES,
                         retry_delay=delay,
                     )
-                    time.sleep(delay)
+                    # Cancel-aware: notify runs as an in-turn tool, so a
+                    # Stop aborts pending delivery retries with the turn
+                    # (the batch synthesizes the cancelled tool_result).
+                    self._backoff_or_cancelled(delay)
                     continue
                 log.warning("notify.no_services_exhausted")
                 msg = "Error: no channel gateway services available"
@@ -16223,7 +16611,8 @@ class ChatSession:
                     gateway_count=len(services),
                     retry_delay=delay,
                 )
-                time.sleep(delay)
+                # Same cancel-aware backoff as the no-services arm above.
+                self._backoff_or_cancelled(delay)
             else:
                 log.warning(
                     "notify.delivery_failed",
@@ -16947,6 +17336,12 @@ class ChatSession:
         elif cmd == "/new":
             from turnstone.core.memory import register_workstream
 
+            # Flush any stranded queued text BEFORE the identity swap so it
+            # is persisted into the workstream it was ADDRESSED to.  Sends
+            # during the command window itself park in the /send route and
+            # never queue; this covers only a message stranded by a dying
+            # send worker's closing race before this command started.
+            self._flush_queued_messages()
             self.messages.clear()
             self._read_files.clear()
             self._repeat_detector.clear()
@@ -17009,6 +17404,10 @@ class ChatSession:
                 elif target_id == self._ws_id:
                     self.ui.on_info("Already in that workstream.")
                 else:
+                    # Same pre-swap flush as /new: stranded queued text is
+                    # persisted into the CURRENT workstream before resume()
+                    # swaps this session's identity to the target.
+                    self._flush_queued_messages()
                     try:
                         resumed: bool | None = self.resume(target_id)
                     except ValueError as exc:
@@ -17159,13 +17558,17 @@ class ChatSession:
                     self.ui.on_info(f"Invalid. Choose from: {', '.join(valid)}")
 
         elif cmd == "/compact":
-            try:
-                self._compact_messages()
-            except GenerationCancelled:
-                # Ctrl-C during a manual compaction aborts cleanly — the message
-                # swap never ran (the cancel-check precedes it), so history is
-                # intact, exactly like cancelling a send.
-                self.ui.on_info("Compaction cancelled.")
+            # Ctrl-C during a manual compaction aborts cleanly — the message
+            # swap never ran (the cancel-check precedes it), so history is
+            # intact, exactly like cancelling a send.  The lifecycle wrapper
+            # already emitted the cancelled end event, so every UI has been
+            # told; nothing more to print here.  Unexpected errors are also
+            # swallowed: the wrapper's manual-trigger backstop already fired
+            # on_error (the red row), and the CLI REPL calls handle_command
+            # with no try/except — re-raising would crash the whole REPL on
+            # a compaction failure (history is untouched on raising exits).
+            with contextlib.suppress(GenerationCancelled, Exception):
+                self.compact_now()
 
         elif cmd == "/creative":
             # Recognized but decommissioned: print a live migration pointer

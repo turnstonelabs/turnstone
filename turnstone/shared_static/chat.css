@@ -994,6 +994,108 @@
   margin-top: 6px;
 }
 
+/* Compaction card — both the in-progress state (``.compaction-running``, with
+   the progress bar) and the settled result (token delta + summary fold).
+   Built by ``buildCompactionProgressCard`` / ``buildCompactionCard``
+   (shared conversation.js) for the interactive pane AND the coord viewer.
+   Magenta accent: a memory/infrastructure operation — distinct from the cyan
+   tool surface, the yellow operator bubbles, and the amber user turns. */
+.msg.compaction-card {
+  border-left-color: var(--magenta);
+  background: var(--panel);
+  padding: 8px 12px;
+  margin: 6px 0;
+  width: 100%;
+}
+.msg.compaction-card .msg-compaction-header {
+  color: var(--magenta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+.msg.compaction-card .msg-compaction-detail {
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.msg.compaction-card .msg-compaction-note {
+  color: var(--ink-3);
+  font-size: 11px;
+  margin-top: 6px;
+}
+.msg.compaction-card .msg-compaction-bar {
+  position: relative;
+  height: 4px;
+  margin-top: 8px;
+  border-radius: 2px;
+  background: var(--magenta-glow);
+  overflow: hidden;
+}
+.msg.compaction-card .msg-compaction-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--magenta);
+  transition: width 300ms ease;
+}
+/* Indeterminate state — a single-batch summarization emits no part-k/N
+   progress, so the bar sweeps until the end event settles it. */
+.msg.compaction-card .msg-compaction-bar.indeterminate .msg-compaction-bar-fill {
+  width: 40%;
+  animation: compaction-sweep 1.4s ease-in-out infinite;
+}
+@keyframes compaction-sweep {
+  0% {
+    margin-left: -40%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg.compaction-card .msg-compaction-bar.indeterminate .msg-compaction-bar-fill {
+    animation: none;
+    width: 100%;
+    opacity: 0.4;
+  }
+  .msg.compaction-card .msg-compaction-bar-fill {
+    transition: none;
+  }
+}
+.msg.compaction-card .msg-compaction-fold {
+  margin-top: 6px;
+}
+.msg.compaction-card .msg-compaction-fold > summary {
+  color: var(--ink-3);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+  text-transform: lowercase;
+}
+.msg.compaction-card .msg-compaction-body {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg-dim);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* Slash-command echo — control-plane input, not a conversational turn.
+   Prompt-styled mono line (the leading "/" is the glyph), quieter than a
+   user bubble so command chatter doesn't read as trajectory. */
+.msg.command-echo {
+  border-left-color: var(--fg-dim);
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 12px;
+}
+
 /* Guard-finding card — the ``output_guard`` operator-context system turn.  The
    inner warning element (``.output-warning`` interactive / ``.coord-tool-row-
    warning`` coord) carries the risk colour + flags + redaction; this wrapper

@@ -328,6 +328,68 @@ class TerminalUI(SessionUI):
         sys.stdout.write(f"{YELLOW}[{label}]{RESET} {content}\n")
         sys.stdout.flush()
 
+    def on_compaction(self, payload: dict[str, Any]) -> int | None:
+        """Render compaction lifecycle events as the terminal's classic text
+        lines — the notice, ``part k/N`` progress, and the token-delta +
+        boxed-summary result the CLI printed before these became structured
+        events (the web UI renders the same payloads as a progress card).
+        """
+        phase = payload.get("phase")
+        if phase == "start":
+            # The threshold notice prints only when a threshold actually
+            # fired (pct present — _do_auto_compact).  The overflow-retry
+            # path compacts with auto=True but prints its own "[Context
+            # overflow — auto-compacting and retrying]" line; claiming a
+            # percentage there would fabricate the trigger.  Manual starts
+            # print nothing — the thinking spinner covers it.
+            pct = payload.get("pct")
+            if payload.get("trigger") == "auto" and pct is not None:
+                where = payload.get("where") or ""
+                qualifier = f" {where}" if where else ""
+                self.on_info(
+                    f"\n[Auto-compacting{qualifier}: prompt exceeds {pct}% of context window]"
+                )
+        elif phase == "progress":
+            if payload.get("warning") == "summary_truncated":
+                self.on_info("[Warning: compaction summary was truncated]")
+            elif payload.get("retry_in") is not None:
+                self.on_info(
+                    f"[Compact retrying in {payload['retry_in']:.0f}s: {payload.get('error', '')}]"
+                )
+            else:
+                self.on_info(f"[compacting part {payload.get('part')}/{payload.get('total')}…]")
+        elif phase == "end":
+            if payload.get("ok"):
+                before = payload.get("before_tokens", 0)
+                after = payload.get("after_tokens", 0)
+                self.on_info(f"[compacted: ~{before:,} -> ~{after:,} tokens]")
+                separator = "─" * 60
+                lines = [separator]
+                for line in str(payload.get("summary") or "").splitlines():
+                    lines.append(f"  {line}")
+                lines.append(separator)
+                self.on_info("\n".join(lines))
+            elif payload.get("reason") != "error":
+                # reason="error" already printed through on_error (red) —
+                # the end event is card-teardown for the web panes, not a
+                # second line here.  A cancelled AUTO compaction is also
+                # silent: the surrounding send prints "[Generation
+                # cancelled]" itself, and pre-lifecycle-events one Stop
+                # printed exactly one line.  (A cancelled MANUAL /compact
+                # keeps the message — it's the only line that path prints.)
+                # A SUPERSEDED end is a force-abandoned compaction retiring
+                # late — nobody is waiting on it; narrating it mid-turn
+                # reads as the LIVE work being cancelled.
+                # HAND-SYNCED SIBLING: conversation.js applyCompactionEvent
+                # implements this same three-clause display policy (skip
+                # error-reason / skip superseded / skip cancelled+auto) for
+                # the web panes — change both or they drift.
+                if not payload.get("superseded") and not (
+                    payload.get("reason") == "cancelled" and payload.get("trigger") == "auto"
+                ):
+                    self.on_info(str(payload.get("message") or ""))
+        return None
+
     def on_state_change(self, state: str) -> None:
         pass  # base TerminalUI ignores state changes
 

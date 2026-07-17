@@ -636,3 +636,35 @@ def test_connectsse_defers_open_when_tab_hidden() -> None:
     )
     assert head.index("this.wsId = wsId;") < head.index("if (document.hidden) {")
     assert head.index('addEventListener("visibilitychange"') < head.index("if (document.hidden) {")
+
+
+def test_send_abort_bound_is_compaction_aware() -> None:
+    """The send POST's abort bound must be selected via the shared
+    ``sendAbortMs`` helper in BOTH panes: sends during a slash-command
+    window park server-side (a manual /compact legitimately runs for
+    minutes), so a hard-coded ~15s abort silently dropped any send made
+    >15s into a long compaction.  The compaction card is the long-bound
+    signal; the wedged-node default stays otherwise."""
+    interactive = _INTERACTIVE.read_text(encoding="utf-8")
+    assert "sendAbortMs(this._compaction)" in interactive, (
+        "interactive sendMessage must select its abort bound off the compaction holder"
+    )
+    coordinator = (_ROOT / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    assert "sendAbortMs(compactionHolder)" in coordinator, (
+        "coordinator coordSend must share the same abort-bound policy"
+    )
+    conversation = (_ROOT / "turnstone/shared_static/conversation.js").read_text(encoding="utf-8")
+    assert "export function sendAbortMs" in conversation
+    assert "600000 : 15000" in conversation.replace("\n", " "), (
+        "long bound while a compaction card is live; 15s wedged-node default otherwise"
+    )
+    # The queued bubble's pre-response x must abort the in-flight (possibly
+    # parked) POST — otherwise a dismissed message dispatches anyway when
+    # the command window closes.
+    assert "queuedEl._sendAbort = () => sendCtrl.abort()" in interactive
+    composer_queue = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(
+        encoding="utf-8"
+    )
+    assert "el._sendAbort()" in composer_queue

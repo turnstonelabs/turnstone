@@ -480,10 +480,17 @@ class PostgreSQLBackend:
         return msg_rows, (attachments or None)
 
     def load_messages(
-        self, ws_id: str, *, limit: int | None = None, repair: bool = True
+        self,
+        ws_id: str,
+        *,
+        limit: int | None = None,
+        repair: bool = True,
+        include_compaction: bool = False,
     ) -> list[dict[str, Any]]:
         msg_rows, attachments = self._conversation_rows(ws_id, limit)
-        return _reconstruct_messages(msg_rows, ws_id, attachments, repair=repair)
+        return _reconstruct_messages(
+            msg_rows, ws_id, attachments, repair=repair, include_compaction=include_compaction
+        )
 
     def load_message_turns(self, ws_id: str, *, checkpointed: bool = True) -> list[Turn]:
         """Load the conversation as canonical ``Turn``s (unresolved AttachmentRef)

@@ -93,6 +93,7 @@ def send(
     enqueue: Callable[[], None],
     run: Callable[[], None],
     thread_name: str | None = None,
+    worker_kind: str = "turn",
 ) -> bool:
     """Dispatch work onto a workstream's worker thread.
 
@@ -105,6 +106,31 @@ def send(
     Both callbacks are no-arg closures — callers close over the
     ``ChatSession`` they want to drive, so the worker can't be racing a
     concurrent ``ws.session`` swap.
+
+    ``worker_kind`` classifies what the slot holds — ``"turn"`` (send /
+    retry / wake / init, the default) or ``"command"`` (slash-command
+    workers, including the minutes-long manual /compact).  Written to
+    ``ws.worker_kind`` in the same lock acquisition as the
+    ``(worker_thread, _worker_running)`` pair.  This is the ONLY site
+    that sets ``_worker_running=True``, so the classification cannot be
+    bypassed by a new dispatch caller.  The /send route parks while a
+    command holds the slot instead of taking the interjection-queue
+    path (whose length cap / cross-user guard are turn semantics); an
+    ``enqueue`` callback that can fire during a command window (the
+    coordinator adapter's, the init race's) must refuse rather than
+    queue — see the command-window refusals at those closures.
+
+    The refusal is DELIBERATELY not centralized here despite the three
+    hand-written guards: each surface needs a different refusal channel
+    (the /send route signals "re-park" via its ``queue_outcome`` flag;
+    the coordinator adapter and the init race raise ``queue.Full`` into
+    their existing backpressure statuses), and a central refusal inside
+    this function can only return ``False`` — indistinguishable from
+    queue-full/closed for the route's re-park decision and mislabeled by
+    the init path's status derivation.  Making it distinguishable means
+    a tri-state contract change across every dispatch caller, which is
+    more surface than three four-line guards.  If you add a NEW enqueue
+    closure that can queue turn work, copy the guard.
 
     Returns:
         ``True`` on successful enqueue (existing worker accepted) or
@@ -196,6 +222,7 @@ def send(
         # lock-window cost is dominated by the spawn branch's identity
         # write either way.
         ws._worker_running = True
+        ws.worker_kind = worker_kind
         t = threading.Thread(target=_runner, name=name, daemon=True)
         ws.worker_thread = t
     # ``t.start()`` may run user code (worker body) before returning;

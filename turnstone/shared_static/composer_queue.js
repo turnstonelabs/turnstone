@@ -297,6 +297,11 @@ export function createQueueController(opts) {
     if (el.getAttribute("aria-busy") === "true") return;
     el.dataset.dismissAttempted = "1";
     _setDismissing(el, true);
+    // A send whose POST is still in flight (parked server-side during a
+    // command window — possibly for minutes) attaches an abort hook: the ×
+    // must kill the request itself, or the dismissed message dispatches
+    // anyway when the window closes.  Post-response the hook is a no-op.
+    if (typeof el._sendAbort === "function") el._sendAbort();
     var msgId = el.dataset.msgId;
     if (!msgId) {
       // Pre-bind: bind() confirms once the server returns the msg_id (it

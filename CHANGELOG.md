@@ -18,6 +18,21 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **Compaction is visible now: lifecycle events, a progress bar, and a
+  persistent transcript card.** Context compaction (manual `/compact` and
+  auto) emits a first-class `compaction` SSE event
+  (`start` / `progress` / `end` — see the API reference) instead of loose
+  info lines. The web UI renders an in-transcript card with a real progress
+  bar (determinate `part k of N` during chunked summarization, indeterminate
+  for single-call compactions) that settles into a result card — token delta
+  plus the summary behind a fold — in both the interactive pane and the
+  coordinator viewer. The result survives reloads: the persisted compaction
+  marker now projects through `/history` as a `role="system"`,
+  `source="compaction"` entry (resume/export/search unchanged), stamped with
+  the end event's id so repaint and SSE replay can't double-render. The
+  marker's `meta` additionally records `before_tokens` / `after_tokens` /
+  `trigger`. Python and TypeScript SDKs gain a typed `CompactionEvent`.
+
 - **One provider transport: every model call now streams (#831).**
   The per-adapter non-streaming entry (`create_completion`) is retired;
   single-shot lanes — judges, titles, compaction, web-fetch extraction,
@@ -159,6 +174,73 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   current model.
 
 ### Fixed
+
+- **Manual `/compact` from the web UI: no phantom user turn, no frozen
+  server, cancellable.** A slash command typed into the web composer no
+  longer renders as a user chat bubble (it echoes as a distinct command
+  chip — commands aren't conversation turns and were never persisted as
+  such). `/compact` itself now dispatches onto the workstream's worker
+  slot instead of running inline on the server's event loop — previously a
+  long compaction froze every SSE stream on the node for its whole
+  duration, which is also why its own progress only ever arrived as one
+  burst after the fact. The manual path carries `send()`'s full generation
+  discipline (`compact_now()`): a force-abandoned compaction goes stale
+  instead of swapping history under a successor turn — and retires at its
+  next checkpoint instead of running out its remaining summary calls,
+  with its late lifecycle events fenced off (`compaction_id` on every
+  event, `superseded` on end events — both in the SDKs) so they can't
+  animate, tear down, re-title, or falsely narrate a successor's card or
+  activity pill; a cancel aimed at it is consumed on exit (previously it
+  bricked every `/compact` retry until the next message); a Stop click on
+  an idle session can't pre-abort the next compaction; a Stop that lands
+  in the completion tail — after the last cancel check, or during a retry
+  backoff (which now aborts immediately instead of sleeping it out) — is
+  honored rather than silently eaten; and Stop now aborts the in-flight
+  summary HTTP call itself (the compaction lane registers its stream in
+  the same abort seam the main loop uses), so cancelling a compaction is
+  immediate instead of waiting out a model call. Messages sent while any
+  slash command holds the worker slot **park** and then run as ordinary
+  full-fidelity sends when the command finishes — they are never routed
+  through the mid-turn interjection queue, whose semantics are
+  turn-shaped: previously a send during a manual `/compact` was silently
+  truncated to 2,000 characters, a second participant in a shared
+  workstream was locked out with a misleading "another participant's
+  turn" 409 for the whole compaction, and a message queued across a
+  `/resume`/`/new` could be answered into the post-swap workstream.
+  A `/compact` raced against an in-flight turn is refused with an
+  explicit busy response. Every other slash command runs through the same
+  worker slot too — mutual exclusion against sends, a running compaction,
+  and each other, with a busy answer replacing the old silent interleave —
+  while the endpoint still awaits quick commands' completion off-loop
+  (without parking an executor thread per request); the post-command pane
+  refreshes (`clear_ui` after `/clear`/`/new`/`/resume`, the
+  workstream-name sync) ride the worker itself, so a command that
+  outlives the endpoint's 60s response backstop still refreshes every
+  pane on completion (the `/command` response contract — `ok` / `running`,
+  with busy refusals answering a loud HTTP 409 rather than a silent 200 —
+  is now documented in the API reference and the OpenAPI spec). Manual compaction
+  success also refreshes the status line/context pill immediately (parity
+  with auto-compaction), compaction failures keep feeding the typed
+  `error` event and the node error counter (while a CLI Ctrl-C reports as
+  cancelled, not a failure), one Stop prints one notice (a cancelled
+  auto-compaction no longer stacks "Compaction cancelled." on top of
+  send's own "[Generation cancelled]"), the workstream activity pill
+  shows "Compacting context…" for the whole summarize phase, restores
+  cleanly afterwards, and can no longer be stranded by a force-stopped
+  compaction (a new turn's generation claim breaks a stale latch). Every
+  retry backoff on the session (stream retries, task agents, notify
+  delivery, compaction) now aborts immediately on Stop via one shared
+  cancel-aware helper instead of sleeping out its exponential delay. The
+  web composer bounds a parked send at 10 minutes while a compaction card
+  is visible (15 s wedged-node default otherwise, shared by both panes),
+  and dismissing a queued bubble aborts the in-flight POST so a dismissed
+  message can't dispatch minutes later. A compaction failure reports
+  exactly once (auto-compaction errors defer to the turn's fatal handler
+  instead of doubling the red row and the error metric), and a manual
+  `/compact` failure no longer crashes the CLI REPL. Post-command pane
+  refreshes and error notices are owner-guarded, so a force-cancelled
+  wedged command that unwedges late can't wipe panes or inject stray
+  notices into a successor turn.
 
 - **Static MCP servers: a pushed catalog change no longer wedges the shared
   session (#839).** The static-path `*/list_changed` handler awaited its
