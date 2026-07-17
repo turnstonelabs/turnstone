@@ -830,6 +830,16 @@ if (c.includes("promote"))
 c = run(makeEl({ hasAttribute: (a) => a === "aria-busy" }), false, queued);
 if (c.includes("promote"))
   throw new Error("dismiss-in-flight chip must be left to its DELETE verdict: " + c);
+// Null / non-object 2xx body (a misbehaving proxy answering `200 null`): the
+// helper normalizes it to {} so neither call site guards — it must fall through
+// to the unknown/"ok" arm and SETTLE the optimistic chip (promote), never throw
+// and strand a delivered message as a connection error.  (The no-op
+// consumeAttachments stub cannot prevent this: data.attached_ids is evaluated to
+// build the :639 call args, so against unfixed code this line throws and crashes
+// the harness.)
+c = run(makeEl(), false, null);
+if (!c.includes("promote"))
+  throw new Error("null body must settle via unknown-ok, not throw: " + c);
 console.log("settle matrix OK");
 """,
         encoding="utf-8",

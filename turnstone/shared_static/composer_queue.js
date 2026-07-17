@@ -544,7 +544,15 @@ export function parsePriority(text) {
 //   busy / attachments_busy / cross_user_interjection / unknown-ok —
 //     the panes' historical shapes, verbatim.
 export function settleSendResponse(queue, data, ctx) {
-  var status = data && data.status;
+  // Normalize a null / non-object 2xx body once, here at the shared
+  // chokepoint, so neither pane's call site has to guard it (interactive
+  // passed bare `data`, the coordinator passed `data || {}` — the divergence
+  // this helper exists to erase).  In-tree /send always returns an object, so
+  // this only hardens against a misbehaving proxy answering e.g. `200 null`;
+  // without it the unknown/"ok" fall-through below would deref
+  // data.attached_ids and surface a delivered message as a connection error.
+  data = data || {};
+  var status = data.status;
   if (status === "queued" && data.msg_id) {
     var queuedEl = ctx.queuedEl;
     if (!queuedEl && data.deferred) {
