@@ -134,9 +134,12 @@ export function projectsError() {
 
 /** Whether this deployment requires new chats to be filed under a project
  *  (server.require_project). ADVISORY only — the create endpoint on the
- *  enforcing node is authoritative. Fails OPEN to false on any refresh failure
- *  so the composer never hides options on a stale-true value; read it only
- *  AFTER {@link refreshProjects} resolves. */
+ *  enforcing node is authoritative. Reads the current cached value
+ *  SYNCHRONOUSLY: before the first {@link refreshProjects} resolves it is the
+ *  fail-open default false, so a synchronous read is safe — a composer can seed
+ *  UI from the warm cache immediately and re-read after a refresh to catch a
+ *  change. Fails OPEN to false on any refresh failure too, so the composer never
+ *  hides options on a stale-true value. */
 export function requireProject() {
   return _requireProject;
 }
