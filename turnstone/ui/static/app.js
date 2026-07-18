@@ -399,15 +399,37 @@ function showNewWsModal(forkFromWsId) {
     });
 
   // Project picker — populated from the shared projects cache, refreshed on
-  // open so a project created elsewhere appears.  Hidden when forking: a fork
-  // inherits its parent's project.
+  // open. Fresh creates SHOW it; forks HIDE it — a fork's project is its
+  // source's, enforced server-side (an explicit body project_id is discarded for
+  // a fork), so the frontend never sends a project for a fork.
+  //
+  // By design there is NO in-modal project picker for a fork: under
+  // require_project a fork of a PROJECTLESS source is refused by the node with a
+  // 400 and no project field (matches the setting help "forking a chat that has
+  // no project is refused just like starting a fresh chat without one") — the
+  // operator files the source under a project first. Do NOT "restore" a fork
+  // project picker here without re-opening the cross-project re-file hole it caused.
   const projLabel = document.querySelector('label[for="new-ws-project"]');
   const projSelect = document.getElementById("new-ws-project");
+  const projHint = projLabel ? projLabel.querySelector(".label-hint") : null;
   if (projLabel) projLabel.hidden = !!_forkFromWsId;
   if (projSelect) projSelect.hidden = !!_forkFromWsId;
+  // Seed the hint from the warm cache SYNCHRONOUSLY so a fresh create isn't
+  // mislabeled "optional" for the duration of the (redundant) refresh round-trip
+  // — requireProject() reads a cache the rail warms at startup. The refresh below
+  // re-affirms it for the rare cold-cache open.
+  if (projHint && !_forkFromWsId && window.TurnstoneProjects) {
+    projHint.textContent = window.TurnstoneProjects.requireProject()
+      ? "required"
+      : "optional";
+  }
   if (projSelect && !_forkFromWsId && window.TurnstoneProjects) {
     window.TurnstoneProjects.refreshProjects().then(function () {
-      _populateProjectSelect(projSelect);
+      const strict = !!window.TurnstoneProjects.requireProject();
+      // Honest label: under require_project a fresh create must resolve to a real
+      // project, so the static "optional" hint must not claim otherwise.
+      if (projHint) projHint.textContent = strict ? "required" : "optional";
+      _populateProjectSelect(projSelect, { requireProject: strict });
     });
   }
 
@@ -479,6 +501,9 @@ function _ensureStandaloneProjectCreator(sel) {
     },
     onClose: function () {
       if (sel.value === _PROJECT_NEW) sel.value = "";
+      // Under require_project a fresh picker must not be left blank after a
+      // cancelled "+ New project…" — snap back to a valid project.
+      _reconcileRequiredProjectSelection(sel);
     },
   });
   if (sel.parentNode) sel.parentNode.insertBefore(creator.el, sel.nextSibling);
@@ -502,10 +527,7 @@ function _populatePersonaSelect(sel) {
   if (placeholder) sel.appendChild(placeholder);
   const choices = window.TurnstonePersonas.personaChoices("interactive");
   choices.forEach(function (c) {
-    const opt = document.createElement("option");
-    opt.value = c.value;
-    opt.textContent = c.text;
-    sel.appendChild(opt);
+    _appendOption(sel, c.value, c.text, false);
   });
   const stillValid = choices.some(function (c) {
     return c.value === previous;
@@ -518,28 +540,90 @@ function _populatePersonaSelect(sel) {
   }
 }
 
-// Fill a project <select> from the shared projects cache, preserving its first
-// <option> (the "No project" placeholder) and the current selection, and append
-// the "+ New project…" sentinel.  No-op when the projects bridge is absent
-// (project.read denied / still loading).
-function _populateProjectSelect(sel) {
+// Add one <option> to a project <select>.
+function _appendOption(sel, value, text, disabled) {
+  const opt = document.createElement("option");
+  opt.value = value;
+  opt.textContent = text;
+  if (disabled) opt.disabled = true;
+  sel.appendChild(opt);
+}
+
+// True when *val* is currently an <option> value on *sel*.
+function _optionExists(sel, val) {
+  for (let i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === val) return true;
+  }
+  return false;
+}
+
+// Fill a project <select> from the shared projects cache.  The picker MODE is
+// passed EXPLICITLY by each caller as {requireProject}; a re-populate from the
+// inline "+ New project…" creator passes nothing and reuses the mode stamped on
+// the element at open time.  This helper NEVER reads the _forkFromWsId module
+// global — the dashboard picker shares it.  No-op when the projects bridge is
+// absent (project.read denied / still loading).  Forks don't reach this helper:
+// their picker is hidden and their project is inherited server-side.
+//
+// Option 0 (placeholder) by mode:
+//   - gate off:            "No project" (value "" -> a projectless create).
+//   - gate on + projects:  "Select a project…" (value "") — the user must
+//                          consciously pick; we never auto-select a project they
+//                          didn't choose (it could silently file the chat under a
+//                          shared one).
+//   - gate on + none:      a DISABLED "No projects available" notice (value "").
+function _populateProjectSelect(sel, opts) {
   if (!sel || !window.TurnstoneProjects) return;
+  const mode = opts || sel._projMode || {};
+  sel._projMode = mode;
+  const strict = !!mode.requireProject;
   _ensureStandaloneProjectCreator(sel);
   const previous = sel.value;
-  const placeholder = sel.options.length ? sel.options[0] : null;
+  const choices = window.TurnstoneProjects.projectChoices();
   sel.replaceChildren();
-  if (placeholder) sel.appendChild(placeholder);
-  window.TurnstoneProjects.projectChoices().forEach(function (c) {
-    const opt = document.createElement("option");
-    opt.value = c.value;
-    opt.textContent = c.text;
-    sel.appendChild(opt);
+  if (!strict) {
+    _appendOption(sel, "", "No project", false);
+  } else if (choices.length === 0) {
+    _appendOption(sel, "", "No projects available", true);
+  } else {
+    // strict + has projects: a "Select a project…" prompt (value "") so the user
+    // must consciously pick — never auto-file under an unchosen (possibly shared)
+    // project. Zero-touch submit sends no project and the gate returns the 400.
+    _appendOption(sel, "", "Select a project…", false);
+  }
+  choices.forEach(function (c) {
+    _appendOption(sel, c.value, c.text, false);
   });
-  const newOpt = document.createElement("option");
-  newOpt.value = _PROJECT_NEW;
-  newOpt.textContent = "+ New project…";
-  sel.appendChild(newOpt);
-  if (previous && previous !== _PROJECT_NEW) sel.value = previous;
+  _appendOption(sel, _PROJECT_NEW, "+ New project…", false);
+  if (previous && previous !== _PROJECT_NEW && _optionExists(sel, previous)) {
+    sel.value = previous;
+  }
+  _reconcileRequiredProjectSelection(sel);
+}
+
+// Under require_project the picker keeps a VALID selection — an already-chosen
+// real project, else the "Select a project…" prompt (value "", installed by
+// populate), else (no projects) the disabled "No projects available" notice. It
+// must NOT auto-select a real project the user didn't choose — that silently
+// files a required chat under a possibly-shared project. No-op when the gate is
+// off.  Idempotent — only sets the SELECTION, never adds options.
+function _reconcileRequiredProjectSelection(sel) {
+  if (!sel) return;
+  const mode = sel._projMode || {};
+  if (!mode.requireProject) return;
+  const real = window.TurnstoneProjects
+    ? window.TurnstoneProjects.projectChoices()
+    : [];
+  if (real.length === 0) {
+    sel.value = ""; // the disabled "No projects available" notice
+    return;
+  }
+  const isReal = real.some(function (c) {
+    return c.value === sel.value;
+  });
+  // Keep a real pick; otherwise rest on the "Select a project…" prompt (value
+  // ""), never auto-selecting an unchosen project.
+  if (!isReal) sel.value = "";
 }
 
 function submitNewWs() {
@@ -561,9 +645,14 @@ function submitNewWs() {
   if (model) body.model = model;
   if (judge_model) body.judge_model = judge_model;
   if (skill && !_forkFromWsId) body.skill = skill;
-  // A fork inherits its parent's project (the picker is hidden); only a fresh
-  // create carries an explicit project_id.
-  if (project_id && !_forkFromWsId) body.project_id = project_id;
+  // Only a FRESH create sends a project_id; a fork's project is its source's,
+  // enforced server-side (the picker is hidden for forks, and any explicit pid is
+  // discarded for a fork on the node). No _PROJECT_NEW guard: the select's change
+  // handler resets the sentinel to "" before opening the creator, so it can't
+  // reach submit (the dashboard quick-create path likewise doesn't filter it).
+  if (project_id && !_forkFromWsId) {
+    body.project_id = project_id;
+  }
   // Persona likewise — a fork resumes the source's stamped persona.
   if (persona && !_forkFromWsId) body.persona = persona;
   if (_forkFromWsId) body.resume_ws = _forkFromWsId;
@@ -597,7 +686,19 @@ function submitNewWs() {
     .then(function (data) {
       window.TurnstoneHatch.setBusy(dlg, false);
       if (data.error) {
-        _newWsError(data.error);
+        // A projectless-source fork can't satisfy require_project in this modal
+        // (no picker, and a pick would be discarded server-side), so the generic
+        // "choose a project" text points at an impossible remedy — surface the
+        // real one (file the source under a project first) instead.
+        if (_forkFromWsId && data.code === "require_project") {
+          _newWsError(
+            "This chat isn't filed under a project, so it can't be forked while " +
+              "this deployment requires one. File the source chat under a project " +
+              "first, then fork it.",
+          );
+        } else {
+          _newWsError(data.error);
+        }
         return;
       }
       if (data.ws_id) {
@@ -1398,7 +1499,11 @@ function _loadDashboardOptionsLists() {
   const projSel = document.getElementById("dashboard-project");
   if (projSel && window.TurnstoneProjects) {
     window.TurnstoneProjects.refreshProjects().then(function () {
-      _populateProjectSelect(projSel);
+      // Dashboard quick-create is ALWAYS a fresh create (never a fork); pass the
+      // mode explicitly so the shared helper never reads the fork-only global.
+      _populateProjectSelect(projSel, {
+        requireProject: !!window.TurnstoneProjects.requireProject(),
+      });
     });
   }
 

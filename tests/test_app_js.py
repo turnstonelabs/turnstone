@@ -2311,3 +2311,49 @@ def test_console_has_matching_pane_hotkeys() -> None:
     assert '"Fork"' not in index and "New workstream" not in index, (
         "Fork + New are intentionally omitted on the console"
     )
+
+
+def test_fork_hides_project_picker() -> None:
+    """A fork must NOT show a project picker. A fork inherits its source's project
+    (enforced server-side), and a re-fileable fork picker was a cross-tenant
+    history-relocation vector — so showNewWsModal hides the picker for forks and
+    the "Keep source's project" fork option is gone."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "projSelect.hidden = !!_forkFromWsId" in body, (
+        "the new-ws project picker must be hidden for forks"
+    )
+    assert "Keep source's project" not in body, (
+        "the fork project picker (and its 'Keep source's project' option) must be removed"
+    )
+
+
+def test_submit_gates_project_on_fork_flag() -> None:
+    """submitNewWs must send body.project_id ONLY for a fresh create
+    (!_forkFromWsId) — a fork never sends a project (its project is the source's,
+    enforced server-side). Not gated on picker visibility or a requireProject()
+    re-read."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    m = re.search(r"function submitNewWs\(\)\s*\{(.*?)\n\}", body, re.S)
+    assert m is not None, "could not locate submitNewWs"
+    fn = m.group(1)
+    assert "TurnstoneProjects.requireProject" not in fn, (
+        "submit must not re-read the requireProject() advisory"
+    )
+    assert re.search(r"project_id && !_forkFromWsId", fn), (
+        "submit must gate project_id on !_forkFromWsId (a fork never sends a project)"
+    )
+
+
+def test_strict_picker_requires_explicit_pick() -> None:
+    """Under require_project the fresh picker must NOT auto-select the first
+    project (which silently mis-files a required chat under a possibly-shared
+    project) — it offers a 'Select a project…' prompt so the user consciously
+    chooses."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "Select a project" in body, (
+        "strict picker must offer an explicit 'Select a project…' prompt"
+    )
+    m = re.search(r"function _reconcileRequiredProjectSelection\(sel\)\s*\{(.*?)\n\}", body, re.S)
+    assert m is not None, "could not locate _reconcileRequiredProjectSelection"
+    fn = m.group(1)
+    assert "real[0]" not in fn, "strict picker must not auto-select the first project"

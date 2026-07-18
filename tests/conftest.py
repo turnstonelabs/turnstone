@@ -430,6 +430,40 @@ def mock_openai_client():
     return client
 
 
+@pytest.fixture
+def make_config_store():
+    """Factory for a lightweight ConfigStore double.
+
+    ``make_config_store(**overrides)`` returns an object whose ``.get(key)``
+    yields the override when present, else the registered SettingDef default —
+    mirroring the real :meth:`ConfigStore.get` fail-open (a bool setting reads
+    as its ``False`` default on a miss, never ``None``). Shared by the
+    ``server.require_project`` gate / advisory tests.
+    """
+
+    _unset = object()
+
+    def _make(**overrides: Any) -> Any:
+        from turnstone.core.settings_registry import SETTINGS
+
+        class _ConfigStoreDouble:
+            def get(self, key: str, default: Any = _unset) -> Any:
+                # Mirror ConfigStore.get precedence exactly: cache (overrides)
+                # first, then a caller-supplied default, then the registry
+                # default, then None — so a reused caller passing an explicit
+                # default for an unset key gets the same value production would.
+                if key in overrides:
+                    return overrides[key]
+                if default is not _unset:
+                    return default
+                defn = SETTINGS.get(key)
+                return defn.default if defn else None
+
+        return _ConfigStoreDouble()
+
+    return _make
+
+
 @pytest.fixture(autouse=True)
 def _clear_policy_cache():
     """Drop the in-process tool-policy cache between tests.

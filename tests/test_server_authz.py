@@ -2468,3 +2468,32 @@ class TestCompactCommandDispatch:
         assert resp.status_code == 409
         assert resp.json()["status"] == "busy"
         assert ws.session.commands == []
+
+
+class TestRequireProjectMountWiring:
+    """server.require_project is wired on the REAL interactive create mount
+    (create_gate_require_project=True on interactive_endpoint_config). Synthetic-
+    cfg unit tests can't catch a mis-wire on the actual mount, so drive the
+    mounted endpoint end-to-end."""
+
+    def test_projectless_interactive_create_gated_when_on(self, app_client, make_config_store):
+        client, _mgr = app_client
+        client.app.state.config_store = make_config_store(**{"server.require_project": True})
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "no-project"},
+            headers=_auth("user-1", permissions=frozenset({"workstreams.create"})),
+        )
+        assert resp.status_code == 400, resp.json()
+        assert resp.json().get("code") == "require_project"
+
+    def test_projectless_interactive_create_allowed_when_off(self, app_client, make_config_store):
+        client, _mgr = app_client
+        client.app.state.config_store = make_config_store()  # flag off (default)
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "no-project"},
+            headers=_auth("user-1", permissions=frozenset({"workstreams.create"})),
+        )
+        body = resp.json()
+        assert not (resp.status_code == 400 and body.get("code") == "require_project"), body

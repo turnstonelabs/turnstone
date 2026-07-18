@@ -469,6 +469,61 @@ def ensure_project_attachable(
         return (403, "project access could not be verified")
 
 
+# ---------------------------------------------------------------------------
+# server.require_project — opt-in, default-off gate refusing projectless
+# interactive creates. One predicate is the ONLY flag read (gate + advisory
+# both call it) so authoritative and advisory logic cannot drift.
+# ---------------------------------------------------------------------------
+
+# Discriminator on the node's 400 body. The console cluster-create proxy
+# surfaces ONLY this coded 400 to the operator and masks every other node
+# outcome to a sanitized 502, so this string is a shared contract — import it
+# on both sides rather than re-spelling the literal.
+REQUIRE_PROJECT_CODE = "require_project"
+
+# Operator-facing 400 message. Deliberately generic: a projectless, private,
+# dangling, or nonexistent fork source must all yield this IDENTICAL text, or
+# the message itself becomes a cross-tenant oracle.
+REQUIRE_PROJECT_ERROR = (
+    "This deployment requires every new chat to be filed under a project. "
+    "Choose a project and try again."
+)
+
+
+def require_project_enabled(config_store: Any) -> bool:
+    """Return True iff the ``server.require_project`` gate is switched on.
+
+    The SINGLE flag read, shared by the authoritative create gate and the
+    advisory ``list_projects`` field so the two cannot diverge in logic.
+    Fail-open: a missing config store (storage unwired) reads as off. The
+    ConfigStore returns the registered SettingDef default (``False``) on a
+    cache miss — so an unset flag is off, not ``None`` — but only because the
+    SettingDef IS registered; forgetting it silently disables the feature.
+    """
+    return config_store is not None and bool(config_store.get("server.require_project"))
+
+
+def require_project_denies_create(config_store: Any, auth: Any, project_id: Any) -> bool:
+    """Return True to REFUSE an interactive create under ``server.require_project``.
+
+    Refuses only when the gate is on, the caller is not exempt automation, and
+    no project is attached (whitespace-only counts as none). Exempt identities:
+    the ``service`` scope (channel gateway, scheduler) and coordinator SESSION
+    spawns (``token_source == "coordinator"``). NOT exempt on any admin
+    permission — ``admin.coordinator`` is a human-operator permission and would
+    leak every operator through the gate. ``console-proxy`` (the normal proxied
+    human) is deliberately NOT exempt: it carries the human's own scopes, which
+    never include ``service``.
+    """
+    if not require_project_enabled(config_store):
+        return False
+    if auth is not None and auth.has_scope("service"):
+        return False
+    if getattr(auth, "token_source", "") == "coordinator":
+        return False
+    return not str(project_id or "").strip()
+
+
 def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:
     """Derive legacy scopes from a granular permission set."""
     scopes: set[str] = set()

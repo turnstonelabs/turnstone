@@ -652,6 +652,13 @@ def _bounded_body_preview(text: str | bytes, cap: int = 200) -> str:
     return _CONTROL_CHAR_RE.sub(" ", text)[:cap]
 
 
+def _dispatch_failed(node_id: str) -> JSONResponse:
+    """The sanitized 502 the cluster-create proxy returns for every masked node
+    outcome (network failure, unparseable 2xx body, and any non-require_project
+    node status). One wording, one status — each caller keeps its own distinct log."""
+    return JSONResponse({"error": f"Dispatch to node {node_id} failed"}, status_code=502)
+
+
 def _proxy_auth_headers(request: Request) -> dict[str, str]:
     """Build auth headers for proxied requests to upstream servers.
 
@@ -2205,18 +2212,81 @@ async def create_workstream(request: Request) -> JSONResponse:
             )
         else:
             resp = await client.post(node_url, json=ws_body, headers=headers)
-        resp.raise_for_status()
     except httpx.HTTPError as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
-        return JSONResponse({"error": f"Dispatch to node {node_id} failed"}, status_code=502)
+        return _dispatch_failed(node_id)
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "correlation_id": resp.json().get("ws_id", ""),
-            "target_node": node_id,
-        }
+    # The node is the authoritative require_project gate. Surface ONLY its
+    # coded require_project 400 to the operator; mask every OTHER node outcome
+    # as an opaque 502. Rationale (do not "simplify" by re-emitting the node
+    # status/body generically):
+    #   * a node 401 re-emitted here trips authFetch's reactive refresh +
+    #     force-logout, dumping a VALID operator to the login overlay and
+    #     double-sending the (non-idempotent) create;
+    #   * a node 429 re-emitted here trips authFetch's auto-retry, minting a
+    #     DUPLICATE workstream;
+    #   * any non-require_project node body may carry internal detail
+    #     ("cannot fork <id>: <persona ValueError>", skill/persona/path text)
+    #     that would land in the operator's browser DOM.
+    # The discriminator is an EXACT code match: coded-but-different bodies
+    # (too_many/too_large/upload) and every un-coded 400 mask to 502. The
+    # actionable attach-denied 403 and factory-misconfig 503 are also masked
+    # to 502 — a deliberate leak boundary; do NOT surface 403/503 here without
+    # re-checking the leak. Branch on the explicit success range (not
+    # raise_for_status) so a future httpx that lets a 3xx through still cannot
+    # reach the 2xx json parse. Guard BOTH body reads (a 204 / non-JSON 2xx
+    # would otherwise raise a JSONDecodeError → console 500 → operator retry →
+    # orphan/duplicate ws).
+    try:
+        _raw = resp.json()
+        node_body = _raw if isinstance(_raw, dict) else None
+    except Exception:
+        # Broad by design at this console->node proxy boundary: ANY parse failure
+        # (a 204 with no body, an intermediary's HTML, a truncated body) must fall
+        # through to the 502 mask below, never propagate. Deliberately wider than
+        # the codebase's narrow (ValueError, JSONDecodeError) json-guard.
+        node_body = None
+
+    if 200 <= resp.status_code < 300:
+        if node_body is None:
+            log.warning(
+                "Workstream dispatch to %s: unparseable %s success body: %s",
+                node_id,
+                resp.status_code,
+                _bounded_body_preview(resp.content),
+            )
+            return _dispatch_failed(node_id)
+        return JSONResponse(
+            {
+                "status": "ok",
+                "correlation_id": node_body.get("ws_id", ""),
+                "target_node": node_id,
+            }
+        )
+
+    from turnstone.core.auth import REQUIRE_PROJECT_CODE, REQUIRE_PROJECT_ERROR
+
+    if (
+        resp.status_code == 400
+        and node_body is not None
+        and node_body.get("code") == REQUIRE_PROJECT_CODE
+    ):
+        # Surface OUR canonical wording, not the node's echoed `error` string: a
+        # version-skewed or misbehaving node must not control the operator-facing
+        # text, and this keeps the message identical across every refusal cause.
+        log.info("Workstream dispatch to %s refused: require_project", node_id)
+        return JSONResponse(
+            {"error": REQUIRE_PROJECT_ERROR, "code": REQUIRE_PROJECT_CODE},
+            status_code=400,
+        )
+
+    log.warning(
+        "Workstream dispatch to %s failed: node status %s: %s",
+        node_id,
+        resp.status_code,
+        _bounded_body_preview(resp.content),
     )
+    return _dispatch_failed(node_id)
 
 
 # ---------------------------------------------------------------------------

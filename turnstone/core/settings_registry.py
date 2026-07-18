@@ -358,6 +358,23 @@ def _build_registry() -> dict[str, SettingDef]:
             "When the limit is reached, the oldest idle workstream is evicted to make room. "
             "Each workstream uses memory proportional to its conversation history.",
         ),
+        SettingDef(
+            "server.require_project",
+            "bool",
+            False,
+            "Require new interactive chats to be filed under a project",
+            "server",
+            help="When on, starting a new interactive chat is refused unless it is filed "
+            "under a project. This is off by default and changes nothing until you turn it "
+            "on. A person can start a chat only once they belong to at least one project: "
+            "there is no automatic or personal project, so before turning this on in a "
+            "strict deployment, give each user membership in a project or mark a project "
+            "public, or they will not be able to start chats at all. Forking or resuming a "
+            "chat keeps the source chat's project; forking a chat that has no project is "
+            "refused just like starting a fresh chat without one. Automation such as "
+            "channel and scheduler activity, and coordinator-spawned sessions, are not "
+            "affected.",
+        ),
         # -- cluster --------------------------------------------------------
         SettingDef(
             "cluster.node_fan_out_limit",

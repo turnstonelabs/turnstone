@@ -21,6 +21,7 @@ let _loaded = false; // has the first refresh attempt completed (ok or failed)?
 let _lastError = null; // last failure: HTTP status, 0 for network/parse, null when ok
 let _inflight = null; // shared pending refresh so concurrent callers coalesce
 let _fingerprint = null; // last fired map signature, for change-detection
+let _requireProject = false; // server.require_project advisory; fail-open false
 const _subs = []; // () => void, fired after each CHANGED refresh
 
 function _fp(rows) {
@@ -79,12 +80,16 @@ export function refreshProjects() {
       // than blanking it, and record the status so the failure is visible
       // instead of looking like an empty list.
       _lastError = r.status;
+      // The require_project advisory fails OPEN: a stale-true value would make
+      // the composer hide options on a transient error, so reset it to false.
+      _requireProject = false;
       console.warn("projects: GET /v1/api/projects -> " + r.status);
       return null;
     })
     .then(function (data) {
       if (data) {
         _lastError = null;
+        _requireProject = !!data.require_project;
         _setCache(data.projects || []);
       }
       return _cache;
@@ -94,6 +99,7 @@ export function refreshProjects() {
       // preserve the last-known cache, never reject (callers chain a bare
       // .then), and surface the failure.
       _lastError = 0;
+      _requireProject = false; // fail-open (see the non-OK branch above)
       console.warn("projects: refresh failed", e);
       return _cache;
     })
@@ -124,6 +130,15 @@ export function projectsLoaded() {
  *  apart from "couldn't load projects" without re-fetching. */
 export function projectsError() {
   return _lastError;
+}
+
+/** Whether this deployment requires new chats to be filed under a project
+ *  (server.require_project). ADVISORY only — the create endpoint on the
+ *  enforcing node is authoritative. Fails OPEN to false on any refresh failure
+ *  so the composer never hides options on a stale-true value; read it only
+ *  AFTER {@link refreshProjects} resolves. */
+export function requireProject() {
+  return _requireProject;
 }
 
 /** Display name for a project_id, or "" when unknown (not yet loaded, no
@@ -169,6 +184,7 @@ window.TurnstoneProjects = {
   getProjects: getProjects,
   projectsLoaded: projectsLoaded,
   projectsError: projectsError,
+  requireProject: requireProject,
   projectName: projectName,
   projectChoices: projectChoices,
   onProjectsChange: onProjectsChange,

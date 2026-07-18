@@ -1529,6 +1529,13 @@ function _refreshAndPopulateProjects() {
 // Populate the launcher's Project picker from the shared cache, preserving the
 // current pick across the rebuild (same reason as _populateLauncherNodes) and
 // always appending the "+ New project…" sentinel after the live list.
+//
+// Under server.require_project the console launcher intentionally does NOT gate
+// this picker on TurnstoneProjects.requireProject() (unlike the node new-ws
+// dialog): the node create endpoint is the authoritative gate, and its refusal
+// is surfaced to the operator by the console proxy (create_workstream). A
+// client-side required-project picker here is a deferred UX nicety, not a
+// correctness requirement.
 function _populateHomeProjectDropdown() {
   if (!_homeCoordComposer) return;
   const TP = window.TurnstoneProjects;

@@ -428,6 +428,12 @@ class SessionEndpointConfig:
     # wires ``False`` — coord create runs only on the console process
     # and the operator's auth result is the source of truth.
     create_supports_user_id_override: bool = False
+    # When ``True`` the shared create handler applies the ``server.require_project``
+    # gate (refuse a projectless interactive create). Declarative per-mount
+    # capability — interactive wires ``True``; coordinator leaves it ``False`` so
+    # coordinator spawns are never gated. A cfg flag rather than a hardcoded kind
+    # literal, matching the ``create_supports_*`` idiom.
+    create_gate_require_project: bool = False
     # (request, body, uid, uploaded_files) -> JSONResponse | None.
     # Per-kind pre-create gate (ws_id format, parent ownership, kind
     # validation, etc. on interactive; 401-on-empty-uid on coord).
@@ -2563,6 +2569,29 @@ def make_create_handler(
             err_validate = await cfg.create_validate_request(request, body, uid, uploaded_files)
             if err_validate is not None:
                 return err_validate
+
+        # --- require_project gate (interactive-create mounts only) -------
+        # Gated by the declarative cfg.create_gate_require_project capability
+        # (True on the interactive create mount, default-False on coordinator)
+        # rather than a hardcoded kind literal, matching the create_supports_*
+        # idiom — coordinator spawns are exempt by design. By this point the
+        # validator has applied any parent-/resume-inherited project_id into body
+        # AND (for a fork) discarded any explicit pick to the source's project or
+        # "", so a private/dangling/projectless fork SOURCE funnels to the SAME
+        # uniform 400 as a projectless fresh create.
+        if cfg.create_gate_require_project:
+            from turnstone.core.auth import (
+                REQUIRE_PROJECT_CODE,
+                REQUIRE_PROJECT_ERROR,
+                require_project_denies_create,
+            )
+
+            _config_store = getattr(request.app.state, "config_store", None)
+            if require_project_denies_create(_config_store, auth, body.get("project_id")):
+                return JSONResponse(
+                    {"error": REQUIRE_PROJECT_ERROR, "code": REQUIRE_PROJECT_CODE},
+                    status_code=400,
+                )
 
         # --- Skill resolution --------------------------------------------
         # Both kinds resolve a body ``skill`` field through

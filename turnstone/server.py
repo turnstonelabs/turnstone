@@ -2216,6 +2216,7 @@ async def _interactive_create_validate_request(
             status_code=400,
         )
     inherited_pid = False
+    resume_inherited_pid = False
     body_parent = body.get("parent_ws_id") or None
     if body_parent is not None:
         from turnstone.core.storage._registry import get_storage as _get_storage_for_parent
@@ -2243,6 +2244,60 @@ async def _interactive_create_validate_request(
         if not (body.get("project_id") or "") and parent_row.get("project_id"):
             body["project_id"] = parent_row.get("project_id")
             inherited_pid = True
+    # Fork/resume: a fork's project is STRUCTURALLY its source's, and only when
+    # the require_project gate is on (off is byte-identical — no resolve, no
+    # inherit, explicit project_id untouched). This DELIBERATELY DIVERGES from the
+    # sibling parent-coordinator block at :2244: that block DEFERS to an explicit
+    # body project_id (a coordinator spawn carries no history, so the
+    # spawn_workstream(project=…) escape hatch is legitimate), whereas a fork
+    # copies the SOURCE's conversation — which must never be re-filed under an
+    # unrelated project the caller merely owns — so here we DISCARD any explicit
+    # project_id up front and then inherit only the source's own project. An
+    # explicit body project_id can never influence a fork.
+    #
+    # No cross-tenant oracle, by construction: for a source that is inaccessible-
+    # private (attach 403 → resume_inherited_pid drop below), projectless, or
+    # nonexistent/unresolvable, body["project_id"] stays "" and the gate emits ONE
+    # uniform 400 — identical BODY *and* STATUS (the discard, not body-equalising,
+    # is what makes them indistinguishable). The residual side-channel is DB-query
+    # LATENCY only (an inaccessible-private source runs extra get_project/
+    # is_project_member); constant-time storage is out of scope.
+    #
+    # RAW/raising storage is deliberate — the swallowing memory.resolve_workstream
+    # would turn a transient DB error into None → a misleading "requires a project"
+    # 400, whereas a raise here surfaces an honest 500 (consistent with the parent
+    # block's sync get_workstream). resume_ws is only read, never mutated:
+    # post_install still performs the real fork (one extra indexed lookup on the
+    # rare fork path). Caveat (pre-existing to the resume mechanic): post_install
+    # re-resolves via the swallowing resolver, so a delete/blip between here and
+    # there degrades the fork to a fresh chat in the inherited project.
+    from turnstone.core.auth import require_project_enabled
+
+    if (
+        isinstance(resume_ws_id, str)
+        and resume_ws_id
+        and require_project_enabled(getattr(request.app.state, "config_store", None))
+    ):
+        # Discard any caller-supplied project_id FIRST: a fork is filed under its
+        # SOURCE's project, or (no accessible source project) refused — never a
+        # caller pick. This structural discard is what blocks the re-file and makes
+        # the {inaccessible/projectless/nonexistent}-source outcomes uniform. It
+        # gates on require_project_enabled (the flag) and NOT require_project_denies_
+        # create (flag + service/coordinator exemptions), DELIBERATELY: the
+        # exemptions waive the "must have a project" MANDATE, but fork-integrity — a
+        # fork's copied history must never be re-filed under an unrelated project —
+        # is a security invariant that binds every forker while the feature is on.
+        # The two require_project predicates differ here on purpose.
+        body["project_id"] = ""
+        from turnstone.core.storage._registry import get_storage as _get_storage_for_resume
+
+        _rstorage = _get_storage_for_resume()
+        if _rstorage is not None:
+            _canonical = _rstorage.resolve_workstream(resume_ws_id)
+            _src_row = _rstorage.get_workstream(_canonical) if _canonical else None
+            if _src_row and _src_row.get("project_id"):
+                body["project_id"] = _src_row["project_id"]
+                resume_inherited_pid = True
     # Project attach gate (explicit or parent-inherited): a private
     # project accepts new workstreams only from its owner/members, and a
     # nonexistent EXPLICIT project_id is a caller error rather than a
@@ -2260,7 +2315,19 @@ async def _interactive_create_validate_request(
         denied = ensure_project_attachable(uid, attach_pid)
         if denied is not None:
             status, message = denied
-            if inherited_pid and status == 400:
+            if resume_inherited_pid:
+                # Resume-inherited project: ANY denial (unknown 400, private
+                # 403, storage-blip/None 403) drops to a projectless create, so
+                # a private/inaccessible/dangling SOURCE is indistinguishable
+                # from a projectless or nonexistent one. Surfacing the 403 would
+                # leak that the resume_ws id sits under a private project the
+                # caller can't see (a cross-tenant oracle). The require_project
+                # gate then emits ONE uniform 400 downstream.
+                body["project_id"] = ""
+            elif inherited_pid and status == 400:
+                # Parent-inherited dangling project (deleted): the child simply
+                # isn't attached. A 403 here (revoked coordinator membership)
+                # still hard-returns below — deliberately loud, unlike resume.
                 body["project_id"] = ""
             else:
                 return JSONResponse({"error": message}, status_code=status)
@@ -3110,7 +3177,7 @@ def _project_request_uid(request: Request) -> tuple[str, JSONResponse | None]:
 
 async def list_projects(request: Request) -> JSONResponse:
     """GET /v1/api/projects — projects the caller owns, is a member of, or public."""
-    from turnstone.core.auth import require_permission
+    from turnstone.core.auth import require_permission, require_project_enabled
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -3126,7 +3193,17 @@ async def list_projects(request: Request) -> JSONResponse:
     )
     storage = get_storage()
     rows = storage.list_projects_for_user(uid, include_archived=include_archived) if storage else []
-    return JSONResponse({"projects": [_project_view(r) for r in rows], "total": len(rows)})
+    # Advisory only — the create gate on the enforcing node is authoritative.
+    # Read via the SAME predicate so advisory and gate can't drift in logic
+    # (they still read per-process ConfigStore caches, which converge at rest).
+    cs = getattr(request.app.state, "config_store", None)
+    return JSONResponse(
+        {
+            "projects": [_project_view(r) for r in rows],
+            "total": len(rows),
+            "require_project": require_project_enabled(cs),
+        }
+    )
 
 
 async def create_project(request: Request) -> JSONResponse:
@@ -4667,6 +4744,7 @@ def create_app(
         sse_executor_lookup=lambda request: request.app.state.sse_executor,
         create_supports_attachments=True,
         create_supports_user_id_override=True,
+        create_gate_require_project=True,
         create_validate_request=_interactive_create_validate_request,
         create_build_kwargs=_interactive_create_build_kwargs,
         create_post_install=_interactive_create_post_install,
