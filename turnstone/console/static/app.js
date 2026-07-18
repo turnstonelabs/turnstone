@@ -1489,6 +1489,12 @@ function _ensureHomeComposerInit() {
 function _refreshAndPopulatePersonas() {
   const TP = window.TurnstonePersonas;
   if (!TP) return;
+  // Paint from the warm cache SYNCHRONOUSLY first so the Persona picker isn't
+  // empty for the refresh round-trip (the rail warms personas at startup), then
+  // refresh-and-repaint to catch a persona created elsewhere. _populateHome-
+  // PersonaDropdown preserves a mid-window pick and only applies the kind default
+  // when nothing valid is selected, so the second paint can't clobber a choice.
+  _populateHomePersonaDropdown();
   TP.refreshPersonas().then(_populateHomePersonaDropdown);
 }
 
@@ -1523,6 +1529,12 @@ function _populateHomePersonaDropdown() {
 function _refreshAndPopulateProjects() {
   const TP = window.TurnstoneProjects;
   if (!TP) return;
+  // Sync paint from the warm cache first (the launcher keeps its "No project"
+  // placeholder when cold), then refresh-and-repaint to catch a project created
+  // elsewhere. _populateHomeProjectDropdown preserves a mid-window pick. The
+  // console launcher intentionally does NOT gate on requireProject() (§8) — the
+  // node create endpoint is the authoritative gate.
+  _populateHomeProjectDropdown();
   TP.refreshProjects().then(_populateHomeProjectDropdown);
 }
 

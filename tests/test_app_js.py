@@ -2353,7 +2353,135 @@ def test_strict_picker_requires_explicit_pick() -> None:
     assert "Select a project" in body, (
         "strict picker must offer an explicit 'Select a project…' prompt"
     )
-    m = re.search(r"function _reconcileRequiredProjectSelection\(sel\)\s*\{(.*?)\n\}", body, re.S)
+    m = re.search(
+        r"function _reconcileRequiredProjectSelection\(sel, choices\)\s*\{(.*?)\n\}",
+        body,
+        re.S,
+    )
     assert m is not None, "could not locate _reconcileRequiredProjectSelection"
     fn = m.group(1)
     assert "real[0]" not in fn, "strict picker must not auto-select the first project"
+    # §6b polish: _populateProjectSelect threads its already-computed choices into
+    # reconcile rather than forcing a second projectChoices() recompute (the onClose
+    # creator caller still passes none and reconcile recomputes for it).
+    assert "_reconcileRequiredProjectSelection(sel, choices)" in body, (
+        "the populate helper must thread its computed choices into reconcile "
+        "(avoids a redundant projectChoices() recompute)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Composer selector FOUC — sync-paint-then-refresh guards
+# ---------------------------------------------------------------------------
+#
+# The project + persona composer selectors are painted from the warm shared
+# client cache (window.TurnstoneProjects / window.TurnstonePersonas, warmed by
+# the rail at startup) SYNCHRONOUSLY on open, BEFORE the deliberate async
+# refresh-and-repaint that catches items created elsewhere.  Pre-fix they were
+# painted only inside the refresh().then callback, so every open flashed an
+# empty dropdown for a network round-trip even when the data was already in
+# memory.  These guards pin the ordering — a synchronous populate must precede
+# the refresh().then — for all three composer surfaces (new-ws modal, dashboard
+# Options, console launcher).  Model/skill selectors are a separate later pass
+# and intentionally NOT covered here.
+
+
+def _slice_top_level_fn(body: str, header: str) -> str:
+    """Slice a top-level ``function`` body from ``header`` to the next
+    column-0 ``function`` declaration (or EOF).  Unlike
+    ``_slice_balanced_body`` this has no fixed-size window, so it is safe
+    for large functions like ``showNewWsModal``.  Nested (indented)
+    ``function () {…}`` expressions never match the ``\\nfunction `` bound,
+    so the slice stops at the next top-level function."""
+    start = body.index(header)
+    nxt = body.find("\nfunction ", start + 1)
+    return body[start:] if nxt < 0 else body[start:nxt]
+
+
+def test_new_ws_modal_paints_project_and_persona_from_cache_synchronously() -> None:
+    """FOUC fix: the new-ws modal's project + persona pickers paint from the warm
+    shared cache SYNCHRONOUSLY on open, BEFORE the async refresh-and-repaint — so a
+    warm-cache open (the common case; the rail warms the caches at startup) shows
+    the populated dropdowns immediately instead of flashing empty for a network
+    round-trip.  The refresh-on-open is KEPT (it catches items created elsewhere);
+    these guards pin only that a synchronous populate precedes it."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function showNewWsModal(")
+    # The FIRST _populateProjectSelect(projSelect, …) is the sync paint; it must
+    # precede the refreshProjects().then(…) async repaint.
+    sync_proj = fn.find("_populateProjectSelect(projSelect")
+    async_proj = fn.find("refreshProjects().then")
+    assert sync_proj >= 0, "the modal must paint the project picker from cache synchronously"
+    assert async_proj >= 0, "the modal must keep refreshProjects().then (catches remote changes)"
+    assert sync_proj < async_proj, (
+        "the synchronous project paint must precede the async refreshProjects().then "
+        "repaint — otherwise the picker flashes empty on every open"
+    )
+    sync_persona = fn.find("_populatePersonaSelect(personaSelect")
+    async_persona = fn.find("refreshPersonas().then")
+    assert sync_persona >= 0, "the modal must paint the persona picker from cache synchronously"
+    assert async_persona >= 0, "the modal must keep refreshPersonas().then"
+    assert sync_persona < async_persona, (
+        "the synchronous persona paint must precede the async refreshPersonas().then repaint"
+    )
+
+
+def test_dashboard_paints_project_and_persona_from_cache_synchronously() -> None:
+    """FOUC fix (dashboard composer twin of the modal): the dashboard Options
+    project + persona pickers paint synchronously from the warm cache before the
+    async refresh.  Also pins the deferred require_project polish — the dashboard
+    Project label carries a ``.label-hint`` span seeded ``required``/``optional``
+    from requireProject() synchronously, matching the new-ws modal."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _loadDashboardOptionsLists(")
+    sync_proj = fn.find("_populateProjectSelect(projSel")
+    async_proj = fn.find("refreshProjects().then")
+    assert sync_proj >= 0, "the dashboard must paint the project picker from cache synchronously"
+    assert async_proj >= 0, "the dashboard must keep refreshProjects().then"
+    assert sync_proj < async_proj, (
+        "the synchronous dashboard project paint must precede the async refresh repaint"
+    )
+    sync_persona = fn.find("_populatePersonaSelect(personaSel")
+    async_persona = fn.find("refreshPersonas().then")
+    assert sync_persona >= 0, "the dashboard must paint the persona picker from cache synchronously"
+    assert async_persona >= 0, "the dashboard must keep refreshPersonas().then"
+    assert sync_persona < async_persona, (
+        "the synchronous dashboard persona paint must precede the async refresh repaint"
+    )
+    # require_project label-hint parity: the dashboard Project label gained a
+    # .label-hint span, seeded synchronously from requireProject() like the modal.
+    html = _INDEX_HTML.read_text(encoding="utf-8")
+    lbl = html.index('for="dashboard-project"')
+    assert 'class="label-hint"' in html[lbl : lbl + 120], (
+        "the dashboard Project label must carry a .label-hint span (required/optional cue)"
+    )
+    sync_hint = fn.find("projHint.textContent")
+    assert 0 <= sync_hint < async_proj, (
+        "the dashboard project label hint must be seeded synchronously (before the refresh)"
+    )
+
+
+def test_console_launcher_paints_project_and_persona_from_cache_synchronously() -> None:
+    """FOUC fix (console launcher composer): the launcher's project + persona
+    pickers paint synchronously from the warm shared cache before the async
+    refresh-and-repaint, mirroring the standalone app.  The console launcher keeps
+    its ungated 'No project' semantics (§8); this only adds the sync pre-paint."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    proj_fn = _slice_top_level_fn(body, "function _refreshAndPopulateProjects(")
+    # The bare _populateHomeProjectDropdown() call is the sync paint; the refresh's
+    # .then argument has no parens, so this matches only the standalone sync call.
+    sync_proj = proj_fn.find("_populateHomeProjectDropdown()")
+    async_proj = proj_fn.find("refreshProjects().then")
+    assert sync_proj >= 0, "the launcher must paint the project picker from cache synchronously"
+    assert async_proj >= 0, "the launcher must keep refreshProjects().then"
+    assert sync_proj < async_proj, (
+        "the synchronous launcher project paint must precede the async refresh repaint"
+    )
+    persona_fn = _slice_top_level_fn(body, "function _refreshAndPopulatePersonas(")
+    sync_persona = persona_fn.find("_populateHomePersonaDropdown()")
+    async_persona = persona_fn.find("refreshPersonas().then")
+    assert sync_persona >= 0, "the launcher must paint the persona picker from cache synchronously"
+    assert async_persona >= 0, "the launcher must keep refreshPersonas().then"
+    assert sync_persona < async_persona, (
+        "the synchronous launcher persona paint must precede the async refresh repaint"
+    )

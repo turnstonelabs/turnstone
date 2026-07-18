@@ -424,6 +424,15 @@ function showNewWsModal(forkFromWsId) {
       : "optional";
   }
   if (projSelect && !_forkFromWsId && window.TurnstoneProjects) {
+    // Paint from the warm cache SYNCHRONOUSLY first so the picker isn't empty for
+    // the (redundant) refresh round-trip — the rail warms projects at startup and
+    // projectChoices()/requireProject() are sync. On a cold cache projectChoices()
+    // is [] and this is a no-op the async fills, so it's never worse than before.
+    // BOTH paints route through the SAME _populateProjectSelect, so the #867
+    // strict-picker invariant (never auto-select a real project) holds identically.
+    _populateProjectSelect(projSelect, {
+      requireProject: !!window.TurnstoneProjects.requireProject(),
+    });
     window.TurnstoneProjects.refreshProjects().then(function () {
       const strict = !!window.TurnstoneProjects.requireProject();
       // Honest label: under require_project a fresh create must resolve to a real
@@ -440,6 +449,11 @@ function showNewWsModal(forkFromWsId) {
   if (personaLabel) personaLabel.hidden = !!_forkFromWsId;
   if (personaSelect) personaSelect.hidden = !!_forkFromWsId;
   if (personaSelect && !_forkFromWsId && window.TurnstonePersonas) {
+    // Sync paint from the warm cache first, then refresh-and-repaint to catch a
+    // persona created elsewhere. _populatePersonaSelect preserves a mid-window
+    // pick and only applies the kind default when nothing valid is selected, so
+    // the second (async) paint can't clobber the user's choice.
+    _populatePersonaSelect(personaSelect);
     window.TurnstonePersonas.refreshPersonas().then(function () {
       _populatePersonaSelect(personaSelect);
     });
@@ -598,7 +612,9 @@ function _populateProjectSelect(sel, opts) {
   if (previous && previous !== _PROJECT_NEW && _optionExists(sel, previous)) {
     sel.value = previous;
   }
-  _reconcileRequiredProjectSelection(sel);
+  // Reuse the choices we already built — reconcile needs the same real-project
+  // list and would otherwise recompute projectChoices() a second time.
+  _reconcileRequiredProjectSelection(sel, choices);
 }
 
 // Under require_project the picker keeps a VALID selection — an already-chosen
@@ -607,13 +623,16 @@ function _populateProjectSelect(sel, opts) {
 // must NOT auto-select a real project the user didn't choose — that silently
 // files a required chat under a possibly-shared project. No-op when the gate is
 // off.  Idempotent — only sets the SELECTION, never adds options.
-function _reconcileRequiredProjectSelection(sel) {
+function _reconcileRequiredProjectSelection(sel, choices) {
   if (!sel) return;
   const mode = sel._projMode || {};
   if (!mode.requireProject) return;
-  const real = window.TurnstoneProjects
-    ? window.TurnstoneProjects.projectChoices()
-    : [];
+  // _populateProjectSelect threads in the projectChoices() list it already built;
+  // the inline "+ New project…" creator's onClose caller passes none, so recompute
+  // from the cache in that case.
+  const real =
+    choices ||
+    (window.TurnstoneProjects ? window.TurnstoneProjects.projectChoices() : []);
   if (real.length === 0) {
     sel.value = ""; // the disabled "No projects available" notice
     return;
@@ -1493,24 +1512,41 @@ function _loadDashboardOptionsLists() {
       });
   }
 
-  // Project picker — refresh the shared cache then repaint (also feeds the
-  // rail's group-by-project).  Re-fetched each time the options open so a
-  // project created elsewhere appears without a page reload.
+  // Project picker — paint from the warm cache then refresh-and-repaint (also
+  // feeds the rail's group-by-project).  Re-fetched each time the options open so
+  // a project created elsewhere appears without a page reload.
   const projSel = document.getElementById("dashboard-project");
+  const projLabel = document.querySelector('label[for="dashboard-project"]');
+  const projHint = projLabel ? projLabel.querySelector(".label-hint") : null;
   if (projSel && window.TurnstoneProjects) {
+    // Seed the "required"/"optional" label hint + paint the picker from the warm
+    // cache SYNCHRONOUSLY (mirrors showNewWsModal) so a fresh open isn't empty or
+    // mislabeled for the refresh round-trip; the async refresh below re-affirms
+    // both to catch a project created elsewhere. Dashboard quick-create is ALWAYS
+    // a fresh create (never a fork); the mode is passed explicitly so the shared
+    // helper never reads the fork-only global.
+    if (projHint) {
+      projHint.textContent = window.TurnstoneProjects.requireProject()
+        ? "required"
+        : "optional";
+    }
+    _populateProjectSelect(projSel, {
+      requireProject: !!window.TurnstoneProjects.requireProject(),
+    });
     window.TurnstoneProjects.refreshProjects().then(function () {
-      // Dashboard quick-create is ALWAYS a fresh create (never a fork); pass the
-      // mode explicitly so the shared helper never reads the fork-only global.
-      _populateProjectSelect(projSel, {
-        requireProject: !!window.TurnstoneProjects.requireProject(),
-      });
+      const strict = !!window.TurnstoneProjects.requireProject();
+      if (projHint) projHint.textContent = strict ? "required" : "optional";
+      _populateProjectSelect(projSel, { requireProject: strict });
     });
   }
 
-  // Persona picker — same refresh-on-open policy; kind default preselected
-  // so a zero-touch launch behaves exactly like today.
+  // Persona picker — same paint-from-cache-then-refresh policy; kind default
+  // preselected so a zero-touch launch behaves exactly like today.
   const personaSel = document.getElementById("dashboard-persona");
   if (personaSel && window.TurnstonePersonas) {
+    // Sync paint first, then refresh-and-repaint; the helper preserves a mid-
+    // window pick and only applies the kind default when nothing valid is chosen.
+    _populatePersonaSelect(personaSel);
     window.TurnstonePersonas.refreshPersonas().then(function () {
       _populatePersonaSelect(personaSel);
     });
