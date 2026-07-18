@@ -727,13 +727,18 @@ def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
             # REUSED session a pre-try raise after a prior errored turn finds
             # _has_persisted_error stale-True (it is session-lifetime — cleared
             # only by _emit_state idle/running, not per-turn), so the recorder
-            # would no-op and swallow the fresh error.  The raw-exc UI leak, the
-            # double state emit, and the pre-try no-persist (the coordinator can
-            # then read a STALE last_error on a reused-session retry) are known,
-            # match the /send and coord-send sibling closures, and are tracked in
-            # #865's per-turn error-signal redesign.
+            # would no-op and swallow the fresh error.  The DISPLAY string is
+            # sanitized inline (a credential-bearing base-URL in the exception
+            # text must not cross into the dashboard SSE, the confidentiality
+            # floor _record_fatal_error also enforces); the double state emit and
+            # the pre-try no-persist (a reused-session retry can then have the
+            # coordinator read a STALE last_error) still need the per-turn
+            # error-signal redesign and are tracked in #865, matching the /send
+            # and coord-send sibling closures.
             if ws.worker_thread is me:
-                ui.on_error(f"Error: {exc}")
+                from turnstone.core.memory import sanitize_error_text
+
+                ui.on_error(f"Error: {sanitize_error_text(str(exc))}")
                 ui.on_stream_end()
                 ui.on_state_change("error")
 

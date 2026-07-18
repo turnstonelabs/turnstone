@@ -776,3 +776,44 @@ class TestInitialWorkerFailureState:
         assert events, "init worker never emitted"
         assert all(e.get("state") != "error" for e in events)
         assert all(e.get("type") != "error" for e in events)
+
+
+def test_retry_closure_sanitizes_error_display(monkeypatch):
+    """The retry (_run) closure sanitizes the exception text before on_error, so
+    a credential-bearing base-URL in a backend error can't cross into the
+    dashboard SSE.  It deliberately does NOT route through ensure_error_recorded
+    (the reused-session stale-flag hazard — #865); the display-sanitize half of
+    that hygiene is fixed at the site.  Driven via the capture pattern: patch the
+    dispatcher to hand back the run closure, then run it inline as the owner."""
+    import threading
+    from types import SimpleNamespace
+
+    from turnstone.core import session_worker
+    from turnstone.server import _interactive_dispatch_retry
+
+    ui = _FakeUI(ws_id="ws-retry")
+
+    def _boom(_msg):
+        raise RuntimeError("cannot reach https://user:pass@host:8000/v1 for model=x")
+
+    ws = SimpleNamespace(
+        id="ws-retry", session=SimpleNamespace(send=_boom), ui=ui, worker_thread=None
+    )
+    captured: dict = {}
+
+    def _capture(_ws, *, enqueue, run, thread_name=None, **_kw):
+        captured["run"] = run
+        return True
+
+    monkeypatch.setattr(session_worker, "send", _capture)
+    _interactive_dispatch_retry(ws, "retry this")
+    assert "run" in captured, "retry did not dispatch through session_worker.send"
+    # The owner guard reads ws.worker_thread is the executing thread; run the
+    # captured closure inline as that owner.
+    ws.worker_thread = threading.current_thread()
+    captured["run"]()
+
+    errors = [e["message"] for e in ui.events if e.get("type") == "error"]
+    assert errors, "retry closure emitted no on_error"
+    assert all("user:pass" not in m for m in errors), errors  # credential redacted
+    assert any("REDACTED" in m for m in errors)  # the sanitizer ran, not a no-op
