@@ -1790,18 +1790,20 @@ class ChatSession:
         # end of tool setup. Only ``_mcp_tools_change_seq`` lives on.
         mcp_tools_seq_at_read = 0
         if kind == WorkstreamKind.COORDINATOR:
-            # No _apply_cwd_notes: COORDINATOR_TOOLS holds no cwd-dependent
-            # tool (no fs/shell), so there is nothing to render.
+            # No _set_interactive_tools/_apply_cwd_notes: COORDINATOR_TOOLS
+            # holds no cwd-dependent tool (no fs/shell), so there is nothing
+            # to render.
             self._tools = list(COORDINATOR_TOOLS)
-            self._task_tools = []
+            self._task_tools: list[dict[str, Any]] = []
         elif self._mcp_client:
             # ``self._mcp_client`` (not the raw kwarg) so an MCP-off persona
             # falls through to the no-MCP branch below.
             # Constants first — the attributes must exist for a listener
             # callback firing mid-construction; the ONE authoritative
-            # merged read runs after the registrations below.
-            self._tools = self._apply_cwd_notes(INTERACTIVE_TOOLS)
-            self._task_tools = self._apply_cwd_notes(TASK_AGENT_TOOLS)
+            # merged read runs after the registrations below.  (Also warms
+            # the get_workspace_dir config cache on the main thread, before
+            # any background-thread rebuild can race the first load.)
+            self._set_interactive_tools([])
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
@@ -1830,8 +1832,7 @@ class ChatSession:
             # the tool-search construction below reading mixed state.
             mcp_tools_seq_at_read = self._mcp_tools_change_seq
             mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-            self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools))
-            self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools))
+            self._set_interactive_tools(mcp_tools)
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
@@ -1840,8 +1841,7 @@ class ChatSession:
             # consented oauth_user servers.
             try_prime_user_pools(self._mcp_client, self._mcp_user_id, context="session-start")
         else:
-            self._tools = self._apply_cwd_notes(INTERACTIVE_TOOLS)
-            self._task_tools = self._apply_cwd_notes(TASK_AGENT_TOOLS)
+            self._set_interactive_tools([])
         # Inject the live alias list into the task_agent tool
         # description so the calling LLM sees its `model` parameter options.
         # Replaces affected tool dicts with deep copies — module-level
@@ -2603,8 +2603,7 @@ class ChatSession:
         # regardless; ``user_id=None`` would silently drop pool tools
         # that the LLM is allowed to call.
         mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_effective_user_id)
-        self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools))
-        self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools))
+        self._set_interactive_tools(mcp_tools)
         self._render_agent_tool_descriptions()
         self._rebuild_tool_search()
 
@@ -2657,22 +2656,36 @@ class ChatSession:
             parts.append(entry)
         return "Available personas: " + "; ".join(parts) + "."
 
+    def _set_interactive_tools(self, mcp_tools: list[dict[str, Any]]) -> None:
+        """Build both interactive tool lanes from pristine bases + MCP catalog.
+
+        THE single assignment path for every fresh interactive build of
+        ``self._tools`` AND ``self._task_tools`` — each lane routes through
+        ``_apply_cwd_notes`` here, so a future rebuild site cannot silently
+        drop the working-dir/workspace notes by assigning from the module
+        constants directly.  Pass ``[]`` when there is no MCP surface
+        (construction pre-read, MCP-off, disconnect): ``merge_mcp_tools``
+        with an empty list is just a fresh copy of the builtin base.
+        """
+        self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools))
+        self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools))
+
     def _apply_cwd_notes(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Render per-process working-dir/workspace notes into fs-tool descriptions.
 
-        THE required wrapper for every fresh interactive build of
-        ``self._tools`` AND ``self._task_tools`` (the task lane is a separate
-        list — instrumenting only ``self._tools`` silently drops sub-agents).
-        Applied at assignment time, so the copy cost is paid per rebuild
-        (construction, MCP catalog change, MCP disconnect), never per request,
-        and the wire tools block stays byte-stable for provider prompt caches
-        (both values are process-stable).  Input must be a pristine base
-        (module constants or ``merge_mcp_tools`` output) — never an
-        already-noted list; the append is not idempotent.  The
+        Reached via ``_set_interactive_tools``, which routes BOTH lanes
+        (``self._tools`` and the separate ``self._task_tools`` sub-agent
+        list) through here at every fresh interactive build.  Applied at
+        assignment time, so the copy cost is paid per rebuild (construction,
+        MCP catalog change, MCP disconnect), never per request, and the wire
+        tools block stays byte-stable for provider prompt caches (both
+        values are process-stable).  Input must be a pristine base (module
+        constants or ``merge_mcp_tools`` output) — never an already-noted
+        list; the append is not idempotent.  The
         ``_render_agent_tool_descriptions`` re-derive is NOT a fresh build
         and must not re-apply: it deep-copies only the persona/model
         param-description tools, passing fs tools (and these notes) through
-        untouched.  Coordinator builds skip the wrapper — COORDINATOR_TOOLS
+        untouched.  Coordinator builds skip all of this — COORDINATOR_TOOLS
         holds no cwd-dependent tool.
 
         ``os.getcwd()`` is what a cwd-less Popen inherits (spawn_group_leader)
@@ -3162,8 +3175,7 @@ class ChatSession:
             )
             self._mcp_prompt_cb = None
         self._mcp_client = None
-        self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, []))
-        self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, []))
+        self._set_interactive_tools([])
         self._render_agent_tool_descriptions()
 
     def _handle_mcp_refresh(self, arg: str) -> None:
