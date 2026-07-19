@@ -123,6 +123,14 @@ class TestNoteMetadataInvariants:
             assert "cwd_note" not in t["function"]
             assert "workspace_note" not in t["function"]
 
+    def test_workspace_note_wording_uniform(self):
+        # The workspace fact is one node-level value, so its sentence is
+        # deliberately identical across the fs tools (unlike cwd_note, whose
+        # prose is per-tool).  Guards a one-file reword from drifting the
+        # copies apart, independent of the exact wording.
+        notes = {_META[name]["workspace_note"] for name in _FS_TOOLS}
+        assert len(notes) == 1, notes
+
 
 # ---------------------------------------------------------------------------
 # ChatSession build sites
@@ -206,5 +214,18 @@ class TestSessionCwdNotes:
             session = _make_session(mcp_client=mock_mcp)
             session._on_mcp_tools_changed()
             session._on_mcp_tools_changed()
+        assert _desc(session._tools, "bash").count(f"Commands run in {os.getcwd()}") == 1
+        assert _desc(session._task_tools, "bash").count(f"Commands run in {os.getcwd()}") == 1
+
+    def test_mcp_drop_surface_keeps_single_note(self, tmp_db):
+        # The MCP-disconnect rebuild (_drop_mcp_surface, reached via resume()
+        # adopting an MCP-off persona) is the third rebuild trigger — the note
+        # must survive it, exactly once, on both lanes.
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = []
+        with patch("turnstone.core.session.get_workspace_dir", return_value=None):
+            session = _make_session(mcp_client=mock_mcp)
+            session._drop_mcp_surface()
+        assert session._mcp_client is None
         assert _desc(session._tools, "bash").count(f"Commands run in {os.getcwd()}") == 1
         assert _desc(session._task_tools, "bash").count(f"Commands run in {os.getcwd()}") == 1

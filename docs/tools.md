@@ -28,13 +28,19 @@ schema plus turnstone-specific metadata keys:
 }
 ```
 
-**Metadata keys** (stripped before sending the schema to the model):
+**Metadata keys** (stripped before sending the schema to the model; the full
+set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 
-| Key            | Type | Meaning |
-|----------------|------|---------|
-| `task_agent`   | bool | Tool is available to task sub-agents. |
-| `auto_approve` | bool | Tool runs without user confirmation (read-only, safe operations). |
-| `primary_key`  | str  | When the model sends a bare string instead of JSON args, map it to this parameter name. |
+| Key              | Type | Meaning |
+|------------------|------|---------|
+| `task_agent`     | bool | Tool is available to task sub-agents. |
+| `coordinator`    | bool | Tool is available to coordinator sessions. Without `interactive: true` alongside it, this reads as coord-only and the tool is stripped from interactive sessions. |
+| `interactive`    | bool | Opt a `coordinator: true` tool back into interactive sessions (dual-kind tools like `memory`). |
+| `auto_approve`   | bool | Tool runs without user confirmation (read-only, safe operations). |
+| `primary_key`    | str  | When the model sends a bare string instead of JSON args, map it to this parameter name. |
+| `kind_variants`  | dict | Per-kind description / parameter-schema overlays so each session kind sees only the surface it can use (see `memory.json`). |
+| `cwd_note`       | str  | Sentence appended to the description at session build time with `{working_dir}` substituted — declare on tools whose semantics depend on the process working directory (see `bash.json`, `apply_cwd_context`). |
+| `workspace_note` | str  | Companion sentence naming the operator-configured workspace directory, `{workspace_dir}` substituted; dropped when no workspace is configured. |
 
 ---
 
