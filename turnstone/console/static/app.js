@@ -1592,8 +1592,12 @@ function _populateHomeProjectDropdown() {
   const choices = TP.projectChoices();
   choices.push({ value: _PROJECT_NEW, text: "+ New project…" });
   _homeCoordComposer.setOptionChoices("project", choices);
-  if (previous && previous !== _PROJECT_NEW)
-    _homeCoordComposer.setOptionValue("project", previous);
+  // Validate before restoring (via _restorePick, like the other pickers): a
+  // since-deleted project must fall back to the "No project" placeholder, not
+  // a blank selectedIndex=-1 select.  The "+ New project…" sentinel is never
+  // restored — it is a command, not a state (and it IS in `choices`, so the
+  // validity check alone would not exclude it).
+  if (previous !== _PROJECT_NEW) _restorePick("project", previous, choices);
 }
 
 // The inline "+ New project…" creator (project_creator.js), mounted once into

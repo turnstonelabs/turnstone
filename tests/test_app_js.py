@@ -2473,6 +2473,11 @@ def test_console_launcher_paints_project_and_persona_from_cache_synchronously() 
     assert "defaultPersona(_launcherKind)" in pop, (
         "the persona populate must revert to the kind default when the pick is gone"
     )
+    proj_pop = _slice_top_level_fn(body, "function _populateHomeProjectDropdown(")
+    assert '_restorePick("project"' in proj_pop, (
+        "the project populate must validate a previous pick via _restorePick (a "
+        "since-deleted project falls back to the placeholder, not a blank select)"
+    )
 
 
 def test_paint_project_picker_syncs_before_refresh() -> None:
