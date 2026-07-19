@@ -32,18 +32,11 @@ const _core = makeListCache({
   url: "/v1/api/models",
   dataKey: "models",
   name: "models",
+  // alias is the unique <select> key — index by it so modelLabel() is an O(1)
+  // getByKey rather than a per-paint scan.
+  keyField: "alias",
   fpRow: function (m) {
     return [m.alias, m.model];
-  },
-  // Fold the default-alias fields into the fingerprint so a role-alias change
-  // (server emits `models_changed` for it) still fires onChange even when the
-  // model rows themselves are unchanged.
-  fpExtra: function (e) {
-    return [
-      e.default_alias,
-      e.judge_default_alias,
-      e.coordinator_default_alias,
-    ];
   },
   captureExtra: function (data) {
     return {
@@ -113,15 +106,12 @@ export function modelChoices() {
 
 /** The "alias (model)" label for a model alias, or "" when the alias is empty or
  *  unknown — lets a composer annotate its "Default — <resolved>" placeholder
- *  without re-implementing the format.  The models cache has no key index, so
- *  this scans the (small) row list. */
+ *  without re-implementing the format.  Resolves via the keyField:"alias" index
+ *  (getByKey), O(1). */
 export function modelLabel(alias) {
   if (!alias) return "";
-  const rows = _core.get();
-  for (let i = 0; i < rows.length; i++) {
-    if (rows[i].alias === alias) return _fmtLabel(rows[i]);
-  }
-  return "";
+  const row = _core.getByKey(alias);
+  return row ? _fmtLabel(row) : "";
 }
 
 /** The resolved default aliases the local server reported:
@@ -134,12 +124,10 @@ export function modelDefaults() {
   return _core.extra();
 }
 
-/** Subscribe to post-refresh changes.  Idempotent.  (No composer subscribes
- *  today — the console repaints via its direct `models_changed` handler — but
- *  the hook is exposed for parity with the other data layers.) */
-export function onModelsChange(cb) {
-  _core.onChange(cb);
-}
+// No onChange subscription is exposed (unlike projects.js / personas.js, whose
+// onChange is consumed by rail.js): the models cache has no live-render consumer
+// — the console repaints on `models_changed` via its own direct handler, the ui
+// composers repaint on open.  Omitted rather than exposed-and-unused.
 
 // Classic (non-module) app.js bundles reach the data layer through this bridge.
 window.TurnstoneModels = {
@@ -150,5 +138,4 @@ window.TurnstoneModels = {
   modelChoices: modelChoices,
   modelLabel: modelLabel,
   modelDefaults: modelDefaults,
-  onModelsChange: onModelsChange,
 };

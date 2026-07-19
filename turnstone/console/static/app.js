@@ -5,16 +5,25 @@ window.onLoginSuccess = function () {
   if (typeof _refreshHomeComposerVisibility === "function") {
     _refreshHomeComposerVisibility();
   }
-  // Re-warm the home-composer skill AND model pickers now that auth has
-  // landed.  The initial page-load pass runs before login completes, so
-  // /v1/api/skills and /v1/api/models 401 (fail-open: the caches keep their
-  // empty state); without this re-run the dropdowns stay at their placeholders
-  // until a reload (models used to only recover on a chance models_changed).
+  // Re-warm ALL FOUR home-composer caches now that auth has landed.  The initial
+  // page-load pass runs before login completes, so /v1/api/{skills,models,
+  // projects,personas} all 401 (fail-open: the caches keep their empty state);
+  // without this re-run the launcher dropdowns — and the rail's group-by-project +
+  // the saved-coordinator project/persona columns — stay empty until a reload.
+  // {force:true} so a still-in-flight failing pre-auth fetch yields a trailing
+  // AUTHENTICATED refetch rather than coalescing onto the 401 (skills/personas
+  // have no *_changed event to recover otherwise).
   if (typeof _refreshAndPopulateSkills === "function") {
-    _refreshAndPopulateSkills();
+    _refreshAndPopulateSkills({ force: true });
   }
   if (typeof _refreshAndPopulateModels === "function") {
-    _refreshAndPopulateModels();
+    _refreshAndPopulateModels({ force: true });
+  }
+  if (typeof _refreshAndPopulateProjects === "function") {
+    _refreshAndPopulateProjects({ force: true });
+  }
+  if (typeof _refreshAndPopulatePersonas === "function") {
+    _refreshAndPopulatePersonas({ force: true });
   }
   // Active-coordinators list is SSE-driven via the console pseudo-node
   // (#9) — no poller to restart after login.  The home-view renderer
@@ -1492,7 +1501,7 @@ function _ensureHomeComposerInit() {
 // the saved-list / rail labels) then repaint the launcher's Persona picker.
 // Safe when the bridge is absent (module still loading): the picker keeps
 // its "Default" placeholder, which the server resolves to the kind default.
-function _refreshAndPopulatePersonas() {
+function _refreshAndPopulatePersonas(callOpts) {
   const TP = window.TurnstonePersonas;
   if (!TP) return;
   // Paint from the warm cache SYNCHRONOUSLY first so the Persona picker isn't
@@ -1501,7 +1510,7 @@ function _refreshAndPopulatePersonas() {
   // PersonaDropdown preserves a mid-window pick and only applies the kind default
   // when nothing valid is selected, so the second paint can't clobber a choice.
   _populateHomePersonaDropdown();
-  TP.refreshPersonas().then(_populateHomePersonaDropdown);
+  TP.refreshPersonas(callOpts).then(_populateHomePersonaDropdown);
 }
 
 // Populate the launcher's Persona picker for the ACTIVE kind, preselecting
@@ -1532,7 +1541,7 @@ function _populateHomePersonaDropdown() {
 // rail's group-by-project) then repaint the launcher's Project picker.  Safe
 // when the bridge is absent (project.read denied / module still loading): the
 // picker simply keeps its "No project" placeholder.
-function _refreshAndPopulateProjects() {
+function _refreshAndPopulateProjects(callOpts) {
   const TP = window.TurnstoneProjects;
   if (!TP) return;
   // Sync paint from the warm cache first (the launcher keeps its "No project"
@@ -1541,7 +1550,7 @@ function _refreshAndPopulateProjects() {
   // console launcher intentionally does NOT gate on requireProject() (§8) — the
   // node create endpoint is the authoritative gate.
   _populateHomeProjectDropdown();
-  TP.refreshProjects().then(_populateHomeProjectDropdown);
+  TP.refreshProjects(callOpts).then(_populateHomeProjectDropdown);
 }
 
 // Populate the launcher's Project picker from the shared cache, preserving the
@@ -1731,11 +1740,11 @@ function _mountHomeCoordComposer() {
 // then refresh-and-repaint to catch a skill created elsewhere.  Safe when the
 // bridge is absent (module still loading / 401 pre-auth — onLoginSuccess re-runs
 // this once auth lands).
-function _refreshAndPopulateSkills() {
+function _refreshAndPopulateSkills(callOpts) {
   const TS = window.TurnstoneSkills;
   if (!TS) return;
   _populateHomeSkillDropdown();
-  TS.refreshSkills().then(_populateHomeSkillDropdown);
+  TS.refreshSkills(callOpts).then(_populateHomeSkillDropdown);
 }
 
 // Populate the launcher's Skill picker from the shared cache, preserving the
@@ -1746,6 +1755,11 @@ function _populateHomeSkillDropdown() {
   if (!_homeCoordComposer) return;
   const TS = window.TurnstoneSkills;
   if (!TS) return;
+  // Reads the shared skills cache, which is FAIL-OPEN by design: a transient
+  // non-OK refresh keeps the last-known rows rather than blanking to the
+  // placeholder (main blanked via `r.ok ? json : {skills:[]}`; this matches the
+  // projects/personas policy).  A since-removed skill is rejected server-side on
+  // launch — a narrow stale-selection window traded for not blanking on a blip.
   const previous = _homeCoordComposer.getOptionValue("skill");
   const choices = TS.getSkills().map(function (t) {
     return {

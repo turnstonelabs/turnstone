@@ -30,12 +30,6 @@ import { authFetch } from "./auth.js";
  * @param {(row:object)=>any} opts.fpRow  per-row fingerprint tuple — the fields
  *                                      subscribers render, so a refresh that
  *                                      returns identical data skips the fan-out
- * @param {(extra:object)=>any} [opts.fpExtra]  extra top-level fields to fold
- *                                      into the fingerprint (e.g. models' default
- *                                      aliases, so a default-only change still
- *                                      fires onChange).  Omit to fingerprint rows
- *                                      only (a `captureExtra` value that changes
- *                                      without a row change then does NOT fire).
  * @param {(data:object)=>object} [opts.captureExtra]  pull extra top-level
  *                                      response fields into cache state on a
  *                                      successful refresh (returns the new
@@ -64,7 +58,6 @@ export function makeListCache(opts) {
   const name = opts.name;
   const keyField = opts.keyField || null;
   const fpRow = opts.fpRow;
-  const fpExtra = opts.fpExtra || null;
   const captureExtra = opts.captureExtra || null;
   const extraDefaults = opts.extraDefaults || null;
   // Default true: an advisory that gates UI (projects' require_project) must fail
@@ -88,10 +81,7 @@ export function makeListCache(opts) {
     // (it escapes anything inside a string field) and needs no separator
     // chars; an earlier per-module version joined on raw control bytes,
     // which made git see the whole file as binary.
-    return JSON.stringify([
-      _cache.map(fpRow),
-      fpExtra ? fpExtra(_extra) : null,
-    ]);
+    return JSON.stringify(_cache.map(fpRow));
   }
 
   function _setCache(rows) {

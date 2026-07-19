@@ -105,6 +105,12 @@ setInterval(pollHealth, 30000);
 // ===========================================================================
 
 window.onLoginSuccess = function () {
+  // Deferred (follow-up): a cold in-place login leaves the dashboard composer
+  // caches (models/skills/projects/personas) warmed pre-auth as empty (401 ->
+  // fail-open) until the Dashboard pane is re-focused (loadDashboard ->
+  // _loadDashboardOptionsLists) or the page reloads. The CONSOLE force-re-warms
+  // all four in its onLoginSuccess; the ui relies on the re-focus repaint and is
+  // NOT force-warmed here (out of the composer-cache scope) — revisit if it bites.
   initWorkstreams();
 };
 
@@ -353,9 +359,13 @@ function showNewWsModal(forkFromWsId) {
     _paintModelSelects(modelSelect, judgeSelect, { freshOnOpen: true });
   }
 
-  // Skill picker — paint fresh-on-open from the warm cache, then refresh.
+  // Skill picker — hidden for a fork (inherited + submit-gated), so skip its
+  // paint too (no wasted /v1/api/skills fetch + hidden-select rebuild); a fresh
+  // create paints fresh-on-open from the warm cache, then refreshes.
   const tplSelect = document.getElementById("new-ws-skill");
-  _paintSkillSelect(tplSelect, { freshOnOpen: true });
+  if (!_forkFromWsId) {
+    _paintSkillSelect(tplSelect, { freshOnOpen: true });
+  }
 
   // Project picker — populated from the shared projects cache, refreshed on
   // open. Fresh creates SHOW it; forks HIDE it — a fork's project is its
@@ -388,15 +398,11 @@ function showNewWsModal(forkFromWsId) {
   const personaSelect = document.getElementById("new-ws-persona");
   if (personaLabel) personaLabel.hidden = !!_forkFromWsId;
   if (personaSelect) personaSelect.hidden = !!_forkFromWsId;
-  if (personaSelect && !_forkFromWsId && window.TurnstonePersonas) {
-    // Fresh-on-open sync paint (renders the kind default; the reused dialog has
-    // no prior pick to carry over), then refresh-and-repaint. The async paint
-    // passes fresh:false so it preserves a mid-window pick and only re-applies
-    // the kind default when nothing valid is selected.
-    _populatePersonaSelect(personaSelect, { fresh: true });
-    window.TurnstonePersonas.refreshPersonas().then(function () {
-      _populatePersonaSelect(personaSelect, { fresh: false });
-    });
+  // Fresh-on-open (the reused dialog has no prior pick); the async repaint
+  // preserves a mid-window pick and re-applies the kind default only when nothing
+  // valid is selected.  Shared with the dashboard via _paintPersonaSelect.
+  if (!_forkFromWsId) {
+    _paintPersonaSelect(personaSelect, { freshOnOpen: true });
   }
 
   document.getElementById("new-ws-name").value = "";
@@ -566,6 +572,21 @@ function _paintSkillSelect(sel, opts) {
   }
 }
 
+// Persona twin of _paintModelSelects (fourth composer picker on the same shape,
+// so the modal + dashboard don't maintain the persona sync-then-refresh dance
+// two different ways).  _populatePersonaSelect keeps the kind default when
+// nothing valid is selected, so the async fresh:false repaint can't clobber a
+// mid-window pick.
+function _paintPersonaSelect(sel, opts) {
+  const freshOnOpen = !!(opts && opts.freshOnOpen);
+  _populatePersonaSelect(sel, { fresh: freshOnOpen });
+  if (window.TurnstonePersonas) {
+    window.TurnstonePersonas.refreshPersonas().then(function () {
+      _populatePersonaSelect(sel, { fresh: false });
+    });
+  }
+}
+
 // Fill the model + judge-model <select>s from the shared models cache.  One list
 // feeds BOTH selects with the same "alias (model)" labels; each placeholder is
 // annotated with the server-resolved default alias ("Default — gpt-5"), resolved
@@ -728,8 +749,13 @@ function submitNewWs() {
   const initEl = document.getElementById("new-ws-initial-message");
   const initial_message = initEl ? initEl.value.trim() : "";
   if (name) body.name = name;
-  // Forks inherit their source's model + judge (the selects are hidden for a
-  // fork), so never override them — matches the skill/persona/project fork guards.
+  // Forks DELIBERATELY inherit their source's model + judge: the selects are
+  // hidden for a fork (showNewWsModal) and never sent here — matching the
+  // skill/persona/project fork guards. A fork resumes the source session
+  // (resume_ws), which already carries its model, so there is intentionally no
+  // fork model/judge override. Do NOT drop these !_forkFromWsId guards without
+  // also un-hiding the selects (a bare gate-removal ships a hidden-select's stale
+  // value).
   if (model && !_forkFromWsId) body.model = model;
   if (judge_model && !_forkFromWsId) body.judge_model = judge_model;
   if (skill && !_forkFromWsId) body.skill = skill;
@@ -1514,17 +1540,11 @@ function _loadDashboardOptionsLists() {
   const projHint = projLabel ? projLabel.querySelector(".label-hint") : null;
   _paintProjectPicker(projSel, projHint, { fork: false });
 
-  // Persona picker — same paint-from-cache-then-refresh policy; kind default
-  // preselected so a zero-touch launch behaves exactly like today.
+  // Persona picker — via the shared wrapper; the dashboard is a persistent panel
+  // so freshOnOpen:false (preserve a pick across a repaint), kind default when
+  // nothing valid is selected.
   const personaSel = document.getElementById("dashboard-persona");
-  if (personaSel && window.TurnstonePersonas) {
-    // Sync paint first, then refresh-and-repaint; the helper preserves a mid-
-    // window pick and only applies the kind default when nothing valid is chosen.
-    _populatePersonaSelect(personaSel);
-    window.TurnstonePersonas.refreshPersonas().then(function () {
-      _populatePersonaSelect(personaSel);
-    });
-  }
+  _paintPersonaSelect(personaSel, { freshOnOpen: false });
 }
 
 // localStorage key for the dashboard composer's Options-panel disclosure

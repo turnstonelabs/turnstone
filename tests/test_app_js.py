@@ -2412,12 +2412,10 @@ def test_new_ws_modal_paints_project_and_persona_from_cache_synchronously() -> N
     assert "_paintProjectPicker(projSelect" in fn, (
         "the modal must paint the project picker via the shared _paintProjectPicker helper"
     )
-    sync_persona = fn.find("_populatePersonaSelect(personaSelect")
-    async_persona = fn.find("refreshPersonas().then")
-    assert sync_persona >= 0, "the modal must paint the persona picker from cache synchronously"
-    assert async_persona >= 0, "the modal must keep refreshPersonas().then"
-    assert sync_persona < async_persona, (
-        "the synchronous persona paint must precede the async refreshPersonas().then repaint"
+    # Persona is painted via the shared _paintPersonaSelect wrapper (fork-gated);
+    # its sync-before-async ordering is pinned in the wrapper-internals test.
+    assert "_paintPersonaSelect(personaSelect" in fn, (
+        "the modal must paint the persona picker via the shared _paintPersonaSelect helper"
     )
 
 
@@ -2433,12 +2431,9 @@ def test_dashboard_paints_project_and_persona_from_cache_synchronously() -> None
     assert "_paintProjectPicker(projSel" in fn, (
         "the dashboard must paint the project picker via the shared _paintProjectPicker helper"
     )
-    sync_persona = fn.find("_populatePersonaSelect(personaSel")
-    async_persona = fn.find("refreshPersonas().then")
-    assert sync_persona >= 0, "the dashboard must paint the persona picker from cache synchronously"
-    assert async_persona >= 0, "the dashboard must keep refreshPersonas().then"
-    assert sync_persona < async_persona, (
-        "the synchronous dashboard persona paint must precede the async refresh repaint"
+    # Persona is painted via the shared _paintPersonaSelect wrapper (freshOnOpen:false).
+    assert "_paintPersonaSelect(personaSel, { freshOnOpen: false })" in fn, (
+        "the dashboard must paint the persona picker via _paintPersonaSelect (preserving)"
     )
     # require_project label-hint parity: the dashboard Project label gained a
     # .label-hint span, seeded synchronously from requireProject() like the modal.
@@ -2460,17 +2455,17 @@ def test_console_launcher_paints_project_and_persona_from_cache_synchronously() 
     # The bare _populateHomeProjectDropdown() call is the sync paint; the refresh's
     # .then argument has no parens, so this matches only the standalone sync call.
     sync_proj = proj_fn.find("_populateHomeProjectDropdown()")
-    async_proj = proj_fn.find("refreshProjects().then")
+    async_proj = proj_fn.find("refreshProjects(callOpts).then")
     assert sync_proj >= 0, "the launcher must paint the project picker from cache synchronously"
-    assert async_proj >= 0, "the launcher must keep refreshProjects().then"
+    assert async_proj >= 0, "the launcher must keep refreshProjects(callOpts).then"
     assert sync_proj < async_proj, (
         "the synchronous launcher project paint must precede the async refresh repaint"
     )
     persona_fn = _slice_top_level_fn(body, "function _refreshAndPopulatePersonas(")
     sync_persona = persona_fn.find("_populateHomePersonaDropdown()")
-    async_persona = persona_fn.find("refreshPersonas().then")
+    async_persona = persona_fn.find("refreshPersonas(callOpts).then")
     assert sync_persona >= 0, "the launcher must paint the persona picker from cache synchronously"
-    assert async_persona >= 0, "the launcher must keep refreshPersonas().then"
+    assert async_persona >= 0, "the launcher must keep refreshPersonas(callOpts).then"
     assert sync_persona < async_persona, (
         "the synchronous launcher persona paint must precede the async refresh repaint"
     )
@@ -2532,6 +2527,11 @@ def test_paint_model_and_skill_wrappers_sync_before_refresh() -> None:
     for wrapper, populate, refresh in (
         ("function _paintModelSelects(", "_populateModelSelect(", "refreshModels().then"),
         ("function _paintSkillSelect(", "_populateSkillSelect(", "refreshSkills().then"),
+        (
+            "function _paintPersonaSelect(",
+            "_populatePersonaSelect(",
+            "refreshPersonas().then",
+        ),
     ):
         fn = _slice_top_level_fn(body, wrapper)
         sync = fn.find(populate)
@@ -2557,8 +2557,8 @@ def test_new_ws_modal_renders_all_selects_fresh_on_open() -> None:
     assert "_paintSkillSelect(tplSelect, { freshOnOpen: true })" in fn, (
         "the modal must paint skill fresh-on-open"
     )
-    assert "_populatePersonaSelect(personaSelect, { fresh: true })" in fn, (
-        "the modal must paint persona fresh-on-open (kind default, no stale carryover)"
+    assert "_paintPersonaSelect(personaSelect, { freshOnOpen: true })" in fn, (
+        "the modal must paint persona fresh-on-open via the shared wrapper"
     )
     proj = fn[fn.find("_paintProjectPicker(projSelect") :]
     assert "freshOnOpen: true" in proj[:120], (
@@ -2601,6 +2601,17 @@ def test_new_ws_modal_fork_inherits_model_and_judge() -> None:
     assert "judgeSelect.hidden = !!_forkFromWsId" in modal, (
         "modal must hide the judge select for a fork"
     )
+    # [4] fix: the skill paint is fork-gated too (skill is hidden for a fork).
+    # Tie the gate to the skill paint SPECIFICALLY — a first-gate check would be
+    # satisfied by the model gate at line ~352 even if the skill paint were left
+    # unconditional, so require the nearest preceding gate to be right above it.
+    skill_paint = modal.find("_paintSkillSelect(tplSelect")
+    assert skill_paint >= 0, "the modal must paint the skill picker"
+    gate = modal.rfind("if (!_forkFromWsId) {", 0, skill_paint)
+    assert gate >= 0 and (skill_paint - gate) < 50, (
+        "the modal skill paint must be directly wrapped in `if (!_forkFromWsId)` "
+        "(skip the wasted fetch + hidden-select rebuild on a fork)"
+    )
     submit = _slice_top_level_fn(body, "function submitNewWs(")
     assert "if (model && !_forkFromWsId) body.model = model;" in submit, (
         "submitNewWs must fork-gate body.model (distinct from the judge line)"
@@ -2624,21 +2635,26 @@ def test_console_launcher_paints_model_and_skill_from_cache_synchronously() -> N
     )
     skill_fn = _slice_top_level_fn(body, "function _refreshAndPopulateSkills(")
     sync_skill = skill_fn.find("_populateHomeSkillDropdown()")
-    async_skill = skill_fn.find("refreshSkills().then")
+    async_skill = skill_fn.find("refreshSkills(callOpts).then")
     assert 0 <= sync_skill < async_skill, (
         "the synchronous launcher skill paint must precede the async refresh repaint"
     )
 
 
-def test_console_relogin_rewarms_model_and_skill() -> None:
-    """onLoginSuccess re-warms BOTH the skill and model caches after auth lands —
-    the boot-time pass runs pre-login (401), so without the model re-warm the
-    console model dropdown would stay at its placeholder until a reload."""
+def test_console_relogin_rewarms_all_four_caches_with_force() -> None:
+    """onLoginSuccess re-warms ALL FOUR composer caches after auth lands (the boot
+    pass runs pre-login -> 401 -> fail-open empty), EACH with {force:true} so a
+    still-in-flight failing pre-auth fetch yields a trailing authenticated refetch
+    (skills/personas have no *_changed event to recover otherwise). Fixes [0]+[2]."""
     body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
     start = body.index("window.onLoginSuccess = function ()")
+    # The four re-warm calls live before the // Active-coordinators marker; an
+    # assert falling outside this slice fails loudly rather than silently passing.
     login = body[start : body.index("// Active-coordinators", start)]
-    assert "_refreshAndPopulateSkills()" in login, "onLoginSuccess must re-warm skills"
-    assert "_refreshAndPopulateModels()" in login, "onLoginSuccess must re-warm models"
+    for name in ("Skills", "Models", "Projects", "Personas"):
+        assert f"_refreshAndPopulate{name}({{ force: true }})" in login, (
+            f"onLoginSuccess must force-re-warm {name.lower()} after login"
+        )
 
 
 def test_models_changed_forces_trailing_single_repaint_path() -> None:
@@ -2667,6 +2683,13 @@ def test_models_label_centralized_on_bridge() -> None:
     assert "modelLabel: modelLabel" in models_src, (
         "models.js must register modelLabel on the window.TurnstoneModels bridge "
         "(classic bundles call it via the bridge)"
+    )
+    # [7] fix: modelLabel resolves via the core's O(1) keyField index, not a scan.
+    assert 'keyField: "alias"' in models_src, (
+        "models.js must index by alias (keyField) so modelLabel is an O(1) getByKey"
+    )
+    assert "getByKey(alias)" in models_src, (
+        "modelLabel must resolve via the core's getByKey index (not a per-paint scan)"
     )
     assert "_resolveModelLabel" not in _APP_JS.read_text(encoding="utf-8"), (
         "the ui app must not keep a local _resolveModelLabel (use TurnstoneModels.modelLabel)"
@@ -2730,14 +2753,19 @@ def test_reset_extra_policy_per_cache() -> None:
 def test_models_cache_exposes_both_server_schemas() -> None:
     """models.js must carry ALL default-alias fields — the node server sends
     default_alias, the console sends coordinator_default_alias, both send
-    judge_default_alias — so each app reads its own, and fold them into the
-    fingerprint so a default-only change still fires onChange (R6)."""
+    judge_default_alias — so each app reads its own (via modelDefaults/captureExtra,
+    which drive the "Default — <alias>" placeholder).  The dead onChange
+    subscription (+ its fingerprint fold) was removed: models has no live-render
+    subscriber (the console repaints via its direct models_changed handler), so it
+    exposes no onModelsChange."""
     src = _MODELS_JS.read_text(encoding="utf-8")
     for field in ("default_alias", "judge_default_alias", "coordinator_default_alias"):
         assert field in src, f"models.js must carry {field} for the two server schemas"
     assert "window.TurnstoneModels" in src, "models.js must install the classic bridge"
     assert "makeListCache" in src, "models.js must build on the shared list_cache core"
-    assert "fpExtra" in src, "models.js must fold the default aliases into the fingerprint (R6)"
+    assert "onModelsChange" not in src, (
+        "models.js must not expose the dead onModelsChange subscription (no subscribers)"
+    )
 
 
 def test_skills_cache_returns_raw_rows() -> None:

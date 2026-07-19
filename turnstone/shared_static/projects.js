@@ -23,10 +23,10 @@ import { makeListCache } from "./list_cache.js";
 // The require_project advisory rides the same /v1/api/projects response as an
 // extra top-level field.  It fails OPEN to false: a stale-true value would make
 // the composer hide options on a transient error, so `extraDefaults` resets it
-// on every refresh failure and it seeds false before the first refresh.  It is
-// deliberately NOT in the fingerprint (no fpExtra) — a require_project-only
-// toggle with an unchanged project list should not force a rail rebuild; the
-// composers re-read it synchronously on their next open.
+// on every refresh failure and it seeds false before the first refresh.  The
+// fingerprint is the project rows only, so a require_project-only toggle (with an
+// unchanged project list) does NOT force a rail rebuild; the composers re-read it
+// synchronously on their next open.
 const _core = makeListCache({
   url: "/v1/api/projects",
   dataKey: "projects",
@@ -53,8 +53,8 @@ const _core = makeListCache({
  * a half-open picker.  A failure is recorded (see {@link projectsError})
  * and warned, rather than silently masqueraded as an empty project list.
  */
-export function refreshProjects() {
-  return _core.refresh();
+export function refreshProjects(callOpts) {
+  return _core.refresh(callOpts);
 }
 
 /** Cached project rows (empty array until the first refresh resolves). */

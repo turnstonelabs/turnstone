@@ -39,8 +39,8 @@ const _core = makeListCache({
  * Failures are recorded (see {@link personasError}) and warned, rather
  * than silently masqueraded as "no personas".
  */
-export function refreshPersonas() {
-  return _core.refresh();
+export function refreshPersonas(callOpts) {
+  return _core.refresh(callOpts);
 }
 
 /** Cached persona rows (empty array until the first refresh resolves). */
