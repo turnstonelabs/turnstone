@@ -21,5 +21,7 @@
     "required": ["path", "content"]
   },
   "task_agent": true,
-  "primary_key": "content"
+  "primary_key": "content",
+  "cwd_note": "Relative paths resolve against {working_dir}.",
+  "workspace_note": "The user's workspace directory is {workspace_dir}."
 }

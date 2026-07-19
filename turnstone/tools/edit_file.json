@@ -41,5 +41,7 @@
     "required": ["path"]
   },
   "task_agent": true,
-  "primary_key": "old_string"
+  "primary_key": "old_string",
+  "cwd_note": "Relative paths resolve against {working_dir}.",
+  "workspace_note": "The user's workspace directory is {workspace_dir}."
 }

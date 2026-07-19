@@ -110,6 +110,12 @@
                                # empty = the instance's default mix
                                # env: TURNSTONE_SEARXNG_ENGINES
 #
+# workspace_dir = "/workspace" # directory surfaced to the model as its workspace
+                               # (informational only — does not chdir or confine
+                               # tools; skipped if the directory doesn't exist).
+                               # The Docker image presets this to /workspace.
+                               # env: TURNSTONE_WORKSPACE
+#
 # Reranking (optional, disabled by default). Turnstone runs no reranker itself —
 # it POSTs to an external Cohere/Jina-compatible /rerank endpoint (self-hosted
 # vLLM/TEI/llama.cpp, or hosted Cohere/Jina/Voyage) to reorder results by query

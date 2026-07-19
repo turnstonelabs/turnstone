@@ -685,8 +685,12 @@ class TestSessionIntegration:
 
     def test_session_without_mcp(self, tmp_db):
         session = self._make_session(mcp_client=None)
-        # Interactive session surface — coordinator tools excluded.
-        assert session._tools is INTERACTIVE_TOOLS
+        # Interactive session surface — coordinator tools excluded.  Name
+        # equality, not identity: the session list is a fresh copy carrying
+        # per-process cwd notes (_apply_cwd_notes), never the constant itself.
+        assert [t["function"]["name"] for t in session._tools] == [
+            t["function"]["name"] for t in INTERACTIVE_TOOLS
+        ]
         assert session._mcp_client is None
 
     def test_session_with_mcp(self, tmp_db):
