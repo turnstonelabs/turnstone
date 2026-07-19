@@ -1,6 +1,6 @@
 {
   "name": "bash",
-  "description": "Execute a bash command and return stdout + stderr. Use for running programs, git, tests, system commands, installing packages, etc. Environment questions ('What Python version?', 'Is X installed?') are tool-use tasks — e.g. bash(command='python --version'). For file creation use write_file instead; for man pages use man instead. Long output is truncated (head+tail preserved, middle elided). Stderr lines prefixed with [stderr]. Runs to completion and returns: any process the command leaves running in the background (e.g. 'server &') is terminated when the command returns — nothing persists across calls. To keep a long-lived process (dev server, watcher) running across calls, set run_in_background=true instead of using '&'.",
+  "description": "Execute a bash command and return stdout + stderr. Use for running programs, git, tests, system commands, installing packages, etc. Environment questions ('What Python version?', 'Is X installed?') are tool-use tasks — e.g. bash(command='python --version'). For file creation use write_file instead. Long output is truncated (head+tail preserved, middle elided). Stderr lines prefixed with [stderr]. Runs to completion and returns: any process the command leaves running in the background (e.g. 'server &') is terminated when the command returns — nothing persists across calls. To keep a long-lived process (dev server, watcher) running across calls, set run_in_background=true instead of using '&'.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -24,5 +24,7 @@
     "required": ["command"]
   },
   "task_agent": true,
-  "primary_key": "command"
+  "primary_key": "command",
+  "cwd_note": "Commands run in {working_dir} — each call starts a fresh shell there; cd does not persist across calls.",
+  "workspace_note": "The user's workspace directory is {workspace_dir}."
 }

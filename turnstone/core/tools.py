@@ -29,6 +29,13 @@ _META_KEYS = {
     # be narrowed per-kind without re-stating the rest of the param
     # schema.  See ``memory.json`` for the canonical example.
     "kind_variants",
+    # Working-directory note templates, rendered into the description at
+    # session tool-list build time by ``apply_cwd_context``.  Declared by
+    # tools whose semantics depend on the process cwd (shell execution,
+    # relative-path resolution).  See ``bash.json`` for the canonical
+    # example.
+    "cwd_note",
+    "workspace_note",
 }
 
 
@@ -122,6 +129,48 @@ INTERACTIVE_TOOL_NAMES = frozenset(t["function"]["name"] for t in INTERACTIVE_TO
 TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}
 BUILTIN_TOOL_NAMES = frozenset(_META)
+
+
+def apply_cwd_context(
+    tools: list[dict[str, Any]], working_dir: str, workspace_dir: str
+) -> list[dict[str, Any]]:
+    """Append rendered working-dir/workspace notes to tools that declare them.
+
+    Tools opt in via ``cwd_note`` / ``workspace_note`` metadata in their JSON
+    (stripped from the wire schema by ``_load_tools``): authored sentences
+    carrying ``{working_dir}`` / ``{workspace_dir}`` placeholders, appended
+    to the tool's description with the placeholder substituted.  Substitution
+    is plain ``str.replace``, NOT ``str.format`` — note prose may contain
+    literal braces (``${VAR}``) that format() would choke on.  A note whose
+    value is empty is skipped entirely, so callers pass ``""`` to drop a fact
+    (unresolvable cwd, absent workspace) without conditional template syntax.
+
+    Returns a NEW list.  Noted tools are deep-copied first: the fs tool dicts
+    are SHARED between ``TOOLS`` / ``INTERACTIVE_TOOLS`` / ``TASK_AGENT_TOOLS``
+    and aliased through ``merge_mcp_tools`` output, so an in-place append
+    would corrupt the module constants for every session.  Tools without
+    notes (MCP, coordinator) pass through by reference.  NOT idempotent —
+    always call on a pristine base list, never on prior output.
+    """
+    if not (working_dir or workspace_dir):
+        return list(tools)
+    out: list[dict[str, Any]] = []
+    for tool in tools:
+        fn = tool.get("function") or {}
+        meta = _META.get(fn.get("name", "")) or {}
+        notes: list[str] = []
+        cwd_note = meta.get("cwd_note", "")
+        if cwd_note and working_dir:
+            notes.append(cwd_note.replace("{working_dir}", working_dir))
+        workspace_note = meta.get("workspace_note", "")
+        if workspace_note and workspace_dir:
+            notes.append(workspace_note.replace("{workspace_dir}", workspace_dir))
+        if notes:
+            tool = copy.deepcopy(tool)
+            fn = tool["function"]
+            fn["description"] = " ".join([fn.get("description", "").rstrip(), *notes]).strip()
+        out.append(tool)
+    return out
 
 
 def merge_mcp_tools(

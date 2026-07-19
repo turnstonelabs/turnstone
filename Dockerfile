@@ -60,8 +60,12 @@ COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 WORKDIR /data
 RUN chown turnstone:turnstone /data
 
-# Workspace mount point — bind-mount a host directory here
+# Workspace mount point — bind-mount a host directory here.  The env var
+# surfaces the path in the model's shell/file tool descriptions
+# (config.get_workspace_dir); without it the mount is invisible to the
+# model, whose cwd is /data below.
 RUN mkdir -p /workspace && chown turnstone:turnstone /workspace
+ENV TURNSTONE_WORKSPACE=/workspace
 
 USER turnstone
 

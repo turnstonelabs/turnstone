@@ -252,6 +252,7 @@ interface, or anyone who can reach it can search through your instance.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WORKSPACE_MOUNT` | empty volume | Host directory bind-mounted at `/workspace` for the model to read/write |
+| `TURNSTONE_WORKSPACE` | `/workspace` (image env) | Directory named as the user's workspace in the model's tool descriptions; informational only — see [Working directory](#working-directory) |
 | `SKIP_PERMISSIONS` | — | Set to any value to auto-approve all tool calls (dev only) |
 | `MCP_CONFIG` | — | Path to an MCP server config file |
 | `TURNSTONE_IMAGE_TAG` | `latest` | ghcr.io image tag — production stack |
@@ -275,6 +276,35 @@ docker compose build --no-cache # rebuild from scratch
 | `turnstone-data` | `/data` per node (SQLite fallback, local state) |
 | `workspace` | `/workspace` (unless `WORKSPACE_MOUNT` is set) |
 | `caddy-data` / `caddy-config` | Caddy's local CA and config (dev stack) |
+
+## Working directory
+
+Node processes run with `/data` as their working directory (the image's
+`WORKDIR`), and that is where the model's shell commands execute and
+relative file paths resolve — **not** `/workspace`. The shell and file
+tool descriptions state both paths (the working directory, and the
+workspace named by `TURNSTONE_WORKSPACE`), so the model knows to look in
+`/workspace` for your files without being told each session.
+
+To make tools start inside the mount instead, override the working
+directory on the node services:
+
+```yaml
+services:
+  turnstone-node:
+    working_dir: /workspace
+```
+
+Two caveats before overriding:
+
+- **SQLite fallback**: when a node runs without PostgreSQL, its fallback
+  database `.turnstone.db` is created in the process working directory.
+  Changing `working_dir` on an existing SQLite-fallback deployment makes
+  the node create a fresh database inside the mount and your prior state
+  appears lost (it is still in the `turnstone-data` volume under `/data`).
+  The stock compose stacks use PostgreSQL and are unaffected.
+- Migrations (`entrypoint.sh`) run in the same working directory, so the
+  same SQLite caveat applies to them.
 
 ## Cleanup
 

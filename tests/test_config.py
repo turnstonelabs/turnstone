@@ -257,6 +257,63 @@ def test_searxng_engines_default_empty(tmp_path, monkeypatch):
     assert config_mod.get_searxng_engines() == ""
 
 
+def _reset_workspace_cache():
+    config_mod._workspace_dir = None
+    config_mod._workspace_dir_loaded = False
+
+
+def test_workspace_dir_from_config(tmp_path, monkeypatch):
+    """get_workspace_dir() reads from config.toml [tools] workspace_dir."""
+    _reset_cache()
+    _reset_workspace_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[tools]\nworkspace_dir = "/srv/projects"\n')
+    set_config_path(str(cfg))
+    monkeypatch.delenv("TURNSTONE_WORKSPACE", raising=False)
+
+    assert config_mod.get_workspace_dir() == "/srv/projects"
+
+
+def test_workspace_dir_config_wins_over_env(tmp_path, monkeypatch):
+    """get_workspace_dir(): config.toml [tools] workspace_dir wins over env."""
+    _reset_cache()
+    _reset_workspace_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[tools]\nworkspace_dir = "/srv/projects"\n')
+    set_config_path(str(cfg))
+    monkeypatch.setenv("TURNSTONE_WORKSPACE", "/ignored")
+
+    assert config_mod.get_workspace_dir() == "/srv/projects"
+
+
+def test_workspace_dir_fallback_to_env(tmp_path, monkeypatch):
+    """get_workspace_dir() falls back to $TURNSTONE_WORKSPACE."""
+    _reset_cache()
+    _reset_workspace_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[tools]\n")
+    set_config_path(str(cfg))
+    monkeypatch.setenv("TURNSTONE_WORKSPACE", "/workspace")
+
+    assert config_mod.get_workspace_dir() == "/workspace"
+
+
+def test_workspace_dir_none_when_unset(tmp_path, monkeypatch):
+    """get_workspace_dir() returns None when neither config nor env is set."""
+    _reset_cache()
+    _reset_workspace_cache()
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[tools]\n")
+    set_config_path(str(cfg))
+    monkeypatch.delenv("TURNSTONE_WORKSPACE", raising=False)
+
+    assert config_mod.get_workspace_dir() is None
+
+
 def test_apply_config_judge_section(tmp_path):
     """apply_config() loads [judge] section and maps to argparse dests."""
     _reset_cache()

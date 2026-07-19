@@ -229,6 +229,39 @@ def get_searxng_engines() -> str:
     return _searxng_engines
 
 
+# -- Workspace directory hint (cached) -----------------------------------------
+
+_workspace_dir: str | None = None
+_workspace_dir_loaded: bool = False
+
+
+def get_workspace_dir() -> str | None:
+    """Load the operator-designated workspace directory (cached after first call).
+
+    Precedence: config.toml [tools] workspace_dir -> $TURNSTONE_WORKSPACE.
+    Returns None when neither is set.  Purely informational: the value is
+    rendered into the fs/shell tool descriptions (tools.apply_cwd_context)
+    so the model knows where user files live when that differs from the
+    process cwd — it does NOT chdir the process, and it does NOT confine
+    tool paths.  The Docker image sets the env var to its stock
+    ``/workspace`` bind-mount point.  Path confinement / per-workstream
+    working directories are a separate planned launch-time grant; keep
+    this a plain node-level hint.
+    """
+    global _workspace_dir, _workspace_dir_loaded
+    if _workspace_dir_loaded:
+        return _workspace_dir
+    _workspace_dir_loaded = True
+    cfg_dir = load_config("tools").get("workspace_dir", "").strip()
+    if cfg_dir:
+        _workspace_dir = cfg_dir
+        return _workspace_dir
+    env_dir = os.environ.get("TURNSTONE_WORKSPACE", "").strip()
+    if env_dir:
+        _workspace_dir = env_dir
+    return _workspace_dir
+
+
 # -- Rerank query instruction (cached) ----------------------------------------
 # The reranker endpoint itself is a per-model definition (admin Models tab ->
 # Reranker role); only the query instruction is a global knob.

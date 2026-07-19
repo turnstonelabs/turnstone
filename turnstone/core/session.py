@@ -57,7 +57,7 @@ from turnstone.core.background_shells import (
     drain_pipe_lines,
     spawn_group_leader,
 )
-from turnstone.core.config import get_searxng_engines, get_searxng_url
+from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
@@ -189,6 +189,7 @@ from turnstone.core.tools import (
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
     TOOLS,
+    apply_cwd_context,
     merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
@@ -1789,6 +1790,8 @@ class ChatSession:
         # end of tool setup. Only ``_mcp_tools_change_seq`` lives on.
         mcp_tools_seq_at_read = 0
         if kind == WorkstreamKind.COORDINATOR:
+            # No _apply_cwd_notes: COORDINATOR_TOOLS holds no cwd-dependent
+            # tool (no fs/shell), so there is nothing to render.
             self._tools = list(COORDINATOR_TOOLS)
             self._task_tools = []
         elif self._mcp_client:
@@ -1797,8 +1800,8 @@ class ChatSession:
             # Constants first — the attributes must exist for a listener
             # callback firing mid-construction; the ONE authoritative
             # merged read runs after the registrations below.
-            self._tools = list(INTERACTIVE_TOOLS)
-            self._task_tools = list(TASK_AGENT_TOOLS)
+            self._tools = self._apply_cwd_notes(INTERACTIVE_TOOLS)
+            self._task_tools = self._apply_cwd_notes(TASK_AGENT_TOOLS)
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
@@ -1827,8 +1830,8 @@ class ChatSession:
             # the tool-search construction below reading mixed state.
             mcp_tools_seq_at_read = self._mcp_tools_change_seq
             mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
-            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+            self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools))
+            self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools))
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
@@ -1837,8 +1840,8 @@ class ChatSession:
             # consented oauth_user servers.
             try_prime_user_pools(self._mcp_client, self._mcp_user_id, context="session-start")
         else:
-            self._tools = INTERACTIVE_TOOLS
-            self._task_tools = TASK_AGENT_TOOLS
+            self._tools = self._apply_cwd_notes(INTERACTIVE_TOOLS)
+            self._task_tools = self._apply_cwd_notes(TASK_AGENT_TOOLS)
         # Inject the live alias list into the task_agent tool
         # description so the calling LLM sees its `model` parameter options.
         # Replaces affected tool dicts with deep copies — module-level
@@ -2600,8 +2603,8 @@ class ChatSession:
         # regardless; ``user_id=None`` would silently drop pool tools
         # that the LLM is allowed to call.
         mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_effective_user_id)
-        self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
-        self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+        self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools))
+        self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools))
         self._render_agent_tool_descriptions()
         self._rebuild_tool_search()
 
@@ -2653,6 +2656,42 @@ class ChatSession:
                     entry += f" — {desc}"
             parts.append(entry)
         return "Available personas: " + "; ".join(parts) + "."
+
+    def _apply_cwd_notes(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Render per-process working-dir/workspace notes into fs-tool descriptions.
+
+        THE required wrapper for every fresh interactive build of
+        ``self._tools`` AND ``self._task_tools`` (the task lane is a separate
+        list — instrumenting only ``self._tools`` silently drops sub-agents).
+        Applied at assignment time, so the copy cost is paid per rebuild
+        (construction, MCP catalog change, MCP disconnect), never per request,
+        and the wire tools block stays byte-stable for provider prompt caches
+        (both values are process-stable).  Input must be a pristine base
+        (module constants or ``merge_mcp_tools`` output) — never an
+        already-noted list; the append is not idempotent.  The
+        ``_render_agent_tool_descriptions`` re-derive is NOT a fresh build
+        and must not re-apply: it deep-copies only the persona/model
+        param-description tools, passing fs tools (and these notes) through
+        untouched.  Coordinator builds skip the wrapper — COORDINATOR_TOOLS
+        holds no cwd-dependent tool.
+
+        ``os.getcwd()`` is what a cwd-less Popen inherits (spawn_group_leader)
+        and what relative file-tool paths resolve against, so the note names
+        where tools actually run.  Guarded: the cwd can be deleted under us
+        (eval workdir teardown), and MCP rebuilds run on a background thread —
+        degrade to note-less descriptions rather than failing the rebuild.
+        The workspace hint drops when the directory is missing on this node
+        (stale config must not point the model at a phantom path) and when it
+        equals the working directory (one fact, not two copies of one path).
+        """
+        try:
+            working_dir = os.getcwd()
+        except OSError:
+            working_dir = ""
+        workspace_dir = get_workspace_dir() or ""
+        if workspace_dir and (workspace_dir == working_dir or not os.path.isdir(workspace_dir)):
+            workspace_dir = ""
+        return apply_cwd_context(tools, working_dir, workspace_dir)
 
     def _render_agent_tool_descriptions(self) -> None:
         """Inject live option lists into agent-tool parameter descriptions.
@@ -3123,8 +3162,8 @@ class ChatSession:
             )
             self._mcp_prompt_cb = None
         self._mcp_client = None
-        self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, [])
-        self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, [])
+        self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, []))
+        self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, []))
         self._render_agent_tool_descriptions()
 
     def _handle_mcp_refresh(self, arg: str) -> None:
