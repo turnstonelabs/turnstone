@@ -45,6 +45,8 @@ import { authFetch } from "./auth.js";
  *                                      false for a merely COSMETIC extra that
  *                                      should keep its last-known value through a
  *                                      transient failure rather than blank.
+ *                                      Moot unless extraDefaults is set — the
+ *                                      reset branch is gated on both.
  * `refresh(opts)` accepts `{force:true}` — an INVALIDATION (e.g. a *_changed SSE
  * event) that must converge to the latest server state: if a refresh is already
  * in flight it chains ONE trailing refetch after it and awaits that, instead of
@@ -66,7 +68,12 @@ export function makeListCache(opts) {
   const resetExtraOnError = opts.resetExtraOnError !== false;
 
   let _cache = []; // last-fetched rows (caller-visible)
-  let _byKey = {}; // keyField value -> row, for O(1) lookup (when keyField set)
+  // keyField value -> row, for O(1) lookup (when keyField set).  Null-prototype:
+  // a row keyed "__proto__" must not swap this map's prototype via the inherited
+  // setter, and an absent-key lookup ("toString", "constructor") must miss (->
+  // undefined -> getByKey's null) instead of resolving an inherited
+  // Object.prototype member as a "row".
+  let _byKey = Object.create(null);
   let _loaded = false; // has the first refresh attempt completed (ok or failed)?
   let _lastError = null; // last failure: HTTP status, 0 for network/parse, null when ok
   let _inflight = null; // shared pending refresh so concurrent callers coalesce
@@ -87,7 +94,7 @@ export function makeListCache(opts) {
   function _setCache(rows) {
     _cache = Array.isArray(rows) ? rows : [];
     if (keyField) {
-      _byKey = {};
+      _byKey = Object.create(null);
       for (const r of _cache) if (r && r[keyField]) _byKey[r[keyField]] = r;
     }
     const firstLoad = !_loaded;
@@ -122,7 +129,13 @@ export function makeListCache(opts) {
         // collapses to one trailing).  INVARIANT: refresh() never rejects (the
         // chain below always resolves via .catch), so this .then always runs; if
         // a reject path is ever added, clear _pending in a .catch or force
-        // callers wedge on a stuck promise.
+        // callers wedge on a stuck promise.  The _pending = null clear is
+        // deliberately BEFORE the recursive refresh() (NOT in a .finally after
+        // it): a force landing DURING the trailing refetch must find _pending
+        // null and chain a NEW trailing fetch, because its invalidation
+        // postdates this one's start.  Clearing after the trailing refresh
+        // resolves would coalesce that late force onto a fetch that predates
+        // its change — the exact race this path exists to close.
         _pending =
           _pending ||
           _inflight.then(function () {
@@ -197,7 +210,8 @@ export function makeListCache(opts) {
       return _lastError;
     },
     /** The captured extra top-level fields (fail-open defaults until a
-     *  successful refresh; reset to those defaults on any failure). */
+     *  successful refresh; reset to those defaults on failure ONLY when
+     *  resetExtraOnError — a cosmetic extra keeps its last-known value). */
     extra: function () {
       return _extra;
     },

@@ -1757,8 +1757,9 @@ function _populateHomeSkillDropdown() {
   if (!TS) return;
   // Reads the shared skills cache, which is FAIL-OPEN by design: a transient
   // non-OK refresh keeps the last-known rows rather than blanking to the
-  // placeholder (main blanked via `r.ok ? json : {skills:[]}`; this matches the
-  // projects/personas policy).  A since-removed skill is rejected server-side on
+  // placeholder (the pre-cache inline fetch blanked on any non-OK via
+  // `r.ok ? json : {skills:[]}`; this cache matches the projects/personas
+  // policy instead).  A since-removed skill is rejected server-side on
   // launch — a narrow stale-selection window traded for not blanking on a blip.
   const previous = _homeCoordComposer.getOptionValue("skill");
   const choices = TS.getSkills().map(function (t) {
@@ -1776,10 +1777,6 @@ function _populateHomeSkillDropdown() {
   if (stillValid) _homeCoordComposer.setOptionValue("skill", previous);
 }
 
-// Format a resolved alias with its model suffix the same way as the
-// dropdown rows ("alias (model)", or just "alias" when they coincide).
-// Returns "" when alias is empty or unknown so callers can fall back
-// to a neutral placeholder.
 // Refresh the shared models cache then repaint the launcher's Model + Judge
 // Model pickers.  Sync paint from the warm cache first (no empty flash for the
 // round-trip), then refresh-and-repaint.  This is ALSO the single repaint path

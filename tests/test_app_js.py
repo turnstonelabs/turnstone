@@ -2517,31 +2517,47 @@ _PERSONAS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static
 
 
 def test_paint_model_and_skill_wrappers_sync_before_refresh() -> None:
-    """The shared _paintModelSelects / _paintSkillSelect wrappers (used by BOTH the
-    modal and dashboard — collapsing the 4x paint-then-refresh dup) paint from the
-    warm cache SYNCHRONOUSLY, then refresh-and-repaint.  CRITICAL: the sync paint
-    passes fresh=freshOnOpen but the ASYNC repaint MUST pass fresh:false — a wrapper
-    leaking freshOnOpen into the async paint would clobber a mid-window pick (for the
-    project picker that reconciles to "" -> a require_project 400)."""
+    """The _paintFromCache chokepoint (PR #869 review: the three wrapper twins
+    repeated the same wiring, so the discipline now lives ONCE) paints from the
+    warm cache SYNCHRONOUSLY, then refreshes-and-repaints.  CRITICAL: the sync
+    paint mirrors the caller's freshOnOpen but the ASYNC repaint MUST pass
+    fresh:false — leaking freshOnOpen into the async paint would clobber a
+    mid-window pick (for the project picker that reconciles to "" -> a
+    require_project 400).  Each wrapper must pair its OWN bridge refresh with
+    its OWN populate helper and thread `fresh` through untouched."""
     body = _APP_JS.read_text(encoding="utf-8")
-    for wrapper, populate, refresh in (
-        ("function _paintModelSelects(", "_populateModelSelect(", "refreshModels().then"),
-        ("function _paintSkillSelect(", "_populateSkillSelect(", "refreshSkills().then"),
+    helper = _slice_top_level_fn(body, "function _paintFromCache(")
+    sync = helper.find("repaint(!!(opts && opts.freshOnOpen))")
+    async_ = helper.find("refresh().then")
+    assert 0 <= sync < async_, (
+        "_paintFromCache must sync-paint (repaint mirroring freshOnOpen) BEFORE "
+        "the async refresh repaint"
+    )
+    assert "repaint(false)" in helper[async_:], (
+        "_paintFromCache's async repaint must pass fresh:false (never leak "
+        "freshOnOpen, or it clobbers a mid-window pick)"
+    )
+    for wrapper, bridge_refresh, populate in (
+        (
+            "function _paintModelSelects(",
+            "window.TurnstoneModels && window.TurnstoneModels.refreshModels",
+            "_populateModelSelect(modelSel, judgeSel, { fresh: fresh })",
+        ),
+        (
+            "function _paintSkillSelect(",
+            "window.TurnstoneSkills && window.TurnstoneSkills.refreshSkills",
+            "_populateSkillSelect(sel, { fresh: fresh })",
+        ),
         (
             "function _paintPersonaSelect(",
-            "_populatePersonaSelect(",
-            "refreshPersonas().then",
+            "window.TurnstonePersonas && window.TurnstonePersonas.refreshPersonas",
+            "_populatePersonaSelect(sel, { fresh: fresh })",
         ),
     ):
         fn = _slice_top_level_fn(body, wrapper)
-        sync = fn.find(populate)
-        async_ = fn.find(refresh)
-        assert 0 <= sync < async_, f"{wrapper} must paint synchronously before the async refresh"
-        assert "{ fresh: freshOnOpen }" in fn, f"{wrapper} sync paint must pass fresh=freshOnOpen"
-        assert "{ fresh: false }" in fn, (
-            f"{wrapper} async repaint must pass fresh:false (never leak freshOnOpen, "
-            "or it clobbers a mid-window pick)"
-        )
+        assert "_paintFromCache(" in fn, f"{wrapper} must route through _paintFromCache"
+        assert bridge_refresh in fn, f"{wrapper} must pass its own bridge refresh"
+        assert populate in fn, f"{wrapper} must thread fresh through to its own populate helper"
 
 
 def test_new_ws_modal_renders_all_selects_fresh_on_open() -> None:
@@ -2564,10 +2580,16 @@ def test_new_ws_modal_renders_all_selects_fresh_on_open() -> None:
     assert "freshOnOpen: true" in proj[:120], (
         "the modal must paint the project picker fresh-on-open"
     )
-    # the model wrapper call is fork-gated (a fork inherits + hides model/judge)
-    guard = fn.find("if (!_forkFromWsId) {")
-    model_paint = fn.find("_paintModelSelects(modelSelect")
-    assert 0 <= guard < model_paint, "the modal model paint must be skipped for a fork"
+    # Fork-gates: the model + persona paints must each be the FIRST statement
+    # inside their own `if (!_forkFromWsId)` block.  (A first-gate ordering
+    # check is vacuous here — the first gate in showNewWsModal IS the model
+    # gate, so it would pass even with the paint hoisted out below it.)
+    assert re.search(r"if \(!_forkFromWsId\) \{\s*_paintModelSelects\(modelSelect", fn), (
+        "the modal model paint must be skipped for a fork"
+    )
+    assert re.search(r"if \(!_forkFromWsId\) \{\s*_paintPersonaSelect\(personaSelect", fn), (
+        "the modal persona paint must be skipped for a fork"
+    )
 
 
 def test_dashboard_paints_model_and_skill_via_wrappers_preserving() -> None:
@@ -2603,12 +2625,13 @@ def test_new_ws_modal_fork_inherits_model_and_judge() -> None:
     )
     # [4] fix: the skill paint is fork-gated too (skill is hidden for a fork).
     # Tie the gate to the skill paint SPECIFICALLY — a first-gate check would be
-    # satisfied by the model gate at line ~352 even if the skill paint were left
-    # unconditional, so require the nearest preceding gate to be right above it.
+    # satisfied by the model gate even if the skill paint were left
+    # unconditional, so require the paint to be the FIRST statement inside its
+    # own gate block.  (A nearest-preceding-gate proximity window false-passes
+    # a gate block that CLOSES before the paint.)
     skill_paint = modal.find("_paintSkillSelect(tplSelect")
     assert skill_paint >= 0, "the modal must paint the skill picker"
-    gate = modal.rfind("if (!_forkFromWsId) {", 0, skill_paint)
-    assert gate >= 0 and (skill_paint - gate) < 50, (
+    assert re.search(r"if \(!_forkFromWsId\) \{\s*_paintSkillSelect\(tplSelect", modal), (
         "the modal skill paint must be directly wrapped in `if (!_forkFromWsId)` "
         "(skip the wasted fetch + hidden-select rebuild on a fork)"
     )
@@ -2630,7 +2653,7 @@ def test_console_launcher_paints_model_and_skill_from_cache_synchronously() -> N
     sync_model = model_fn.find("_populateHomeModelDropdowns()")
     async_model = model_fn.find("refreshModels(callOpts).then")
     assert sync_model >= 0, "the launcher must paint the model pickers from cache synchronously"
-    assert 0 <= sync_model < async_model, (
+    assert sync_model < async_model, (
         "the synchronous launcher model paint must precede the async refresh repaint"
     )
     skill_fn = _slice_top_level_fn(body, "function _refreshAndPopulateSkills(")
@@ -2717,6 +2740,11 @@ def test_list_cache_core_is_failopen_coalesced_and_gated() -> None:
     schedules a trailing refetch that converges to the latest (finding [2])."""
     src = _LIST_CACHE_JS.read_text(encoding="utf-8")
     assert "return _inflight;" in src, "non-force callers must coalesce onto the in-flight refresh"
+    assert src.count("_byKey = Object.create(null)") == 2, (
+        "both _byKey sites (declaration + _setCache rebuild) must be null-prototype "
+        "(a row keyed __proto__ must not swap the map's prototype; inherited members "
+        "must not resolve as rows)"
+    )
     assert "_lastError = r.status" in src and "_lastError = 0" in src, (
         "a non-OK status and a network/parse error must both be recorded (fail-open)"
     )

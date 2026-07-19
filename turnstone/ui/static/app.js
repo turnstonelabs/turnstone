@@ -545,46 +545,59 @@ function _paintProjectPicker(sel, hint, opts) {
   });
 }
 
-// Paint the model + judge pickers from the warm cache then refresh-and-repaint,
-// collapsing the identical sync-then-refresh dance the modal and dashboard both
-// need (mirrors _paintProjectPicker).  freshOnOpen renders the actual defaults on
-// a reused-dialog open; the async repaint ALWAYS preserves (fresh:false) so a
-// mid-window pick survives.  The populate helper no-ops when the bridge/select is
-// absent (cold cache -> the async refresh fills it, never worse than before).
-function _paintModelSelects(modelSel, judgeSel, opts) {
-  const freshOnOpen = !!(opts && opts.freshOnOpen);
-  _populateModelSelect(modelSel, judgeSel, { fresh: freshOnOpen });
-  if (window.TurnstoneModels) {
-    window.TurnstoneModels.refreshModels().then(function () {
-      _populateModelSelect(modelSel, judgeSel, { fresh: false });
+// One chokepoint for the composer paint discipline, shared by the three
+// cache-backed wrappers below (mirrors _paintProjectPicker, which keeps its own
+// tail — fork/hint logic): sync-paint NOW from the warm cache, then
+// refresh-and-repaint.  The sync paint mirrors the caller's freshOnOpen (a
+// reused-dialog open renders the actual defaults); the async repaint is ALWAYS
+// fresh:false — it must preserve a pick made during the fetch window, never
+// re-blank.  `refresh` may be absent (bridge module still loading): the
+// populate helpers no-op without their bridge and the refresh is skipped —
+// never worse than the pre-cache behavior.
+function _paintFromCache(refresh, repaint, opts) {
+  repaint(!!(opts && opts.freshOnOpen));
+  if (refresh) {
+    refresh().then(function () {
+      repaint(false);
     });
   }
+}
+
+// Paint the model + judge pickers from the warm cache then refresh-and-repaint,
+// collapsing the identical sync-then-refresh dance the modal and dashboard both
+// need.
+function _paintModelSelects(modelSel, judgeSel, opts) {
+  _paintFromCache(
+    window.TurnstoneModels && window.TurnstoneModels.refreshModels,
+    function (fresh) {
+      _populateModelSelect(modelSel, judgeSel, { fresh: fresh });
+    },
+    opts,
+  );
 }
 
 // Skill twin of _paintModelSelects.
 function _paintSkillSelect(sel, opts) {
-  const freshOnOpen = !!(opts && opts.freshOnOpen);
-  _populateSkillSelect(sel, { fresh: freshOnOpen });
-  if (window.TurnstoneSkills) {
-    window.TurnstoneSkills.refreshSkills().then(function () {
-      _populateSkillSelect(sel, { fresh: false });
-    });
-  }
+  _paintFromCache(
+    window.TurnstoneSkills && window.TurnstoneSkills.refreshSkills,
+    function (fresh) {
+      _populateSkillSelect(sel, { fresh: fresh });
+    },
+    opts,
+  );
 }
 
-// Persona twin of _paintModelSelects (fourth composer picker on the same shape,
-// so the modal + dashboard don't maintain the persona sync-then-refresh dance
-// two different ways).  _populatePersonaSelect keeps the kind default when
-// nothing valid is selected, so the async fresh:false repaint can't clobber a
-// mid-window pick.
+// Persona twin of _paintModelSelects.  _populatePersonaSelect keeps the kind
+// default when nothing valid is selected, so the fresh:false repaint can't
+// clobber a mid-window pick.
 function _paintPersonaSelect(sel, opts) {
-  const freshOnOpen = !!(opts && opts.freshOnOpen);
-  _populatePersonaSelect(sel, { fresh: freshOnOpen });
-  if (window.TurnstonePersonas) {
-    window.TurnstonePersonas.refreshPersonas().then(function () {
-      _populatePersonaSelect(sel, { fresh: false });
-    });
-  }
+  _paintFromCache(
+    window.TurnstonePersonas && window.TurnstonePersonas.refreshPersonas,
+    function (fresh) {
+      _populatePersonaSelect(sel, { fresh: fresh });
+    },
+    opts,
+  );
 }
 
 // Fill the model + judge-model <select>s from the shared models cache.  One list
@@ -604,7 +617,7 @@ function _populateModelSelect(modelSel, judgeSel, opts) {
   const prevJudge = fresh || !judgeSel ? "" : judgeSel.value;
   const modelDefault = M.modelLabel(defaults.default_alias || "");
   const judgeDefault = M.modelLabel(defaults.judge_default_alias || "");
-  modelSel.textContent = "";
+  modelSel.replaceChildren();
   _appendOption(
     modelSel,
     "",
@@ -612,7 +625,7 @@ function _populateModelSelect(modelSel, judgeSel, opts) {
     false,
   );
   if (judgeSel) {
-    judgeSel.textContent = "";
+    judgeSel.replaceChildren();
     _appendOption(
       judgeSel,
       "",
@@ -643,7 +656,7 @@ function _populateSkillSelect(sel, opts) {
   if (!sel || !window.TurnstoneSkills) return;
   const fresh = !!(opts && opts.fresh);
   const previous = fresh ? "" : sel.value;
-  sel.textContent = "";
+  sel.replaceChildren();
   _appendOption(sel, "", "Use defaults", false);
   window.TurnstoneSkills.getSkills().forEach(function (t) {
     let label = t.name;
