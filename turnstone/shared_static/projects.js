@@ -39,6 +39,11 @@ const _core = makeListCache({
     return { requireProject: !!data.require_project };
   },
   extraDefaults: { requireProject: false },
+  // require_project GATES the picker (strict mode hides the projectless option),
+  // so it must fail OPEN: a failed refresh resets it to false rather than letting
+  // a stale-true value hide options.  (Default, but explicit for the contrast
+  // with models.js, whose cosmetic extra opts out of the reset.)
+  resetExtraOnError: true,
 });
 
 /**

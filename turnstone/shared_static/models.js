@@ -57,16 +57,23 @@ const _core = makeListCache({
     judge_default_alias: "",
     coordinator_default_alias: "",
   },
+  // The default aliases are a COSMETIC placeholder annotation ("Default — gpt-5"),
+  // not a UI-gating advisory, so keep the last-known value through a transient
+  // refresh failure instead of blanking it back to an un-annotated "Default
+  // model".  A first-load failure still shows all-"" (the seed above).
+  resetExtraOnError: false,
 });
 
 /**
  * Fetch /v1/api/models into the cache.  Resolves to the row list and NEVER
  * rejects — a failed/forbidden fetch keeps the prior cache (a picker never
- * blanks) and resets the default aliases to "".  Recorded (see
- * {@link modelsError}) and warned rather than masqueraded as "no models".
+ * blanks) AND keeps the last-known default aliases; a first-load failure still
+ * shows all-"".  Recorded (see {@link modelsError}) rather than masqueraded as
+ * "no models".  Pass `{force:true}` to force a fresh fetch that converges to the
+ * latest server state even mid-flight (the `models_changed` SSE path uses this).
  */
-export function refreshModels() {
-  return _core.refresh();
+export function refreshModels(callOpts) {
+  return _core.refresh(callOpts);
 }
 
 /** Cached model rows (empty until the first refresh resolves).  Raw rows so
@@ -87,24 +94,42 @@ export function modelsError() {
   return _core.error();
 }
 
-/** `{value, text}` choices for a model <select> — the label ("alias (model)",
- *  or just "alias" when they coincide) is identical across all three creation
- *  surfaces, so it is centralized here.  Callers seed their own static
- *  "Default …" placeholder as option 0. */
+// The one place the "alias (model)" label (or just "alias" when they coincide)
+// is formatted — modelChoices, modelLabel, and every composer placeholder
+// annotation resolve through here so the option labels and the "Default — …"
+// placeholder can never disagree.
+function _fmtLabel(m) {
+  return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+}
+
+/** `{value, text}` choices for a model <select> — the label is identical across
+ *  all three creation surfaces, so it is centralized here.  Callers seed their
+ *  own static "Default …" placeholder as option 0. */
 export function modelChoices() {
   return _core.get().map(function (m) {
-    return {
-      value: m.alias,
-      text: m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")",
-    };
+    return { value: m.alias, text: _fmtLabel(m) };
   });
+}
+
+/** The "alias (model)" label for a model alias, or "" when the alias is empty or
+ *  unknown — lets a composer annotate its "Default — <resolved>" placeholder
+ *  without re-implementing the format.  The models cache has no key index, so
+ *  this scans the (small) row list. */
+export function modelLabel(alias) {
+  if (!alias) return "";
+  const rows = _core.get();
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].alias === alias) return _fmtLabel(rows[i]);
+  }
+  return "";
 }
 
 /** The resolved default aliases the local server reported:
  *  `{default_alias, judge_default_alias, coordinator_default_alias}` (each ""
  *  when not sent).  The ui dashboard reads default_alias, the console launcher
- *  reads coordinator_default_alias; both read judge_default_alias.  Fails open
- *  to all-"" on a refresh error. */
+ *  reads coordinator_default_alias; both read judge_default_alias.  Keeps the
+ *  last-known values on a refresh error (a cosmetic annotation, not a UI gate);
+ *  all-"" only before the first successful load. */
 export function modelDefaults() {
   return _core.extra();
 }
@@ -123,6 +148,7 @@ window.TurnstoneModels = {
   modelsLoaded: modelsLoaded,
   modelsError: modelsError,
   modelChoices: modelChoices,
+  modelLabel: modelLabel,
   modelDefaults: modelDefaults,
   onModelsChange: onModelsChange,
 };

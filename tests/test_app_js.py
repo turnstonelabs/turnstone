@@ -2481,7 +2481,9 @@ def test_paint_project_picker_syncs_before_refresh() -> None:
     the two can't drift and silently re-introduce the FOUC) seeds the required/
     optional hint + paints the picker via _populateProjectSelect SYNCHRONOUSLY,
     then refreshes-and-repaints.  It skips a fork, and both paints route through
-    the same _populateProjectSelect (preserving the #867 strict-picker invariant)."""
+    the same _populateProjectSelect (preserving the #867 strict-picker invariant).
+    The sync paint passes freshOnOpen; the async repaint MUST pass fresh=false, or
+    it clobbers a project the user picked mid-refresh (require_project -> 400)."""
     body = _APP_JS.read_text(encoding="utf-8")
     fn = _slice_top_level_fn(body, "function _paintProjectPicker(")
     assert "_populateProjectSelect(" in fn, (
@@ -2489,12 +2491,15 @@ def test_paint_project_picker_syncs_before_refresh() -> None:
     )
     assert "hint.textContent" in fn, "_paintProjectPicker must seed the required/optional hint"
     assert "opts.fork" in fn, "_paintProjectPicker must skip for a fork"
-    sync_call = fn.find("paint();")
+    sync_call = fn.find("paint(freshOnOpen)")
     async_refresh = fn.find("refreshProjects().then")
     assert async_refresh >= 0, "_paintProjectPicker must keep refreshProjects().then"
     assert 0 <= sync_call < async_refresh, (
-        "_paintProjectPicker must paint synchronously (paint()) BEFORE the async "
-        "refreshProjects().then repaint"
+        "_paintProjectPicker must paint synchronously (paint(freshOnOpen)) BEFORE the "
+        "async refreshProjects().then repaint"
+    )
+    assert "paint(false)" in fn[async_refresh:], (
+        "_paintProjectPicker's async repaint must pass fresh=false (preserve a mid-window pick)"
     )
 
 
@@ -2516,57 +2521,103 @@ _PROJECTS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static
 _PERSONAS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/personas.js"
 
 
-def test_new_ws_modal_paints_model_and_skill_from_cache_synchronously() -> None:
-    """The modal's model + skill pickers paint from the warm cache SYNCHRONOUSLY
-    on open, BEFORE the async refresh-and-repaint (no empty-dropdown flash)."""
+def test_paint_model_and_skill_wrappers_sync_before_refresh() -> None:
+    """The shared _paintModelSelects / _paintSkillSelect wrappers (used by BOTH the
+    modal and dashboard — collapsing the 4x paint-then-refresh dup) paint from the
+    warm cache SYNCHRONOUSLY, then refresh-and-repaint.  CRITICAL: the sync paint
+    passes fresh=freshOnOpen but the ASYNC repaint MUST pass fresh:false — a wrapper
+    leaking freshOnOpen into the async paint would clobber a mid-window pick (for the
+    project picker that reconciles to "" -> a require_project 400)."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    for wrapper, populate, refresh in (
+        ("function _paintModelSelects(", "_populateModelSelect(", "refreshModels().then"),
+        ("function _paintSkillSelect(", "_populateSkillSelect(", "refreshSkills().then"),
+    ):
+        fn = _slice_top_level_fn(body, wrapper)
+        sync = fn.find(populate)
+        async_ = fn.find(refresh)
+        assert 0 <= sync < async_, f"{wrapper} must paint synchronously before the async refresh"
+        assert "{ fresh: freshOnOpen }" in fn, f"{wrapper} sync paint must pass fresh=freshOnOpen"
+        assert "{ fresh: false }" in fn, (
+            f"{wrapper} async repaint must pass fresh:false (never leak freshOnOpen, "
+            "or it clobbers a mid-window pick)"
+        )
+
+
+def test_new_ws_modal_renders_all_selects_fresh_on_open() -> None:
+    """Finding [0] fix — every composer select in the reused new-ws <dialog> renders
+    its ACTUAL value fresh on open (no stale carryover from the last open): model +
+    skill via the wrappers with freshOnOpen:true, persona via {fresh:true}, project
+    via _paintProjectPicker freshOnOpen:true.  The model paint is fork-gated."""
     body = _APP_JS.read_text(encoding="utf-8")
     fn = _slice_top_level_fn(body, "function showNewWsModal(")
-    sync_model = fn.find("_populateModelSelect(modelSelect")
-    async_model = fn.find("refreshModels().then")
-    assert sync_model >= 0, "the modal must paint the model picker from cache synchronously"
-    assert async_model >= 0, "the modal must keep refreshModels().then"
-    assert sync_model < async_model, (
-        "the synchronous model paint must precede the async refreshModels().then repaint"
+    assert "_paintModelSelects(modelSelect, judgeSelect, { freshOnOpen: true })" in fn, (
+        "the modal must paint model+judge fresh-on-open via the shared wrapper"
     )
-    sync_skill = fn.find("_populateSkillSelect(tplSelect)")
-    async_skill = fn.find("refreshSkills().then")
-    assert sync_skill >= 0, "the modal must paint the skill picker from cache synchronously"
-    assert async_skill >= 0, "the modal must keep refreshSkills().then"
-    assert sync_skill < async_skill, (
-        "the synchronous skill paint must precede the async refreshSkills().then repaint"
+    assert "_paintSkillSelect(tplSelect, { freshOnOpen: true })" in fn, (
+        "the modal must paint skill fresh-on-open"
     )
+    assert "_populatePersonaSelect(personaSelect, { fresh: true })" in fn, (
+        "the modal must paint persona fresh-on-open (kind default, no stale carryover)"
+    )
+    proj = fn[fn.find("_paintProjectPicker(projSelect") :]
+    assert "freshOnOpen: true" in proj[:120], (
+        "the modal must paint the project picker fresh-on-open"
+    )
+    # the model wrapper call is fork-gated (a fork inherits + hides model/judge)
+    guard = fn.find("if (!_forkFromWsId) {")
+    model_paint = fn.find("_paintModelSelects(modelSelect")
+    assert 0 <= guard < model_paint, "the modal model paint must be skipped for a fork"
 
 
-def test_dashboard_paints_model_and_skill_from_cache_synchronously() -> None:
-    """Dashboard twin — model + skill paint synchronously before the refresh, and
-    the old fetch-once ``options.length <= 1`` guard is GONE (upgraded to
-    refresh-on-open via the coalesced cache, matching project/persona)."""
+def test_dashboard_paints_model_and_skill_via_wrappers_preserving() -> None:
+    """Dashboard twin — model + skill paint via the SAME wrappers but freshOnOpen:false
+    (a persistent panel preserves a pick across a repaint), and the old fetch-once
+    ``options.length <= 1`` guard is gone."""
     body = _APP_JS.read_text(encoding="utf-8")
     fn = _slice_top_level_fn(body, "function _loadDashboardOptionsLists(")
-    sync_model = fn.find("_populateModelSelect(modelSel")
-    async_model = fn.find("refreshModels().then")
-    assert sync_model >= 0, "the dashboard must paint the model picker from cache synchronously"
-    assert 0 <= sync_model < async_model, (
-        "the synchronous dashboard model paint must precede the async refresh repaint"
+    assert "_paintModelSelects(modelSel, judgeSel, { freshOnOpen: false })" in fn, (
+        "the dashboard must paint model+judge via the wrapper, preserving (freshOnOpen:false)"
     )
-    sync_skill = fn.find("_populateSkillSelect(skillSel)")
-    async_skill = fn.find("refreshSkills().then")
-    assert sync_skill >= 0, "the dashboard must paint the skill picker from cache synchronously"
-    assert 0 <= sync_skill < async_skill, (
-        "the synchronous dashboard skill paint must precede the async refresh repaint"
+    assert "_paintSkillSelect(skillSel, { freshOnOpen: false })" in fn, (
+        "the dashboard must paint skill via the wrapper, preserving"
     )
     assert "options.length <= 1" not in fn, (
         "the dashboard model/skill fetch-once guard must be removed (refresh-on-open now)"
     )
 
 
+def test_new_ws_modal_fork_inherits_model_and_judge() -> None:
+    """Q2 — a fork INHERITS its source's model + judge: the modal hides both selects
+    for a fork (like skill/persona/project), and submitNewWs gates body.model AND
+    body.judge_model on !_forkFromWsId.  Asserts the model line SPECIFICALLY — its
+    guard `model && !_forkFromWsId` is a substring of the judge line, so a
+    model-unguarded regression would otherwise false-pass."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    modal = _slice_top_level_fn(body, "function showNewWsModal(")
+    assert "modelSelect.hidden = !!_forkFromWsId" in modal, (
+        "modal must hide the model select for a fork"
+    )
+    assert "judgeSelect.hidden = !!_forkFromWsId" in modal, (
+        "modal must hide the judge select for a fork"
+    )
+    submit = _slice_top_level_fn(body, "function submitNewWs(")
+    assert "if (model && !_forkFromWsId) body.model = model;" in submit, (
+        "submitNewWs must fork-gate body.model (distinct from the judge line)"
+    )
+    assert "if (judge_model && !_forkFromWsId) body.judge_model = judge_model;" in submit, (
+        "submitNewWs must fork-gate body.judge_model"
+    )
+
+
 def test_console_launcher_paints_model_and_skill_from_cache_synchronously() -> None:
     """Console launcher — the model + skill refresh wrappers paint synchronously
-    from the warm cache before the async refresh-and-repaint."""
+    from the warm cache before the async refresh-and-repaint.  The model wrapper
+    threads callOpts so models_changed can force a trailing refresh."""
     body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
     model_fn = _slice_top_level_fn(body, "function _refreshAndPopulateModels(")
     sync_model = model_fn.find("_populateHomeModelDropdowns()")
-    async_model = model_fn.find("refreshModels().then")
+    async_model = model_fn.find("refreshModels(callOpts).then")
     assert sync_model >= 0, "the launcher must paint the model pickers from cache synchronously"
     assert 0 <= sync_model < async_model, (
         "the synchronous launcher model paint must precede the async refresh repaint"
@@ -2574,7 +2625,6 @@ def test_console_launcher_paints_model_and_skill_from_cache_synchronously() -> N
     skill_fn = _slice_top_level_fn(body, "function _refreshAndPopulateSkills(")
     sync_skill = skill_fn.find("_populateHomeSkillDropdown()")
     async_skill = skill_fn.find("refreshSkills().then")
-    assert sync_skill >= 0, "the launcher must paint the skill picker from cache synchronously"
     assert 0 <= sync_skill < async_skill, (
         "the synchronous launcher skill paint must precede the async refresh repaint"
     )
@@ -2591,18 +2641,38 @@ def test_console_relogin_rewarms_model_and_skill() -> None:
     assert "_refreshAndPopulateModels()" in login, "onLoginSuccess must re-warm models"
 
 
-def test_models_changed_single_repaint_path() -> None:
-    """The console ``models_changed`` SSE handler repaints the launcher via the
-    refresh wrapper (which reads the warm cache), and the launcher does NOT ALSO
-    subscribe onModelsChange — one repaint path, no double rebuild (graph R7)."""
+def test_models_changed_forces_trailing_single_repaint_path() -> None:
+    """The console ``models_changed`` handler repaints via the refresh wrapper with
+    {force:true} — so a burst of model-config changes converges to the latest server
+    state (trailing refresh) — and the launcher does NOT ALSO subscribe onModelsChange
+    (one repaint path, no double rebuild)."""
     body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
     mc = body.index('data.type === "models_changed"')
-    handler = body[mc : mc + 600]
-    assert "_refreshAndPopulateModels()" in handler, (
-        "models_changed must repaint the launcher model dropdowns via the refresh wrapper"
+    handler = body[mc : mc + 700]
+    assert "_refreshAndPopulateModels({ force: true })" in handler, (
+        "models_changed must force a trailing refresh so it converges to the latest"
     )
     assert "onModelsChange" not in body, (
-        "the console must not ALSO subscribe onModelsChange (single repaint path — R7)"
+        "the console must not ALSO subscribe onModelsChange (single repaint path)"
+    )
+
+
+def test_models_label_centralized_on_bridge() -> None:
+    """Finding [7] — the "alias (model)" label lives ONCE in models.js: modelLabel is
+    exported AND registered on the window.TurnstoneModels bridge (the classic app.js
+    bundles reach it only via the bridge — an ES-only export throws at runtime), and
+    neither app keeps a local _resolveModelLabel copy."""
+    models_src = _MODELS_JS.read_text(encoding="utf-8")
+    assert "export function modelLabel(" in models_src, "models.js must export modelLabel"
+    assert "modelLabel: modelLabel" in models_src, (
+        "models.js must register modelLabel on the window.TurnstoneModels bridge "
+        "(classic bundles call it via the bridge)"
+    )
+    assert "_resolveModelLabel" not in _APP_JS.read_text(encoding="utf-8"), (
+        "the ui app must not keep a local _resolveModelLabel (use TurnstoneModels.modelLabel)"
+    )
+    assert "_resolveModelLabel" not in _CONSOLE_APP_JS.read_text(encoding="utf-8"), (
+        "the console app must not keep a local _resolveModelLabel"
     )
 
 
@@ -2616,21 +2686,44 @@ def test_models_skills_module_tagged_in_both_apps() -> None:
         assert "/shared/skills.js" in html, f"skills.js must be module-tagged in {idx.name}"
 
 
-def test_list_cache_core_is_failopen_and_coalesced() -> None:
-    """The extracted list_cache.js core coalesces concurrent refreshes, fails open
-    (keeps the prior cache + records the error on a non-OK/exception, never
-    rejects — only the SUCCESS branch calls _setCache), and fires subscribers only
-    on first load or a changed fingerprint."""
+def test_list_cache_core_is_failopen_coalesced_and_gated() -> None:
+    """The extracted list_cache.js core: non-force callers coalesce onto the in-flight
+    refresh; it fails open (keeps the prior cache + records the error, never rejects —
+    only the SUCCESS branch calls _setCache); the extra-reset is GATED on
+    resetExtraOnError across BOTH error branches (finding [1]); and a force caller
+    schedules a trailing refetch that converges to the latest (finding [2])."""
     src = _LIST_CACHE_JS.read_text(encoding="utf-8")
-    assert "if (_inflight) return _inflight" in src, "refresh must coalesce concurrent callers"
+    assert "return _inflight;" in src, "non-force callers must coalesce onto the in-flight refresh"
     assert "_lastError = r.status" in src and "_lastError = 0" in src, (
         "a non-OK status and a network/parse error must both be recorded (fail-open)"
     )
     assert src.count("_setCache(data[dataKey]") == 1, (
         "only the success branch may repopulate the cache (non-OK/catch keep the prior cache)"
     )
+    # finding [1]: the extra-reset must be gated on resetExtraOnError on BOTH the
+    # non-OK branch AND the network/parse .catch branch (a cosmetic extra must
+    # survive a network drop too, not just a non-OK status).
+    assert src.count("resetExtraOnError && extraDefaults") == 2, (
+        "resetExtraOnError must gate the extra-reset on BOTH error branches"
+    )
+    # finding [2]: a force caller gets a trailing refetch (converges to latest).
+    assert "callOpts.force" in src and "_pending" in src, (
+        "a force caller must schedule a trailing refetch so it converges to the latest state"
+    )
     assert "firstLoad || fp !== _fingerprint" in src, (
         "subscribers must fire on first load or a changed fingerprint only"
+    )
+
+
+def test_reset_extra_policy_per_cache() -> None:
+    """require_project (an advisory that GATES the picker) must fail open on error;
+    the models default-aliases (a COSMETIC annotation) must keep their last-known
+    value.  So projects opts INTO the reset, models opts OUT (finding [1])."""
+    assert "resetExtraOnError: true" in _PROJECTS_JS.read_text(encoding="utf-8"), (
+        "projects.js must reset the require_project advisory on error (fail-open)"
+    )
+    assert "resetExtraOnError: false" in _MODELS_JS.read_text(encoding="utf-8"), (
+        "models.js must keep last-known default aliases on error (cosmetic, not a gate)"
     )
 
 

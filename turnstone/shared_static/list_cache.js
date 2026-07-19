@@ -41,9 +41,20 @@ import { authFetch } from "./auth.js";
  *                                      successful refresh (returns the new
  *                                      `extra` object, replacing the prior one)
  * @param {object} [opts.extraDefaults] the fail-open `extra` value — installed
- *                                      at init AND restored on every refresh
- *                                      failure, so a stale-true advisory can't
- *                                      survive a transient error
+ *                                      at init AND (when resetExtraOnError)
+ *                                      restored on a refresh failure, so a
+ *                                      stale-true advisory can't survive a
+ *                                      transient error
+ * @param {boolean} [opts.resetExtraOnError=true]  whether a failed refresh resets
+ *                                      `extra` to extraDefaults.  True for an
+ *                                      ADVISORY that gates UI (must fail open);
+ *                                      false for a merely COSMETIC extra that
+ *                                      should keep its last-known value through a
+ *                                      transient failure rather than blank.
+ * `refresh(opts)` accepts `{force:true}` — an INVALIDATION (e.g. a *_changed SSE
+ * event) that must converge to the latest server state: if a refresh is already
+ * in flight it chains ONE trailing refetch after it and awaits that, instead of
+ * coalescing onto the in-flight response that may predate the change.
  * @returns {{refresh:Function, get:Function, getByKey:Function,
  *            loaded:Function, error:Function, extra:Function, onChange:Function}}
  */
@@ -56,12 +67,17 @@ export function makeListCache(opts) {
   const fpExtra = opts.fpExtra || null;
   const captureExtra = opts.captureExtra || null;
   const extraDefaults = opts.extraDefaults || null;
+  // Default true: an advisory that gates UI (projects' require_project) must fail
+  // open, so a stale-true value can't survive an error.  A cosmetic extra
+  // (models' resolved default aliases) passes false to keep the last-known value.
+  const resetExtraOnError = opts.resetExtraOnError !== false;
 
   let _cache = []; // last-fetched rows (caller-visible)
   let _byKey = {}; // keyField value -> row, for O(1) lookup (when keyField set)
   let _loaded = false; // has the first refresh attempt completed (ok or failed)?
   let _lastError = null; // last failure: HTTP status, 0 for network/parse, null when ok
   let _inflight = null; // shared pending refresh so concurrent callers coalesce
+  let _pending = null; // trailing refresh chained after _inflight for a force() call
   let _fingerprint = null; // last fired signature, for change-detection
   let _extra = extraDefaults ? Object.assign({}, extraDefaults) : {};
   const _subs = []; // () => void, fired after each CHANGED refresh
@@ -102,20 +118,43 @@ export function makeListCache(opts) {
     }
   }
 
-  function refresh() {
+  function refresh(callOpts) {
     // Coalesce concurrent callers (startup warm + a picker open can both fire
     // this) onto one in-flight request — they share the promise and _setCache
     // runs once.
-    if (_inflight) return _inflight;
+    if (_inflight) {
+      if (callOpts && callOpts.force) {
+        // A force caller is an INVALIDATION ("the data definitely changed" — a
+        // *_changed SSE event): it must converge to the latest server state, so
+        // chain ONE trailing refetch after the in-flight one and await THAT,
+        // rather than coalescing onto a response that may predate the change.
+        // Reused if several force calls land during the same fetch (a burst
+        // collapses to one trailing).  INVARIANT: refresh() never rejects (the
+        // chain below always resolves via .catch), so this .then always runs; if
+        // a reject path is ever added, clear _pending in a .catch or force
+        // callers wedge on a stuck promise.
+        _pending =
+          _pending ||
+          _inflight.then(function () {
+            _pending = null;
+            return refresh();
+          });
+        return _pending;
+      }
+      return _inflight;
+    }
     _inflight = authFetch(url)
       .then(function (r) {
         if (r.ok) return r.json();
         // A non-OK status (403 when a grant is missing, a 5xx, ...) is NOT "you
-        // have zero rows": keep the prior cache rather than blanking it, record
-        // the status so the failure is visible, and reset the advisory extra to
-        // its fail-open default (a stale-true value must not survive an error).
+        // have zero rows": keep the prior cache rather than blanking it and
+        // record the status.  Reset the extra to its fail-open default ONLY when
+        // resetExtraOnError (an advisory that gates UI must not survive stale); a
+        // cosmetic extra keeps its last-known value.
         _lastError = r.status;
-        if (extraDefaults) _extra = Object.assign({}, extraDefaults);
+        if (resetExtraOnError && extraDefaults) {
+          _extra = Object.assign({}, extraDefaults);
+        }
         console.warn(name + ": GET " + url + " -> " + r.status);
         return null;
       })
@@ -130,9 +169,11 @@ export function makeListCache(opts) {
       .catch(function (e) {
         // Network drop or a non-JSON body — same policy as a non-OK status:
         // preserve the last-known cache, never reject (callers chain a bare
-        // .then), surface the failure, fail-open the extra.
+        // .then), surface the failure, fail-open the extra (when configured).
         _lastError = 0;
-        if (extraDefaults) _extra = Object.assign({}, extraDefaults);
+        if (resetExtraOnError && extraDefaults) {
+          _extra = Object.assign({}, extraDefaults);
+        }
         console.warn(name + ": refresh failed", e);
         return _cache;
       })

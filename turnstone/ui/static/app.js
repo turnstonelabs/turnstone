@@ -336,27 +336,26 @@ function showNewWsModal(forkFromWsId) {
   if (skillLabel) skillLabel.hidden = !!_forkFromWsId;
   if (skillSelect) skillSelect.hidden = !!_forkFromWsId;
 
-  // Model + judge pickers — paint from the warm models cache first, then
-  // refresh-and-repaint.  The modal keeps the plain static "Default …"
-  // placeholders (annotate:false); the dashboard annotates with the resolved
-  // default.  On a cold cache the sync paint is a no-op the refresh fills.
+  // Model + judge pickers — HIDDEN for a fork: a fork inherits its source's
+  // model + judge (like skill/persona/project), and submitNewWs gates both on
+  // !_forkFromWsId.  For a fresh create, paint from the warm cache with the
+  // resolved-default annotation ("Default — gpt-5"), FRESH on open (the reused
+  // dialog has no prior pick to carry over), then refresh-and-repaint.
+  const modelLabel = document.querySelector('label[for="new-ws-model"]');
+  const judgeLabel = document.querySelector('label[for="new-ws-judge-model"]');
   const modelSelect = document.getElementById("new-ws-model");
   const judgeSelect = document.getElementById("new-ws-judge-model");
-  _populateModelSelect(modelSelect, judgeSelect, { annotate: false });
-  if (window.TurnstoneModels) {
-    window.TurnstoneModels.refreshModels().then(function () {
-      _populateModelSelect(modelSelect, judgeSelect, { annotate: false });
-    });
+  if (modelLabel) modelLabel.hidden = !!_forkFromWsId;
+  if (judgeLabel) judgeLabel.hidden = !!_forkFromWsId;
+  if (modelSelect) modelSelect.hidden = !!_forkFromWsId;
+  if (judgeSelect) judgeSelect.hidden = !!_forkFromWsId;
+  if (!_forkFromWsId) {
+    _paintModelSelects(modelSelect, judgeSelect, { freshOnOpen: true });
   }
 
-  // Skill picker — same paint-from-cache-then-refresh.
+  // Skill picker — paint fresh-on-open from the warm cache, then refresh.
   const tplSelect = document.getElementById("new-ws-skill");
-  _populateSkillSelect(tplSelect);
-  if (window.TurnstoneSkills) {
-    window.TurnstoneSkills.refreshSkills().then(function () {
-      _populateSkillSelect(tplSelect);
-    });
-  }
+  _paintSkillSelect(tplSelect, { freshOnOpen: true });
 
   // Project picker — populated from the shared projects cache, refreshed on
   // open. Fresh creates SHOW it; forks HIDE it — a fork's project is its
@@ -378,7 +377,10 @@ function showNewWsModal(forkFromWsId) {
   // refresh-and-repaint — shared with the dashboard via _paintProjectPicker so
   // the two can't drift; skips for a fork (its picker is hidden above,
   // inheritance is server-enforced).
-  _paintProjectPicker(projSelect, projHint, { fork: !!_forkFromWsId });
+  _paintProjectPicker(projSelect, projHint, {
+    fork: !!_forkFromWsId,
+    freshOnOpen: true,
+  });
 
   // Persona picker — hidden when forking (a fork resumes the source's
   // stamped persona; the create handler skips resolution on resume_ws).
@@ -387,13 +389,13 @@ function showNewWsModal(forkFromWsId) {
   if (personaLabel) personaLabel.hidden = !!_forkFromWsId;
   if (personaSelect) personaSelect.hidden = !!_forkFromWsId;
   if (personaSelect && !_forkFromWsId && window.TurnstonePersonas) {
-    // Sync paint from the warm cache first, then refresh-and-repaint to catch a
-    // persona created elsewhere. _populatePersonaSelect preserves a mid-window
-    // pick and only applies the kind default when nothing valid is selected, so
-    // the second (async) paint can't clobber the user's choice.
-    _populatePersonaSelect(personaSelect);
+    // Fresh-on-open sync paint (renders the kind default; the reused dialog has
+    // no prior pick to carry over), then refresh-and-repaint. The async paint
+    // passes fresh:false so it preserves a mid-window pick and only re-applies
+    // the kind default when nothing valid is selected.
+    _populatePersonaSelect(personaSelect, { fresh: true });
     window.TurnstonePersonas.refreshPersonas().then(function () {
-      _populatePersonaSelect(personaSelect);
+      _populatePersonaSelect(personaSelect, { fresh: false });
     });
   }
 
@@ -471,9 +473,12 @@ function _ensureStandaloneProjectCreator(sel) {
 // — this dialog only creates interactive workstreams), preselecting the kind
 // default so a zero-touch create behaves exactly like today.  No-op when the
 // personas bridge is absent (module still loading / pre-seed database).
-function _populatePersonaSelect(sel) {
+function _populatePersonaSelect(sel, opts) {
   if (!sel || !window.TurnstonePersonas) return;
-  const previous = sel.value;
+  // A fresh modal open has no prior selection to preserve — render the kind
+  // default; a repaint (fresh=false) keeps a mid-window pick.
+  const fresh = !!(opts && opts.fresh);
+  const previous = fresh ? "" : sel.value;
   const placeholder = sel.options.length ? sel.options[0] : null;
   sel.replaceChildren();
   if (placeholder) sel.appendChild(placeholder);
@@ -518,37 +523,66 @@ function _optionExists(sel, val) {
 // #867 strict-picker invariant (never auto-select a real project) holds on each.
 function _paintProjectPicker(sel, hint, opts) {
   if ((opts && opts.fork) || !sel || !window.TurnstoneProjects) return;
-  const paint = function () {
+  // paint(fresh): a fresh open renders the actual default (no prior selection);
+  // the async repaint MUST pass fresh=false, or it clobbers a project the user
+  // picked during the refresh round-trip — under require_project that reconciles
+  // the select back to "" and submit then sends no project -> a 400.
+  const paint = function (fresh) {
     const strict = !!window.TurnstoneProjects.requireProject();
     if (hint) hint.textContent = strict ? "required" : "optional";
-    _populateProjectSelect(sel, { requireProject: strict });
+    _populateProjectSelect(sel, { requireProject: strict, fresh: fresh });
   };
-  paint(); // sync from the warm cache (no-op when cold; the async fills it)
-  window.TurnstoneProjects.refreshProjects().then(paint);
+  const freshOnOpen = !!(opts && opts.freshOnOpen);
+  paint(freshOnOpen); // sync from the warm cache (no-op when cold; the async fills it)
+  window.TurnstoneProjects.refreshProjects().then(function () {
+    paint(false);
+  });
 }
 
-// Fill the model + judge-model <select>s from the shared models cache.  One
-// list feeds BOTH selects with the same "alias (model)" labels; each keeps its
-// own static "Default …" placeholder (option 0) and its own preserved pick.
-// When opts.annotate is set (the dashboard) the placeholders show the
-// server-resolved default alias; the modal passes annotate:false and keeps the
-// plain static text.  No-op when the models bridge is absent (still loading) —
-// the async refresh then fills it, exactly as before this cache existed.
+// Paint the model + judge pickers from the warm cache then refresh-and-repaint,
+// collapsing the identical sync-then-refresh dance the modal and dashboard both
+// need (mirrors _paintProjectPicker).  freshOnOpen renders the actual defaults on
+// a reused-dialog open; the async repaint ALWAYS preserves (fresh:false) so a
+// mid-window pick survives.  The populate helper no-ops when the bridge/select is
+// absent (cold cache -> the async refresh fills it, never worse than before).
+function _paintModelSelects(modelSel, judgeSel, opts) {
+  const freshOnOpen = !!(opts && opts.freshOnOpen);
+  _populateModelSelect(modelSel, judgeSel, { fresh: freshOnOpen });
+  if (window.TurnstoneModels) {
+    window.TurnstoneModels.refreshModels().then(function () {
+      _populateModelSelect(modelSel, judgeSel, { fresh: false });
+    });
+  }
+}
+
+// Skill twin of _paintModelSelects.
+function _paintSkillSelect(sel, opts) {
+  const freshOnOpen = !!(opts && opts.freshOnOpen);
+  _populateSkillSelect(sel, { fresh: freshOnOpen });
+  if (window.TurnstoneSkills) {
+    window.TurnstoneSkills.refreshSkills().then(function () {
+      _populateSkillSelect(sel, { fresh: false });
+    });
+  }
+}
+
+// Fill the model + judge-model <select>s from the shared models cache.  One list
+// feeds BOTH selects with the same "alias (model)" labels; each placeholder is
+// annotated with the server-resolved default alias ("Default — gpt-5"), resolved
+// once via the cache's modelLabel.  A fresh open renders the default (no prior
+// selection); a repaint preserves each select's mid-window pick independently.
+// No-op when the models bridge is absent (still loading) — the async refresh then
+// fills it, exactly as before this cache existed.
 function _populateModelSelect(modelSel, judgeSel, opts) {
   if (!modelSel || !window.TurnstoneModels) return;
-  const annotate = !!(opts && opts.annotate);
+  const fresh = !!(opts && opts.fresh);
   const M = window.TurnstoneModels;
   const choices = M.modelChoices();
   const defaults = M.modelDefaults();
-  const models = M.getModels();
-  const prevModel = modelSel.value;
-  const prevJudge = judgeSel ? judgeSel.value : "";
-  const modelDefault = annotate
-    ? _resolveModelLabel(defaults.default_alias || "", models)
-    : "";
-  const judgeDefault = annotate
-    ? _resolveModelLabel(defaults.judge_default_alias || "", models)
-    : "";
+  const prevModel = fresh ? "" : modelSel.value;
+  const prevJudge = fresh || !judgeSel ? "" : judgeSel.value;
+  const modelDefault = M.modelLabel(defaults.default_alias || "");
+  const judgeDefault = M.modelLabel(defaults.judge_default_alias || "");
   modelSel.textContent = "";
   _appendOption(
     modelSel,
@@ -569,10 +603,11 @@ function _populateModelSelect(modelSel, judgeSel, opts) {
     _appendOption(modelSel, c.value, c.text, false);
     if (judgeSel) _appendOption(judgeSel, c.value, c.text, false);
   });
-  // Preserve a mid-window pick on EACH select independently so the async
-  // repaint can't clobber a fast user's choice.
-  if (prevModel && _optionExists(modelSel, prevModel))
+  // Preserve a mid-window pick on EACH select independently so the async repaint
+  // can't clobber a fast user's choice (a fresh open zeroed both above).
+  if (prevModel && _optionExists(modelSel, prevModel)) {
     modelSel.value = prevModel;
+  }
   if (judgeSel && prevJudge && _optionExists(judgeSel, prevJudge)) {
     judgeSel.value = prevJudge;
   }
@@ -583,9 +618,10 @@ function _populateModelSelect(modelSel, judgeSel, opts) {
 // ui label appends " [MCP]" for MCP-origin skills (the console launcher does
 // not — which is why the cache returns raw rows).  No-op when the bridge is
 // absent.
-function _populateSkillSelect(sel) {
+function _populateSkillSelect(sel, opts) {
   if (!sel || !window.TurnstoneSkills) return;
-  const previous = sel.value;
+  const fresh = !!(opts && opts.fresh);
+  const previous = fresh ? "" : sel.value;
   sel.textContent = "";
   _appendOption(sel, "", "Use defaults", false);
   window.TurnstoneSkills.getSkills().forEach(function (t) {
@@ -615,10 +651,15 @@ function _populateSkillSelect(sel) {
 function _populateProjectSelect(sel, opts) {
   if (!sel || !window.TurnstoneProjects) return;
   const mode = opts || sel._projMode || {};
-  sel._projMode = mode;
+  // Stamp ONLY the picker mode onto the element (the inline "+ New project…"
+  // creator's no-opts repaint reuses it); `fresh` is read from the LIVE opts
+  // per-call and deliberately NOT stamped, so a fresh:true modal open can't
+  // persist into a later preserve-repaint.
+  sel._projMode = { requireProject: !!mode.requireProject };
   const strict = !!mode.requireProject;
+  const fresh = !!(opts && opts.fresh);
   _ensureStandaloneProjectCreator(sel);
-  const previous = sel.value;
+  const previous = fresh ? "" : sel.value;
   const choices = window.TurnstoneProjects.projectChoices();
   sel.replaceChildren();
   if (!strict) {
@@ -687,8 +728,10 @@ function submitNewWs() {
   const initEl = document.getElementById("new-ws-initial-message");
   const initial_message = initEl ? initEl.value.trim() : "";
   if (name) body.name = name;
-  if (model) body.model = model;
-  if (judge_model) body.judge_model = judge_model;
+  // Forks inherit their source's model + judge (the selects are hidden for a
+  // fork), so never override them — matches the skill/persona/project fork guards.
+  if (model && !_forkFromWsId) body.model = model;
+  if (judge_model && !_forkFromWsId) body.judge_model = judge_model;
   if (skill && !_forkFromWsId) body.skill = skill;
   // Only a FRESH create sends a project_id; a fork's project is its source's,
   // enforced server-side (the picker is hidden for forks, and any explicit pid is
@@ -1450,46 +1493,18 @@ function _refreshDashboardSubmitLabel() {
   btn.textContent = hasText || hasFiles ? "Send" : "Create";
 }
 
-// Format a resolved alias with its model suffix the same way as the
-// dropdown rows ("alias (model)", or just "alias" when they coincide).
-// Returns "" when alias is empty or unknown so callers fall back to a
-// neutral placeholder.
-function _resolveModelLabel(alias, models) {
-  if (!alias) return "";
-  for (let i = 0; i < (models || []).length; i++) {
-    const m = models[i];
-    if (m.alias === alias) {
-      return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-    }
-  }
-  return "";
-}
-
 function _loadDashboardOptionsLists() {
-  // Models — paint from the warm cache (placeholders annotated with the
-  // server-resolved default alias) then refresh-and-repaint.  Previously
-  // fetch-once (guarded on options.length); now refresh-on-open via the
-  // coalesced models cache, matching the project/persona pickers.
+  // Models + skills — paint from the warm cache (model placeholders annotated
+  // with the server-resolved default) then refresh-and-repaint, via the shared
+  // wrappers (same paths the modal uses).  The dashboard composer is persistent
+  // (not a reused dialog), so freshOnOpen:false — it preserves a pick across a
+  // repaint.  Previously fetch-once (guarded on options.length); now
+  // refresh-on-open via the coalesced caches, matching the project/persona pickers.
   const modelSel = document.getElementById("dashboard-model");
   const judgeSel = document.getElementById("dashboard-judge-model");
-  if (modelSel) {
-    _populateModelSelect(modelSel, judgeSel, { annotate: true });
-    if (window.TurnstoneModels) {
-      window.TurnstoneModels.refreshModels().then(function () {
-        _populateModelSelect(modelSel, judgeSel, { annotate: true });
-      });
-    }
-  }
-  // Skills — same paint-from-cache-then-refresh.
+  _paintModelSelects(modelSel, judgeSel, { freshOnOpen: false });
   const skillSel = document.getElementById("dashboard-skill");
-  if (skillSel) {
-    _populateSkillSelect(skillSel);
-    if (window.TurnstoneSkills) {
-      window.TurnstoneSkills.refreshSkills().then(function () {
-        _populateSkillSelect(skillSel);
-      });
-    }
-  }
+  _paintSkillSelect(skillSel, { freshOnOpen: false });
 
   // Project picker — paint from the warm cache then refresh-and-repaint (also
   // feeds the rail's group-by-project). Dashboard quick-create is ALWAYS a fresh

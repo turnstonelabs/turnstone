@@ -429,9 +429,11 @@ function handleClusterEvent(data) {
     // Server emits this when a model definition or a role-assignment
     // setting (model.default_alias, judge.model, coordinator.model_alias,
     // coordinator.reasoning_effort) changes.  Refresh anything that
-    // renders model aliases so labels stay accurate without a reload.
+    // renders model aliases so labels stay accurate without a reload.  Pass
+    // {force:true} so a burst of changes converges to the latest (the coalesced
+    // open/startup path stays plain — see _refreshAndPopulateModels).
     if (typeof _refreshAndPopulateModels === "function") {
-      _refreshAndPopulateModels();
+      _refreshAndPopulateModels({ force: true });
     }
     if (typeof _sklcInvalidateModelsCache === "function") {
       _sklcInvalidateModelsCache();
@@ -1764,27 +1766,18 @@ function _populateHomeSkillDropdown() {
 // dropdown rows ("alias (model)", or just "alias" when they coincide).
 // Returns "" when alias is empty or unknown so callers can fall back
 // to a neutral placeholder.
-function _resolveModelLabel(alias, models) {
-  if (!alias) return "";
-  for (let i = 0; i < (models || []).length; i++) {
-    const m = models[i];
-    if (m.alias === alias) {
-      return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-    }
-  }
-  return "";
-}
-
 // Refresh the shared models cache then repaint the launcher's Model + Judge
 // Model pickers.  Sync paint from the warm cache first (no empty flash for the
 // round-trip), then refresh-and-repaint.  This is ALSO the single repaint path
-// for the `models_changed` SSE event: it refreshes the cache and repaints, so
-// there is no second (subscription) path that would double-repaint.
-function _refreshAndPopulateModels() {
+// for the `models_changed` SSE event, which passes {force:true} so the refresh
+// converges to the latest server state (and its .then repaints from THAT) even
+// when a burst of model-config changes lands mid-fetch — no second
+// (subscription) path that would double-repaint.
+function _refreshAndPopulateModels(callOpts) {
   const TM = window.TurnstoneModels;
   if (!TM) return;
   _populateHomeModelDropdowns();
-  TM.refreshModels().then(_populateHomeModelDropdowns);
+  TM.refreshModels(callOpts).then(_populateHomeModelDropdowns);
 }
 
 // Populate the launcher's Model + Judge Model pickers from the shared cache —
@@ -1799,8 +1792,11 @@ function _populateHomeModelDropdowns() {
   const TM = window.TurnstoneModels;
   if (!TM) return;
   const choices = TM.modelChoices();
-  const models = TM.getModels();
   const defaults = TM.modelDefaults();
+  // The launcher composer is a PERSISTENT panel (it never reopens like the new-ws
+  // modal), so preserving the prior pick across a repaint is INTENDED — not the
+  // modal's fresh-on-open reset.  A background models_changed must not clobber a
+  // mid-window model/judge choice.
   const prevModel = _homeCoordComposer.getOptionValue("model");
   const prevJudge = _homeCoordComposer.getOptionValue("judge_model");
   _homeCoordComposer.setOptionChoices("model", choices);
@@ -1811,14 +1807,8 @@ function _populateHomeModelDropdowns() {
   // "Default model" line above it.  Em-dash separator (rather than nested
   // parens) keeps the alias's "(model)" suffix legible and matches the
   // ``(default — alias (model))`` pattern used in the admin Roles tab.
-  const coordDefault = _resolveModelLabel(
-    defaults.coordinator_default_alias || "",
-    models,
-  );
-  const judgeDefault = _resolveModelLabel(
-    defaults.judge_default_alias || "",
-    models,
-  );
+  const coordDefault = TM.modelLabel(defaults.coordinator_default_alias || "");
+  const judgeDefault = TM.modelLabel(defaults.judge_default_alias || "");
   _homeCoordComposer.setOptionPlaceholder(
     "model",
     coordDefault ? "Default — " + coordDefault : "Default model",
