@@ -336,67 +336,27 @@ function showNewWsModal(forkFromWsId) {
   if (skillLabel) skillLabel.hidden = !!_forkFromWsId;
   if (skillSelect) skillSelect.hidden = !!_forkFromWsId;
 
-  // Populate model dropdown
+  // Model + judge pickers — paint from the warm models cache first, then
+  // refresh-and-repaint.  The modal keeps the plain static "Default …"
+  // placeholders (annotate:false); the dashboard annotates with the resolved
+  // default.  On a cold cache the sync paint is a no-op the refresh fills.
   const modelSelect = document.getElementById("new-ws-model");
   const judgeSelect = document.getElementById("new-ws-judge-model");
-  const curModel = ""; // (focused-pane model prefill was PaneManager-only; dead in the L-shell)
-  modelSelect.textContent = "";
-  judgeSelect.textContent = "";
-  const defaultOpt = document.createElement("option");
-  defaultOpt.value = "";
-  defaultOpt.textContent = curModel
-    ? "Default (" + curModel + ")"
-    : "Default model";
-  modelSelect.appendChild(defaultOpt);
-  const defJudgeOpt = document.createElement("option");
-  defJudgeOpt.value = "";
-  defJudgeOpt.textContent = "Default (agent model)";
-  judgeSelect.appendChild(defJudgeOpt);
-  authFetch("/v1/api/models")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.models || []).forEach(function (m) {
-        const opt = document.createElement("option");
-        opt.value = m.alias;
-        opt.textContent =
-          m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-        modelSelect.appendChild(opt);
-
-        const judgeOpt = document.createElement("option");
-        judgeOpt.value = m.alias;
-        judgeOpt.textContent = opt.textContent;
-        judgeSelect.appendChild(judgeOpt);
-      });
-    })
-    .catch(function () {
-      /* ignore — default model still works */
+  _populateModelSelect(modelSelect, judgeSelect, { annotate: false });
+  if (window.TurnstoneModels) {
+    window.TurnstoneModels.refreshModels().then(function () {
+      _populateModelSelect(modelSelect, judgeSelect, { annotate: false });
     });
+  }
 
+  // Skill picker — same paint-from-cache-then-refresh.
   const tplSelect = document.getElementById("new-ws-skill");
-  const tplDefaultOpt = document.createElement("option");
-  tplDefaultOpt.value = "";
-  tplDefaultOpt.textContent = "Use defaults";
-  tplSelect.replaceChildren(tplDefaultOpt);
-  authFetch("/v1/api/skills")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.skills || []).forEach(function (t) {
-        const opt = document.createElement("option");
-        opt.value = t.name;
-        let label = t.name;
-        if (t.is_default) label += " (default)";
-        if (t.origin === "mcp") label += " [MCP]";
-        opt.textContent = label;
-        tplSelect.appendChild(opt);
-      });
-    })
-    .catch(function () {
-      /* ignore */
+  _populateSkillSelect(tplSelect);
+  if (window.TurnstoneSkills) {
+    window.TurnstoneSkills.refreshSkills().then(function () {
+      _populateSkillSelect(tplSelect);
     });
+  }
 
   // Project picker — populated from the shared projects cache, refreshed on
   // open. Fresh creates SHOW it; forks HIDE it — a fork's project is its
@@ -565,6 +525,76 @@ function _paintProjectPicker(sel, hint, opts) {
   };
   paint(); // sync from the warm cache (no-op when cold; the async fills it)
   window.TurnstoneProjects.refreshProjects().then(paint);
+}
+
+// Fill the model + judge-model <select>s from the shared models cache.  One
+// list feeds BOTH selects with the same "alias (model)" labels; each keeps its
+// own static "Default …" placeholder (option 0) and its own preserved pick.
+// When opts.annotate is set (the dashboard) the placeholders show the
+// server-resolved default alias; the modal passes annotate:false and keeps the
+// plain static text.  No-op when the models bridge is absent (still loading) —
+// the async refresh then fills it, exactly as before this cache existed.
+function _populateModelSelect(modelSel, judgeSel, opts) {
+  if (!modelSel || !window.TurnstoneModels) return;
+  const annotate = !!(opts && opts.annotate);
+  const M = window.TurnstoneModels;
+  const choices = M.modelChoices();
+  const defaults = M.modelDefaults();
+  const models = M.getModels();
+  const prevModel = modelSel.value;
+  const prevJudge = judgeSel ? judgeSel.value : "";
+  const modelDefault = annotate
+    ? _resolveModelLabel(defaults.default_alias || "", models)
+    : "";
+  const judgeDefault = annotate
+    ? _resolveModelLabel(defaults.judge_default_alias || "", models)
+    : "";
+  modelSel.textContent = "";
+  _appendOption(
+    modelSel,
+    "",
+    modelDefault ? "Default — " + modelDefault : "Default model",
+    false,
+  );
+  if (judgeSel) {
+    judgeSel.textContent = "";
+    _appendOption(
+      judgeSel,
+      "",
+      judgeDefault ? "Default — " + judgeDefault : "Default (agent model)",
+      false,
+    );
+  }
+  choices.forEach(function (c) {
+    _appendOption(modelSel, c.value, c.text, false);
+    if (judgeSel) _appendOption(judgeSel, c.value, c.text, false);
+  });
+  // Preserve a mid-window pick on EACH select independently so the async
+  // repaint can't clobber a fast user's choice.
+  if (prevModel && _optionExists(modelSel, prevModel))
+    modelSel.value = prevModel;
+  if (judgeSel && prevJudge && _optionExists(judgeSel, prevJudge)) {
+    judgeSel.value = prevJudge;
+  }
+}
+
+// Fill a skill <select> from the shared skills cache, keeping the static
+// "Use defaults" placeholder (option 0) and preserving a mid-window pick.  The
+// ui label appends " [MCP]" for MCP-origin skills (the console launcher does
+// not — which is why the cache returns raw rows).  No-op when the bridge is
+// absent.
+function _populateSkillSelect(sel) {
+  if (!sel || !window.TurnstoneSkills) return;
+  const previous = sel.value;
+  sel.textContent = "";
+  _appendOption(sel, "", "Use defaults", false);
+  window.TurnstoneSkills.getSkills().forEach(function (t) {
+    let label = t.name;
+    if (t.is_default) label += " (default)";
+    if (t.origin === "mcp") label += " [MCP]";
+    _appendOption(sel, t.name, label, false);
+  });
+  if (previous && _optionExists(sel, previous)) sel.value = previous;
 }
 
 // Fill a project <select> from the shared projects cache.  The picker MODE is
@@ -1436,76 +1466,29 @@ function _resolveModelLabel(alias, models) {
 }
 
 function _loadDashboardOptionsLists() {
-  // Models
+  // Models — paint from the warm cache (placeholders annotated with the
+  // server-resolved default alias) then refresh-and-repaint.  Previously
+  // fetch-once (guarded on options.length); now refresh-on-open via the
+  // coalesced models cache, matching the project/persona pickers.
   const modelSel = document.getElementById("dashboard-model");
   const judgeSel = document.getElementById("dashboard-judge-model");
-  if (modelSel && modelSel.options.length <= 1) {
-    authFetch("/v1/api/models")
-      .then(function (r) {
-        return r.json();
-      })
-      .then(function (data) {
-        (data.models || []).forEach(function (m) {
-          const opt = document.createElement("option");
-          opt.value = m.alias;
-          opt.textContent =
-            m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-          modelSel.appendChild(opt);
-          if (judgeSel) {
-            const jOpt = document.createElement("option");
-            jOpt.value = m.alias;
-            jOpt.textContent = opt.textContent;
-            judgeSel.appendChild(jOpt);
-          }
-        });
-        // Surface the resolved defaults in the placeholder rows so the
-        // panel shows which model actually runs when left untouched —
-        // mirrors the coordinator launcher.  The judge tracks the
-        // per-workstream agent model unless judge.model is explicitly
-        // configured, so keep the "(agent model)" wording in that case
-        // rather than advertising a fixed alias the judge won't use.
-        const modelDefault = _resolveModelLabel(
-          data.default_alias || "",
-          data.models || [],
-        );
-        modelSel.options[0].textContent = modelDefault
-          ? "Default — " + modelDefault
-          : "Default model";
-        if (judgeSel) {
-          const judgeDefault = _resolveModelLabel(
-            data.judge_default_alias || "",
-            data.models || [],
-          );
-          judgeSel.options[0].textContent = judgeDefault
-            ? "Default — " + judgeDefault
-            : "Default (agent model)";
-        }
-      })
-      .catch(function () {
-        /* default model still works */
+  if (modelSel) {
+    _populateModelSelect(modelSel, judgeSel, { annotate: true });
+    if (window.TurnstoneModels) {
+      window.TurnstoneModels.refreshModels().then(function () {
+        _populateModelSelect(modelSel, judgeSel, { annotate: true });
       });
+    }
   }
-  // Skills
+  // Skills — same paint-from-cache-then-refresh.
   const skillSel = document.getElementById("dashboard-skill");
-  if (skillSel && skillSel.options.length <= 1) {
-    authFetch("/v1/api/skills")
-      .then(function (r) {
-        return r.json();
-      })
-      .then(function (data) {
-        (data.skills || []).forEach(function (t) {
-          const opt = document.createElement("option");
-          opt.value = t.name;
-          let label = t.name;
-          if (t.is_default) label += " (default)";
-          if (t.origin === "mcp") label += " [MCP]";
-          opt.textContent = label;
-          skillSel.appendChild(opt);
-        });
-      })
-      .catch(function () {
-        /* ignore */
+  if (skillSel) {
+    _populateSkillSelect(skillSel);
+    if (window.TurnstoneSkills) {
+      window.TurnstoneSkills.refreshSkills().then(function () {
+        _populateSkillSelect(skillSel);
       });
+    }
   }
 
   // Project picker — paint from the warm cache then refresh-and-repaint (also

@@ -5,12 +5,16 @@ window.onLoginSuccess = function () {
   if (typeof _refreshHomeComposerVisibility === "function") {
     _refreshHomeComposerVisibility();
   }
-  // Re-populate the home-composer skill dropdown now that auth has
-  // landed.  The initial page-load pass runs before login completes,
-  // so /v1/api/skills 401s; without this re-run the dropdown stays
-  // empty.
-  if (typeof _populateHomeSkillDropdown === "function") {
-    _populateHomeSkillDropdown();
+  // Re-warm the home-composer skill AND model pickers now that auth has
+  // landed.  The initial page-load pass runs before login completes, so
+  // /v1/api/skills and /v1/api/models 401 (fail-open: the caches keep their
+  // empty state); without this re-run the dropdowns stay at their placeholders
+  // until a reload (models used to only recover on a chance models_changed).
+  if (typeof _refreshAndPopulateSkills === "function") {
+    _refreshAndPopulateSkills();
+  }
+  if (typeof _refreshAndPopulateModels === "function") {
+    _refreshAndPopulateModels();
   }
   // Active-coordinators list is SSE-driven via the console pseudo-node
   // (#9) — no poller to restart after login.  The home-view renderer
@@ -426,8 +430,8 @@ function handleClusterEvent(data) {
     // setting (model.default_alias, judge.model, coordinator.model_alias,
     // coordinator.reasoning_effort) changes.  Refresh anything that
     // renders model aliases so labels stay accurate without a reload.
-    if (typeof _populateHomeModelDropdowns === "function") {
-      _populateHomeModelDropdowns();
+    if (typeof _refreshAndPopulateModels === "function") {
+      _refreshAndPopulateModels();
     }
     if (typeof _sklcInvalidateModelsCache === "function") {
       _sklcInvalidateModelsCache();
@@ -1474,8 +1478,8 @@ function _ensureHomeComposerInit() {
   _homeComposerInit = true;
   _mountHomeCoordComposer();
   _wireLauncherToggle();
-  _populateHomeSkillDropdown();
-  _populateHomeModelDropdowns();
+  _refreshAndPopulateSkills();
+  _refreshAndPopulateModels();
   _refreshAndPopulateProjects();
   _refreshAndPopulatePersonas();
   _ensureHomeProjectCreator();
@@ -1720,24 +1724,40 @@ function _mountHomeCoordComposer() {
   });
 }
 
+// Refresh the shared skills cache then repaint the launcher's Skill picker.
+// Sync paint from the warm cache first (no empty flash for the round-trip),
+// then refresh-and-repaint to catch a skill created elsewhere.  Safe when the
+// bridge is absent (module still loading / 401 pre-auth — onLoginSuccess re-runs
+// this once auth lands).
+function _refreshAndPopulateSkills() {
+  const TS = window.TurnstoneSkills;
+  if (!TS) return;
+  _populateHomeSkillDropdown();
+  TS.refreshSkills().then(_populateHomeSkillDropdown);
+}
+
+// Populate the launcher's Skill picker from the shared cache, preserving the
+// current pick across the rebuild (the async repaint must not clobber a
+// mid-window choice).  The console label omits the " [MCP]" suffix the ui
+// pickers add — which is why the cache returns raw rows.
 function _populateHomeSkillDropdown() {
   if (!_homeCoordComposer) return;
-  authFetch("/v1/api/skills")
-    .then(function (r) {
-      return r.ok ? r.json() : { skills: [] };
-    })
-    .then(function (data) {
-      const choices = (data.skills || []).map(function (t) {
-        return {
-          value: t.name,
-          text: t.is_default ? t.name + " (default)" : t.name,
-        };
-      });
-      _homeCoordComposer.setOptionChoices("skill", choices);
-    })
-    .catch(function () {
-      /* defaults still work even without the dropdown populated */
+  const TS = window.TurnstoneSkills;
+  if (!TS) return;
+  const previous = _homeCoordComposer.getOptionValue("skill");
+  const choices = TS.getSkills().map(function (t) {
+    return {
+      value: t.name,
+      text: t.is_default ? t.name + " (default)" : t.name,
+    };
+  });
+  _homeCoordComposer.setOptionChoices("skill", choices);
+  const stillValid =
+    previous &&
+    choices.some(function (c) {
+      return c.value === previous;
     });
+  if (stillValid) _homeCoordComposer.setOptionValue("skill", previous);
 }
 
 // Format a resolved alias with its model suffix the same way as the
@@ -1755,52 +1775,75 @@ function _resolveModelLabel(alias, models) {
   return "";
 }
 
-// Populate Model + Judge Model dropdowns from /v1/api/models — same
-// list the interactive new-ws modal uses.  Empty/default option stays
-// at the top so submitting without a choice falls back to the
-// ConfigStore-configured coordinator.model_alias / judge.model.
+// Refresh the shared models cache then repaint the launcher's Model + Judge
+// Model pickers.  Sync paint from the warm cache first (no empty flash for the
+// round-trip), then refresh-and-repaint.  This is ALSO the single repaint path
+// for the `models_changed` SSE event: it refreshes the cache and repaints, so
+// there is no second (subscription) path that would double-repaint.
+function _refreshAndPopulateModels() {
+  const TM = window.TurnstoneModels;
+  if (!TM) return;
+  _populateHomeModelDropdowns();
+  TM.refreshModels().then(_populateHomeModelDropdowns);
+}
+
+// Populate the launcher's Model + Judge Model pickers from the shared cache —
+// same list the interactive new-ws modal uses.  One list feeds both selects;
+// each keeps its "Default …" placeholder (option 0) and its own preserved pick
+// (the async repaint must not clobber a mid-window choice).  The console reads
+// its OWN default-alias fields (coordinator_default_alias for the model,
+// judge_default_alias for the judge) — the node server sends different ones, so
+// the shared cache exposes all of them and each app picks its own.
 function _populateHomeModelDropdowns() {
   if (!_homeCoordComposer) return;
-  authFetch("/v1/api/models")
-    .then(function (r) {
-      return r.ok ? r.json() : { models: [] };
+  const TM = window.TurnstoneModels;
+  if (!TM) return;
+  const choices = TM.modelChoices();
+  const models = TM.getModels();
+  const defaults = TM.modelDefaults();
+  const prevModel = _homeCoordComposer.getOptionValue("model");
+  const prevJudge = _homeCoordComposer.getOptionValue("judge_model");
+  _homeCoordComposer.setOptionChoices("model", choices);
+  _homeCoordComposer.setOptionChoices("judge_model", choices);
+  // Both placeholders use the same "Default — alias (model)" template — the
+  // field-row labels (MODEL / JUDGE MODEL) already carry the role context, so an
+  // asymmetric "Default judge model" reads awkwardly alongside the plain
+  // "Default model" line above it.  Em-dash separator (rather than nested
+  // parens) keeps the alias's "(model)" suffix legible and matches the
+  // ``(default — alias (model))`` pattern used in the admin Roles tab.
+  const coordDefault = _resolveModelLabel(
+    defaults.coordinator_default_alias || "",
+    models,
+  );
+  const judgeDefault = _resolveModelLabel(
+    defaults.judge_default_alias || "",
+    models,
+  );
+  _homeCoordComposer.setOptionPlaceholder(
+    "model",
+    coordDefault ? "Default — " + coordDefault : "Default model",
+  );
+  _homeCoordComposer.setOptionPlaceholder(
+    "judge_model",
+    judgeDefault ? "Default — " + judgeDefault : "Default model",
+  );
+  // Preserve a mid-window pick on each select independently.
+  if (
+    prevModel &&
+    choices.some(function (c) {
+      return c.value === prevModel;
     })
-    .then(function (data) {
-      const choices = (data.models || []).map(function (m) {
-        const label =
-          m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-        return { value: m.alias, text: label };
-      });
-      _homeCoordComposer.setOptionChoices("model", choices);
-      _homeCoordComposer.setOptionChoices("judge_model", choices);
-      // Both placeholders use the same "Default — alias (model)"
-      // template — the field-row labels (MODEL / JUDGE MODEL) already
-      // carry the role context, so an asymmetric "Default judge model"
-      // reads awkwardly alongside the plain "Default model" line above
-      // it.  Em-dash separator (rather than nested parens) keeps the
-      // alias's "(model)" suffix legible and matches the
-      // ``(default — alias (model))`` pattern used in the admin Roles
-      // tab.
-      const coordDefault = _resolveModelLabel(
-        data.coordinator_default_alias || "",
-        data.models || [],
-      );
-      const judgeDefault = _resolveModelLabel(
-        data.judge_default_alias || "",
-        data.models || [],
-      );
-      _homeCoordComposer.setOptionPlaceholder(
-        "model",
-        coordDefault ? "Default — " + coordDefault : "Default model",
-      );
-      _homeCoordComposer.setOptionPlaceholder(
-        "judge_model",
-        judgeDefault ? "Default — " + judgeDefault : "Default model",
-      );
+  ) {
+    _homeCoordComposer.setOptionValue("model", prevModel);
+  }
+  if (
+    prevJudge &&
+    choices.some(function (c) {
+      return c.value === prevJudge;
     })
-    .catch(function () {
-      /* defaults still work even without the dropdown populated */
-    });
+  ) {
+    _homeCoordComposer.setOptionValue("judge_model", prevJudge);
+  }
 }
 
 function _refreshHomeComposerVisibility() {
