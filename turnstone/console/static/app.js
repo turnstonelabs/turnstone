@@ -1497,20 +1497,51 @@ function _ensureHomeComposerInit() {
   _refreshHomeComposerVisibility();
 }
 
+// One chokepoint for the launcher paint discipline shared by the four
+// _refreshAndPopulate* wrappers below: sync-paint NOW from the warm cache (no
+// empty flash for the refresh round-trip), then refresh-and-repaint (callOpts
+// threads {force:true} for invalidation callers — models_changed,
+// onLoginSuccess).  `refresh` absent = bridge missing (module still loading /
+// pre-auth): the wrapper no-ops and onLoginSuccess re-runs each once auth
+// lands.  If the module graph itself failed to load, the picker stays empty
+// until a reload — the ACCEPTED shared-cache tradeoff; see _paintFromCache in
+// ui/static/app.js for the full ruling (no per-picker retry, no inline-fetch
+// fallback).
+function _paintHomeFromCache(refresh, populate, callOpts) {
+  if (!refresh) return;
+  populate();
+  refresh(callOpts).then(function () {
+    populate();
+  });
+}
+
+// Restore a launcher-composer option pick after a choices rebuild IF it is
+// still a valid choice; returns whether it was restored (the persona caller
+// reverts to the kind default otherwise).  Console-composer setter idiom
+// ONLY — the ui twin (_populatePersonaSelect etc.) works on raw <select>
+// elements via sel.value/_optionExists and is deliberately NOT unified
+// across files.
+function _restorePick(fieldId, previous, choices) {
+  const still =
+    previous &&
+    choices.some(function (c) {
+      return c.value === previous;
+    });
+  if (still) _homeCoordComposer.setOptionValue(fieldId, previous);
+  return !!still;
+}
+
 // Refresh the shared personas cache (window.TurnstonePersonas — also feeds
 // the saved-list / rail labels) then repaint the launcher's Persona picker.
 // Safe when the bridge is absent (module still loading): the picker keeps
 // its "Default" placeholder, which the server resolves to the kind default.
 function _refreshAndPopulatePersonas(callOpts) {
   const TP = window.TurnstonePersonas;
-  if (!TP) return;
-  // Paint from the warm cache SYNCHRONOUSLY first so the Persona picker isn't
-  // empty for the refresh round-trip (the rail warms personas at startup), then
-  // refresh-and-repaint to catch a persona created elsewhere. _populateHome-
-  // PersonaDropdown preserves a mid-window pick and only applies the kind default
-  // when nothing valid is selected, so the second paint can't clobber a choice.
-  _populateHomePersonaDropdown();
-  TP.refreshPersonas(callOpts).then(_populateHomePersonaDropdown);
+  _paintHomeFromCache(
+    TP && TP.refreshPersonas,
+    _populateHomePersonaDropdown,
+    callOpts,
+  );
 }
 
 // Populate the launcher's Persona picker for the ACTIVE kind, preselecting
@@ -1524,14 +1555,7 @@ function _populateHomePersonaDropdown() {
   const previous = _homeCoordComposer.getOptionValue("persona");
   const choices = TP.personaChoices(_launcherKind);
   _homeCoordComposer.setOptionChoices("persona", choices);
-  const stillValid =
-    previous &&
-    choices.some(function (c) {
-      return c.value === previous;
-    });
-  if (stillValid) {
-    _homeCoordComposer.setOptionValue("persona", previous);
-  } else {
+  if (!_restorePick("persona", previous, choices)) {
     const dflt = TP.defaultPersona(_launcherKind);
     if (dflt) _homeCoordComposer.setOptionValue("persona", dflt.name);
   }
@@ -1543,14 +1567,11 @@ function _populateHomePersonaDropdown() {
 // picker simply keeps its "No project" placeholder.
 function _refreshAndPopulateProjects(callOpts) {
   const TP = window.TurnstoneProjects;
-  if (!TP) return;
-  // Sync paint from the warm cache first (the launcher keeps its "No project"
-  // placeholder when cold), then refresh-and-repaint to catch a project created
-  // elsewhere. _populateHomeProjectDropdown preserves a mid-window pick. The
-  // console launcher intentionally does NOT gate on requireProject() (§8) — the
-  // node create endpoint is the authoritative gate.
-  _populateHomeProjectDropdown();
-  TP.refreshProjects(callOpts).then(_populateHomeProjectDropdown);
+  _paintHomeFromCache(
+    TP && TP.refreshProjects,
+    _populateHomeProjectDropdown,
+    callOpts,
+  );
 }
 
 // Populate the launcher's Project picker from the shared cache, preserving the
@@ -1742,9 +1763,11 @@ function _mountHomeCoordComposer() {
 // this once auth lands).
 function _refreshAndPopulateSkills(callOpts) {
   const TS = window.TurnstoneSkills;
-  if (!TS) return;
-  _populateHomeSkillDropdown();
-  TS.refreshSkills(callOpts).then(_populateHomeSkillDropdown);
+  _paintHomeFromCache(
+    TS && TS.refreshSkills,
+    _populateHomeSkillDropdown,
+    callOpts,
+  );
 }
 
 // Populate the launcher's Skill picker from the shared cache, preserving the
@@ -1769,12 +1792,7 @@ function _populateHomeSkillDropdown() {
     };
   });
   _homeCoordComposer.setOptionChoices("skill", choices);
-  const stillValid =
-    previous &&
-    choices.some(function (c) {
-      return c.value === previous;
-    });
-  if (stillValid) _homeCoordComposer.setOptionValue("skill", previous);
+  _restorePick("skill", previous, choices);
 }
 
 // Refresh the shared models cache then repaint the launcher's Model + Judge
@@ -1786,9 +1804,11 @@ function _populateHomeSkillDropdown() {
 // (subscription) path that would double-repaint.
 function _refreshAndPopulateModels(callOpts) {
   const TM = window.TurnstoneModels;
-  if (!TM) return;
-  _populateHomeModelDropdowns();
-  TM.refreshModels(callOpts).then(_populateHomeModelDropdowns);
+  _paintHomeFromCache(
+    TM && TM.refreshModels,
+    _populateHomeModelDropdowns,
+    callOpts,
+  );
 }
 
 // Populate the launcher's Model + Judge Model pickers from the shared cache —
@@ -1829,22 +1849,8 @@ function _populateHomeModelDropdowns() {
     judgeDefault ? "Default — " + judgeDefault : "Default model",
   );
   // Preserve a mid-window pick on each select independently.
-  if (
-    prevModel &&
-    choices.some(function (c) {
-      return c.value === prevModel;
-    })
-  ) {
-    _homeCoordComposer.setOptionValue("model", prevModel);
-  }
-  if (
-    prevJudge &&
-    choices.some(function (c) {
-      return c.value === prevJudge;
-    })
-  ) {
-    _homeCoordComposer.setOptionValue("judge_model", prevJudge);
-  }
+  _restorePick("model", prevModel, choices);
+  _restorePick("judge_model", prevJudge, choices);
 }
 
 function _refreshHomeComposerVisibility() {

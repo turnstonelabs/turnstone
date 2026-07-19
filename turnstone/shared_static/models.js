@@ -61,9 +61,10 @@ const _core = makeListCache({
  * Fetch /v1/api/models into the cache.  Resolves to the row list and NEVER
  * rejects — a failed/forbidden fetch keeps the prior cache (a picker never
  * blanks) AND keeps the last-known default aliases; a first-load failure still
- * shows all-"".  Recorded (see {@link modelsError}) rather than masqueraded as
- * "no models".  Pass `{force:true}` to force a fresh fetch that converges to the
- * latest server state even mid-flight (the `models_changed` SSE path uses this).
+ * shows all-"".  Failures are warned and fail open (see list_cache.js) rather
+ * than masqueraded as "no models".  Pass `{force:true}` to force a fresh fetch
+ * that converges to the latest server state even mid-flight (the
+ * `models_changed` SSE path uses this).
  */
 export function refreshModels(callOpts) {
   return _core.refresh(callOpts);
@@ -73,18 +74,6 @@ export function refreshModels(callOpts) {
  *  a caller can resolve a default alias to its "alias (model)" label. */
 export function getModels() {
   return _core.get();
-}
-
-/** Whether the first refresh has resolved — distinguishes "no models" from
- *  "not loaded yet". */
-export function modelsLoaded() {
-  return _core.loaded();
-}
-
-/** Last refresh failure status (HTTP status, 0 for network/parse), or null
- *  when the last refresh succeeded. */
-export function modelsError() {
-  return _core.error();
 }
 
 // The one place the "alias (model)" label (or just "alias" when they coincide)
@@ -127,14 +116,14 @@ export function modelDefaults() {
 // No onChange subscription is exposed (unlike projects.js / personas.js, whose
 // onChange is consumed by rail.js): the models cache has no live-render consumer
 // — the console repaints on `models_changed` via its own direct handler, the ui
-// composers repaint on open.  Omitted rather than exposed-and-unused.
+// composers repaint on open.  The loaded/error readers are omitted for the same
+// no-consumer reason; projects.js/personas.js keep theirs as pre-existing
+// public surface.  Omitted rather than exposed-and-unused.
 
 // Classic (non-module) app.js bundles reach the data layer through this bridge.
 window.TurnstoneModels = {
   refreshModels: refreshModels,
   getModels: getModels,
-  modelsLoaded: modelsLoaded,
-  modelsError: modelsError,
   modelChoices: modelChoices,
   modelLabel: modelLabel,
   modelDefaults: modelDefaults,

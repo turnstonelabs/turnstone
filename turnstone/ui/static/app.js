@@ -527,8 +527,11 @@ function _optionExists(sel, val) {
 // skips entirely (a fork inherits its source's project server-side; the modal
 // hides the picker for forks).  Both paints reuse _populateProjectSelect, so the
 // #867 strict-picker invariant (never auto-select a real project) holds on each.
+// The sync-then-refresh tail routes through _paintFromCache (the fork skip and
+// the hint stay bespoke here); returns its async-repaint promise.
 function _paintProjectPicker(sel, hint, opts) {
-  if ((opts && opts.fork) || !sel || !window.TurnstoneProjects) return;
+  if ((opts && opts.fork) || !sel || !window.TurnstoneProjects)
+    return Promise.resolve();
   // paint(fresh): a fresh open renders the actual default (no prior selection);
   // the async repaint MUST pass fresh=false, or it clobbers a project the user
   // picked during the refresh round-trip — under require_project that reconciles
@@ -538,36 +541,41 @@ function _paintProjectPicker(sel, hint, opts) {
     if (hint) hint.textContent = strict ? "required" : "optional";
     _populateProjectSelect(sel, { requireProject: strict, fresh: fresh });
   };
-  const freshOnOpen = !!(opts && opts.freshOnOpen);
-  paint(freshOnOpen); // sync from the warm cache (no-op when cold; the async fills it)
-  window.TurnstoneProjects.refreshProjects().then(function () {
-    paint(false);
-  });
+  return _paintFromCache(window.TurnstoneProjects.refreshProjects, paint, opts);
 }
 
 // One chokepoint for the composer paint discipline, shared by the three
-// cache-backed wrappers below (mirrors _paintProjectPicker, which keeps its own
-// tail — fork/hint logic): sync-paint NOW from the warm cache, then
-// refresh-and-repaint.  The sync paint mirrors the caller's freshOnOpen (a
-// reused-dialog open renders the actual defaults); the async repaint is ALWAYS
-// fresh:false — it must preserve a pick made during the fetch window, never
-// re-blank.  `refresh` may be absent (bridge module still loading): the
-// populate helpers no-op without their bridge and the refresh is skipped —
-// never worse than the pre-cache behavior.
+// cache-backed wrappers below and _paintProjectPicker's tail: sync-paint NOW
+// from the warm cache, then refresh-and-repaint.  The sync paint mirrors the
+// caller's freshOnOpen (a reused-dialog open renders the actual defaults); the
+// async repaint is ALWAYS fresh:false — it must preserve a pick made during
+// the fetch window, never re-blank.  Returns the async-repaint promise
+// (already-resolved when there is nothing to refresh) so a caller can act
+// after the repaint lands — the dashboard chains its Options-chip recompute.
+//
+// `refresh` may be absent (bridge missing): the sync populate no-ops and the
+// refresh is skipped.  If the module graph itself failed to load (a failed
+// /shared/models.js, skills.js, personas.js, projects.js, or list_cache.js
+// fetch at page load), that picker stays empty until a reload — an ACCEPTED
+// tradeoff of the shared-cache architecture, the same class the projects/
+// personas pickers + rail have carried since #867/#868.  Do NOT add a
+// per-picker retry (a cache-busted dynamic re-import creates a second cache
+// instance with split-brain state) or an inline-fetch fallback (it resurrects
+// the dual-path this refactor deleted); surfacing a failed bridge, if ever
+// wanted, belongs in the app shell for all bridges at once.
 function _paintFromCache(refresh, repaint, opts) {
   repaint(!!(opts && opts.freshOnOpen));
-  if (refresh) {
-    refresh().then(function () {
-      repaint(false);
-    });
-  }
+  if (!refresh) return Promise.resolve();
+  return refresh().then(function () {
+    repaint(false);
+  });
 }
 
 // Paint the model + judge pickers from the warm cache then refresh-and-repaint,
 // collapsing the identical sync-then-refresh dance the modal and dashboard both
 // need.
 function _paintModelSelects(modelSel, judgeSel, opts) {
-  _paintFromCache(
+  return _paintFromCache(
     window.TurnstoneModels && window.TurnstoneModels.refreshModels,
     function (fresh) {
       _populateModelSelect(modelSel, judgeSel, { fresh: fresh });
@@ -578,7 +586,7 @@ function _paintModelSelects(modelSel, judgeSel, opts) {
 
 // Skill twin of _paintModelSelects.
 function _paintSkillSelect(sel, opts) {
-  _paintFromCache(
+  return _paintFromCache(
     window.TurnstoneSkills && window.TurnstoneSkills.refreshSkills,
     function (fresh) {
       _populateSkillSelect(sel, { fresh: fresh });
@@ -591,7 +599,7 @@ function _paintSkillSelect(sel, opts) {
 // default when nothing valid is selected, so the fresh:false repaint can't
 // clobber a mid-window pick.
 function _paintPersonaSelect(sel, opts) {
-  _paintFromCache(
+  return _paintFromCache(
     window.TurnstonePersonas && window.TurnstonePersonas.refreshPersonas,
     function (fresh) {
       _populatePersonaSelect(sel, { fresh: fresh });
@@ -1539,11 +1547,23 @@ function _loadDashboardOptionsLists() {
   // (not a reused dialog), so freshOnOpen:false — it preserves a pick across a
   // repaint.  Previously fetch-once (guarded on options.length); now
   // refresh-on-open via the coalesced caches, matching the project/persona pickers.
+  //
+  // EVERY paint chains a recompute of the collapsed Options chip on its async
+  // repaint: a repaint can drop a server-removed pick (the select falls back to
+  // its placeholder) or revert the persona to its kind default WITHOUT firing
+  // 'change' — the optionsPanel change listener covers user edits only — and
+  // the chip must always name what submit will send.  The project paint is
+  // chained for symmetry/future chip coverage; _refreshDashboardOptionsSummary
+  // reads persona/model/judge/skill only today.
   const modelSel = document.getElementById("dashboard-model");
   const judgeSel = document.getElementById("dashboard-judge-model");
-  _paintModelSelects(modelSel, judgeSel, { freshOnOpen: false });
+  _paintModelSelects(modelSel, judgeSel, { freshOnOpen: false }).then(
+    _refreshDashboardOptionsSummary,
+  );
   const skillSel = document.getElementById("dashboard-skill");
-  _paintSkillSelect(skillSel, { freshOnOpen: false });
+  _paintSkillSelect(skillSel, { freshOnOpen: false }).then(
+    _refreshDashboardOptionsSummary,
+  );
 
   // Project picker — paint from the warm cache then refresh-and-repaint (also
   // feeds the rail's group-by-project). Dashboard quick-create is ALWAYS a fresh
@@ -1551,13 +1571,17 @@ function _loadDashboardOptionsLists() {
   const projSel = document.getElementById("dashboard-project");
   const projLabel = document.querySelector('label[for="dashboard-project"]');
   const projHint = projLabel ? projLabel.querySelector(".label-hint") : null;
-  _paintProjectPicker(projSel, projHint, { fork: false });
+  _paintProjectPicker(projSel, projHint, { fork: false }).then(
+    _refreshDashboardOptionsSummary,
+  );
 
   // Persona picker — via the shared wrapper; the dashboard is a persistent panel
   // so freshOnOpen:false (preserve a pick across a repaint), kind default when
   // nothing valid is selected.
   const personaSel = document.getElementById("dashboard-persona");
-  _paintPersonaSelect(personaSel, { freshOnOpen: false });
+  _paintPersonaSelect(personaSel, { freshOnOpen: false }).then(
+    _refreshDashboardOptionsSummary,
+  );
 }
 
 // localStorage key for the dashboard composer's Options-panel disclosure

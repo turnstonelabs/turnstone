@@ -36,8 +36,8 @@ const _core = makeListCache({
 /**
  * Fetch /v1/api/skills into the cache.  Resolves to the row list and NEVER
  * rejects — a failed/forbidden fetch keeps the prior cache (a picker never
- * blanks).  Recorded (see {@link skillsError}) rather than masqueraded as "no
- * skills".  Pass `{force:true}` to force a fresh fetch that converges to the
+ * blanks).  Failures are warned and fail open (see list_cache.js) rather than
+ * masqueraded as "no skills".  Pass `{force:true}` to force a fresh fetch that converges to the
  * latest even mid-flight (onLoginSuccess uses this to recover a failed pre-auth
  * warm — skills has no *_changed event to recover otherwise).
  */
@@ -51,26 +51,14 @@ export function getSkills() {
   return _core.get();
 }
 
-/** Whether the first refresh has resolved — distinguishes "no skills" from
- *  "not loaded yet". */
-export function skillsLoaded() {
-  return _core.loaded();
-}
-
-/** Last refresh failure status (HTTP status, 0 for network/parse), or null
- *  when the last refresh succeeded. */
-export function skillsError() {
-  return _core.error();
-}
-
 // No onChange subscription is exposed (unlike projects.js / personas.js): the
 // skills cache has no live-render consumer — the composers repaint on open.
+// The loaded/error readers are omitted for the same no-consumer reason;
+// projects.js/personas.js keep theirs as pre-existing public surface.
 // Omitted rather than exposed-and-unused.
 
 // Classic (non-module) app.js bundles reach the data layer through this bridge.
 window.TurnstoneSkills = {
   refreshSkills: refreshSkills,
   getSkills: getSkills,
-  skillsLoaded: skillsLoaded,
-  skillsError: skillsError,
 };

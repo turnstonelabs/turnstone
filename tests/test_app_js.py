@@ -2446,39 +2446,44 @@ def test_dashboard_paints_project_and_persona_from_cache_synchronously() -> None
 
 
 def test_console_launcher_paints_project_and_persona_from_cache_synchronously() -> None:
-    """FOUC fix (console launcher composer): the launcher's project + persona
-    pickers paint synchronously from the warm shared cache before the async
-    refresh-and-repaint, mirroring the standalone app.  The console launcher keeps
-    its ungated 'No project' semantics (§8); this only adds the sync pre-paint."""
+    """FOUC fix (console launcher composer): the project + persona wrappers route
+    through the _paintHomeFromCache chokepoint — sync paint from the warm cache,
+    then refresh(callOpts)-and-repaint; the ordering discipline is asserted ONCE
+    on the helper (in the model/skill twin test).  Each wrapper must pair its OWN
+    bridge refresh with its OWN populate helper.  Also pins the persona
+    kind-default revert: _populateHomePersonaDropdown must fall back to
+    defaultPersona(kind) when the previous pick is no longer a valid choice (the
+    interactive/coordinator persona shelves are disjoint), or a kind toggle
+    silently degrades the picker to a bare placeholder."""
     body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
     proj_fn = _slice_top_level_fn(body, "function _refreshAndPopulateProjects(")
-    # The bare _populateHomeProjectDropdown() call is the sync paint; the refresh's
-    # .then argument has no parens, so this matches only the standalone sync call.
-    sync_proj = proj_fn.find("_populateHomeProjectDropdown()")
-    async_proj = proj_fn.find("refreshProjects(callOpts).then")
-    assert sync_proj >= 0, "the launcher must paint the project picker from cache synchronously"
-    assert async_proj >= 0, "the launcher must keep refreshProjects(callOpts).then"
-    assert sync_proj < async_proj, (
-        "the synchronous launcher project paint must precede the async refresh repaint"
-    )
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TP && TP\.refreshProjects,\s*_populateHomeProjectDropdown",
+        proj_fn,
+    ), "the launcher project wrapper must pair its bridge refresh + populate via the chokepoint"
     persona_fn = _slice_top_level_fn(body, "function _refreshAndPopulatePersonas(")
-    sync_persona = persona_fn.find("_populateHomePersonaDropdown()")
-    async_persona = persona_fn.find("refreshPersonas(callOpts).then")
-    assert sync_persona >= 0, "the launcher must paint the persona picker from cache synchronously"
-    assert async_persona >= 0, "the launcher must keep refreshPersonas(callOpts).then"
-    assert sync_persona < async_persona, (
-        "the synchronous launcher persona paint must precede the async refresh repaint"
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TP && TP\.refreshPersonas,\s*_populateHomePersonaDropdown",
+        persona_fn,
+    ), "the launcher persona wrapper must pair its bridge refresh + populate via the chokepoint"
+    pop = _slice_top_level_fn(body, "function _populateHomePersonaDropdown(")
+    assert '_restorePick("persona"' in pop, (
+        "the persona populate must restore a still-valid pick via _restorePick"
+    )
+    assert "defaultPersona(_launcherKind)" in pop, (
+        "the persona populate must revert to the kind default when the pick is gone"
     )
 
 
 def test_paint_project_picker_syncs_before_refresh() -> None:
     """The shared _paintProjectPicker (used by BOTH the modal and dashboard, so
     the two can't drift and silently re-introduce the FOUC) seeds the required/
-    optional hint + paints the picker via _populateProjectSelect SYNCHRONOUSLY,
-    then refreshes-and-repaints.  It skips a fork, and both paints route through
-    the same _populateProjectSelect (preserving the #867 strict-picker invariant).
-    The sync paint passes freshOnOpen; the async repaint MUST pass fresh=false, or
-    it clobbers a project the user picked mid-refresh (require_project -> 400)."""
+    optional hint + paints via _populateProjectSelect, and routes its
+    sync-then-refresh tail through the _paintFromCache chokepoint — where the
+    sync-before-async + always-fresh:false discipline is asserted once.  Its
+    fork/absent-bridge path returns a resolved promise so the dashboard's chained
+    Options-chip recompute still runs.  Both paints reuse _populateProjectSelect
+    (preserving the #867 strict-picker invariant)."""
     body = _APP_JS.read_text(encoding="utf-8")
     fn = _slice_top_level_fn(body, "function _paintProjectPicker(")
     assert "_populateProjectSelect(" in fn, (
@@ -2486,15 +2491,13 @@ def test_paint_project_picker_syncs_before_refresh() -> None:
     )
     assert "hint.textContent" in fn, "_paintProjectPicker must seed the required/optional hint"
     assert "opts.fork" in fn, "_paintProjectPicker must skip for a fork"
-    sync_call = fn.find("paint(freshOnOpen)")
-    async_refresh = fn.find("refreshProjects().then")
-    assert async_refresh >= 0, "_paintProjectPicker must keep refreshProjects().then"
-    assert 0 <= sync_call < async_refresh, (
-        "_paintProjectPicker must paint synchronously (paint(freshOnOpen)) BEFORE the "
-        "async refreshProjects().then repaint"
+    assert "return Promise.resolve();" in fn, (
+        "_paintProjectPicker's fork/absent-bridge path must return a resolved "
+        "promise (the dashboard chains its Options-chip recompute on the return)"
     )
-    assert "paint(false)" in fn[async_refresh:], (
-        "_paintProjectPicker's async repaint must pass fresh=false (preserve a mid-window pick)"
+    assert "return _paintFromCache(window.TurnstoneProjects.refreshProjects, paint, opts)" in fn, (
+        "_paintProjectPicker's tail must route through the _paintFromCache "
+        "chokepoint (sync paint(freshOnOpen) then always-fresh:false repaint)"
     )
 
 
@@ -2537,6 +2540,17 @@ def test_paint_model_and_skill_wrappers_sync_before_refresh() -> None:
         "_paintFromCache's async repaint must pass fresh:false (never leak "
         "freshOnOpen, or it clobbers a mid-window pick)"
     )
+    # Promise contract: callers (the dashboard Options-chip recompute) chain on
+    # the async repaint landing; the no-refresh path must still hand back a
+    # resolved promise or the chain throws on a cold bridge.
+    assert "return Promise.resolve()" in helper, (
+        "_paintFromCache must return an already-resolved promise when there is "
+        "no refresh (dashboard callers chain the Options-chip recompute)"
+    )
+    assert "return refresh().then" in helper, (
+        "_paintFromCache must return the async-repaint promise (callers act "
+        "after the repaint lands)"
+    )
     for wrapper, bridge_refresh, populate in (
         (
             "function _paintModelSelects(",
@@ -2555,7 +2569,7 @@ def test_paint_model_and_skill_wrappers_sync_before_refresh() -> None:
         ),
     ):
         fn = _slice_top_level_fn(body, wrapper)
-        assert "_paintFromCache(" in fn, f"{wrapper} must route through _paintFromCache"
+        assert "return _paintFromCache(" in fn, f"{wrapper} must return the _paintFromCache promise"
         assert bridge_refresh in fn, f"{wrapper} must pass its own bridge refresh"
         assert populate in fn, f"{wrapper} must thread fresh through to its own populate helper"
 
@@ -2593,17 +2607,23 @@ def test_new_ws_modal_renders_all_selects_fresh_on_open() -> None:
 
 
 def test_dashboard_paints_model_and_skill_via_wrappers_preserving() -> None:
-    """Dashboard twin — model + skill paint via the SAME wrappers but freshOnOpen:false
-    (a persistent panel preserves a pick across a repaint), and the old fetch-once
-    ``options.length <= 1`` guard is gone."""
+    """Dashboard twin — all four pickers paint via the SAME wrappers but
+    freshOnOpen:false (a persistent panel preserves a pick across a repaint), the
+    old fetch-once ``options.length <= 1`` guard is gone, and EVERY paint chains
+    _refreshDashboardOptionsSummary on its async repaint: a repaint can drop a
+    server-removed pick (or revert persona to its kind default) without firing
+    'change', and the collapsed Options chip must always name what submit sends."""
     body = _APP_JS.read_text(encoding="utf-8")
     fn = _slice_top_level_fn(body, "function _loadDashboardOptionsLists(")
-    assert "_paintModelSelects(modelSel, judgeSel, { freshOnOpen: false })" in fn, (
-        "the dashboard must paint model+judge via the wrapper, preserving (freshOnOpen:false)"
-    )
-    assert "_paintSkillSelect(skillSel, { freshOnOpen: false })" in fn, (
-        "the dashboard must paint skill via the wrapper, preserving"
-    )
+    for paint in (
+        "_paintModelSelects(modelSel, judgeSel, { freshOnOpen: false })",
+        "_paintSkillSelect(skillSel, { freshOnOpen: false })",
+        "_paintProjectPicker(projSel, projHint, { fork: false })",
+        "_paintPersonaSelect(personaSel, { freshOnOpen: false })",
+    ):
+        assert re.search(re.escape(paint) + r"\.then\(\s*_refreshDashboardOptionsSummary", fn), (
+            f"dashboard paint must chain the Options-chip recompute: {paint[:36]}"
+        )
     assert "options.length <= 1" not in fn, (
         "the dashboard model/skill fetch-once guard must be removed (refresh-on-open now)"
     )
@@ -2645,23 +2665,28 @@ def test_new_ws_modal_fork_inherits_model_and_judge() -> None:
 
 
 def test_console_launcher_paints_model_and_skill_from_cache_synchronously() -> None:
-    """Console launcher — the model + skill refresh wrappers paint synchronously
-    from the warm cache before the async refresh-and-repaint.  The model wrapper
-    threads callOpts so models_changed can force a trailing refresh."""
+    """Console launcher — the four _refreshAndPopulate* wrappers route through the
+    _paintHomeFromCache chokepoint: sync paint from the warm cache BEFORE the
+    async refresh(callOpts)-and-repaint (callOpts threads {force:true} for the
+    models_changed / onLoginSuccess invalidation callers).  The ordering
+    discipline is asserted once, on the helper; the wrappers are pairing-checked
+    (model/skill here, project/persona in their twin test)."""
     body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    helper = _slice_top_level_fn(body, "function _paintHomeFromCache(")
+    sync = helper.find("populate()")
+    async_ = helper.find("refresh(callOpts).then")
+    assert 0 <= sync < async_, (
+        "_paintHomeFromCache must sync-paint (populate()) BEFORE the async "
+        "refresh(callOpts).then repaint"
+    )
     model_fn = _slice_top_level_fn(body, "function _refreshAndPopulateModels(")
-    sync_model = model_fn.find("_populateHomeModelDropdowns()")
-    async_model = model_fn.find("refreshModels(callOpts).then")
-    assert sync_model >= 0, "the launcher must paint the model pickers from cache synchronously"
-    assert sync_model < async_model, (
-        "the synchronous launcher model paint must precede the async refresh repaint"
-    )
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TM && TM\.refreshModels,\s*_populateHomeModelDropdowns", model_fn
+    ), "the launcher model wrapper must pair its bridge refresh + populate via the chokepoint"
     skill_fn = _slice_top_level_fn(body, "function _refreshAndPopulateSkills(")
-    sync_skill = skill_fn.find("_populateHomeSkillDropdown()")
-    async_skill = skill_fn.find("refreshSkills(callOpts).then")
-    assert 0 <= sync_skill < async_skill, (
-        "the synchronous launcher skill paint must precede the async refresh repaint"
-    )
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TS && TS\.refreshSkills,\s*_populateHomeSkillDropdown", skill_fn
+    ), "the launcher skill wrapper must pair its bridge refresh + populate via the chokepoint"
 
 
 def test_console_relogin_rewarms_all_four_caches_with_force() -> None:
@@ -2723,13 +2748,22 @@ def test_models_label_centralized_on_bridge() -> None:
 
 
 def test_models_skills_module_tagged_in_both_apps() -> None:
-    """models.js + skills.js are ``<script type=module>``-tagged before app.js in
-    BOTH index.html so their window bridges install before the classic bundle
-    boots and reads window.TurnstoneModels / window.TurnstoneSkills."""
+    """All four data-layer modules (projects/personas/models/skills) are
+    ``<script type=module>``-tagged BEFORE /shared/shell.js in BOTH index.html.
+    shell.js is the LAST module tag and calls TS_APP.boot (the first dashboard /
+    launcher paint); module execution follows tag order, and classic app.js is
+    parse-time definitions only — so a data-layer tag reordered below shell.js
+    boots the app before that bridge installs: the sync paint no-ops AND the
+    refresh is skipped, a silent test-green FOUC regression without this guard."""
     for idx in (_INDEX_HTML, _CONSOLE_INDEX):
         html = idx.read_text(encoding="utf-8")
-        assert "/shared/models.js" in html, f"models.js must be module-tagged in {idx.name}"
-        assert "/shared/skills.js" in html, f"skills.js must be module-tagged in {idx.name}"
+        for mod in ("projects", "personas", "models", "skills"):
+            path = f"/shared/{mod}.js"
+            assert path in html, f"{mod}.js must be module-tagged in {idx.name}"
+            assert html.index(path) < html.index("/shared/shell.js"), (
+                f"{mod}.js must be tagged BEFORE shell.js in {idx.name} — its "
+                "bridge must install before TS_APP.boot paints the composers"
+            )
 
 
 def test_list_cache_core_is_failopen_coalesced_and_gated() -> None:
