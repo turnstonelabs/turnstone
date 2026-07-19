@@ -2407,15 +2407,10 @@ def test_new_ws_modal_paints_project_and_persona_from_cache_synchronously() -> N
     these guards pin only that a synchronous populate precedes it."""
     body = _APP_JS.read_text(encoding="utf-8")
     fn = _slice_top_level_fn(body, "function showNewWsModal(")
-    # The FIRST _populateProjectSelect(projSelect, …) is the sync paint; it must
-    # precede the refreshProjects().then(…) async repaint.
-    sync_proj = fn.find("_populateProjectSelect(projSelect")
-    async_proj = fn.find("refreshProjects().then")
-    assert sync_proj >= 0, "the modal must paint the project picker from cache synchronously"
-    assert async_proj >= 0, "the modal must keep refreshProjects().then (catches remote changes)"
-    assert sync_proj < async_proj, (
-        "the synchronous project paint must precede the async refreshProjects().then "
-        "repaint — otherwise the picker flashes empty on every open"
+    # Project is painted via the shared _paintProjectPicker helper (fork-gated);
+    # the sync-before-async pattern is pinned in test_paint_project_picker_syncs.
+    assert "_paintProjectPicker(projSelect" in fn, (
+        "the modal must paint the project picker via the shared _paintProjectPicker helper"
     )
     sync_persona = fn.find("_populatePersonaSelect(personaSelect")
     async_persona = fn.find("refreshPersonas().then")
@@ -2434,12 +2429,9 @@ def test_dashboard_paints_project_and_persona_from_cache_synchronously() -> None
     from requireProject() synchronously, matching the new-ws modal."""
     body = _APP_JS.read_text(encoding="utf-8")
     fn = _slice_top_level_fn(body, "function _loadDashboardOptionsLists(")
-    sync_proj = fn.find("_populateProjectSelect(projSel")
-    async_proj = fn.find("refreshProjects().then")
-    assert sync_proj >= 0, "the dashboard must paint the project picker from cache synchronously"
-    assert async_proj >= 0, "the dashboard must keep refreshProjects().then"
-    assert sync_proj < async_proj, (
-        "the synchronous dashboard project paint must precede the async refresh repaint"
+    # Project is painted via the shared _paintProjectPicker helper.
+    assert "_paintProjectPicker(projSel" in fn, (
+        "the dashboard must paint the project picker via the shared _paintProjectPicker helper"
     )
     sync_persona = fn.find("_populatePersonaSelect(personaSel")
     async_persona = fn.find("refreshPersonas().then")
@@ -2455,10 +2447,7 @@ def test_dashboard_paints_project_and_persona_from_cache_synchronously() -> None
     assert 'class="label-hint"' in html[lbl : lbl + 120], (
         "the dashboard Project label must carry a .label-hint span (required/optional cue)"
     )
-    sync_hint = fn.find("projHint.textContent")
-    assert 0 <= sync_hint < async_proj, (
-        "the dashboard project label hint must be seeded synchronously (before the refresh)"
-    )
+    # The hint is seeded synchronously inside _paintProjectPicker (asserted there).
 
 
 def test_console_launcher_paints_project_and_persona_from_cache_synchronously() -> None:
@@ -2484,4 +2473,26 @@ def test_console_launcher_paints_project_and_persona_from_cache_synchronously() 
     assert async_persona >= 0, "the launcher must keep refreshPersonas().then"
     assert sync_persona < async_persona, (
         "the synchronous launcher persona paint must precede the async refresh repaint"
+    )
+
+
+def test_paint_project_picker_syncs_before_refresh() -> None:
+    """The shared _paintProjectPicker (used by BOTH the modal and dashboard, so
+    the two can't drift and silently re-introduce the FOUC) seeds the required/
+    optional hint + paints the picker via _populateProjectSelect SYNCHRONOUSLY,
+    then refreshes-and-repaints.  It skips a fork, and both paints route through
+    the same _populateProjectSelect (preserving the #867 strict-picker invariant)."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _paintProjectPicker(")
+    assert "_populateProjectSelect(" in fn, (
+        "_paintProjectPicker must paint via _populateProjectSelect"
+    )
+    assert "hint.textContent" in fn, "_paintProjectPicker must seed the required/optional hint"
+    assert "opts.fork" in fn, "_paintProjectPicker must skip for a fork"
+    sync_call = fn.find("paint();")
+    async_refresh = fn.find("refreshProjects().then")
+    assert async_refresh >= 0, "_paintProjectPicker must keep refreshProjects().then"
+    assert 0 <= sync_call < async_refresh, (
+        "_paintProjectPicker must paint synchronously (paint()) BEFORE the async "
+        "refreshProjects().then repaint"
     )

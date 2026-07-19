@@ -414,33 +414,11 @@ function showNewWsModal(forkFromWsId) {
   const projHint = projLabel ? projLabel.querySelector(".label-hint") : null;
   if (projLabel) projLabel.hidden = !!_forkFromWsId;
   if (projSelect) projSelect.hidden = !!_forkFromWsId;
-  // Seed the hint from the warm cache SYNCHRONOUSLY so a fresh create isn't
-  // mislabeled "optional" for the duration of the (redundant) refresh round-trip
-  // — requireProject() reads a cache the rail warms at startup. The refresh below
-  // re-affirms it for the rare cold-cache open.
-  if (projHint && !_forkFromWsId && window.TurnstoneProjects) {
-    projHint.textContent = window.TurnstoneProjects.requireProject()
-      ? "required"
-      : "optional";
-  }
-  if (projSelect && !_forkFromWsId && window.TurnstoneProjects) {
-    // Paint from the warm cache SYNCHRONOUSLY first so the picker isn't empty for
-    // the (redundant) refresh round-trip — the rail warms projects at startup and
-    // projectChoices()/requireProject() are sync. On a cold cache projectChoices()
-    // is [] and this is a no-op the async fills, so it's never worse than before.
-    // BOTH paints route through the SAME _populateProjectSelect, so the #867
-    // strict-picker invariant (never auto-select a real project) holds identically.
-    _populateProjectSelect(projSelect, {
-      requireProject: !!window.TurnstoneProjects.requireProject(),
-    });
-    window.TurnstoneProjects.refreshProjects().then(function () {
-      const strict = !!window.TurnstoneProjects.requireProject();
-      // Honest label: under require_project a fresh create must resolve to a real
-      // project, so the static "optional" hint must not claim otherwise.
-      if (projHint) projHint.textContent = strict ? "required" : "optional";
-      _populateProjectSelect(projSelect, { requireProject: strict });
-    });
-  }
+  // Paint the picker + its required/optional hint from the warm cache, then
+  // refresh-and-repaint — shared with the dashboard via _paintProjectPicker so
+  // the two can't drift; skips for a fork (its picker is hidden above,
+  // inheritance is server-enforced).
+  _paintProjectPicker(projSelect, projHint, { fork: !!_forkFromWsId });
 
   // Persona picker — hidden when forking (a fork resumes the source's
   // stamped persona; the create handler skips resolution on resume_ws).
@@ -569,6 +547,24 @@ function _optionExists(sel, val) {
     if (sel.options[i].value === val) return true;
   }
   return false;
+}
+
+// Paint a FRESH-create project picker (+ its required/optional label hint) from
+// the warm cache SYNCHRONOUSLY, then refresh-and-repaint.  Shared by the new-ws
+// modal and the dashboard composer so the two paths can't drift and silently
+// re-introduce the empty-dropdown / mislabel FOUC this exists to prevent.  A fork
+// skips entirely (a fork inherits its source's project server-side; the modal
+// hides the picker for forks).  Both paints reuse _populateProjectSelect, so the
+// #867 strict-picker invariant (never auto-select a real project) holds on each.
+function _paintProjectPicker(sel, hint, opts) {
+  if ((opts && opts.fork) || !sel || !window.TurnstoneProjects) return;
+  const paint = function () {
+    const strict = !!window.TurnstoneProjects.requireProject();
+    if (hint) hint.textContent = strict ? "required" : "optional";
+    _populateProjectSelect(sel, { requireProject: strict });
+  };
+  paint(); // sync from the warm cache (no-op when cold; the async fills it)
+  window.TurnstoneProjects.refreshProjects().then(paint);
 }
 
 // Fill a project <select> from the shared projects cache.  The picker MODE is
@@ -1513,32 +1509,12 @@ function _loadDashboardOptionsLists() {
   }
 
   // Project picker — paint from the warm cache then refresh-and-repaint (also
-  // feeds the rail's group-by-project).  Re-fetched each time the options open so
-  // a project created elsewhere appears without a page reload.
+  // feeds the rail's group-by-project). Dashboard quick-create is ALWAYS a fresh
+  // create (never a fork); shared with the modal via _paintProjectPicker.
   const projSel = document.getElementById("dashboard-project");
   const projLabel = document.querySelector('label[for="dashboard-project"]');
   const projHint = projLabel ? projLabel.querySelector(".label-hint") : null;
-  if (projSel && window.TurnstoneProjects) {
-    // Seed the "required"/"optional" label hint + paint the picker from the warm
-    // cache SYNCHRONOUSLY (mirrors showNewWsModal) so a fresh open isn't empty or
-    // mislabeled for the refresh round-trip; the async refresh below re-affirms
-    // both to catch a project created elsewhere. Dashboard quick-create is ALWAYS
-    // a fresh create (never a fork); the mode is passed explicitly so the shared
-    // helper never reads the fork-only global.
-    if (projHint) {
-      projHint.textContent = window.TurnstoneProjects.requireProject()
-        ? "required"
-        : "optional";
-    }
-    _populateProjectSelect(projSel, {
-      requireProject: !!window.TurnstoneProjects.requireProject(),
-    });
-    window.TurnstoneProjects.refreshProjects().then(function () {
-      const strict = !!window.TurnstoneProjects.requireProject();
-      if (projHint) projHint.textContent = strict ? "required" : "optional";
-      _populateProjectSelect(projSel, { requireProject: strict });
-    });
-  }
+  _paintProjectPicker(projSel, projHint, { fork: false });
 
   // Persona picker — same paint-from-cache-then-refresh policy; kind default
   // preselected so a zero-touch launch behaves exactly like today.
