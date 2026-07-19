@@ -2382,8 +2382,8 @@ def test_strict_picker_requires_explicit_pick() -> None:
 # empty dropdown for a network round-trip even when the data was already in
 # memory.  These guards pin the ordering — a synchronous populate must precede
 # the refresh().then — for all three composer surfaces (new-ws modal, dashboard
-# Options, console launcher).  Model/skill selectors are a separate later pass
-# and intentionally NOT covered here.
+# Options, console launcher).  The model/skill selectors (phase 2b) are covered
+# by the guards further down (search "models/skills composer FOUC").
 
 
 def _slice_top_level_fn(body: str, header: str) -> str:
@@ -2496,3 +2496,198 @@ def test_paint_project_picker_syncs_before_refresh() -> None:
         "_paintProjectPicker must paint synchronously (paint()) BEFORE the async "
         "refreshProjects().then repaint"
     )
+
+
+# --- models/skills composer FOUC (phase 2b) --------------------------------
+#
+# The model + skill pickers had NO client cache: every composer open re-fetched
+# /v1/api/models and /v1/api/skills inline, flashing an empty dropdown for the
+# round-trip.  Phase 2b adds shared caches (models.js / skills.js) on the
+# extracted list_cache.js core that the composers read synchronously, then
+# refresh-and-repaint — the same pattern the project/persona pickers use.  These
+# guards pin the sync-before-async ordering on all three surfaces, the cache
+# fail-open/coalesce contract, the two-server-schema exposure, and the
+# single-repaint-path wiring.
+
+_LIST_CACHE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/list_cache.js"
+_MODELS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/models.js"
+_SKILLS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/skills.js"
+_PROJECTS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/projects.js"
+_PERSONAS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/personas.js"
+
+
+def test_new_ws_modal_paints_model_and_skill_from_cache_synchronously() -> None:
+    """The modal's model + skill pickers paint from the warm cache SYNCHRONOUSLY
+    on open, BEFORE the async refresh-and-repaint (no empty-dropdown flash)."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function showNewWsModal(")
+    sync_model = fn.find("_populateModelSelect(modelSelect")
+    async_model = fn.find("refreshModels().then")
+    assert sync_model >= 0, "the modal must paint the model picker from cache synchronously"
+    assert async_model >= 0, "the modal must keep refreshModels().then"
+    assert sync_model < async_model, (
+        "the synchronous model paint must precede the async refreshModels().then repaint"
+    )
+    sync_skill = fn.find("_populateSkillSelect(tplSelect)")
+    async_skill = fn.find("refreshSkills().then")
+    assert sync_skill >= 0, "the modal must paint the skill picker from cache synchronously"
+    assert async_skill >= 0, "the modal must keep refreshSkills().then"
+    assert sync_skill < async_skill, (
+        "the synchronous skill paint must precede the async refreshSkills().then repaint"
+    )
+
+
+def test_dashboard_paints_model_and_skill_from_cache_synchronously() -> None:
+    """Dashboard twin — model + skill paint synchronously before the refresh, and
+    the old fetch-once ``options.length <= 1`` guard is GONE (upgraded to
+    refresh-on-open via the coalesced cache, matching project/persona)."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _loadDashboardOptionsLists(")
+    sync_model = fn.find("_populateModelSelect(modelSel")
+    async_model = fn.find("refreshModels().then")
+    assert sync_model >= 0, "the dashboard must paint the model picker from cache synchronously"
+    assert 0 <= sync_model < async_model, (
+        "the synchronous dashboard model paint must precede the async refresh repaint"
+    )
+    sync_skill = fn.find("_populateSkillSelect(skillSel)")
+    async_skill = fn.find("refreshSkills().then")
+    assert sync_skill >= 0, "the dashboard must paint the skill picker from cache synchronously"
+    assert 0 <= sync_skill < async_skill, (
+        "the synchronous dashboard skill paint must precede the async refresh repaint"
+    )
+    assert "options.length <= 1" not in fn, (
+        "the dashboard model/skill fetch-once guard must be removed (refresh-on-open now)"
+    )
+
+
+def test_console_launcher_paints_model_and_skill_from_cache_synchronously() -> None:
+    """Console launcher — the model + skill refresh wrappers paint synchronously
+    from the warm cache before the async refresh-and-repaint."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    model_fn = _slice_top_level_fn(body, "function _refreshAndPopulateModels(")
+    sync_model = model_fn.find("_populateHomeModelDropdowns()")
+    async_model = model_fn.find("refreshModels().then")
+    assert sync_model >= 0, "the launcher must paint the model pickers from cache synchronously"
+    assert 0 <= sync_model < async_model, (
+        "the synchronous launcher model paint must precede the async refresh repaint"
+    )
+    skill_fn = _slice_top_level_fn(body, "function _refreshAndPopulateSkills(")
+    sync_skill = skill_fn.find("_populateHomeSkillDropdown()")
+    async_skill = skill_fn.find("refreshSkills().then")
+    assert sync_skill >= 0, "the launcher must paint the skill picker from cache synchronously"
+    assert 0 <= sync_skill < async_skill, (
+        "the synchronous launcher skill paint must precede the async refresh repaint"
+    )
+
+
+def test_console_relogin_rewarms_model_and_skill() -> None:
+    """onLoginSuccess re-warms BOTH the skill and model caches after auth lands —
+    the boot-time pass runs pre-login (401), so without the model re-warm the
+    console model dropdown would stay at its placeholder until a reload."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    start = body.index("window.onLoginSuccess = function ()")
+    login = body[start : body.index("// Active-coordinators", start)]
+    assert "_refreshAndPopulateSkills()" in login, "onLoginSuccess must re-warm skills"
+    assert "_refreshAndPopulateModels()" in login, "onLoginSuccess must re-warm models"
+
+
+def test_models_changed_single_repaint_path() -> None:
+    """The console ``models_changed`` SSE handler repaints the launcher via the
+    refresh wrapper (which reads the warm cache), and the launcher does NOT ALSO
+    subscribe onModelsChange — one repaint path, no double rebuild (graph R7)."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    mc = body.index('data.type === "models_changed"')
+    handler = body[mc : mc + 600]
+    assert "_refreshAndPopulateModels()" in handler, (
+        "models_changed must repaint the launcher model dropdowns via the refresh wrapper"
+    )
+    assert "onModelsChange" not in body, (
+        "the console must not ALSO subscribe onModelsChange (single repaint path — R7)"
+    )
+
+
+def test_models_skills_module_tagged_in_both_apps() -> None:
+    """models.js + skills.js are ``<script type=module>``-tagged before app.js in
+    BOTH index.html so their window bridges install before the classic bundle
+    boots and reads window.TurnstoneModels / window.TurnstoneSkills."""
+    for idx in (_INDEX_HTML, _CONSOLE_INDEX):
+        html = idx.read_text(encoding="utf-8")
+        assert "/shared/models.js" in html, f"models.js must be module-tagged in {idx.name}"
+        assert "/shared/skills.js" in html, f"skills.js must be module-tagged in {idx.name}"
+
+
+def test_list_cache_core_is_failopen_and_coalesced() -> None:
+    """The extracted list_cache.js core coalesces concurrent refreshes, fails open
+    (keeps the prior cache + records the error on a non-OK/exception, never
+    rejects — only the SUCCESS branch calls _setCache), and fires subscribers only
+    on first load or a changed fingerprint."""
+    src = _LIST_CACHE_JS.read_text(encoding="utf-8")
+    assert "if (_inflight) return _inflight" in src, "refresh must coalesce concurrent callers"
+    assert "_lastError = r.status" in src and "_lastError = 0" in src, (
+        "a non-OK status and a network/parse error must both be recorded (fail-open)"
+    )
+    assert src.count("_setCache(data[dataKey]") == 1, (
+        "only the success branch may repopulate the cache (non-OK/catch keep the prior cache)"
+    )
+    assert "firstLoad || fp !== _fingerprint" in src, (
+        "subscribers must fire on first load or a changed fingerprint only"
+    )
+
+
+def test_models_cache_exposes_both_server_schemas() -> None:
+    """models.js must carry ALL default-alias fields — the node server sends
+    default_alias, the console sends coordinator_default_alias, both send
+    judge_default_alias — so each app reads its own, and fold them into the
+    fingerprint so a default-only change still fires onChange (R6)."""
+    src = _MODELS_JS.read_text(encoding="utf-8")
+    for field in ("default_alias", "judge_default_alias", "coordinator_default_alias"):
+        assert field in src, f"models.js must carry {field} for the two server schemas"
+    assert "window.TurnstoneModels" in src, "models.js must install the classic bridge"
+    assert "makeListCache" in src, "models.js must build on the shared list_cache core"
+    assert "fpExtra" in src, "models.js must fold the default aliases into the fingerprint (R6)"
+
+
+def test_skills_cache_returns_raw_rows() -> None:
+    """skills.js exposes raw rows (getSkills) — the ui pickers add a ' [MCP]' suffix
+    the console omits, so a single pre-formatted label in the cache would silently
+    change one app's labels."""
+    src = _SKILLS_JS.read_text(encoding="utf-8")
+    assert "window.TurnstoneSkills" in src, "skills.js must install the classic bridge"
+    assert "makeListCache" in src, "skills.js must build on the shared list_cache core"
+    assert "getSkills" in src, "skills.js must expose raw rows via getSkills"
+
+
+def test_projects_personas_keep_public_surface_on_factory() -> None:
+    """The projects.js / personas.js retrofit onto list_cache.js must preserve their
+    full public surface — rail.js and project_creator.js import these by name, and
+    the classic bundles read the window bridges."""
+    proj = _PROJECTS_JS.read_text(encoding="utf-8")
+    assert "makeListCache" in proj, "projects.js must build on the shared core"
+    for name in (
+        "refreshProjects",
+        "getProjects",
+        "projectsLoaded",
+        "projectsError",
+        "requireProject",
+        "projectName",
+        "projectChoices",
+        "onProjectsChange",
+        "createProject",
+    ):
+        assert f"function {name}(" in proj, f"projects.js must still export {name}"
+    assert "requireProject: false" in proj, (
+        "the require_project advisory must seed / fail-open to false"
+    )
+    persona = _PERSONAS_JS.read_text(encoding="utf-8")
+    assert "makeListCache" in persona, "personas.js must build on the shared core"
+    for name in (
+        "refreshPersonas",
+        "getPersonas",
+        "personasLoaded",
+        "personasError",
+        "personaLabel",
+        "defaultPersona",
+        "personaChoices",
+        "onPersonasChange",
+    ):
+        assert f"function {name}(" in persona, f"personas.js must still export {name}"

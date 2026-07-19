@@ -1,0 +1,128 @@
+/* models.js — client-side model-list data layer.
+ *
+ * Backs the model + judge-model pickers on every creation surface (the
+ * standalone new-ws modal, the dashboard quick-create, and the console
+ * launcher composer).  Before this the pickers each re-fetched
+ * /v1/api/models inline on every open, flashing an empty dropdown for the
+ * round-trip; this warms a shared cache the composers read synchronously.
+ *
+ * TWO SERVER SCHEMAS, ONE CACHE.  /v1/api/models is served by BOTH the node
+ * server (ui app) and the console server, with DIFFERENT default-alias
+ * fields: the node sends `default_alias` (+ `judge_default_alias`), the
+ * console sends `coordinator_default_alias` (+ `judge_default_alias`).  So
+ * the cache exposes the raw default-alias fields via {@link modelDefaults}
+ * (each "" when the local server didn't send it) and each app reads its own
+ * — it must NOT normalize to a single field name.  The per-row alias/model
+ * shape is common, so {@link modelChoices} formats one app-agnostic label.
+ *
+ * House style mirrors projects.js: coalescing / fail-open refresh /
+ * change-detection / bridge come from the shared `makeListCache` core;
+ * installs a `window.TurnstoneModels` bridge for the classic app.js bundles.
+ *
+ * NOTE (parallel readers, intentionally NOT unified here): the console
+ * governance panel (_sklcModelsPromise), the per-node voice-role fetch, and
+ * the admin schedule picker are independent /v1/api/models readers with
+ * their own (or no) caching.  This cache is a fourth path scoped to the
+ * composer pickers; unifying the others is a separate follow-up.
+ */
+
+import { makeListCache } from "./list_cache.js";
+
+const _core = makeListCache({
+  url: "/v1/api/models",
+  dataKey: "models",
+  name: "models",
+  fpRow: function (m) {
+    return [m.alias, m.model];
+  },
+  // Fold the default-alias fields into the fingerprint so a role-alias change
+  // (server emits `models_changed` for it) still fires onChange even when the
+  // model rows themselves are unchanged.
+  fpExtra: function (e) {
+    return [
+      e.default_alias,
+      e.judge_default_alias,
+      e.coordinator_default_alias,
+    ];
+  },
+  captureExtra: function (data) {
+    return {
+      default_alias: data.default_alias || "",
+      judge_default_alias: data.judge_default_alias || "",
+      coordinator_default_alias: data.coordinator_default_alias || "",
+    };
+  },
+  extraDefaults: {
+    default_alias: "",
+    judge_default_alias: "",
+    coordinator_default_alias: "",
+  },
+});
+
+/**
+ * Fetch /v1/api/models into the cache.  Resolves to the row list and NEVER
+ * rejects — a failed/forbidden fetch keeps the prior cache (a picker never
+ * blanks) and resets the default aliases to "".  Recorded (see
+ * {@link modelsError}) and warned rather than masqueraded as "no models".
+ */
+export function refreshModels() {
+  return _core.refresh();
+}
+
+/** Cached model rows (empty until the first refresh resolves).  Raw rows so
+ *  a caller can resolve a default alias to its "alias (model)" label. */
+export function getModels() {
+  return _core.get();
+}
+
+/** Whether the first refresh has resolved — distinguishes "no models" from
+ *  "not loaded yet". */
+export function modelsLoaded() {
+  return _core.loaded();
+}
+
+/** Last refresh failure status (HTTP status, 0 for network/parse), or null
+ *  when the last refresh succeeded. */
+export function modelsError() {
+  return _core.error();
+}
+
+/** `{value, text}` choices for a model <select> — the label ("alias (model)",
+ *  or just "alias" when they coincide) is identical across all three creation
+ *  surfaces, so it is centralized here.  Callers seed their own static
+ *  "Default …" placeholder as option 0. */
+export function modelChoices() {
+  return _core.get().map(function (m) {
+    return {
+      value: m.alias,
+      text: m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")",
+    };
+  });
+}
+
+/** The resolved default aliases the local server reported:
+ *  `{default_alias, judge_default_alias, coordinator_default_alias}` (each ""
+ *  when not sent).  The ui dashboard reads default_alias, the console launcher
+ *  reads coordinator_default_alias; both read judge_default_alias.  Fails open
+ *  to all-"" on a refresh error. */
+export function modelDefaults() {
+  return _core.extra();
+}
+
+/** Subscribe to post-refresh changes.  Idempotent.  (No composer subscribes
+ *  today — the console repaints via its direct `models_changed` handler — but
+ *  the hook is exposed for parity with the other data layers.) */
+export function onModelsChange(cb) {
+  _core.onChange(cb);
+}
+
+// Classic (non-module) app.js bundles reach the data layer through this bridge.
+window.TurnstoneModels = {
+  refreshModels: refreshModels,
+  getModels: getModels,
+  modelsLoaded: modelsLoaded,
+  modelsError: modelsError,
+  modelChoices: modelChoices,
+  modelDefaults: modelDefaults,
+  onModelsChange: onModelsChange,
+};

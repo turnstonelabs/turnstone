@@ -11,51 +11,26 @@
  * at creation is a user action, authoring lives behind the console admin
  * CRUD.
  *
- * House style mirrors projects.js: an ES module for module consumers that
- * ALSO installs a `window.TurnstonePersonas` bridge for the classic
- * (non-module) app.js bundles.  All fetches ride the shared cookie-auth
- * `authFetch`.
+ * House style mirrors projects.js: the coalescing, fail-open refresh,
+ * change-detection fan-out, and bridge machinery come from the shared
+ * `makeListCache` core (list_cache.js); this module adds the persona-specific
+ * readers (kind-filtered choices, the kind default, name→label resolution).
+ * An ES module for module consumers that ALSO installs a
+ * `window.TurnstonePersonas` bridge for the classic (non-module) app.js
+ * bundles.  All fetches ride the shared cookie-auth `authFetch`.
  */
 
-import { authFetch } from "./auth.js";
+import { makeListCache } from "./list_cache.js";
 
-let _cache = []; // last-fetched persona rows (enabled only)
-let _byName = {}; // name -> row, for O(1) label/default resolution
-let _loaded = false; // has the first refresh attempt completed (ok or failed)?
-let _lastError = null; // last failure: HTTP status, 0 for network/parse, null when ok
-let _inflight = null; // shared pending refresh so concurrent callers coalesce
-let _fingerprint = null; // last fired list signature, for change-detection
-const _subs = []; // () => void, fired after each CHANGED refresh
-
-function _fp(rows) {
-  // Cheap signature of the fields subscribers render, so a refresh
-  // returning identical data skips the fan-out (same policy as
-  // projects.js — JSON.stringify keeps the file text-safe for git).
-  return JSON.stringify(
-    rows.map(function (p) {
-      return [p.name, p.display_name, p.applies_to_kinds, p.is_default];
-    }),
-  );
-}
-
-function _setCache(rows) {
-  _cache = Array.isArray(rows) ? rows : [];
-  _byName = {};
-  for (const p of _cache) if (p && p.name) _byName[p.name] = p;
-  const firstLoad = !_loaded;
-  _loaded = true;
-  const fp = _fp(_cache);
-  if (firstLoad || fp !== _fingerprint) {
-    _fingerprint = fp;
-    _subs.forEach(function (cb) {
-      try {
-        cb(_cache);
-      } catch (_) {
-        /* a subscriber throwing must not abort the rest of the fan-out */
-      }
-    });
-  }
-}
+const _core = makeListCache({
+  url: "/v1/api/personas",
+  dataKey: "personas",
+  name: "personas",
+  keyField: "name",
+  fpRow: function (p) {
+    return [p.name, p.display_name, p.applies_to_kinds, p.is_default];
+  },
+});
 
 /**
  * Fetch /v1/api/personas into the cache.  Resolves to the row list and
@@ -65,48 +40,24 @@ function _setCache(rows) {
  * than silently masqueraded as "no personas".
  */
 export function refreshPersonas() {
-  if (_inflight) return _inflight;
-  _inflight = authFetch("/v1/api/personas")
-    .then(function (r) {
-      if (r.ok) return r.json();
-      _lastError = r.status;
-      console.warn("personas: GET /v1/api/personas -> " + r.status);
-      return null;
-    })
-    .then(function (data) {
-      if (data) {
-        _lastError = null;
-        _setCache(data.personas || []);
-      }
-      return _cache;
-    })
-    .catch(function (e) {
-      _lastError = 0;
-      console.warn("personas: refresh failed", e);
-      return _cache;
-    })
-    .finally(function () {
-      _loaded = true;
-      _inflight = null;
-    });
-  return _inflight;
+  return _core.refresh();
 }
 
 /** Cached persona rows (empty array until the first refresh resolves). */
 export function getPersonas() {
-  return _cache;
+  return _core.get();
 }
 
 /** Whether the first refresh has resolved — lets a reader distinguish
  *  "no personas" (pre-seed database) from "not loaded yet". */
 export function personasLoaded() {
-  return _loaded;
+  return _core.loaded();
 }
 
 /** Status of the last refresh failure — HTTP status, 0 for network/parse
  *  error, null when the last refresh succeeded. */
 export function personasError() {
-  return _lastError;
+  return _core.error();
 }
 
 /** Display label for a persona name, or the raw name when unknown (a
@@ -114,13 +65,13 @@ export function personasError() {
  *  it), or "" for an empty/pre-persona value. */
 export function personaLabel(name) {
   if (!name) return "";
-  const p = _byName[name];
+  const p = _core.getByKey(name);
   return (p && p.display_name) || name;
 }
 
 /** The default persona row for a workstream kind, or null (pre-seed DB). */
 export function defaultPersona(kind) {
-  for (const p of _cache) {
+  for (const p of _core.get()) {
     if (p.is_default && (p.applies_to_kinds || []).indexOf(kind) >= 0) return p;
   }
   return null;
@@ -130,7 +81,7 @@ export function defaultPersona(kind) {
  *  ("interactive" | "coordinator").  The kind's default persona sorts
  *  first so a zero-touch composer preselects today's behavior. */
 export function personaChoices(kind) {
-  const rows = _cache.filter(function (p) {
+  const rows = _core.get().filter(function (p) {
     return (p.applies_to_kinds || []).indexOf(kind) >= 0;
   });
   rows.sort(function (a, b) {
@@ -145,7 +96,7 @@ export function personaChoices(kind) {
 /** Subscribe to post-refresh changes (picker repopulate, label refresh).
  *  Idempotent — the same callback is registered at most once. */
 export function onPersonasChange(cb) {
-  if (typeof cb === "function" && _subs.indexOf(cb) < 0) _subs.push(cb);
+  _core.onChange(cb);
 }
 
 // Classic (non-module) app.js bundles reach the data layer through this
