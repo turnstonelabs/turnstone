@@ -1,0 +1,140 @@
+/* ==========================================================================
+   MCP error embed (consent / scope / forbidden / operator) — pairs with
+   mcp_error.js and owns EVERY class that module emits, so any page that
+   renders the card gets its styling from this one sheet.  Linked by all
+   three card hosts: the standalone coordinator page, the console L-shell,
+   and the node interactive page.  Tokens resolve via shared base.css,
+   which every host links.  (Reach pinned by the className→rule parity
+   test in tests/test_app_js.py.)
+   ========================================================================== */
+.mcp-error-card {
+  border-top: 1px solid var(--border);
+  background: var(--code-bg);
+  padding: 12px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: start;
+  font-family: var(--font-ui);
+  font-size: 13px;
+}
+
+.mcp-error-icon {
+  font-size: 20px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.mcp-error-card.mcp-error-forbidden .mcp-error-icon,
+.mcp-error-card.mcp-error-operator .mcp-error-icon {
+  color: var(--red);
+}
+
+.mcp-error-card.mcp-error-transient .mcp-error-icon {
+  color: var(--yellow);
+}
+
+/* .mcp-error-actionable deliberately has no rule: the base card look IS
+   the actionable look (accent icon + Connect button). */
+
+.mcp-error-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mcp-error-title {
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.mcp-error-detail {
+  color: var(--fg-dim);
+}
+
+.mcp-error-server,
+.mcp-error-scopes {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.mcp-error-server code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg);
+}
+
+.mcp-scope-pill {
+  display: inline-block;
+  /* Panel-on-code-bg like the raw-payload box below: the card itself is
+     --code-bg, so a --code-bg pill had zero fill contrast and the
+     0.06/0.08-alpha --border read as a bare hairline (below the ≥0.15-α
+     chip rule) — --panel + solid --hair lift it off the card in both
+     themes. */
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 10px;
+  padding: 2px 8px;
+  margin-right: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg);
+}
+
+.mcp-error-action-btn {
+  margin-top: 6px;
+  padding: 6px 12px;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 4px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  align-self: start;
+}
+
+.mcp-error-action-btn:hover {
+  filter: brightness(1.1);
+}
+
+.mcp-error-card details {
+  grid-column: 1 / -1;
+  margin-top: 6px;
+}
+
+.mcp-error-card details summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 4px 0;
+}
+
+.mcp-error-card details pre {
+  margin: 4px 0 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* The card's raw-payload <pre> carries className "tool-output" so it
+   matches the hosts' generic tool-output look — but pages without those
+   generic rules (the standalone coordinator page) must not render it
+   bare.  This rule carries ONLY the box properties the generic
+   .tool-output rules supply (interactive.css:122 padding/max-height/
+   overflow; :330 panel surface/border/radius): the typography properties
+   (font, size, color, wrap) stay with `.mcp-error-card details pre`
+   above, which out-specifies the generic rules today — carrying them
+   here too would flip that contest on interactive hosts and shift
+   rendering. */
+.mcp-error-card .tool-output {
+  padding: 8px 12px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  max-height: 300px;
+  overflow-y: auto;
+}

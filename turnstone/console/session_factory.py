@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
     from turnstone.console.coordinator_client import CoordinatorClient
     from turnstone.core.config_store import ConfigStore
+    from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelRegistry
     from turnstone.core.personas import PersonaSnapshot
     from turnstone.core.session import SessionUI
@@ -46,12 +47,18 @@ def build_console_session_factory(
     config_store: ConfigStore,
     node_id: str,
     coord_client_factory: Callable[[str, str], CoordinatorClient],
+    mcp_client_getter: Callable[[], MCPClientManager | None] | None = None,
 ) -> Callable[..., ChatSession]:
     """Return a session factory that builds coordinator-kind ChatSessions.
 
     The factory signature matches :class:`turnstone.core.workstream._SessionFactory`.
     ``coord_client_factory`` is called at session-create time with
     ``(ws_id, user_id)`` and returns a prepared :class:`CoordinatorClient`.
+    ``mcp_client_getter`` returns the console's CURRENT MCP client manager
+    (or ``None``) — a getter rather than an instance because the console's
+    ensure-helper can (re)construct the manager after this factory is
+    built; it is consulted per session construction (#725), the console
+    counterpart of the node factory's ``mcp_ref[0]`` read.
 
     Only ``kind="coordinator"`` is supported here — the console doesn't
     host interactive workstreams.  The factory rejects any other kind
@@ -138,6 +145,13 @@ def build_console_session_factory(
 
         live_memory_config = _build_memory_config()
         live_judge_config = _build_judge_config()
+        # Coordinator MCP surface (#725): resolved per construction so the
+        # session sees the CURRENT manager — the console ensure-helper can
+        # (re)construct it after this factory was built.  Passed
+        # unconditionally, exactly like the node session factory reads
+        # mcp_ref[0]: whether MCP tools actually surface is the persona's
+        # call, same as interactive (#725).
+        live_mcp_client = mcp_client_getter() if mcp_client_getter is not None else None
         # NOTE: do not pre-resolve ``live_judge_config.model`` against the
         # registry here.  ``IntentJudge.__init__`` does a richer resolution
         # that also picks up the alias's *provider + client*; rewriting
@@ -198,7 +212,7 @@ def build_console_session_factory(
             auto_compact_pct=config_store.get("session.auto_compact_pct"),
             agent_max_turns=config_store.get("tools.agent_max_turns"),
             tool_truncation=config_store.get("tools.truncation"),
-            mcp_client=None,  # console doesn't host MCP today
+            mcp_client=live_mcp_client,
             registry=registry,
             model_alias=effective_alias,
             health_registry=None,

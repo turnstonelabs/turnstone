@@ -57,6 +57,12 @@ from turnstone.core.auth import (
 )
 from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
 from turnstone.core.log import get_logger
+from turnstone.core.mcp_utils import (
+    public_server_status as _public_server_status,
+)
+from turnstone.core.mcp_utils import (
+    strip_server_status_for_read as _strip_server_status_for_read,
+)
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.model_turn import resolve_effort_setting, resolve_temperature_setting
 from turnstone.core.ratelimit import resolve_client_ip
@@ -3725,59 +3731,10 @@ def internal_mcp_reload(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", **result})
 
 
-_SERVER_STATUS_PUBLIC_KEYS: tuple[str, ...] = (
-    "connected",
-    "tools",
-    "resources",
-    "prompts",
-    "error",
-    "transport",
-    "circuit_open",
-    "consecutive_failures",
-)
-
-_READ_STATUS_PUBLIC_KEYS: tuple[str, ...] = tuple(
-    k for k in _SERVER_STATUS_PUBLIC_KEYS if k != "error"
-)
-
-
-def _strip_server_status(full: dict[str, Any]) -> dict[str, Any]:
-    """Project a status dict to the approve-scope public-safe key set.
-
-    The full status dict embeds ``command`` (stdio argv) and ``url``
-    (remote MCP endpoint) which are admin-only context. Approve-scoped
-    callers (refresh/reconnect) get the verbose ``error`` text so an
-    operator triaging a failure sees the underlying exception.
-
-    Read-scope callers must use :func:`_strip_server_status_for_read`
-    instead — error strings can carry stdio binary paths
-    (``FileNotFoundError: ... '/usr/local/bin/...'``) or internal MCP
-    URLs (``httpx.ConnectError: ... 'https://internal/...'``) and
-    those are equivalent to leaking ``command``/``url``.
-    """
-    return {k: full[k] for k in _SERVER_STATUS_PUBLIC_KEYS if k in full}
-
-
-def _strip_server_status_for_read(full: dict[str, Any]) -> dict[str, Any]:
-    """Project a status dict for read-scope callers.
-
-    Drops the verbose ``error`` text and replaces it with a coarse
-    ``has_error: bool`` so dashboards can light up a failure indicator
-    without leaking the underlying exception detail.
-    """
-    out = {k: full[k] for k in _READ_STATUS_PUBLIC_KEYS if k in full}
-    out["has_error"] = bool(full.get("error"))
-    return out
-
-
-def _public_server_status(mcp_mgr: Any, name: str) -> dict[str, Any]:
-    """Strip ``command``/``url`` from ``get_server_status`` before returning over the wire."""
-    # aggregate=True: the operator refresh/reconnect endpoints are approve-scoped
-    # cluster actions with no single requesting user, so oauth_user servers report
-    # the any-user warm-pool view (matching the admin console) rather than the
-    # per-user default — which, with user_id=None, would render a warm, in-use
-    # server as disconnected/empty right after a successful refresh.
-    return _strip_server_status(mcp_mgr.get_server_status(name, aggregate=True))
+# Wire-safety status projections live in core/mcp_utils (#725: the
+# console's coordinator-facing arms present the same schema); imported
+# at the top of this module under the established private names so
+# every endpoint body below stays byte-identical.
 
 
 def internal_mcp_status(request: Request) -> JSONResponse:

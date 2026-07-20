@@ -162,6 +162,15 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
         # surfacing to a human channel without spawning a child purely
         # to ship the message.  Routing is session-kind-agnostic.
         "notify",
+        # ``read_resource``/``use_prompt`` joined in 1.8 (#725) — the
+        # coordinator MCP surface covers tools, resources, AND prompts.
+        # They sit in the BASE list unconditionally (like their
+        # interactive siblings), but the WIRE strips them when no client
+        # is attached or the per-user catalog counts are zero — the
+        # _without_tool gate in _get_active_tools, pinned by the wire
+        # matrix in test_workstream_kind.py.
+        "read_resource",
+        "use_prompt",
     }
     # Sub-agent tool set is zeroed on coordinator sessions.
     assert sess._task_tools == []

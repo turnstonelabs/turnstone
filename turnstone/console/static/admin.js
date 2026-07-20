@@ -3747,6 +3747,7 @@ const _settingsSectionOrder = [
   "tools",
   "server",
   "cluster",
+  "coordinator",
   "channels",
   "mcp",
   "ratelimit",
@@ -3763,6 +3764,7 @@ function _settingsSectionLabel(section) {
     tools: "Tools",
     server: "Server",
     cluster: "Cluster",
+    coordinator: "Coordinator",
     channels: "Channels",
     audio: "Voice",
     mcp: "MCP",
@@ -4670,6 +4672,15 @@ function loadAdminMcp() {
     .then(function (data) {
       _mcpServers = data.servers || [];
       _renderMcpServers(_mcpServers);
+      // Re-sync the rail's pending-consent badge AFTER the table renders
+      // — the operator has now seen current state (#874).  A failed load
+      // (the catch below) keeps the pending signal instead.
+      if (
+        window.TS_APP &&
+        typeof window.TS_APP.syncConsentBadge === "function"
+      ) {
+        window.TS_APP.syncConsentBadge();
+      }
     })
     .catch(function () {
       setSafeHtml(
@@ -5472,9 +5483,43 @@ function reloadMcpNodes() {
         totalAdded += (nr.added || []).length;
         totalRemoved += (nr.removed || []).length;
       }
-      let msg = "Reload sent to " + nodeIds.length + " node(s)";
+      // The results map includes the console's own MCP reconcile under
+      // the "console" pseudo-node key (coordinator MCP, #725) — count it
+      // separately so the operator-facing tally stays honest, and only
+      // claim "+ console" when the console actually RECONCILED: a
+      // skipped entry (nothing configured) says nothing, and an error
+      // entry gets an explicit failure note instead of riding the
+      // success phrasing.  failed beats reconciled if a malformed entry
+      // ever carries both shapes.  (The added/removed tally above can
+      // only include console counts when the entry is reconcile-shaped —
+      // exactly when "+ console" is claimed — so attribution stays
+      // honest.)
+      const consoleEntry = Object.prototype.hasOwnProperty.call(
+        results,
+        "console",
+      )
+        ? results.console
+        : null;
+      const consoleFailed =
+        consoleEntry !== null && consoleEntry.error !== undefined;
+      const consoleReconciled =
+        !consoleFailed &&
+        consoleEntry !== null &&
+        (consoleEntry.added !== undefined ||
+          consoleEntry.removed !== undefined ||
+          consoleEntry.updated !== undefined);
+      const nodeCount =
+        consoleEntry !== null ? nodeIds.length - 1 : nodeIds.length;
+      let msg =
+        nodeCount === 0 && consoleReconciled
+          ? "Reload sent to console"
+          : "Reload sent to " +
+            nodeCount +
+            " node(s)" +
+            (consoleReconciled ? " + console" : "");
       if (totalAdded) msg += ", +" + totalAdded + " added";
       if (totalRemoved) msg += ", -" + totalRemoved + " removed";
+      if (consoleFailed) msg += "; console reload failed";
       showToast(msg);
       _clearMcpSyncPending();
       setTimeout(loadAdminMcp, 1500);

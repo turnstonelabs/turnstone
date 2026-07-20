@@ -19,6 +19,7 @@ import pytest
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
 _INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/interactive.js"
+_MCP_ERROR_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/mcp_error.js"
 _SHELL_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/shell.js"
 _REDACT_CREDENTIALS_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/shared_static/redact_credentials.js"
@@ -433,20 +434,27 @@ _UNSAFE_CODE_SINK_RE = re.compile(
 
 def test_phase8_mcp_error_helpers_defined() -> None:
     """``tryParseMcpError`` (envelope detector) + ``buildMcpErrorEmbed``
-    (interactive consent / forbidden / operator card) moved into the shared
-    interactive module with the Pane.  The consent-badge state
-    (``_pendingConsentServers`` / ``_onConsentDetected``) stays in the
-    standalone shell — it drives the rail's Manage-row badge — and the pane
-    reaches it through the ``host.onConsentDetected`` seam.  The shared host
-    bridges that seam to the standalone via ``window.TS_APP.onConsentDetected``
-    (undefined on the console, so it stays a no-op there).  Pin both halves and
+    (consent / forbidden / operator card) live in the shared ``mcp_error.js``
+    module — lifted out of interactive.js by #725 so BOTH conversation
+    surfaces render the same card: the interactive pane AND the coordinator
+    pane (whose sessions carry the same MCP surface, persona-gated).
+    The consent-badge state (``_pendingConsentServers`` /
+    ``_onConsentDetected``) stays in the standalone shell — it drives the
+    rail's Manage-row badge — and the pane reaches it through the
+    ``host.onConsentDetected`` seam.  The shared host bridges that seam to the
+    standalone via ``window.TS_APP.onConsentDetected`` (undefined on the
+    console, so it stays a no-op there).  Pin the module, both consumers, and
     the bridge."""
-    inter = _INTERACTIVE_JS.read_text(encoding="utf-8")
-    assert "function tryParseMcpError" in inter
-    assert "function buildMcpErrorEmbed" in inter
+    mod = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    assert "function tryParseMcpError" in mod
+    assert "function buildMcpErrorEmbed" in mod
     # The actionable branch surfaces consent via the THREADED callback, not a
     # direct shell call — that decoupling is what lets the console no-op it.
-    assert "if (onConsent) onConsent(err.server)" in inter
+    assert "if (onConsent) onConsent(err.server)" in mod
+    inter = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    assert 'from "./mcp_error.js"' in inter, (
+        "the interactive pane must consume the shared MCP error module"
+    )
     assert "onConsentDetected(s)" in inter, (
         "the pane must notify consent through host.onConsentDetected"
     )
@@ -454,6 +462,15 @@ def test_phase8_mcp_error_helpers_defined() -> None:
     # detected, so the console — which never defines the hook — no-ops).
     assert "window.TS_APP.onConsentDetected(server)" in inter, (
         "the shared interactive host must bridge onConsentDetected to the TS_APP seam"
+    )
+    # The coordinator pane is the second consumer (#725): a coordinator MCP
+    # dispatch hitting consent-required must render the card, not raw JSON.
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    assert '"/shared/mcp_error.js"' in coord, (
+        "the coordinator pane must import the shared MCP error module (#725)"
+    )
+    assert "tryParseMcpError(" in coord and "buildMcpErrorEmbed(" in coord, (
+        "the coordinator pane must dispatch structured MCP errors to the shared card"
     )
     app = _APP_JS.read_text(encoding="utf-8")
     assert "_pendingConsentServers" in app
@@ -570,6 +587,7 @@ _UNSAFE_CODE_SINK_LINT_TARGETS = [
     ("turnstone/shared_static/utils.js", _UTILS_JS),
     ("turnstone/shared_static/auth.js", _AUTH_JS),
     ("turnstone/shared_static/kb.js", _KB_JS),
+    ("turnstone/shared_static/mcp_error.js", _MCP_ERROR_JS),
     ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
     ("turnstone/console/static/admin.js", _CONSOLE_ADMIN_JS),
     ("turnstone/console/static/governance.js", _CONSOLE_GOVERNANCE_JS),
@@ -860,7 +878,7 @@ def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
     scopes list. The card builder uses createElement + textContent
     throughout so a script-tag server name renders harmlessly. Pin
     the absence of the unsafe-write inside ``buildMcpErrorEmbed``."""
-    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
     start = body.index("function buildMcpErrorEmbed(")
     # Bound to the function body — find its closing brace at column 0.
     rest = body[start:]
@@ -883,7 +901,7 @@ def test_mcp_error_button_gated_on_consent_url_not_code_alone() -> None:
     obo rows) produced a button that dead-ended in a 'no consent URL' toast.
     The button must render only when a valid per-server consent URL is present —
     obo errors show the card's honest detail text without a broken affordance."""
-    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
     start = body.index("function buildMcpErrorEmbed(")
     rest = body[start:]
     end_match = re.search(r"\n}\n", rest)
@@ -939,7 +957,7 @@ def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
     string and the ``startsWith`` form so a future refactor can't
     silently weaken the guard.
     """
-    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
     # Bound the search to the click handler region (between the
     # ``buildMcpErrorEmbed`` function and the next top-level helper) to
     # avoid false positives from unrelated string occurrences.
@@ -2879,3 +2897,133 @@ def test_projects_personas_keep_public_surface_on_factory() -> None:
         "onPersonasChange",
     ):
         assert f"function {name}(" in persona, f"personas.js must still export {name}"
+
+
+_MCP_ERROR_CSS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/mcp_error.css"
+
+# The categories _mcpErrorCategory can return that carry their own CSS —
+# buildMcpErrorEmbed's interpolated `"mcp-error-" + category` class expands
+# to these plus "actionable", which is deliberately unstyled (the base card
+# look IS the actionable look: accent icon + Connect button).
+_MCP_ERROR_STYLED_CATEGORIES = ("operator", "transient", "forbidden")
+
+
+def test_mcp_error_css_owns_every_card_class() -> None:
+    """Every class mcp_error.js assigns has a rule in mcp_error.css.
+
+    The dual-static reach class (#725 review round 1: the standalone
+    coordinator page rendered the consent card bare because the card's
+    rules lived only in a host sheet it never linked).  The sheet pairs
+    with the module and every card host links it; this pin makes the
+    invariant structural — add a class to the card and this fails until
+    mcp_error.css owns it."""
+    js = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    css = _MCP_ERROR_CSS.read_text(encoding="utf-8")
+    tokens: set[str] = set()
+    for assignment in re.findall(r'className\s*=\s*"([^"]+)"', js):
+        for tok in assignment.split():
+            if tok.endswith("-"):
+                # Interpolated category suffix ("mcp-error-" + category).
+                tokens.update(tok + cat for cat in _MCP_ERROR_STYLED_CATEGORIES)
+            else:
+                tokens.add(tok)
+    assert "mcp-error-card" in tokens, "class extractor found nothing — regex rotted?"
+    missing = sorted(t for t in tokens if ("." + t) not in css)
+    assert not missing, f"mcp_error.css lacks rules for: {missing}"
+
+
+def test_mcp_error_css_linked_by_every_card_host() -> None:
+    """Every page that renders the MCP error card links its sheet — the
+    other half of the reach invariant (a future host that imports
+    mcp_error.js without the stylesheet regresses to bare markup)."""
+    root = Path(__file__).resolve().parent.parent
+    hosts = (
+        root / "turnstone/console/static/coordinator/index.html",
+        root / "turnstone/console/static/index.html",
+        root / "turnstone/ui/static/index.html",
+    )
+    for host in hosts:
+        html = host.read_text(encoding="utf-8")
+        assert "/shared/mcp_error.css" in html, f"{host.name} must link /shared/mcp_error.css"
+
+
+def test_console_consent_badge_seam() -> None:
+    """#874 badge half, console side: the console defines the same
+    TS_APP.onConsentDetected seam the node dashboard does (which the shared
+    pane host bridges interactive panes' detections to), hydrates from the
+    Phase 9 persistence endpoint at boot, and badges the Admin > MCP
+    Servers rail row through the shell bridge."""
+    js = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert "window.TS_APP.onConsentDetected" in js
+    assert '"/v1/api/mcp/oauth/pending"' in js
+    assert 'setRowBadge("mcp"' in js
+    assert "window.TS_APP.syncConsentBadge" in js
+
+
+def test_admin_mcp_panel_resyncs_consent_badge() -> None:
+    """The admin MCP panel re-syncs the badge to DB truth AFTER a
+    successful render (node Connections-flow semantics) — and only then:
+    a failed load keeps the pending signal.  The order is asserted inside
+    loadAdminMcp's body (a whole-file check would bind to unrelated
+    earlier .catch( sites and false-pass a move into the failure path)."""
+    js = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    body = js[js.index("function loadAdminMcp(") :]
+    body = body[: body.index("\nfunction ")]
+    assert (
+        body.index("_renderMcpServers(") < body.index("syncConsentBadge") < body.index(".catch(")
+    ), "syncConsentBadge must sit in loadAdminMcp's success path, after the render"
+
+
+def test_coordinator_pane_threads_consent_detection() -> None:
+    """#874 badge half, coordinator side: the single MCP-error helper
+    passes the consent callback to the card builder (both result paths get
+    detection), forwarding to the L-shell seam and the standalone
+    status-bar chip."""
+    js = _COORD_JS.read_text(encoding="utf-8")
+    assert "buildMcpErrorEmbed(mcpErr, output, _notifyConsentDetected)" in js
+    assert "onConsentDetected" in js
+    assert "coord-sb-consent" in js
+    # The chip is standalone-only chrome; the L-shell pane relies on the
+    # rail badge.
+    assert "opts.standalone" in js
+
+
+def test_consent_badge_visibility_resync_pins() -> None:
+    """#874 self-heal: both consent surfaces re-pull server truth on the
+    visibility-show edge (the consent popup is noopener — no cross-window
+    channel exists), with merge-on-success semantics: the mirrors diff
+    against a preFetch snapshot so a detection landing mid-fetch survives
+    and a failed fetch never blanks a possibly-valid warning.  A blind
+    clear()-then-refill would clobber mid-fetch adds — the preFetch
+    marker is the pin against that regression."""
+    app = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert 'document.addEventListener("visibilitychange"' in app
+    assert "_resyncPendingConsents" in app
+    assert app.count("preFetch") >= 2
+    # Single-flight: overlapping fetches can resolve out of order and no
+    # ordering guard covers every interleaving (stale clobber, failure
+    # suppression, phantom re-adds) — exclusion plus one queued rerun is
+    # the pinned shape, with a bounded flight so a stalled fetch cannot
+    # wedge the gate shut.  The timeout signal is feature-detected (old
+    # runtimes, per the codebase's AbortController guards) so it can
+    # never throw the gate wedged.
+    assert "_resyncInFlight" in app
+    assert "_resyncQueued" in app
+    assert app.count("AbortSignal.timeout") >= 2  # guard + use
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    assert 'document.addEventListener("visibilitychange"' in coord
+    assert coord.count("preFetch") >= 2
+    assert "hydrateInFlight" in coord
+    assert "hydrateQueued" in coord
+    assert coord.count("AbortSignal.timeout") >= 2  # guard + use
+
+
+def test_reload_toast_console_phrasing_pins() -> None:
+    """Reload-toast truth table (#725): a node-less install reads
+    'Reload sent to console' instead of '0 node(s) + console'; a failed
+    console entry appends its explicit note; and failed beats reconciled
+    if a malformed entry ever carries both shapes."""
+    js = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    assert '"Reload sent to console"' in js
+    assert '"; console reload failed"' in js
+    assert "!consoleFailed &&" in js

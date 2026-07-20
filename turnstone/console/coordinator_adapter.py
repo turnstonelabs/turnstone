@@ -294,8 +294,10 @@ class CoordinatorAdapter:
         prefix (``/high``, ``/urgent``, etc.) by :meth:`ChatSession.queue_message`.
 
         ``acting_user_id`` is the authenticated sender. On a fresh turn it is
-        bound as the coordinator's acting user (so per-participant MCP creds and
-        the state_change acting-user signal work once coordinator MCP lands);
+        bound as the coordinator's acting user — with coordinator MCP enabled
+        (#725) this re-scopes the session's MCP listeners and primes the
+        sender's per-user pools, so each participant dispatches against their
+        OWN credentials, and it drives the state_change acting-user signal;
         on a mid-turn interjection it is passed to ``queue_message``, which
         rejects a DIFFERENT participant (:class:`CrossUserInterjectionError`) —
         the same cross-user protection the interactive surface has. Empty on

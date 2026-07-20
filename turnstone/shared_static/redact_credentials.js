@@ -211,3 +211,18 @@ export function redactCredentials(text) {
 
   return result;
 }
+
+// Pretty-print JSON WITH redaction — the sanctioned way to render a raw
+// JSON payload for display (interactive.js raw-payload views, the shared
+// MCP error card).  Lives here, next to the redaction it wraps, so a
+// future caller cannot pretty-print without redacting.  Returns null for
+// non-JSON input; callers fall back to redactCredentials(text) directly.
+export function tryPrettyJson(text) {
+  let obj;
+  try {
+    obj = JSON.parse(text);
+  } catch (e) {
+    return null;
+  }
+  return redactCredentials(JSON.stringify(obj, null, 2));
+}

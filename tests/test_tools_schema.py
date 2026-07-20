@@ -60,7 +60,8 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        # 19 interactive tools + 12 coordinator-only tools.
+        # 31 tool files total: 12 coordinator-only + the rest interactive,
+        # with memory/skills/notify/read_resource/use_prompt dual-kind.
         assert len(TOOLS) == 31
 
     def test_task_agent_tools_count(self):
@@ -69,7 +70,7 @@ class TestToolsMetadata:
     def test_coordinator_tools_count(self):
         from turnstone.core.tools import COORDINATOR_TOOLS
 
-        assert len(COORDINATOR_TOOLS) == 15
+        assert len(COORDINATOR_TOOLS) == 17
         assert {t["function"]["name"] for t in COORDINATOR_TOOLS} == {
             "spawn_workstream",
             "spawn_batch",
@@ -99,6 +100,15 @@ class TestToolsMetadata:
             # failed, phase done) without spawning a child purely to
             # ship a message.  Routing logic is session-kind-agnostic.
             "notify",
+            # ``read_resource``/``use_prompt`` are dual-kind (#725):
+            # coordinators get the full MCP surface — tools, resources,
+            # prompts — persona-gated like every session.  The catalog
+            # blocks in the system prompt and the name-keyed dispatch
+            # light up together with these schemas; both tools keep
+            # auto_approve:false, so coordinator calls prompt like any
+            # other MCP-backed action.
+            "read_resource",
+            "use_prompt",
         }
 
     def test_auto_approve_sets_match(self):

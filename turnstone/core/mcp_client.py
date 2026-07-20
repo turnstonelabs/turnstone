@@ -9088,7 +9088,15 @@ def create_mcp_client(
 ) -> MCPClientManager | None:
     """Create and start an MCP client manager.
 
-    Returns *None* if no servers are configured.
+    Returns *None* if nothing is configured — no static servers from any
+    source AND no pool-backed (``oauth_user``/``oauth_obo``) DB rows.
+    Pool-backed rows alone construct an empty-config manager: their
+    connections form lazily per user, so they contribute nothing to the
+    static *servers* dict, but the host still needs a running manager
+    for those pools to form on.  (Returning None here for pool-only
+    installs left the host managerless after every restart — no pools,
+    no MCP — until the next admin MCP write or reload fan-out happened
+    to lazy-construct one.)
     """
     # Check DB first to know which servers are DB-managed
     db_names: set[str] = set()
@@ -9107,7 +9115,7 @@ def create_mcp_client(
             log.warning("Failed to load DB-managed MCP servers", exc_info=True)
 
     servers = load_mcp_config(config_path, storage=storage)
-    if not servers:
+    if not servers and not oauth_user_names and not obo_names:
         return None
 
     mgr = MCPClientManager(servers)

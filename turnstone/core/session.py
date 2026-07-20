@@ -1438,7 +1438,10 @@ class ChatSession:
         self.model = model
         # Coordinator plumbing: populated by the console's session factory
         # only — ``kind == COORDINATOR`` sessions run COORDINATOR_TOOLS
-        # and dispatch tool execs through ``coord_client``.
+        # (plus a merged MCP surface when the factory passes an
+        # ``mcp_client``, #725) and dispatch their BUILTIN tool execs
+        # through ``coord_client``; MCP tools dispatch in-process via
+        # ``_prepare_mcp_tool``/``call_tool_sync`` like every other kind.
         self._kind = kind
         self._parent_ws_id = parent_ws_id if parent_ws_id else None
         self._coord_client: Any = coord_client
@@ -1768,17 +1771,16 @@ class ChatSession:
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
         self._mcp_resource_cb: Any = None
         self._mcp_prompt_cb: Any = None
-        # Tool-set selection is kind-aware:
-        #   * coordinator — fixed COORDINATOR_TOOLS, no MCP surface.
-        #     Coordinators are meta-orchestrators that spawn child
-        #     workstreams; MCP tools / resources / prompts live on the
-        #     children.  Giving the coordinator direct MCP access
-        #     defeats the child-spawning pattern, so we don't merge
-        #     MCP tools and don't register MCP listeners either.
-        #   * interactive + mcp — INTERACTIVE_TOOLS ∪ mcp tools; MCP
-        #     listeners register so tool/resource/prompt refreshes flow
-        #     through to this session.
-        #   * interactive (no mcp) — INTERACTIVE_TOOLS.
+        # Tool-set selection is kind-aware in the BASE only (see
+        # _set_session_tools):
+        #   * coordinator — COORDINATOR_TOOLS base; with an mcp_client
+        #     (the console factory passes the live console manager,
+        #     #725) the MCP surface merges additively and the SAME
+        #     listener/prime skeleton as interactive runs below.  Client
+        #     presence IS the session-level contract — the console
+        #     counterpart of a node session holding mcp_ref[0].
+        #   * interactive — INTERACTIVE_TOOLS ∪ mcp tools when a client
+        #     is present; plain INTERACTIVE_TOOLS otherwise.
         # Unconditional — every session kind carries the counter, so its
         # existence never encodes "MCP was wired at construction" (a
         # late-bound client or a directly-invoked callback must not
@@ -1789,13 +1791,7 @@ class ChatSession:
         # value at the authoritative merged read, compared once at the
         # end of tool setup. Only ``_mcp_tools_change_seq`` lives on.
         mcp_tools_seq_at_read = 0
-        if kind == WorkstreamKind.COORDINATOR:
-            # No _set_interactive_tools/_apply_cwd_notes: COORDINATOR_TOOLS
-            # holds no cwd-dependent tool (no fs/shell), so there is nothing
-            # to render.
-            self._tools = list(COORDINATOR_TOOLS)
-            self._task_tools: list[dict[str, Any]] = []
-        elif self._mcp_client:
+        if self._mcp_client:
             # ``self._mcp_client`` (not the raw kwarg) so an MCP-off persona
             # falls through to the no-MCP branch below.
             # Constants first — the attributes must exist for a listener
@@ -1803,7 +1799,7 @@ class ChatSession:
             # merged read runs after the registrations below.  (Also warms
             # the get_workspace_dir config cache on the main thread, before
             # any background-thread rebuild can race the first load.)
-            self._set_interactive_tools([])
+            self._set_session_tools([])
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
@@ -1832,7 +1828,7 @@ class ChatSession:
             # the tool-search construction below reading mixed state.
             mcp_tools_seq_at_read = self._mcp_tools_change_seq
             mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-            self._set_interactive_tools(mcp_tools)
+            self._set_session_tools(mcp_tools)
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
@@ -1841,7 +1837,7 @@ class ChatSession:
             # consented oauth_user servers.
             try_prime_user_pools(self._mcp_client, self._mcp_user_id, context="session-start")
         else:
-            self._set_interactive_tools([])
+            self._set_session_tools([])
         # Inject the live alias list into the task_agent tool
         # description so the calling LLM sees its `model` parameter options.
         # Replaces affected tool dicts with deep copies — module-level
@@ -1893,11 +1889,7 @@ class ChatSession:
         # dependency now exists, so re-running the full callback is
         # safe — it rebuilds the merged lists, rendered descriptions,
         # and search index from the CURRENT maps.
-        if (
-            self._kind != WorkstreamKind.COORDINATOR
-            and self._mcp_client
-            and self._mcp_tools_change_seq != mcp_tools_seq_at_read
-        ):
+        if self._mcp_client and self._mcp_tools_change_seq != mcp_tools_seq_at_read:
             self._on_mcp_tools_changed()
         # Skill: explicit name overrides is_default skills.  ``skill_arguments``
         # carries the spec's $ARGUMENTS payload — set at create/load time,
@@ -2587,10 +2579,6 @@ class ChatSession:
         """
         if not self._mcp_client:
             return
-        # Coordinator sessions don't consume MCP tools — the tool set
-        # is fixed at COORDINATOR_TOOLS.  Ignore MCP server changes.
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return
         # Monotonic change marker: the constructor snapshots this around
         # its authoritative post-registration read and re-runs this
         # callback if it advanced — otherwise a notification landing
@@ -2603,7 +2591,7 @@ class ChatSession:
         # regardless; ``user_id=None`` would silently drop pool tools
         # that the LLM is allowed to call.
         mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_effective_user_id)
-        self._set_interactive_tools(mcp_tools)
+        self._set_session_tools(mcp_tools)
         self._render_agent_tool_descriptions()
         self._rebuild_tool_search()
 
@@ -2656,24 +2644,38 @@ class ChatSession:
             parts.append(entry)
         return "Available personas: " + "; ".join(parts) + "."
 
-    def _set_interactive_tools(self, mcp_tools: list[dict[str, Any]]) -> None:
-        """Build both interactive tool lanes from pristine bases + MCP catalog.
+    def _set_session_tools(self, mcp_tools: list[dict[str, Any]]) -> None:
+        """Build this session's tool lanes from pristine bases + MCP catalog.
 
-        THE single assignment path for every fresh interactive build of
-        ``self._tools`` AND ``self._task_tools`` — each lane routes through
-        ``_apply_cwd_notes`` here, so a future rebuild site cannot silently
-        drop the working-dir/workspace notes by assigning from the module
-        constants directly.  Pass ``[]`` when there is no MCP surface
-        (construction pre-read, MCP-off, disconnect): ``merge_mcp_tools``
-        with an empty list is just a fresh copy of the builtin base.
+        THE single assignment path for every fresh build of ``self._tools``
+        AND ``self._task_tools`` — kind-aware in the BASE only, so every
+        rebuild site (construction pre-read, authoritative read, catalog
+        change, MCP drop) and any future one is kind-correct by
+        construction rather than by remembering a guard:
+
+        * coordinator — ``merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools)``;
+          no cwd notes (no cwd-dependent tool in the base, and MCP tools
+          never carry one) and no task-agent lane.
+        * interactive — both lanes route through ``_apply_cwd_notes`` so a
+          rebuild cannot silently drop the working-dir/workspace notes by
+          assigning from the module constants directly.
+
+        Pass ``[]`` when there is no MCP surface (construction pre-read,
+        MCP-off, disconnect): ``merge_mcp_tools`` with an empty list is a
+        fresh copy of the builtin base, so the no-client and drop paths
+        reproduce the fixed kind base verbatim.
         """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            self._tools = merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools)
+            self._task_tools: list[dict[str, Any]] = []
+            return
         self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools))
         self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools))
 
     def _apply_cwd_notes(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Render per-process working-dir/workspace notes into fs-tool descriptions.
 
-        Reached via ``_set_interactive_tools``, which routes BOTH lanes
+        Reached via ``_set_session_tools`` (interactive lane), which routes BOTH lanes
         (``self._tools`` and the separate ``self._task_tools`` sub-agent
         list) through here at every fresh interactive build.  Applied at
         assignment time, so the copy cost is paid per rebuild (construction,
@@ -2685,8 +2687,9 @@ class ChatSession:
         ``_render_agent_tool_descriptions`` re-derive is NOT a fresh build
         and must not re-apply: it deep-copies only the persona/model
         param-description tools, passing fs tools (and these notes) through
-        untouched.  Coordinator builds skip all of this — COORDINATOR_TOOLS
-        holds no cwd-dependent tool.
+        untouched.  Coordinator builds never reach here — their
+        ``_set_session_tools`` lane skips notes (COORDINATOR_TOOLS holds no
+        cwd-dependent tool, and MCP tools never carry one).
 
         ``os.getcwd()`` is what a cwd-less Popen inherits (spawn_group_leader)
         and what relative file-tool paths resolve against, so the note names
@@ -3154,8 +3157,10 @@ class ChatSession:
         adopting an MCP-off stamp.  Deregisters the three listeners (same
         ``_mcp_listener_user_id`` identity rule as ``close()``), drops the
         client reference, and resets both toolsets to the builtin lists.
-        Only reachable on interactive sessions — coordinators never hold a
-        client.  The caller rebuilds tool search and recomposes the prompt.
+        Reachable on BOTH kinds (#725): a coordinator resume() can adopt an
+        MCP-off stamp too — the kind-aware ``_set_session_tools`` resets it
+        to COORDINATOR_TOOLS, never the interactive lanes.  The caller
+        rebuilds tool search and recomposes the prompt.
         """
         if self._mcp_client is None:
             return
@@ -3175,7 +3180,7 @@ class ChatSession:
             )
             self._mcp_prompt_cb = None
         self._mcp_client = None
-        self._set_interactive_tools([])
+        self._set_session_tools([])
         self._render_agent_tool_descriptions()
 
     def _handle_mcp_refresh(self, arg: str) -> None:
@@ -5919,7 +5924,13 @@ class ChatSession:
             return
         self._acting_user_id = user_id
         mcp = self._mcp_client
-        if not mcp or self._kind == WorkstreamKind.COORDINATOR:
+        # Coordinators participate fully (#725): they are multi-sender by
+        # design (any admin.coordinator operator with project visibility
+        # may drive one — ownership is not enforced), so an acting-user
+        # change MUST re-scope the listeners and prime the new user's
+        # pools below; otherwise operator B would dispatch against
+        # operator A's primed pool catalog.
+        if not mcp:
             return
         old_listener_uid = self._mcp_listener_user_id
         new_listener_uid: str | None = self._mcp_effective_user_id
@@ -5939,10 +5950,17 @@ class ChatSession:
         # state under the new identity NOW — the prime above completes
         # asynchronously and only notifies on catalog changes, while
         # already-warm pool entries for this user produce no
-        # notification at all.
+        # notification at all.  ONE _init_system_messages() covers both
+        # the resource and prompt catalogs: the _on_mcp_resources_changed
+        # / _on_mcp_prompts_changed wrappers are pure passthroughs to it
+        # (they exist for the manager's separate notification channels,
+        # which still fire them independently), and it rebuilds the full
+        # system message copy-on-write — calling it twice per handoff was
+        # a redundant list_prompt_policies() read + compose per rebind.
+        # The persona-catalog read inside the tools rebuild stays as-is:
+        # sender-independent but handoff-frequency, not worth memoizing.
         self._on_mcp_tools_changed()
-        self._on_mcp_resources_changed()
-        self._on_mcp_prompts_changed()
+        self._init_system_messages()
 
     def send(
         self,

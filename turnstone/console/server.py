@@ -5121,6 +5121,9 @@ def _bootstrap_coord_subsystem(
         config_store=config_store,
         node_id="console",
         coord_client_factory=_coord_client_factory,
+        # Getter, not the instance: the console MCP ensure-helper can
+        # (re)construct the manager after this bootstrap (#725).
+        mcp_client_getter=lambda: getattr(app.state, "mcp_client", None),
     )
     coord_adapter = CoordinatorAdapter(
         collector=app.state.collector,
@@ -5579,6 +5582,28 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         # ``asyncio.to_thread`` invocation.
         await asyncio.to_thread(_load_and_bootstrap_coord_subsystem, app, storage, config_store)
 
+    # Console-hosted MCP client manager for coordinator workstreams
+    # (#725) — node-boot parity: same constructor, same catalog
+    # resolution (DB → mcp.config_path → config.toml), same bounded
+    # inline connect wait, None when nothing is configured.  Later
+    # convergence rides the reload fan-out (_ensure_console_mcp_client).
+    app.state.mcp_client = None
+    if storage and config_store:
+        from turnstone.core.mcp_client import create_mcp_client
+
+        try:
+            app.state.mcp_client = await asyncio.to_thread(
+                create_mcp_client,
+                config_store.get("mcp.config_path") or None,
+                storage=storage,
+            )
+        except Exception:
+            log.warning(
+                "console MCP manager boot failed — coordinators get no MCP "
+                "until the next admin MCP write or reload",
+                exc_info=True,
+            )
+
     yield
     # Shutdown
     if _console_heartbeat_task is not None:
@@ -5633,6 +5658,20 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         log.debug("console.coord_ui_refs_reset_failed", exc_info=True)
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
+    # Console-hosted MCP manager: coordinator sessions stay LOADED at
+    # console shutdown (there is no session-close loop here, unlike the
+    # node), so their MCP listeners are intentionally still registered
+    # when the manager dies — acceptable because the process is exiting
+    # and the manager's listener fan-out swallows per-callback
+    # exceptions.  shutdown() blocks (mcp-loop join + transport
+    # teardown), so offload like coord_state_writer above.  Ordered
+    # before close_mcp_oauth_state per LIFO teardown.
+    _console_mcp_shutdown = getattr(app.state, "mcp_client", None)
+    if _console_mcp_shutdown is not None:
+        try:
+            await asyncio.to_thread(_console_mcp_shutdown.shutdown)
+        except Exception:
+            log.debug("console.mcp_client_shutdown_failed", exc_info=True)
     # Close in reverse order of initialization (mcp_oauth → mcp_crypto →
     # oidc) per LIFO teardown discipline.
     from turnstone.core.mcp_oauth import close_mcp_oauth_state
@@ -10233,7 +10272,15 @@ def _mcp_server_to_detail(
 async def _collect_mcp_status(
     request: Request,
 ) -> dict[str, dict[str, dict[str, Any]]]:
-    """Query all nodes for MCP status. Returns {node_id: {server_name: status}}."""
+    """Query all nodes — and the console's own manager — for MCP status.
+
+    Returns {node_id: {server_name: status}}.  The console's manager
+    reports under the collector's console pseudo-node id (#725): the
+    admin MCP view must show the surface coordinators actually dispatch
+    through.  Its rows carry the same read-scope projection node rows
+    get (``has_error``, no command/url/verbose error); on failure the
+    console key is omitted, matching ``_fetch``'s None contract.
+    """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
     client: httpx.AsyncClient = request.app.state.proxy_client
@@ -10258,7 +10305,31 @@ async def _collect_mcp_status(
                 log.debug("Failed to fetch MCP status from node %s", node_id, exc_info=True)
         return node_id, None
 
-    results = await asyncio.gather(*[_fetch(n) for n in nodes])
+    async def _console() -> tuple[str, dict[str, dict[str, Any]] | None]:
+        # Class constant, not the collector instance: several callers
+        # exercise this collector with minimal stubs, and the pseudo-node
+        # key must not depend on runtime state they never provided.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        mgr = getattr(request.app.state, "mcp_client", None)
+        if mgr is None:
+            return console_id, None
+        from turnstone.core.mcp_utils import strip_server_status_for_read
+
+        # Mirrors internal_mcp_status's admin path: cross-user aggregate
+        # view scoped to the requesting admin.
+        uid = _auth_user_id(request)
+
+        def _status() -> dict[str, dict[str, Any]]:
+            all_status = mgr.get_all_server_status(uid, aggregate=True)
+            return {n: strip_server_status_for_read(s) for n, s in all_status.items()}
+
+        try:
+            return console_id, await asyncio.to_thread(_status)
+        except Exception:
+            log.debug("console MCP status read failed", exc_info=True)
+            return console_id, None
+
+    results = await asyncio.gather(*[_fetch(n) for n in nodes], _console())
     return {nid: servers for nid, servers in results if servers is not None}
 
 
@@ -10951,6 +11022,60 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"}, background=_schedule_mcp_reload(request))
 
 
+# Guards concurrent construction of the console's own MCP client manager
+# (lifespan boot racing an admin-write fan-out, or two rapid fan-outs
+# while ``app.state.mcp_client`` is still None).  Two winners would each
+# start an mcp-loop daemon thread and a static connection set; the second
+# assignment clobbers the first ref and the loser leaks both forever.
+# The node's ``internal_mcp_reload`` lazy-construct carries exactly this
+# latent race (turnstone/server.py internal_mcp_reload) — the console
+# does not replicate it.  Same shape as ``_COORD_BOOTSTRAP_LOCK``.
+_CONSOLE_MCP_ENSURE_LOCK = threading.Lock()
+
+
+def _ensure_console_mcp_client(app: Any) -> dict[str, Any]:
+    """Reconcile — and lazily construct — the console's own MCP client manager.
+
+    The console hosts an ``MCPClientManager`` so coordinator-kind
+    workstreams get an MCP tool surface (#725).  Node parity throughout:
+    construction goes through ``create_mcp_client`` — the same catalog
+    resolution as a node host (DB rows, then ``mcp.config_path``, then
+    this host's config.toml; ``None`` when nothing is configured) — and
+    the reconcile arm runs whenever a manager exists, so running
+    coordinators track admin edits exactly like node sessions do.
+
+    This is the ONE lazy-construct/reconcile path for every post-boot
+    trigger — the admin-write reload fan-out and the operator
+    ``POST /reload`` — mirroring the node's ``internal_mcp_reload``.
+    Unlike the node's arm, the body holds a lock: two concurrent
+    triggers on a managerless console must not double-construct (the
+    node's unlocked equivalent is issue #873).
+
+    Plain SYNC function: construction connects to static servers and
+    ``reconcile_sync`` performs bounded sync waits, so every caller
+    (all async) MUST invoke via ``asyncio.to_thread``.
+
+    Returns a reconcile-shaped dict (``added``/``removed``/``updated``,
+    or ``skipped``) so the operator reload view reports the console
+    alongside the nodes.
+    """
+    with _CONSOLE_MCP_ENSURE_LOCK:
+        storage = getattr(app.state, "auth_storage", None)
+        if storage is None:
+            return {"skipped": "storage not initialized"}
+        mgr = getattr(app.state, "mcp_client", None)
+        if mgr is None:
+            from turnstone.core.mcp_client import create_mcp_client
+
+            cs = getattr(app.state, "config_store", None)
+            cfg_path = cs.get("mcp.config_path") if cs is not None else None
+            mgr = create_mcp_client(cfg_path or None, storage=storage)
+            if mgr is None:
+                return {"skipped": "no MCP servers configured"}
+            app.state.mcp_client = mgr
+        return mgr.reconcile_sync(storage)
+
+
 async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     """Tell all nodes to re-read the mcp_servers DB table and reconcile.
 
@@ -10986,7 +11111,33 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
                 log.debug("Failed to notify node %s for MCP reload", node_id, exc_info=True)
                 return node_id, {"error": str(exc)}
 
-    results = await asyncio.gather(*[_notify(n) for n in nodes])
+    async def _console() -> tuple[str, Any]:
+        # The console hosts its own MCP manager for coordinator sessions
+        # (#725) — ensure/reconcile it in the SAME gather as the node
+        # fan-out so EVERY producer (post-write background hooks and the
+        # operator POST /reload alike) covers it, and so the console's
+        # (up to ~30s) construct/connect work OVERLAPS the node HTTP
+        # window instead of stacking after it on the operator-inline
+        # reload path.  Keyed under the collector's console pseudo-node
+        # id: get_nodes hides that id from fan-out enumeration, so the
+        # key can neither collide with a real node nor self-HTTP.
+        # Deliberately OUTSIDE ``sem`` — that semaphore paces node POSTs,
+        # and a ~30s worker-thread hold would starve a slot.  Exceptions
+        # are caught HERE (the gather runs return_exceptions=False): a
+        # console failure must not abandon collected node results.  Class
+        # constant for the key, like the sibling arms: stub collectors
+        # may not carry the instance attr.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        try:
+            return (
+                console_id,
+                await asyncio.to_thread(_ensure_console_mcp_client, request.app),
+            )
+        except Exception as exc:
+            log.warning("console MCP self-reconcile failed", exc_info=True)
+            return console_id, {"error": str(exc)}
+
+    results = await asyncio.gather(*[_notify(n) for n in nodes], _console())
     return {nid: data for nid, data in results if data is not None}
 
 
@@ -11018,23 +11169,97 @@ def _schedule_mcp_reload(request: Request) -> BackgroundTask:
                 exc_info=True,
             )
             return
+        # The console's ensure entry rides the same results dict but is
+        # NOT a node: its failures are already logged with console
+        # wording at their production sites, and counting it here would
+        # both warn with node-remediation prose for a console-local
+        # failure and inflate the denominator (a node-less install with
+        # a console error would log "1 of 1 node(s)").  Class constant,
+        # not request.app.state.collector: the accounting must not
+        # depend on runtime state the (possibly patched) fan-out never
+        # touched.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        node_results = {nid: data for nid, data in results.items() if nid != console_id}
         unreached = sorted(
-            nid for nid, data in results.items() if isinstance(data, dict) and "error" in data
+            nid for nid, data in node_results.items() if isinstance(data, dict) and "error" in data
         )
         if unreached:
             log.warning(
                 "auto mcp-reload did not reach %d of %d node(s) after admin write "
                 "(stale MCP catalog until next reload): %s",
                 len(unreached),
-                len(results),
+                len(node_results),
                 ", ".join(unreached),
             )
 
     return BackgroundTask(_run)
 
 
+def _console_mcp_action_outcome(mgr: Any, action: str, name: str) -> dict[str, Any]:
+    """Run one per-server MCP action against the console's own manager.
+
+    COPY of the node endpoints' outcome classification
+    (``internal_mcp_refresh_one`` / ``internal_mcp_reconnect_one`` in
+    turnstone/server.py) minus the HTTP mapping — deliberately a copy,
+    not an extraction, so the node endpoint bodies stay untouched; the
+    equivalence is pinned by TestConsoleActionOutcomeParity in
+    tests/test_mcp_admin_api.py, which drives both sides with identical
+    managers and fails if either drifts.  See the node endpoints for the
+    full rationale comments (authoritative-outcome re-check;
+    error-beats-skip).
+
+    Sync + blocking (``refresh_sync``/``reconnect_sync`` park on manager
+    locks up to their caller timeouts) — call via ``asyncio.to_thread``.
+    """
+    from turnstone.core.mcp_utils import public_server_status
+
+    if action == "refresh":
+        try:
+            mgr.refresh_sync(server_name=name)
+        except Exception as exc:
+            log.warning("console MCP refresh failed for %s: %s", name, exc)
+            return {"status": "error", "error": "refresh failed"}
+        status = public_server_status(mgr, name)
+        if status.get("error"):
+            log.warning("console MCP refresh reported error for %s: %s", name, status["error"])
+            return {"status": "error", "error": "refresh failed", "server": status}
+        if mgr.last_refresh_outcome(name) == "skipped":
+            return {"status": "skipped", "server": status}
+        return {"status": "ok", "server": status}
+
+    try:
+        result = mgr.reconnect_sync(name)
+    except Exception as exc:
+        log.warning("console MCP reconnect failed for %s: %s", name, exc)
+        return {"status": "error", "error": "reconnect failed"}
+    if result.get("error"):
+        log.warning(
+            "console MCP reconnect reported error for %s: %s",
+            name,
+            result.get("error", ""),
+        )
+        return {
+            "status": "error",
+            "error": "reconnect failed",
+            "server": public_server_status(mgr, name),
+        }
+    return {"status": "ok", "server": public_server_status(mgr, name)}
+
+
 async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> dict[str, Any]:
-    """Tell all nodes to perform a per-server MCP action.
+    """Tell all nodes — and the console's own manager — to perform a per-server MCP action.
+
+    Console arm (#725): the console's manager serves coordinator
+    dispatch, so the operator's per-server recovery actions must reach
+    it like any node's — otherwise reconnecting a wedged server heals
+    every node while the surface coordinators actually dispatch through
+    stays wedged until a console restart.  The arm runs the pinned copy
+    of the node outcome classification (see
+    ``_console_mcp_action_outcome``), keyed under the collector's
+    console pseudo-node id, gated on manager PRESENCE (nothing here
+    reads settings — a live manager must stay operable).  Names the
+    console's catalog never carried (e.g. servers from a node's own
+    config file) report skipped, not error.
 
     *action* is the suffix of the internal endpoint — currently
     ``"refresh"`` or ``"reconnect"``.  Each node is hit at
@@ -11073,7 +11298,32 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
                 )
                 return node_id, {"error": str(exc)}
 
-    results = await asyncio.gather(*[_notify(n) for n in nodes])
+    def _console_action() -> dict[str, Any]:
+        # Sync body for the worker thread.
+        mgr = getattr(request.app.state, "mcp_client", None)
+        if mgr is None:
+            return {"skipped": "console MCP manager not running"}
+        # Membership via the public status API (covers static AND
+        # pool-backed names): a name only nodes know must skip, not
+        # error through reconnect_sync's "unknown server" arm.
+        if name not in mgr.get_all_server_status(None, aggregate=True):
+            return {"skipped": "not in console catalog"}
+        return _console_mcp_action_outcome(mgr, action, name)
+
+    async def _console() -> tuple[str, Any]:
+        # Gather sibling OUTSIDE ``sem`` (that semaphore paces node
+        # POSTs; a long worker-thread hold would starve a slot),
+        # self-caught so a console failure never abandons collected node
+        # results — mirroring the reload fan-out's console arm.  Class
+        # constant for the key: stub collectors may not carry the attr.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        try:
+            return console_id, await asyncio.to_thread(_console_action)
+        except Exception as exc:
+            log.warning("console MCP %s of %s failed", action, name, exc_info=True)
+            return console_id, {"error": str(exc)}
+
+    results = await asyncio.gather(*[_notify(n) for n in nodes], _console())
     return {nid: data for nid, data in results if data is not None}
 
 
@@ -11354,7 +11604,14 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
             ip,
         )
 
-    return JSONResponse({"imported": imported, "skipped": skipped, "errors": errors})
+    # Conditional like the audit record above: import is the one write
+    # whose 200 can mean zero row changes (every name already present) —
+    # fan out only when rows actually changed, matching the CRUD
+    # siblings' newly-written-row semantics.
+    return JSONResponse(
+        {"imported": imported, "skipped": skipped, "errors": errors},
+        background=_schedule_mcp_reload(request) if imported else None,
+    )
 
 
 # ---------------------------------------------------------------------------
