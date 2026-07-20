@@ -471,8 +471,9 @@ def ensure_project_attachable(
 
 # ---------------------------------------------------------------------------
 # server.require_project — opt-in, default-off gate refusing projectless
-# interactive creates. One predicate is the ONLY flag read (gate + advisory
-# both call it) so authoritative and advisory logic cannot drift.
+# creates on the gated mounts (interactive on nodes, coordinator on the
+# console). One predicate is the ONLY flag read (gate + advisory both call
+# it) so authoritative and advisory logic cannot drift.
 # ---------------------------------------------------------------------------
 
 # Discriminator on the node's 400 body. The console cluster-create proxy
@@ -504,16 +505,28 @@ def require_project_enabled(config_store: Any) -> bool:
 
 
 def require_project_denies_create(config_store: Any, auth: Any, project_id: Any) -> bool:
-    """Return True to REFUSE an interactive create under ``server.require_project``.
+    """Return True to REFUSE a gated create under ``server.require_project``.
 
-    Refuses only when the gate is on, the caller is not exempt automation, and
-    no project is attached (whitespace-only counts as none). Exempt identities:
-    the ``service`` scope (channel gateway, scheduler) and coordinator SESSION
-    spawns (``token_source == "coordinator"``). NOT exempt on any admin
-    permission — ``admin.coordinator`` is a human-operator permission and would
-    leak every operator through the gate. ``console-proxy`` (the normal proxied
-    human) is deliberately NOT exempt: it carries the human's own scopes, which
-    never include ``service``.
+    Serves both gated mounts: interactive creates on nodes and coordinator
+    creates on the console. Refuses only when the gate is on, the caller is
+    not exempt automation, and no project is attached. "No project" is read
+    the way the create path actually persists it: a non-string body value
+    (int / bool / list / dict) is coerced to absent — exactly as
+    ``_coord_create_build_kwargs`` and the interactive create do — so a
+    truthy non-string like ``project_id: 123`` cannot stringify past the
+    gate and mint a projectless session; whitespace-only counts as none too.
+    Exempt identities: the ``service`` scope (channel gateway,
+    scheduler) and the sessions a coordinator spawns
+    (``token_source == "coordinator"`` — minted per coordinator session for
+    its child spawns and sends; no current path lets that token CREATE a
+    coordinator, so the exemption is child-spawn-only in practice. If a
+    coordinator tool ever gains the ability to create coordinators, decide
+    then whether that path should stay exempt). NOT exempt on any admin
+    permission — ``admin.coordinator`` is a human-operator permission and
+    would leak every operator through the gate, including the console
+    coordinator launcher this gate now covers. ``console-proxy`` (the normal
+    proxied human) is deliberately NOT exempt: it carries the human's own
+    scopes, which never include ``service``.
     """
     if not require_project_enabled(config_store):
         return False
@@ -521,7 +534,7 @@ def require_project_denies_create(config_store: Any, auth: Any, project_id: Any)
         return False
     if getattr(auth, "token_source", "") == "coordinator":
         return False
-    return not str(project_id or "").strip()
+    return not (project_id if isinstance(project_id, str) else "").strip()
 
 
 def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:
