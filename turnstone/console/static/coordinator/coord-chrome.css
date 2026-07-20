@@ -556,3 +556,28 @@
     max-height: none;
   }
 }
+
+/* Standalone-page pending-consent chip (#874) — the rail-less page's
+   counterpart of the L-shell rail badge.  Rides the status bar next to
+   the token/tool/turn chips; hidden at zero via [hidden]. */
+.ws-sb-consent {
+  color: var(--yellow);
+  font-weight: 500;
+}
+
+/* Below ~440px the sentence-length chip is the only wrappable element in
+   the nowrap status bar and fragments across 2–4 lines; let it drop
+   intact onto its own full line instead.  Scoped to bars carrying the
+   chip (ws-sb-has-consent is set at chip mount) so the L-shell pane's
+   bar keeps its single-line behavior.  Plain nowrap without the wrap
+   rules would be worse: the bar is overflow:hidden, so the warning
+   would clip out of existence. */
+@media (max-width: 700px) {
+  .ws-status-bar.ws-sb-has-consent {
+    flex-wrap: wrap;
+  }
+  .ws-status-bar.ws-sb-has-consent .ws-sb-consent {
+    flex-basis: 100%;
+    white-space: nowrap;
+  }
+}

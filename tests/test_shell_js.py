@@ -51,6 +51,7 @@ _ESM_BUNDLES = [
     _SHARED / "conversation.js",
     _SHARED / "preview.js",
     _SHARED / "redact_credentials.js",
+    _SHARED / "mcp_error.js",
 ]
 
 # Sink scan: everything except renderer.js — the one sanctioned HTML-string
@@ -72,6 +73,7 @@ _ESM_NO_VAR_BUNDLES = [
     _SHARED / "conversation.js",
     _SHARED / "preview.js",
     _SHARED / "redact_credentials.js",
+    _SHARED / "mcp_error.js",
 ]
 
 # The same unsafe DOM-write / dynamic-code sink set that ``test_app_js.py``

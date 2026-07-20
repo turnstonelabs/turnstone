@@ -16,6 +16,8 @@
     },
     "required": ["name"]
   },
+  "coordinator": true,
+  "interactive": true,
   "task_agent": true,
   "auto_approve": false,
   "primary_key": "name"

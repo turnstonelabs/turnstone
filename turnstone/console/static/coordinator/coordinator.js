@@ -44,6 +44,7 @@ import {
   indexLabel,
 } from "/shared/conversation.js";
 import { redactCredentials } from "/shared/redact_credentials.js";
+import { tryParseMcpError, buildMcpErrorEmbed } from "/shared/mcp_error.js";
 import {
   createQueueController,
   parsePriority,
@@ -58,6 +59,145 @@ import {
   overflowWindowTripped,
   degradedCooldownStep,
 } from "/shared/sse_overflow.js";
+
+// Standalone-page pending-consent chip (#874): the rail-less coordinator
+// page's counterpart of the L-shell rail badge.  The pending set is
+// USER-scoped server truth (the Phase 9 mcp_oauth_pending table), not
+// per-workstream state — the wording says "awaiting consent", never "this
+// workstream".  Inert until mount() (the L-shell pane never mounts it; the
+// rail badge carries the signal there).
+const _consentChip = (function () {
+  const pending = new Set();
+  let chipEl = null;
+  function paint() {
+    if (!chipEl) return;
+    const n = pending.size;
+    chipEl.hidden = n === 0;
+    if (n > 0) {
+      // Glyph is aria-hidden so screen readers announce only the plain
+      // sentence (an aria-label on a role-less span is ignored by
+      // several of them, which then voice the raw glyph).
+      chipEl.textContent = "";
+      const glyph = document.createElement("span");
+      glyph.setAttribute("aria-hidden", "true");
+      glyph.textContent = "⚠ ";
+      chipEl.appendChild(glyph);
+      chipEl.appendChild(
+        document.createTextNode(
+          n + " MCP server" + (n === 1 ? "" : "s") + " awaiting consent",
+        ),
+      );
+    }
+  }
+  let hydrateInFlight = false;
+  let hydrateQueued = false;
+  function hydrate() {
+    // Merge-on-success: entries the server no longer lists are dropped
+    // ONLY if they predate this fetch (the preFetch snapshot) — a
+    // detection add()ed while the fetch was in flight survives, since
+    // its DB row may postdate the server's read.  A failed fetch
+    // changes nothing, so a possibly-valid warning is never blanked.
+    // Single-flight: overlapping hydrates (mount + rapid visibility
+    // edges) can resolve out of order, and every guard short of
+    // exclusion re-admits some interleaving; one flight at a time makes
+    // the class structurally impossible, and an edge firing mid-flight
+    // queues exactly one rerun so the freshest truth still lands.
+    if (hydrateInFlight) {
+      hydrateQueued = true;
+      return;
+    }
+    // Bounded flight: a stalled fetch would otherwise hold the gate
+    // shut forever (the .finally below never runs, freezing self-heal);
+    // on timeout the chain rejects → .catch → .finally clears the gate
+    // and drains any queued rerun.  Feature-detected like the
+    // codebase's AbortController guards — old runtimes just run
+    // unbounded, as before — and computed BEFORE the gate is set so no
+    // throw can wedge it (or escape mount()).
+    const signal =
+      typeof AbortSignal !== "undefined" && AbortSignal.timeout
+        ? AbortSignal.timeout(10000)
+        : undefined;
+    hydrateInFlight = true;
+    const preFetch = new Set(pending);
+    authFetch("/v1/api/mcp/oauth/pending", { signal: signal })
+      .then(function (r) {
+        return r.ok ? r.json() : null;
+      })
+      .then(function (data) {
+        if (!data || !Array.isArray(data.servers)) return;
+        const fetched = new Set();
+        for (let i = 0; i < data.servers.length; i++) {
+          const row = data.servers[i];
+          if (row && typeof row.server_name === "string") {
+            fetched.add(row.server_name);
+          }
+        }
+        preFetch.forEach(function (s) {
+          if (!fetched.has(s)) pending.delete(s);
+        });
+        fetched.forEach(function (s) {
+          pending.add(s);
+        });
+        paint();
+      })
+      .catch(function () {})
+      .finally(function () {
+        hydrateInFlight = false;
+        if (hydrateQueued) {
+          hydrateQueued = false;
+          hydrate();
+        }
+      });
+  }
+  return {
+    mount: function (elRef) {
+      chipEl = elRef;
+      paint();
+      // Hydrate so a consent wall hit while nobody watched still
+      // surfaces here...
+      hydrate();
+      // ...and self-heal after the popup: the consent flow opens
+      // noopener (no cross-window channel exists), and the user lands
+      // back on this tab right after finishing there — so re-pull server
+      // truth on every visibility-show edge.  mount() runs once per
+      // page, so this registers exactly one listener.
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible") hydrate();
+      });
+    },
+    add: function (server) {
+      if (typeof server === "string" && server) {
+        pending.add(server);
+        paint();
+      }
+    },
+  };
+})();
+
+// Consent-detection fan-out for the card's onConsent hook (#874): in the
+// L-shell the console app exposes the same window.TS_APP.onConsentDetected
+// seam the node dashboard does (driving the rail's MCP-row badge); the
+// standalone page mounts the status-bar chip instead.  Both are no-ops
+// when their surface is absent.
+function _notifyConsentDetected(server) {
+  const app = window.TS_APP;
+  if (app && typeof app.onConsentDetected === "function") {
+    app.onConsentDetected(server);
+  }
+  _consentChip.add(server);
+}
+
+// Shared MCP-error detection for both result paths (#725): parse + build
+// ONLY — wrapper concerns stay with each call site (the live-row path
+// adds the conv-row-result marker classes; the orphan path appends into
+// .msg-body).  Consent threading lands here once, for both (#874).
+function _tryMcpErrorBlock(isError, output) {
+  if (!isError) return null;
+  const mcpErr = tryParseMcpError(output);
+  return mcpErr
+    ? buildMcpErrorEmbed(mcpErr, output, _notifyConsentDetected)
+    : null;
+}
 
 function buildCoordChrome(root, opts) {
   opts = opts || {};
@@ -232,6 +372,23 @@ function createCoordinatorPane(root, wsId, opts) {
     return null;
   }
   buildCoordChrome(root, opts);
+
+  if (opts && opts.standalone) {
+    // Rail-less page: mount the pending-consent chip in the status bar —
+    // the persistent signal the L-shell gets from the rail badge (#874).
+    const sb = root.querySelector("#coord-status-bar");
+    if (sb) {
+      // Marker class scopes the narrow-width wrap rules to bars that
+      // actually carry the chip (the L-shell pane's bar never does).
+      sb.classList.add("ws-sb-has-consent");
+      const chip = document.createElement("span");
+      chip.id = "coord-sb-consent";
+      chip.className = "ws-sb-consent";
+      chip.hidden = true;
+      sb.appendChild(chip);
+      _consentChip.mount(chip);
+    }
+  }
 
   const messagesEl = root.querySelector("#coord-messages");
   const coordMain = root.querySelector("#coord-main");
@@ -1005,6 +1162,17 @@ function createCoordinatorPane(root, wsId, opts) {
       _scheduleScroll();
       return entry.row;
     }
+    // Orphan result (no live row — replay edge): still render the MCP
+    // error card rather than the raw envelope (#725).
+    const orphanCard = _tryMcpErrorBlock(isError, output);
+    if (orphanCard) {
+      const el = appendMsg("error", "", {
+        label: "error · " + (name || "tool"),
+        callId: callId,
+      });
+      el.querySelector(".msg-body").appendChild(orphanCard);
+      return el;
+    }
     const html = renderToolOutput(output);
     const el = appendMsg(isError ? "error" : "tool", html, {
       label: (isError ? "error · " : "") + (name || "tool"),
@@ -1321,7 +1489,16 @@ function createCoordinatorPane(root, wsId, opts) {
       const batch = row.closest(".conv-batch");
       if (batch) batch.classList.add("conv-batch--error");
     }
-    const block = buildConvResult(output, { isError });
+    // Structured MCP error envelope (consent / re-consent / forbidden /
+    // operator) renders as the shared card instead of raw JSON — the same
+    // dispatch the interactive pane does (#725).  The card's Connect popup
+    // works here unchanged: the console hosts /v1/api/mcp/oauth/start and
+    // consent_url is relative.  The conv-row-result marker keeps the
+    // replace-existing logic above and _refreshRowStatus working when the
+    // result is the card.
+    let block = _tryMcpErrorBlock(isError, output);
+    if (block) block.classList.add("conv-row-result");
+    if (!block) block = buildConvResult(output, { isError });
     // Marker class so _refreshRowStatus can preserve the row's .error state
     // across upgrade-in-place when the error came from a tool_result.
     if (isError) block.classList.add("conv-row-result--error");

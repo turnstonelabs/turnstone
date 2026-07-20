@@ -965,6 +965,42 @@ class TestCreateMcpClient:
             result = create_mcp_client()
             assert result is None
 
+    def test_returns_none_with_storage_but_no_rows(self):
+        """Empty DB + empty file config still yields no manager."""
+        from turnstone.core.mcp_client import create_mcp_client
+
+        storage = MagicMock()
+        storage.list_mcp_servers.return_value = []
+        with patch("turnstone.core.mcp_client.load_mcp_config", return_value={}):
+            assert create_mcp_client(storage=storage) is None
+
+    def test_pool_only_rows_construct_manager(self):
+        """Pool-backed rows alone must construct an empty-config manager.
+
+        oauth_user/oauth_obo rows are stripped from the static config
+        (_db_servers_to_config), so load_mcp_config returns {} — but the
+        host still needs a running manager for per-user pools to form.
+        Returning None here left a pool-only install managerless after
+        every restart until the next admin MCP write or reload fan-out."""
+        from turnstone.core.mcp_client import create_mcp_client
+
+        storage = MagicMock()
+        storage.list_mcp_servers.return_value = [
+            {"name": "g", "auth_type": "oauth_user"},
+            {"name": "o", "auth_type": "oauth_obo"},
+        ]
+        with patch("turnstone.core.mcp_client.MCPClientManager") as cls:
+            result = create_mcp_client(storage=storage)
+        cls.assert_called_once_with({})
+        inst = cls.return_value
+        assert result is inst
+        inst.start.assert_called_once_with()
+        # Pool-name caches still populated so per-turn auth_type lookups
+        # and pool priming see the rows.
+        assert inst._oauth_user_server_names == {"g"}
+        assert inst._obo_server_names == {"o"}
+        assert inst._db_managed == set()
+
 
 # ---------------------------------------------------------------------------
 # Tool refresh — _rebuild_tools, _refresh_server, listeners

@@ -217,3 +217,91 @@ def test_whitespace_only_coord_alias_falls_through() -> None:
     )
     _invoke(factory)
     assert registry.captured_alias == "registry-default"
+
+
+# ---------------------------------------------------------------------------
+# Coordinator MCP gate (#725) — flag × getter matrix, resolved per construction
+# ---------------------------------------------------------------------------
+
+
+def _capture_chatsession_kwargs(
+    *,
+    settings: dict[str, Any],
+    mcp_client_getter: Any = None,
+    getter_passed: bool = True,
+) -> Any:
+    """Run the factory through to a (patched) ChatSession and return the
+    captured construction kwargs.  ChatSession's own contract is covered
+    elsewhere; the unit under test here is the factory's MCP gate."""
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    extra: dict[str, Any] = {}
+    if getter_passed:
+        extra["mcp_client_getter"] = mcp_client_getter
+    factory = build_console_session_factory(
+        registry=_fake_registry(),
+        config_store=_FakeConfigStore(dict(settings)),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+        **extra,
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+    with patch("turnstone.console.session_factory.ChatSession") as cs:
+        factory(ui, ws_id="w1")
+    assert cs.call_count == 1
+    return cs.call_args.kwargs
+
+
+def test_mcp_getter_passes_live_manager_unconditionally() -> None:
+    """Node parity: the factory passes the live console manager to every
+    coordinator session (the console counterpart of the node factory's
+    mcp_ref[0] read) — whether MCP tools surface is the persona's call,
+    exactly as for interactive sessions."""
+    manager = MagicMock()
+    got = _capture_chatsession_kwargs(settings={}, mcp_client_getter=lambda: manager)
+    assert got["mcp_client"] is manager
+
+
+def test_mcp_getter_none_manager_passes_none() -> None:
+    """Nothing configured (create_mcp_client returned None): the session
+    gets None, not a crash."""
+    got = _capture_chatsession_kwargs(settings={}, mcp_client_getter=lambda: None)
+    assert got["mcp_client"] is None
+
+
+def test_mcp_no_getter_is_backward_compatible() -> None:
+    got = _capture_chatsession_kwargs(settings={}, getter_passed=False)
+    assert got["mcp_client"] is None
+
+
+def test_mcp_getter_resolved_per_construction() -> None:
+    """The getter is consulted at EVERY construction — a manager
+    (re)constructed by the console ensure-helper after factory build must
+    reach the next session.  An instance captured at factory-build time
+    fails this row."""
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    holder: dict[str, Any] = {"mgr": None}
+    factory = build_console_session_factory(
+        registry=_fake_registry(),
+        config_store=_FakeConfigStore({}),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+        mcp_client_getter=lambda: holder["mgr"],
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+    with patch("turnstone.console.session_factory.ChatSession") as cs:
+        factory(ui, ws_id="w1")
+        first = cs.call_args.kwargs["mcp_client"]
+        manager = MagicMock()
+        holder["mgr"] = manager  # the ensure-helper lazily constructed it
+        factory(ui, ws_id="w2")
+        second = cs.call_args.kwargs["mcp_client"]
+    assert first is None
+    assert second is manager

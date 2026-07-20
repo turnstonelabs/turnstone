@@ -2356,6 +2356,139 @@ window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
     return { error: "Failed to open this session." };
   });
 };
+// === MCP consent badge (console L-shell) ====================================
+// Mirror of the node dashboard's pending-consent subsystem (ui/static/app.js
+// §12), driving the rail's Admin > MCP Servers row badge through the shell
+// bridge.  The pending set is USER-scoped server truth — the Phase 9
+// mcp_oauth_pending table, which the console serves at
+// /v1/api/mcp/oauth/pending — hydrated at boot and fed live by hosted panes
+// through the window.TS_APP.onConsentDetected seam (the shared pane host
+// bridges an interactive pane's detections here, and the coordinator pane
+// forwards its error card's onConsent; both light up now that the seam
+// exists on the console).  admin.js re-syncs after the operator has SEEN
+// the MCP panel render (same semantics as the node's Connections flow).
+const _pendingConsentServers = new Set();
+
+function _refreshConsentBadge() {
+  const shell = window.TS_SHELL;
+  if (!shell || typeof shell.setRowBadge !== "function") return;
+  const n = _pendingConsentServers.size;
+  const label =
+    n === 0
+      ? ""
+      : n + " MCP server" + (n === 1 ? "" : "s") + " awaiting consent";
+  shell.setRowBadge("mcp", n, label);
+}
+
+function _onConsentDetected(server) {
+  if (typeof server === "string" && server) {
+    _pendingConsentServers.add(server);
+    _refreshConsentBadge();
+  }
+}
+
+function loadPendingConsents() {
+  authFetch("/v1/api/mcp/oauth/pending")
+    .then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    })
+    .then(function (data) {
+      if (!data || !Array.isArray(data.servers)) return;
+      for (let i = 0; i < data.servers.length; i++) {
+        const row = data.servers[i];
+        if (row && typeof row.server_name === "string") {
+          _pendingConsentServers.add(row.server_name);
+        }
+      }
+      _refreshConsentBadge();
+    })
+    .catch(function () {
+      // Endpoint failures must not block console boot.
+    });
+}
+
+// Live MCP-consent notifications from a hosted pane — the seam the shared
+// pane host bridges to (and the coordinator pane's card forwards to).
+window.TS_APP.onConsentDetected = _onConsentDetected;
+// Badge re-sync to DB truth after the operator has seen the admin MCP
+// panel render: clear-then-rehydrate, the node Connections-flow semantics
+// (a FAILED panel load keeps the pending signal instead).  The repaint
+// between clear and rehydrate keeps the badge↔set invariant even when the
+// rehydrate fetch fails — matching the node's _clearConsentBadge.
+window.TS_APP.syncConsentBadge = function () {
+  _pendingConsentServers.clear();
+  _refreshConsentBadge();
+  loadPendingConsents();
+};
+
+// Visibility-show resync (#874): the consent popup opens noopener — no
+// cross-window channel exists — so the only reliable signal that consent
+// completed is the user returning to this tab.  Merge-on-success:
+// entries the server no longer lists are dropped ONLY if they predate
+// this fetch (the preFetch snapshot) — a detection arriving through
+// _onConsentDetected while the fetch is in flight survives, since its
+// DB row may postdate the server's read.  A failed fetch changes
+// nothing, so a possibly-valid warning is never blanked (unlike
+// syncConsentBadge above, whose blind clear is justified by the
+// operator having just SEEN the MCP panel).
+let _resyncInFlight = false;
+let _resyncQueued = false;
+function _resyncPendingConsents() {
+  // Single-flight: overlapping fetches can resolve out of order, and
+  // every guard short of exclusion re-admits some interleaving (a stale
+  // read clobbering a newer one, a failed fetch suppressing a valid
+  // one, an older read's additions surviving a newer read's deletes).
+  // One flight at a time makes the whole class structurally impossible;
+  // an edge firing mid-flight queues exactly one rerun so the freshest
+  // truth still lands.
+  if (_resyncInFlight) {
+    _resyncQueued = true;
+    return;
+  }
+  // Bounded flight: a stalled fetch would otherwise hold the gate shut
+  // forever (the .finally below never runs, freezing self-heal); on
+  // timeout the chain rejects → .catch → .finally clears the gate and
+  // drains any queued rerun.  Feature-detected like the codebase's
+  // AbortController guards — old runtimes just run unbounded, as before
+  // — and computed BEFORE the gate is set so no throw can wedge it.
+  const signal =
+    typeof AbortSignal !== "undefined" && AbortSignal.timeout
+      ? AbortSignal.timeout(10000)
+      : undefined;
+  _resyncInFlight = true;
+  const preFetch = new Set(_pendingConsentServers);
+  authFetch("/v1/api/mcp/oauth/pending", { signal: signal })
+    .then(function (r) {
+      return r.ok ? r.json() : null;
+    })
+    .then(function (data) {
+      if (!data || !Array.isArray(data.servers)) return;
+      const fetched = new Set();
+      for (let i = 0; i < data.servers.length; i++) {
+        const row = data.servers[i];
+        if (row && typeof row.server_name === "string") {
+          fetched.add(row.server_name);
+        }
+      }
+      preFetch.forEach(function (s) {
+        if (!fetched.has(s)) _pendingConsentServers.delete(s);
+      });
+      fetched.forEach(function (s) {
+        _pendingConsentServers.add(s);
+      });
+      _refreshConsentBadge();
+    })
+    .catch(function () {})
+    .finally(function () {
+      _resyncInFlight = false;
+      if (_resyncQueued) {
+        _resyncQueued = false;
+        _resyncPendingConsents();
+      }
+    });
+}
+
 window.TS_APP.boot = function () {
   history.replaceState({ view: "home" }, "");
   _initSavedCoordTable(); // substrate modules have evaluated by boot time
@@ -2365,6 +2498,15 @@ window.TS_APP.boot = function () {
   // pipeline (#9); the console pseudo-node carries coordinator
   // ws_created / ws_closed / cluster_state events.
   loadOverview();
+  // Hydrate the MCP pending-consent badge (#874): a coordinator or
+  // scheduled run that hit mcp_consent_required while nobody watched left
+  // a DB row — the badge is how the operator finds out.  Cheap no-op on
+  // installs with no user-scoped MCP servers; failures are silent.
+  loadPendingConsents();
+  // Self-heal the badge after the consent popup (see _resyncPendingConsents).
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") _resyncPendingConsents();
+  });
   _ensureHomeComposerInit();
   // Refresh the coord button visibility once auth.js has populated
   // sessionStorage from the initial whoami.  window.permissionsReady
