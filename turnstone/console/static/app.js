@@ -1578,18 +1578,31 @@ function _refreshAndPopulateProjects(callOpts) {
 // current pick across the rebuild (same reason as _populateLauncherNodes) and
 // always appending the "+ New project…" sentinel after the live list.
 //
-// Under server.require_project the console launcher intentionally does NOT gate
-// this picker on TurnstoneProjects.requireProject() (unlike the node new-ws
-// dialog): the node create endpoint is the authoritative gate, and its refusal
-// is surfaced to the operator by the console proxy (create_workstream). A
-// client-side required-project picker here is a deferred UX nicety, not a
-// correctness requirement.
+// Under server.require_project BOTH launcher kinds are authoritatively gated
+// server-side: interactive at the node create endpoint (refusal surfaced by
+// the console proxy, create_workstream), coordinator at the console's own
+// create mount (refusal rendered inline by _createCoordinator). The picker
+// mirrors the interactive dashboard's soft treatment — retitle the
+// placeholder so projectless reads as a prompt, never auto-select a real
+// project the operator didn't choose — and leaves enforcement to the
+// server's coded 400 (the composer has no per-option disable, so the
+// placeholder stays selectable; picking it just surfaces the server's
+// message).
 function _populateHomeProjectDropdown() {
   if (!_homeCoordComposer) return;
   const TP = window.TurnstoneProjects;
   if (!TP) return;
   const previous = _homeCoordComposer.getOptionValue("project");
   const choices = TP.projectChoices();
+  const strict = !!TP.requireProject();
+  _homeCoordComposer.setOptionPlaceholder(
+    "project",
+    strict
+      ? choices.length
+        ? "Select a project…"
+        : "No projects available"
+      : "No project",
+  );
   choices.push({ value: _PROJECT_NEW, text: "+ New project…" });
   _homeCoordComposer.setOptionChoices("project", choices);
   // Validate before restoring (via _restorePick, like the other pickers): a

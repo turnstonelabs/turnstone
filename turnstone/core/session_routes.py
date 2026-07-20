@@ -429,10 +429,13 @@ class SessionEndpointConfig:
     # and the operator's auth result is the source of truth.
     create_supports_user_id_override: bool = False
     # When ``True`` the shared create handler applies the ``server.require_project``
-    # gate (refuse a projectless interactive create). Declarative per-mount
-    # capability — interactive wires ``True``; coordinator leaves it ``False`` so
-    # coordinator spawns are never gated. A cfg flag rather than a hardcoded kind
-    # literal, matching the ``create_supports_*`` idiom.
+    # gate (refuse a projectless create). Declarative per-mount capability —
+    # both current kinds wire ``True`` (interactive on the node mount,
+    # coordinator on the console mount); a future kind opts out by leaving the
+    # default. Sessions a coordinator spawns stay exempt inside
+    # ``require_project_denies_create`` (token_source), not via this flag. A
+    # cfg flag rather than a hardcoded kind literal, matching the
+    # ``create_supports_*`` idiom.
     create_gate_require_project: bool = False
     # (request, body, uid, uploaded_files) -> JSONResponse | None.
     # Per-kind pre-create gate (ws_id format, parent ownership, kind
@@ -2570,15 +2573,19 @@ def make_create_handler(
             if err_validate is not None:
                 return err_validate
 
-        # --- require_project gate (interactive-create mounts only) -------
+        # --- require_project gate ----------------------------------------
         # Gated by the declarative cfg.create_gate_require_project capability
-        # (True on the interactive create mount, default-False on coordinator)
-        # rather than a hardcoded kind literal, matching the create_supports_*
-        # idiom — coordinator spawns are exempt by design. By this point the
-        # validator has applied any parent-/resume-inherited project_id into body
-        # AND (for a fork) discarded any explicit pick to the source's project or
-        # "", so a private/dangling/projectless fork SOURCE funnels to the SAME
-        # uniform 400 as a projectless fresh create.
+        # (True on both the interactive and coordinator create mounts) rather
+        # than a hardcoded kind literal, matching the create_supports_* idiom.
+        # Sessions a coordinator SPAWNS remain exempt — that's the
+        # token_source == "coordinator" branch inside
+        # require_project_denies_create, not a mount property. On the
+        # interactive mount, by this point the validator has applied any
+        # parent-/resume-inherited project_id into body AND (for a fork)
+        # discarded any explicit pick to the source's project or "", so a
+        # private/dangling/projectless fork SOURCE funnels to the SAME uniform
+        # 400 as a projectless fresh create. (Coordinator has no fork/resume —
+        # its validator only checks attachability of an explicit pick.)
         if cfg.create_gate_require_project:
             from turnstone.core.auth import (
                 REQUIRE_PROJECT_CODE,

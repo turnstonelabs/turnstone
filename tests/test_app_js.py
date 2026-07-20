@@ -2498,6 +2498,32 @@ def test_console_launcher_paints_project_and_persona_from_cache_synchronously() 
     )
 
 
+def test_console_launcher_project_placeholder_tracks_require_project() -> None:
+    """require_project parity on the console launcher: with the gate on, BOTH
+    launcher kinds are refused a projectless create server-side (interactive at
+    the node, coordinator at the console's own mount), so the picker must stop
+    presenting "No project" as a normal choice.  Mirrors the interactive strict
+    picker's soft treatment — retitle the placeholder ("Select a project…", or
+    "No projects available" when none exist) and never auto-select a real
+    project; the server's coded 400 stays the enforcement."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _populateHomeProjectDropdown(")
+    assert "TP.requireProject()" in fn, (
+        "the launcher project populate must read the requireProject() advisory"
+    )
+    assert re.search(r'setOptionPlaceholder\(\s*"project"', fn), (
+        "strict mode must retitle the seeded placeholder via setOptionPlaceholder"
+    )
+    for label in ("Select a project…", "No projects available", "No project"):
+        assert label in fn, f"placeholder branch missing the {label!r} title"
+    # The has-projects check must see REAL projects only: the placeholder is
+    # computed before the "+ New project…" sentinel is appended, or an empty
+    # deployment would read as having one project and mis-title the prompt.
+    assert fn.index("setOptionPlaceholder") < fn.index("_PROJECT_NEW"), (
+        "the placeholder must be computed before the + New project… sentinel is appended"
+    )
+
+
 def test_paint_project_picker_syncs_before_refresh() -> None:
     """The shared _paintProjectPicker (used by BOTH the modal and dashboard, so
     the two can't drift and silently re-introduce the FOUC) seeds the required/

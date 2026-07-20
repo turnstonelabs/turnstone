@@ -14573,6 +14573,13 @@ def create_app(
         events_replay=_coord_events_replay,
         create_supports_attachments=True,
         create_supports_user_id_override=False,
+        # Coordinator creates honour ``server.require_project`` exactly like
+        # interactive creates — the operator's own token gets no exemption.
+        # Distinct seam: the sessions a coordinator SPAWNS stay exempt via
+        # the ``token_source == "coordinator"`` branch inside
+        # ``require_project_denies_create``; that covers child spawns on
+        # nodes, not creating the coordinator itself.
+        create_gate_require_project=True,
         create_validate_request=_coord_create_validate_request,
         create_build_kwargs=_coord_create_build_kwargs,
         create_post_install=_coord_create_post_install,
