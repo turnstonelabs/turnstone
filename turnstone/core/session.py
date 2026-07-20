@@ -14843,9 +14843,13 @@ class ChatSession:
         timeout = item.get("timeout") or self.tool_timeout
         try:
             # Pre-bind so the ``finally`` can't raise ``UnboundLocalError``
-            # and mask the real error if the spawn below fails.
+            # and mask the real error if the spawn below fails.  The chunk
+            # gate pre-binds with them — its .set() runs in the same
+            # finally, and setting it when no drain ever started is a
+            # harmless no-op.
             proc: subprocess.Popen[str] | None = None
             script_path: str | None = None
+            emit_done = threading.Event()
             try:
                 from turnstone.core.env import scrubbed_env
 
@@ -14874,8 +14878,30 @@ class ChatSession:
                 # ``drain_pipe_lines`` (the drain half of the recipe both
                 # bash variants share); only the sinks differ — stdout also
                 # streams to the UI.
+                #
+                # ``emit_done`` gates the UI half only: once set (after the
+                # join window, before ANY report path), the drain callback
+                # stops forwarding lines to the UI but keeps collecting
+                # ``stdout_parts`` so the pipe always drains and the child
+                # never blocks on a full pipe.  Without the gate, a drain
+                # thread that outlives its join (``bash.drain_leaked``
+                # below — a double-``setsid`` grandchild holding stdout
+                # open) keeps emitting into LATER turns: the UI batches
+                # chunks per call_id, some local providers REUSE call_ids
+                # across turns, and the client grafts stray chunks under
+                # the completed row.  The execution closure is the one
+                # identity that id reuse can't confuse, so the leak is
+                # closed here at the source rather than with a UI-side
+                # closed-call ledger (which per-turn resets or LRU churn
+                # would silently re-open).  Residual race: a line already
+                # past the check when the event sets — at most one line,
+                # equivalent to the pre-batching behaviour.  (The event is
+                # pre-bound next to ``proc`` above so the finally's .set()
+                # can't UnboundLocalError on a failed spawn.)
                 def _on_stdout(line: str) -> None:
                     stdout_parts.append(line)
+                    if emit_done.is_set():
+                        return
                     try:
                         self.ui.on_tool_output_chunk(call_id, line)
                     except Exception:
@@ -14942,6 +14968,17 @@ class ChatSession:
                 if stdout_thread.is_alive() or stderr_thread.is_alive():
                     log.warning("bash.drain_leaked", call_id=call_id, pid=proc.pid)
             finally:
+                # The gate sets in the FINALLY, not after the joins in the
+                # try body: every report path (normal / cancel / timeout /
+                # exception) runs after this block, and an exception thrown
+                # anywhere between thread start and the joins — a failed
+                # stderr_thread.start() under thread exhaustion, say —
+                # would otherwise reach the outer handlers' tool_result
+                # with the gate unset, killpg unreached, and a live drain
+                # still forwarding chunks past its own result (the exact
+                # cross-turn grafting the gate exists to prevent).  On the
+                # normal path this is the same post-join position.
+                emit_done.set()
                 if proc is not None:
                     with self._procs_lock:
                         self._active_procs.discard(proc)

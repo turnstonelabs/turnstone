@@ -22,6 +22,14 @@ was a verified corruption mode in the design review:
   batch would paint into a NEW assistant bubble (the split/duplicate
   look).  The flush lives at the top of ``_enqueue`` itself so every
   emit path — base-class, subclass, and route-level — is covered.
+  ``tool_output_chunk`` is deliberately NOT such an emit anymore: it
+  buffers in its own per-call batcher (see
+  ``test_sse_chunk_batching.py``) and bypasses ``_enqueue``, so chunk
+  traffic no longer force-flushes token batches (the per-line
+  amplifier).  Chunk-vs-content interleaving is cosmetic — independent
+  DOM subtrees — so losing that ordering is safe; the load-bearing
+  chunk ordering (against its own ``tool_result``) is enforced in
+  ``on_tool_result``.
 
 Negative-test discipline: the double-render tests fail if the flush's
 inflight-append + enqueue are split across ``_ws_lock`` sections, and
@@ -227,22 +235,33 @@ def test_direct_enqueue_flushes_pending_batch_first(wide_window: None) -> None:
     assert events[1]["text"] == "bb"
 
 
-def test_tool_and_status_emits_flush_pending_batch(wide_window: None) -> None:
-    """Representative non-token ``on_*`` emitters (tool output chunk,
-    status) deliver a pending batch before their own event."""
+def test_status_emit_flushes_but_chunks_do_not(wide_window: None) -> None:
+    """The ``_enqueue`` chokepoint flush covers real non-token emitters
+    (``status`` here) — but ``tool_output_chunk`` no longer counts as
+    one: it buffers in the per-call chunk batcher and bypasses
+    ``_enqueue`` entirely, so a chunk arriving mid-token-accumulation
+    must NOT flush the pending content batch (that per-line force-flush
+    was the amplifier that defeated token batching under line-chatty
+    tools).  Chunk-vs-content wire order is cosmetic (independent DOM
+    subtrees); the chunk's own load-bearing ordering is pinned in
+    ``test_sse_chunk_batching.py``."""
     ui = _make_ui()
     lq = ui._register_listener()
     ui.on_content_token("aa")
     ui.on_content_token("bb")  # pending
-    ui.on_tool_output_chunk("call-1", "chunk")
-    ui.on_content_token("cc")  # immediate?  No — window is wide and the
-    # flush just ran, so this pends; the status emit must deliver it.
+    ui.on_tool_output_chunk("call-1", "chunk")  # first chunk: emits its
+    # own (immediate, TTFO) batch, does NOT flush the pending "bb"
+    ui.on_content_token("cc")  # joins the still-pending batch
     ui.on_status({"prompt_tokens": 1, "completion_tokens": 2}, 1000, "med")
     events = _drain(lq)
     types = [ev["type"] for ev in events]
-    assert types == ["content", "content", "tool_output_chunk", "content", "status"]
-    assert events[1]["text"] == "bb"
-    assert events[3]["text"] == "cc"
+    assert types == ["content", "tool_output_chunk", "content", "status"]
+    assert events[0]["text"] == "aa"
+    assert events[1]["chunk"] == "chunk"
+    assert events[2]["text"] == "bbcc", (
+        "the pending token batch must survive chunk traffic and flush "
+        "at the next REAL non-token emit (status)"
+    )
 
 
 def test_reasoning_batches_and_kind_switch_flushes(wide_window: None) -> None:

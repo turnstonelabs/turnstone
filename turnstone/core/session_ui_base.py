@@ -57,6 +57,11 @@ _DEFAULT_LISTENER_QUEUE_MAX = 500
 # ``_enqueue`` and gets one fresh ``_event_id``, so it never violates
 # the no-in-ring-coalescing rule (see ``_resolve_event_buffer_max``):
 # no consumer's ``last_event_id`` can fall inside a batch.
+# ``tool_output_chunk`` shares this cadence (same two constants) via
+# the per-call_id batcher (``_PendingChunkBatch`` below) — line-chatty
+# tools under the 4-wide pool were the OTHER storm source, one event
+# per stdout line, and each line's ``_enqueue`` also force-flushed the
+# pending token batch (the amplifier).
 #
 # The window is measured from the LAST flush, checked on token
 # arrival (no timer thread): the first fragment after ≥window of
@@ -69,6 +74,28 @@ _DEFAULT_LISTENER_QUEUE_MAX = 500
 # tests can pin cadence-sensitive behaviour deterministically.
 _TOKEN_BATCH_WINDOW_SECS = 0.025
 _TOKEN_BATCH_MAX_CHARS = 4096
+
+
+class _PendingChunkBatch:
+    """One tool call's pending ``tool_output_chunk`` accumulator.
+
+    ``tool_output_chunk`` shares the token batcher's cadence (window +
+    size cap, same constants) but is keyed PER call_id — up to four
+    concurrent tools stream lines at once and their batches must not
+    interleave text.  ``last_flush`` lives on the entry (not a UI-level
+    scalar like ``_last_token_flush``) so each call's stream keeps its
+    own window clock; it starts at 0.0 so a call's FIRST line flushes
+    immediately (time-to-first-output protection, mirroring tokens).
+    The entry survives window flushes (the clock must persist) and is
+    removed at the call's terminal flush or turn teardown.
+    """
+
+    __slots__ = ("fragments", "last_flush", "size")
+
+    def __init__(self) -> None:
+        self.fragments: list[str] = []
+        self.size: int = 0
+        self.last_flush: float = 0.0
 
 
 class _ListenerOverflow(queue.Full):
@@ -642,6 +669,16 @@ class SessionUIBase:
         # ``time.monotonic()`` of the last real flush; 0.0 makes the
         # first fragment of a fresh UI flush immediately.
         self._last_token_flush: float = 0.0
+        # Per-call_id chunk batches (tool_output_chunk coalescing — the
+        # same emit-time batching as tokens, keyed per call because up
+        # to 4 concurrent tools stream lines at once).  Guarded by
+        # ``_ws_lock``; each KEY is single-writer (one bash drain
+        # thread per call_id — order within a key assumes that, see
+        # :meth:`_buffer_chunk_locked`), the DICT is multi-writer.
+        # Entries persist across window flushes (they carry the
+        # per-call cadence clock) and are removed at the call's
+        # terminal flush (:meth:`on_tool_result`) or turn teardown.
+        self._pending_chunks: dict[str, _PendingChunkBatch] = {}
         # Last broadcast (activity, activity_state) tuple — used by
         # :meth:`_broadcast_activity` overrides to dedup back-to-back
         # identical activity ticks. Tool-heavy turns can fire many
@@ -720,9 +757,16 @@ class SessionUIBase:
         acquires it (non-reentrant).  Token events never come through
         here: :meth:`on_content_token` / :meth:`on_reasoning_token`
         buffer under ``_ws_lock`` and their flush emits via
-        :meth:`_enqueue_direct`.  Every current call site enqueues
-        outside ``_ws_lock``; a violation deadlocks immediately (and
-        loudly) in any test that exercises the path.
+        :meth:`_enqueue_direct`.  ``tool_output_chunk`` likewise
+        bypasses this path via the per-call chunk batcher
+        (:meth:`on_tool_output_chunk`) — which is also why chunk
+        emission no longer force-flushes the token batch (chunk-vs-
+        content interleaving is cosmetic: independent DOM subtrees;
+        the load-bearing chunk ordering is against its OWN call's
+        ``tool_result``, enforced in :meth:`on_tool_result`).  Every
+        current call site enqueues outside ``_ws_lock``; a violation
+        deadlocks immediately (and loudly) in any test that exercises
+        the path.
 
         Returns the monotonic ``_event_id`` assigned to this event so a
         caller that also persists the same turn (e.g.
@@ -901,6 +945,118 @@ class SessionUIBase:
         would paint a dead ``send()``'s tail into the NEW turn's bubble.
         """
         self._reset_pending_locked()
+
+    def _buffer_chunk_locked(self, call_id: str, chunk: str) -> None:
+        """Accumulate one tool-output line; flush on window/size.
+
+        Caller holds ``_ws_lock``.  Chunks share the token batcher's
+        cadence constants but batch PER call_id (concurrent tools must
+        not interleave text) — see :class:`_PendingChunkBatch` for the
+        per-entry clock semantics.  Order within a key assumes ONE
+        producer thread per call_id, true by construction today (a
+        single ``bash-drain-out-{call_id}`` thread streams stdout;
+        stderr is not streamed) and pinned by
+        ``test_chunk_producer_surface_is_single_site``.
+
+        Tail latency, ruled ACCEPTED (do not add a flush timer): a tool
+        that prints a burst then runs silently holds the trailing
+        sub-window batch until its next line, its own ``tool_result``,
+        or turn teardown — the same arrival-driven stall the token
+        batcher documents (its backstop is the ``_enqueue`` chokepoint;
+        chunks' backstop is the call's terminal).  Bounded at one
+        sub-window batch, the burst's first line already painted
+        (first-line-immediate), and the result delivers the complete
+        output regardless; a timer thread would break the batchers'
+        deliberately timer-less design for that sliver.
+
+        Late chunks from a LEAKED drain thread (past its join timeout,
+        ``bash.drain_leaked``) are gated at the PRODUCER — the
+        ``emit_done`` event in ``_exec_bash``'s stdout closure — not
+        here: the execution closure is the one identity that call_id
+        reuse across turns can't confuse, whereas a UI-side
+        closed-call ledger keyed on call_id would either discard a
+        reusing provider's NEW stream or re-open under per-turn resets
+        / LRU churn (both found in review).  A chunk that slips the
+        gate's one-line race re-buffers here and emits — identical to
+        the pre-batching behaviour for the same line.
+        """
+        batch = self._pending_chunks.get(call_id)
+        if batch is None:
+            batch = _PendingChunkBatch()
+            self._pending_chunks[call_id] = batch
+        batch.fragments.append(chunk)
+        batch.size += len(chunk)
+        if (
+            time.monotonic() - batch.last_flush >= _TOKEN_BATCH_WINDOW_SECS
+            or batch.size >= _TOKEN_BATCH_MAX_CHARS
+        ):
+            self._flush_chunk_batch_locked(call_id)
+
+    def _flush_chunk_batch_locked(self, call_id: str) -> None:
+        """Emit ``call_id``'s pending chunks as ONE event.  Caller holds
+        ``_ws_lock``.
+
+        The entry stays in the dict (its ``last_flush`` clock re-arms
+        the window for the ongoing stream); removal happens only at the
+        call's terminal (:meth:`_finish_chunk_call_locked`) or turn
+        teardown.  Emits via :meth:`_enqueue_direct` — the same
+        lock-order (``_ws_lock`` outer → ``_listeners_lock`` inner) as
+        the token flush; ``_stamp_agent_parent`` runs at the chokepoint,
+        so a sub-agent's batch stamps by its (still-registered) call_id
+        at flush time.  Deliberately does NOT flush the token batch:
+        chunk-vs-content interleaving is cosmetic (independent DOM
+        subtrees) — wiring chunks into the token flush is the per-line
+        amplifier this batching removes.
+        """
+        batch = self._pending_chunks.get(call_id)
+        if batch is None or not batch.fragments:
+            return
+        text = "".join(batch.fragments)
+        batch.fragments = []
+        batch.size = 0
+        batch.last_flush = time.monotonic()
+        self._enqueue_direct({"type": "tool_output_chunk", "call_id": call_id, "chunk": text})
+
+    def _flush_all_chunk_batches_locked(self) -> None:
+        """Flush every call's pending chunks and drop the entries.
+
+        Caller holds ``_ws_lock``.  The turn-teardown backstop
+        (``stream_end`` / idle-error snapshot / turn commit / error) —
+        after it, no stream continues, so the per-call clocks are dead
+        weight and the entries go with the flush.  A tool that died
+        with NEITHER a self-reported nor a synthesized ``tool_result``
+        (unproven-reachable) self-heals here: its <pre> was never
+        removed (no result rendered), so the late batch paints in
+        place.
+        """
+        for call_id in list(self._pending_chunks):
+            self._flush_chunk_batch_locked(call_id)
+        self._pending_chunks.clear()
+
+    def _discard_pending_chunks_locked(self) -> None:
+        """Drop all pending chunk text without emitting.  Caller holds
+        ``_ws_lock``.
+
+        Only for the stale-crash path (:meth:`on_turn_start`) — the
+        mirror of :meth:`_discard_pending_tokens_locked`, same
+        rationale: never enqueued, never ring-buffered, so discarding
+        is consistent everywhere.
+        """
+        self._pending_chunks.clear()
+
+    def _finish_chunk_call_locked(self, call_id: str) -> None:
+        """Terminal flush for one call: emit its pending chunks and drop
+        the entry (its window clock included).  Caller holds ``_ws_lock``.
+
+        Runs BEFORE the call's ``tool_result`` enqueues (the
+        load-bearing ordering: the client removes the streaming <pre>
+        when it renders the result, so trailing chunks must be on the
+        wire first).  Late leaked-drain chunks after this point are
+        gated at the producer (see :meth:`_buffer_chunk_locked`), so no
+        closed-call bookkeeping lives here.
+        """
+        self._flush_chunk_batch_locked(call_id)
+        self._pending_chunks.pop(call_id, None)
 
     def _stamp_agent_parent(self, data: dict[str, Any]) -> dict[str, Any]:
         """Stamp ``parent_call_id`` on a sub-agent's child event.
@@ -2995,6 +3151,7 @@ class SessionUIBase:
         """
         with self._ws_lock:
             self._discard_pending_tokens_locked()
+            self._discard_pending_chunks_locked()
             self._reset_inflight_buffers_locked()
 
     def on_turn_committed(self) -> None:
@@ -3021,6 +3178,7 @@ class SessionUIBase:
         """
         with self._ws_lock:
             self._flush_token_batch_locked()
+            self._flush_all_chunk_batches_locked()
             self._reset_inflight_buffers_locked()
 
     def on_thinking_start(self) -> None:
@@ -3091,6 +3249,10 @@ class SessionUIBase:
 
     def on_stream_end(self) -> None:
         with self._ws_lock:
+            # Turn-teardown backstop for the chunk batcher (the token
+            # batch flushes via _enqueue's chokepoint below; chunks
+            # bypass _enqueue, so their backstop lives here).
+            self._flush_all_chunk_batches_locked()
             self._ws_current_activity = ""
             self._ws_activity_state = ""
         self._broadcast_activity()
@@ -3117,6 +3279,12 @@ class SessionUIBase:
         projection's ``preview`` field so live and replay render identically.
         """
         with self._ws_lock:
+            # Terminal flush of this call's chunk stream BEFORE the
+            # result event goes out — the client removes the streaming
+            # <pre> when it renders the result, so trailing chunks must
+            # precede it on the wire.  (Late leaked-drain chunks are
+            # gated at the producer; see _buffer_chunk_locked.)
+            self._finish_chunk_call_locked(call_id)
             self._ws_tool_calls[name] = self._ws_tool_calls.get(name, 0) + 1
             self._ws_turn_tool_calls += 1
             self._ws_current_activity = ""
@@ -3135,7 +3303,21 @@ class SessionUIBase:
         self._enqueue(event)
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
-        self._enqueue({"type": "tool_output_chunk", "call_id": call_id, "chunk": chunk})
+        """Buffer one tool-output line into the per-call chunk batcher.
+
+        The per-LINE ``_enqueue`` this replaces was the event-storm
+        source under parallel task agents (4 concurrent line-chatty
+        tools ⇒ hundreds-thousands of events/sec past the token
+        batcher, overflowing listener queues), and — because every
+        non-token ``_enqueue`` force-flushes the pending token batch —
+        each line also defeated token batching (the amplifier).
+        Buffered chunks bypass ``_enqueue`` entirely; the batch emits
+        via ``_enqueue_direct`` on window/size, the call's
+        ``tool_result`` (:meth:`on_tool_result`) is the per-call
+        ordering backstop, and turn teardown flushes stragglers.
+        """
+        with self._ws_lock:
+            self._buffer_chunk_locked(call_id, chunk)
 
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         """Record per-ws token / context counters + enqueue + persist usage.
@@ -3284,6 +3466,10 @@ class SessionUIBase:
         self._enqueue({"type": "info", "message": message})
 
     def on_error(self, message: str) -> None:
+        with self._ws_lock:
+            # Error teardown backstop for the chunk batcher (token
+            # batch flushes via _enqueue below; chunks bypass it).
+            self._flush_all_chunk_batches_locked()
         self._enqueue({"type": "error", "message": message})
 
     def on_system_turn(
@@ -3546,8 +3732,10 @@ class SessionUIBase:
             # below), and the terminal-state payload must carry the
             # full turn text — a batch stranded in the accumulator
             # would otherwise vanish from the dashboard payload AND
-            # from connected panes.
+            # from connected panes.  Pending chunk batches flush here
+            # for the same reason (cancel/error paths skip stream_end).
             self._flush_token_batch_locked()
+            self._flush_all_chunk_batches_locked()
             tokens = self._ws_prompt_tokens + self._ws_completion_tokens
             ctx = self._ws_context_ratio
             activity = self._ws_current_activity
