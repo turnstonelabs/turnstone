@@ -145,13 +145,72 @@ def test_replay_truncated_when_last_event_id_predates_buffer() -> None:
 def test_replay_empty_buffer_returns_replay_ok_empty() -> None:
     """Cold-start ws with zero events ever: replay_ok / empty list.
     A spurious ``replay_truncated`` envelope on a freshly-opened
-    workstream would be confusing and incorrect."""
+    workstream would be confusing and incorrect.  (This is the
+    regression guard for the derived-staleness rule's ``snap_seq > 0``
+    gate — an empty ring is only truncated when the counter proves
+    events once existed.)"""
     ui = _make_ui()
     lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(0)
     assert status == "replay_ok"
     assert replay == []
     assert lost == 0
     assert earliest == 0
+
+
+def test_replay_empty_buffer_with_seeded_counter_reports_truncated() -> None:
+    """Rehydrate case: the UI instance was rebuilt over an existing
+    conversation (``_seed_event_id_from_storage`` reseeds ``_event_id``
+    from ``MAX(conversations.event_id)``) but the ring died with the old
+    process.  A client whose cursor sits below the counter provably lost
+    events no ring can replay — report ``truncated`` so the client runs
+    its /history resync, instead of the pre-fix silent ``replay_ok``
+    (stuck-busy panes and committed turns missing until a manual
+    reload)."""
+    ui = _make_ui()
+    ui._event_id = 500  # what _seed_event_id_from_storage does on rehydrate
+    lq, replay, status, lost, earliest, snap = ui.register_listener_with_replay(400)
+    assert status == "truncated"
+    assert replay == []
+    assert lost == 100  # exact (not a lower bound) on the empty-ring path
+    assert earliest == 501  # next id that will exist; nothing below is retained
+    assert snap["seq"] == 500
+
+
+def test_replay_empty_buffer_cursor_at_counter_is_lossless_replay_ok() -> None:
+    """Strict ``<`` is load-bearing: a client that saw everything before
+    the rebuild (cursor == seeded counter) lost nothing — ``replay_ok``
+    with an empty slice, no spurious resync churn on every
+    reconnect-after-rehydrate."""
+    ui = _make_ui()
+    ui._event_id = 500
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(500)
+    assert status == "replay_ok"
+    assert replay == []
+    assert lost == 0
+
+
+def test_replay_empty_buffer_negative_cursor_cold_start_stays_replay_ok() -> None:
+    """A malformed negative cursor (``?last_event_id=-1`` parses as an
+    int) on a brand-new ws must not manufacture a truncated envelope —
+    the ``snap_seq > 0`` guard keeps cold start on ``replay_ok``."""
+    ui = _make_ui()
+    lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(-1)
+    assert status == "replay_ok"
+    assert replay == []
+
+
+def test_can_replay_from_stays_false_on_empty_ring_despite_seeded_counter() -> None:
+    """Deliberate asymmetry with the register path (ruled 2026-07-20 —
+    see the ``can_replay_from`` docstring; do not "fix"): on an empty
+    ring with a stale cursor, ``register_listener_with_replay`` reports
+    ``truncated`` (the recovery MESSAGE) while ``can_replay_from`` stays
+    ``False`` (the recovery ROUTE — ``/history`` keeps the in-flight
+    turn and withholds the cursor, because a cursor pointing into an
+    empty ring would immediately re-truncate on connect and loop the
+    client through resync)."""
+    ui = _make_ui()
+    ui._event_id = 500
+    assert ui.can_replay_from(400) is False
 
 
 def test_replay_registers_listener_atomically_with_buffer_snapshot() -> None:

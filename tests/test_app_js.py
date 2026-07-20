@@ -199,10 +199,11 @@ def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
 
     Two load-bearing guards are pinned here:
 
-    1. The seed is gated on ``seedCursor`` so ONLY the initial-connect
-       caller (``_loadHistoryThenConnect``, which reconnects) seeds it;
-       the clear_ui / replay_truncated re-render callers (no reconnect)
-       must NOT rewind ``_lastEventId`` off the live stream position.
+    1. The seed is gated on ``seedCursor`` so ONLY callers that
+       reconnect (``_loadHistoryThenConnect`` — first paint, ws switch,
+       and both truncated-resync branches) seed it; the clear_ui
+       re-render caller runs on a LIVE stream with no reconnect and
+       must NOT rewind ``_lastEventId`` off the live position.
     2. ``connectSSE`` gates the ``?last_event_id=`` param on
        ``!= null`` (not truthiness) so a valid cursor of 0 — a brand-new
        ws's first-turn boundary — isn't silently dropped to the fresh
@@ -225,22 +226,34 @@ def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
         "rewind the live stream and a 0 cursor still fast-forwards."
     )
     assert "seedCursor = false" in fn, (
-        "seedCursor must default false so the clear_ui / replay_truncated "
-        "re-render callers (which pass only 2 args) never seed the cursor."
+        "seedCursor must default false so the clear_ui re-render caller "
+        "(which passes only 2 args and stays on the live stream) never "
+        "seeds the cursor."
     )
     # (1b) the initial-connect path opts in with seedCursor=true.
     assert "_refetchHistory(wsId, token, true)" in body, (
         "_loadHistoryThenConnect must call _refetchHistory(..., true) so "
         "the reconnecting initial-connect path is the only seeder."
     )
-    # (2) connectSSE gates the last_event_id param on != null, not truthiness.
+    # (2) connectSSE gates the last_event_id param on != null, not
+    # truthiness, and a recorded truncation gap overrides the live cursor
+    # (the connect-chokepoint half of the gap-repair guarantee).
     assert re.search(
-        r"if\s*\(\s*this\._lastEventId\s*!=\s*null\s*\)\s*\{\s*"
+        r"const connectCursor =\s*this\._truncatedFromCursor != null\s*"
+        r"\?\s*this\._truncatedFromCursor\s*:\s*this\._lastEventId;",
+        body,
+    ), (
+        "connectSSE must present the truncation-time cursor while a gap "
+        "is on record — the advanced live cursor would draw replay_ok "
+        "and silently forget the gap."
+    )
+    assert re.search(
+        r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*"
         r"evtUrl\s*\+=\s*\"\?last_event_id=\"",
         body,
     ), (
         "connectSSE must gate the ?last_event_id= param on "
-        "this._lastEventId != null (not truthiness) — else a cursor of 0 "
+        "connectCursor != null (not truthiness) — else a cursor of 0 "
         "(brand-new ws first turn) is dropped to the fresh snapshot path."
     )
 

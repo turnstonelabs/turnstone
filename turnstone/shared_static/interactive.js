@@ -62,6 +62,7 @@ import {
   DEGRADED_COOLDOWN_BASE_MS,
   DEGRADED_COOLDOWN_MAX_MS,
   DEGRADED_COOLDOWN_RESET_MS,
+  TRUNCATED_RESYNC_JITTER_MS,
   overflowWindowTripped,
   degradedCooldownStep,
 } from "./sse_overflow.js";
@@ -261,8 +262,10 @@ class Pane {
     this.projectName = "";
     this._lastStatusEvt = null;
     this._historyLoadToken = 0;
-    // Event backlog while a clear_ui / replay_truncated rebuild is in
-    // flight — see _beginReplayQuiesce.  {token, events[]} or null.
+    // Event backlog while a clear_ui rebuild is in flight — see
+    // _beginReplayQuiesce.  {token, events[]} or null.  (The truncated
+    // resync no longer quiesces: it tears the stream down first, so no
+    // live events exist during its rebuild.)
     this._replayQueue = null;
     // Hot-path caches — all invalidated by _clearAgentTracking/replayHistory.
     // _nearBottom mirrors the scroller position via a passive scroll listener
@@ -289,17 +292,45 @@ class Pane {
     // Set when replay_truncated arrives mid-stream (refetching then would
     // detach the live bubble); consumed on the next idle edge.
     this._pendingTruncatedResync = false;
+    // The cursor position a replay_truncated envelope was received AT —
+    // i.e. "a gap of lost events exists BELOW this cursor".  Keep-oldest:
+    // set only when null (repeated envelopes for the same unrepaired gap
+    // must not advance it), cleared by any successful full-history render
+    // (replayHistory — resync success or a clear_ui rebuild both repair
+    // the gap) or a ws switch.  Its one consumer is the connectSSE
+    // chokepoint: while set, every manual (re)connect presents THIS
+    // cursor (not the since-advanced live _lastEventId), so the server
+    // re-answers replay_truncated and the resync re-arms no matter which
+    // teardown cancelled the pending jittered timer — the gap-repair
+    // guarantee survives any interleaving of hide/show, degraded
+    // cooldowns, recover beats, and failed /history fetches.
+    this._truncatedFromCursor = null;
     // Field instrumentation for the two distinct "output stops while the
     // backend is healthy" causes: server-signalled overflow closes
     // (dropped-events class) vs client dispatch/render throws (wedge
     // class).  The console lines at each increment carry the running
     // count, so a field report shows which class fired without a
-    // debugger attached.
-    this._streamHealth = { overflows: 0, renderThrows: 0, malformedFrames: 0 };
-    // Rolling timestamps of stream_overflow closes — input to the
-    // degraded catch-up limiter (see overflowWindowTripped above).
+    // debugger attached.  ``truncatedGaps`` counts replay-window misses
+    // (truncated envelopes acted on), NOT resyncs performed — a
+    // degraded-catchup trip records the gap but skips its resync.
+    this._streamHealth = {
+      overflows: 0,
+      renderThrows: 0,
+      malformedFrames: 0,
+      truncatedGaps: 0,
+    };
+    // Rolling timestamps of heavyweight-recovery churn — stream_overflow
+    // closes AND truncated resyncs (both via _recordChurnAndMaybeTrip) —
+    // input to the degraded catch-up limiter (overflowWindowTripped).
     this._overflowTimes = [];
     this._degradedTimer = null;
+    // Pending jittered truncated-resync (see _scheduleTruncatedResync).
+    // Cancelled by disconnectSSE alongside _degradedTimer, so any path that
+    // tears the transport down (ws switch via _loadHistoryThenConnect,
+    // close-on-hide, degraded entry, destroy) also discards a resync
+    // scheduled for the OLD stream — the next connect's own truncated
+    // envelope reschedules if the gap still exists.
+    this._resyncTimer = null;
     this._degradedCooldownMs = DEGRADED_COOLDOWN_BASE_MS;
     // Timestamp of the last degraded-catchup trip; drives the cooldown
     // ladder's escalate-vs-reset decision independently of _overflowTimes.
@@ -370,6 +401,17 @@ class Pane {
     if (this._degradedTimer) {
       clearTimeout(this._degradedTimer);
       this._degradedTimer = null;
+    }
+    // Same ownership rule for a pending jittered truncated-resync: a
+    // torn-down stream's scheduled resync must not fire against whatever
+    // the pane connects to next (its .finally reconnect would land on the
+    // NEW ws).  The timer's own firing path nulls the field before calling
+    // _loadHistoryThenConnect, so — like _degradedTimer above — this never
+    // cancels the work it is part of.  If the gap still exists after the
+    // teardown, the next connect's truncated envelope reschedules it.
+    if (this._resyncTimer) {
+      clearTimeout(this._resyncTimer);
+      this._resyncTimer = null;
     }
     if (this.evtSource) {
       this.evtSource.close();
@@ -668,10 +710,11 @@ class Pane {
 
   _syncApprovalState() {
     // Prune orphaned cycles whose block elements are no longer in the DOM.
-    // A clear_ui / replay_truncated / re-render that wipes the conversation
-    // subtree (messagesEl.replaceChildren()) also clears approvalCycles via
-    // _resetStreamingRefs.  But if an approve_request event is processed
-    // between the wipe and the refetch, its cycle card is in a detached
+    // A rebuild that wipes the conversation subtree (clear_ui re-render,
+    // truncated resync — messagesEl.replaceChildren()) also clears
+    // approvalCycles via _resetStreamingRefs.  But if an approve_request
+    // event is processed between the wipe and the refetch, its cycle card
+    // is in a detached
     // subtree and the matching approval_resolved may never arrive — leaving
     // pendingApproval=true and the send button disabled forever.
     for (const [cid, entry] of this.approvalCycles) {
@@ -1259,14 +1302,35 @@ class Pane {
       "/v1/api/workstreams/" +
       encodeURIComponent(wsId) +
       "/events";
+    // A recorded truncation gap OVERRIDES the live cursor: while
+    // _truncatedFromCursor is set (gap detected, no full render yet),
+    // every manual (re)connect presents the truncation-time cursor, so
+    // the server re-answers replay_truncated and the resync re-arms —
+    // whatever teardown cancelled the pending jittered resync in the
+    // meantime (close-on-hide, degraded entry, ws reassignment beat).
+    // This connect chokepoint is what makes the gap-repair guarantee
+    // interleaving-proof; a cancellable timer alone silently lost the
+    // repair when a hide/show cycle landed inside the jitter window
+    // after the live cursor had advanced past the truncation point.
+    // Safe against double-render: ring eviction is forward-only, so a
+    // once-truncated cursor can never re-enter replay range — this
+    // connect always draws the envelope, never a bulk replay.  (Native
+    // EventSource auto-reconnects bypass this — the browser's header
+    // carries the advanced id — but they never run disconnectSSE, so
+    // the pending resync timer survives them.)
+    //
     // ``!= null`` (not truthiness): a resume cursor of 0 is valid — the
     // ring buffer's first emitted event is id 1, so register_listener_with_replay(0)
     // replays the whole in-flight turn. A brand-new ws seeds _event_id at 0,
     // so its first user row (and thus a first-turn /history cursor) can be 0;
     // a truthiness gate would silently drop it and fall back to the lossy
     // fresh snapshot. Mirrors the ``data.cursor != null`` guard in _refetchHistory.
-    if (this._lastEventId != null) {
-      evtUrl += "?last_event_id=" + encodeURIComponent(this._lastEventId);
+    const connectCursor =
+      this._truncatedFromCursor != null
+        ? this._truncatedFromCursor
+        : this._lastEventId;
+    if (connectCursor != null) {
+      evtUrl += "?last_event_id=" + encodeURIComponent(connectCursor);
     }
     // Close-on-hide / replay-on-show: installed once per pane, removed
     // by the factory's destroy().  A hidden tab's throttled drain is the
@@ -1401,19 +1465,17 @@ class Pane {
     this._hiddenDisconnect = false;
   }
 
-  _noteStreamOverflow() {
-    this._streamHealth.overflows += 1;
+  _recordChurnAndMaybeTrip() {
+    // The ONE rolling-window churn accounting step for the degraded
+    // ladder — stream_overflow closes (_noteStreamOverflow) AND
+    // truncated resyncs (_noteTruncatedResync) land here, so the trip
+    // parameters and the degraded-entry call have a single
+    // implementation that cannot silently diverge.  The cooldown-ladder
+    // reset lives in _enterDegradedCatchup (keyed off _lastDegradedAt),
+    // NOT here — this method only counts and trips.  Returns true when
+    // this entry ENTERED degraded catch-up.
     const now = Date.now();
     this._overflowTimes.push(now);
-    console.warn(
-      "interactive: server closed the stream after a send-queue overflow " +
-        "(total " +
-        this._streamHealth.overflows +
-        "); reconnect will replay the gap",
-    );
-    // Trip when OVERFLOW_TRIP_COUNT closes land inside the rolling window.
-    // The cooldown-ladder reset lives in _enterDegradedCatchup (keyed off
-    // _lastDegradedAt), NOT here — this method only counts and trips.
     if (
       overflowWindowTripped(
         this._overflowTimes,
@@ -1423,7 +1485,78 @@ class Pane {
       )
     ) {
       this._enterDegradedCatchup();
+      return true;
     }
+    return false;
+  }
+
+  _noteStreamOverflow() {
+    this._streamHealth.overflows += 1;
+    console.warn(
+      "interactive: server closed the stream after a send-queue overflow " +
+        "(total " +
+        this._streamHealth.overflows +
+        "); reconnect will replay the gap",
+    );
+    this._recordChurnAndMaybeTrip();
+  }
+
+  _recordTruncatedGap() {
+    // The one increment+log step for the replay-window class — EVERY
+    // truncatedGaps bump goes through here so the console invariant
+    // documented at the _streamHealth initializer holds (each increment
+    // carries the running count).  Class-of-event wording only: the
+    // recovery that follows differs by caller (jittered fresh-connect,
+    // idle-edge fresh-connect, or a degraded-catchup skip), so the line
+    // must not assert an action a trip may skip.  Churn accounting is
+    // deliberately NOT here — the idle-edge caller records the gap
+    // without feeding the degraded ladder.
+    this._streamHealth.truncatedGaps += 1;
+    console.warn(
+      "interactive: replay window could not cover the reconnect gap " +
+        "(total " +
+        this._streamHealth.truncatedGaps +
+        ")",
+    );
+  }
+
+  _noteTruncatedResync() {
+    // Count a truncated-triggered full resync into the SAME rolling
+    // churn window as overflow closes (_overflowTimes): both are "this
+    // consumer needed heavyweight recovery", and the degraded ladder is
+    // the bound for either loop.  Separate _streamHealth counter (via
+    // _recordTruncatedGap) so a field report distinguishes the
+    // dropped-events class (overflows) from the replay-window class
+    // (truncatedGaps).
+    //
+    // Returns true when this trip ENTERED degraded catch-up — the
+    // caller must then SKIP starting its resync: the cooldown ladder
+    // just disconnected the stream, and a _loadHistoryThenConnect
+    // started now would reconnect from its .finally and defeat the
+    // cooldown it triggered.  The wake-up reconnect re-arrives here via
+    // a fresh replay_truncated (its cursor is still stale), so the
+    // resync is deferred, not lost.
+    this._recordTruncatedGap();
+    return this._recordChurnAndMaybeTrip();
+  }
+
+  _scheduleTruncatedResync() {
+    // Start the truncated-triggered fresh connect after a random
+    // 0..TRUNCATED_RESYNC_JITTER_MS spread.  The truncated envelope is
+    // herd-shaped — a node restart makes every stale-cursor tab
+    // reconnect inside the EventSource retry jitter and each answers
+    // with a /history fetch — and the per-tab churn limiter cannot see
+    // a cross-tab herd (one resync per tab never trips it), so the
+    // spread is applied here, before the fetch.  During the wait the
+    // pane keeps painting live events from the still-open stream; the
+    // gap predates the resync either way, so the only cost is a
+    // delayed backfill.  disconnectSSE owns cancellation (ws switch,
+    // hide, degraded entry, destroy — see the field comment).
+    if (this._resyncTimer != null) return; // one pending resync at a time
+    this._resyncTimer = setTimeout(() => {
+      this._resyncTimer = null;
+      if (this.wsId) this._loadHistoryThenConnect(this.wsId);
+    }, Math.random() * TRUNCATED_RESYNC_JITTER_MS);
   }
 
   _enterDegradedCatchup() {
@@ -1488,7 +1621,11 @@ class Pane {
     // must preserve these): a stale quiesce queue would wedge the new load's
     // events behind a flush that never comes, stale agent tracking points at
     // the DOM this load is about to replace, and a pending truncated-resync
-    // is superseded by the full refetch below.
+    // is superseded by the full refetch below.  The truncation-gap cursor
+    // is dropped ONLY on a ws switch (it names a gap in the OLD ws); a
+    // same-ws reload keeps it armed until a successful full render
+    // (replayHistory clears it) so a failed fetch can retry below.
+    if (this.wsId !== wsId) this._truncatedFromCursor = null;
     this._replayQueue = null;
     this._clearAgentTracking();
     this._pendingTruncatedResync = false;
@@ -1497,12 +1634,25 @@ class Pane {
     // the pane has switched to another ws. Newest load wins; older ones drop.
     const token = (this._historyLoadToken || 0) + 1;
     this._historyLoadToken = token;
-    // ``seedCursor=true``: this is the initial-connect path (the
-    // ``.finally`` reconnects), so a resume cursor from /history should
-    // seed _lastEventId for that connect. The clear_ui / replay_truncated
-    // re-render callers pass it false — they run on an already-live stream
-    // and must NOT rewind _lastEventId off the live position.
+    // ``seedCursor=true``: every caller of THIS path reconnects (the
+    // ``.finally``), so a resume cursor from /history should seed
+    // _lastEventId for that connect.  Callers: first paint, ws switch,
+    // and — since the 2026-07 dead-stream ruling — both replay_truncated
+    // resync branches (a truncated stream is torn down and fully
+    // re-established, so cursor adoption is safe AND required: /history
+    // trims the in-flight turn whenever it returns a cursor).  Only the
+    // clear_ui re-render still calls _refetchHistory directly with
+    // seedCursor=false — it runs on an already-live stream and must NOT
+    // rewind _lastEventId off the live position.
     this._refetchHistory(wsId, token, true).finally(() => {
+      // Failed-fetch retry rides the connect chokepoint, not this
+      // callback: a fetch failure leaves _truncatedFromCursor set (only
+      // replayHistory's full render clears it), so the reconnect below
+      // presents the truncation-time cursor, draws replay_truncated
+      // again, and the resync retries — bounded by the churn limiter +
+      // degraded ladder.  The old transcript survives a failed fetch
+      // (the failure branch never reaches replayHistory's wipe), so the
+      // retry window shows stale-but-real content, not an empty pane.
       if (token === this._historyLoadToken) this.connectSSE(wsId);
     });
   }
@@ -1514,12 +1664,13 @@ class Pane {
     // → empty pane); the render is deliberately OUTSIDE the catch so a
     // render bug surfaces loudly instead of being masked as an empty pane.
     //
-    // ``seedCursor`` is true ONLY on the initial-connect path
-    // (_loadHistoryThenConnect, which reconnects via .finally). The
-    // re-render callers leave it false so a fast-forward cursor never
-    // rewinds the live stream's _lastEventId backward (which would
-    // double-render on a later transient reconnect, or — on a re-render
-    // that trims an orphan with no reconnect — strand the omitted turn).
+    // ``seedCursor`` is true ONLY via _loadHistoryThenConnect (which
+    // reconnects via .finally — first paint, ws switch, truncated
+    // resync). The live-stream re-render caller (clear_ui) leaves it
+    // false so a fast-forward cursor never rewinds the live stream's
+    // _lastEventId backward (which would double-render on a later
+    // transient reconnect, or — on a re-render that trims an orphan
+    // with no reconnect — strand the omitted turn).
     const id = wsId || this.wsId;
     let data = null;
     try {
@@ -1568,7 +1719,10 @@ class Pane {
     } else {
       // Failure path never reaches replayHistory — reset the streaming refs
       // here too, or the flushed backlog and resumed live events would paint
-      // into the subtree clear_ui already wiped.
+      // into the subtree clear_ui already wiped.  It also leaves
+      // _truncatedFromCursor SET (only replayHistory clears it), which is
+      // what arms the connect chokepoint's retry for a failed truncated
+      // resync.
       this._resetStreamingRefs();
       this.showEmptyState();
       this._endReplayQuiesce(token);
@@ -1576,10 +1730,12 @@ class Pane {
   }
 
   _beginReplayQuiesce(token) {
-    // Arm the handleEvent queue for a full re-render (clear_ui /
-    // replay_truncated).  Token-owned: a newer load's quiesce replaces this
-    // one wholesale — events queued before the newer snapshot was fetched
-    // are covered by that snapshot, so dropping them is lossless.
+    // Arm the handleEvent queue for a full re-render on a LIVE stream
+    // (clear_ui — the sole remaining quiescing caller; the truncated
+    // resync disconnects first instead).  Token-owned: a newer load's
+    // quiesce replaces this one wholesale — events queued before the
+    // newer snapshot was fetched are covered by that snapshot, so
+    // dropping them is lossless.
     this._replayQueue = { token: token, events: [] };
   }
 
@@ -1655,7 +1811,7 @@ class Pane {
     // Guard: drop events that belong to a different workstream.
     // This prevents cross-contamination during tab switches and reconnects.
     if (evt.ws_id && evt.ws_id !== this.wsId) return;
-    // While a clear_ui / replay_truncated rebuild is in flight, live events
+    // While a clear_ui rebuild is in flight, live events
     // must not paint into a DOM the imminent replaceChildren() will wipe —
     // anything painted in the [snapshot-fetch → rebuild] window is lost with
     // no redelivery (the re-render callers never rewind _lastEventId).  Queue
@@ -1814,12 +1970,21 @@ class Pane {
           // Deferred replay_truncated re-sync: the truncation arrived while
           // a segment was streaming (refetching then would have detached the
           // live bubble), so repair the lost-event gap now that the turn is
-          // settled and /history is complete.
+          // settled and /history is complete.  Same dead-stream flow as the
+          // immediate branch (full fresh connect, cursor adoption) — but NOT
+          // counted into the degraded-churn window, and NOT herd-jittered:
+          // this branch fires once per latch, and the latch only re-arms via
+          // a NEW truncated envelope followed by a full turn-settle —
+          // inherently rate-limited AND per-pane staggered by turn timing,
+          // unlike the immediate branch's reconnect loop (which the limiter
+          // bounds and _scheduleTruncatedResync spreads).  Usually /history
+          // returns no cursor here (no orphan at idle) and the reconnect is
+          // a plain fresh connect; a queued send racing the fetch just means
+          // a seeded reconnect instead — both converge.
           if (this._pendingTruncatedResync) {
             this._pendingTruncatedResync = false;
-            const rsToken = this._historyLoadToken;
-            this._beginReplayQuiesce(rsToken);
-            this._refetchHistory(this.wsId, rsToken);
+            this._recordTruncatedGap();
+            this._loadHistoryThenConnect(this.wsId);
           }
           // Only steal focus if this is the active pane and no approval pending.
           if (this._host.isFocused(this) && !this.pendingApproval) {
@@ -2042,15 +2207,28 @@ class Pane {
         // re-render from REST and dispatch any queued edit-and-resend
         // once the (possibly truncated) history lands. The resend keys
         // off this signal rather than an inline history SSE event. Capture
-        // the load token so a ws switch mid-flight discards both the
-        // re-render and the resend (no cross-ws send).
+        // the load token AND the ws identity: a ws SWITCH mid-flight
+        // discards both the re-render and the resend (no cross-ws send),
+        // but a SAME-ws supersession — the jittered truncated resync
+        // bumps _historyLoadToken through _loadHistoryThenConnect — must
+        // still fire the resend: the superseding load renders the same
+        // post-rewind history, and silently dropping the queued edit
+        // stranded the composer busy with a message that never sent.
         const token = this._historyLoadToken;
+        const editWs = this.wsId;
         this._beginReplayQuiesce(token);
         this.messagesEl.replaceChildren();
         this._resetStreamingRefs();
         this._refetchHistory(this.wsId, token)
           .then(() => {
-            if (token !== this._historyLoadToken) return;
+            if (token !== this._historyLoadToken && this.wsId !== editWs) {
+              // Cross-ws supersession: release the latch + busy so the
+              // composer recovers; the edit belongs to a pane state that
+              // no longer exists.
+              this._pendingEditSend = null;
+              this.setBusy(false);
+              return;
+            }
             if (!this._pendingEditSend) return;
             const editText = this._pendingEditSend;
             this._pendingEditSend = null;
@@ -2091,22 +2269,50 @@ class Pane {
       }
 
       case "replay_truncated":
-        // Reconnect buffer evicted past our last-seen event id — the
-        // live recovery replay no longer carries history, so re-sync
-        // from REST. Skip while a turn is mid-stream: the recovery
-        // floor's in_progress_snapshot already paints it, and an async
-        // refetch's replaceChildren() would detach the live bubble so
-        // content deltas render nowhere. Re-syncs on the next clean
-        // (re)connect.  The guard covers BOTH streaming targets — a
-        // reasoning-only segment (currentReasoningEl without a content
-        // bubble yet) is just as detachable as a content one.  Mid-stream
-        // the resync is DEFERRED, not dropped: skipping outright left the
-        // lost-event gap unrepaired for the rest of the session (no clean
-        // reconnect may come for hours); the idle edge consumes the flag.
+        // The stream just admitted losing events past recovery — treat
+        // the connection as DEAD and run the full fresh-connect flow
+        // (_loadHistoryThenConnect: disconnect first, REST /history,
+        // rebuild, adopt the returned resume cursor, reconnect).  The
+        // cursor adoption is the point (ruled 2026-07-20, do not revert
+        // to an in-place refetch): /history TRIMS the trailing in-flight
+        // turn whenever it hands back a cursor (_resume_cursor_and_trim),
+        // on the assumption the caller replays from that cursor.  The old
+        // in-place refetch here discarded the cursor, so a mid-run
+        // truncation wiped the executing turn's rows (task cards
+        // included) with no redelivery — sub-agent children then escaped
+        // to top-level rows after the orphan grace.  Disconnect-first
+        // also removes the old flush-vs-reconnect ambiguity: no live
+        // events arrive during the rebuild, so nothing double-renders.
+        //
+        // Skip while a turn is mid-stream: an async refetch's
+        // replaceChildren() would detach the live bubble so content
+        // deltas render nowhere.  The guard covers BOTH streaming
+        // targets — a reasoning-only segment (currentReasoningEl
+        // without a content bubble yet) is just as detachable as a
+        // content one.  Mid-stream the resync is DEFERRED, not
+        // dropped; the idle edge consumes the flag.
+        //
+        // Record WHERE the gap sits before either branch: the envelope
+        // arrived at the connect cursor, but by the time the resync's
+        // /history fetch runs (after the jitter, or at the idle edge)
+        // the live stream has advanced _lastEventId well past it — the
+        // failed-fetch retry needs this truncation-time value, not the
+        // advanced one (see _truncatedFromCursor's field comment).
+        // Keep-oldest: a retry reconnect re-delivers an envelope for the
+        // SAME unrepaired gap and must not advance the record.
+        if (this._truncatedFromCursor == null) {
+          this._truncatedFromCursor = this._lastEventId;
+        }
         if (!this.currentAssistantEl && !this.currentReasoningEl) {
-          const rtToken = this._historyLoadToken;
-          this._beginReplayQuiesce(rtToken);
-          this._refetchHistory(this.wsId, rtToken);
+          // Limiter check BEFORE scheduling the resync — a trip has just
+          // disconnected the stream for a cooldown, and a resync started
+          // now would reconnect from its .finally and defeat the cooldown
+          // (see _noteTruncatedResync).  No trip → the fresh connect
+          // starts after a herd-spreading jitter
+          // (_scheduleTruncatedResync).
+          if (!this._noteTruncatedResync()) {
+            this._scheduleTruncatedResync();
+          }
         } else {
           this._pendingTruncatedResync = true;
         }
@@ -2766,6 +2972,12 @@ class Pane {
 
   replayHistory(messages) {
     this.messagesEl.replaceChildren();
+    // A full committed-history render repairs any recorded truncation
+    // gap — whether this render came from the truncated resync itself or
+    // from an unrelated clear_ui rebuild.  Clear the retry cursor so a
+    // LATER failed reload doesn't rewind onto a gap that no longer
+    // exists.
+    this._truncatedFromCursor = null;
     // The rebuild just orphaned any in-flight streaming targets — reset them,
     // and release the agent-card/orphan maps whose entries now point at
     // replaced subtrees (detached-DOM retention).

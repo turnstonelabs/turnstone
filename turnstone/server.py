@@ -1075,6 +1075,17 @@ async def global_events_sse(request: Request) -> Response:
         else:
             buffered = list(event_buffer)
             if not buffered:
+                # KNOWN GAP (#881): an empty ring after a node restart
+                # reports ``replay_ok`` even when the client's cursor is
+                # stale, silently skipping the events lost with the old
+                # process.  The per-ws stream fixes this by deriving
+                # staleness from its storage-seeded ``_event_id`` counter
+                # (see ``register_listener_with_replay``); the global
+                # counter (``global_event_id_holder``) resets to 0 at
+                # boot, so the same rule cannot apply — a boot-epoch
+                # staleness signal is the fix direction tracked in #881.
+                # Tolerable meanwhile: consumers are idempotent roster
+                # state refreshed periodically, not append-only history.
                 replay_status = "replay_ok"
             else:
                 earliest_available_id = buffered[0][0]
