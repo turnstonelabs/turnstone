@@ -3289,7 +3289,17 @@ function createCoordinatorPane(root, wsId, opts) {
         // nowhere.  Mid-stream the resync is DEFERRED, not dropped — skipping
         // outright left the ring-evicted gap unrepaired for the rest of the
         // session (no clean reconnect may come for hours); the idle edge
-        // consumes the flag.  Mirrors interactive.js's _pendingTruncatedResync.
+        // consumes the flag.
+        //
+        // KNOWN GAP (#882): this refetch discards the /history ``cursor``
+        // and stays on the live stream, so a MID-RUN truncation loses the
+        // trailing in-flight turn (/history trims it whenever it returns a
+        // cursor, expecting the caller to replay from that cursor).
+        // interactive.js now treats truncated as a dead stream (disconnect
+        // → refetch with cursor adoption → reconnect); mirroring that here
+        // is #882.  The rehydrate-triggered truncation (empty reborn ring)
+        // recovers correctly today — a rehydrated ws has no in-flight
+        // orphan to trim.
         if (!currentAssistantEl && !currentReasoningEl) {
           refetchHistory();
         } else {

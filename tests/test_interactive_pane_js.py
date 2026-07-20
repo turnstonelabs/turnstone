@@ -275,17 +275,20 @@ def test_stream_pipeline_is_wedge_proof() -> None:
 
 
 def test_rebuild_quiesces_live_events_and_releases_agent_tracking() -> None:
-    """clear_ui / replay_truncated re-render race (perf audit P0): live SSE
-    events painted between the history snapshot and ``replaceChildren()``
-    were wiped with no redelivery, and streaming refs kept pointing at
-    detached nodes.  Pinned: the quiesce queue sits on the handleEvent hot
-    path, both re-render triggers arm it, ``replayHistory`` resets the
-    streaming refs and clears the agent-card/orphan maps (the detached-DOM
-    retention leak), and the mid-stream guard covers the reasoning bubble."""
+    """clear_ui re-render race (perf audit P0): live SSE events painted
+    between the history snapshot and ``replaceChildren()`` were wiped with
+    no redelivery, and streaming refs kept pointing at detached nodes.
+    Pinned: the quiesce queue sits on the handleEvent hot path, the
+    live-stream re-render trigger (clear_ui) arms it, ``replayHistory``
+    resets the streaming refs and clears the agent-card/orphan maps (the
+    detached-DOM retention leak), and the mid-stream guard covers the
+    reasoning bubble.  (replay_truncated no longer arms the quiesce — it
+    tears the stream down and runs the full fresh-connect flow instead;
+    see test_truncated_resync_is_full_fresh_connect.)"""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     assert "this._replayQueue.events.push(evt);" in body
-    assert body.count("this._beginReplayQuiesce(") >= 2, (
-        "both clear_ui and replay_truncated must arm the quiesce"
+    assert body.count("this._beginReplayQuiesce(") >= 1, (
+        "clear_ui must arm the quiesce (it re-renders on a LIVE stream)"
     )
     assert "!this.currentAssistantEl && !this.currentReasoningEl" in body
     replay = body.index("replayHistory(messages) {")
@@ -309,7 +312,7 @@ def test_rebuild_quiesces_live_events_and_releases_agent_tracking() -> None:
     assert "this._clearAgentTracking();" not in disc_seg
     assert "this._replayQueue = null;" not in disc_seg
     load = body.index("_loadHistoryThenConnect(wsId) {")
-    load_seg = body[load : load + 2200]
+    load_seg = body[load : body.index("async _refetchHistory(", load)]
     assert "this._clearAgentTracking();" in load_seg
     assert "this._replayQueue = null;" in load_seg
     # A mid-stream replay_truncated DEFERS the re-sync (flag consumed on the
@@ -320,7 +323,7 @@ def test_rebuild_quiesces_live_events_and_releases_agent_tracking() -> None:
     # replayHistory, and stale refs there streamed the retried generation's
     # first segment into a detached bubble.
     fail = body.index("Failure path never reaches replayHistory")
-    assert "this._resetStreamingRefs();" in body[fail : fail + 400], (
+    assert "this._resetStreamingRefs();" in body[fail : fail + 700], (
         "the refetch failure branch must reset streaming refs"
     )
 
@@ -451,13 +454,176 @@ def test_stream_overflow_case_counts_and_rate_limits() -> None:
     body = _INTERACTIVE.read_text(encoding="utf-8")
     assert 'case "stream_overflow":' in body
     assert "this._noteStreamOverflow();" in body
-    assert "_streamHealth = { overflows: 0, renderThrows: 0, malformedFrames: 0 }" in body
+    # The health object carries all four field-forensics counters; the
+    # truncated-resync counter distinguishes the replay-window class from
+    # the dropped-events class (overflows).
+    health = re.search(r"_streamHealth = \{(.*?)\};", body, re.S)
+    assert health is not None, "_streamHealth initializer not found"
+    for field in ("overflows: 0", "renderThrows: 0", "malformedFrames: 0", "truncatedGaps: 0"):
+        assert field in health.group(1), f"_streamHealth must init {field!r}"
     # Both wedge-class catch sites increment the render-throw counter,
     # and the malformed-frame drop counts too — the C-OVERDETERMINED
     # instrumentation that tells drops apart from wedges in the field.
     assert body.count("this._streamHealth.renderThrows += 1;") == 2
     assert "this._streamHealth.malformedFrames += 1;" in body
     assert "this._streamHealth.overflows += 1;" in body
+
+
+def test_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
+    """replay_truncated = the stream admitted losing events past recovery.
+    The pane must treat the connection as DEAD: run the full fresh-connect
+    flow (``_loadHistoryThenConnect`` — disconnect first, REST /history,
+    adopt the resume cursor, reconnect) rather than an in-place refetch.
+    The in-place shape discarded the /history cursor while /history TRIMS
+    the trailing in-flight turn whenever it returns one — a mid-run
+    truncation wiped the executing turn (task cards included) with no
+    redelivery, and sub-agent children then escaped to top-level rows
+    after the orphan grace (the 2026-07 field reports).
+
+    Pinned: (1) the immediate branch routes through
+    ``_noteTruncatedResync()`` and SKIPS the resync when the limiter just
+    tripped — the cooldown disconnected the stream, and the flow's
+    ``.finally`` reconnect would defeat it; on no-trip it SCHEDULES the
+    fresh connect behind the herd-spreading jitter rather than starting
+    it inline (a node restart makes every stale-cursor tab resync inside
+    the EventSource retry window, and the per-tab limiter cannot see a
+    cross-tab herd); (2) the mid-stream guard still DEFERS (detachable
+    bubble); (3) the idle-edge consumption runs the same fresh-connect
+    flow, unjittered (staggered by turn-settle timing); (4) the limiter
+    feeds the SAME churn window as overflow closes and enters degraded
+    catch-up on trip; (5) neither truncated branch arms the quiesce or
+    calls the in-place ``_refetchHistory`` — the old shape must not come
+    back; (6) every ``truncatedGaps`` bump routes through the one
+    increment+log step (``_recordTruncatedGap``), whose class-of-event
+    wording never asserts a resync a trip may skip; (7) the scheduler
+    nulls its handle before loading and ``disconnectSSE`` cancels a
+    pending one, so a torn-down stream's resync can't fire against the
+    pane's next workstream; (8) the gap-repair guarantee is
+    interleaving-proof via the connect chokepoint; (9) a same-ws load
+    supersession must not strand a queued edit-and-resend."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
+    assert trunc is not None, "replay_truncated case not found"
+    t = trunc.group(1)
+    # (1) immediate branch: limiter check gates the JITTERED fresh connect.
+    assert "if (!this._noteTruncatedResync())" in t
+    assert "this._scheduleTruncatedResync();" in t
+    # (2) mid-stream defer unchanged.
+    assert "!this.currentAssistantEl && !this.currentReasoningEl" in t
+    assert "this._pendingTruncatedResync = true;" in t
+    # (5) the old in-place shape must not come back.
+    assert "_beginReplayQuiesce" not in t
+    assert "_refetchHistory" not in t
+    # (3) idle-edge consumption: consume the latch, record, fresh-connect.
+    idle = re.search(
+        r"if \(this\._pendingTruncatedResync\) \{(.*?)\n          \}",
+        body,
+        re.S,
+    )
+    assert idle is not None, "idle-edge truncated consumption not found"
+    i = idle.group(1)
+    assert "this._pendingTruncatedResync = false;" in i
+    assert "this._recordTruncatedGap();" in i
+    assert "this._loadHistoryThenConnect(this.wsId);" in i
+    assert "_refetchHistory" not in i
+    # (4) the limiter method: records the gap, then delegates churn
+    # accounting to the ONE shared trip step (also used by
+    # _noteStreamOverflow) so the trip parameters cannot silently diverge
+    # between the overflow and truncated classes.
+    note = re.search(r"_noteTruncatedResync\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert note is not None, "_noteTruncatedResync method not found"
+    n = note.group(1)
+    assert "this._recordTruncatedGap();" in n
+    assert "return this._recordChurnAndMaybeTrip();" in n
+    churn = re.search(r"_recordChurnAndMaybeTrip\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert churn is not None, "_recordChurnAndMaybeTrip method not found"
+    c = churn.group(1)
+    assert "this._overflowTimes.push(now);" in c
+    assert "overflowWindowTripped(" in c
+    assert "this._enterDegradedCatchup();" in c
+    assert "return true;" in c
+    assert "return false;" in c
+    over = re.search(r"_noteStreamOverflow\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert over is not None, "_noteStreamOverflow method not found"
+    assert "this._recordChurnAndMaybeTrip();" in over.group(1), (
+        "overflow closes must feed the same shared churn step"
+    )
+    # (6) the one increment+log step: every bump carries the running count,
+    # class-of-event wording (no action a trip may skip); the counter is
+    # named for what it counts — gap detections, not resyncs performed.
+    rec = re.search(r"_recordTruncatedGap\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert rec is not None, "_recordTruncatedGap method not found"
+    r = rec.group(1)
+    assert "this._streamHealth.truncatedGaps += 1;" in r
+    assert "console.warn(" in r
+    assert "resyncing history from REST" not in r, (
+        "the shared log line must not assert a resync the trip branch skips"
+    )
+    assert body.count("this._streamHealth.truncatedGaps += 1;") == 1, (
+        "all truncatedGaps bumps must route through _recordTruncatedGap "
+        "so the running-count console invariant holds"
+    )
+    # (7) jittered scheduler: dedup guard, null-before-load, cancel on
+    # disconnect.
+    sched = re.search(r"_scheduleTruncatedResync\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert sched is not None, "_scheduleTruncatedResync method not found"
+    s = sched.group(1)
+    assert "if (this._resyncTimer != null) return;" in s
+    assert "Math.random() * TRUNCATED_RESYNC_JITTER_MS" in s
+    null_then_load = s.index("this._resyncTimer = null;")
+    load = s.index("this._loadHistoryThenConnect(this.wsId);")
+    assert null_then_load < load, (
+        "the firing path must null the handle BEFORE loading, or "
+        "disconnectSSE (called inside the load) would cancel the work it "
+        "is part of"
+    )
+    dis = re.search(r"disconnectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert dis is not None, "disconnectSSE not found"
+    assert "clearTimeout(this._resyncTimer)" in dis.group(1)
+    # (8) interleaving-proof gap repair: the truncation-time cursor is a
+    # single record — captured keep-oldest at the envelope, cleared by
+    # any full committed-history render (replayHistory) or a ws switch —
+    # and the CONNECT CHOKEPOINT consumes it: while set, every manual
+    # (re)connect presents it instead of the since-advanced live cursor,
+    # so the server re-answers replay_truncated and the resync re-arms
+    # no matter which teardown (hide/show, degraded cooldown, recover
+    # beat, failed /history fetch) cancelled the pending jittered timer.
+    # A cancellable timer alone silently lost the repair when a
+    # hide/show cycle landed inside the jitter window.
+    assert re.search(
+        r"if \(this\._truncatedFromCursor == null\) \{\s*"
+        r"this\._truncatedFromCursor = this\._lastEventId;",
+        t,
+    ), "the truncated case must record the truncation-time cursor keep-oldest"
+    load = body.index("_loadHistoryThenConnect(wsId) {")
+    load_seg = body[load : body.index("async _refetchHistory(", load)]
+    assert "if (this.wsId !== wsId) this._truncatedFromCursor = null;" in load_seg, (
+        "a ws switch must drop the old ws's truncation record"
+    )
+    replay_fn = body.index("replayHistory(messages) {")
+    assert "this._truncatedFromCursor = null;" in body[replay_fn : replay_fn + 900], (
+        "a successful full-history render must clear the truncation record"
+    )
+    conn = body.index("connectSSE(wsId) {")
+    conn_seg = body[conn : body.index("this.evtSource = new EventSource", conn)]
+    assert "this._truncatedFromCursor != null" in conn_seg, (
+        "connectSSE must consult the truncation record"
+    )
+    assert "encodeURIComponent(connectCursor)" in conn_seg
+    # (9) same-ws supersession must not strand the queued edit-and-resend
+    # (the jittered resync bumps _historyLoadToken through
+    # _loadHistoryThenConnect while a clear_ui edit flow is in flight);
+    # only a ws SWITCH discards the resend, and then it recovers the
+    # composer instead of leaving the latch armed for the next ws.
+    clear = re.search(r'case "clear_ui": \{(.*?)break;', body, re.S)
+    assert clear is not None, "clear_ui case not found"
+    cl = clear.group(1)
+    assert "const editWs = this.wsId;" in cl
+    assert "if (token !== this._historyLoadToken && this.wsId !== editWs)" in cl, (
+        "only a cross-ws supersession may discard the edit-and-resend"
+    )
+    assert "this._pendingEditSend = null;" in cl
+    assert "this.setBusy(false);" in cl
 
 
 def test_degraded_catchup_stops_live_stream_and_retries() -> None:

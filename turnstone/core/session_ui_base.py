@@ -1141,18 +1141,36 @@ class SessionUIBase:
             ``last_event_id`` (the client has already seen everything
             up to and including ``last_event_id``).
 
-        Empty buffer: returned ``status="replay_ok"`` with empty
-        ``replay_events`` regardless of ``last_event_id``.  This is
-        the cold-start case (the ws just bootstrapped with no events
-        ever) and the all-quiet case (a long-idle ws past which all
-        events fall out of the buffer cap, but in practice the buffer
-        starts evicting only after the cap is hit — which means the
-        counter is at the cap and the client's last_event_id is below
-        earliest, so they get ``truncated`` instead).  We can't
-        distinguish the two without a separate ``highest_evicted_id``
-        tracker; treating empty as ``replay_ok`` is the safe choice
-        for the genuine cold-start case (no false ``replay_truncated``
-        envelopes on freshly-opened workstreams).
+        Empty buffer: the ring is created once and only ever appended
+        (one call site, :meth:`_enqueue_direct`; a ``deque(maxlen=…)``
+        past its cap evicts but never empties), so an empty ring means
+        exactly one of two things and the ``_event_id`` counter
+        distinguishes them:
+
+          - ``_event_id == 0`` — genuine cold start (brand-new ws,
+            nothing ever emitted) → ``"replay_ok"`` with an empty
+            slice.  No false ``replay_truncated`` on freshly-opened
+            workstreams; the ``> 0`` guard also rejects a malformed
+            negative cursor (``?last_event_id=-1`` parses as an int).
+          - ``_event_id > 0`` — this UI instance was rebuilt over an
+            existing conversation (:meth:`_seed_event_id_from_storage`
+            reseeds the counter from ``MAX(conversations.event_id)``
+            on rehydrate / node restart) and the ring died with the
+            old process.  A client whose ``last_event_id`` is BELOW
+            the counter provably missed events that no ring can
+            replay → ``"truncated"``, so the client runs its
+            /history resync instead of silently continuing with a
+            hole (the pre-fix behaviour: stuck-busy panes and
+            committed turns missing until a manual reload).
+            ``last_event_id == _event_id`` (strict ``<`` is
+            load-bearing) means the client saw everything before the
+            rebuild — no loss, ``"replay_ok"``.
+
+        On the empty-ring truncated path ``lost_count`` is the exact
+        counter gap and ``earliest_available_id`` is ``_event_id + 1``
+        (the next id that will exist; nothing below it is retained).
+        No production client reads either field — they are envelope
+        forensics — but tests assert them.
         """
         client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
         # Lock order matches writer: ``_ws_lock`` outer, ``_listeners_lock``
@@ -1176,6 +1194,14 @@ class SessionUIBase:
             "seq": snap_seq,
         }
         if not buffered:
+            # Derived staleness — see the docstring's empty-buffer
+            # section.  ``snap_seq`` (the counter captured under the
+            # registration locks) rather than a re-read of
+            # ``self._event_id`` keeps the check atomic with the
+            # listener registration.
+            if snap_seq > 0 and last_event_id < snap_seq:
+                lost_count = snap_seq - last_event_id
+                return client_queue, [], "truncated", lost_count, snap_seq + 1, snapshot
             return client_queue, [], "replay_ok", 0, 0, snapshot
         earliest_id = buffered[0][0]
         if last_event_id < earliest_id - 1:
@@ -1205,6 +1231,21 @@ class SessionUIBase:
           - ``cursor < earliest_id - 1`` → False (would be ``truncated``);
           - no event id strictly greater than ``cursor`` → False (the
             delta would be empty — nothing in-flight to replay).
+
+        DELIBERATE asymmetry with ``register_listener_with_replay``'s
+        empty-ring branch (ruled 2026-07-20, do not "fix"): on an empty
+        ring with a stale cursor the register path reports
+        ``"truncated"`` (honesty — the client must resync from REST),
+        while this predicate stays False (an empty ring genuinely
+        cannot fast-forward, so ``/history`` must keep the in-flight
+        turn and withhold the cursor).  Mirroring the truncated rule
+        here would hand out cursors that point into a ring with
+        nothing in it — every such connect would immediately
+        re-truncate, looping the client through resync until new
+        events happen to cover the gap.  Both branches answer the same
+        underlying question ("can the ring cover it?" — no) at
+        different decision points: one picks the recovery MESSAGE, the
+        other picks the recovery ROUTE.
         """
         with self._listeners_lock:
             if not self._event_buffer:
