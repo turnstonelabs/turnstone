@@ -509,12 +509,14 @@ def require_project_denies_create(config_store: Any, auth: Any, project_id: Any)
 
     Serves both gated mounts: interactive creates on nodes and coordinator
     creates on the console. Refuses only when the gate is on, the caller is
-    not exempt automation, and no project is attached. "No project" is read
-    the way the create path actually persists it: a non-string body value
-    (int / bool / list / dict) is coerced to absent — exactly as
-    ``_coord_create_build_kwargs`` and the interactive create do — so a
-    truthy non-string like ``project_id: 123`` cannot stringify past the
-    gate and mint a projectless session; whitespace-only counts as none too.
+    not exempt automation, and no project is attached. The gate counts a
+    project as attached only when ``project_id`` is a non-empty string after
+    stripping; absent, empty, whitespace-only, or a non-string body value
+    (int / bool / list / dict) all read as "no project." Treating a
+    non-string as absent matches how ``_coord_create_build_kwargs`` persists
+    it (``None``) and stops a truthy non-string like ``project_id: 123`` from
+    stringifying past the gate and minting a projectless session while the
+    create stores no project.
     Exempt identities: the ``service`` scope (channel gateway,
     scheduler) and the sessions a coordinator spawns
     (``token_source == "coordinator"`` — minted per coordinator session for
