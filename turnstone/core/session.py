@@ -472,6 +472,47 @@ _active_shell_owner: contextvars.ContextVar[str | None] = contextvars.ContextVar
 _REPEAT_EXEMPT_TOOLS: frozenset[str] = frozenset({"bash_output"})
 
 
+# Tools whose results are orchestration *handles* — control-determining state
+# (a spawned child's ws_id, the task scratchpad, wait resolutions) the model
+# cannot re-derive once dropped.  At an exhausted context budget these cross
+# truncation with a guaranteed floor instead of the zero-budget drop: losing
+# tens of bytes of handle wedges the whole orchestration loop (#883 — a
+# coordinator can never ``wait_for_workstream`` a child whose ws_id it never
+# saw), while admitting a floored result costs at most
+# ``_TRUNCATION_FLOOR_CHARS`` against a safety margin the pre-send
+# ``_over_hard`` guard enforces anyway.  Only builtin names belong here: MCP
+# tools are namespaced ``mcp__{server}__{tool}`` and can never collide.
+# Background-bash spawn acks carry a shell_id handle too, but share the
+# "bash" name with foreground bash (whose huge outputs MUST stay
+# budget-truncated); they are covered by the drain's per-batch zero-budget
+# grace pool instead — see #891 before widening this set.
+_STRUCTURAL_FLOOR_TOOLS: frozenset[str] = frozenset(
+    {"spawn_workstream", "spawn_batch", "wait_for_workstream", "tasks"}
+)
+# The guaranteed admission size (chars, ~512 tokens at 4 chars/token): the
+# floor granted to structural-tool and error results, and the per-result
+# ceiling on the zero-budget verbatim grace pool below.
+# docs/architecture.md ("Tool Output Truncation") enumerates the floor
+# tools and these sizes in prose — keep it in sync when either changes.
+_TRUNCATION_FLOOR_CHARS: int = 2048
+# Per-BATCH grace pool (chars) funding verbatim admission of small
+# NON-structural results at zero budget (denial notices, spawn acks —
+# destroying a result smaller than the ~310-char drop notice is a net
+# loss).  Bounded so a wide batch of small results cannot collectively
+# bypass the per-output budget bookkeeping: once the pool is spent,
+# further results get the honest drop notice (~6x smaller than the
+# floor).  Structural/error floors do not draw from it.
+_ZERO_BUDGET_VERBATIM_POOL_CHARS: int = 2 * _TRUNCATION_FLOOR_CHARS
+# Hard cap on zero-budget mid-turn compaction attempts per send().  An
+# UNPRODUCTIVE attempt (budget still exhausted after) jumps straight to
+# the cap; productive attempts increment toward it, so a session whose
+# post-compact fixed overhead (system prompt + tool defs + summary)
+# hovers just under the zero line cannot pay an LLM summary call on
+# every tool batch — the marginal-recovery thrash regime.  2 = one
+# genuine recover-then-re-exhaust cycle per send.
+_ZERO_BUDGET_COMPACT_CAP_PER_SEND: int = 2
+
+
 # ONE source of truth for recognized boolean-arg strings — both coercers
 # below derive from these, so a new provider quirk added here reaches every
 # tool at once instead of drifting per-tool.
@@ -3416,22 +3457,66 @@ class ChatSession:
         self._print_status_line()
         return compacted
 
-    def _truncate_output(self, output: str, remaining_budget_tokens: int | None = None) -> str:
+    def _truncate_output(
+        self,
+        output: str,
+        remaining_budget_tokens: int | None = None,
+        floor_chars: int = 0,
+    ) -> str:
         """Truncate tool output, keeping head + tail.
 
         The effective limit is the *minimum* of:
         - ``self.tool_truncation`` (fixed cap, defaults to 50% of context)
         - ``remaining_budget_tokens`` converted to chars (if provided)
 
+        raised to at least ``floor_chars`` when given.  The floor is the
+        guaranteed admission size for results the orchestration cannot lose
+        (structural handles, error dispositions — the drain loop decides);
+        it deliberately wins over BOTH the budget and an operator-set cap,
+        because a lost ws_id or masked failure wedges the session outright
+        (#883) while an admitted floor costs ~512 tokens against a margin
+        the pre-send ``_over_hard`` guard enforces regardless.
+
         This ensures a single tool result cannot overflow the context window
         even when the conversation is already partially full.
+
+        A non-positive limit (context budget exhausted — reachable only via
+        the budget arm; ``tool_truncation`` is always positive) replaces the
+        output with an explicit drop notice.  Small results are usually
+        still admitted at zero budget, but that is the DRAIN's decision, not
+        this function's: the caller funds them through ``floor_chars`` from
+        a bounded per-batch grace pool, so collective verbatim admission
+        stays accounted (an unconditioned small-pass here let a wide batch
+        of small results bypass the per-output bookkeeping entirely).
+        The notice must never read as a
+        successful-but-trimmed call: the earlier placeholder did, and a
+        coordinator that "successfully" spawned a child while its ws_id was
+        silently destroyed stalled unrecoverably (#883).  It states what the
+        shell knows — the call ran; the output is gone — so the model
+        neither re-fires side-effecting calls nor waits on results it will
+        never see.  Full receipts are not preserved for re-derivation
+        (deliberate — see #883 discussion); re-running after compaction is
+        the recovery path for read-only calls.
         """
+        if not output:
+            # Nothing to truncate and nothing to account: an empty result
+            # always passes.  Without this, a zero-budget batch would
+            # replace a 0-char result with the ~310-char drop notice —
+            # false ("none of it could be added") and net-negative.
+            return output
         limit = self.tool_truncation
         if remaining_budget_tokens is not None:
             budget_chars = int(remaining_budget_tokens * self._chars_per_token)
             limit = min(limit, budget_chars)
+        limit = max(limit, floor_chars)
         if limit <= 0:
-            return f"[Output truncated — {len(output)} chars exceeded context budget]"
+            return (
+                f"Error: tool result dropped — context budget exhausted. The call ran "
+                f"and produced a {len(output)}-char result, but none of it could be "
+                f"added to the conversation. Do not assume the call failed and do not "
+                f"re-run side-effecting calls. Compact or wrap up; re-issue read-only "
+                f"calls afterwards if their output is still needed."
+            )
         if len(output) <= limit:
             return output
         half = limit // 2
@@ -6116,6 +6201,23 @@ class ChatSession:
                 )
                 if self._generation != my_generation:
                     return
+            # Send-scoped attempt counter for the zero-budget compaction
+            # trigger in the tool-result drain below, capped at
+            # ``_ZERO_BUDGET_COMPACT_CAP_PER_SEND``.  Each drain pass resets
+            # ``pre_attempted_compact``, so without send-scoped state a
+            # wedged turn re-pays the LLM summary call every tool batch.
+            # An UNPRODUCTIVE attempt (budget still exhausted after) jumps
+            # straight to the cap; a productive one increments toward it,
+            # so a genuine recover-then-re-exhaust still earns one fresh
+            # attempt while the marginal-recovery thrash regime (fixed
+            # overhead hovering just under the zero line, every attempt
+            # "productive" by a hair) is bounded at the cap all the same.
+            # Deliberately a LOCAL, not an instance attribute: the
+            # generation-swap ``return``s inside the loop would skip any
+            # end-of-send clear, and stale instance state would suppress a
+            # legitimate compaction on the NEXT send.  Dying with the call
+            # frame is the reset.
+            zero_budget_compact_attempts = 0
             while True:
                 self._check_cancelled(my_generation)
                 msgs = self._prepare_wire_messages(self._full_messages())
@@ -6323,11 +6425,93 @@ class ChatSession:
                     self._do_auto_compact("mid-turn", preserve_tail=1, my_generation=my_generation)
                     pre_attempted_compact = True
                 truncation_budget = self._remaining_token_budget()
+                if (
+                    truncation_budget <= 0
+                    and not pre_attempted_compact
+                    and zero_budget_compact_attempts < _ZERO_BUDGET_COMPACT_CAP_PER_SEND
+                    and self._generation == my_generation
+                ):
+                    # Zero tool-result budget wedges the loop BELOW the owed
+                    # thresholds: with max_tokens ≥ context_window/4 the
+                    # response reserve zeroes the budget near 70% fullness,
+                    # well under auto_compact_pct, and a stalled model
+                    # appends too little to ever cross it — so without this
+                    # trigger the session can sit in the zero band
+                    # indefinitely while every tool result is floored or
+                    # dropped (#883).  Zero budget is itself
+                    # compaction-owed evidence.  ``auto=True`` WITHOUT
+                    # ``threshold_pct``, exactly like the ctx-overflow
+                    # retry: no threshold was evaluated, so the notice must
+                    # not claim one.  Bounded per send by the attempt
+                    # counter; if compaction cannot clear the band the
+                    # floor/drop-notice path below is the backstop.
+                    self._compact_messages(
+                        auto=True,
+                        preserve_tail=1,
+                        my_generation=my_generation,
+                        where="mid-turn, tool-result budget exhausted",
+                    )
+                    self._print_status_line()
+                    pre_attempted_compact = True
+                    zero_budget_compact_attempts += 1
+                    truncation_budget = self._remaining_token_budget()
+                    if truncation_budget <= 0:
+                        # The attempt didn't clear the band (bail, or the
+                        # post-compact floor of system prompt + summary +
+                        # tool defs alone exceeds the zero threshold on
+                        # this window) — retrying cannot help, so burn the
+                        # remaining attempts for this send.
+                        zero_budget_compact_attempts = _ZERO_BUDGET_COMPACT_CAP_PER_SEND
                 _truncated: dict[str, str] = {}
+                # Per-batch grace pool: small NON-structural results are
+                # admitted verbatim at zero budget by funding their own
+                # size as the floor, until the pool is spent — bounding
+                # THIS door's collective admission where an unconditioned
+                # small-pass would let N small results bypass the
+                # per-output bookkeeping below entirely.  The pool bounds
+                # only the small-result door; the structural/error floors
+                # below are per-result by design (ruling at their site).
+                zero_budget_verbatim_pool = _ZERO_BUDGET_VERBATIM_POOL_CHARS
                 for tc_id, output in results:
                     if isinstance(output, str):
+                        # Structural handles and error dispositions get the
+                        # guaranteed floor: neither may be zero-dropped (a
+                        # lost ws_id stalls orchestration, a masked failure
+                        # reads as success — #883).  ``_tool_error_flags``
+                        # is still populated here; the per-result loop
+                        # below pops it to build the persisted turn.
+                        # DELIBERATELY per-result, with NO aggregate cap
+                        # (unlike the grace pool): capping structural
+                        # floors would re-open #883 for wide fan-outs
+                        # (every parallel spawn's handle is needed or its
+                        # child orphans), and capping error floors would
+                        # mask failures behind a success-leaning notice —
+                        # inviting the blind re-runs #865/#866 exist to
+                        # prevent.  Worst case is bounded by the model's
+                        # own batch width and lands on the pre-send
+                        # ``_over_hard`` guard / ctx-overflow retry: one
+                        # extra compaction round-trip, traded for never
+                        # losing a handle or a disposition.
+                        _floor = (
+                            _TRUNCATION_FLOOR_CHARS
+                            if (
+                                _tc_names.get(tc_id, "") in _STRUCTURAL_FLOOR_TOOLS
+                                or self._tool_error_flags.get(tc_id, False)
+                            )
+                            else 0
+                        )
+                        if (
+                            _floor == 0
+                            and truncation_budget <= 0
+                            and len(output) <= _TRUNCATION_FLOOR_CHARS
+                            and zero_budget_verbatim_pool >= len(output)
+                        ):
+                            _floor = len(output)
+                            zero_budget_verbatim_pool -= len(output)
                         truncated = self._truncate_output(
-                            output, remaining_budget_tokens=truncation_budget
+                            output,
+                            remaining_budget_tokens=truncation_budget,
+                            floor_chars=_floor,
                         )
                         _truncated[tc_id] = truncated
                         truncation_budget = max(
@@ -9914,6 +10098,10 @@ class ChatSession:
             "skills": self._prepare_skills,
             # Coordinator tools: only reachable when this session was
             # constructed with kind="coordinator" (COORDINATOR_TOOLS set).
+            # A new tool whose result is an orchestration HANDLE (ws_id,
+            # task scratchpad, wait resolution) must also join
+            # ``_STRUCTURAL_FLOOR_TOOLS`` or it loses its zero-budget
+            # truncation floor and re-opens the #883 wedge.
             "spawn_workstream": self._prepare_spawn_workstream,
             "spawn_batch": self._prepare_spawn_batch,
             "close_all_children": self._prepare_close_all_children,
