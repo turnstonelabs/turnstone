@@ -290,7 +290,11 @@ class Pane {
     this._streamElIndex = new Map();
     this._resizeObs = null;
     // Set when replay_truncated arrives mid-stream (refetching then would
-    // detach the live bubble); consumed on the next idle edge.
+    // detach the live bubble); consumed on the next idle edge.  Cleared by
+    // _loadHistoryThenConnect at load start AND by replayHistory's
+    // supersession (a successful full render obsoletes the deferred
+    // resync — without that clear, a clear_ui heal left the latch armed
+    // and the next idle edge fired a phantom full resync).
     this._pendingTruncatedResync = false;
     // The cursor position a replay_truncated envelope was received AT —
     // i.e. "a gap of lost events exists BELOW this cursor".  Keep-oldest:
@@ -329,7 +333,19 @@ class Pane {
     // tears the transport down (ws switch via _loadHistoryThenConnect,
     // close-on-hide, degraded entry, destroy) also discards a resync
     // scheduled for the OLD stream — the next connect's own truncated
-    // envelope reschedules if the gap still exists.
+    // envelope reschedules if the gap still exists.  Also cancelled by
+    // replayHistory's supersession: a successful full render obsoletes a
+    // pending resync (a clear_ui heal keeps the stream live, so no
+    // teardown would otherwise catch the timer).  The heal-time cancel is
+    // safe against dropping a NEEDED repair because every clear_ui
+    // emitter is turn-free at emission — rewind/retry are busy-gated
+    // server-side, and the open post-load replay fires only on rehydrate,
+    // behind the already-loaded shortcut — so a heal render is never a
+    // cursor-trimmed snapshot of a pre-existing executing turn, and a
+    // turn STARTING mid-heal rides the replay quiesce (its events land
+    // after these clears and re-arm if truncated).  If a clear_ui emitter
+    // that can coexist with an executing turn is ever added, the heal
+    // must instead re-arm the resync when /history returns a cursor.
     this._resyncTimer = null;
     this._degradedCooldownMs = DEGRADED_COOLDOWN_BASE_MS;
     // Timestamp of the last degraded-catchup trip; drives the cooldown
@@ -1556,7 +1572,8 @@ class Pane {
     // spread is applied here, before the fetch.  During the wait the
     // pane keeps painting live events from the still-open stream; the
     // gap predates the resync either way, so the only cost is a
-    // delayed backfill.  disconnectSSE owns cancellation (ws switch,
+    // delayed backfill.  disconnectSSE cancels teardown-orphaned resyncs
+    // and replayHistory supersedes on a heal (ws switch,
     // hide, degraded entry, destroy — see the field comment).
     if (this._resyncTimer != null) return; // one pending resync at a time
     this._resyncTimer = setTimeout(() => {
@@ -2979,11 +2996,25 @@ class Pane {
   replayHistory(messages) {
     this.messagesEl.replaceChildren();
     // A full committed-history render repairs any recorded truncation
-    // gap — whether this render came from the truncated resync itself or
-    // from an unrelated clear_ui rebuild.  Clear the retry cursor so a
-    // LATER failed reload doesn't rewind onto a gap that no longer
-    // exists.
+    // gap — from the resync itself or an unrelated clear_ui rebuild — so
+    // it supersedes ALL pending repair intent in one place: retry cursor,
+    // deferred mid-turn latch, pending jittered timer.  The latch/timer
+    // clears do real work ONLY on the clear_ui heal (every
+    // _loadHistoryThenConnect flavor cleared both before the fetch); a
+    // latch or timer surviving that heal fired a phantom load at the next
+    // idle edge — false truncatedGaps bump, needless teardown, and a
+    // cursorless reconnect with nothing armed on its failed-fetch leg.
+    // The timer's fire path nulls its handle before loading, so this
+    // cancel never cancels work it is part of.  Safe on the heal path
+    // because clear_ui emitters are turn-free at emission (see the
+    // _resyncTimer field comment).  Mirrors coordinator.js
+    // refetchHistory's supersession.
     this._truncatedFromCursor = null;
+    this._pendingTruncatedResync = false;
+    if (this._resyncTimer) {
+      clearTimeout(this._resyncTimer);
+      this._resyncTimer = null;
+    }
     // The rebuild just orphaned any in-flight streaming targets — reset them,
     // and release the agent-card/orphan maps whose entries now point at
     // replaced subtrees (detached-DOM retention).

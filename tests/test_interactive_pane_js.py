@@ -601,8 +601,26 @@ def test_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
         "a ws switch must drop the old ws's truncation record"
     )
     replay_fn = body.index("replayHistory(messages) {")
-    assert "this._truncatedFromCursor = null;" in body[replay_fn : replay_fn + 900], (
+    replay_head = body[replay_fn : replay_fn + 1200]
+    assert "this._truncatedFromCursor = null;" in replay_head, (
         "a successful full-history render must clear the truncation record"
+    )
+    # (8b) ...and supersede ALL pending repair intent in the same breath —
+    # the deferred mid-turn latch and any pending jittered timer.  Without
+    # these, a clear_ui heal left them armed and the next idle edge fired a
+    # phantom _loadHistoryThenConnect against the repaired gap (false
+    # truncatedGaps bump; on its failed-fetch leg, a cursorless reconnect
+    # with nothing armed).  Every _loadHistoryThenConnect flavor
+    # clears both BEFORE its fetch, so these are no-ops on the load paths —
+    # the clear_ui heal is the path they exist for.  Mirrors the
+    # coordinator's refetchHistory supersession.
+    assert "this._pendingTruncatedResync = false;" in replay_head, (
+        "replayHistory must clear the deferred-resync latch — a latch "
+        "surviving a heal fires a phantom resync at the next idle edge"
+    )
+    assert "clearTimeout(this._resyncTimer)" in replay_head, (
+        "replayHistory must cancel a pending jittered resync — the render "
+        "just repaired the gap it was scheduled for"
     )
     conn = body.index("connectSSE(wsId) {")
     conn_seg = body[conn : body.index("this.evtSource = new EventSource", conn)]
@@ -624,6 +642,9 @@ def test_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
     )
     assert "this._pendingEditSend = null;" in cl
     assert "this.setBusy(false);" in cl
+    # Supersession is centralized at the render (replayHistory) — clear_ui
+    # must not grow a path-local resync cancel of its own.
+    assert "clearTimeout(this._resyncTimer)" not in cl
 
 
 def test_degraded_catchup_stops_live_stream_and_retries() -> None:
