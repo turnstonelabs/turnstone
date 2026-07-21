@@ -46,7 +46,10 @@ from tests._sse_recovery_server import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-pytestmark = [pytest.mark.e2e_recovery, pytest.mark.live]
+# NOT ``live`` — these run a scripted provider, no LLM backend.  The CI
+# lanes deselect via ``-m "not live and not e2e_recovery"``; select with
+# ``-m e2e_recovery``.
+pytestmark = pytest.mark.e2e_recovery
 
 
 # ---------------------------------------------------------------------------
