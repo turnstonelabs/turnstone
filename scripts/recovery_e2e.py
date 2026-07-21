@@ -27,19 +27,21 @@ the page asserts the final DOM has the expected top-level tool rows, the
 task_agent card nests its sub-tool rows (NO child escaped to the top
 level), and the composer settles idle. Stamps ``RECOVERY-READY-STORM-<n>``.
 
-Scenario B (hide -> restart -> show): the page runs a turn, the runner
-hides the tab (interactive.js closes the stream), restarts the node on the
-SAME port (fresh empty ring, storage-seeded counter), then shows the tab;
-the pane reconnects to the restarted node, the committed transcript stays
-intact, and the composer settles idle. Stamps ``RECOVERY-READY-RESTART``.
-
-The specific ``replay_truncated`` envelope is NOT asserted at the browser
-level here: it needs a browser cursor below the restarted node's seeded
-counter, and Chrome's ``EventSource`` tracks that cursor internally only on
-its native auto-reconnect (not on the close-on-hide reconnect, which opens
-a fresh stream). The truncated -> lost_count -> /history-cursor rebuild is
-proven deterministically at the server-contract level in Tier 1's
-``test_restart_truncated_honesty`` / ``test_failed_resync_retries_via_truncation_record``.
+Scenario B (hide mid-turn -> restart -> show): the runner hides the tab
+the moment the first streamed line paints (freezing the pane's cursor at
+a mid-turn event id — the MessageEvent ``lastEventId`` capture is what
+makes that cursor real; the pre-2026-07 object-form read left it null and
+this whole path unassertable), lets the turn and a follow-up text commit
+while hidden, restarts the node on the SAME port (fresh empty ring,
+storage-seeded counter), then shows the tab.  The show-edge reconnect
+presents the stale cursor, MUST draw ``replay_truncated`` (asserted:
+trunc>=1), the truncated resync rebuilds from /history, and the turns
+committed during the hide window MUST be present afterwards (asserted:
+``healed`` — the 'turn disappeared' field symptom).  Stamps
+``RECOVERY-READY-RESTART-rows<n>-trunc<n>``.  The exact ``lost_count``
+arithmetic and the failed-resync retry stay at the server-contract level
+in Tier 1's ``test_restart_truncated_honesty`` /
+``test_failed_resync_retries_via_truncation_record``.
 
 A NOTE ON THE BROWSER OVERFLOW (server-side poison): a real listener-queue
 poison needs the browser to STOP reading the socket so TCP backpressure
@@ -81,6 +83,13 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Healed-gap sentinel for scenario B: injected as the scripted turn-2 text
+# AND threaded to the page via ``?healed=`` (read into ``healedSentinel``),
+# so the injected text and the DOM check share one definition.  Must never
+# collide with rendered command/output text — the bash command row paints
+# its shell source verbatim, which contains the keyword ``done``.
+HEALED_SENTINEL = "HEALED-e5b1"
+
 # ---------------------------------------------------------------------------
 # The recovery page — served same-origin by the node at /recovery.
 # ---------------------------------------------------------------------------
@@ -117,6 +126,9 @@ PAGE_HTML = r"""<!doctype html>
       const wsId = q.get("ws_id");
       const scenario = q.get("scenario") || "storm";
       const expectRows = parseInt(q.get("rows") || "4", 10);
+      // Healed-gap sentinel, threaded from the runner (HEALED_SENTINEL)
+      // so the injected turn text and this check cannot drift apart.
+      const healedSentinel = q.get("healed") || "";
 
       // REAL pane against THIS origin (base=""): real authFetch (cookie) and
       // real EventSource. The default host provides all SSE seams.
@@ -212,24 +224,41 @@ PAGE_HTML = r"""<!doctype html>
           return origHandle(ev);
         };
         window.__verifyRestart = function () {
-          // Browser-level restart RECOVERY: after the node restarts on the
-          // same port, the pane reconnects (status bar not stuck
-          // disconnected), the committed transcript is intact, and the
-          // composer settles idle. (The specific ``replay_truncated``
-          // envelope requires a browser cursor below the restarted node's
-          // seeded counter; Chrome's EventSource tracks that cursor
-          // internally only on its native auto-reconnect, so it is proven
-          // deterministically at the server-contract level in Tier 1's
-          // test_restart_truncated_honesty. ``__truncatedSeen`` is recorded
-          // here for the runs where it does fire.)
+          // Browser-level restart RECOVERY, full contract: the runner hid
+          // the tab MID-turn (cursor frozen below the commits that land
+          // while hidden), so the show-edge reconnect must present the
+          // stale cursor and draw ``replay_truncated`` (REQUIRED since the
+          // MessageEvent lastEventId capture fix — the pre-fix object-form
+          // read left manual reconnects cursorless and this envelope
+          // unreachable, which is why trunc used to report 0), the
+          // truncated resync must rebuild from /history, and the turns
+          // committed DURING the hide window must be present afterwards
+          // (``healed`` — the 'turn disappeared' field symptom).  Composer
+          // idle, status bar not stuck disconnected.
           const c = domCounts();
           const idle = !pane.busy;
           const disc = document.querySelector(".ws-sb-disconnected") !== null;
-          document.title =
-            c.topLevel >= 1 && idle && !disc
-              ? "RECOVERY-READY-RESTART-rows" + c.topLevel + "-trunc" + window.__truncatedSeen
-              : "RECOVERY-FAILED-RESTART-rows" + c.topLevel +
-                "-busy" + (pane.busy ? 1 : 0) + "-disc" + (disc ? 1 : 0);
+          // Sentinel must be collision-proof against everything else the
+          // transcript renders: the paced bash COMMAND row paints its
+          // shell text verbatim (buildConvCmd), which contains the
+          // keyword ``done`` — a plain-word sentinel is vacuously
+          // present whether or not the hidden-window turn survived.
+          // The value rides the ?healed= param (single source:
+          // HEALED_SENTINEL in the runner).
+          const healed =
+            healedSentinel !== "" &&
+            (pane.messagesEl.textContent || "").includes(healedSentinel);
+          const ok =
+            c.topLevel >= 1 &&
+            idle &&
+            !disc &&
+            healed &&
+            window.__truncatedSeen >= 1;
+          document.title = ok
+            ? "RECOVERY-READY-RESTART-rows" + c.topLevel + "-trunc" + window.__truncatedSeen
+            : "RECOVERY-FAILED-RESTART-rows" + c.topLevel +
+              "-busy" + (pane.busy ? 1 : 0) + "-disc" + (disc ? 1 : 0) +
+              "-healed" + (healed ? 1 : 0) + "-trunc" + window.__truncatedSeen;
         };
       }
     </script>
@@ -514,31 +543,54 @@ def run_restart(chrome: str) -> str:
 
     port = _free_port()
     node = _boot_node(port=port)
-    # A PACED turn so the tab can hide MID-turn (browser cursor below the
-    # committed counter) -> the post-restart reconnect draws truncated.
+    # A PACED turn so the tab can hide MID-turn: the browser cursor
+    # freezes at a mid-stream event id, the rest of turn 1 plus the
+    # turn-2 text commit while hidden, and the restarted node's seeded
+    # counter therefore sits ABOVE the frozen cursor -> the show-edge
+    # reconnect draws ``replay_truncated`` and must heal the gap.
     paced = parallel_bash_script({"r0": "for i in $(seq 1 40); do echo r-$i; sleep 0.05; done"})
-    ws_id = node.create_workstream(paced, final_text_script("done"), name="browser-restart")
+    # The turn-2 text is the healed-gap sentinel — it must be a token
+    # that cannot appear in any rendered command/output (the bash
+    # command row contains the shell keyword ``done``, so the obvious
+    # word is vacuously present; see __verifyRestart).  Single source:
+    # the same constant is injected as the scripted turn text AND
+    # threaded to the page via ?healed=, so the two sides cannot drift.
+    ws_id = node.create_workstream(
+        paced, final_text_script(HEALED_SENTINEL), name="browser-restart"
+    )
     profile = Path(_scratch()) / "chrome-restart"
     proc, cdp_port = _launch_chrome(chrome, profile)
     cdp: CDP | None = None
     try:
         cdp = CDP(_page_ws_url(cdp_port))
-        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=restart"
+        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=restart&healed={HEALED_SENTINEL}"
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
-        node.wait_turn(ws_id, timeout=30)  # the turn renders into the DOM
-        time.sleep(0.5)
-        # Hide the tab -> interactive.js closes the stream (close-on-hide).
+        # Hide as soon as the FIRST streamed line has painted (proof the
+        # pane holds a live mid-turn cursor) — NOT after wait_turn, which
+        # would leave the cursor at/above the committed counter and the
+        # reconnect on the lossless replay_ok path (trunc0).
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            painted = cdp.evaluate("document.querySelector('.tool-output-stream') !== null")
+            if painted:
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError("restart scenario: first streamed line never painted")
         cdp.evaluate("window.__hide && window.__hide()")
+        # The turn (and the follow-up text) commits while the tab is hidden.
+        node.wait_turn(ws_id, timeout=30)
         # Restart the node on the SAME port (fresh empty ring, seeded counter).
         node.stop()
         node = _boot_node(port=port)
         node.open_workstream(ws_id)
-        # Show the tab -> the pane reconnects to the restarted node and recovers.
-        # The reconnect + any resync carries jitter, so settle before the verdict.
+        # Show the tab -> stale-cursor reconnect -> truncated -> jittered
+        # resync (0-10s) -> /history rebuild.  Settle past the worst-case
+        # jitter before the verdict.
         cdp.evaluate("window.__show && window.__show()")
-        time.sleep(9.0)
+        time.sleep(12.0)
         cdp.evaluate("window.__verifyRestart && window.__verifyRestart()")
-        return _poll_title(cdp, 15)
+        return _poll_title(cdp, 20)
     finally:
         if cdp is not None:
             cdp.close()

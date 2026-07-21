@@ -16,13 +16,6 @@ let workstreams = {};
 let currentWsId = null;
 let globalEvtSource = null;
 let globalRetryDelay = 1000;
-// Saved high-water mark for the manual-reconnect path (the
-// EventSource constructor can't set custom headers, so the
-// browser-native ``Last-Event-ID`` header is unavailable on
-// reconnect — we thread it via ``?last_event_id=N`` instead).  Updated
-// from ``globalEvtSource.lastEventId`` on every onmessage; native
-// auto-reconnect uses the header directly on the same source object.
-let globalLastEventId = null;
 let dashboardVisible = false;
 let _historyNavigation = false;
 let _lastHealth = null;
@@ -1759,28 +1752,29 @@ function connectGlobalSSE() {
     globalEvtSource.close();
     globalEvtSource = null;
   }
-  // Manual-reconnect path threads ``?last_event_id=N`` because the
-  // EventSource constructor can't set headers; native auto-reconnect
-  // on the same source uses the header directly.
-  let globalUrl = "/v1/api/events/global";
-  if (globalLastEventId) {
-    globalUrl += "?last_event_id=" + encodeURIComponent(globalLastEventId);
-  }
-  globalEvtSource = new EventSource(globalUrl);
+  // Manual reconnects on the GLOBAL stream are DELIBERATELY cursorless
+  // (no ``?last_event_id=`` — do not add a MessageEvent lastEventId
+  // capture here like the per-ws streams'): the global ring cannot
+  // report truncation for a stale cursor after a node restart (its
+  // counter reboots at 0 — KNOWN GAP #881), so presenting one draws
+  // ``replay_ok``-empty with NO node_snapshot and the roster ghosts
+  // exactly when a full rebuild is most needed.  Cursorless manual
+  // reconnects always draw the fresh node_snapshot — lossless for
+  // roster STATE (unlike per-ws append-only history, where the
+  // storage-seeded counter makes a stale cursor report ``truncated``
+  // and the cursor is therefore safe to track).  Native auto-reconnect
+  // keeps its browser-internal header either way.  Revisit when #881's
+  // boot-epoch staleness signal lands.
+  globalEvtSource = new EventSource("/v1/api/events/global");
   globalEvtSource.onopen = function () {
     globalRetryDelay = 1000;
   };
   globalEvtSource.onmessage = function (e) {
-    // Capture lastEventId BEFORE JSON.parse (see Pane.connectSSE
-    // onmessage for full rationale).
-    if (globalEvtSource && globalEvtSource.lastEventId) {
-      globalLastEventId = globalEvtSource.lastEventId;
-    }
-    // Guarded parse: the cursor above has already advanced past this frame,
-    // so a parse failure is a permanently-lost roster mutation — resync the
-    // roster from REST instead of silently drifting (a dropped ws_created
-    // renders as a conversation that never appears; a dropped ws_closed as
-    // a ghost row forever).
+    // Guarded parse: native auto-reconnect's header cursor has already
+    // advanced past this frame, so a parse failure is a permanently-lost
+    // roster mutation — resync the roster from REST instead of silently
+    // drifting (a dropped ws_created renders as a conversation that
+    // never appears; a dropped ws_closed as a ghost row forever).
     let data = null;
     try {
       data = JSON.parse(e.data);
