@@ -1366,17 +1366,23 @@ class Pane {
     };
 
     this.evtSource.onmessage = (e) => {
-      // Capture lastEventId BEFORE JSON.parse so a (rare) malformed
-      // event doesn't desync the manual-reconnect fallback from
-      // native auto-reconnect (which advances lastEventId regardless
-      // of whether we successfully process the data).  Server's
-      // stamping contract: ``id:`` only on events sourced from the
-      // per-ws ring buffer — synthetic replay events (history /
-      // state_change / in_progress_snapshot) don't advance the
-      // counter, so reconnect resumes from the last BUFFERED id (or
-      // none on a truly-fresh connect that never received one).
-      if (this.evtSource && this.evtSource.lastEventId) {
-        this._lastEventId = this.evtSource.lastEventId;
+      // Capture lastEventId from the MESSAGE EVENT, before JSON.parse,
+      // so a malformed frame can't desync the manual-reconnect cursor
+      // from native auto-reconnect.  Spec shape — do NOT revert to
+      // reading the property off the EventSource OBJECT: per WHATWG the
+      // id lives on MessageEvent only, so the pre-2026-07 object-form
+      // read was a dead conditional and every manual reconnect (show
+      // edge, degraded retry, recover beat) went cursorless, silently
+      // dropping turns committed during the gap.  Guard: ``!= null &&
+      // !== ""`` — no-id frames carry "" per spec.  (lastEventId is a
+      // DOMString, so the valid id "0" — the error-surface snap_seq —
+      // is TRUTHY and plain truthiness would also accept it; the
+      // explicit form is for parity with the NUMERIC cursor gates
+      // below, where bare truthiness genuinely drops 0.)  Stamping
+      // contract: ``id:`` rides only ring-buffered events; synthetic
+      // replay frames never advance it.
+      if (e.lastEventId != null && e.lastEventId !== "") {
+        this._lastEventId = e.lastEventId;
       }
       // Guarded parse + dispatch.  onmessage is the pane's whole event
       // pipeline: an exception escaping it doesn't close the EventSource, so

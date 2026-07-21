@@ -1024,7 +1024,11 @@ def _slice_balanced_body(body: str, anchor: int) -> str | None:
     depth = 0
     in_str: str | None = None
     start = i
-    while i < n and i - start < 8000:
+    # 12000: connectSSE reached ~7950 chars during the 2026-07 SSE
+    # recovery campaign (cursor-override + capture-rationale comments);
+    # the window exists to bound a runaway scan, not to cap legitimate
+    # method growth — keep it comfortably above the largest real body.
+    while i < n and i - start < 12000:
         ch = body[i]
         if in_str:
             if ch == "\\" and i + 1 < n:
@@ -1996,12 +2000,79 @@ def test_coord_detects_server_restart_by_backwards_event_id() -> None:
     m = re.search(r"evtSource\.onmessage = function \(event\) \{(.*?)\n    \};", body, re.S)
     assert m is not None, "onmessage handler not found"
     handler = m.group(1)
-    assert "Number(evtSource.lastEventId) < Number(lastEventId)" in handler
+    assert "Number(event.lastEventId) < Number(lastEventId)" in handler
     assert "!gapRefreshedAtOpen" in handler
     assert "refreshSidebarAfterGap();" in handler
-    check = handler.index("Number(evtSource.lastEventId) < Number(lastEventId)")
-    overwrite = handler.index("lastEventId = evtSource.lastEventId;")
+    check = handler.index("Number(event.lastEventId) < Number(lastEventId)")
+    overwrite = handler.index("lastEventId = event.lastEventId;")
     assert check < overwrite
+
+
+def test_sse_cursor_captured_from_message_event_never_the_source_object() -> None:
+    """``lastEventId`` lives on the MessageEvent — EventSource exposes no
+    such property (WHATWG: url/withCredentials/readyState only), so an
+    object-form read like ``evtSource.lastEventId`` is undefined in every
+    real browser.  All three clients shipped exactly that dead
+    conditional: the cursor never tracked live traffic, every MANUAL
+    reconnect (close-on-hide show edge, degraded retry, recover beat)
+    connected fresh, and turns committed during the gap silently never
+    painted — the 2026-07 'turn disappeared' field mechanism.  Only a
+    real-browser harness could catch it (source-pattern tests pinned the
+    broken form as happily as the fixed one), so this tripwire at least
+    pins the corrected form and forbids the dead one by name.
+
+    Guard shape is pinned too — the explicit ``!= null && !== ""`` form.
+    On a DOMString this is behaviorally identical to truthiness (the
+    valid id "0" is a truthy STRING; only "" and null/undefined are
+    falsy here), so the pin is for cross-site symmetry with the NUMERIC
+    cursor gates (``_lastEventId != null`` / ``data.cursor != null``),
+    where truthiness genuinely drops a valid 0 — one visual idiom for
+    every cursor guard keeps a future editor from "simplifying" the
+    numeric ones to match a terser string form.
+
+    The GLOBAL stream (app.js) is the deliberate exception: its manual
+    reconnects are pinned CURSORLESS — the global ring's counter reboots
+    at 0 on restart (KNOWN GAP #881), so a stale cursor draws
+    ``replay_ok``-empty with no node_snapshot and the roster ghosts;
+    cursorless always draws the fresh snapshot.  Revisit when #881
+    lands.
+
+    Comments are stripped before the scan (module-level, string-aware
+    stripper) so documentation may name the anti-pattern verbatim — the
+    tripwire forbids the dead CODE, not its description."""
+    dead_form = re.compile(r"(?:this\.)?\w*[Ee]vtSource\.lastEventId")
+    for path, capture in (
+        (
+            _INTERACTIVE_JS,
+            r'if \(e\.lastEventId != null && e\.lastEventId !== ""\) \{\s*'
+            r"this\._lastEventId = e\.lastEventId;",
+        ),
+        (
+            _COORD_JS,
+            r'if \(event\.lastEventId != null && event\.lastEventId !== ""\) \{',
+        ),
+    ):
+        body = path.read_text(encoding="utf-8")
+        code = _strip_js_comments(body)
+        hits = [m.group(0) for m in dead_form.finditer(code)]
+        assert not hits, (
+            f"{path.name}: cursor read off the EventSource OBJECT {hits} — "
+            "that property does not exist; capture from the MessageEvent."
+        )
+        assert re.search(capture, code), (
+            f"{path.name}: MessageEvent cursor capture (with the "
+            '``!= null && !== ""`` guard) not found'
+        )
+    app_code = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
+    assert not dead_form.search(app_code), (
+        "app.js: dead EventSource-object cursor read must not return"
+    )
+    assert "lastEventId" not in app_code and "last_event_id" not in app_code, (
+        "app.js global stream must stay CURSORLESS on manual reconnects "
+        "until #881's boot-epoch staleness signal lands — a stale cursor "
+        "on the reborn global ring draws replay_ok-empty with no "
+        "node_snapshot (ghost roster)."
+    )
 
 
 def test_interactive_history_is_rest_first_not_sse() -> None:

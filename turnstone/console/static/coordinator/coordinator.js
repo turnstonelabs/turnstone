@@ -2648,7 +2648,15 @@ function createCoordinatorPane(root, wsId, opts) {
       // Capture lastEventId BEFORE JSON.parse so a malformed event
       // doesn't desync the manual-reconnect fallback from native
       // auto-reconnect.
-      if (evtSource && evtSource.lastEventId) {
+      // ``lastEventId`` lives on the MESSAGE EVENT — EventSource exposes
+      // no such property, so the pre-2026-07 read off the source OBJECT
+      // was a dead conditional: the cursor never tracked live traffic
+      // and the counter-reset detector below never fired in a real
+      // browser.  ``!== ""``: no-id frames carry "" per spec.  (A
+      // DOMString — the valid id "0" is truthy, so truthiness would
+      // behave identically; the explicit form matches interactive.js's
+      // canonical capture.)
+      if (event.lastEventId != null && event.lastEventId !== "") {
         // A live event id BELOW our saved cursor means the server's per-ws
         // event counter reset — a coordinator process restart with a fresh,
         // empty ring.  The replay path can't flag that (a cursor at/above the
@@ -2661,12 +2669,12 @@ function createCoordinatorPane(root, wsId, opts) {
         if (
           lastEventId != null &&
           !gapRefreshedAtOpen &&
-          Number(evtSource.lastEventId) < Number(lastEventId)
+          Number(event.lastEventId) < Number(lastEventId)
         ) {
           refreshSidebarAfterGap();
           gapRefreshedAtOpen = true;
         }
-        lastEventId = evtSource.lastEventId;
+        lastEventId = event.lastEventId;
       }
       let data = null;
       try {
