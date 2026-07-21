@@ -103,6 +103,7 @@ testpaths = ["tests"]
 markers = [
     "live: requires a running LLM backend",
     "allow_thread_leak: test intentionally leaves a background thread running (opts out of the leaked-thread guard)",
+    "e2e_recovery: opt-in end-to-end SSE recovery harness (real server + real SSE consumers, scripted provider); tens of seconds each, deselected from the fast default suite. Co-marked ``live`` so the CI ``-m 'not live'`` run skips them; select with ``-m e2e_recovery``.",
 ]
 filterwarnings = [
     # mcp v1 deprecates streamablehttp_client for an entry point whose call
