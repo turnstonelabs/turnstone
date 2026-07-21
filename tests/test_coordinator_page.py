@@ -495,11 +495,20 @@ def test_coordinator_js_seeds_resume_cursor_only_on_initial_connect():
     Pins three invariants mirroring the app.js guards:
       1. ``refetchHistory`` takes a ``seedCursor`` flag (default false) and
          seeds ``lastEventId`` from ``hist.cursor`` only when set + non-null,
-         so the clear_ui / replay_truncated re-render callers (live stream,
-         no reconnect) don't rewind the live cursor.
-      2. the initial-connect path opts in via ``refetchHistory(true)``.
-      3. ``connectSSE`` gates ``?last_event_id=`` on ``!= null`` so a cursor
-         of 0 (a brand-new ws's first-turn boundary) isn't dropped.
+         so the clear_ui re-render caller (live stream, no reconnect — the
+         one remaining seedless caller after the #882 dead-stream ruling)
+         doesn't rewind the live cursor.
+      2. every caller that reconnects opts in: init via
+         ``await refetchHistory(true)``, and the truncated resync via
+         ``loadHistoryThenReconnect``'s ``refetchHistory(true).finally``
+         (cursor adoption is the #882 fix core — /history trims the
+         in-flight turn whenever it returns a cursor).
+      3. ``connectSSE`` gates ``?last_event_id=`` on ``connectCursor !=
+         null`` so a cursor of 0 (a brand-new ws's first-turn boundary)
+         isn't dropped — where ``connectCursor`` presents a recorded
+         truncation gap over the advanced live cursor (the gap-repair
+         chokepoint; see the truncated fresh-connect test in
+         test_app_js.py).
     """
     import re
     from pathlib import Path
@@ -510,7 +519,7 @@ def test_coordinator_js_seeds_resume_cursor_only_on_initial_connect():
     body = coord_js.read_text(encoding="utf-8")
     assert "async function refetchHistory(seedCursor = false)" in body, (
         "refetchHistory must take a seedCursor flag (default false) so only "
-        "the initial-connect caller seeds the resume cursor."
+        "the reconnecting callers seed the resume cursor."
     )
     assert re.search(
         r"if\s*\(\s*seedCursor\s*&&\s*hist\.cursor\s*!=\s*null\s*\)\s*"
@@ -520,10 +529,44 @@ def test_coordinator_js_seeds_resume_cursor_only_on_initial_connect():
     assert "await refetchHistory(true)" in body, (
         "the initial-connect path must call refetchHistory(true) to seed the cursor."
     )
+    flow = re.search(r"function loadHistoryThenReconnect\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert flow is not None, "loadHistoryThenReconnect not found"
+    assert "refetchHistory(true)" in flow.group(1) and ".finally(" in flow.group(1), (
+        "the truncated resync (loadHistoryThenReconnect) must seed via "
+        "refetchHistory(true) and reconnect in .finally."
+    )
     assert re.search(
-        r"if\s*\(\s*lastEventId\s*!=\s*null\s*\)\s*\{\s*url\s*\+=\s*\"\?last_event_id=\"",
+        r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*url\s*\+=\s*\"\?last_event_id=\"",
         body,
-    ), "connectSSE must gate ?last_event_id= on lastEventId != null (so cursor 0 isn't dropped)."
+    ), "connectSSE must gate ?last_event_id= on connectCursor != null (so cursor 0 isn't dropped)."
+
+
+def test_coordinator_refetch_failure_preserves_the_pane():
+    """A FAILED /history fetch must leave the message column and the
+    tool-row/batch tracking untouched (#882 G3): refetchHistory's wipe +
+    resets must sit AFTER the ``if (!hist) return`` guard.  Pre-fix the
+    wipe ran first, so a failed fetch — likeliest exactly during the
+    restart windows that trigger truncated resyncs — left an EMPTY pane
+    on a live stream with no retry record.  Stale-but-real beats blank,
+    and the maps stay valid against the untouched DOM."""
+    import re
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+    start = body.index("async function refetchHistory(seedCursor = false)")
+    fn = body[start : start + 3000]
+    guard = fn.index("if (!hist) return;")
+    wipe = fn.index("messagesEl.replaceChildren();")
+    resets = fn.index("toolRows.clear();")
+    assert guard < wipe and guard < resets, (
+        "refetchHistory must bail on a failed fetch BEFORE wiping the "
+        "pane or clearing the tool-row maps — a failed /history must be "
+        "a DOM no-op."
+    )
+    assert re.search(r"if \(!hist\) return;", fn), "failure guard missing"
 
 
 def test_coordinator_js_early_paints_pending_tool_calls():

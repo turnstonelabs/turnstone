@@ -1771,9 +1771,13 @@ def test_coord_stream_overflow_case_counts_and_rate_limits() -> None:
     body = _COORD_JS.read_text(encoding="utf-8")
     assert 'case "stream_overflow":' in body
     assert "noteStreamOverflow();" in body
-    # The three-way health counter distinguishes dropped events (overflow /
-    # malformed frame) from render wedges (dispatch / render throw).
-    assert "streamHealth = { overflows: 0, renderThrows: 0, malformedFrames: 0 }" in body
+    # The health object carries all four field-forensics counters; the
+    # truncated-resync counter distinguishes the replay-window class from
+    # the dropped-events class (overflows).
+    health = re.search(r"const streamHealth = \{(.*?)\};", body, re.S)
+    assert health is not None, "streamHealth initializer not found"
+    for field in ("overflows: 0", "renderThrows: 0", "malformedFrames: 0", "truncatedGaps: 0"):
+        assert field in health.group(1), f"streamHealth must init {field!r}"
     assert "streamHealth.overflows += 1;" in body
     assert "streamHealth.malformedFrames += 1;" in body
     # Exactly two render-throw increment sites: the noteRenderThrow helper
@@ -1789,11 +1793,13 @@ def test_coord_stream_overflow_case_counts_and_rate_limits() -> None:
     assert 'noteRenderThrow("streamingRender", e);' in body
     assert 'noteRenderThrow("in_progress_snapshot render", e);' in body
     assert 'noteRenderThrow("streamingRenderFinalize", e);' in body
+    # Overflow closes route through the ONE shared churn step (also fed by
+    # truncated resyncs — see the truncated fresh-connect test), keeping the
+    # class-specific instrumentation in noteStreamOverflow itself.
     note = re.search(r"function noteStreamOverflow\(\)\s*\{(.*?)\n  \}", body, re.S)
     assert note is not None, "noteStreamOverflow not found"
-    assert "overflowWindowTripped(" in note.group(1)
-    assert "enterDegradedCatchup()" in note.group(1)
-    # The trip handler only counts + trips; the cooldown reset lives in
+    assert "recordChurnAndMaybeTrip();" in note.group(1)
+    # The counting step only counts + trips; the cooldown reset lives in
     # enterDegradedCatchup (keyed off lastDegradedAt) — the finding [0] shape.
     assert "degradedCooldownMs" not in note.group(1), (
         "noteStreamOverflow must not touch the cooldown — that reset defeated the ladder escalation"
@@ -1929,16 +1935,25 @@ def test_coord_post_gap_sidebar_refresh_is_replay_aware() -> None:
     under close-on-hide must not rebuild the sidebar.  The refresh fires
     exactly when the replay cannot vouch for the gap: no resume cursor or an
     over-threshold gap at onopen, or the server's replay_truncated envelope
-    (ring evicted), deduped per open via gapRefreshedAtOpen."""
+    (ring evicted), deduped per open via gapRefreshedAtOpen.  While a
+    truncation gap is on record the onopen arm stands down entirely
+    (truncatedFromCursor == null gate): the gap machinery owns sidebar
+    recovery — gap-start envelope refresh + heal-time refresh — and the
+    failed-resync retry loop (which nulls lastEventId and never re-seeds it
+    on failure) must not re-fire this refresh once per reconnect."""
     body = _COORD_JS.read_text(encoding="utf-8")
     conn = re.search(r"function connectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
     assert conn is not None
     method = conn.group(1)
     gate = re.search(
-        r"wasReconnecting &&\s*\(lastEventId == null \|\| gapMs > GAP_REFRESH_THRESHOLD_MS\)",
+        r"wasReconnecting &&\s*truncatedFromCursor == null &&\s*"
+        r"\(lastEventId == null \|\| gapMs > GAP_REFRESH_THRESHOLD_MS\)",
         method,
     )
-    assert gate is not None, "onopen must gate the sidebar refresh on replay coverage"
+    assert gate is not None, (
+        "onopen must gate the sidebar refresh on replay coverage AND on no "
+        "truncation gap being on record (the gap machinery owns recovery)"
+    )
     assert "refreshSidebarAfterGap();" in method
     assert "gapRefreshedAtOpen = true;" in method
     # The ring-evicted signal triggers the same refresh (deduped per open).
@@ -1962,31 +1977,227 @@ def test_coord_post_gap_sidebar_refresh_is_replay_aware() -> None:
 
 def test_coord_defers_truncated_resync_and_consumes_at_idle() -> None:
     """replay_truncated seen mid-stream must be DEFERRED, not dropped (matches
-    interactive's _pendingTruncatedResync): refetching immediately would detach
-    the live bubble (content OR a reasoning-only one), but skipping outright
-    leaves the ring-evicted turns lost for the session.  The guard covers both
-    streaming targets and latches otherwise; the next state_change=idle consumes
-    the flag — which also repairs a turn stranded by close-on-hide (stream_end
-    evicted while hidden), resetting the streaming refs first since
-    refetchHistory does not null them."""
+    interactive's _pendingTruncatedResync): tearing down + refetching
+    immediately would detach the live bubble (content OR a reasoning-only
+    one), but skipping outright leaves the ring-evicted turns lost for the
+    session.  The guard covers both streaming targets and latches otherwise;
+    the next state_change=idle consumes the flag through the SAME dead-stream
+    flow as the immediate branch (loadHistoryThenReconnect, which owns the
+    streaming-ref reset) — recording the gap but NOT feeding the degraded
+    churn window (turn-settle timing already rate-limits this branch), and
+    NOT jittered (once per latch, staggered per pane by turn timing)."""
     body = _COORD_JS.read_text(encoding="utf-8")
     trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
     assert trunc is not None, "replay_truncated case not found"
     t = trunc.group(1)
     assert "if (!currentAssistantEl && !currentReasoningEl)" in t
-    assert "refetchHistory();" in t
     assert "pendingTruncatedResync = true;" in t
     st = re.search(r'case "state_change":(.*?)\n      case ', body, re.S)
     assert st is not None, "state_change case not found"
     s = st.group(1)
-    assert "if (pendingTruncatedResync)" in s
-    assert "pendingTruncatedResync = false;" in s
-    assert "currentAssistantEl = null;" in s
-    assert "refetchHistory();" in s
-    # Consume the latch, THEN reset the dangling refs and refetch.
-    consume = s.index("pendingTruncatedResync = false;")
-    refetch = s.index("refetchHistory();")
-    assert consume < refetch
+    idle = re.search(r"if \(pendingTruncatedResync\) \{(.*?)\n          \}", s, re.S)
+    assert idle is not None, "idle-edge truncated consumption not found"
+    i = idle.group(1)
+    assert "pendingTruncatedResync = false;" in i
+    assert "recordTruncatedGap();" in i
+    assert "loadHistoryThenReconnect();" in i
+    # Consume the latch, THEN record the gap and run the fresh-connect flow.
+    consume = i.index("pendingTruncatedResync = false;")
+    load = i.index("loadHistoryThenReconnect();")
+    assert consume < load
+    # No churn feed and no jitter at the idle edge — noteTruncatedResync /
+    # scheduleTruncatedResync belong to the immediate branch only.
+    assert "noteTruncatedResync" not in i
+    assert "scheduleTruncatedResync" not in i
+    # And no in-place seedless refetch on either consumption path.
+    assert "refetchHistory();" not in i
+    assert "refetchHistory();" not in t
+
+
+def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
+    """replay_truncated = the stream admitted losing events past recovery.
+    The coordinator pane must treat the connection as DEAD and mirror
+    interactive.js's converged recovery design (the #882 parity port).
+
+    Pinned: (1) the truncation-time cursor is recorded KEEP-OLDEST at the
+    envelope, BEFORE the mid-stream branch, and the connect chokepoint
+    presents it over the advanced live cursor while set — the
+    interleaving-proof half of the gap-repair guarantee (a cancellable
+    timer alone silently loses the repair when a hide/show cycle lands
+    inside the jitter window); (2) the record is cleared ONLY by a
+    successful full render (refetchHistory, below the ``!hist`` guard) —
+    never by the teardown chokepoint or suspendStream; (3) the immediate
+    branch routes through ``noteTruncatedResync()`` and SKIPS the resync
+    when the limiter just tripped (the cooldown disconnected the stream;
+    a ``.finally`` reconnect would defeat it), else SCHEDULES the fresh
+    connect behind the herd-spreading jitter; (4) churn accounting is ONE
+    shared step (``recordChurnAndMaybeTrip``) fed by BOTH overflow closes
+    and truncated resyncs, so the trip parameters cannot silently diverge;
+    (5) the jitter scheduler dedups to one pending resync and its fire
+    path nulls the handle BEFORE loading (the teardown inside the load
+    would cancel the work it is part of), while ``closeStreamTransport``
+    owns cancellation of a merely-pending timer; (6) the dead-stream flow
+    tears down FIRST, resets the streaming refs (refetchHistory does not
+    null them, and the envelope's own in_progress_snapshot may have
+    re-created a bubble inside the jitter window), seeds via
+    ``refetchHistory(true)``, and reconnects in ``.finally`` gated on the
+    pane still owning its stream lifecycle (``visHandler`` — the destroy /
+    close-session sentinel); (7) every ``truncatedGaps`` bump routes
+    through the one increment+log step; (8) the old in-place seedless
+    refetch must not come back; (9) repair-intent supersession is ONE
+    site — refetchHistory's success path clears the gap record, the
+    deferred latch, AND any pending resync timer together (a failed fetch
+    returns above the block and clears none, keeping the resync armed as
+    repair owner; a latch or timer surviving a heal fired a phantom
+    resync whose failed-fetch leg reconnected cursorless with nothing
+    armed) — and clear_ui carries no path-local cancel of its own;
+    (10) the envelope's sidebar refresh is deduped per GAP
+    (isNewTruncationGap) on top of the per-open flag — a failed-resync
+    retry loop must not re-stampede /children + /tasks once per reconnect
+    — with the retry-window staleness covered instead by ONE heal-time
+    refresh on the successful render inside loadHistoryThenReconnect."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
+    assert trunc is not None, "replay_truncated case not found"
+    t = trunc.group(1)
+    # (1) keep-oldest record at the envelope, before the refs branch (the
+    # null-check rides the isNewTruncationGap capture, which also feeds the
+    # per-gap sidebar dedup below).
+    assert "if (isNewTruncationGap) {" in t
+    assert "truncatedFromCursor = lastEventId;" in t
+    record = t.index("truncatedFromCursor = lastEventId;")
+    branch = t.index("if (!currentAssistantEl && !currentReasoningEl)")
+    assert record < branch, "the gap must be recorded before the mid-stream branch"
+    # (10) sidebar refresh deduped per GAP as well as per open: a retry
+    # reconnect re-draws the envelope for the SAME unrepaired gap and must
+    # NOT re-stampede /children + /tasks (only /history rides the jitter).
+    assert "const isNewTruncationGap = truncatedFromCursor == null;" in t
+    assert t.index("const isNewTruncationGap") < record, (
+        "the new-gap capture must precede the keep-oldest record"
+    )
+    assert "if (isNewTruncationGap && !gapRefreshedAtOpen) refreshSidebarAfterGap();" in t
+    # (1) connect chokepoint: the recorded cursor overrides the live one,
+    # gated ``!= null`` (0/"0" are valid ids).
+    assert re.search(
+        r"const connectCursor =\s*truncatedFromCursor != null\s*"
+        r"\?\s*truncatedFromCursor\s*:\s*lastEventId;",
+        body,
+    ), (
+        "connectSSE must present the truncation-time cursor while a gap is "
+        "on record — the advanced live cursor would draw replay_ok and "
+        "silently forget the gap."
+    )
+    assert re.search(
+        r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*"
+        r"url\s*\+=\s*\"\?last_event_id=\"",
+        body,
+    ), "connectSSE must gate ?last_event_id= on connectCursor != null"
+    # (2) cleared only by a successful full render — below the !hist guard,
+    # riding the wipe — and never by the teardown paths.
+    start = body.index("async function refetchHistory(seedCursor = false)")
+    fn = body[start : start + 4500]
+    guard = fn.index("if (!hist) return;")
+    clear = fn.index("truncatedFromCursor = null;")
+    assert guard < clear, "the record must only clear once a payload rendered"
+    teardown = re.search(r"function closeStreamTransport\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert teardown is not None, "closeStreamTransport not found"
+    assert "truncatedFromCursor" not in teardown.group(1), (
+        "teardown must not clear the gap record — it is the durable repair state"
+    )
+    sus = re.search(r"function suspendStream\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert sus is not None
+    assert "truncatedFromCursor" not in sus.group(1)
+    # (3) limiter check gates the JITTERED fresh connect in the immediate
+    # branch.
+    assert "if (!noteTruncatedResync())" in t
+    assert "scheduleTruncatedResync();" in t
+    # (8) the old in-place seedless refetch must not come back in the case.
+    assert "refetchHistory();" not in t
+    # (4) ONE shared churn step, fed by both classes; ladder reset stays in
+    # enterDegradedCatchup.
+    churn = re.search(r"function recordChurnAndMaybeTrip\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert churn is not None, "recordChurnAndMaybeTrip not found"
+    c = churn.group(1)
+    assert "overflowTimes.push(now);" in c
+    assert "overflowWindowTripped(" in c
+    assert "enterDegradedCatchup();" in c
+    assert "return true;" in c
+    assert "return false;" in c
+    assert "degradedCooldownMs" not in c
+    over = re.search(r"function noteStreamOverflow\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert over is not None
+    assert "recordChurnAndMaybeTrip();" in over.group(1), (
+        "overflow closes must feed the same shared churn step"
+    )
+    note = re.search(r"function noteTruncatedResync\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert note is not None, "noteTruncatedResync not found"
+    n = note.group(1)
+    assert "recordTruncatedGap();" in n
+    assert "return recordChurnAndMaybeTrip();" in n
+    # (5) jittered scheduler: dedup guard, jitter const, null-before-load,
+    # cancellation owned by the teardown chokepoint.
+    sched = re.search(r"function scheduleTruncatedResync\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert sched is not None, "scheduleTruncatedResync not found"
+    s = sched.group(1)
+    assert "if (truncatedResyncTimer != null) return;" in s
+    assert "Math.random() * TRUNCATED_RESYNC_JITTER_MS" in s
+    null_then_load = s.index("truncatedResyncTimer = null;")
+    load = s.index("loadHistoryThenReconnect();")
+    assert null_then_load < load, (
+        "the firing path must null the handle BEFORE loading, or the "
+        "teardown inside loadHistoryThenReconnect would cancel the work it "
+        "is part of"
+    )
+    assert "clearTimeout(truncatedResyncTimer)" in teardown.group(1)
+    # (6) the dead-stream flow: teardown first, refs reset, seeded refetch,
+    # guarded .finally reconnect, deferred latch superseded.
+    flow = re.search(r"function loadHistoryThenReconnect\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert flow is not None, "loadHistoryThenReconnect not found"
+    f = flow.group(1)
+    assert f.index("suspendStream();") < f.index("refetchHistory(true)")
+    assert "currentAssistantEl = null;" in f
+    assert "currentReasoningEl = null;" in f
+    assert "pendingTruncatedResync = false;" in f
+    # Reborn-ring convergence: the load must DROP the live cursor before the
+    # fetch — without this, a post-restart heal on an idle ws (no /history
+    # cursor) re-presents the frozen pre-restart cursor against the reseeded
+    # empty ring, draws replay_truncated forever, and parks the pane in
+    # degraded cooldown cycles.  Found by recovery_e2e --scenario
+    # coord-restart (browser-level); invisible to source-pattern tests —
+    # this pin only keeps the fix from being "simplified" away.
+    assert "lastEventId = null;" in f
+    assert f.index("lastEventId = null;") < f.index("refetchHistory(true)")
+    assert ".finally(" in f
+    assert f.index("refetchHistory(true)") < f.index(".finally(")
+    assert "if (visHandler) connectSSE();" in f
+    # (10) heal-time sidebar refresh: once, on the successful render only
+    # (record cleared), only on the cursor-SEEDED heal (the cursorless
+    # heal's fresh-connect onopen runs the same refresh via its no-cursor
+    # arm), and standing down when a SLOW heal (past the cursor-trust
+    # window, measured off the same disconnectedAt) guarantees onopen's
+    # over-threshold refresh — the two arms are exclusive by construction.
+    # Never on the failed-fetch leg of the retry loop.
+    assert "const onopenWillRefresh =" in f
+    assert "GAP_REFRESH_THRESHOLD_MS" in f
+    assert "truncatedFromCursor == null &&" in f
+    assert "lastEventId != null &&" in f
+    assert "!onopenWillRefresh" in f
+    assert "refreshSidebarAfterGap();" in f
+    # (7) single truncatedGaps bump site (running-count console invariant).
+    assert body.count("streamHealth.truncatedGaps += 1;") == 1
+    rec = re.search(r"function recordTruncatedGap\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert rec is not None, "recordTruncatedGap not found"
+    assert "console.warn(" in rec.group(1)
+    # (9) repair-intent supersession lives in refetchHistory's success path
+    # — record + deferred latch + pending timer, all below the !hist guard
+    # — and clear_ui carries no path-local cancel.
+    assert "pendingTruncatedResync = false;" in fn
+    assert "clearTimeout(truncatedResyncTimer)" in fn
+    assert guard < fn.index("pendingTruncatedResync = false;")
+    assert guard < fn.index("clearTimeout(truncatedResyncTimer)")
+    cu = re.search(r'case "clear_ui": \{(.*?)\n      \}', body, re.S)
+    assert cu is not None, "clear_ui case not found"
+    assert "clearTimeout" not in cu.group(1)
 
 
 def test_coord_detects_server_restart_by_backwards_event_id() -> None:

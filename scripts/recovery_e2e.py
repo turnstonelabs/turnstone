@@ -14,9 +14,11 @@ own state machine (interactive.js) does the recovery.
 
 Usage::
 
-    python3 scripts/recovery_e2e.py                 # run both scenarios
+    python3 scripts/recovery_e2e.py                 # run all three scenarios
     python3 scripts/recovery_e2e.py --scenario storm
     python3 scripts/recovery_e2e.py --scenario restart
+    python3 scripts/recovery_e2e.py --scenario coord-restart
+    python3 scripts/recovery_e2e.py --scenario both   # A+B only (legacy)
     python3 scripts/recovery_e2e.py --keep-open 8971  # serve the storm page
                                                       # for manual inspection
 
@@ -62,6 +64,43 @@ watch ``document.title``. For the restart scenario, boot with a fixed
 port, load the restart page, background the tab, restart the node
 (``RecoveryServer`` on the same port), foreground the tab, and watch the
 title settle to ``RECOVERY-READY-RESTART``.
+
+Scenario C (coord-restart): the REAL coordinator pane
+(console/static/coordinator/coordinator.js — the #882 parity port of the
+same truncated-recovery machinery) driven through the SAME hide -> restart
+-> show sequence as Scenario B.  The coordinator only runs under the
+console app in production, and the console's coordinator subsystems build
+inside its server lifespan against a config-resolved model registry — no
+``create_app(prebuilt SessionManager)`` seam for this harness's scripted
+provider.  So the scenario mounts the pane against the interactive
+recovery node instead: the node serves the console's coordinator static
+tree at ``/coord-static`` (a distinct prefix — the node's own ``/static``
+mount would swallow the console path) and a pane-only page at
+``/coord-recovery``; the pane's module imports are all absolute
+``/shared/*`` and resolve against the node.  Fidelity caveats, all inert
+for the recovery machinery under test: the workstream is
+interactive-kind (no coordinator status events — the status bar keeps its
+placeholder), and ``/children`` + ``/tasks`` 404 here (the pane's loaders
+catch and render empty by design).  What IS real: the full chrome
+(buildCoordChrome), cookie auth, EventSource + MessageEvent cursor
+capture, the connect chokepoint, the dead-stream resync
+(loadHistoryThenReconnect), the churn limiter, and the jitter.  Asserted:
+the show-edge reconnect draws ``replay_truncated`` (trunc>=1, counted at
+the transport by a page-side EventSource wrapper — the coordinator's
+handleEvent, cursor, and even its SSE indicator are closure-private or
+deliberately absent from the chrome), the resync rebuilds from /history
+with the hidden-window turns present (``healed``), tool rows intact, the
+stream re-opened post-show, the status bar not stuck dim, and idle
+asserted server-side by the runner.  Stamps
+``RECOVERY-READY-COORD-rows<n>-trunc<n>``.
+
+MANUAL COORDINATOR RUNBOOK (real console topology, no CDP): boot a dev
+console + one node (docker-compose dev cluster), open a coordinator with
+running children, hide the tab mid-turn, restart the CONSOLE process (the
+coordinator ring lives there), show the tab, and verify: the pane draws
+one truncated full rebuild (no blank pane), the mid-run turn's tool rows
+re-appear inside their batch (no standalone top-level orphan bubbles),
+and turns committed while hidden are present.
 """
 
 from __future__ import annotations
@@ -266,6 +305,168 @@ PAGE_HTML = r"""<!doctype html>
 </html>
 """
 
+# ---------------------------------------------------------------------------
+# The coordinator recovery page — served same-origin by the node at
+# /coord-recovery.  A near-clone of the production standalone page
+# (console/static/coordinator/index.html): the same /shared script
+# substrate (classic theme.js first, then the deferred module set), the
+# same createCoordinatorPane(document.body, wsId, {standalone:true}) +
+# connect() bootstrap — with the coordinator files imported from
+# /coord-static (see the module docstring) and Google-fonts dropped
+# (hermetic run).  Scenario instrumentation reads only public chrome ids.
+# ---------------------------------------------------------------------------
+
+COORD_PAGE_HTML = r"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>coord recovery livepass</title>
+    <link rel="stylesheet" href="/shared/base.css" />
+    <link rel="stylesheet" href="/shared/ui-base.css" />
+    <link rel="stylesheet" href="/shared/chat.css" />
+    <link rel="stylesheet" href="/shared/conversation.css" />
+    <link rel="stylesheet" href="/shared/mcp_error.css" />
+    <link rel="stylesheet" href="/coord-static/coordinator.css" />
+    <link rel="stylesheet" href="/coord-static/coord-chrome.css" />
+    <style>
+      body { height: 100vh; margin: 0; }
+    </style>
+  </head>
+  <body>
+    <script>
+      // Transport-level instrumentation: the coordinator's handleEvent and
+      // cursor are closure-private (unlike interactive's class methods), and
+      // its chrome deliberately builds NO header/SSE indicator — so every
+      // scenario signal is read off the wire by wrapping EventSource BEFORE
+      // any module loads (classic script = runs before the deferred module
+      // set, so the pane's connectSSE always constructs the wrapper):
+      //   __truncatedSeen — replay_truncated frames (the envelope);
+      //   __esOpens      — stream opens (drives the send; a listener is
+      //                    registered before /send so no events are missed);
+      //   __idFrames     — id-bearing frames, i.e. exactly the frames that
+      //                    advance the pane's reconnect cursor (same
+      //                    ``!= null && !== ""`` guard as the pane) — the
+      //                    hide fires only after this proves a live mid-turn
+      //                    cursor.
+      window.__truncatedSeen = 0;
+      window.__esOpens = 0;
+      window.__idFrames = 0;
+      (function () {
+        const RealES = window.EventSource;
+        function CountingES(url, opts) {
+          const es = new RealES(url, opts);
+          es.addEventListener("open", function () {
+            window.__esOpens += 1;
+          });
+          es.addEventListener("message", function (e) {
+            if (e.lastEventId != null && e.lastEventId !== "") {
+              window.__idFrames += 1;
+            }
+            try {
+              const d = JSON.parse(e.data);
+              if (d && d.type === "replay_truncated") window.__truncatedSeen += 1;
+            } catch (_) {}
+          });
+          return es;
+        }
+        CountingES.prototype = RealES.prototype;
+        CountingES.CONNECTING = RealES.CONNECTING;
+        CountingES.OPEN = RealES.OPEN;
+        CountingES.CLOSED = RealES.CLOSED;
+        window.EventSource = CountingES;
+      })();
+    </script>
+    <script src="/shared/theme.js"></script>
+    <script type="module" src="/shared/utils.js"></script>
+    <script type="module" src="/shared/toast.js"></script>
+    <script type="module" src="/shared/auth.js"></script>
+    <script type="module" src="/shared/kb.js"></script>
+    <script type="module" src="/shared/composer.js"></script>
+    <script type="module" src="/shared/composer_attachments.js"></script>
+    <script type="module" src="/shared/composer_queue.js"></script>
+    <script type="module" src="/shared/status_bar.js"></script>
+    <script type="module" src="/shared/renderer.js"></script>
+    <script type="module">
+      import { createCoordinatorPane } from "/coord-static/coordinator.js";
+
+      const q = new URLSearchParams(location.search);
+      const wsId = q.get("ws_id");
+      const healedSentinel = q.get("healed") || "";
+
+      const pane = createCoordinatorPane(document.body, wsId, {
+        standalone: true,
+      });
+      window.__pane = pane;
+      if (pane) pane.connect();
+
+      window.__hide = function () {
+        Object.defineProperty(document, "hidden", { configurable: true, value: true });
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+        document.dispatchEvent(new Event("visibilitychange"));
+      };
+      window.__show = function () {
+        Object.defineProperty(document, "hidden", { configurable: true, value: false });
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+        document.dispatchEvent(new Event("visibilitychange"));
+      };
+
+      // Drive /send once the stream has OPENED at the transport (__esOpens —
+      // the pane's listener is registered by then, so no events are missed).
+      // The chrome has no SSE pill to poll: the header was deliberately
+      // dropped (see buildCoordChrome's comment).
+      let sent = false;
+      function sendOnce(msg) {
+        if (sent) return;
+        sent = true;
+        window
+          .authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: msg }),
+          })
+          .catch((e) => { document.title = "RECOVERY-FAILED-COORD-send-" + e; });
+      }
+      const sendPoll = setInterval(() => {
+        if (window.__esOpens >= 1) {
+          clearInterval(sendPoll);
+          sendOnce("run a turn");
+        }
+      }, 100);
+
+      window.__verifyCoordRestart = function () {
+        // Same contract as Scenario B, read off the coordinator's public
+        // chrome + the transport wrapper (idle is asserted SERVER-side by
+        // the runner — the chrome has no state text element): the show-edge
+        // reconnect must present the frozen mid-turn cursor and draw
+        // replay_truncated (trunc>=1), the dead-stream resync must rebuild
+        // from /history with the hidden-window turns present (healed), the
+        // stream must have re-opened after the show (__esOpens >= 2), the
+        // status bar must not be stuck dim (.ws-sb-disconnected removed by
+        // the post-recovery onopen), and the tool rows must be intact.
+        const messages = document.getElementById("coord-messages");
+        const rows = messages
+          ? messages.querySelectorAll(".conv-row[data-call-id]").length
+          : 0;
+        const reopened = window.__esOpens >= 2;
+        const disc =
+          document.querySelector("#coord-status-bar.ws-sb-disconnected") !== null;
+        const healed =
+          healedSentinel !== "" &&
+          ((messages && messages.textContent) || "").includes(healedSentinel);
+        const ok =
+          rows >= 1 && reopened && !disc && healed && window.__truncatedSeen >= 1;
+        document.title = ok
+          ? "RECOVERY-READY-COORD-rows" + rows + "-trunc" + window.__truncatedSeen
+          : "RECOVERY-FAILED-COORD-rows" + rows +
+            "-reopened" + (reopened ? 1 : 0) +
+            "-disc" + (disc ? 1 : 0) + "-healed" + (healed ? 1 : 0) +
+            "-trunc" + window.__truncatedSeen;
+      };
+    </script>
+  </body>
+</html>
+"""
+
 
 # ---------------------------------------------------------------------------
 # Minimal dependency-free CDP client (WebSocket over a raw socket).
@@ -428,6 +629,30 @@ def _page_route() -> Any:
     return Route("/recovery", recovery_page)
 
 
+def _coord_routes() -> list[Any]:
+    """The coordinator scenario's same-origin extras: the pane page, and the
+    console's coordinator static tree under the ``/coord-static`` prefix —
+    a DISTINCT prefix because the node's own ``/static`` mount (ui/static)
+    matches first and would 404 the console path from inside its own tree.
+    coordinator.js's module imports are all absolute ``/shared/*``, which
+    the node already serves."""
+    from starlette.responses import HTMLResponse
+    from starlette.routing import Mount, Route
+    from starlette.staticfiles import StaticFiles
+
+    import turnstone
+
+    coord_dir = Path(turnstone.__file__).resolve().parent / "console" / "static" / "coordinator"
+
+    async def coord_recovery_page(_request: Any) -> HTMLResponse:
+        return HTMLResponse(COORD_PAGE_HTML)
+
+    return [
+        Route("/coord-recovery", coord_recovery_page),
+        Mount("/coord-static", app=StaticFiles(directory=str(coord_dir)), name="coord-static"),
+    ]
+
+
 def _boot_node(port: int = 0) -> Any:
     from tests._sse_recovery_server import RecoveryServer
     from turnstone.core.storage import init_storage, reset_storage
@@ -438,7 +663,7 @@ def _boot_node(port: int = 0) -> Any:
     # /recovery passes the middleware. init storage per boot (shared singleton).
     reset_storage()
     init_storage("sqlite", path=os.path.join(_scratch(), "recovery_e2e.db"), run_migrations=True)
-    return RecoveryServer(extra_routes=[_page_route()], port=port)
+    return RecoveryServer(extra_routes=[_page_route(), *_coord_routes()], port=port)
 
 
 def _scratch() -> str:
@@ -598,6 +823,73 @@ def run_restart(chrome: str) -> str:
         node.stop()
 
 
+def run_coord_restart(chrome: str) -> str:
+    from tests._sse_recovery_server import final_text_script, parallel_bash_script
+
+    port = _free_port()
+    node = _boot_node(port=port)
+    # Same shape as Scenario B: a PACED turn so the tab can hide MID-turn.
+    # The coordinator renders no streamed tool output (no tool_output_chunk
+    # case), but the chunk frames still advance the pane's cursor in
+    # onmessage BEFORE dispatch — so the hide freezes a genuinely mid-turn
+    # cursor even though the paint signal differs (see below).  The closing
+    # assistant text after the bash is the healed-gap sentinel, committed
+    # while hidden.
+    paced = parallel_bash_script({"c0": "for i in $(seq 1 40); do echo c-$i; sleep 0.05; done"})
+    ws_id = node.create_workstream(
+        paced, final_text_script(HEALED_SENTINEL), name="browser-coord-restart"
+    )
+    profile = Path(_scratch()) / "chrome-coord-restart"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/coord-recovery?ws_id={ws_id}&healed={HEALED_SENTINEL}"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        # Hide once the BROWSER has captured a live mid-turn cursor: the
+        # coordinator chrome has no status/SSE text elements (the header was
+        # deliberately dropped) and paints no streamed output line, so the
+        # signal is transport-level — id-bearing frames received by the page
+        # (__idFrames; exactly the frames that advance the pane's reconnect
+        # cursor).  The turn must also still be RUNNING server-side, or the
+        # frozen cursor could sit at/above the committed counter and the
+        # reconnect would take the lossless replay_ok path (trunc0).  The
+        # paced bash runs >=2s, so this lands mid-turn.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            frames = cdp.evaluate("window.__idFrames || 0")
+            if isinstance(frames, int) and frames >= 2 and node.ws_state(ws_id) == "running":
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError(
+                "coord-restart scenario: no mid-turn cursor captured "
+                "(id frames never reached the page while running)"
+            )
+        time.sleep(0.5)
+        cdp.evaluate("window.__hide && window.__hide()")
+        # The turn (and the sentinel closing text) commits while hidden.
+        node.wait_turn(ws_id, timeout=30)
+        # Restart the node on the SAME port (fresh empty ring, seeded counter).
+        node.stop()
+        node = _boot_node(port=port)
+        node.open_workstream(ws_id)
+        # Show the tab -> stale-cursor reconnect -> truncated -> jittered
+        # resync (0-10s) -> /history rebuild.  Settle past the worst-case
+        # jitter, assert idle SERVER-side (the chrome has no state text to
+        # read), then take the in-page verdict.
+        cdp.evaluate("window.__show && window.__show()")
+        time.sleep(12.0)
+        _wait_state(node, ws_id, "idle", 15)
+        cdp.evaluate("window.__verifyCoordRestart && window.__verifyCoordRestart()")
+        return _poll_title(cdp, 20)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
 def _wait_state(node: Any, ws_id: str, state: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -632,7 +924,12 @@ def keep_open(port: int) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--scenario", choices=["storm", "restart", "both"], default="both")
+    ap.add_argument(
+        "--scenario",
+        choices=["storm", "restart", "coord-restart", "both", "all"],
+        default="all",
+        help="'both' = A+B (legacy alias); 'all' adds the coordinator scenario",
+    )
     ap.add_argument("--keep-open", type=int, metavar="PORT", help="serve the storm page, no CDP")
     args = ap.parse_args()
 
@@ -646,13 +943,17 @@ def main() -> None:
         raise SystemExit(2)
 
     failures = 0
-    if args.scenario in ("storm", "both"):
+    if args.scenario in ("storm", "both", "all"):
         verdict = run_storm(chrome)
         print(f"scenario A (storm):   {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("restart", "both"):
+    if args.scenario in ("restart", "both", "all"):
         verdict = run_restart(chrome)
         print(f"scenario B (restart): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("coord-restart", "all"):
+        verdict = run_coord_restart(chrome)
+        print(f"scenario C (coord):   {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     raise SystemExit(1 if failures else 0)
 
