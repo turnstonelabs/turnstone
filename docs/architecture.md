@@ -985,10 +985,14 @@ context budget, and three guarantees apply when that budget reaches zero
   successful-looking trim).
 
 A zero budget also triggers one mid-turn auto-compaction before results are
-sized: the response reserve zeroes the budget well below the auto-compact
-threshold (near 70% fullness with `max_tokens ≥ context_window/4`), and
-without this trigger a session could idle in that band indefinitely with
-every tool result floored or dropped.
+sized. With `max_tokens ≥ context_window/4` the response reserve zeroes the
+budget near 70% fullness — below the default 80% auto-compact threshold —
+and without this trigger a session could idle in that band indefinitely
+with every tool result floored or dropped. The trigger keys on the
+exhausted budget itself, not on any threshold, so it composes with any
+operator-set `auto_compact_pct`: with thresholds below the zero point the
+ordinary owed-compaction paths fire first and this trigger degrades to a
+backstop for the cases where they bailed or freed too little.
 
 ---
 

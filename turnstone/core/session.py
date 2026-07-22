@@ -6431,14 +6431,20 @@ class ChatSession:
                     and zero_budget_compact_attempts < _ZERO_BUDGET_COMPACT_CAP_PER_SEND
                     and self._generation == my_generation
                 ):
-                    # Zero tool-result budget wedges the loop BELOW the owed
-                    # thresholds: with max_tokens ≥ context_window/4 the
-                    # response reserve zeroes the budget near 70% fullness,
-                    # well under auto_compact_pct, and a stalled model
-                    # appends too little to ever cross it — so without this
+                    # Zero tool-result budget can wedge the loop BELOW the
+                    # owed thresholds: with max_tokens ≥ context_window/4
+                    # the response reserve zeroes the budget near 70%
+                    # fullness — under the DEFAULT auto_compact_pct, and
+                    # further under any raised one — while a stalled model
+                    # appends too little to ever cross it, so without this
                     # trigger the session can sit in the zero band
                     # indefinitely while every tool result is floored or
-                    # dropped (#883).  Zero budget is itself
+                    # dropped (#883).  The predicate is the exhausted
+                    # budget itself, never a threshold, so it composes
+                    # with any operator-set auto_compact_pct: thresholds
+                    # below the zero point compact via the owed path
+                    # first, and this branch is its bail/insufficient
+                    # backstop.  Zero budget is itself
                     # compaction-owed evidence.  ``auto=True`` WITHOUT
                     # ``threshold_pct``, exactly like the ctx-overflow
                     # retry: no threshold was evaluated, so the notice must
