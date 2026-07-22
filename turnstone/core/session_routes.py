@@ -31,9 +31,10 @@ call the factory during startup and pass the result as
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -3395,6 +3396,13 @@ def _resume_cursor_and_trim(
     return messages[:orphan_idx], cursor
 
 
+# One /history flight's result: (messages, resume cursor, load_failed).
+# ``load_failed`` is True only when ``load_messages`` RAISED — never for
+# a legitimately empty workstream; see ``_reconstruct`` inside
+# :func:`make_history_handler`.
+_HistoryFlightResult: TypeAlias = tuple[list[dict[str, Any]], int | None, bool]
+
+
 def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``GET {prefix}/{ws_id}/history`` — message history.
 
@@ -3429,13 +3437,38 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
     lifted verbs' storage offload pattern; pre-lift coord ran them
     inline on the event loop).
 
+    Restart-herd coalescing (issue #884): concurrent requests for the
+    same ``(ws_id, limit)`` share ONE reconstruction (single-flight) —
+    after a node restart every open pane resyncs via REST ``/history``
+    inside the same jitter window, and each un-coalesced request repeats
+    the full ``load_messages`` → decoration → projection pipeline
+    against a cold process.  Deliberately single-flight only, NO
+    result/TTL cache: the payload depends on live-mutable inputs with no
+    total cheap invalidation signal (the ``surface_persisted_reasoning``
+    registry toggle emits no per-ws event; cold workstreams have no
+    event counter at all), so a cached payload could serve stale
+    reasoning/approval/cursor state for the whole TTL, while a joiner's
+    worst-case staleness equals the flight duration — the same window a
+    lone slow request already exposes.  All auth/existence gates run
+    per-request BEFORE a request may join a flight; only the
+    caller-independent reconstruction is shared.
+
     Args:
         cfg: per-kind policy bundle.
     """
 
-    async def history(request: Request) -> Response:
-        import asyncio
+    # In-flight reconstructions, keyed ``(ws_id, limit)``.  Holds ONLY
+    # live flights — each task pops its own key in a ``finally`` before
+    # completing, so a later request can never read a completed (stale)
+    # result: this map is a single-flight, not a cache.  Scoped to this
+    # cfg's closure (one map per mount) so interactive and coordinator
+    # ws_ids can never collide across kinds, mirroring the cfg-level
+    # isolation of every other lifted verb.  Touched only from the event
+    # loop thread — no lock needed; the ``limit`` component is required
+    # (a limit=10 caller must not receive a limit=500 payload).
+    flights: dict[tuple[str, int], asyncio.Task[_HistoryFlightResult]] = {}
 
+    async def history(request: Request) -> Response:
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
@@ -3509,6 +3542,105 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
             limit = 100
         limit = max(1, min(limit, 500))
 
+        # ---- single-flight join (issue #884) --------------------------
+        # Everything ABOVE this line is per-request (auth, tenant, kind,
+        # existence, limit) and must stay above it: a request may only
+        # join a flight after its own gates passed.  Everything below is
+        # the caller-independent reconstruction, shared via ``flights``.
+        key = (ws_id, limit)
+        task = flights.get(key)
+        joined = task is not None
+        if task is None:
+            task = asyncio.create_task(_run_flight(key, mgr, storage, request.app.state))
+            flights[key] = task
+        else:
+            # The coalescing tests synchronize on this record — keep the
+            # ``ws.history.coalesced ws=`` prefix stable (a rename turns
+            # their join-wait into a confusing 5s timeout, not a clean
+            # failure).
+            log.debug("ws.history.coalesced ws=%s", ws_id[:8])
+        # ``shield``: this request disconnecting must not cancel the
+        # shared reconstruction other joiners are awaiting — the flight
+        # is a detached task that completes (and pops its key) on its
+        # own.  A cancelled REQUEST still propagates CancelledError out
+        # of the shield to Starlette as usual.  Accepted cost: a LONE
+        # reader's mid-flight disconnect no longer aborts the
+        # reconstruction (pre-coalescing, the inline pipeline was
+        # cancellable at its next await) — the detached flight runs its
+        # bounded pipeline to completion once, unobserved.  Reviewed
+        # and kept as-is: refcounting awaiters to cancel-at-zero would
+        # add a join-vs-cancel race (a late joiner grabbing a task the
+        # last leaver is cancelling) to a seam that is race-free
+        # precisely because the flight is never cancelled.
+        messages, cursor, load_failed = await asyncio.shield(task)
+        if joined and load_failed:
+            # The shared draw hit a transient ``load_messages`` failure
+            # and produced the 200-empty payload.  Both clients render a
+            # 200-empty as an authoritative empty pane (the seedless
+            # clear_ui path has no SSE redelivery to repair it), so
+            # sharing the failed draw would fan ONE storage blip out as
+            # a pane wipe across every joiner.  Joiners therefore retry
+            # once, independently and unshared — exactly the blast
+            # radius the un-coalesced endpoint had.  The flight OWNER
+            # keeps its failed draw (same as a lone request today).
+            log.debug("ws.history.coalesced_retry ws=%s", ws_id[:8])
+            messages, cursor, _ = await _reconstruct(mgr, storage, request.app.state, ws_id, limit)
+        # Each awaiter serializes its own JSONResponse from the shared
+        # payload — cost parity with the un-coalesced endpoint (one
+        # render per request).  Sharing pre-rendered bytes across
+        # awaiters was reviewed and declined: it reshapes the flight
+        # result to (bytes, flag), splitting the _HistoryFlightResult
+        # contract the retry path still needs, for a herd-only
+        # serialization micro-win.
+        return JSONResponse({"ws_id": ws_id, "messages": messages, "cursor": cursor})
+
+    async def _run_flight(
+        key: tuple[str, int],
+        mgr: SessionManager,
+        storage: Any,
+        app_state: Any,
+    ) -> _HistoryFlightResult:
+        # The key MUST be popped when (and only when) this flight
+        # settles — success, internal exception, or task cancellation —
+        # and from inside the task itself, so ``flights`` never holds a
+        # completed task: a finished (stale) or poisoned flight can
+        # never be joined late and replay an old result or exception.
+        try:
+            return await _reconstruct(mgr, storage, app_state, key[0], key[1])
+        finally:
+            flights.pop(key, None)
+
+    async def _reconstruct(
+        mgr: SessionManager,
+        storage: Any,
+        app_state: Any,
+        ws_id: str,
+        limit: int,
+    ) -> _HistoryFlightResult:
+        """The shareable reconstruction: rows → decorated, projected payload.
+
+        Runs once per flight and is awaited by every coalesced request,
+        so it must not read anything request- or caller-specific — the
+        auth/tenant/kind gates all ran per-request before the flight
+        was joined.  Resolves its own ``mgr.get(ws_id)`` handle (rather
+        than inheriting the flight owner's) so the live reads below
+        (``_pending_approval``, the replay ring, agent trajectories)
+        anchor to flight start; a joiner can observe live state up to
+        one flight-duration old — the same window a single slow request
+        already exposes.  A stale resume ``cursor`` handed to a joiner
+        degrades gracefully: if the ring evicts past it before that
+        client connects, the stream answers ``replay_truncated`` and
+        the client resyncs.
+
+        Returns ``(messages, cursor, load_failed)`` — ``load_failed``
+        is True only when ``load_messages`` RAISED (transient storage
+        failure), never for a legitimately empty workstream.  The
+        caller uses it to keep an exception-empty payload from fanning
+        a pane wipe out to coalesced joiners (see the joiner retry in
+        ``history``).
+        """
+        live_session = mgr.get(ws_id)
+        load_failed = False
         messages: list[dict[str, Any]] = []
         # Fresh-connect resume cursor (the ``Last-Event-ID`` the client
         # opens its initial SSE with).  Non-None only when the trailing
@@ -3532,7 +3664,13 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                     include_compaction=True,
                 )
             except Exception:
-                log.debug("ws.history.load_failed ws=%s", ws_id[:8], exc_info=True)
+                # Warning, not debug: this 200-empty renders as an
+                # authoritative pane wipe in both clients, and under
+                # coalescing it is also what triggers the joiner retry —
+                # a storage blip here is operationally interesting for
+                # the same reason ``decoration_failed`` below is.
+                load_failed = True
+                log.warning("ws.history.load_failed ws=%s", ws_id[:8], exc_info=True)
         # Audit-trail decoration — attach persisted intent_verdict and
         # output_assessment data to each assistant.tool_calls entry so
         # the dashboard's history replay paints the same verdict pills
@@ -3597,8 +3735,8 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                     # ``app.state.registry``; console stores its coord
                     # registry as ``app.state.coord_registry``.  The
                     # lifted handler is shared, so we try both.
-                    resolved_registry = getattr(request.app.state, "registry", None) or getattr(
-                        request.app.state, "coord_registry", None
+                    resolved_registry = getattr(app_state, "registry", None) or getattr(
+                        app_state, "coord_registry", None
                     )
                 if resolved_registry is not None and resolved_alias:
                     try:
@@ -3688,7 +3826,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                     ws_id[:8],
                     exc_info=True,
                 )
-        return JSONResponse({"ws_id": ws_id, "messages": messages, "cursor": cursor})
+        return messages, cursor, load_failed
 
     return history
 

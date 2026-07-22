@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import queue
+import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -17,6 +21,8 @@ from starlette.routing import Mount, Route
 from starlette.testclient import TestClient
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -954,11 +960,18 @@ def _interactive_endpoint_cfg(
     )
 
 
-def _build_history_app(
+def _build_history_asgi_app(
     mock_mgr: Any,
     storage: Any,
     tenant_check: Any = None,
-) -> TestClient:
+) -> Starlette:
+    """Raw ASGI app for the lifted history factory.
+
+    Returned un-wrapped (no ``TestClient``) so the coalescing tests can
+    drive CONCURRENT requests through ``httpx.ASGITransport`` on a
+    private event loop — ``TestClient`` is synchronous and can only
+    hold one request in flight at a time.
+    """
     cfg = _interactive_endpoint_cfg(mock_mgr, tenant_check=tenant_check)
     handler = make_history_handler(cfg)
     app = Starlette(
@@ -974,7 +987,15 @@ def _build_history_app(
     )
     app.state.workstreams = mock_mgr
     app.state.auth_storage = storage
-    return TestClient(app)
+    return app
+
+
+def _build_history_app(
+    mock_mgr: Any,
+    storage: Any,
+    tenant_check: Any = None,
+) -> TestClient:
+    return TestClient(_build_history_asgi_app(mock_mgr, storage, tenant_check=tenant_check))
 
 
 def _build_detail_app(
@@ -1483,6 +1504,287 @@ class TestHistoryInteractive:
         # No synthetic tool row spliced after the orphaned tool_calls.
         assert roles == ["user", "assistant", "user", "assistant"]
         assert all(m.get("role") != "tool" for m in r.json()["messages"])
+
+
+class _GatedStorage:
+    """Delegates to the real backend; ``load_messages`` counts entries,
+    optionally raises, and blocks on ``gate`` until the test releases it
+    (a pre-set gate is a pass-through).  The count-then-block ordering
+    is load-bearing for the coalescing tests: a request that did NOT
+    join an existing flight bumps ``load_calls`` at entry — before the
+    gate can block it — so the counter distinguishes join from
+    second-flight without any timing assumptions."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.gate = threading.Event()
+        self.load_calls = 0
+        self.fail_next = 0
+        self._lock = threading.Lock()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def load_messages(self, ws_id: str, **kwargs: Any) -> Any:
+        with self._lock:
+            self.load_calls += 1
+            should_fail = self.fail_next > 0
+            if should_fail:
+                self.fail_next -= 1
+        if not self.gate.wait(timeout=10):
+            raise TimeoutError("test gate never released")
+        if should_fail:
+            raise RuntimeError("transient load failure (test)")
+        return self._inner.load_messages(ws_id, **kwargs)
+
+
+async def _until(cond: Callable[[], bool], timeout: float = 5.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not cond():
+            await asyncio.sleep(0.01)
+
+
+class TestHistoryCoalescing:
+    """Single-flight coalescing of concurrent ``/history`` requests (#884).
+
+    The matrix these tests assert: join-vs-miss × gates-per-request ×
+    failed-vs-clean shared draw × key isolation × no cross-flight
+    caching × owner cancellation.  Driven through ``httpx.ASGITransport``
+    on a private loop because ``TestClient`` cannot hold two requests in
+    flight at once.
+
+    Determinism scheme: every synchronization point is a positive
+    observable edge — the owner's arrival on ``load_calls == 1`` (it
+    entered ``load_messages`` and parked on the gate), and the JOIN on
+    the handler's ``ws.history.coalesced`` debug record, which is
+    emitted synchronously at the map-hit branch before the joiner
+    awaits the flight (capture through stdlib handlers is verified:
+    turnstone's structlog config routes to stdlib logging, so pytest's
+    ``caplog`` sees it).  The join-proof stays counter-based on top:
+    a request that did NOT join bumps ``load_calls`` before the gate
+    can block it (see ``_GatedStorage``), so ``load_calls == 1`` after
+    the join record proves sharing."""
+
+    def _register_ws(self, storage: Any, ws_id: str) -> None:
+        storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        storage.save_message(ws_id, "user", "hello")
+        storage.save_message(ws_id, "assistant", "hi there")
+
+    def _live_mgr(self, ws_id: str) -> MagicMock:
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_ws.ui._pending_approval = None
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+        return mock_mgr
+
+    def _counting_tenant(self) -> tuple[Any, dict[str, int]]:
+        calls = {"n": 0}
+
+        def check(request: Any, ws_id: str, mgr: Any) -> Any:
+            calls["n"] += 1
+            if request.headers.get("x-test-deny"):
+                return JSONResponse({"error": "Workstream not found"}, status_code=404)
+            return None
+
+        return check, calls
+
+    def _scaffold(
+        self, storage: Any, ws_id: str
+    ) -> tuple[_GatedStorage, dict[str, int], Starlette, str]:
+        self._register_ws(storage, ws_id)
+        gated = _GatedStorage(storage)
+        tenant, tenant_calls = self._counting_tenant()
+        app = _build_history_asgi_app(self._live_mgr(ws_id), gated, tenant_check=tenant)
+        return gated, tenant_calls, app, f"/v1/api/workstreams/{ws_id}/history"
+
+    async def _drive_two_joiners(
+        self,
+        app: Starlette,
+        url: str,
+        gated: _GatedStorage,
+        caplog: Any,
+        *,
+        cancel_owner: bool = False,
+    ) -> tuple[Any, httpx.Response]:
+        """Drive two concurrent requests through one shared flight.
+
+        Every wait is a positive observable edge.  Owner arrival:
+        ``load_calls == 1`` (it entered ``load_messages`` and parked on
+        the gate).  JOIN: the handler logs ``ws.history.coalesced``
+        synchronously at the map-hit branch, before the joiner awaits
+        the flight — waiting on that record (via ``caplog``; capture
+        verified, structlog routes to stdlib logging) proves t2 joined
+        while the flight is still gated, with no wall-clock beat.  The
+        trailing ``"ws="`` in the match keeps it from also matching
+        ``ws.history.coalesced_retry``.  The counter join-proof stays
+        on top: a request that did NOT join bumps ``load_calls`` at
+        ``load_messages`` entry, BEFORE the gate can block it (see
+        ``_GatedStorage``).
+
+        ``cancel_owner=True`` swaps the clean tail for the
+        owner-disconnect tail (cancel t1 before releasing the gate,
+        await the joiner, collect t1's outcome) — on that path the
+        first tuple member is the owner's ``CancelledError``, not a
+        ``Response``, hence the loose first-slot type.
+        """
+        caplog.set_level(logging.DEBUG, logger="turnstone.core.session_routes")
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            t1 = asyncio.create_task(c.get(url))
+            await _until(lambda: gated.load_calls == 1)
+            t2 = asyncio.create_task(c.get(url))
+            await _until(
+                lambda: any("ws.history.coalesced ws=" in r.getMessage() for r in caplog.records)
+            )
+            assert gated.load_calls == 1
+            if cancel_owner:
+                t1.cancel()
+                gated.gate.set()
+                r2 = await t2
+                (r1,) = await asyncio.gather(t1, return_exceptions=True)
+                return r1, r2
+            gated.gate.set()
+            r1, r2 = await asyncio.gather(t1, t2)
+            return r1, r2
+
+    def test_concurrent_requests_share_one_flight(self, _inject_storage: Any, caplog: Any) -> None:
+        gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-share")
+
+        r1, r2 = asyncio.run(self._drive_two_joiners(app, url, gated, caplog))
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r1.json() == r2.json()
+        contents = [m.get("content") for m in r1.json()["messages"]]
+        assert contents == ["hello", "hi there"]
+        assert gated.load_calls == 1
+
+    def test_failed_shared_draw_not_fanned_out_to_joiner(
+        self, _inject_storage: Any, caplog: Any
+    ) -> None:
+        """A transient ``load_messages`` failure in the shared draw
+        yields the owner's 200-empty (same as a lone request today) but
+        the JOINER retries independently and gets the real rows — one
+        storage blip must not wipe every coalesced pane."""
+        gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-fail")
+        gated.fail_next = 1
+
+        r1, r2 = asyncio.run(self._drive_two_joiners(app, url, gated, caplog))
+        assert r1.status_code == 200
+        assert r1.json()["messages"] == []
+        assert r2.status_code == 200
+        assert [m.get("content") for m in r2.json()["messages"]] == ["hello", "hi there"]
+        # Owner draw + joiner retry — never a third.
+        assert gated.load_calls == 2
+
+    def test_gates_run_per_request_before_join(self, _inject_storage: Any) -> None:
+        """A caller failing its own tenant gate gets its 404 while the
+        flight is still in the air — it never joins and never triggers
+        a reconstruction of its own."""
+        gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-deny")
+
+        async def run() -> tuple[httpx.Response, httpx.Response]:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                t1 = asyncio.create_task(c.get(url))
+                await _until(lambda: gated.load_calls == 1)
+                r2 = await c.get(url, headers={"x-test-deny": "1"})
+                assert gated.load_calls == 1
+                gated.gate.set()
+                r1 = await t1
+                return r1, r2
+
+        r1, r2 = asyncio.run(run())
+        assert r1.status_code == 200
+        assert r2.status_code == 404
+        assert gated.load_calls == 1
+
+    def test_flight_key_includes_limit(self, _inject_storage: Any) -> None:
+        """A limit=1 caller must not receive the limit-100 payload:
+        different limits are different flights."""
+        gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-limit")
+
+        async def run() -> tuple[httpx.Response, httpx.Response]:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                t1 = asyncio.create_task(c.get(url))
+                await _until(lambda: gated.load_calls == 1)
+                t2 = asyncio.create_task(c.get(url, params={"limit": 1}))
+                # Positively waits for the SECOND reconstruction to
+                # enter load_messages while the first is still gated —
+                # the limit=1 request did not join.
+                await _until(lambda: gated.load_calls == 2)
+                gated.gate.set()
+                r1, r2 = await asyncio.gather(t1, t2)
+                return r1, r2
+
+        r1, r2 = asyncio.run(run())
+        assert len(r1.json()["messages"]) == 2
+        assert len(r2.json()["messages"]) == 1
+        assert gated.load_calls == 2
+
+    def test_no_result_reuse_across_completed_flights(self, _inject_storage: Any) -> None:
+        """The flights map is a single-flight, not a cache: a request
+        arriving after a flight completed reconstructs afresh."""
+        gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-seq")
+        gated.gate.set()  # pass-through
+
+        async def run() -> tuple[httpx.Response, httpx.Response]:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                r1 = await c.get(url)
+                r2 = await c.get(url)
+                return r1, r2
+
+        r1, r2 = asyncio.run(run())
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r1.json() == r2.json()
+        assert gated.load_calls == 2
+
+    def test_decoration_failure_is_shared_not_retried(
+        self, _inject_storage: Any, caplog: Any
+    ) -> None:
+        """The inverse of the load-failure test: a decoration/projection
+        failure AFTER a successful load is degraded-but-non-empty, so it
+        is shared to joiners as-is — ``load_failed`` stays False and no
+        joiner retry fires (``load_calls`` stays 1, vs the load-failure
+        test's 2).  Pins the two failure modes apart: conflating them
+        (e.g. setting ``load_failed`` in the decoration except) would
+        turn every shared degraded draw into a double reconstruction."""
+        gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-decor")
+
+        with patch(
+            "turnstone.core.history_decoration.project_history_messages",
+            side_effect=RuntimeError("projection failure (test)"),
+        ) as fake_project:
+            r1, r2 = asyncio.run(self._drive_two_joiners(app, url, gated, caplog))
+        # The degraded path must actually have run — without this, a
+        # fixture whose cursor is None either way would let an
+        # ineffective patch pass the assertions below vacuously.
+        assert fake_project.called
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        # Degraded (un-projected, cursor=None) but NON-empty and identical —
+        # the joiner shared the draw instead of re-reconstructing.
+        assert r1.json() == r2.json()
+        assert r1.json()["messages"]
+        assert r1.json()["cursor"] is None
+        assert gated.load_calls == 1
+
+    def test_owner_disconnect_leaves_joiner_completing(
+        self, _inject_storage: Any, caplog: Any
+    ) -> None:
+        """The flight is a detached task: cancelling the request that
+        CREATED it (client disconnect) must not cancel the shared
+        reconstruction a joiner is awaiting."""
+        gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-cancel")
+
+        r1, r2 = asyncio.run(self._drive_two_joiners(app, url, gated, caplog, cancel_owner=True))
+        assert isinstance(r1, asyncio.CancelledError)
+        assert r2.status_code == 200
+        assert [m.get("content") for m in r2.json()["messages"]] == ["hello", "hi there"]
+        assert gated.load_calls == 1
 
 
 class TestBuildHistorySystemTurnPropagation:
