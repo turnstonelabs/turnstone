@@ -203,7 +203,64 @@ class RecoveryServer:
         self._port = int(self._sock.getsockname()[1])
         self._sock.listen(128)
 
-        self._server = uvicorn.Server(uvicorn.Config(self._app, log_level="warning", lifespan="on"))
+        # -- fault injection (public knobs below) ----------------------------
+        # In-process arming: the Tier-2 runner holds this RecoveryServer and
+        # arms a knob, THEN drives the browser request that consumes it.
+        # Single-writer by construction — the runner never arms a knob while
+        # the loop thread is mid-consume — and CPython makes each int read /
+        # write atomic, so these need no lock even though the uvicorn loop
+        # thread increments/decrements them while the runner thread reads.
+        self.history_requests = 0
+        self.rewind_requests = 0
+        # Per-ws SSE connection opens (``GET …/events`` — the EventSource the
+        # pane's connectSSE builds).  A TRANSPORT-FREE heal (the #890 idle-edge
+        # staleness backstop, a quiesced REST refetch) must leave this FLAT; a
+        # reload-based backstop would bump it once per reconnect (the round-5
+        # storm).  Same lock-free single-writer int discipline as above.
+        self.events_requests = 0
+        self._history_fail_remaining = 0
+        self._history_delay_ms = 0
+        # A thin pure-ASGI fault layer wrapping the REAL app (the production
+        # app itself is untouched): count + optionally delay/fail
+        # ``GET …/history``, count ``POST …/rewind``, count each per-ws SSE
+        # connection open (``GET …/events``), forward everything else (SSE
+        # bodies, /send, lifespan, static) verbatim.
+        production_app = self._app
+
+        async def _fault_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+            if scope.get("type") == "http":
+                path = scope.get("path", "")
+                method = scope.get("method", "")
+                if path.endswith("/history") and method == "GET":
+                    self.history_requests += 1
+                    if self._history_delay_ms > 0:
+                        await asyncio.sleep(self._history_delay_ms / 1000.0)
+                    if self._history_fail_remaining > 0:
+                        self._history_fail_remaining -= 1
+                        await send(
+                            {
+                                "type": "http.response.start",
+                                "status": 500,
+                                "headers": [(b"content-type", b"application/json")],
+                            }
+                        )
+                        await send({"type": "http.response.body", "body": b'{"error": "injected"}'})
+                        return
+                elif path.endswith("/rewind") and method == "POST":
+                    self.rewind_requests += 1
+                elif path.endswith("/events") and method == "GET":
+                    # Per-ws SSE connection open — count it (readable on
+                    # RecoveryServer) and forward the long-lived stream
+                    # verbatim below.  Uniquely the per-ws stream: the global
+                    # lane is ``…/events/global`` (ends ``/global``), and the
+                    # route the pane's EventSource hits is
+                    # ``…/workstreams/{ws_id}/events`` (session_routes).
+                    self.events_requests += 1
+            await production_app(scope, receive, send)
+
+        self._server = uvicorn.Server(
+            uvicorn.Config(_fault_app, log_level="warning", lifespan="on")
+        )
         self._thread = threading.Thread(
             target=self._serve, name=f"uvicorn-recovery-{self._port}", daemon=True
         )
@@ -341,6 +398,29 @@ class RecoveryServer:
         r.raise_for_status()
         result: dict[str, Any] = r.json()
         return result
+
+    # -- fault-injection knobs -----------------------------------------------
+    # Armed in-process by the Tier-2 runner (single writer at a time — see
+    # __init__).  A plain int is deliberate: CPython makes the loop thread's
+    # increment/decrement and the runner thread's read each atomic, and the
+    # arm-then-consume ordering means they never race.
+
+    def fail_history(self, count: int) -> None:
+        """Make the next ``count`` ``GET …/history`` responses a 500 — the
+        failed refetch the #890 guard-before-wipe must survive."""
+        self._history_fail_remaining = count
+
+    def delay_history(self, ms: int) -> None:
+        """Hold each ``GET …/history`` ``ms`` ms before forwarding (0
+        clears).  Opens the clear_ui-refetch quiesce window that the row
+        affordance gate (``busy || _replayQueue``) must close."""
+        self._history_delay_ms = ms
+
+    @property
+    def history_fail_remaining(self) -> int:
+        """Unconsumed forced-failure budget — 0 proves the armed failure
+        actually fired (assert backend state, never scripted absence)."""
+        return self._history_fail_remaining
 
     # -- teardown ------------------------------------------------------------
 
