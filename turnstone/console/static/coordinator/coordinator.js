@@ -5291,6 +5291,15 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _rewindToMessage(msgEl) {
+    // KNOWN GAP (#894, do not re-derive): from clear_ui arrival until
+    // the next SUCCESSFUL refetchHistory render — the fetch window AND
+    // the failed-fetch aftermath — the stale transcript is visible
+    // with busy false, so this DOM count can over-rewind.  Port
+    // interactive.js's #890 shape: a transcript-staleness latch set at
+    // clear_ui, cleared only by the full render, gating the mutating
+    // affordances (a plain refetch-in-flight flag is NOT enough — it
+    // reopens on the failed exit, the bug interactive hit).  The
+    // retry leg needs a quiesce-free variant here.
     if (busy) return;
     const userMsgs = messagesEl.querySelectorAll(".msg.user");
     const idx = Array.prototype.indexOf.call(userMsgs, msgEl);

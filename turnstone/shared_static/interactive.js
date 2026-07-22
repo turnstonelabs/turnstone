@@ -267,6 +267,40 @@ class Pane {
     // resync no longer quiesces: it tears the stream down first, so no
     // live events exist during its rebuild.)
     this._replayQueue = null;
+    // Transcript-staleness latch (#890): TRUE = the visible transcript
+    // no longer matches the server's conversation STRUCTURE.  Set at
+    // clear_ui arrival (the server just restructured) and on a ws
+    // reassignment (near-vacuous under one-Pane-per-ws, kept
+    // defensively); cleared in exactly ONE place — replayHistory's
+    // full render, the moment the DOM matches the server again.  NOT
+    // tied to the quiesce: the quiesce tracks event buffering and
+    // releases on a FAILED fetch too, which left a window where a
+    // rewind/edit computed turn counts off the stale DOM (over-rewind).
+    // Row-level MUTATING affordances (rewind / edit / edit-and-resend)
+    // gate on this alongside ``busy``; a new mutating affordance must
+    // adopt the same gate.  Route-L reloads deliberately do NOT set
+    // it: first paint renders into an empty pane (rewind early-returns
+    // on idx < 0), the truncated resync self-heals via its armed
+    // cursor, and the onLogin re-auth reload is count-preserving for
+    // rewind purposes except a server-side advance during the outage —
+    // where a stale count UNDER-rewinds (non-destructive) rather than
+    // over-rewinds.  Accepted residual, ruled: after a DOUBLE fetch
+    // failure the latch persists and rewind/edit stay closed until the
+    // next idle-edge heal (any turn end) or reload — safe-closed
+    // strictly beats destructive-open, and a reconnect snapshot must
+    // NOT clear it (a snapshot heals only the in-flight turn, never
+    // the committed structure the latch tracks).
+    this._historyStale = false;
+    // Single bounded retry for a failed clear_ui refetch (transient
+    // 500s cluster in restart windows).  Scheduled ONCE per clear_ui
+    // from its .then when the latch survived the fetch; fire-time
+    // guards: token still current, latch still set, and TURN-FREE
+    // (never replaceChildren a live bubble — the same rule the
+    // truncated resync's deferred branch follows; a busy pane defers
+    // to the idle-edge heal instead).  Superseded by any newer load
+    // (token bump) and cancelled in replayHistory's supersession
+    // block.
+    this._staleRetryTimer = null;
     // Hot-path caches — all invalidated by _clearAgentTracking/replayHistory.
     // _nearBottom mirrors the scroller position via a passive scroll listener
     // (no per-token geometry reads); the two Maps make per-event row/stream
@@ -1649,6 +1683,38 @@ class Pane {
     // same-ws reload keeps it armed until a successful full render
     // (replayHistory clears it) so a failed fetch can retry below.
     if (this.wsId !== wsId) this._truncatedFromCursor = null;
+    // A reassignment also invalidates the staleness latch's referent —
+    // whatever transcript is visible belongs to the OLD ws, so any
+    // DOM-derived count is wrong until the new ws renders.  Set, not
+    // clear: replayHistory's render releases it.  (Near-vacuous under
+    // one-Pane-per-ws; kept defensively with the other wsId!==wsId
+    // branches.)
+    if (this.wsId !== wsId) this._historyStale = true;
+    // Streaming-ref reset, gated on RESUMABILITY rather than ws
+    // identity: refs may survive a reload only when the reconnect can
+    // resume into them — same ws AND an armed truncation cursor (the
+    // ring replay continues the mid-jitter bubble; resetting there
+    // orphaned it beside a duplicate).  Every other flavor resets: a
+    // ws SWITCH (the drop above just nulled the cursor — old-ws refs
+    // must not survive into the new ws's stream), a first paint or
+    // idle-edge reload (refs already null; no-op), and an UNARMED
+    // same-ws reload (the onLogin re-auth fan-out): its reconnect is
+    // cursorless, a turn that completed during the outage sends no
+    // resuming snapshot, and a stale non-null ref would concatenate
+    // the NEXT turn's content into the old bubble at its old DOM
+    // position.
+    //
+    // KNOWN RESIDUAL (ruled, do not re-derive): the armed-case
+    // preservation adds one route into the pre-existing cross-client
+    // in_progress_snapshot stale-ref secondary — a turn that starts
+    // streaming during the resync jitter leaves these refs non-null,
+    // and a reconnect snapshot reflecting a NEWER turn reuses the
+    // stale bubble (transient; heals at the next idle-edge resync).
+    // Deferred to the both-clients snapshot sweep: resetting armed
+    // refs here kills the mid-jitter continuity contract, and
+    // patching the snapshot handler in ONE client diverges parity
+    // (coordinator.js's handler is identical).
+    if (this._truncatedFromCursor == null) this._resetStreamingRefs();
     this._replayQueue = null;
     this._clearAgentTracking();
     this._pendingTruncatedResync = false;
@@ -1740,14 +1806,19 @@ class Pane {
         this._endReplayQuiesce(token);
       }
     } else {
-      // Failure path never reaches replayHistory — reset the streaming refs
-      // here too, or the flushed backlog and resumed live events would paint
-      // into the subtree clear_ui already wiped.  It also leaves
-      // _truncatedFromCursor SET (only replayHistory clears it), which is
-      // what arms the connect chokepoint's retry for a failed truncated
-      // resync.
-      this._resetStreamingRefs();
-      this.showEmptyState();
+      // Failed fetch = DOM + ref + repair-intent no-op (#890, the G3
+      // guard-before-wipe ported from coordinator.js refetchHistory).
+      // The prior transcript stays on screen: no wipe ever ran (see
+      // the clear_ui case), and appending an empty-state hint below
+      // real content was the old resync-route wart.  The streaming
+      // refs stay untouched — null per the turn-free-at-clear_ui
+      // invariant, or validly attached on the resync route, where
+      // resetting them orphaned a mid-jitter turn's bubble and let
+      // the reconnect snapshot build a duplicate beside it.
+      // _truncatedFromCursor stays SET (only replayHistory clears
+      // it), which is what arms the connect chokepoint's retry for a
+      // failed truncated resync.  Only the quiesce must release, or
+      // a queued clear_ui backlog would wedge the pane.
       this._endReplayQuiesce(token);
     }
   }
@@ -2008,6 +2079,36 @@ class Pane {
             this._pendingTruncatedResync = false;
             this._recordTruncatedGap();
             this._loadHistoryThenConnect(this.wsId);
+          } else if (this._historyStale && !this._replayQueue) {
+            // Staleness-latch backstop (#890): a clear_ui refetch and
+            // its one bounded retry both failed, so the transcript
+            // still doesn't match the server and rewind/edit are
+            // latch-closed.  The turn just settled — refetch now.
+            //
+            // TRANSPORT-FREE BY DESIGN (ruled, do not "upgrade" this
+            // to _loadHistoryThenConnect): the heal must never touch
+            // the stream.  A reload's fresh reconnect draws the
+            // server's synthetic state_change:idle, which lands back
+            // in THIS branch — with /history down that was a
+            // zero-backoff disconnect/refetch/reconnect storm against
+            // a recovering node (the round-5 critical).  A quiesced
+            // REST refetch emits zero SSE events, so the trigger edge
+            // is only ever organic (turn-settle-driven, no server
+            // heartbeats) and the loop is structurally impossible.
+            // Stream death has its own owners (EventSource native
+            // auto-reconnect, the host recovery beat, the truncated
+            // resync) — the old reload's reconnect was redundant.
+            // The !_replayQueue guard skips the edge when a quiesced
+            // fetch is already in flight.  The else keeps the
+            // truncated branch's reload from doubling up (its render
+            // clears the latch too).  On another failure the latch
+            // persists and the next ORGANIC settle retries.  Accepted
+            // liveness lag: if /history recovers while the pane sits
+            // idle untouched, rewind/edit stay closed until the next
+            // organic settle — strictly safer than the storm.
+            const staleToken = this._historyLoadToken;
+            this._beginReplayQuiesce(staleToken);
+            this._refetchHistory(this.wsId, staleToken);
           }
           // Only steal focus if this is the active pane and no approval pending.
           if (this._host.isFocused(this) && !this.pendingApproval) {
@@ -2226,24 +2327,79 @@ class Pane {
 
       case "clear_ui": {
         // Conversation was structurally reset (rewind / retry / resume /
-        // open / fork). Empty the pane for immediate feedback, then
-        // re-render from REST and dispatch any queued edit-and-resend
-        // once the (possibly truncated) history lands. The resend keys
-        // off this signal rather than an inline history SSE event. Capture
-        // the load token AND the ws identity: a ws SWITCH mid-flight
-        // discards both the re-render and the resend (no cross-ws send),
-        // but a SAME-ws supersession — the jittered truncated resync
-        // bumps _historyLoadToken through _loadHistoryThenConnect — must
-        // still fire the resend: the superseding load renders the same
-        // post-rewind history, and silently dropping the queued edit
-        // stranded the composer busy with a message that never sent.
+        // open / fork). Re-render from REST and dispatch any queued
+        // edit-and-resend once the (possibly truncated) history lands.
+        // The resend keys off this signal rather than an inline history
+        // SSE event.
+        //
+        // No pre-wipe (#890, the guard-before-wipe shape coord shipped
+        // in #882's G3): the wipe + streaming-ref reset live in
+        // replayHistory, reached only on a SUCCESSFUL fetch — so a
+        // failed /history keeps the prior transcript on screen.
+        // Stale-but-real beats a blank pane on a live stream, and
+        // /history failures cluster in exactly the restart windows
+        // that emit clear_ui replays.  The quiesce stays armed across
+        // the fetch either way: queued live events replay into the
+        // rebuilt pane on success, or onto the stale-but-real one on
+        // failure — safe because clear_ui emitters are turn-free at
+        // emission (see the _resyncTimer field comment), so the
+        // surviving streaming refs are null and replayed events build
+        // fresh rows below the stale transcript.  The stale rows stay
+        // VISIBLE but their mutating affordances gate on the
+        // _historyStale latch (set below, cleared only by a successful
+        // replayHistory render — see the field comment), so a turn
+        // count computed off the stale DOM can't reach the server
+        // during the fetch OR after a failed one.  A failed fetch
+        // schedules one turn-free retry (the .then below); the
+        // idle-edge heal backstops a double failure.  Coord's cosmetic
+        // [data-busy] grey-out stays a deferred parity item (#890 PR).
+        //
+        // Capture the load token AND the ws identity: a ws SWITCH
+        // mid-flight discards both the re-render and the resend (no
+        // cross-ws send), but a SAME-ws supersession — the jittered
+        // truncated resync bumps _historyLoadToken through
+        // _loadHistoryThenConnect — must still fire the resend: the
+        // superseding load renders the same post-rewind history, and
+        // silently dropping the queued edit stranded the composer busy
+        // with a message that never sent.  On a FAILED fetch the
+        // resend still fires (the rewind already committed
+        // server-side); its bubble lands on the stale transcript and
+        // the rewound truth arrives with the next successful refetch —
+        // coord's same ruling.
         const token = this._historyLoadToken;
         const editWs = this.wsId;
+        this._historyStale = true;
         this._beginReplayQuiesce(token);
-        this.messagesEl.replaceChildren();
-        this._resetStreamingRefs();
         this._refetchHistory(this.wsId, token)
           .then(() => {
+            // Failed fetch (the latch survived — only replayHistory
+            // clears it): schedule the ONE bounded retry.  Scheduled
+            // here rather than in the failure branch so a retry's own
+            // failure cannot re-schedule (bounded by construction);
+            // fire-time guards make it a no-op once superseded or
+            // while a turn streams (the idle-edge heal owns the busy
+            // case).
+            if (this._historyStale && token === this._historyLoadToken) {
+              if (this._staleRetryTimer) clearTimeout(this._staleRetryTimer);
+              this._staleRetryTimer = setTimeout(() => {
+                this._staleRetryTimer = null;
+                if (
+                  token === this._historyLoadToken &&
+                  this._historyStale &&
+                  !this._replayQueue &&
+                  !this.busy &&
+                  !this.currentAssistantEl &&
+                  !this.currentReasoningEl
+                ) {
+                  // !_replayQueue: yield to an in-flight quiesced
+                  // fetch (the idle-edge backstop shares this token)
+                  // instead of stomping its queue for a same-token
+                  // double-render.
+                  this._beginReplayQuiesce(token);
+                  this._refetchHistory(this.wsId, token);
+                }
+              }, 2000);
+            }
             if (token !== this._historyLoadToken && this.wsId !== editWs) {
               // Cross-ws supersession: release the latch + busy so the
               // composer recovers; the edit belongs to a pane state that
@@ -2836,7 +2992,7 @@ class Pane {
   }
 
   _rewindToMessage(msgEl) {
-    if (this.busy) return;
+    if (this.busy || this._historyStale) return;
     // Count how many user messages come at or after this one. Bare
     // ``.msg.user`` is intentional: system-nudge markers carry that
     // class and the server's _find_turn_boundaries counts them as
@@ -2849,7 +3005,7 @@ class Pane {
   }
 
   _startEdit(msgEl, originalText) {
-    if (this.busy) return;
+    if (this.busy || this._historyStale) return;
     // Save current child nodes for cancel restoration
     const savedNodes = [];
     while (msgEl.firstChild) {
@@ -2911,7 +3067,7 @@ class Pane {
   }
 
   _editAndResend(msgEl, newText) {
-    if (this.busy) return;
+    if (this.busy || this._historyStale) return;
     // Count turns to rewind (from this message onward). Bare
     // ``.msg.user`` matches the server's turn semantics — see
     // _rewindToMessage.
@@ -2970,13 +3126,15 @@ class Pane {
   }
 
   _resetStreamingRefs() {
-    // Null every ref that can point into a wiped subtree, so the next event
-    // creates fresh targets instead of writing invisibly into detached
-    // nodes.  Called wherever the transcript DOM is (or is about to be)
-    // replaced — replayHistory, the clear_ui immediate wipe, and the
-    // refetch-FAILURE path (which shows the empty state without ever
-    // reaching replayHistory; leaving refs stale there made the retried
-    // generation's whole first segment stream into a detached bubble).
+    // Null every ref that can point into a wiped or non-resumable
+    // subtree, so the next event creates fresh targets instead of
+    // writing invisibly into detached nodes (or into a superseded
+    // bubble).  Callers (#890 shape): replayHistory's full render (the
+    // subtree was just replaced) and _loadHistoryThenConnect's
+    // non-resumable reloads (no armed truncation cursor — the
+    // reconnect cannot resume into the surviving refs).  The clear_ui
+    // pre-wipe and the refetch-failure call are GONE: a failed fetch
+    // preserves the pane, and preserved DOM keeps valid refs.
     this.currentAssistantEl = null;
     this.currentAssistantBodyEl = null;
     this.currentReasoningEl = null;
@@ -3014,6 +3172,14 @@ class Pane {
     if (this._resyncTimer) {
       clearTimeout(this._resyncTimer);
       this._resyncTimer = null;
+    }
+    // The render also restores structural truth — clear the staleness
+    // latch (its ONLY clear site) and cancel any pending clear_ui
+    // failure retry, which exists to produce exactly this render.
+    this._historyStale = false;
+    if (this._staleRetryTimer) {
+      clearTimeout(this._staleRetryTimer);
+      this._staleRetryTimer = null;
     }
     // The rebuild just orphaned any in-flight streaming targets — reset them,
     // and release the agent-card/orphan maps whose entries now point at
@@ -4884,6 +5050,11 @@ function createInteractivePane(root, wsId, opts) {
       active = true;
       if (!connected) {
         connected = true;
+        // Load-bearing pre-seed (#890): _refetchHistory's failure path
+        // no longer appends an empty-state, so a FAILED first paint
+        // shows this placeholder only because it is seeded here,
+        // before the fetch.  Removing it would leave a genuinely blank
+        // pane when the first /history fails.
         pane.showEmptyState();
         pane._loadHistoryThenConnect(wsId);
       }
@@ -4913,6 +5084,16 @@ function createInteractivePane(root, wsId, opts) {
       if (recoverTimer) {
         clearTimeout(recoverTimer);
         recoverTimer = null;
+      }
+      // The clear_ui failure retry survives everything EXCEPT a token
+      // bump — and destroy() bumps nothing, so an armed retry would
+      // fire ~2s post-destroy, pass its guards (latch still set, refs
+      // null), and replayHistory into the detached pane.  Cancel it
+      // here, terminal-only: disconnectSSE must NOT cancel it —
+      // transport-only reconnects keep the pending heal intent.
+      if (pane._staleRetryTimer) {
+        clearTimeout(pane._staleRetryTimer);
+        pane._staleRetryTimer = null;
       }
       pane.disconnectSSE();
       // The document-level visibilitychange listener holds a strong ref
