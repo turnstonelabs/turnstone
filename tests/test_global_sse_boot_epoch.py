@@ -50,8 +50,13 @@ def _make_app_state(
     """Minimal ``app.state`` for the global SSE handler.
 
     Real lock / deque / list so registration and slicing run the
-    production code paths; only the snapshot builder is stubbed (its
-    composition has its own coverage in ``test_console.py``).
+    production code paths; only the snapshot builder is stubbed — the
+    replay-branch decisions under test never depend on its composition.
+    The real ``_build_node_snapshot`` is exercised end-to-end by
+    ``scripts/recovery_e2e.py --scenario roster-restart`` (snapshot
+    membership + evict); its full field projection has no direct unit
+    test today (``test_console.py`` covers only the CONSUMER side,
+    feeding hand-built snapshot dicts to the collector).
     """
     buf: collections.deque[tuple[int, dict[str, Any]]] = collections.deque(maxlen=50)
     for item in buffered or []:
