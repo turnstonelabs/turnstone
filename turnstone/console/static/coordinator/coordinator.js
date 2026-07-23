@@ -1174,8 +1174,10 @@ function createCoordinatorPane(root, wsId, opts) {
       if (preview.length > 600) preview = preview.slice(0, 600) + "…";
     } else if (argsRaw) {
       // Malformed JSON or non-object args — show the raw payload
-      // truncated.  Matches the interactive replay's substring(0, 100)
-      // fallback at ui/static/app.js Pane.replayHistory.
+      // truncated.  Matches the interactive replay's fallback in
+      // shared_static/interactive.js replayHistory (the live parity
+      // source; the old ui/static/app.js Pane.replayHistory moved
+      // there in the L-shell step-5a lift).
       header = name;
       preview = argsRaw.length > 200 ? argsRaw.slice(0, 200) + "…" : argsRaw;
     }
