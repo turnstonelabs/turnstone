@@ -2241,12 +2241,18 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
     every cursor guard keeps a future editor from "simplifying" the
     numeric ones to match a terser string form.
 
-    The GLOBAL stream (app.js) is the deliberate exception: its manual
-    reconnects are pinned CURSORLESS — the global ring's counter reboots
-    at 0 on restart (KNOWN GAP #881), so a stale cursor draws
-    ``replay_ok``-empty with no node_snapshot and the roster ghosts;
-    cursorless always draws the fresh snapshot.  Revisit when #881
-    lands.
+    The GLOBAL stream (app.js) was pinned CURSORLESS here until #881
+    landed its boot-epoch signal: global ids are now
+    ``"{boot_epoch}-{counter}"``, so a cursor from a prior boot
+    mismatches the live epoch and draws ``replay_truncated`` + a fresh
+    node_snapshot instead of the old ``replay_ok``-empty ghost-roster
+    shape — the reason for cursorlessness is gone, and app.js now
+    captures/presents the cursor like the per-ws clients.  Its cursor
+    stays an OPAQUE STRING end to end (never ``parseInt``/``Number``
+    — the epoch prefix would NaN any numeric read), presented via
+    ``?last_event_id=`` (EventSource cannot set the header manually),
+    and cleared where the record dies: the ``replay_truncated``
+    handler and ``onLogout``.
 
     Comments are stripped before the scan (module-level, string-aware
     stripper) so documentation may name the anti-pattern verbatim — the
@@ -2262,6 +2268,11 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
             _COORD_JS,
             r'if \(event\.lastEventId != null && event\.lastEventId !== ""\) \{',
         ),
+        (
+            _APP_JS,
+            r'if \(e\.lastEventId != null && e\.lastEventId !== ""\) \{\s*'
+            r"globalLastEventId = e\.lastEventId;",
+        ),
     ):
         body = path.read_text(encoding="utf-8")
         code = _strip_js_comments(body)
@@ -2275,14 +2286,22 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
             '``!= null && !== ""`` guard) not found'
         )
     app_code = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
-    assert not dead_form.search(app_code), (
-        "app.js: dead EventSource-object cursor read must not return"
+    # Presentation: manual reconnects carry the stored cursor as a query
+    # param, behind the same string-guard idiom (see docstring above for
+    # why the explicit form is pinned).
+    assert re.search(
+        r'if \(globalLastEventId != null && globalLastEventId !== ""\) \{\s*'
+        r'globalUrl \+= "\?last_event_id=" \+ encodeURIComponent\(globalLastEventId\);',
+        app_code,
+    ), (
+        "app.js: manual global reconnect must present the stored cursor "
+        "via ?last_event_id= behind the house string guard"
     )
-    assert "lastEventId" not in app_code and "last_event_id" not in app_code, (
-        "app.js global stream must stay CURSORLESS on manual reconnects "
-        "until #881's boot-epoch staleness signal lands — a stale cursor "
-        "on the reborn global ring draws replay_ok-empty with no "
-        "node_snapshot (ghost roster)."
+    # The cursor is opaque — any numeric interpretation of it is a bug
+    # (the epoch prefix turns Number()/parseInt() into NaN silently).
+    assert not re.search(r"(?:Number|parseInt)\(\s*globalLastEventId", app_code), (
+        "app.js: the global cursor is an opaque epoch-tagged string — "
+        "never interpret it numerically"
     )
 
 
