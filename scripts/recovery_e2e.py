@@ -23,7 +23,8 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario rewind-window     # E2 (#890)
     python3 scripts/recovery_e2e.py --scenario rewind-failed-window  # E3 (#890)
     python3 scripts/recovery_e2e.py --scenario stale-backstop    # E4 (#890)
-    python3 scripts/recovery_e2e.py --scenario roster-restart    # F (#881)
+    python3 scripts/recovery_e2e.py --scenario roster-restart    # F1 (#881)
+    python3 scripts/recovery_e2e.py --scenario roster-restart-native  # F2 (#881)
     python3 scripts/recovery_e2e.py --scenario both   # A+B only (legacy)
     python3 scripts/recovery_e2e.py --keep-open 8971  # serve the storm page
                                                       # for manual inspection
@@ -169,7 +170,7 @@ one truncated full rebuild (no blank pane), the mid-run turn's tool rows
 re-appear inside their batch (no standalone top-level orphan bubbles),
 and turns committed while hidden are present.
 
-Scenario F (roster-restart, #881): the REAL node dashboard (``/`` +
+Scenario F1 (roster-restart, #881): the REAL node dashboard (``/`` +
 ui/static/app.js) driven through a node restart on the GLOBAL stream —
 the last silent-gap class from the truncated-recovery campaign.  Unlike
 the pane scenarios there is no custom page: the runner navigates to the
@@ -198,11 +199,32 @@ wrapper), ghost GONE + keeper PRESENT in the roster MODEL
 deliberately not the dashboard TABLE, whose membership refreshes only on
 interaction by design (see ``_roster_has_ws``) — and the backend proof
 ``global_events_requests>=1`` on the restarted node (the reconnect hit
-the real endpoint).  The NATIVE header path (browser echoes the
-epoch-tagged id on auto-reconnect) differs only in cursor transport and
-is pinned both-transports by Tier-1
-``test_global_sse_boot_epoch::test_query_param_fallback_matches_header_semantics``.
+the real endpoint).  Server-side, both cursor transports run the same
+parse (header-using tests cover it in Tier-1
+``test_global_sse_boot_epoch``); the CLIENT-side native path is a
+different animal and is Scenario F2's job.
 Stamps/returns ``RECOVERY-READY-ROSTER-trunc<n>-cursor<n>``.
+
+Scenario F2 (roster-restart-native, #881): the NATIVE-transport sibling
+of F1, and the only behavioral coverage of two pure-browser semantics no
+Tier-1 harness can express (the mechanism-5 lesson): the auto-reconnect
+header echo, and id-less frames inheriting the connection's persisted
+``lastEventId`` (WHATWG) — the mechanism that forced app.js's
+node_snapshot-branch cursor clear.  Phase A as F1.  Phase B: restart
+with the tab VISIBLE and the EventSource left OPEN, so the browser's own
+retry carries the stale pre-restart header — ``trunc>=1`` with
+``cursor==0`` IS the header-transport proof (only a presented-and-stale
+cursor draws the envelope; the query-param counter stays untouched) —
+and the heal must evict the ghost from model+rail.  Phase C (the
+round-3 fix's discriminator): immediately after the heal — guarded by
+an idFrames-unchanged precondition so the ~10s aggregate tick cannot
+race in unnoticed — force a manual reconnect (close the wrapper-held
+EventSource + hide/show).  It must go CURSORLESS with ``trunc`` still at
+1: pre-fix, the id-less snapshot frame re-captured the dead cursor and
+this reconnect presented it for a redundant second truncated round
+(``cursor1-trunc2``).  ``__globalOpens`` proves the second connection
+happened at the transport.  Stamps/returns
+``RECOVERY-READY-ROSTERNATIVE-trunc<n>-cursor0-opens<n>``.
 """
 
 from __future__ import annotations
@@ -1034,7 +1056,7 @@ def _coord_routes() -> list[Any]:
     ]
 
 
-def _boot_node(port: int = 0) -> Any:
+def _boot_node(port: int = 0, sock: Any = None) -> Any:
     from tests._sse_recovery_server import RecoveryServer
     from turnstone.core.storage import init_storage, reset_storage
 
@@ -1042,9 +1064,11 @@ def _boot_node(port: int = 0) -> Any:
     # runner via CDP BEFORE navigation), so make it public by prefixing under
     # a public path is unavailable here; instead the runner sets the cookie so
     # /recovery passes the middleware. init storage per boot (shared singleton).
+    # ``sock``: a pre-bound placeholder for the gap-free restart handoff
+    # (see RecoveryServer's ``sock`` parameter).
     reset_storage()
     init_storage("sqlite", path=os.path.join(_scratch(), "recovery_e2e.db"), run_migrations=True)
-    return RecoveryServer(extra_routes=[_page_route(), *_coord_routes()], port=port)
+    return RecoveryServer(extra_routes=[_page_route(), *_coord_routes()], port=port, sock=sock)
 
 
 def _scratch() -> str:
@@ -1217,6 +1241,7 @@ ROSTER_INJECT_JS = r"""
 window.__globalTruncated = 0;
 window.__globalIdFrames = 0;
 window.__globalCursorPresented = 0;
+window.__globalOpens = 0;
 window.__globalES = null;
 window.__hide = function () {
   Object.defineProperty(document, "hidden", { configurable: true, value: true });
@@ -1234,6 +1259,7 @@ window.__show = function () {
     const es = new RealES(url, opts);
     if (String(url).indexOf("/events/global") !== -1) {
       window.__globalES = es;
+      window.__globalOpens += 1;
       if (String(url).indexOf("last_event_id=") !== -1) {
         window.__globalCursorPresented += 1;
       }
@@ -1283,6 +1309,30 @@ def _roster_has_ws(cdp: CDP, ws_id: str, name: str) -> bool:
         )
     )
     return in_model and in_rail
+
+
+def _roster_absent_ws(cdp: CDP, ws_id: str, name: str) -> bool:
+    """The ws is fully evicted: absent from BOTH the model and the rail.
+
+    NOT ``not _roster_has_ws(...)`` — that De Morgans into
+    "absent from EITHER surface", which would stamp a heal HEALED while
+    a model-evicted ghost's row still lingers in the rail DOM (the exact
+    render-propagation regression the roster scenarios exist to catch;
+    round-4 review)."""
+    in_model = bool(
+        cdp.evaluate(
+            "(window.TS_APP && window.TS_APP.getClusterState) ? "
+            "window.TS_APP.getClusterState().nodes.local.workstreams.some("
+            f"function (w) {{ return w.id === {json.dumps(ws_id)}; }}) : true"
+        )
+    )
+    in_rail = bool(
+        cdp.evaluate(
+            "Array.prototype.some.call(document.querySelectorAll('button.row'), "
+            f"function (b) {{ return (b.title || '').indexOf({json.dumps(name)}) === 0; }})"
+        )
+    )
+    return not in_model and not in_rail
 
 
 def run_roster_restart(chrome: str) -> str:
@@ -1358,7 +1408,7 @@ def run_roster_restart(chrome: str) -> str:
         while time.monotonic() < deadline:
             trunc = cdp.evaluate("window.__globalTruncated || 0")
             cursor = cdp.evaluate("window.__globalCursorPresented || 0")
-            ghost_gone = not _roster_has_ws(cdp, ghost_id, "roster-ghost")
+            ghost_gone = _roster_absent_ws(cdp, ghost_id, "roster-ghost")
             keeper_here = _roster_has_ws(cdp, keeper_id, "roster-keeper")
             if (
                 isinstance(trunc, int)
@@ -1376,7 +1426,7 @@ def run_roster_restart(chrome: str) -> str:
             cursor = cdp.evaluate("window.__globalCursorPresented || 0")
             return (
                 f"RECOVERY-FAILED-ROSTER-trunc{trunc}-cursor{cursor}"
-                f"-ghost{'0' if not _roster_has_ws(cdp, ghost_id, 'roster-ghost') else '1'}"
+                f"-ghost{'0' if _roster_absent_ws(cdp, ghost_id, 'roster-ghost') else '1'}"
                 f"-keeper{'1' if _roster_has_ws(cdp, keeper_id, 'roster-keeper') else '0'}"
             )
         # Backend proof: the reconnect hit the restarted node's REAL global
@@ -1386,6 +1436,148 @@ def run_roster_restart(chrome: str) -> str:
             return "RECOVERY-FAILED-ROSTER-no-backend-global-connect"
         verdict = f"RECOVERY-READY-ROSTER-trunc{trunc}-cursor{cursor}"
         # Stamp the title too so the manual runbook flow reads the same way.
+        cdp.evaluate(f"document.title = {json.dumps(verdict)}")
+        return verdict
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
+def run_roster_restart_native(chrome: str) -> str:
+    from tests._sse_recovery_server import bash_toolcall_script, final_text_script
+
+    port = _free_port()
+    node = _boot_node(port=port)
+    keeper_id = node.create_workstream(final_text_script("keeper idle"), name="roster-keeper")
+    ghost_id = node.create_workstream(
+        bash_toolcall_script("g1", "echo ghost-activity"),
+        final_text_script("ghost done"),
+        name="roster-ghost",
+    )
+    profile = Path(_scratch()) / "chrome-roster-native"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        cdp.cmd("Page.enable")
+        cdp.cmd("Page.addScriptToEvaluateOnNewDocument", {"source": ROSTER_INJECT_JS})
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, node.base_url + "/")
+
+        # -- Phase A: identical to F1 ---------------------------------------
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if _roster_has_ws(cdp, ghost_id, "roster-ghost") and _roster_has_ws(
+                cdp, keeper_id, "roster-keeper"
+            ):
+                break
+            time.sleep(0.3)
+        else:
+            return "RECOVERY-FAILED-ROSTERNATIVE-rows-never-rendered"
+        node.send(ghost_id)
+        node.wait_turn(ghost_id, timeout=30)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            frames = cdp.evaluate("window.__globalIdFrames || 0")
+            if isinstance(frames, int) and frames >= 1:
+                break
+            time.sleep(0.3)
+        else:
+            return "RECOVERY-FAILED-ROSTERNATIVE-no-global-id-frames"
+        if cdp.evaluate("window.__globalTruncated || 0") != 0:
+            return "RECOVERY-FAILED-ROSTERNATIVE-truncated-false-positive"
+        if cdp.evaluate("window.__globalCursorPresented || 0") != 0:
+            return "RECOVERY-FAILED-ROSTERNATIVE-premature-cursor-presentation"
+
+        # -- Phase B: NATIVE heal — visible tab, EventSource left open ------
+        # The browser's own retry (the server's 2.5-4.5s ``retry:``
+        # directive) carries the persisted pre-restart id as the
+        # Last-Event-ID HEADER — the transport no manual path can
+        # exercise.  ``trunc>=1`` with the query-param counter still 0
+        # is itself the header proof: only a presented-and-stale cursor
+        # draws the envelope (a cursorless fresh connect draws
+        # snapshot-only).
+        #
+        # Gap-free handoff: a failed EventSource reconnect ATTEMPT is
+        # terminal per WHATWG (fail-the-connection → CLOSED, no second
+        # retry), so the single retry must never hit a refused port.
+        # The placeholder binds (SO_REUSEPORT) while node1 still lives,
+        # its backlog completes the retry's TCP handshake during the
+        # boot, and node2's uvicorn drains it once serving.
+        from tests._sse_recovery_server import make_listen_socket
+
+        placeholder = make_listen_socket(port)
+        node.stop()
+        node = _boot_node(port=port, sock=placeholder)
+        node.open_workstream(keeper_id)
+
+        deadline = time.monotonic() + 25
+        healed = False
+        while time.monotonic() < deadline:
+            trunc = cdp.evaluate("window.__globalTruncated || 0")
+            ghost_gone = _roster_absent_ws(cdp, ghost_id, "roster-ghost")
+            keeper_here = _roster_has_ws(cdp, keeper_id, "roster-keeper")
+            if isinstance(trunc, int) and trunc >= 1 and ghost_gone and keeper_here:
+                healed = True
+                break
+            time.sleep(0.4)
+        if not healed:
+            trunc = cdp.evaluate("window.__globalTruncated || 0")
+            # es state: 0/1 = the retry is still pending (boot too slow /
+            # stream never dropped), 2 = the browser gave up (a refused
+            # window reached the single terminal retry).
+            es_state = cdp.evaluate("window.__globalES ? window.__globalES.readyState : -1")
+            return (
+                f"RECOVERY-FAILED-ROSTERNATIVE-trunc{trunc}"
+                f"-ghost{'0' if _roster_absent_ws(cdp, ghost_id, 'roster-ghost') else '1'}"
+                f"-keeper{'1' if _roster_has_ws(cdp, keeper_id, 'roster-keeper') else '0'}"
+                f"-es{es_state}"
+            )
+        if cdp.evaluate("window.__globalCursorPresented || 0") != 0:
+            return "RECOVERY-FAILED-ROSTERNATIVE-native-leg-used-query-cursor"
+        if node.global_events_requests < 1:
+            return "RECOVERY-FAILED-ROSTERNATIVE-no-backend-global-connect"
+
+        # -- Phase C: the round-3 fix's discriminator -----------------------
+        # The heal's id-less snapshot frame re-captured the dead cursor
+        # on THIS (native) path until app.js's node_snapshot-branch
+        # clear; prove the clear works by forcing a manual reconnect
+        # NOW and asserting it goes CURSORLESS with no second truncated
+        # round.  Precondition: no id-bearing frame may have landed
+        # since the heal (an aggregate tick would legitimately re-arm a
+        # LIVE cursor and void the probe — ~10s cadence vs this
+        # sub-second window; a distinct verdict keeps a freak race
+        # readable as environment, not regression).
+        frames_at_heal = cdp.evaluate("window.__globalIdFrames || 0")
+        opens_before = cdp.evaluate("window.__globalOpens || 0")
+        cdp.evaluate("window.__globalES && window.__globalES.close()")
+        cdp.evaluate("window.__hide && window.__hide()")
+        cdp.evaluate("window.__show && window.__show()")
+        if cdp.evaluate("window.__globalIdFrames || 0") != frames_at_heal:
+            return "RECOVERY-FAILED-ROSTERNATIVE-tick-raced-the-probe"
+
+        deadline = time.monotonic() + 10
+        reopened = False
+        while time.monotonic() < deadline:
+            opens = cdp.evaluate("window.__globalOpens || 0")
+            if isinstance(opens, int) and isinstance(opens_before, int) and opens > opens_before:
+                reopened = True
+                break
+            time.sleep(0.3)
+        if not reopened:
+            return "RECOVERY-FAILED-ROSTERNATIVE-manual-reconnect-never-fired"
+        cursor = cdp.evaluate("window.__globalCursorPresented || 0")
+        trunc = cdp.evaluate("window.__globalTruncated || 0")
+        opens = cdp.evaluate("window.__globalOpens || 0")
+        if cursor != 0:
+            # Pre-fix shape: the dead cursor survived the snapshot frame
+            # and the manual reconnect presented it (cursor1 → a
+            # redundant second truncated round follows).
+            return f"RECOVERY-FAILED-ROSTERNATIVE-dead-cursor-represented-cursor{cursor}"
+        if trunc != 1:
+            return f"RECOVERY-FAILED-ROSTERNATIVE-redundant-truncated-trunc{trunc}"
+        verdict = f"RECOVERY-READY-ROSTERNATIVE-trunc{trunc}-cursor0-opens{opens}"
         cdp.evaluate(f"document.title = {json.dumps(verdict)}")
         return verdict
     finally:
@@ -2099,6 +2291,7 @@ def main() -> None:
             "rewind-failed-window",
             "stale-backstop",
             "roster-restart",
+            "roster-restart-native",
             "both",
             "all",
         ],
@@ -2152,7 +2345,11 @@ def main() -> None:
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     if args.scenario in ("roster-restart", "all"):
         verdict = run_roster_restart(chrome)
-        print(f"scenario F (roster): {verdict}")
+        print(f"scenario F1 (roster-manual): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("roster-restart-native", "all"):
+        verdict = run_roster_restart_native(chrome)
+        print(f"scenario F2 (roster-native): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     raise SystemExit(1 if failures else 0)
 

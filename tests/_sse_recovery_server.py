@@ -90,6 +90,7 @@ class RecoveryServer:
         listener_cap: int | None = None,
         extra_routes: list[Any] | None = None,
         port: int = 0,
+        sock: socket.socket | None = None,
     ) -> None:
         self._global_queue: _q.Queue[dict[str, Any]] = _q.Queue(maxsize=100000)
         self._global_listeners: list[_q.Queue[dict[str, Any]]] = []
@@ -180,13 +181,16 @@ class RecoveryServer:
             self._app.router.routes.extend(extra_routes)
 
         # Pre-bind a listening socket with a small SO_SNDBUF (accepted conns
-        # inherit it), then hand it to uvicorn.
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
-        self._sock.bind(("127.0.0.1", port))  # port=0 -> ephemeral; fixed -> restart reuse
+        # inherit it), then hand it to uvicorn.  ``sock`` injection: the
+        # gap-free restart scenarios (roster-restart-native) bind a
+        # placeholder BEFORE stopping the prior node and hand it in here —
+        # a failed EventSource reconnect attempt is TERMINAL per WHATWG
+        # (fail-the-connection → CLOSED, no further retries), so the
+        # native-retry leg must never observe a refused-window; the
+        # placeholder's listen backlog completes the TCP handshake during
+        # the boot and uvicorn drains it once serving.
+        self._sock = sock if sock is not None else make_listen_socket(port, sndbuf=sndbuf)
         self._port = int(self._sock.getsockname()[1])
-        self._sock.listen(128)
 
         # -- fault injection (public knobs below) ----------------------------
         # In-process arming: the Tier-2 runner holds this RecoveryServer and
@@ -250,8 +254,20 @@ class RecoveryServer:
                     self.global_events_requests += 1
             await production_app(scope, receive, send)
 
+        # ``timeout_graceful_shutdown``: an SSE stream that is still open
+        # at ``stop()`` would otherwise park uvicorn's graceful drain
+        # indefinitely (the 20s thread-join just expires and the browser
+        # stays attached to the zombie server — the roster-restart-native
+        # scenario is the one caller that stops a node mid-stream).  A
+        # bounded drain force-closes the stream after 2s and the lifespan
+        # shutdown (#885's daemon-thread teardown) still runs after it.
         self._server = uvicorn.Server(
-            uvicorn.Config(_fault_app, log_level="warning", lifespan="on")
+            uvicorn.Config(
+                _fault_app,
+                log_level="warning",
+                lifespan="on",
+                timeout_graceful_shutdown=2,
+            )
         )
         self._thread = threading.Thread(
             target=self._serve, name=f"uvicorn-recovery-{self._port}", daemon=True
@@ -430,6 +446,25 @@ class RecoveryServer:
         # Restore any patched cap defaults.
         for meth, defaults in self._orig_defaults:
             meth.__defaults__ = defaults
+
+
+def make_listen_socket(port: int, *, sndbuf: int = _DEFAULT_SNDBUF) -> socket.socket:
+    """Bound + listening socket the way :class:`RecoveryServer` binds its own.
+
+    ``SO_REUSEPORT`` on every listener (same process, same uid) is what
+    lets a restart scenario bind the successor's socket while the prior
+    node still holds the port — the seam behind the gap-free handoff
+    documented at the ``sock`` parameter.  ``SO_SNDBUF`` matches the
+    server's small send buffer so accepted connections inherit identical
+    backpressure behavior regardless of which side bound the socket.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
+    s.bind(("127.0.0.1", port))  # port=0 -> ephemeral; fixed -> restart reuse
+    s.listen(128)
+    return s
 
 
 def _tcp_ready(port: int, timeout: float) -> bool:
