@@ -5151,6 +5151,10 @@ class ChatSession:
             # MUST keep None — it runs on parallel tool threads and a
             # registration would clobber the main stream's _cancel_stream.
             cancel_ref=cancel_ref,
+            # Per-user OBO backend auth (see main loop) — utility completions on
+            # an entra_obo alias mint under the same driver; static aliases and
+            # userless internal calls resolve None and keep the static key.
+            obo_api_key=self._model_obo_token(lane.alias),
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
@@ -5372,7 +5376,7 @@ class ChatSession:
         tracker = self._get_health_tracker()
 
         try:
-            result = self._try_stream(self.client, self.model, msgs)
+            result = self._try_stream(self.client, self.model, msgs, model_alias=self._model_alias)
             if tracker:
                 tracker.record_success()
             return result
@@ -5483,6 +5487,14 @@ class ChatSession:
             role_counts,
         )
         msgs = self._maybe_attach_vllm_chat_reasoning(msgs, prov, model_alias)
+        # Per-user OBO backend auth: bind the minted token as the SDK client's
+        # api_key (with_options reuses the connection pool) so it becomes the
+        # provider's own credential header — extra_headers can't override the
+        # Anthropic SDK's x-api-key. None → the backend's static key stands.
+        # Resolved once, outside the retry loop.
+        obo_key = self._model_obo_token(model_alias or "")
+        if obo_key:
+            client = client.with_options(api_key=obo_key)
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             self._check_cancelled()
@@ -5966,6 +5978,76 @@ class ChatSession:
         pre-existing single-user behaviour.
         """
         return self._acting_user_id or self._mcp_user_id
+
+    def _model_obo_token(self, alias: str) -> str | None:
+        """Resolve the per-user OBO access token for an OBO-enabled backend.
+
+        When *alias*'s ModelConfig has ``auth_mode == "entra_obo"`` and a user
+        is driving the turn, mint a per-user Entra OBO access token for the
+        model's ``obo_audience`` and return it.  The caller binds it as the SDK
+        client's ``api_key`` (via ``with_options``, which reuses the connection
+        pool) so the SDK emits it as its own credential header — deliberately
+        NOT an injected ``extra_headers`` value, which the Anthropic SDK will
+        not let override its ``x-api-key``.
+
+        Returns ``None`` (leave the static key in place) for static aliases, an
+        empty/unknown alias, missing user context (CLI / eval / coordinator /
+        service turns, where ``_mcp_effective_user_id`` is empty), or a failed
+        mint — so the call still goes through on the backend's static credential.
+        The minted token is cached in the DB (``mcp_user_tokens``, shared across
+        worker nodes) per (user, audience), so a warm call is one cache read
+        rather than a re-mint. A fallback with a user present is logged (below)
+        so a silent drop to the static/placeholder credential is never invisible.
+        """
+        registry = self._registry
+        mcp = self._mcp_client
+        if registry is None or mcp is None or not alias or not registry.has_alias(alias):
+            return None
+        try:
+            cfg = registry.get_config(alias)
+        except ValueError:
+            return None
+        mode = getattr(cfg, "auth_mode", "static")
+        if mode not in ("entra_obo", "entra_app") or not cfg.obo_audience:
+            return None
+        if mode == "entra_app":
+            # App/managed identity via client-credentials — Turnstone's own SSO
+            # app reg, no user needed, so this also covers utility / coordinator
+            # / service / CLI turns. The gateway resolves it to one shared
+            # virtual account (no per-user attribution).
+            token = mcp.mint_app_token_sync(audience=cfg.obo_audience)
+            if not token:
+                log.warning(
+                    "model_app.fallback_to_static",
+                    alias=alias,
+                    audience=cfg.obo_audience,
+                    has_static_key=bool(getattr(cfg, "api_key", "")),
+                )
+                return None
+            return token
+        # entra_obo — per-user On-Behalf-Of.
+        user_id = (self._mcp_effective_user_id or "").strip()
+        if not user_id:
+            # Expected for utility / CLI / eval / coordinator / service turns —
+            # no user to mint on behalf of, so the static credential stands.
+            log.debug("model_obo.no_user_context", alias=alias, audience=cfg.obo_audience)
+            return None
+        token = mcp.mint_model_obo_token_sync(user_id=user_id, audience=cfg.obo_audience)
+        if not token:
+            # A user IS driving but the mint yielded nothing (no captured
+            # credential, decrypt failure, or the AS rejected the grant). Never
+            # silent: the request now goes out on the backend's STATIC credential
+            # — and when no api_key is set that is the unusable placeholder the
+            # backend rejects with an opaque 401. Surface the cause on our side.
+            log.warning(
+                "model_obo.fallback_to_static",
+                alias=alias,
+                user_id=user_id,
+                audience=cfg.obo_audience,
+                has_static_key=bool(getattr(cfg, "api_key", "")),
+            )
+            return None
+        return token
 
     def _history_scope_user_id(self) -> str | None:
         """Identity that scopes conversation-history reads (recall tool,
@@ -16044,6 +16126,9 @@ class ChatSession:
                         or (self.reasoning_effort if same_lane else None),
                         mint=mint,
                         wire_id_map=wire_id_map,
+                        # Per-user OBO backend auth for the sub-agent lane (see
+                        # main loop); None for static aliases / userless turns.
+                        obo_api_key=self._model_obo_token(lane.alias),
                     )
                     # Sub-agent turns bypass on_status — record per-turn so
                     # task-agent spend is visible in the dashboard, attributed

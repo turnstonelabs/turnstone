@@ -1695,6 +1695,35 @@
                   />
                 </div>
               </div>
+              <div class="sh-section">Backend auth</div>
+              <div class="field-pair">
+                <div>
+                  <label for="model-auth-mode">Auth mode</label>
+                  <select id="model-auth-mode">
+                    <option value="static">static (API key)</option>
+                    <option value="entra_obo">
+                      entra_obo (per-user OBO)
+                    </option>
+                    <option value="entra_app">
+                      entra_app (app identity)
+                    </option>
+                  </select>
+                </div>
+                <div>
+                  <label for="model-obo-audience"
+                    >OBO audience
+                    <span class="label-hint"
+                      >resource App ID URI; required for entra_obo /
+                      entra_app</span
+                    ></label
+                  >
+                  <input
+                    type="text"
+                    id="model-obo-audience"
+                    placeholder="https://your-resource.example.com"
+                  />
+                </div>
+              </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="model-enabled" checked />
                 <span class="toggle-track" aria-hidden="true"></span>

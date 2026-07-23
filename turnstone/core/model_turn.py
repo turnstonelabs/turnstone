@@ -636,6 +636,7 @@ def model_turn(
     wire_id_map: dict[str, str] | None = None,
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     cancel_ref: list[Any] | None = None,
+    obo_api_key: str | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
 
@@ -698,6 +699,16 @@ def model_turn(
     policy inside ``create_streaming`` and propagate unchanged).  An
     aborted *cancel_ref* suppresses retries — a deadline that closed the
     stream must not have the request resurrected behind its back.
+
+    *obo_api_key* is the per-user OBO access token for an
+    ``auth_mode='entra_obo'`` backend.  When set, the call is issued on
+    ``lane.client.with_options(api_key=...)`` — a copy that reuses the
+    client's connection pool but swaps the credential, so the SDK emits it as
+    its own auth header (``x-api-key`` for Anthropic, ``Authorization: Bearer``
+    for OpenAI-style).  This is deliberately NOT header injection via
+    ``extra_headers``: the Anthropic SDK does not let ``extra_headers``
+    override its ``x-api-key``, so an injected header is silently dropped.
+    ``None`` leaves the lane's static client credential in place.
     """
     if mint is not None and wire_id_map is None:
         raise ValueError(
@@ -732,8 +743,12 @@ def model_turn(
         # request-level retry), so an exception from it is a request-time
         # failure that already got its retries; only drain-time failures
         # are mid-stream deaths the SDK could never see.
+        # OBO backends bind the per-user token as the client's api_key so the
+        # SDK emits it as its own auth header; with_options reuses the pool.
+        # (extra_headers can't override the Anthropic SDK's x-api-key.)
+        call_client = lane.client.with_options(api_key=obo_api_key) if obo_api_key else lane.client
         chunks = lane.provider.create_streaming(
-            client=lane.client,
+            client=call_client,
             model=lane.model,
             messages=wire,
             tools=tools,

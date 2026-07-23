@@ -1011,6 +1011,10 @@ class ModelDefinitionInfo(BaseModel):
     reasoning_effort: str | None = None
     surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
+    # "static" (send api_key) or "entra_obo" (mint a per-user OBO token for
+    # obo_audience at call time — see model_definitions migration 068).
+    auth_mode: str = "static"
+    obo_audience: str = ""
     source: str = ""
     created_by: str = ""
     created: str = ""
@@ -1031,6 +1035,8 @@ class CreateModelDefinitionRequest(BaseModel):
     reasoning_effort: str | None = None
     surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
+    auth_mode: str = "static"
+    obo_audience: str = ""
 
 
 class UpdateModelDefinitionRequest(BaseModel):
@@ -1047,6 +1053,8 @@ class UpdateModelDefinitionRequest(BaseModel):
     reasoning_effort: str | None = None
     surface_persisted_reasoning: bool | None = None
     replay_reasoning_to_model: bool | None = None
+    auth_mode: str | None = None
+    obo_audience: str | None = None
 
 
 class ListModelDefinitionsResponse(BaseModel):

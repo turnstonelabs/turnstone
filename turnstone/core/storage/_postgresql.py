@@ -5071,6 +5071,8 @@ class PostgreSQLBackend:
         reasoning_effort: str | None = None,
         surface_persisted_reasoning: bool = True,
         replay_reasoning_to_model: bool = False,
+        auth_mode: str = "static",
+        obo_audience: str = "",
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -5093,6 +5095,8 @@ class PostgreSQLBackend:
                     reasoning_effort=reasoning_effort,
                     surface_persisted_reasoning=1 if surface_persisted_reasoning else 0,
                     replay_reasoning_to_model=1 if replay_reasoning_to_model else 0,
+                    auth_mode=auth_mode,
+                    obo_audience=obo_audience,
                     created_by=created_by,
                     created=now,
                     updated=now,

@@ -7135,6 +7135,10 @@ function _renderModels(items) {
     // operator opt-in). Default values are silent.
     if (m.surface_persisted_reasoning === false) overrides.push("surface=off");
     if (m.replay_reasoning_to_model === true) overrides.push("replay=on");
+    // Per-user OBO / app-identity backend auth surfaces as a hint (static is
+    // the default).
+    if (m.auth_mode === "entra_obo") overrides.push("obo");
+    else if (m.auth_mode === "entra_app") overrides.push("app");
     if (overrides.length) {
       const ovrSpan = document.createElement("span");
       ovrSpan.className = "model-overrides-hint";
@@ -7337,6 +7341,8 @@ function showCreateModelModal() {
   document.getElementById("model-enabled").checked = true;
   document.getElementById("model-surface-persisted-reasoning").checked = true;
   document.getElementById("model-replay-reasoning").checked = false;
+  document.getElementById("model-auth-mode").value = "static";
+  document.getElementById("model-obo-audience").value = "";
   document.getElementById("model-detect-result").hidden = true;
   document.getElementById("model-detect-btn").disabled = false;
   document.getElementById("model-detect-btn").textContent = "Detect";
@@ -7390,6 +7396,10 @@ function showEditModelModal(definitionId) {
         m.max_tokens != null ? m.max_tokens : "";
       document.getElementById("model-reasoning-effort").value =
         m.reasoning_effort != null ? m.reasoning_effort : "";
+      document.getElementById("model-auth-mode").value =
+        m.auth_mode || "static";
+      document.getElementById("model-obo-audience").value =
+        m.obo_audience || "";
       // Parse capabilities JSON and extract server_compat for structured fields
       let capsObj = {};
       try {
@@ -7685,6 +7695,26 @@ function submitCreateModel() {
   form.replay_reasoning_to_model = document.getElementById(
     "model-replay-reasoning",
   ).checked;
+
+  // Backend auth: entra_obo mints a per-user OBO token for obo_audience at
+  // call time; entra_app mints an app-identity (client-credentials) token from
+  // Turnstone's SSO app reg. (The server re-validates the same pairing.)
+  const authMode =
+    document.getElementById("model-auth-mode").value || "static";
+  const oboAudience = document
+    .getElementById("model-obo-audience")
+    .value.trim();
+  if (
+    (authMode === "entra_obo" || authMode === "entra_app") &&
+    oboAudience === ""
+  ) {
+    _showModelError(
+      "OBO audience is required when auth mode is 'entra_obo' or 'entra_app'",
+    );
+    return;
+  }
+  form.auth_mode = authMode;
+  form.obo_audience = oboAudience;
 
   const apiKey = document.getElementById("model-api-key").value;
   if (apiKey) form.api_key = apiKey;

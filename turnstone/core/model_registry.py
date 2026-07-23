@@ -48,6 +48,15 @@ class ModelConfig:
     # Server compatibility settings for openai-compatible backends.
     # Populated from capabilities["server_compat"] during load.
     server_compat: dict[str, Any] = field(default_factory=dict)
+    # Per-user backend auth.  ``auth_mode="static"`` (default) sends
+    # ``api_key`` unchanged.  ``auth_mode="entra_obo"`` mints a per-user Entra
+    # OBO access token for ``obo_audience`` at call time and sends it as the
+    # backend credential (x-api-key for Anthropic surfaces, Authorization:
+    # Bearer for OpenAI-style), falling back to ``api_key`` when there is no
+    # user context.  ``obo_audience`` is the resource App ID URI redeemed as
+    # ``<obo_audience>/.default`` (see ``mint_obo_access_token``).
+    auth_mode: str = "static"
+    obo_audience: str = ""
 
 
 def _api_surface_of(cfg: ModelConfig) -> str | None:
@@ -145,9 +154,18 @@ class ModelRegistry:
                 raise ValueError(f"Unknown model alias: {alias}")
             if alias not in self._clients:
                 cfg = self._models[alias]
+                # An entra_obo / entra_app backend authenticates per-call via a
+                # minted token bound with ``client.with_options(api_key=...)``, so
+                # the cached client only needs to CONSTRUCT — feed a placeholder
+                # when no static fallback key is set (the SDKs reject an empty key
+                # that also has no env fallback).  The real credential is supplied
+                # per call and never rides on this base client object.
+                client_key = cfg.api_key
+                if not client_key and cfg.auth_mode in ("entra_obo", "entra_app"):
+                    client_key = "obo-placeholder-unused"
                 try:
                     self._clients[alias] = create_client(
-                        cfg.provider, base_url=cfg.base_url, api_key=cfg.api_key
+                        cfg.provider, base_url=cfg.base_url, api_key=client_key
                     )
                 except ValueError:
                     # create_client's own misconfig errors already carry
@@ -432,6 +450,10 @@ def load_model_registry(
                 # pre-052 row missing these columns degrades gracefully.
                 row_surface_persisted_reasoning = bool(row.get("surface_persisted_reasoning", True))
                 row_replay_reasoning = bool(row.get("replay_reasoning_to_model", False))
+                # Per-user OBO auth (defaults match a pre-068 row missing the
+                # columns → "static", no audience → unchanged behaviour).
+                row_auth_mode = str(row.get("auth_mode") or "static")
+                row_obo_audience = _resolve_env_vars(row.get("obo_audience") or "")
                 configs[alias] = ModelConfig(
                     alias=alias,
                     base_url=row_base_url,
@@ -449,6 +471,8 @@ def load_model_registry(
                     surface_persisted_reasoning=row_surface_persisted_reasoning,
                     replay_reasoning_to_model=row_replay_reasoning,
                     server_compat=row_server_compat,
+                    auth_mode=row_auth_mode,
+                    obo_audience=row_obo_audience,
                 )
         except Exception:
             if strict:
@@ -502,6 +526,8 @@ def load_model_registry(
         entry_server_compat = entry_caps.pop("server_compat", {})
         if not isinstance(entry_server_compat, dict):
             entry_server_compat = {}
+        entry_auth_mode = str(entry.get("auth_mode", "static") or "static")
+        entry_obo_audience = _resolve_env_vars(str(entry.get("obo_audience", "")))
         configs[alias] = ModelConfig(
             alias=alias,
             base_url=entry_base_url,
@@ -520,6 +546,8 @@ def load_model_registry(
             max_tokens=entry_max_tokens,
             reasoning_effort=entry_effort,
             server_compat=entry_server_compat,
+            auth_mode=entry_auth_mode,
+            obo_audience=entry_obo_audience,
         )
 
     # 3. Back-compat shim: synthesize a "default" alias from CLI/auto-detected

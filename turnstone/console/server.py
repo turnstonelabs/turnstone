@@ -11627,6 +11627,11 @@ _REASONING_EFFORT_CHOICES = frozenset(
 )
 # Keep in sync with turnstone.core.providers._VALID_API_SURFACES.
 _API_SURFACE_CHOICES = frozenset({"chat", "responses"})
+# Per-model backend auth mode.  "static" = send the stored api_key; "entra_obo"
+# = mint a per-user Entra OBO token for obo_audience at call time; "entra_app"
+# = mint an app-identity (client-credentials) token from Turnstone's own SSO app
+# registration for obo_audience (no user; one shared machine identity).
+_MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app"})
 
 
 def _validate_api_surface(caps: Any) -> str | None:
@@ -12066,6 +12071,16 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     surface_persisted_reasoning = bool(body.get("surface_persisted_reasoning", True))
     replay_reasoning_to_model = bool(body.get("replay_reasoning_to_model", False))
 
+    auth_mode = str(body.get("auth_mode", "static")).strip() or "static"
+    if auth_mode not in _MODEL_AUTH_MODES:
+        return JSONResponse({"error": f"Invalid auth_mode: {auth_mode!r}"}, status_code=400)
+    obo_audience = str(body.get("obo_audience", "")).strip()
+    if auth_mode in ("entra_obo", "entra_app") and not obo_audience:
+        return JSONResponse(
+            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
+            status_code=400,
+        )
+
     storage.create_model_definition(
         definition_id=definition_id,
         alias=alias,
@@ -12082,6 +12097,8 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         reasoning_effort=reasoning_effort,
         surface_persisted_reasoning=surface_persisted_reasoning,
         replay_reasoning_to_model=replay_reasoning_to_model,
+        auth_mode=auth_mode,
+        obo_audience=obo_audience,
     )
 
     record_audit(
@@ -12247,6 +12264,23 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         updates["surface_persisted_reasoning"] = bool(body["surface_persisted_reasoning"])
     if "replay_reasoning_to_model" in body:
         updates["replay_reasoning_to_model"] = bool(body["replay_reasoning_to_model"])
+
+    if "auth_mode" in body:
+        am = str(body["auth_mode"]).strip() or "static"
+        if am not in _MODEL_AUTH_MODES:
+            return JSONResponse({"error": f"Invalid auth_mode: {am!r}"}, status_code=400)
+        updates["auth_mode"] = am
+    if "obo_audience" in body:
+        updates["obo_audience"] = str(body["obo_audience"]).strip()
+    # Cross-field: entra_obo needs an audience. Validate the POST-merge state so
+    # a request that touches only one of the pair still checks against the other.
+    eff_auth_mode = updates.get("auth_mode", existing.get("auth_mode", "static"))
+    eff_audience = updates.get("obo_audience", existing.get("obo_audience", ""))
+    if eff_auth_mode in ("entra_obo", "entra_app") and not eff_audience:
+        return JSONResponse(
+            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
+            status_code=400,
+        )
 
     if updates:
         storage.update_model_definition(definition_id, **updates)

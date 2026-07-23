@@ -642,6 +642,8 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "reasoning_effort",
         "surface_persisted_reasoning",
         "replay_reasoning_to_model",
+        "auth_mode",
+        "obo_audience",
     }
 )
 PROJECT_MUTABLE = frozenset({"name", "visibility", "state", "parent_project_id"})
