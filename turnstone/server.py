@@ -1160,37 +1160,17 @@ async def global_events_sse(request: Request) -> Response:
                     replay_events = [ev for eid, ev in buffered if eid > last_event_id]
         listeners.append(client_queue)
 
-    if replay_status != "replay_ok":
-        # Snapshot built AFTER the lock: ``_build_node_snapshot`` is an
-        # O(workstreams) walk taking each ws's ``_ws_lock``, and under
-        # ``global_listeners_lock`` it would stall the fanout thread's
-        # per-event stamping for EVERY listener — N-fold during a
-        # restart herd of stale-cursor reconnects, exactly when the
-        # reborn node is emitting its re-open events.  Registration
-        # already happened under the lock above, so every event from
-        # that instant on is queued to this listener: nothing is lost,
-        # and deltas stamped while the snapshot builds re-apply
-        # idempotently over the (newer) snapshot at the consumer
-        # (state-of-world contract — see the endpoint docstring).
-        # ``replay_ok`` is by design exactly the no-snapshot shape
-        # (truncated always carries the snapshot floor, fresh always
-        # snapshots), so this predicate and the generator's emission
-        # branch stay one rule.
-        snapshot = _build_node_snapshot(request.app.state)
+    def _deregister() -> None:
+        """Remove this connection's queue from the fan-out list.
 
-    if replay_status == "truncated":
-        # Envelope chokepoint log, analog of ``ws.events.replay_truncated``
-        # on the per-ws lane — one line per gap detection, the operator
-        # signal that clients are being told to resync (a burst of
-        # ``reason=boot_epoch`` right after startup is the restart herd
-        # healing; sustained ``reason=ring_evicted`` means the ring cap
-        # is being outrun).
-        log.info(
-            "global.events.replay_truncated",
-            reason=truncated_reason,
-            lost_count=lost_count if truncated_reason == "ring_evicted" else None,
-            cursor=(last_event_id_raw or "")[:64],
-        )
+        Idempotent (``in`` check under the lock).  Two owners share it:
+        the generator's ``finally`` on every stream exit, and the
+        registration-window guard below for exits that fire before the
+        generator exists.
+        """
+        with listeners_lock:
+            if client_queue in listeners:
+                listeners.remove(client_queue)
 
     async def event_generator() -> AsyncGenerator[dict[str, Any], None]:
         _metrics.record_sse_connect()
@@ -1262,11 +1242,62 @@ async def global_events_sse(request: Request) -> Response:
                     pass  # poll timeout, retry
         finally:
             _metrics.record_sse_disconnect()
-            with listeners_lock:
-                if client_queue in listeners:
-                    listeners.remove(client_queue)
+            _deregister()
 
-    return EventSourceResponse(event_generator(), ping=5)
+    # Registration-window guard (#881 round-2 review): from the append
+    # above until the return below, THIS frame owns the listener — the
+    # generator's ``finally`` (the normal owner) cannot run before the
+    # generator exists, so any exit in this window must de-register or
+    # the queue leaks into the fan-out loop forever (the fan-out thread
+    # never removes dead listeners; pre-#881 the append was the LAST
+    # statement of the locked block precisely so a raising snapshot
+    # build could not strand it).  Everything that can raise lives
+    # inside the try — the snapshot build (storage reads + per-ws
+    # locks), the log call, and response construction; the two ``def``s
+    # above are pure bindings and cannot.  ``BaseException``: the
+    # window is await-free today, so a cancellation cannot land inside
+    # it, but the guard must not silently narrow if a future edit
+    # introduces an await.  Ownership passes to the generator's
+    # ``finally`` once the return succeeds.
+    try:
+        if replay_status != "replay_ok":
+            # Snapshot built AFTER the lock: ``_build_node_snapshot``
+            # is an O(workstreams) walk taking each ws's ``_ws_lock``,
+            # and under ``global_listeners_lock`` it would stall the
+            # fanout thread's per-event stamping for EVERY listener —
+            # N-fold during a restart herd of stale-cursor reconnects,
+            # exactly when the reborn node is emitting its re-open
+            # events.  Registration already happened under the lock
+            # above, so every event from that instant on is queued to
+            # this listener: nothing is lost, and deltas stamped while
+            # the snapshot builds re-apply idempotently over the
+            # (newer) snapshot at the consumer (state-of-world
+            # contract — see the endpoint docstring).  ``replay_ok``
+            # is by design exactly the no-snapshot shape (truncated
+            # always carries the snapshot floor, fresh always
+            # snapshots), so this predicate and the generator's
+            # emission branch stay one rule.
+            snapshot = _build_node_snapshot(request.app.state)
+
+        if replay_status == "truncated":
+            # Envelope chokepoint log, analog of
+            # ``ws.events.replay_truncated`` on the per-ws lane — one
+            # line per gap detection, the operator signal that clients
+            # are being told to resync (a burst of ``reason=boot_epoch``
+            # right after startup is the restart herd healing; sustained
+            # ``reason=ring_evicted`` means the ring cap is being
+            # outrun).
+            log.info(
+                "global.events.replay_truncated",
+                reason=truncated_reason,
+                lost_count=lost_count if truncated_reason == "ring_evicted" else None,
+                cursor=(last_event_id_raw or "")[:64],
+            )
+
+        return EventSourceResponse(event_generator(), ping=5)
+    except BaseException:
+        _deregister()
+        raise
 
 
 async def dashboard(request: Request) -> JSONResponse:

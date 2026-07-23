@@ -31,6 +31,7 @@ import collections
 import json
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace as SimpleNS
 from typing import Any
 
@@ -204,14 +205,42 @@ def test_same_epoch_cursor_at_head_is_caught_up_replay_ok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cursor at the newest id is the normal caught-up reconnect:
-    nothing to replay, no snapshot, and crucially no false truncated."""
-    yields = _drain(
-        monkeypatch,
-        buffered=[_ev(4), _ev(5)],
-        headers={"Last-Event-ID": f"{EPOCH}-5"},
-        max_yields=1,
-    )
-    assert _types(yields) == []
+    nothing to replay, no snapshot, and crucially no false truncated.
+
+    Asserted POSITIVELY: a sentinel live event is queued to the
+    registered listener before draining, so the drain runs through the
+    live loop and the sentinel must be the FIRST data frame — a spurious
+    envelope or snapshot would land ahead of it.  (A drain truncated at
+    the always-first ``retry`` frame asserts nothing — round-2 review.)
+    """
+    monkeypatch.setattr(server_mod, "_build_node_snapshot", lambda _s: dict(_SNAPSHOT_STUB))
+    app_state = _make_app_state(buffered=[_ev(4), _ev(5)])
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="boot-epoch-test")
+    app_state.sse_executor = executor
+    req = _fake_request(app_state, headers={"Last-Event-ID": f"{EPOCH}-5"})
+
+    async def _run() -> list[dict[str, Any]]:
+        async with asyncio.timeout(10):
+            resp: Any = await server_mod.global_events_sse(req)
+            # Registered by handler-await time; the live sentinel the
+            # drain below must reach as its first data frame.
+            app_state.global_listeners[0].put_nowait(
+                {"type": "ws_state", "ws_id": "sentinel", "_event_id": 6}
+            )
+            out: list[dict[str, Any]] = []
+            async for chunk in resp.body_iterator:
+                out.append(chunk)
+                if len(out) >= 2:
+                    break
+            await resp.body_iterator.aclose()
+            return out
+
+    try:
+        yields = asyncio.run(_run())
+    finally:
+        executor.shutdown(wait=True)
+    frames = _data_frames(yields)
+    assert [f.get("ws_id") for f in frames] == ["sentinel"]
 
 
 def test_same_epoch_ring_miss_is_truncated_with_honest_counts(
@@ -375,6 +404,65 @@ def test_epoch_is_hex_and_dashless_by_construction() -> None:
 
     src = inspect.getsource(server_mod)
     assert "app.state.global_boot_epoch = secrets.token_hex(" in src
+
+
+def test_snapshot_builds_after_registration_outside_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins the branch's concurrency contract AT THE BUILD SITE: when
+    ``_build_node_snapshot`` runs, (1) the listener is already
+    REGISTERED — registration-before-build is the no-loss ordering
+    (every event from registration on is queued, so the newer snapshot
+    plus the queued deltas covers everything), and (2)
+    ``global_listeners_lock`` is RELEASED — the O(workstreams) build
+    must not stall the fan-out thread.  A refactor "harmonizing" this
+    lane with the per-ws build-under-lock shape, or reordering
+    registration after the build, fails here and nowhere else."""
+    app_state = _make_app_state(buffered=[_ev(1)])
+    probed: dict[str, Any] = {}
+
+    def _probe(_s: Any) -> dict[str, Any]:
+        probed["registered"] = len(app_state.global_listeners)
+        acquired = app_state.global_listeners_lock.acquire(blocking=False)
+        probed["lock_free"] = acquired
+        if acquired:
+            app_state.global_listeners_lock.release()
+        return dict(_SNAPSHOT_STUB)
+
+    monkeypatch.setattr(server_mod, "_build_node_snapshot", _probe)
+    req = _fake_request(app_state, headers={"Last-Event-ID": "deadbeef-1"})
+
+    async def _run() -> None:
+        resp: Any = await server_mod.global_events_sse(req)
+        await resp.body_iterator.aclose()
+
+    asyncio.run(_run())
+    assert probed == {"registered": 1, "lock_free": True}
+
+
+def test_raising_snapshot_build_deregisters_the_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registration-window guard (#881 round-2 review): registration
+    precedes the build, so a raising ``_build_node_snapshot`` fires
+    before the generator — whose ``finally`` is the normal owner of
+    de-registration — ever exists.  The window guard must remove the
+    queue, or it sits dead in the fan-out list forever (the fan-out
+    thread never removes listeners)."""
+    app_state = _make_app_state(buffered=[_ev(1)])
+
+    def _boom(_s: Any) -> dict[str, Any]:
+        raise RuntimeError("storage hiccup")
+
+    monkeypatch.setattr(server_mod, "_build_node_snapshot", _boom)
+    req = _fake_request(app_state, headers={"Last-Event-ID": "deadbeef-1"})
+
+    async def _run() -> None:
+        await server_mod.global_events_sse(req)
+
+    with pytest.raises(RuntimeError, match="storage hiccup"):
+        asyncio.run(_run())
+    assert app_state.global_listeners == []
 
 
 def test_listener_registered_exactly_once_per_connect(
