@@ -22,6 +22,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import sys
 import textwrap
 import threading
@@ -1009,6 +1010,19 @@ async def global_events_sse(request: Request) -> Response:
     On connect, emits a ``node_snapshot`` event with the full node state
     (workstreams, health, aggregate) followed by real-time delta events.
     The snapshot and listener registration are atomic — no events are lost.
+
+    Resume contract (#881): every event's SSE ``id:`` is
+    ``"{boot_epoch}-{counter}"``, where ``boot_epoch`` is a per-process
+    nonce and ``counter`` is the process-local monotonic event id.  A
+    reconnect presenting a cursor (``Last-Event-ID`` header or
+    ``?last_event_id=``) whose epoch matches gets the ring replay
+    (``replay_ok`` past the counter, or a ``replay_truncated`` envelope
+    with ``reason="ring_evicted"`` when the ring has moved on); a cursor
+    from any other epoch — a prior boot, another node, a pre-#881
+    bare-int client — gets ``replay_truncated`` with
+    ``reason="boot_epoch"`` followed by a fresh ``node_snapshot``, since
+    the events it missed died with the process that minted it.  Clients
+    treat the cursor as an opaque string; only this handler parses it.
     """
     # -- Service-scope gate ---------------------------------------------------
     # The global stream carries cluster-wide workstream inventory across
@@ -1036,14 +1050,44 @@ async def global_events_sse(request: Request) -> Response:
     # Native EventSource sets the header on auto-reconnect; the
     # manual-reconnect path (which can't set custom headers on
     # ``new EventSource(url)``) uses the query-param fallback.
+    #
+    # Global ids are ``"{boot_epoch}-{counter}"`` (#881): the epoch half
+    # proves the cursor was minted by THIS process.  The counter reboots
+    # at 0 with the process, so without the epoch a pre-restart cursor is
+    # first invisibly "ahead" of the reborn ring (empty replay slice) and
+    # then, as the counter re-grows past it, aliases into the new id
+    # space — both draw ``replay_ok`` and silently skip the restart
+    # boundary.  Parse outcomes:
+    #   - no cursor            → ``last_event_id = None`` (fresh);
+    #   - epoch matches        → ``last_event_id = counter`` (ring logic);
+    #   - anything else        → ``cursor_stale = True`` (a cursor was
+    #     presented but is unusable: prior-boot epoch, another node's
+    #     epoch, a bare-int cursor from a pre-#881 client, or garbage)
+    #     → the ``replay_truncated`` + node_snapshot floor below.  A
+    #     present-but-unusable cursor must NOT fall back to ``fresh``:
+    #     fresh is the no-loss shape, and this caller has provably
+    #     lost the events between its cursor and this boot.
+    boot_epoch: str = request.app.state.global_boot_epoch
     last_event_id_raw = request.headers.get("Last-Event-ID") or request.query_params.get(
         "last_event_id"
     )
-    last_event_id: int | None
-    try:
-        last_event_id = int(last_event_id_raw) if last_event_id_raw else None
-    except (TypeError, ValueError):
-        last_event_id = None
+    last_event_id: int | None = None
+    cursor_stale = False
+    if last_event_id_raw:
+        cursor_epoch, sep, counter_raw = last_event_id_raw.partition("-")
+        if sep and cursor_epoch == boot_epoch:
+            try:
+                last_event_id = int(counter_raw)
+            except ValueError:
+                cursor_stale = True
+            else:
+                if last_event_id < 0:
+                    # Our counters start at 1; a negative counter can
+                    # only be forged.  Same floor as garbage.
+                    last_event_id = None
+                    cursor_stale = True
+        else:
+            cursor_stale = True
 
     # -- Atomic snapshot / replay-slice + listener registration ---------------
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
@@ -1053,40 +1097,54 @@ async def global_events_sse(request: Request) -> Response:
         request.app.state.global_event_buffer
     )
 
-    # Three replay shapes, matching :func:`make_events_handler`:
+    # Four replay shapes (the first three matching :func:`make_events_handler`):
     #   - ``last_event_id is None`` → ``"fresh"``: emit node_snapshot
     #     then live.
     #   - ``last_event_id`` + buffer covers gap → ``"replay_ok"``:
     #     emit buffered events past the id, SKIP node_snapshot, then
     #     live.
-    #   - ``last_event_id`` + buffer too short → ``"truncated"``: emit
-    #     a ``replay_truncated`` envelope then fall through to
-    #     ``"fresh"`` (node_snapshot is the recovery floor).
+    #   - ``last_event_id`` + buffer too short → ``"truncated"``
+    #     (``reason="ring_evicted"``, honest ``lost_count``): emit a
+    #     ``replay_truncated`` envelope then fall through to ``"fresh"``
+    #     (node_snapshot is the recovery floor).
+    #   - ``cursor_stale`` (#881) → ``"truncated"``
+    #     (``reason="boot_epoch"``): the cursor is from another boot —
+    #     the prior ring died with its process, so what was lost is
+    #     unknowable; the envelope omits ``lost_count`` /
+    #     ``earliest_available_id`` rather than guess.  The per-ws
+    #     stream never needs this arm: its counter is storage-seeded
+    #     across restarts, so plain counter comparison detects staleness
+    #     there (see ``register_listener_with_replay``); the global
+    #     counter is process-local and reboots at 0, hence the epoch.
     replay_status: str
+    truncated_reason = "ring_evicted"
     replay_events: list[dict[str, Any]] = []
     lost_count = 0
     earliest_available_id = 0
     snapshot: dict[str, Any] | None = None
 
     with listeners_lock:
-        if last_event_id is None:
+        if cursor_stale:
+            replay_status = "truncated"
+            truncated_reason = "boot_epoch"
+            snapshot = _build_node_snapshot(request.app.state)
+        elif last_event_id is None:
             replay_status = "fresh"
             snapshot = _build_node_snapshot(request.app.state)
         else:
             buffered = list(event_buffer)
             if not buffered:
-                # KNOWN GAP (#881): an empty ring after a node restart
-                # reports ``replay_ok`` even when the client's cursor is
-                # stale, silently skipping the events lost with the old
-                # process.  The per-ws stream fixes this by deriving
-                # staleness from its storage-seeded ``_event_id`` counter
-                # (see ``register_listener_with_replay``); the global
-                # counter (``global_event_id_holder``) resets to 0 at
-                # boot, so the same rule cannot apply — a boot-epoch
-                # staleness signal is the fix direction tracked in #881.
-                # Tolerable meanwhile: consumers are idempotent roster
-                # state refreshed periodically, not append-only history.
-                replay_status = "replay_ok"
+                # Same-epoch cursor against an empty ring is impossible
+                # by construction (ids are only minted by the fanout
+                # thread's single append site, first id 1, and the ring
+                # is never cleared — an id implies a non-empty ring), so
+                # a cursor landing here is forged or a bug.  Fail SAFE
+                # to the truncated floor: the snapshot rebuild is
+                # idempotent, whereas trusting the cursor would replay
+                # nothing and ghost the roster (#881's original lie).
+                replay_status = "truncated"
+                truncated_reason = "boot_epoch"
+                snapshot = _build_node_snapshot(request.app.state)
             else:
                 earliest_available_id = buffered[0][0]
                 if last_event_id < earliest_available_id - 1:
@@ -1098,16 +1156,40 @@ async def global_events_sse(request: Request) -> Response:
                     replay_events = [ev for eid, ev in buffered if eid > last_event_id]
         listeners.append(client_queue)
 
+    if replay_status == "truncated":
+        # Envelope chokepoint log, analog of ``ws.events.replay_truncated``
+        # on the per-ws lane — one line per gap detection, the operator
+        # signal that clients are being told to resync (a burst of
+        # ``reason=boot_epoch`` right after startup is the restart herd
+        # healing; sustained ``reason=ring_evicted`` means the ring cap
+        # is being outrun).
+        log.info(
+            "global.events.replay_truncated",
+            reason=truncated_reason,
+            lost_count=lost_count if truncated_reason == "ring_evicted" else None,
+            cursor=(last_event_id_raw or "")[:64],
+        )
+
     async def event_generator() -> AsyncGenerator[dict[str, Any], None]:
         _metrics.record_sse_connect()
 
         def _format_event(event: dict[str, Any]) -> dict[str, str]:
-            """Strip ``_event_id`` from the wire dict, attach SSE ``id:``."""
+            """Strip ``_event_id`` from the wire dict, attach SSE ``id:``.
+
+            The id is ``"{boot_epoch}-{counter}"`` — GLOBAL-LANE ONLY
+            (#881).  Do not propagate the epoch tag to the per-ws
+            formatter in ``make_events_handler``: per-ws ids must stay
+            bare ints — their counter is storage-seeded across restarts
+            (epoch unnecessary), clients seed cursors from ``/history``'s
+            integer ``cursor``, and coordinator.js's counter-reset
+            detector does ``Number(event.lastEventId)`` comparisons that
+            an epoch prefix would turn into ``NaN`` and silently kill.
+            """
             ev_copy = dict(event)
             eid = ev_copy.pop("_event_id", None)
             out: dict[str, str] = {"data": json.dumps(ev_copy)}
             if eid is not None:
-                out["id"] = str(eid)
+                out["id"] = f"{boot_epoch}-{eid}"
             return out
 
         try:
@@ -1117,15 +1199,23 @@ async def global_events_sse(request: Request) -> Response:
             yield {"retry": random.randint(2500, 4500)}
 
             if replay_status == "truncated":
-                yield {
-                    "data": json.dumps(
-                        {
-                            "type": "replay_truncated",
-                            "lost_count": lost_count,
-                            "earliest_available_id": earliest_available_id,
-                        }
-                    )
+                # ``reason`` distinguishes an in-epoch ring overrun
+                # (``ring_evicted`` — ``lost_count`` /
+                # ``earliest_available_id`` are honest) from a
+                # cross-boot cursor (``boot_epoch`` — the prior ring
+                # died with its process, so the loss is unknowable and
+                # the numeric fields are OMITTED rather than invented).
+                # No first-party consumer reads the numeric fields
+                # (app.js reads only ``type`` and resyncs), so the
+                # conditional shape is wire-safe.
+                envelope: dict[str, Any] = {
+                    "type": "replay_truncated",
+                    "reason": truncated_reason,
                 }
+                if truncated_reason == "ring_evicted":
+                    envelope["lost_count"] = lost_count
+                    envelope["earliest_available_id"] = earliest_available_id
+                yield {"data": json.dumps(envelope)}
             if replay_status == "replay_ok":
                 for ev in replay_events:
                     yield _format_event(ev)
@@ -4972,6 +5062,18 @@ def create_app(
     # Single-element list as a mutable int holder so the fanout
     # thread can ``counter_holder[0] += 1`` under the lock.
     app.state.global_event_id_holder = [0]
+    # Per-process boot epoch for the global SSE lane (#881).  The
+    # counter above reboots at 0 with the process (unlike the per-ws
+    # counters, which ``_seed_event_id_from_storage`` seeds from
+    # ``MAX(conversations.event_id)``), so a bare integer cursor from a
+    # prior boot is indistinguishable from — and eventually aliases
+    # into — the new id space.  Every global SSE ``id:`` is therefore
+    # stamped ``"{epoch}-{counter}"``; a reconnect cursor whose epoch
+    # differs from the live process is stale by construction and draws
+    # the ``replay_truncated`` + node_snapshot recovery floor in
+    # :func:`global_events_sse`.  Hex nonce (never contains ``-``), so
+    # ``partition("-")`` splits the id unambiguously.
+    app.state.global_boot_epoch = secrets.token_hex(4)
     app.state.skip_permissions = skip_permissions
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage

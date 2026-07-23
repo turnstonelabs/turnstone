@@ -186,7 +186,13 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Emits a node_snapshot event on connect (workstreams, health, aggregate), "
         "followed by real-time delta events (ws_state, ws_activity, ws_created, "
         "ws_closed, ws_rename, health_changed, aggregate). "
-        "Pass ?expected_node_id=X for identity verification (returns 409 on mismatch).",
+        "Pass ?expected_node_id=X for identity verification (returns 409 on mismatch). "
+        "Every event's SSE id is an opaque '{boot_epoch}-{counter}' string; presenting "
+        "it on reconnect (Last-Event-ID header or ?last_event_id=) replays missed "
+        "events, or emits a replay_truncated event (reason: ring_evicted with "
+        "lost_count + earliest_available_id, or boot_epoch when the cursor predates "
+        "this server process) followed by a fresh node_snapshot. Treat the id as "
+        "opaque — its format may change.",
         tags=["Streaming"],
     ),
     EndpointSpec(
