@@ -413,7 +413,7 @@ class RecoveryServer:
     def delay_history(self, ms: int) -> None:
         """Hold each ``GET …/history`` ``ms`` ms before forwarding (0
         clears).  Opens the clear_ui-refetch quiesce window that the row
-        affordance gate (``busy || _replayQueue``) must close."""
+        affordance gate (``busy || _historyStale``) must close."""
         self._history_delay_ms = ms
 
     @property

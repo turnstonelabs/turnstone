@@ -46,7 +46,7 @@ instead of concatenating into the stale one.  Stamps
 Scenario E2 (rewind-window): three completed turns; a REAL rewind click POSTs
 and its clear_ui refetch is held open (``RecoveryServer.delay_history``),
 keeping the quiesce armed; a second REAL rewind click mid-rebuild must be
-gated by ``busy || _replayQueue`` and never reach the server.  Backend proof
+gated by ``busy || _historyStale`` and never reach the server.  Backend proof
 ``rewind_requests == 1``.  Stamps ``RECOVERY-READY-REWINDWIN-posts1``.
 
 Scenario E3 (rewind-failed-window): the FAILED-refetch sibling of E2.  Three
