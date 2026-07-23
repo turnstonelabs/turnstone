@@ -23,6 +23,9 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario rewind-window     # E2 (#890)
     python3 scripts/recovery_e2e.py --scenario rewind-failed-window  # E3 (#890)
     python3 scripts/recovery_e2e.py --scenario stale-backstop    # E4 (#890)
+    python3 scripts/recovery_e2e.py --scenario coord-rewind-window        # G1 (#894)
+    python3 scripts/recovery_e2e.py --scenario coord-rewind-failed-window # G2 (#894)
+    python3 scripts/recovery_e2e.py --scenario coord-stale-backstop       # G3 (#894)
     python3 scripts/recovery_e2e.py --scenario roster-restart    # F1 (#881)
     python3 scripts/recovery_e2e.py --scenario roster-restart-native  # F2 (#881)
     python3 scripts/recovery_e2e.py --scenario both   # A+B only (legacy)
@@ -795,6 +798,7 @@ COORD_PAGE_HTML = r"""<!doctype html>
       const q = new URLSearchParams(location.search);
       const wsId = q.get("ws_id");
       const healedSentinel = q.get("healed") || "";
+      const scenario = q.get("scenario") || "coord-restart";
 
       const pane = createCoordinatorPane(document.body, wsId, {
         standalone: true,
@@ -816,7 +820,9 @@ COORD_PAGE_HTML = r"""<!doctype html>
       // Drive /send once the stream has OPENED at the transport (__esOpens —
       // the pane's listener is registered by then, so no events are missed).
       // The chrome has no SSE pill to poll: the header was deliberately
-      // dropped (see buildCoordChrome's comment).
+      // dropped (see buildCoordChrome's comment).  coord-restart only: the
+      // #894 rewind scenarios (G1-G3) seed their turns server-side before
+      // navigation and must not inject an extra one.
       let sent = false;
       function sendOnce(msg) {
         if (sent) return;
@@ -829,12 +835,108 @@ COORD_PAGE_HTML = r"""<!doctype html>
           })
           .catch((e) => { document.title = "RECOVERY-FAILED-COORD-send-" + e; });
       }
-      const sendPoll = setInterval(() => {
-        if (window.__esOpens >= 1) {
-          clearInterval(sendPoll);
-          sendOnce("run a turn");
-        }
-      }, 100);
+      if (scenario === "coord-restart") {
+        const sendPoll = setInterval(() => {
+          if (window.__esOpens >= 1) {
+            clearInterval(sendPoll);
+            sendOnce("run a turn");
+          }
+        }, 100);
+      }
+
+      // Shared by the #894 rewind scenarios (G1/G2/G3): click the REAL
+      // rewind button on the idx-th user row.  The coordinator pane object
+      // exposes NO messagesEl and NO latch/quiesce fields (closure-private
+      // state, unlike interactive's class) — every probe on this page reads
+      // the public #coord-messages container, and the runner threads the
+      // authoritative fault-layer counters into the verdicts.
+      window.__clickCoordRewind = function (idx) {
+        const rows = document
+          .getElementById("coord-messages")
+          .querySelectorAll(".msg.user");
+        const row = rows[idx];
+        if (!row) return false;
+        const icon = row.querySelector(".icon-rewind");
+        const btn = icon ? icon.closest("button") : null;
+        if (!btn) return false;
+        btn.click();
+        return true;
+      };
+      function _coordUserRows() {
+        return document
+          .getElementById("coord-messages")
+          .querySelectorAll(".msg.user").length;
+      }
+
+      // G1 — the row affordance gate (busy || historyStale) under a
+      // HELD-OPEN clear_ui refetch.  Mirrors __verifyRewindWindow; coord has
+      // no quiesce, so the runner's in-flight edge is the fault layer's
+      // history_requests bump (counted on arrival, before the hold).
+      window.__verifyCoordRewindWindow = function (posts) {
+        const userRows = _coordUserRows();
+        // One rewind took effect (2nd-of-3 user row = rewind 2 turns => one
+        // user row left); the gated 1st-row click never reached the server
+        // (posts stays 1).  A broken gate => posts 2, rows 0.
+        const ok = posts === 1 && userRows === 1;
+        document.title = ok
+          ? "RECOVERY-READY-COORDREWINDWIN-posts" + posts
+          : "RECOVERY-FAILED-COORDREWINDWIN-posts" + posts + "-rows" + userRows;
+      };
+
+      // G2 — the FAILED clear_ui refetch aftermath.  Mirrors
+      // __verifyRewindFail: the latch (not a refetch-in-flight flag) must
+      // hold the gate closed AFTER the failed fetch, then the bounded 2s
+      // retry heals and reopens.  Pre-latch coord regresses to closed2.
+      window.__verifyCoordRewindFail = function (posts, closedPosts, healed) {
+        const userRows = _coordUserRows();
+        const ok = closedPosts === 1 && healed && posts === 2;
+        document.title = ok
+          ? "RECOVERY-READY-COORDREWINDFAIL-posts2-heal1"
+          : "RECOVERY-FAILED-COORDREWINDFAIL-closed" +
+            closedPosts +
+            "-heal" +
+            (healed ? 1 : 0) +
+            "-posts" +
+            posts +
+            "-rows" +
+            userRows;
+      };
+
+      // G3 — the TRANSPORT-FREE idle-edge backstop.  Mirrors
+      // __verifyStaleBackstop; the storm assertion is sseDelta === 0 (the
+      // heal opened ZERO EventSource connections — a reconnecting backstop
+      // bumps events_requests once per reconnect and self-triggers).  The
+      // latch-cleared proof is the reopen POST (posts 2), not a field read:
+      // coord's latch is closure-private.
+      window.__verifyCoordStaleBackstop = function (
+        healed,
+        sseDelta,
+        histDelta,
+        gatedPosts,
+        posts,
+      ) {
+        const userRows = _coordUserRows();
+        const ok =
+          healed &&
+          sseDelta === 0 &&
+          histDelta === 1 &&
+          gatedPosts === 1 &&
+          posts === 2;
+        document.title = ok
+          ? "RECOVERY-READY-COORDSTALEBACKSTOP-heal1-sse0"
+          : "RECOVERY-FAILED-COORDSTALEBACKSTOP-heal" +
+            (healed ? 1 : 0) +
+            "-sse" +
+            sseDelta +
+            "-hist" +
+            histDelta +
+            "-gated" +
+            gatedPosts +
+            "-posts" +
+            posts +
+            "-rows" +
+            userRows;
+      };
 
       window.__verifyCoordRestart = function () {
         // Same contract as Scenario B, read off the coordinator's public
@@ -2245,6 +2347,311 @@ def run_stale_backstop(chrome: str) -> str:
         node.stop()
 
 
+_COORD_ROWS_JS = "document.getElementById('coord-messages').querySelectorAll('.msg.user').length"
+
+
+def run_coord_rewind_window(chrome: str) -> str:
+    """Scenario G1 — the coordinator row affordance gate (``busy ||
+    historyStale``, #894, the coord port of E2).  Three completed turns =>
+    three user rows; a REAL rewind click on the second row POSTs and its
+    clear_ui refetch is held open by node.delay_history; a second REAL rewind
+    click (first row) mid-hold must return before POSTing.  Coord has no
+    quiesce to observe (its latch is closure-private), so the in-flight edge
+    is the fault layer's ``history_requests`` bump — counted on ARRIVAL,
+    before the hold sleeps — and the latch is set synchronously BEFORE that
+    fetch dispatches, so the bump proves the gate is closed.  Backend proof:
+    node.rewind_requests == 1 (only the first click reached the server)."""
+    node, ws_id = _seed_three_completed_turns("browser-coord-rewind-window")
+    profile = Path(_scratch()) / "chrome-coord-rewind-window"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/coord-recovery?ws_id={ws_id}&scenario=coord-rewind-window"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        # Wait for the initial /history to paint all three user rows.
+        if not _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
+            raise AssertionError("coord-rewind-window: three user rows never rendered")
+        # Relative baseline (never assume how many /history the boot ran).
+        hist_baseline = node.history_requests
+        # Hold every /history 3s so the clear_ui refetch keeps the latch's
+        # only clear site — the success render — from running while the
+        # second click lands.
+        node.delay_history(3000)
+        # Click #1 — the REAL rewind button on the SECOND user row: POSTs,
+        # server emits clear_ui, the refetch is now held.
+        if not cdp.evaluate("window.__clickCoordRewind(1)"):
+            raise AssertionError("coord-rewind-window: second-row rewind button missing")
+        # The held refetch ARRIVED (counter bumps before the delay sleep) —
+        # the clear_ui handler set historyStale synchronously before
+        # dispatching this fetch, so from here the gate is provably closed.
+        if not _poll_until(lambda: node.history_requests == hist_baseline + 1, 5, 0.05):
+            raise AssertionError("coord-rewind-window: clear_ui refetch never arrived")
+        # Click #2 — the rewind button on the FIRST user row WHILE the
+        # refetch is held: the #894 gate must return before POSTing.
+        if not cdp.evaluate("window.__clickCoordRewind(0)"):
+            raise AssertionError("coord-rewind-window: first-row rewind button missing")
+        # The gate leaves no positive edge (a POST that never happens), so
+        # confirm the NON-occurrence over a bounded window: a failed gate's
+        # /rewind is NOT delayed and would land within ~200ms.
+        _poll_until(lambda: node.rewind_requests != 1, 1.5, 0.05)
+        posts = node.rewind_requests
+        # Release the hold and let the single in-flight rewind settle to one
+        # user row (2nd-of-3 row rewound 2 turns => one user turn remains).
+        node.delay_history(0)
+        _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 1, 8)
+        print(f"  coord-rewind-window rewind_requests={posts}")
+        cdp.evaluate(f"window.__verifyCoordRewindWindow({posts})")
+        return _poll_title(cdp, 15)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
+def run_coord_rewind_failed_window(chrome: str) -> str:
+    """Scenario G2 — the coordinator FAILED clear_ui refetch aftermath
+    (#894, the coord port of E3).  The rewind's clear_ui refetch is forced to
+    500; the historyStale LATCH (set at clear_ui, cleared ONLY by a
+    successful refetchHistory render) must keep the row affordances gated
+    over the stale-but-real transcript after the failed fetch — the exact
+    aftermath where a refetch-in-flight flag would reopen the gate and let a
+    second rewind over-rewind.  The bounded 2s retry then heals and reopens.
+
+    Coord's latch is closure-private, so the closed phase is proven by
+    observables: rewind #1 POSTed + the fail budget consumed => the clear_ui
+    handler ran (the latch was set synchronously before its fetch), and the
+    gated click's POST NON-occurrence is the gate assertion itself.  Backend
+    proofs: rewind_requests 1 -> (gated) 1 -> 2, history_fail_remaining == 0,
+    history_requests >= baseline + 2 (failed refetch + the retry's fetch)."""
+    node, ws_id = _seed_three_completed_turns("browser-coord-rewind-failed-window")
+    profile = Path(_scratch()) / "chrome-coord-rewind-failed-window"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/coord-recovery?ws_id={ws_id}&scenario=coord-rewind-failed-window"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        # Wait for the initial /history to paint all three user rows.  This
+        # load MUST succeed, so arm the forced failure only AFTERWARDS.
+        if not _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
+            raise AssertionError("coord-rewind-failed-window: three user rows never rendered")
+        hist_baseline = node.history_requests
+        # Arm ONE forced /history 500: the NEXT /history — the rewind's
+        # clear_ui refetch — fails.
+        node.fail_history(1)
+        # Click #1 — the REAL rewind on the SECOND user row: POSTs (the
+        # authoritative rewind commits server-side), the server emits
+        # clear_ui, and its refetch 500s.  The stale transcript survives
+        # (#882 guard-before-wipe) and the historyStale latch stays SET.
+        if not cdp.evaluate("window.__clickCoordRewind(1)"):
+            raise AssertionError("coord-rewind-failed-window: second-row rewind button missing")
+        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
+            raise AssertionError("coord-rewind-failed-window: first rewind never POSTed")
+        if not _poll_until(lambda: node.history_fail_remaining == 0, 15):
+            raise AssertionError("coord-rewind-failed-window: forced /history failure never fired")
+        # Backend proof the failure actually happened (never scripted absence).
+        assert node.history_fail_remaining == 0, (
+            "coord-rewind-failed-window: fail budget not consumed"
+        )
+        # Hold the bounded retry's /history open: the retry is a fixed 2s
+        # timer, so delaying its fetch defers the latch's only clear site to
+        # ~failure+5s — a wide, CDP-speed-independent window for the gated
+        # click below.  Armed AFTER the failure (the first refetch fails
+        # fast) and ~1.8s BEFORE the retry fires.
+        node.delay_history(3000)
+        # CLOSED-PHASE — the stale transcript is intact (the failed fetch
+        # wiped nothing: guard-before-wipe), and the latch survived the
+        # failed exit (its clear sits below ``if (!hist) return``).
+        stale_rows = cdp.evaluate(_COORD_ROWS_JS)
+        if stale_rows != 3:
+            raise AssertionError(
+                f"coord-rewind-failed-window: failed fetch did not preserve the "
+                f"transcript (user rows={stale_rows}, expected 3)"
+            )
+        # Click #2 — rewind on the FIRST user row while the latch is set:
+        # the #894 gate (busy || historyStale) must return before POSTing.
+        if not cdp.evaluate("window.__clickCoordRewind(0)"):
+            raise AssertionError("coord-rewind-failed-window: first-row rewind button missing")
+        # Non-occurrence over a bounded window — the assertion that
+        # regresses to closed2 on pre-latch code.
+        _poll_until(lambda: node.rewind_requests != 1, 1.5, 0.05)
+        closed_posts = node.rewind_requests
+        # HEAL-PHASE — the bounded retry fires at ~2s (pane idle,
+        # turn-free), its held /history completes (~failure+5s) and rebuilds
+        # the rewound transcript: index 1 of 3 user rows rewinds 2 turns =>
+        # ONE user row.  Poll to a deadline rather than sleeping.
+        healed = _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 1, 10, 0.2)
+        # The retry re-fetched: failed refetch + the retry's success = two
+        # more than the paint baseline.  The 3->1 DOM transition above is
+        # the load-bearing proof the retry RENDERED.  Load-bearing counter —
+        # do not let history_requests drop back to write-only.
+        assert node.history_requests >= hist_baseline + 2, (
+            f"coord-rewind-failed-window: retry did not re-fetch "
+            f"(history_requests={node.history_requests}, baseline={hist_baseline})"
+        )
+        # Release the hold — the reopen's own clear_ui refetch must not be
+        # delayed.
+        node.delay_history(0)
+        # REOPEN-PHASE — the healing render cleared the latch.  A rewind on
+        # the remaining user row must land with a FRESH count
+        # (rewind_requests -> 2).  On a heal failure the verdict is already
+        # lost; skip the click and stamp the observed counts.
+        if healed:
+            if not cdp.evaluate("window.__clickCoordRewind(0)"):
+                raise AssertionError("coord-rewind-failed-window: healed-row rewind button missing")
+            _poll_until(lambda: node.rewind_requests == 2, 8, 0.05)
+        posts = node.rewind_requests
+        print(
+            f"  coord-rewind-failed-window closed_posts={closed_posts} "
+            f"healed={healed} posts={posts}"
+        )
+        cdp.evaluate(
+            f"window.__verifyCoordRewindFail({posts}, {closed_posts}, "
+            f"{'true' if healed else 'false'})"
+        )
+        return _poll_title(cdp, 15)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
+def run_coord_stale_backstop(chrome: str) -> str:
+    """Scenario G3 — the coordinator ``historyStale`` latch's TRANSPORT-FREE
+    idle-edge backstop (#894, the coord port of E4).  The DOUBLE-failure
+    sibling of G2: the rewind's clear_ui refetch AND its one bounded 2s retry
+    are BOTH forced to 500 (``node.fail_history(2)``), so the latch cannot
+    self-heal and rewind/edit stay gated over the stale-but-real transcript.
+    A plain send (never latch-gated; raw authFetch here) runs the fourth
+    scripted turn whose ORGANIC turn-settle idle edge fires the backstop: a
+    plain seedless REST ``refetchHistory`` — deliberately NOT
+    ``loadHistoryThenReconnect`` (a reconnecting heal draws the server's
+    synthetic ``state_change:idle`` back into its own trigger: a
+    zero-backoff reconnect/refetch storm).
+
+    THE STORM PROOF (both counted at the fault layer): ``events_requests``
+    is UNCHANGED across the whole heal (``sse0`` — zero new EventSource
+    connections) and ``history_requests`` grew by exactly ONE (the
+    backstop's single fetch; the plain fourth turn emits no clear_ui).
+    Coord's latch is closure-private, so the latch-cleared proof is the
+    reopen POST (rewind_requests -> 2), not a field read.  Every poll is
+    deadline-bounded so a regressed looping backstop stamps a clean FAILED,
+    never a hang."""
+    from tests._sse_recovery_server import final_text_script
+
+    # Seed three turns and queue a FOURTH final_text (the sentinel-bearing
+    # turn the backstop-driving send below runs) — the shared helper keeps
+    # the seeding byte-identical to G1/G2 so the rewind arithmetic matches.
+    node, ws_id = _seed_three_completed_turns(
+        "browser-coord-stale-backstop",
+        extra_scripts=(final_text_script(BACKSTOP_SENTINEL),),
+    )
+    profile = Path(_scratch()) / "chrome-coord-stale-backstop"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/coord-recovery?ws_id={ws_id}&scenario=coord-stale-backstop"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        # Wait for the initial /history to paint all three user rows.  This
+        # load MUST succeed, so arm the forced failures only AFTERWARDS.
+        if not _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
+            raise AssertionError("coord-stale-backstop: three user rows never rendered")
+        # Arm TWO forced /history 500s: the rewind's clear_ui refetch AND its
+        # one bounded 2s retry both fail, so ONLY the organic idle-edge
+        # backstop can clear the latch.
+        node.fail_history(2)
+        # Click #1 — the REAL rewind on the SECOND user row: POSTs (the
+        # authoritative rewind commits server-side to ONE user turn), the
+        # server emits clear_ui, and its refetch 500s (fault 2 -> 1).
+        if not cdp.evaluate("window.__clickCoordRewind(1)"):
+            raise AssertionError("coord-stale-backstop: second-row rewind button missing")
+        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
+            raise AssertionError("coord-stale-backstop: first rewind never POSTed")
+        # Both the clear_ui refetch AND the 2s retry must fire and fail
+        # (fault 2 -> 1 -> 0): history_fail_remaining == 0 proves both
+        # consumed.  The retry fires ~2s after the first failure.
+        if not _poll_until(lambda: node.history_fail_remaining == 0, 20):
+            raise AssertionError(
+                "coord-stale-backstop: the two forced /history failures never both fired"
+            )
+        # Backend proof the failures actually happened (never scripted absence).
+        assert node.history_fail_remaining == 0, "coord-stale-backstop: fail budget not consumed"
+        # The stale transcript is intact — the failed fetches wiped nothing.
+        stale_rows = cdp.evaluate(_COORD_ROWS_JS)
+        if stale_rows != 3:
+            raise AssertionError(
+                f"coord-stale-backstop: failed fetches did not preserve the "
+                f"transcript (user rows={stale_rows}, expected 3)"
+            )
+        # Click #2 — rewind on the FIRST user row while the latch is set:
+        # gated, POST non-occurrence confirmed over a bounded window.
+        if not cdp.evaluate("window.__clickCoordRewind(0)"):
+            raise AssertionError("coord-stale-backstop: first-row rewind button missing")
+        _poll_until(lambda: node.rewind_requests != 1, 1.5, 0.05)
+        gated_posts = node.rewind_requests  # must still be 1 (latch gated it)
+        # Baselines captured the instant BEFORE the send: the heal must add
+        # exactly ZERO SSE opens and exactly ONE /history fetch from here.
+        events_baseline = node.events_requests
+        history_baseline = node.history_requests
+        # Drive a plain send via in-page authFetch — sends are NOT
+        # latch-gated, so this reaches the server, runs the fourth scripted
+        # turn (BACKSTOP_SENTINEL), and its ORGANIC turn-settle idle edge
+        # fires the backstop.
+        _send_in_page(cdp, "fourth turn")
+        # HEAL: the fourth turn settles -> idle edge -> plain REST refetch
+        # (fault exhausted) succeeds -> the render rebuilds the rewound (ONE
+        # user turn) + sent (a second) transcript to TWO user rows, SENTINEL
+        # present.  The 3->2 transition is the load-bearing proof the
+        # backstop RENDERED; the latch-cleared proof is the reopen POST
+        # below (the latch itself is closure-private).
+        healed = _poll_until(
+            lambda: cdp.evaluate(
+                _COORD_ROWS_JS + " === 2 && (document.getElementById('coord-messages')"
+                ".textContent||'').includes(" + json.dumps(BACKSTOP_SENTINEL) + ")"
+            ),
+            20,
+            0.2,
+        )
+        # THE STORM DELTAS, captured BEFORE the reopen click's own clear_ui
+        # refetch so the arithmetic is exactly the backstop's:
+        #  - events_delta MUST be 0: the backstop is a REST refetchHistory,
+        #    ZERO EventSource connections (a reload backstop's connectSSE
+        #    bumps events_requests per reconnect — the storm).
+        #  - history_delta MUST be 1: the plain fourth turn emits no
+        #    clear_ui, so the ONLY /history in the send+heal window is the
+        #    backstop's fetch.
+        events_delta = node.events_requests - events_baseline
+        history_delta = node.history_requests - history_baseline
+        # REOPEN: the healing render cleared the latch, so a rewind on a
+        # remaining user row is legitimate and lands (rewind_requests -> 2).
+        # On a heal failure the verdict is already lost; skip the click and
+        # stamp the observed counts.
+        if healed:
+            if not cdp.evaluate("window.__clickCoordRewind(0)"):
+                raise AssertionError("coord-stale-backstop: healed-row rewind button missing")
+            _poll_until(lambda: node.rewind_requests == 2, 8, 0.05)
+        posts = node.rewind_requests
+        print(
+            f"  coord-stale-backstop gated_posts={gated_posts} healed={healed} "
+            f"events_delta={events_delta} history_delta={history_delta} posts={posts}"
+        )
+        cdp.evaluate(
+            "window.__verifyCoordStaleBackstop("
+            f"{'true' if healed else 'false'}, "
+            f"{events_delta}, {history_delta}, {gated_posts}, {posts})"
+        )
+        return _poll_title(cdp, 15)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
 def _wait_state(node: Any, ws_id: str, state: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -2290,6 +2697,9 @@ def main() -> None:
             "rewind-window",
             "rewind-failed-window",
             "stale-backstop",
+            "coord-rewind-window",
+            "coord-rewind-failed-window",
+            "coord-stale-backstop",
             "roster-restart",
             "roster-restart-native",
             "both",
@@ -2342,6 +2752,18 @@ def main() -> None:
     if args.scenario in ("stale-backstop", "all"):
         verdict = run_stale_backstop(chrome)
         print(f"scenario E4 (stalebackstop): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("coord-rewind-window", "all"):
+        verdict = run_coord_rewind_window(chrome)
+        print(f"scenario G1 (coord-rewindwin): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("coord-rewind-failed-window", "all"):
+        verdict = run_coord_rewind_failed_window(chrome)
+        print(f"scenario G2 (coord-rewindfail): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("coord-stale-backstop", "all"):
+        verdict = run_coord_stale_backstop(chrome)
+        print(f"scenario G3 (coord-stalebackstop): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     if args.scenario in ("roster-restart", "all"):
         verdict = run_roster_restart(chrome)
