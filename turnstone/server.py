@@ -4312,14 +4312,19 @@ def _aggregate_emitter_thread(
     mgr: SessionManager,
     global_queue: queue.Queue[dict[str, Any]],
     interval: float = 10.0,
+    stop: threading.Event | None = None,
 ) -> None:
     """Periodically emit aggregate token/tool_call totals on the global SSE queue.
 
     Runs as a daemon thread so the console receives periodic updates without
-    having to poll ``/v1/api/dashboard``.
+    having to poll ``/v1/api/dashboard``.  ``stop`` (#885) is the lifespan
+    shutdown signal — ``wait(interval)`` doubles as the tick sleep, so a
+    set wakes the thread immediately instead of stranding shutdown behind
+    a sleep.
     """
-    while True:
-        time.sleep(interval)
+    if stop is None:
+        stop = threading.Event()
+    while not stop.wait(interval):
         total_tokens = 0
         total_tool_calls = 0
         active_count = 0
@@ -4356,6 +4361,7 @@ def _idle_cleanup_thread(
     timeout_sec: float,
     global_queue: queue.Queue[dict[str, Any]],
     rate_limiter: Any = None,
+    stop: threading.Event | None = None,
 ) -> None:
     """Periodically close IDLE workstreams and clean up rate limiter buckets.
 
@@ -4364,14 +4370,27 @@ def _idle_cleanup_thread(
     ``reason="closed"``. The old manual emission here (``reason="idle"``)
     is gone — the frontend didn't differentiate "idle" from "closed"
     anyway and the duplicate event caused spurious UI flicker.
+
+    ``stop`` (#885): lifespan shutdown signal, same ``wait``-as-sleep
+    pattern as :func:`_aggregate_emitter_thread`.
     """
     del global_queue  # adapter handles the emission
+    if stop is None:
+        stop = threading.Event()
     check_every = min(300.0, timeout_sec / 4)  # check at 1/4 of timeout, max 5 min
-    while True:
-        time.sleep(check_every)
+    while not stop.wait(check_every):
         mgr.close_idle(timeout_sec)
         if rate_limiter is not None:
             rate_limiter.cleanup()
+
+
+# Shutdown sentinel for ``_global_fanout_thread`` (#885): the lifespan
+# puts THIS object on the global queue and the thread exits when it draws
+# it.  Identity-checked (``is``), so an event that merely equals it can't
+# spoof a shutdown; dict-typed so the queue's type stays honest.  FIFO
+# gives clean drain semantics — everything enqueued before the sentinel
+# still stamps + fans out.
+_FANOUT_SHUTDOWN: dict[str, Any] = {"type": "_fanout_shutdown"}
 
 
 def _global_fanout_thread(
@@ -4392,10 +4411,14 @@ def _global_fanout_thread(
     event lands in ONLY the buffer or ONLY the listener queue across
     the registration boundary.  Mirrors :meth:`SessionUIBase._enqueue`'s
     contract for the global lane.
+
+    Exits when it draws :data:`_FANOUT_SHUTDOWN` from the queue (#885).
     """
     while True:
         try:
             event = source_queue.get()
+            if event is _FANOUT_SHUTDOWN:
+                return
             with lock:
                 counter_holder[0] += 1
                 event_id = counter_holder[0]
@@ -4420,6 +4443,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Dedicated executor for SSE queue polling so it doesn't compete
     # with the default asyncio executor (which caps at ~32 workers).
     app.state.sse_executor = ThreadPoolExecutor(max_workers=200, thread_name_prefix="sse")
+    # Lifespan daemon-thread shutdown (#885): one shared Event for the
+    # sleep-loop threads plus the queue sentinel for the fanout; refs
+    # kept so the shutdown tail below can join them.  ``daemon=True``
+    # stays — it is the backstop if a join times out, not the shutdown
+    # mechanism.
+    daemon_stop = threading.Event()
     # Start global event fan-out thread
     fanout = threading.Thread(
         target=_global_fanout_thread,
@@ -4437,10 +4466,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     agg_emitter = threading.Thread(
         target=_aggregate_emitter_thread,
         args=(app.state.workstreams, app.state.global_queue),
+        kwargs={"stop": daemon_stop},
         daemon=True,
     )
     agg_emitter.start()
     # Start idle cleanup thread if configured
+    cleanup: threading.Thread | None = None
     if app.state.idle_timeout > 0:
         cleanup = threading.Thread(
             target=_idle_cleanup_thread,
@@ -4450,6 +4481,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 app.state.global_queue,
                 app.state.rate_limiter,
             ),
+            kwargs={"stop": daemon_stop},
             daemon=True,
         )
         cleanup.start()
@@ -4668,6 +4700,21 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.oidc import close_oidc_state
 
     await close_oidc_state(app.state)
+    # Stop the lifespan daemon threads (#885).  Sessions are already
+    # closed above, so their final ws_closed events sit ahead of the
+    # sentinel in the queue and still fan out (FIFO drain); the Event
+    # wakes the sleep-loop threads immediately.  Joins are bounded and
+    # off-loop; a thread that outlives its budget is logged and left to
+    # the daemon flag rather than wedging shutdown.
+    daemon_stop.set()
+    with contextlib.suppress(queue.Full):
+        app.state.global_queue.put(_FANOUT_SHUTDOWN, timeout=1)
+    for _t in (fanout, agg_emitter, cleanup):
+        if _t is None:
+            continue
+        await asyncio.to_thread(_t.join, 5)
+        if _t.is_alive():
+            log.warning("server.daemon_thread_join_timeout", thread=_t.name)
     app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
 
 

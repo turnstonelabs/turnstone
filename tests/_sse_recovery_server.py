@@ -23,15 +23,16 @@ The recipe (verified end-to-end) has four load-bearing pieces:
    every SSE event enqueued" barrier (``stream_end`` is per-LLM-call, not
    per-turn, so it is NOT a completion marker).
 
-4. **Thread hygiene.** ``create_app``'s lifespan unconditionally starts
-   two daemon fan-out threads (``_global_fanout_thread`` blocking on
-   ``global_queue.get()``, ``_aggregate_emitter_thread`` on a 10s loop)
-   with no shutdown sentinel — they would trip conftest's leaked-thread
-   guard. They serve the cluster/global lane, which the per-ws ``/events``
-   path under test never touches, so the harness swaps them for no-ops
-   before boot (restored on ``stop``). The result is a fully clean
-   teardown — no ``allow_thread_leak`` needed — with the real per-ws SSE
-   engine fully intact.
+4. **Thread hygiene.** ``create_app``'s lifespan starts daemon fan-out
+   threads (``_global_fanout_thread`` blocking on ``global_queue.get()``,
+   ``_aggregate_emitter_thread`` on a 10s loop).  The harness used to
+   swap them for no-ops (they had no shutdown and tripped conftest's
+   leaked-thread guard), which kept the global lane dead here; #885 gave
+   the lifespan a real shutdown (stop Event + a queue sentinel for the
+   fanout, joined in the lifespan exit that ``stop()``'s
+   ``should_exit``/join drives), so the harness now runs them REAL — the
+   ``roster-restart`` scenario depends on a live global lane — and
+   teardown stays clean with no ``allow_thread_leak``.
 """
 
 from __future__ import annotations
@@ -49,7 +50,6 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import uvicorn
 
-import turnstone.server as tsrv
 from tests._session_helpers import scripted_chat_client
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
@@ -69,17 +69,6 @@ _JWT_SECRET = "sse-recovery-e2e-jwt-secret-minimum-32-chars!"
 # the listener-queue poison stays bounded (paired with the client's small
 # SO_RCVBUF in _sse_recovery_helpers). Harmless for prompt readers.
 _DEFAULT_SNDBUF = 8192
-
-
-def _noop_thread(*_args: object, **_kwargs: object) -> None:
-    """Stand-in for the cluster-lane daemon threads (see module docstring)."""
-
-
-# The REAL daemon-thread factories, captured once at import so restore always
-# targets them regardless of how many servers neuter/restore in a run (the
-# restart scenarios build a second server before the run ends).
-_REAL_FANOUT = tsrv._global_fanout_thread
-_REAL_AGGREGATE = tsrv._aggregate_emitter_thread
 
 
 def _fake_client(scripts: tuple[Any, ...]) -> Any:
@@ -157,10 +146,6 @@ class RecoveryServer:
         )
         self._adapter.attach(self._manager)
         WebUI._workstream_mgr = self._manager
-
-        # Neuter the cluster-lane daemons for a clean teardown (see docstring).
-        tsrv._global_fanout_thread = _noop_thread
-        tsrv._aggregate_emitter_thread = _noop_thread
 
         # Optional small listener-queue cap. The cap is a default arg on the
         # registration methods with no config/env override, so lower it by
@@ -435,9 +420,7 @@ class RecoveryServer:
             self._http.close()
         with contextlib.suppress(OSError):
             self._sock.close()
-        # Restore the cluster-lane daemon factories + any patched cap defaults.
-        tsrv._global_fanout_thread = _REAL_FANOUT
-        tsrv._aggregate_emitter_thread = _REAL_AGGREGATE
+        # Restore any patched cap defaults.
         for meth, defaults in self._orig_defaults:
             meth.__defaults__ = defaults
 
