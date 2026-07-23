@@ -557,7 +557,9 @@ def test_coordinator_refetch_failure_preserves_the_pane():
     )
     body = coord_js.read_text(encoding="utf-8")
     start = body.index("async function refetchHistory(seedCursor = false)")
-    fn = body[start : start + 3000]
+    # Window sized to reach the early-reset block past the #894 latch-clear
+    # comments; the pinned invariant is the ORDER below, not the density.
+    fn = body[start : start + 5000]
     guard = fn.index("if (!hist) return;")
     wipe = fn.index("messagesEl.replaceChildren();")
     resets = fn.index("toolRows.clear();")
@@ -567,6 +569,121 @@ def test_coordinator_refetch_failure_preserves_the_pane():
         "a DOM no-op."
     )
     assert re.search(r"if \(!hist\) return;", fn), "failure guard missing"
+
+
+def test_coordinator_history_stale_latch_contract():
+    """#894 (the #890 port): a rewind/edit clicked during a clear_ui refetch
+    window — or after a FAILED refetch — must not count the stale pre-rewind
+    DOM.  Pins the latch's structural contract:
+
+      1. clear_ui sets ``historyStale = true`` BEFORE its seedless
+         ``refetchHistory()`` call (the only set site), so the gate closes
+         for the whole fetch window.
+      2. The DOM-counting affordances gate on ``busy || historyStale``
+         (_rewindToMessage / _editAndResend / _startEdit); _rewindToTurns
+         and _retryLast stay busy-only (explicit-arg / no-DOM-count paths —
+         the at-site rulings).
+      3. ``historyStale = false`` lives ONLY below the ``if (!hist)
+         return;`` failure guard in refetchHistory: a failed fetch keeps
+         the latch set (a refetch-in-flight flag would reopen on exactly
+         that exit — the over-rewind aftermath).
+      4. The idle-edge backstop is TRANSPORT-FREE: the arm behind the
+         pendingTruncatedResync consumer heals via plain
+         ``refetchHistory()``, never ``loadHistoryThenReconnect()`` —
+         a reconnecting heal draws the server's synthetic
+         state_change:idle back into its own trigger (the #890 round-5
+         zero-backoff storm).
+      5. The retry is bounded by construction: ``staleRetryTimer =
+         setTimeout`` appears exactly once (the clear_ui .then), so no
+         path — including the retry's own — can re-arm it.
+      6. destroy() cancels staleRetryTimer (terminal-only) while
+         closeStreamTransport does NOT (transport redials keep the heal
+         intent alive).
+    """
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    # 1. Set site: inside the clear_ui case, before the refetch call.
+    assert body.count("historyStale = true;") == 1, (
+        "historyStale must be set in exactly one place (clear_ui arrival)."
+    )
+    clear_case = body.index('case "clear_ui"')
+    set_site = body.index("historyStale = true;")
+    refetch_call = body.index("refetchHistory()", clear_case)
+    assert clear_case < set_site < refetch_call, (
+        "clear_ui must latch historyStale BEFORE calling refetchHistory() "
+        "so the gate covers the whole fetch window."
+    )
+
+    # 2. Gates: DOM-counting affordances latch-gated; explicit-arg /
+    #    no-count paths stay busy-only.
+    def _fn_slice(name: str) -> str:
+        start = body.index("function " + name)
+        return body[start : body.index("\n  function ", start + 1)]
+
+    for gated in ("_rewindToMessage", "_editAndResend", "_startEdit"):
+        assert "if (busy || historyStale) return;" in _fn_slice(gated), (
+            f"{gated} must gate on busy || historyStale (#894)."
+        )
+    for ungated in ("_rewindToTurns", "_retryLast"):
+        sl = _fn_slice(ungated)
+        assert "if (busy) return;" in sl and "busy || historyStale" not in sl, (
+            f"{ungated} must stay busy-only (at-site ruling: explicit turn "
+            "count / no DOM count — latch-gating it blocks legitimate calls)."
+        )
+
+    # 3. Clear site: exactly one assignment to false (past the decl),
+    #    below the failure guard.
+    clears = re.findall(r"(?<!let )historyStale = false;", body)
+    assert len(clears) == 1, (
+        "historyStale must clear in exactly one place (refetchHistory's success path)."
+    )
+    fetch_start = body.index("async function refetchHistory(seedCursor = false)")
+    guard = body.index("if (!hist) return;", fetch_start)
+    clear_site = body.index("historyStale = false;", fetch_start)
+    assert guard < clear_site, (
+        "the latch clear must sit BELOW the failure guard — a failed fetch "
+        "keeps the latch set (that survival arms the retry/backstop)."
+    )
+
+    # 4. Transport-free backstop: the arm after the truncated consumer
+    #    refetches over REST and never reconnects.
+    trunc_arm = body.index("if (pendingTruncatedResync)")
+    backstop = body.index("historyStale &&", trunc_arm)
+    idle_block_end = body.index('ev.state === "running"', backstop)
+    backstop_arm = body[backstop:idle_block_end]
+    assert "refetchHistory();" in backstop_arm, (
+        "the staleness backstop must heal via a plain seedless refetchHistory()."
+    )
+    assert "loadHistoryThenReconnect();" not in backstop_arm, (
+        "TRANSPORT-FREE ruling: the staleness backstop must never "
+        "reconnect — a reload's fresh reconnect draws the synthetic "
+        "state_change:idle back into this trigger (zero-backoff storm)."
+    )
+
+    # 5. Bounded retry: exactly one arm site.
+    assert body.count("staleRetryTimer = setTimeout") == 1, (
+        "the stale retry must be armed in exactly one place (clear_ui "
+        ".then) — bounded by construction."
+    )
+
+    # 6. Teardown: terminal cancel in destroy(); NOT in closeStreamTransport.
+    destroy_slice = body[body.index("function destroy()") :]
+    destroy_slice = destroy_slice[: destroy_slice.index("\n  function ")]
+    assert "clearTimeout(staleRetryTimer)" in destroy_slice, (
+        "destroy() must cancel the stale retry timer or it fires into "
+        "detached DOM (and pins the closure)."
+    )
+    cst_start = body.index("function closeStreamTransport()")
+    cst_slice = body[cst_start : body.index("\n  function ", cst_start + 1)]
+    assert "clearTimeout(staleRetryTimer)" not in cst_slice, (
+        "closeStreamTransport must NOT cancel the stale retry — transport "
+        "redials keep the pending heal intent (terminal-only cancel)."
+    )
 
 
 def test_coordinator_js_early_paints_pending_tool_calls():

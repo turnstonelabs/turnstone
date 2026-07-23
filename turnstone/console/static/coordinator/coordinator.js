@@ -642,6 +642,33 @@ function createCoordinatorPane(root, wsId, opts) {
   // also catches a turn stranded by close-on-hide (finished while hidden, its
   // stream_end evicted before the show-edge reconnect).
   let pendingTruncatedResync = false;
+  // Transcript-staleness latch (#894, the port of interactive.js's #890
+  // _historyStale).  Set at clear_ui arrival — from that moment the visible
+  // transcript is the PRE-rewind one and no longer matches the server's
+  // restructured conversation — and cleared in EXACTLY ONE place:
+  // refetchHistory's success-path render.  It gates the DOM-counting
+  // affordances (_rewindToMessage / _editAndResend / _startEdit, via
+  // ``busy || historyStale``) so a turn count computed off the stale DOM
+  // can't reach POST /rewind during the refetch window OR after a failed
+  // refetch.  LATCH, not a refetch-in-flight flag: a flag reopens on the
+  // failed exit, which is exactly the over-rewind window (the bug
+  // interactive.js hit in its round-3 review).  Heals: one bounded
+  // turn-free retry armed by the clear_ui handler, then the idle-edge
+  // backstop in the state_change consumer — both plain REST refetches
+  // (TRANSPORT-FREE; the ruling lives at the backstop).
+  let historyStale = false;
+  // Count of refetchHistory calls currently awaiting /history.  The
+  // staleness heals (retry + backstop) read it to YIELD to any in-flight
+  // fetch — clear_ui's own, a sibling heal's, or a resync's — instead of
+  // stomping it with a same-snapshot double render.  Coord's quiesce-free
+  // substitute for interactive.js's !_replayQueue yield guard.  A COUNT,
+  // not a boolean: overlapping fetches are reachable (another actor's
+  // rewind can emit clear_ui while a heal fetch is in flight), and a
+  // boolean would clear on the first finisher's exit with a fetch still
+  // live.  Only the await window needs bracketing — the render after
+  // ``if (!hist)`` is synchronous, so no timer or SSE handler can observe
+  // the counter mid-render.
+  let refetchesInFlight = 0;
   // The cursor position a replay_truncated envelope was received AT — i.e.
   // "a gap of lost events exists BELOW this cursor".  Keep-oldest: set only
   // when null (repeated envelopes for the same unrepaired gap must not
@@ -707,6 +734,17 @@ function createCoordinatorPane(root, wsId, opts) {
   // stream — the next connect's own truncated envelope reschedules if the
   // gap still exists (truncatedFromCursor re-presents it).
   let truncatedResyncTimer = null;
+  // The ONE bounded clear_ui-failure retry (#894; mirrors interactive.js's
+  // _staleRetryTimer).  Armed only from the clear_ui handler's .then when
+  // the latch survived the refetch; never re-armed from its own firing
+  // (bounded by construction).  Cancelled by refetchHistory's success path
+  // and destroy() ONLY — deliberately NOT by closeStreamTransport beside
+  // the transport timers above: this is a REST-refetch timer, not a
+  // transport timer, and a transport-only redial (hide/show, degraded
+  // cooldown, reconnect backoff) must keep the pending heal intent alive.
+  // A firing after coordCloseSession no-ops via the visHandler fire-time
+  // guard.
+  let staleRetryTimer = null;
   let degradedCooldownMs = DEGRADED_COOLDOWN_BASE_MS;
   let lastDegradedAt = 0;
   // Close-on-hide / replay-on-show bookkeeping.  A hidden tab's throttled event
@@ -2507,6 +2545,10 @@ function createCoordinatorPane(root, wsId, opts) {
       clearTimeout(truncatedResyncTimer);
       truncatedResyncTimer = null;
     }
+    // staleRetryTimer is deliberately NOT cancelled here — it is a
+    // REST-refetch heal, not transport state, and a transport-only redial
+    // must keep the pending heal intent (terminal-only cancel; see its
+    // decl and destroy()).
   }
 
   function connectSSE() {
@@ -3472,6 +3514,55 @@ function createCoordinatorPane(root, wsId, opts) {
             pendingTruncatedResync = false;
             recordTruncatedGap();
             loadHistoryThenReconnect();
+          } else if (
+            historyStale &&
+            !refetchesInFlight &&
+            !currentAssistantEl &&
+            !currentReasoningEl
+          ) {
+            // Staleness-latch backstop (#894): the clear_ui refetch and its
+            // one bounded retry both failed, so the transcript still doesn't
+            // match the server and rewind/edit stay latch-closed.  The turn
+            // just settled — refetch now.
+            //
+            // TRANSPORT-FREE BY DESIGN (ruled, do not "upgrade" this to
+            // loadHistoryThenReconnect): the heal must never touch the
+            // stream.  A reload's fresh reconnect draws the server's
+            // synthetic state_change:idle, which lands back in THIS branch —
+            // with /history down that is a zero-backoff disconnect/refetch/
+            // reconnect storm against a recovering node (interactive.js's
+            // round-5 critical), self-sustaining until /history recovers.
+            // A plain REST refetch emits zero SSE events, so the trigger
+            // edge is only ever organic (turn-settle driven; the server
+            // pushes no state_change heartbeats) and the loop is
+            // structurally impossible.  Stream death has its own owners
+            // (EventSource native auto-reconnect, the truncated resync in
+            // the branch above — whose heal legitimately IS a reconnect:
+            // its stream is dead, this arm's is alive) and the else-if
+            // keeps the truncated branch's reload from doubling up (its
+            // render clears this latch too).
+            //
+            // The ref guards are a DELIBERATE divergence from the
+            // interactive template (which omits them on its backstop):
+            // interactive's replayHistory resets the streaming refs on
+            // every render, coord's refetchHistory does not — and this arm
+            // also serves state_change:error edges, where no stream_end ran
+            // finishAssistantStream and a live-bubble ref can survive.
+            // Firing then would replaceChildren the bubble out from under
+            // the dangling ref; skipping defers the heal to the next
+            // organic settle (that turn's stream_end nulls the refs).
+            // Correctness never rides this arm — the busy||historyStale
+            // gate carries it; heals are liveness only.  Accepted liveness
+            // lag (ruled): if /history recovers while the pane sits idle
+            // untouched, rewind/edit stay closed until the next organic
+            // settle — strictly safer than the storm.  Do not add ANY
+            // transport-touching timer to shorten it.
+            //
+            // Fire-and-forget, seedless: the stream is alive so lastEventId
+            // must not rewind; no composer state rides this heal (that is
+            // the clear_ui caller's .catch), so a render throw stays loud;
+            // and nothing here re-arms the retry, keeping it bounded.
+            refetchHistory();
           }
         } else if (
           ev.state === "running" ||
@@ -3558,6 +3649,14 @@ function createCoordinatorPane(root, wsId, opts) {
         // resync still armed when this rebuild lands); the residual
         // fetch-overlap window is transient-cosmetic and heals on the next
         // full render or chokepoint retry.
+        //
+        // Latch transcript staleness FIRST (#894): from this moment until a
+        // successful render the visible DOM is the PRE-rewind transcript
+        // and must not feed a rewind/edit turn count (see historyStale's
+        // decl).  The cosmetic [data-busy] grey-out for this window stays a
+        // deferred parity item (#890 PR ruling) — the handler-side
+        // ``busy || historyStale`` gate carries the correctness.
+        historyStale = true;
         refetchHistory()
           .then(() => {
             // Repair-intent supersession (pending resync timer + deferred
@@ -3566,6 +3665,43 @@ function createCoordinatorPane(root, wsId, opts) {
             // fetch (which also resolves) clears none, and a mid-render
             // throw skips this .then entirely — so the pending resync
             // stays the repair owner exactly when the pane still needs it.
+            //
+            // Failed fetch (the latch survived — only the success render
+            // clears it): arm the ONE bounded turn-free retry (#894).
+            // Armed here rather than in a failure branch so the retry's own
+            // failure cannot re-arm (bounded by construction); a NEWER
+            // clear_ui replaces the pending timer via the clearTimeout
+            // below, so at most one retry is ever pending.  Fire-time
+            // guards make a stale firing a no-op: healed or superseded
+            // (historyStale — coord has no load token; single-wsId, so the
+            // latch itself is the still-current signal), a fetch already
+            // in flight (!refetchesInFlight — yield instead of stomping it
+            // with a same-snapshot double render), mid-turn (!busy — the
+            // idle-edge backstop owns the busy case, e.g. the edit-resend
+            // dispatched below), a live bubble (the ref guards are
+            // LOAD-BEARING: refetchHistory does not reset streaming refs,
+            // so a wipe would strand a dangling ref), or torn down
+            // (visHandler — destroy() also cancels this timer outright,
+            // but coordCloseSession only nulls visHandler).
+            if (historyStale) {
+              if (staleRetryTimer) clearTimeout(staleRetryTimer);
+              staleRetryTimer = setTimeout(() => {
+                staleRetryTimer = null;
+                if (
+                  historyStale &&
+                  !refetchesInFlight &&
+                  !busy &&
+                  !currentAssistantEl &&
+                  !currentReasoningEl &&
+                  visHandler
+                ) {
+                  // Fire-and-forget, seedless (live stream — lastEventId
+                  // must not rewind); a render throw stays loud, as on the
+                  // backstop.
+                  refetchHistory();
+                }
+              }, 2000);
+            }
             if (!_pendingEditSend) return;
             const editText = _pendingEditSend;
             _pendingEditSend = null;
@@ -5280,6 +5416,10 @@ function createCoordinatorPane(root, wsId, opts) {
   // ------------------------------------------------------------------
 
   function _rewindToTurns(turns) {
+    // Deliberately busy-only, NOT latch-gated (#894 ruling): the caller
+    // passes an explicit turn count, so transcript staleness cannot
+    // corrupt it, and programmatic rewinds must keep working while a heal
+    // is pending.  The DOM-counting wrappers below carry the latch.
     if (busy) return;
     if (!Number.isInteger(turns) || turns < 1) return;
     authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/rewind", {
@@ -5293,16 +5433,14 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _rewindToMessage(msgEl) {
-    // KNOWN GAP (#894, do not re-derive): from clear_ui arrival until
-    // the next SUCCESSFUL refetchHistory render — the fetch window AND
-    // the failed-fetch aftermath — the stale transcript is visible
-    // with busy false, so this DOM count can over-rewind.  Port
-    // interactive.js's #890 shape: a transcript-staleness latch set at
-    // clear_ui, cleared only by the full render, gating the mutating
-    // affordances (a plain refetch-in-flight flag is NOT enough — it
-    // reopens on the failed exit, the bug interactive hit).  The
-    // retry leg needs a quiesce-free variant here.
-    if (busy) return;
+    // busy || historyStale (#894, the #890 port): from clear_ui arrival
+    // until the next SUCCESSFUL refetchHistory render — the fetch window
+    // AND the failed-fetch aftermath — the visible transcript is the
+    // stale PRE-rewind DOM with busy false, so the .msg.user count below
+    // would over-rewind the already-restructured server conversation.
+    // The latch closes exactly that window; see historyStale's decl for
+    // the heal paths that reopen the affordances.
+    if (busy || historyStale) return;
     const userMsgs = messagesEl.querySelectorAll(".msg.user");
     const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
@@ -5311,6 +5449,10 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _retryLast() {
+    // Deliberately busy-only, NOT latch-gated (#894 ruling): no DOM count
+    // feeds this POST — /retry re-runs the server's own last turn, which
+    // is authoritative regardless of what the pane shows.  Mirrors
+    // interactive.js, whose retry is equally ungated.
     if (busy) return;
     authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/retry", {
       method: "POST",
@@ -5321,7 +5463,10 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _editAndResend(msgEl, newText) {
-    if (busy) return;
+    // busy || historyStale (#894): same stale-DOM hazard as
+    // _rewindToMessage — the turn count AND the _pendingEditSend latch
+    // would both bind to a transcript the server no longer has.
+    if (busy || historyStale) return;
     const userMsgs = messagesEl.querySelectorAll(".msg.user");
     const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
@@ -5373,7 +5518,11 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _startEdit(msgEl, originalText) {
-    if (busy) return;
+    // busy || historyStale (#894): entering edit mode on a stale row would
+    // let the user type into a message the pending re-render is about to
+    // replaceChildren away — and _editAndResend would refuse the submit
+    // anyway.  Gate at entry so the affordance and the action agree.
+    if (busy || historyStale) return;
     // Save current child nodes so Cancel can restore them.
     const savedNodes = [];
     while (msgEl.firstChild) {
@@ -5579,6 +5728,12 @@ function createCoordinatorPane(root, wsId, opts) {
   // empty — harmless no-ops.
   async function refetchHistory(seedCursor = false) {
     let hist = null;
+    // Count the await window so the staleness heals can yield to an
+    // in-flight fetch (see refetchesInFlight's decl).  Only the fetch
+    // needs bracketing: the render below runs synchronously after the
+    // await, so no timer or SSE handler can observe the counter
+    // mid-render.
+    refetchesInFlight++;
     try {
       hist = await getJSON(
         "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
@@ -5586,6 +5741,8 @@ function createCoordinatorPane(root, wsId, opts) {
     } catch (e) {
       console.warn("coord history fetch failed", e);
       hist = null;
+    } finally {
+      refetchesInFlight--;
     }
     // A FAILED fetch keeps the pane intact: the wipe + tracking resets
     // run only once a payload actually arrived.  (Pre-#882 the wipe ran
@@ -5620,6 +5777,19 @@ function createCoordinatorPane(root, wsId, opts) {
     if (truncatedResyncTimer) {
       clearTimeout(truncatedResyncTimer);
       truncatedResyncTimer = null;
+    }
+    // A successful full render also restores transcript truth: clear the
+    // staleness latch and cancel the pending heal retry (#894).  These sit
+    // HERE — below the ``if (!hist) return`` and beside the other repair
+    // clears, BEFORE the long render loop — so a FAILED fetch leaves the
+    // latch set (which is what arms the retry/backstop), while a mid-render
+    // throw doesn't re-close a pane whose replaceChildren already
+    // committed (a partially painted FRESH transcript at worst
+    // UNDER-counts, the safe direction).  The ONLY latch-clear site.
+    historyStale = false;
+    if (staleRetryTimer) {
+      clearTimeout(staleRetryTimer);
+      staleRetryTimer = null;
     }
     toolRows.clear();
     activeBatch = null;
@@ -5939,6 +6109,16 @@ function createCoordinatorPane(root, wsId, opts) {
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
     // truncated resync).
     closeStreamTransport();
+    // The clear_ui-failure retry deliberately survives closeStreamTransport
+    // (transport-only redials keep the heal intent — see its decl), so it
+    // must die HERE, the terminal path: destroy() bumps no generation, and
+    // while the visHandler fire-time guard would render a post-destroy
+    // firing inert, a timer into a destroyed pane must be dead, not merely
+    // inert — it pins the closure for its remaining delay.
+    if (staleRetryTimer) {
+      clearTimeout(staleRetryTimer);
+      staleRetryTimer = null;
+    }
     [
       cancelTimeoutId,
       forceTimeoutId,
