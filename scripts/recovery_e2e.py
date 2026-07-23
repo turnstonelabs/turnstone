@@ -1771,7 +1771,7 @@ def _poll_until(pred: Any, timeout: float, interval: float = 0.1) -> bool:
 def _send_in_page(cdp: CDP, message: str) -> None:
     """POST /send from inside the page via the pane's own authFetch (cookie
     auth, node-proxy base) — the one shared shape for scenarios that drive a
-    turn mid-flight (E1/E4).  A raw POST emits no live user row, so the sent
+    turn mid-flight (E1/E4/G3).  A raw POST emits no live user row, so the sent
     turn appears only via the next /history render."""
     cdp.evaluate(
         "window.authFetch('/v1/api/workstreams/' + "

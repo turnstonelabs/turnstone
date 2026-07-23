@@ -664,11 +664,22 @@ def test_coordinator_history_stale_latch_contract():
         "reconnect — a reload's fresh reconnect draws the synthetic "
         "state_change:idle back into this trigger (zero-backoff storm)."
     )
+    assert "!refetchesInFlight" in backstop_arm, (
+        "the backstop must yield to an in-flight refetch — without the "
+        "guard it stomps a same-snapshot fetch with a double render "
+        "(mirrors interactive's !_replayQueue pin)."
+    )
 
-    # 5. Bounded retry: exactly one arm site.
+    # 5. Bounded retry: exactly one arm site, and its fire guard yields to
+    #    an in-flight fetch.
     assert body.count("staleRetryTimer = setTimeout") == 1, (
         "the stale retry must be armed in exactly one place (clear_ui "
         ".then) — bounded by construction."
+    )
+    retry_arm = body.index("staleRetryTimer = setTimeout")
+    assert "!refetchesInFlight" in body[retry_arm : retry_arm + 700], (
+        "the retry's fire guard must yield to an in-flight refetch "
+        "(mirrors interactive's !_replayQueue pin)."
     )
 
     # 6. Teardown: terminal cancel in destroy(); NOT in closeStreamTransport.
