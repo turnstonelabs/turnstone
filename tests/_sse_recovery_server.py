@@ -203,6 +203,11 @@ class RecoveryServer:
         # reload-based backstop would bump it once per reconnect (the round-5
         # storm).  Same lock-free single-writer int discipline as above.
         self.events_requests = 0
+        # Global-lane SSE connection opens (``GET …/events/global`` — the
+        # roster stream app.js's connectGlobalSSE builds).  The
+        # roster-restart scenario (#881) asserts the post-restart manual
+        # reconnect actually reached the reborn node's real endpoint.
+        self.global_events_requests = 0
         self._history_fail_remaining = 0
         self._history_delay_ms = 0
         # A thin pure-ASGI fault layer wrapping the REAL app (the production
@@ -241,6 +246,8 @@ class RecoveryServer:
                     # route the pane's EventSource hits is
                     # ``…/workstreams/{ws_id}/events`` (session_routes).
                     self.events_requests += 1
+                elif path.endswith("/events/global") and method == "GET":
+                    self.global_events_requests += 1
             await production_app(scope, receive, send)
 
         self._server = uvicorn.Server(

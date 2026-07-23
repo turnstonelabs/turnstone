@@ -23,6 +23,7 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario rewind-window     # E2 (#890)
     python3 scripts/recovery_e2e.py --scenario rewind-failed-window  # E3 (#890)
     python3 scripts/recovery_e2e.py --scenario stale-backstop    # E4 (#890)
+    python3 scripts/recovery_e2e.py --scenario roster-restart    # F (#881)
     python3 scripts/recovery_e2e.py --scenario both   # A+B only (legacy)
     python3 scripts/recovery_e2e.py --keep-open 8971  # serve the storm page
                                                       # for manual inspection
@@ -167,6 +168,41 @@ coordinator ring lives there), show the tab, and verify: the pane draws
 one truncated full rebuild (no blank pane), the mid-run turn's tool rows
 re-appear inside their batch (no standalone top-level orphan bubbles),
 and turns committed while hidden are present.
+
+Scenario F (roster-restart, #881): the REAL node dashboard (``/`` +
+ui/static/app.js) driven through a node restart on the GLOBAL stream —
+the last silent-gap class from the truncated-recovery campaign.  Unlike
+the pane scenarios there is no custom page: the runner navigates to the
+production dashboard and injects transport instrumentation via CDP
+``Page.addScriptToEvaluateOnNewDocument`` (an EventSource wrapper scoped
+to ``/events/global`` URLs — app.js's stream + cursor are module-private
+and the roster machinery exposes no counters).  Phase A (negative
+control): two live workstreams render as roster rows; a scripted turn on
+one drives global ``ws_state`` frames, proving the page holds a live
+epoch-tagged cursor with ZERO ``replay_truncated`` observed — the live
+cursor must not false-positive.  Phase B: hide, close the global
+EventSource (the browser-gave-up CLOSED state — a closed source never
+auto-retries, so the show edge's MANUAL reconnect is the only
+reconnect), restart the node on the same port re-opening only ONE
+workstream, show.  ``_reconnectDeadSSEs`` fires ``connectGlobalSSE``,
+which presents the stored pre-restart cursor via ``?last_event_id=``
+(counted off the wrapper's URL — the item-6 client half); the reborn
+node's epoch mismatch draws ``replay_truncated`` (``reason:
+boot_epoch``) + a fresh node_snapshot, and the in-stream snapshot's
+``evict`` sweep removes the not-reopened workstream's row — the exact
+ghost-roster field symptom (pre-#881 the reborn ring answered
+``replay_ok``-empty: no envelope, no snapshot, ghost row forever).
+Asserted: browser-observed trunc>=1 + cursor-presented>=1 (transport
+wrapper), ghost GONE + keeper PRESENT in the roster MODEL
+(``TS_APP.getClusterState()``) and the RAIL (``fireRender``'s surface) —
+deliberately not the dashboard TABLE, whose membership refreshes only on
+interaction by design (see ``_roster_has_ws``) — and the backend proof
+``global_events_requests>=1`` on the restarted node (the reconnect hit
+the real endpoint).  The NATIVE header path (browser echoes the
+epoch-tagged id on auto-reconnect) differs only in cursor transport and
+is pinned both-transports by Tier-1
+``test_global_sse_boot_epoch::test_query_param_fallback_matches_header_semantics``.
+Stamps/returns ``RECOVERY-READY-ROSTER-trunc<n>-cursor<n>``.
 """
 
 from __future__ import annotations
@@ -1168,6 +1204,197 @@ def run_restart(chrome: str) -> str:
         node.stop()
 
 
+# Injected into the REAL dashboard page via Page.addScriptToEvaluateOnNewDocument
+# (runs before any page script on every navigation).  Same transport-level
+# discipline as the coord page's inline wrapper, but scoped to GLOBAL-stream
+# URLs only — the dashboard also opens per-ws EventSources whose frames and
+# truncated envelopes must not pollute the roster counters.  ``__globalES``
+# keeps the live instance reachable so the runner can force the CLOSED state
+# (app.js's module-private ``globalEvtSource`` is otherwise untouchable);
+# ``new CountingES(...)`` returns the REAL EventSource, so app.js's
+# ``readyState`` checks and handlers see the genuine object.
+ROSTER_INJECT_JS = r"""
+window.__globalTruncated = 0;
+window.__globalIdFrames = 0;
+window.__globalCursorPresented = 0;
+window.__globalES = null;
+window.__hide = function () {
+  Object.defineProperty(document, "hidden", { configurable: true, value: true });
+  Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+  document.dispatchEvent(new Event("visibilitychange"));
+};
+window.__show = function () {
+  Object.defineProperty(document, "hidden", { configurable: true, value: false });
+  Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+  document.dispatchEvent(new Event("visibilitychange"));
+};
+(function () {
+  const RealES = window.EventSource;
+  function CountingES(url, opts) {
+    const es = new RealES(url, opts);
+    if (String(url).indexOf("/events/global") !== -1) {
+      window.__globalES = es;
+      if (String(url).indexOf("last_event_id=") !== -1) {
+        window.__globalCursorPresented += 1;
+      }
+      es.addEventListener("message", function (e) {
+        if (e.lastEventId != null && e.lastEventId !== "") {
+          window.__globalIdFrames += 1;
+        }
+        try {
+          const d = JSON.parse(e.data);
+          if (d && d.type === "replay_truncated") window.__globalTruncated += 1;
+        } catch (_) {}
+      });
+    }
+    return es;
+  }
+  CountingES.prototype = RealES.prototype;
+  CountingES.CONNECTING = RealES.CONNECTING;
+  CountingES.OPEN = RealES.OPEN;
+  CountingES.CLOSED = RealES.CLOSED;
+  window.EventSource = CountingES;
+})();
+"""
+
+
+def _roster_has_ws(cdp: CDP, ws_id: str, name: str) -> bool:
+    """The ws is in the healed roster: present in the MODEL
+    (``TS_APP.getClusterState()`` — the projection of app.js's
+    ``workstreams`` map, the state the snapshot evict mutates) AND
+    rendered in the RAIL (``fireRender``'s surface; rows are name-keyed
+    via ``title``).  Deliberately NOT the dashboard TABLE
+    (``#dash-ws-table``): its MEMBERSHIP refreshes only on interaction
+    (``loadDashboard`` on show/boot/delete) for live ws_created/ws_closed
+    too — only existing rows live-patch (see app.js
+    ``updateTabIndicator``) — so a lingering dash row is the table's
+    documented refresh model, not a failed heal."""
+    in_model = bool(
+        cdp.evaluate(
+            "(window.TS_APP && window.TS_APP.getClusterState) ? "
+            "window.TS_APP.getClusterState().nodes.local.workstreams.some("
+            f"function (w) {{ return w.id === {json.dumps(ws_id)}; }}) : false"
+        )
+    )
+    in_rail = bool(
+        cdp.evaluate(
+            "Array.prototype.some.call(document.querySelectorAll('button.row'), "
+            f"function (b) {{ return (b.title || '').indexOf({json.dumps(name)}) === 0; }})"
+        )
+    )
+    return in_model and in_rail
+
+
+def run_roster_restart(chrome: str) -> str:
+    from tests._sse_recovery_server import bash_toolcall_script, final_text_script
+
+    port = _free_port()
+    node = _boot_node(port=port)
+    # keeper FIRST (its pending scripted client is never consumed — no send
+    # targets it), then ghost so the ghost's turn script is the pending one
+    # its /send consumes.
+    keeper_id = node.create_workstream(final_text_script("keeper idle"), name="roster-keeper")
+    ghost_id = node.create_workstream(
+        bash_toolcall_script("g1", "echo ghost-activity"),
+        final_text_script("ghost done"),
+        name="roster-ghost",
+    )
+    profile = Path(_scratch()) / "chrome-roster"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        cdp.cmd("Page.enable")
+        cdp.cmd("Page.addScriptToEvaluateOnNewDocument", {"source": ROSTER_INJECT_JS})
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, node.base_url + "/")
+
+        # -- Phase A: live roster + live cursor, zero false truncated -------
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if _roster_has_ws(cdp, ghost_id, "roster-ghost") and _roster_has_ws(
+                cdp, keeper_id, "roster-keeper"
+            ):
+                break
+            time.sleep(0.3)
+        else:
+            return "RECOVERY-FAILED-ROSTER-rows-never-rendered"
+        # A scripted turn on the ghost drives ws_state frames down the global
+        # stream — the id-bearing frames that make the page's stored cursor
+        # (and the wrapper's count) real.
+        node.send(ghost_id)
+        node.wait_turn(ghost_id, timeout=30)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            frames = cdp.evaluate("window.__globalIdFrames || 0")
+            if isinstance(frames, int) and frames >= 1:
+                break
+            time.sleep(0.3)
+        else:
+            return "RECOVERY-FAILED-ROSTER-no-global-id-frames"
+        # Negative control: a LIVE cursor over a live ring must not draw the
+        # envelope, and no manual reconnect has happened yet.
+        if cdp.evaluate("window.__globalTruncated || 0") != 0:
+            return "RECOVERY-FAILED-ROSTER-truncated-false-positive"
+        if cdp.evaluate("window.__globalCursorPresented || 0") != 0:
+            return "RECOVERY-FAILED-ROSTER-premature-cursor-presentation"
+
+        # -- Phase B: deaf browser -> restart -> manual stale-cursor heal ---
+        cdp.evaluate("window.__hide && window.__hide()")
+        # Force the browser-gave-up state: a CLOSED source never auto-retries,
+        # so the show edge's manual ``connectGlobalSSE`` is the ONLY reconnect
+        # and the ``?last_event_id=`` presentation is deterministic (a native
+        # retry landing first would consume the staleness and clear the
+        # stored cursor — the native transport is Tier-1-pinned instead).
+        cdp.evaluate("window.__globalES && window.__globalES.close()")
+        node.stop()
+        node = _boot_node(port=port)
+        # Only the keeper comes back — the ghost stays unloaded, exactly a
+        # restarted node's roster truth the pre-#881 silent gap never showed.
+        node.open_workstream(keeper_id)
+        cdp.evaluate("window.__show && window.__show()")
+
+        deadline = time.monotonic() + 15
+        healed = False
+        while time.monotonic() < deadline:
+            trunc = cdp.evaluate("window.__globalTruncated || 0")
+            cursor = cdp.evaluate("window.__globalCursorPresented || 0")
+            ghost_gone = not _roster_has_ws(cdp, ghost_id, "roster-ghost")
+            keeper_here = _roster_has_ws(cdp, keeper_id, "roster-keeper")
+            if (
+                isinstance(trunc, int)
+                and trunc >= 1
+                and isinstance(cursor, int)
+                and cursor >= 1
+                and ghost_gone
+                and keeper_here
+            ):
+                healed = True
+                break
+            time.sleep(0.3)
+        if not healed:
+            trunc = cdp.evaluate("window.__globalTruncated || 0")
+            cursor = cdp.evaluate("window.__globalCursorPresented || 0")
+            return (
+                f"RECOVERY-FAILED-ROSTER-trunc{trunc}-cursor{cursor}"
+                f"-ghost{'0' if not _roster_has_ws(cdp, ghost_id, 'roster-ghost') else '1'}"
+                f"-keeper{'1' if _roster_has_ws(cdp, keeper_id, 'roster-keeper') else '0'}"
+            )
+        # Backend proof: the reconnect hit the restarted node's REAL global
+        # endpoint (the counter lives on the reborn server, so >=1 can only
+        # come from a post-restart connection).
+        if node.global_events_requests < 1:
+            return "RECOVERY-FAILED-ROSTER-no-backend-global-connect"
+        verdict = f"RECOVERY-READY-ROSTER-trunc{trunc}-cursor{cursor}"
+        # Stamp the title too so the manual runbook flow reads the same way.
+        cdp.evaluate(f"document.title = {json.dumps(verdict)}")
+        return verdict
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
 def run_coord_restart(chrome: str) -> str:
     from tests._sse_recovery_server import final_text_script, parallel_bash_script
 
@@ -1871,6 +2098,7 @@ def main() -> None:
             "rewind-window",
             "rewind-failed-window",
             "stale-backstop",
+            "roster-restart",
             "both",
             "all",
         ],
@@ -1921,6 +2149,10 @@ def main() -> None:
     if args.scenario in ("stale-backstop", "all"):
         verdict = run_stale_backstop(chrome)
         print(f"scenario E4 (stalebackstop): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("roster-restart", "all"):
+        verdict = run_roster_restart(chrome)
+        print(f"scenario F (roster): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     raise SystemExit(1 if failures else 0)
 
