@@ -670,16 +670,33 @@ def test_coordinator_history_stale_latch_contract():
         "(mirrors interactive's !_replayQueue pin)."
     )
 
-    # 5. Bounded retry: exactly one arm site, and its fire guard yields to
-    #    an in-flight fetch.
+    # 5. Bounded retry: exactly one arm site; the ARM is teardown-gated;
+    #    the fire guard yields to an in-flight fetch and carries the
+    #    teardown sentinel.
     assert body.count("staleRetryTimer = setTimeout") == 1, (
         "the stale retry must be armed in exactly one place (clear_ui "
         ".then) — bounded by construction."
     )
+    assert body.count("if (historyStale && visHandler) {") == 1, (
+        "the arm must be gated on the teardown sentinel too — the "
+        "clear_ui .then can settle after destroy()/coordCloseSession, "
+        "and an ungated arm recreates the orphan timer destroy's cancel "
+        "exists to kill."
+    )
     retry_arm = body.index("staleRetryTimer = setTimeout")
-    assert "!refetchesInFlight" in body[retry_arm : retry_arm + 700], (
+    retry_fire = body[retry_arm : retry_arm + 700]
+    assert "!refetchesInFlight" in retry_fire, (
         "the retry's fire guard must yield to an in-flight refetch "
         "(mirrors interactive's !_replayQueue pin)."
+    )
+    assert "visHandler" in retry_fire, (
+        "the retry's fire guard must carry the teardown sentinel — it is "
+        "the SOLE protection for the coordCloseSession path, which nulls "
+        "visHandler but does not cancel the timer."
+    )
+    assert "if (staleRetryTimer) clearTimeout(staleRetryTimer);" in body, (
+        "re-arming on a newer clear_ui must cancel the pending timer "
+        "first, or a double clear_ui leaks a timer."
     )
 
     # 6. Teardown: terminal cancel in destroy(); NOT in closeStreamTransport.

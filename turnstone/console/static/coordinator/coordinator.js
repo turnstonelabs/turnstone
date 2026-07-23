@@ -3683,7 +3683,16 @@ function createCoordinatorPane(root, wsId, opts) {
             // so a wipe would strand a dangling ref), or torn down
             // (visHandler — destroy() also cancels this timer outright,
             // but coordCloseSession only nulls visHandler).
-            if (historyStale) {
+            //
+            // The ARM is visHandler-gated too: this .then can settle AFTER
+            // a teardown (destroy/close-session during the in-flight
+            // refetch), and destroy's clearTimeout already ran — an arm
+            // here would recreate the orphan timer destroy exists to kill
+            // (a no-op fire, but it pins the dead closure for 2s).  The
+            // edit-resend below stays UNgated on teardown by design: the
+            // rewind committed server-side and the workstream outlives the
+            // pane UI, so the user's committed edit still delivers.
+            if (historyStale && visHandler) {
               if (staleRetryTimer) clearTimeout(staleRetryTimer);
               staleRetryTimer = setTimeout(() => {
                 staleRetryTimer = null;
