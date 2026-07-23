@@ -698,6 +698,17 @@ def test_coordinator_history_stale_latch_contract():
         "re-arming on a newer clear_ui must cancel the pending timer "
         "first, or a double clear_ui leaks a timer."
     )
+    # The consumer pins above are only meaningful while the PRODUCER
+    # brackets every fetch: without the ++/-- pair the counter is
+    # permanently 0 and both yield guards pass vacuously.
+    assert body.count("refetchesInFlight++") == 1, (
+        "refetchHistory must increment the in-flight counter before its "
+        "await — the yield guards read it."
+    )
+    assert body.count("refetchesInFlight--") == 1, (
+        "the in-flight counter must decrement in exactly one place (the "
+        "fetch finally) so every exit rebalances it."
+    )
 
     # 6. Teardown: terminal cancel in destroy(); NOT in closeStreamTransport.
     destroy_slice = body[body.index("function destroy()") :]
