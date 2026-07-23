@@ -5376,7 +5376,9 @@ class ChatSession:
         tracker = self._get_health_tracker()
 
         try:
-            result = self._try_stream(self.client, self.model, msgs)
+            result = self._try_stream(
+                self.client, self.model, msgs, model_alias=self._model_alias
+            )
             if tracker:
                 tracker.record_success()
             return result
@@ -5989,8 +5991,10 @@ class ChatSession:
         empty/unknown alias, missing user context (CLI / eval / coordinator /
         service turns, where ``_mcp_effective_user_id`` is empty), or a failed
         mint — so the call still goes through on the backend's static credential.
-        The mint is cached per (user, audience), so this is a dict lookup on the
-        hot path once warm.
+        The minted token is cached in the DB (``mcp_user_tokens``, shared across
+        worker nodes) per (user, audience), so a warm call is one cache read
+        rather than a re-mint. A fallback with a user present is logged (below)
+        so a silent drop to the static/placeholder credential is never invisible.
         """
         registry = self._registry
         mcp = self._mcp_client
@@ -6004,9 +6008,24 @@ class ChatSession:
             return None
         user_id = (self._mcp_effective_user_id or "").strip()
         if not user_id:
+            # Expected for utility / CLI / eval / coordinator / service turns —
+            # no user to mint on behalf of, so the static credential stands.
+            log.debug("model_obo.no_user_context", alias=alias, audience=cfg.obo_audience)
             return None
         token = mcp.mint_model_obo_token_sync(user_id=user_id, audience=cfg.obo_audience)
         if not token:
+            # A user IS driving but the mint yielded nothing (no captured
+            # credential, decrypt failure, or the AS rejected the grant). Never
+            # silent: the request now goes out on the backend's STATIC credential
+            # — and when no api_key is set that is the unusable placeholder the
+            # backend rejects with an opaque 401. Surface the cause on our side.
+            log.warning(
+                "model_obo.fallback_to_static",
+                alias=alias,
+                user_id=user_id,
+                audience=cfg.obo_audience,
+                has_static_key=bool(getattr(cfg, "api_key", "")),
+            )
             return None
         from turnstone.core.providers import obo_auth_headers
 

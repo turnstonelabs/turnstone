@@ -2687,30 +2687,24 @@ async def get_obo_access_token_classified(
 # Deliberately lighter than get_obo_access_token_classified: a model backend is
 # ONE resource addressed by a single audience, redeemed identically for every
 # alias that points at it — not a per-server grant graph.  So this owns no
-# per-server cache row, dead-grant classification, or re-consent affordance.  It
-# reuses the same mint legs, credential store, RT-rotation CAS, and cluster
-# credential lock, with a per-process access-token cache.
+# dead-grant classification or re-consent affordance.  It reuses the same mint
+# legs, credential store, RT-rotation CAS, cluster credential lock, AND the same
+# ``mcp_user_tokens`` mint-cache row the classified path uses (refresh_token=NULL,
+# "cache, not custody") — keyed under a synthetic ``__model_obo__:<audience>``
+# server name.  Caching in the DB rather than per-process means the minted token
+# is shared across worker nodes (a user tapping any worker reuses it instead of
+# re-minting) and is inspectable/decodable for debugging.
 
 
-def _model_obo_cache(app_state: Any) -> dict[tuple[str, str], dict[str, Any]]:
-    """Per-process ``(user_id, audience) → {access_token, expires_at}`` cache.
+def _model_obo_cache_server(audience: str) -> str:
+    """Synthetic ``mcp_user_tokens`` server key for a model audience's mint-cache row.
 
-    Stashed on *app_state* so it shares the object's lifetime and is reachable
-    from both the pre-lock fast path and the under-lock re-check.  In-process
-    only: each node caches its own minted access token (cheap), while the shared
-    mutable resource — the refresh credential — is still cluster-locked whenever
-    a mint rotates it.
+    The table's PK is ``(user_id, server_name)`` and model audiences vary, so the
+    audience is embedded in the key — mirroring the in-process ``(user, audience)``
+    key and the ``__model_obo__:<audience>`` single-flight lock.  The ``__model_obo__:``
+    prefix keeps these cache rows distinguishable from real oauth_user server rows.
     """
-    cache = getattr(app_state, "_model_obo_token_cache", None)
-    if cache is None:
-        cache = {}
-        try:
-            app_state._model_obo_token_cache = cache
-        except Exception:
-            # app_state without settable attrs (unusual) → mint every call.
-            # Correct, just not cached.
-            return {}
-    return cache
+    return f"__model_obo__:{audience}"
 
 
 async def mint_obo_access_token(
@@ -2726,8 +2720,10 @@ async def mint_obo_access_token(
     Redeems the user's captured refresh credential (``oidc_user_credentials``)
     for *audience* via the configured OBO grant profile, persists any rotated
     refresh token (value CAS, cluster-locked exactly like the MCP mint), and
-    caches the access token in-process keyed ``(user_id, audience)`` until
-    shortly before expiry.
+    caches the minted access token in an ``mcp_user_tokens`` mint-cache row
+    (``refresh_token=NULL``) keyed ``__model_obo__:<audience>`` — the same
+    "cache, not custody" row the classified path uses — so the token is shared
+    across worker nodes and inspectable, until shortly before expiry.
 
     Returns ``None`` — the signal for callers to fall back to their static
     credential — when OIDC is disabled/unconfigured, the profile has no mint
@@ -2755,12 +2751,16 @@ async def mint_obo_access_token(
     # rfc8693 applies a scope restriction (mirrors the classified path).
     effective_scopes = "" if profile == "entra" else scopes
 
-    cache = _model_obo_cache(app_state)
-    key = (user_id, audience)
+    cache_server = _model_obo_cache_server(audience)
     if not force_refresh:
-        hit = cache.get(key)
-        if hit is not None and hit.get("expires_at") and not _token_needs_refresh(hit["expires_at"]):
-            return str(hit["access_token"])
+        try:
+            plain = await asyncio.to_thread(token_store.get_user_token, user_id, cache_server)
+        except MCPTokenDecryptError:
+            # A mint-cache row we can't decrypt (key rotated away) is a miss, not
+            # a fatal error — re-mint rather than fail the model call.
+            plain = None
+        if _is_fresh_obo_cache_row(plain, audience, effective_scopes) and plain is not None:
+            return plain["access_token"]
 
     # Single-flight the mint: a per-(user, audience) asyncio lock for local
     # coalescing, then the SAME per-(user, issuer) credential lock + cluster
@@ -2768,19 +2768,18 @@ async def mint_obo_access_token(
     # mutable resource (rotation write-back), so a model mint and an MCP mint for
     # the same user serialise on it cluster-wide.  Order is always
     # audience → credential and nothing takes the reverse, so no deadlock.
-    lock = _refresh_lock_for(app_state, user_id, f"__model_obo__:{audience}")
+    lock = _refresh_lock_for(app_state, user_id, cache_server)
     credential_key = f"__obo__:{issuer}"
     credential_lock = _refresh_lock_for(app_state, user_id, credential_key)
     pg_lock = await _acquire_pg_refresh_lock(storage, user_id, credential_key)
     async with lock, credential_lock, pg_lock:
         if not force_refresh:
-            hit = cache.get(key)
-            if (
-                hit is not None
-                and hit.get("expires_at")
-                and not _token_needs_refresh(hit["expires_at"])
-            ):
-                return str(hit["access_token"])
+            try:
+                plain = await asyncio.to_thread(token_store.get_user_token, user_id, cache_server)
+            except MCPTokenDecryptError:
+                plain = None
+            if _is_fresh_obo_cache_row(plain, audience, effective_scopes) and plain is not None:
+                return plain["access_token"]
 
         credential = await _read_obo_credential(
             app_state, token_store, user_id, "__model_obo__", issuer
@@ -2839,12 +2838,34 @@ async def mint_obo_access_token(
                 "model_obo.mint_missing_access_token", user_id=user_id, audience=audience
             )
             return None
-        cache[key] = {
-            "access_token": access_token,
-            "expires_at": _expires_at_from_response(
-                tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
-            ),
-        }
+        try:
+            await _persist_obo_cache_row(
+                token_store,
+                user_id,
+                cache_server,
+                access_token=access_token,
+                expires_at=_expires_at_from_response(
+                    tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
+                ),
+                scopes=effective_scopes,
+                issuer=issuer,
+                audience=audience,
+            )
+        except Exception:
+            # Best-effort, mirroring the classified path: the mint already produced
+            # a working token, so a cache-write hiccup must not discard it.
+            log.warning(
+                "model_obo.cache_persist_failed",
+                user_id=user_id,
+                audience=audience,
+                exc_info=True,
+            )
+        log.info(
+            "model_obo.minted",
+            user_id=user_id,
+            audience=audience,
+            cache_server=cache_server,
+        )
         return access_token
 
 

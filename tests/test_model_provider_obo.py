@@ -197,8 +197,11 @@ class TestOboAuthHeaders:
         assert obo_auth_headers("anthropic-compatible", "TOK") == {"x-api-key": "TOK"}
 
     def test_openai_style_uses_bearer(self) -> None:
+        # Capital "Authorization" — must match the OpenAI SDK's own default-auth
+        # header key, else the SDK emits two Authorization headers (dup 400 /
+        # stale client key wins) instead of the override replacing it.
         for prov in ("openai", "openai-compatible", "google", "xai"):
-            assert obo_auth_headers(prov, "TOK") == {"authorization": "Bearer TOK"}
+            assert obo_auth_headers(prov, "TOK") == {"Authorization": "Bearer TOK"}
 
 
 # ---------------------------------------------------------------------------
@@ -332,9 +335,51 @@ class TestMintOboAccessToken:
             "client_secret": "csecret",
             "scope": f"{AUDIENCE}/.default",
         }
-        # Second call serves the in-process cache — zero extra IdP round-trips.
+        # Second call serves the DB mint-cache row — zero extra IdP round-trips.
         token2 = _mint(state)
         assert token2 == "at-minted"
+        assert client.post.call_count == 1
+
+    def test_minted_token_cached_in_db_and_shared_across_nodes(
+        self, storage: SQLiteBackend
+    ) -> None:
+        # One shared enc key, as a cluster shares MCP_ENC_KEY across workers.
+        cipher = make_mcp_token_cipher()
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
+        )
+        node_a = SimpleNamespace(
+            auth_storage=storage,
+            mcp_token_store=MCPTokenStore(storage, cipher, node_id="A"),
+            oidc_config=_make_oidc_config(),
+            obo_http_client=client,
+            mcp_oauth_refresh_locks={},
+        )
+        node_a.mcp_token_store.upsert_oidc_credential(USER, ISSUER, refresh_token="rt-1")
+
+        assert _mint(node_a) == "at-minted"
+        assert client.post.call_count == 1
+
+        # Persisted as a "cache, not custody" row (refresh_token NULL), decodable.
+        cache_server = f"__model_obo__:{AUDIENCE}"
+        raw = storage.get_mcp_user_token(USER, cache_server)
+        assert raw is not None and raw["refresh_token_ct"] is None
+        plain = node_a.mcp_token_store.get_user_token(USER, cache_server)
+        assert plain is not None
+        assert plain["access_token"] == "at-minted"
+        assert plain["audience"] == AUDIENCE
+
+        # A DIFFERENT worker (same DB + enc key) serves the cached token with NO
+        # new IdP round-trip — no needless per-worker re-mint.
+        node_b = SimpleNamespace(
+            auth_storage=storage,
+            mcp_token_store=MCPTokenStore(storage, cipher, node_id="B"),
+            oidc_config=_make_oidc_config(),
+            obo_http_client=client,
+            mcp_oauth_refresh_locks={},
+        )
+        assert _mint(node_b) == "at-minted"
         assert client.post.call_count == 1
 
     def test_rotated_refresh_token_persisted_to_credential(self, storage: SQLiteBackend) -> None:
@@ -457,7 +502,19 @@ class TestModelAuthHeaders:
         reg = _registry_with(self._obo_cfg(provider="openai-compatible"))
         sess = _fake_session(registry=reg, user_id=USER, mint_token="minted-jwt")
         headers = ChatSession._model_auth_headers(sess, "tf")
-        assert headers == {"authorization": "Bearer minted-jwt"}
+        assert headers == {"Authorization": "Bearer minted-jwt"}
+
+    def test_primary_stream_forwards_alias_for_obo(self) -> None:
+        # Regression: the primary _create_stream_with_retry call must pass
+        # model_alias, or _model_auth_headers("") can't resolve the OBO override
+        # and an entra_obo main turn goes out on the static client key. The
+        # fallback path and utility (title) completions always passed the alias;
+        # the primary path silently didn't.
+        sess = MagicMock()
+        sess._model_alias = "oboagent"
+        ChatSession._create_stream_with_retry(sess, [{"role": "user", "content": "hi"}])
+        sess._try_stream.assert_called_once()
+        assert sess._try_stream.call_args.kwargs.get("model_alias") == "oboagent"
 
     def test_static_alias_returns_none_and_never_mints(self) -> None:
         static_cfg = ModelConfig(
