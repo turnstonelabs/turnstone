@@ -20,9 +20,11 @@ let globalRetryDelay = 1000;
 // OPAQUE ``"{boot_epoch}-{counter}"`` string (#881).  Captured from the
 // MessageEvent in the global onmessage, presented as ``?last_event_id=``
 // on manual reconnects, and cleared when the record is dead: on a
-// ``replay_truncated`` envelope (the gap is being healed by snapshot +
-// resync) and on logout (roster identity reset).  Never parsed here —
-// only the server can interpret it.
+// ``replay_truncated`` envelope (the gap is being healed), on a
+// ``node_snapshot`` (the recovery floor — required, not belt-and-braces:
+// that id-less frame re-captures the connection's stale cursor on native
+// reconnects, see the branch comment) and on logout (roster identity
+// reset).  Never parsed here — only the server can interpret it.
 let globalLastEventId = null;
 let dashboardVisible = false;
 let _historyNavigation = false;
@@ -1816,6 +1818,18 @@ function connectGlobalSSE() {
       // through their own Tier-2 streams.  Eviction is safe here (and only
       // here): the snapshot is serialized with ws_created/ws_closed on the
       // stream itself.
+      //
+      // The pre-snapshot cursor is dead in every case that draws a
+      // snapshot (fresh has none; truncated's is spent) — and this frame
+      // is id-less, so on a NATIVE reconnect the capture above just
+      // re-stored the connection's stale pre-restart cursor, undoing the
+      // truncated branch's clear (id-less frames inherit the persisted
+      // last-event-ID string; a manual reconnect's fresh EventSource
+      // starts empty and the "" guard blocks it).  Clear it here so a
+      // manual reconnect racing in before the next id-bearing frame goes
+      // cursorless instead of re-presenting the dead cursor for a
+      // redundant truncated round.
+      globalLastEventId = null;
       applyRosterSnapshot(data.workstreams || [], { evict: true });
     } else if (data.type === "replay_truncated") {
       // Events between our cursor and the buffer head (reason
