@@ -2252,7 +2252,13 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
     — the epoch prefix would NaN any numeric read), presented via
     ``?last_event_id=`` (EventSource cannot set the header manually),
     and cleared where the record dies: the ``replay_truncated``
-    handler and ``onLogout``.
+    handler, the ``node_snapshot`` recovery floor (required, not
+    belt-and-braces — that id-less frame's MessageEvent inherits the
+    connection's stale pre-restart cursor on NATIVE reconnects, so the
+    pre-dispatch capture re-stores it and only a branch-level clear
+    kills it), and ``onLogout``.  All three clears are pinned below —
+    a simplify pass dropping one reintroduces the redundant
+    dead-cursor truncated round.
 
     Comments are stripped before the scan (module-level, string-aware
     stripper) so documentation may name the anti-pattern verbatim — the
@@ -2302,6 +2308,24 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
     assert not re.search(r"(?:Number|parseInt)\(\s*globalLastEventId", app_code), (
         "app.js: the global cursor is an opaque epoch-tagged string — "
         "never interpret it numerically"
+    )
+    # Dead-record clears (see docstring): truncated envelope, snapshot
+    # recovery floor (BEFORE the roster rebuild), and logout.
+    assert re.search(
+        r"globalLastEventId = null;\s*resyncRoster\(\);",
+        app_code,
+    ), "app.js: the replay_truncated handler must clear the spent cursor"
+    assert re.search(
+        r"globalLastEventId = null;\s*applyRosterSnapshot\(",
+        app_code,
+    ), (
+        "app.js: the node_snapshot branch must clear the cursor — on "
+        "native reconnects this id-less frame re-captured the stale one"
+    )
+    logout_body = re.search(r"window\.onLogout = function \(\) \{(.*?)\n\};", app_code, re.S)
+    assert logout_body is not None, "app.js: window.onLogout not found"
+    assert "globalLastEventId = null;" in logout_body.group(1), (
+        "app.js: onLogout must reset the cursor (roster identity reset)"
     )
 
 
