@@ -398,7 +398,7 @@ def test_epoch_is_hex_and_dashless_by_construction() -> None:
     import secrets
 
     for _ in range(64):
-        assert "-" not in secrets.token_hex(4)
+        assert "-" not in secrets.token_hex(8)
     # And the production init uses token_hex — source-level pin.
     import inspect
 
