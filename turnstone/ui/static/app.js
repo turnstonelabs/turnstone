@@ -16,6 +16,14 @@ let workstreams = {};
 let currentWsId = null;
 let globalEvtSource = null;
 let globalRetryDelay = 1000;
+// Resume cursor for the global stream — the last SSE id observed, an
+// OPAQUE ``"{boot_epoch}-{counter}"`` string (#881).  Captured from the
+// MessageEvent in the global onmessage, presented as ``?last_event_id=``
+// on manual reconnects, and cleared when the record is dead: on a
+// ``replay_truncated`` envelope (the gap is being healed by snapshot +
+// resync) and on logout (roster identity reset).  Never parsed here —
+// only the server can interpret it.
+let globalLastEventId = null;
 let dashboardVisible = false;
 let _historyNavigation = false;
 let _lastHealth = null;
@@ -115,6 +123,10 @@ window.onLogout = function () {
     globalEvtSource.close();
     globalEvtSource = null;
   }
+  // Roster identity reset — the next principal starts cursorless
+  // (fresh snapshot) rather than resuming from this session's stream
+  // position.
+  globalLastEventId = null;
   fireRender();
 };
 
@@ -1752,29 +1764,42 @@ function connectGlobalSSE() {
     globalEvtSource.close();
     globalEvtSource = null;
   }
-  // Manual reconnects on the GLOBAL stream are DELIBERATELY cursorless
-  // (no ``?last_event_id=`` — do not add a MessageEvent lastEventId
-  // capture here like the per-ws streams'): the global ring cannot
-  // report truncation for a stale cursor after a node restart (its
-  // counter reboots at 0 — KNOWN GAP #881), so presenting one draws
-  // ``replay_ok``-empty with NO node_snapshot and the roster ghosts
-  // exactly when a full rebuild is most needed.  Cursorless manual
-  // reconnects always draw the fresh node_snapshot — lossless for
-  // roster STATE (unlike per-ws append-only history, where the
-  // storage-seeded counter makes a stale cursor report ``truncated``
-  // and the cursor is therefore safe to track).  Native auto-reconnect
-  // keeps its browser-internal header either way.  Revisit when #881's
-  // boot-epoch staleness signal lands.
-  globalEvtSource = new EventSource("/v1/api/events/global");
+  // Manual reconnects present the stored cursor (an opaque
+  // ``"{boot_epoch}-{counter}"`` string) via the query param — a
+  // ``new EventSource(url)`` cannot set the ``Last-Event-ID`` header.
+  // Safe since #881: a cursor from another boot (or another node, or a
+  // pre-epoch client) mismatches the server's live epoch and draws
+  // ``replay_truncated`` + a fresh node_snapshot — the ghost-roster
+  // shape that once forced these reconnects cursorless (a stale cursor
+  // drew ``replay_ok``-empty with NO snapshot against the reborn ring)
+  // can no longer occur.  A live cursor skips the wholesale snapshot
+  // rebuild and replays just the missed deltas.  Native auto-reconnect
+  // keeps its browser-internal header either way; the string guard is
+  // the house cursor-guard idiom (see test_app_js.py).
+  let globalUrl = "/v1/api/events/global";
+  if (globalLastEventId != null && globalLastEventId !== "") {
+    globalUrl += "?last_event_id=" + encodeURIComponent(globalLastEventId);
+  }
+  globalEvtSource = new EventSource(globalUrl);
   globalEvtSource.onopen = function () {
     globalRetryDelay = 1000;
   };
   globalEvtSource.onmessage = function (e) {
-    // Guarded parse: native auto-reconnect's header cursor has already
-    // advanced past this frame, so a parse failure is a permanently-lost
-    // roster mutation — resync the roster from REST instead of silently
-    // drifting (a dropped ws_created renders as a conversation that
-    // never appears; a dropped ws_closed as a ghost row forever).
+    // Cursor capture BEFORE the parse, mirroring the browser: native
+    // reconnect's header cursor advances past every id-bearing frame
+    // whether or not its JSON parses, and the manual cursor must agree
+    // with it (both recover a lost frame the same way — the resync
+    // below).  MessageEvent property, never the EventSource object
+    // (which has no such property — see the test_app_js.py tripwire).
+    if (e.lastEventId != null && e.lastEventId !== "") {
+      globalLastEventId = e.lastEventId;
+    }
+    // Guarded parse: the cursor (native header and stored copy alike)
+    // has already advanced past this frame, so a parse failure is a
+    // permanently-lost roster mutation — resync the roster from REST
+    // instead of silently drifting (a dropped ws_created renders as a
+    // conversation that never appears; a dropped ws_closed as a ghost
+    // row forever).
     let data = null;
     try {
       data = JSON.parse(e.data);
@@ -1793,9 +1818,15 @@ function connectGlobalSSE() {
       // stream itself.
       applyRosterSnapshot(data.workstreams || [], { evict: true });
     } else if (data.type === "replay_truncated") {
-      // Events between our cursor and the buffer head are gone for good.
-      // The node_snapshot that follows rebuilds the roster; refetch too so
-      // recovery doesn't depend on event ordering.
+      // Events between our cursor and the buffer head (reason
+      // "ring_evicted"), or everything since another boot minted the
+      // cursor (reason "boot_epoch"), are gone for good.  The cursor is
+      // spent — clear it so a manual reconnect racing in before the
+      // next id-bearing frame draws a fresh snapshot instead of
+      // re-presenting the dead cursor for a redundant truncated round.
+      // The node_snapshot that follows rebuilds the roster; refetch too
+      // so recovery doesn't depend on event ordering.
+      globalLastEventId = null;
       resyncRoster();
     } else if (data.type === "ws_state") {
       updateTabIndicator(data.ws_id, data.state, {
