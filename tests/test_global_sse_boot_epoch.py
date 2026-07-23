@@ -40,7 +40,7 @@ from starlette.requests import Request
 
 import turnstone.server as server_mod
 
-EPOCH = "0badf00d"  # test-pinned boot epoch (hex, like secrets.token_hex(4))
+EPOCH = "0badf00dcafebabe"  # test-pinned boot epoch (hex, like secrets.token_hex(8))
 
 
 def _make_app_state(

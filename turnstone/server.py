@@ -4763,6 +4763,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # off-loop; a thread that outlives its budget is logged and left to
     # the daemon flag rather than wedging shutdown.
     daemon_stop.set()
+    # The sentinel put stays inline (unlike the off-loop joins below): the
+    # fanout consumer is still alive here — it exits only on drawing this
+    # sentinel — and fans out with non-blocking put_nowait, so the bounded
+    # queue drains fast and put() returns at once; timeout=1 is a ceiling
+    # that never binds. Off-loop is reserved for the multi-second joins.
     with contextlib.suppress(queue.Full):
         app.state.global_queue.put(_FANOUT_SHUTDOWN, timeout=1)
     for _t in (fanout, agg_emitter, cleanup):
