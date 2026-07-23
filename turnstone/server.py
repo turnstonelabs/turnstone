@@ -1029,7 +1029,10 @@ async def global_events_sse(request: Request) -> Response:
     from any other epoch — a prior boot, another node, a pre-#881
     bare-int client — gets ``replay_truncated`` with
     ``reason="boot_epoch"`` followed by a fresh ``node_snapshot``, since
-    the events it missed died with the process that minted it.  Clients
+    the events it missed died with the process that minted it.
+    ``boot_epoch`` is not exclusively a foreign-epoch signal: a
+    same-epoch cursor over an EMPTY ring (impossible from our own ids —
+    forged or a bug) also draws it via the fail-safe branch below.  Clients
     treat the cursor as an opaque string; only this handler parses it.
     """
     # -- Service-scope gate ---------------------------------------------------
@@ -5172,8 +5175,13 @@ def create_app(
     # differs from the live process is stale by construction and draws
     # the ``replay_truncated`` + node_snapshot recovery floor in
     # :func:`global_events_sse`.  Hex nonce (never contains ``-``), so
-    # ``partition("-")`` splits the id unambiguously.
-    app.state.global_boot_epoch = secrets.token_hex(4)
+    # ``partition("-")`` splits the id unambiguously.  64 bits: the
+    # equality check is the ONLY thing standing between a prior-boot
+    # cursor and a silent ``replay_ok``-empty alias, and the collision
+    # event is per same-node restart-pair — 2^-64 keeps a
+    # fleet-lifetime of restarts engineered far below threshold where
+    # 32 bits left it merely unlikely (review round 4).
+    app.state.global_boot_epoch = secrets.token_hex(8)
     app.state.skip_permissions = skip_permissions
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage

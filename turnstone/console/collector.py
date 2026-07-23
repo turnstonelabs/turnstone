@@ -284,8 +284,9 @@ class ClusterCollector:
         ``node_snapshot`` and the collector rebuilds wholesale.  That is
         this consumer's recovery model (idempotent state-of-world, not
         append-only history), it side-steps cursor staleness across node
-        restarts entirely, and it means the epoch-tagged ids and the
-        ``replay_truncated`` envelope on this stream can never fire here.
+        restarts entirely, and it means the epoch staleness check and
+        the ``replay_truncated`` envelope can never fire here — the
+        epoch-tagged ids themselves are on the wire, just never read.
         If a cursor is ever adopted, present the SSE ``id:`` VERBATIM
         (opaque ``"{boot_epoch}-{counter}"`` — never parse it) and handle
         ``replay_truncated`` explicitly; today an unknown event type
