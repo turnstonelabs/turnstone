@@ -1009,7 +1009,15 @@ async def global_events_sse(request: Request) -> Response:
 
     On connect, emits a ``node_snapshot`` event with the full node state
     (workstreams, health, aggregate) followed by real-time delta events.
-    The snapshot and listener registration are atomic — no events are lost.
+    Listener registration happens under the fan-out lock BEFORE the
+    snapshot is built (the O(workstreams) build must not stall the
+    fan-out thread), so no event is lost: a delta stamped while the
+    snapshot builds is both reflected in the (newer) snapshot and queued
+    behind it, and consumers absorb the double-representation because
+    the stream is state-of-world — app.js re-applies deltas over the
+    snapshot idempotently, the console collector rebuilds wholesale.
+    The visible cost is at most a transient stale tick during the build
+    window, healed by the next delta.
 
     Resume contract (#881): every event's SSE ``id:`` is
     ``"{boot_epoch}-{counter}"``, where ``boot_epoch`` is a per-process
@@ -1127,10 +1135,8 @@ async def global_events_sse(request: Request) -> Response:
         if cursor_stale:
             replay_status = "truncated"
             truncated_reason = "boot_epoch"
-            snapshot = _build_node_snapshot(request.app.state)
         elif last_event_id is None:
             replay_status = "fresh"
-            snapshot = _build_node_snapshot(request.app.state)
         else:
             buffered = list(event_buffer)
             if not buffered:
@@ -1144,17 +1150,33 @@ async def global_events_sse(request: Request) -> Response:
                 # nothing and ghost the roster (#881's original lie).
                 replay_status = "truncated"
                 truncated_reason = "boot_epoch"
-                snapshot = _build_node_snapshot(request.app.state)
             else:
                 earliest_available_id = buffered[0][0]
                 if last_event_id < earliest_available_id - 1:
                     replay_status = "truncated"
                     lost_count = (earliest_available_id - 1) - last_event_id
-                    snapshot = _build_node_snapshot(request.app.state)
                 else:
                     replay_status = "replay_ok"
                     replay_events = [ev for eid, ev in buffered if eid > last_event_id]
         listeners.append(client_queue)
+
+    if replay_status != "replay_ok":
+        # Snapshot built AFTER the lock: ``_build_node_snapshot`` is an
+        # O(workstreams) walk taking each ws's ``_ws_lock``, and under
+        # ``global_listeners_lock`` it would stall the fanout thread's
+        # per-event stamping for EVERY listener — N-fold during a
+        # restart herd of stale-cursor reconnects, exactly when the
+        # reborn node is emitting its re-open events.  Registration
+        # already happened under the lock above, so every event from
+        # that instant on is queued to this listener: nothing is lost,
+        # and deltas stamped while the snapshot builds re-apply
+        # idempotently over the (newer) snapshot at the consumer
+        # (state-of-world contract — see the endpoint docstring).
+        # ``replay_ok`` is by design exactly the no-snapshot shape
+        # (truncated always carries the snapshot floor, fresh always
+        # snapshots), so this predicate and the generator's emission
+        # branch stay one rule.
+        snapshot = _build_node_snapshot(request.app.state)
 
     if replay_status == "truncated":
         # Envelope chokepoint log, analog of ``ws.events.replay_truncated``
