@@ -2106,6 +2106,10 @@ class Pane {
             // liveness lag: if /history recovers while the pane sits
             // idle untouched, rewind/edit stay closed until the next
             // organic settle — strictly safer than the storm.
+            //
+            // Fire-and-forget (no .catch) is deliberate: no composer state
+            // rides this heal to un-strand (that is the clear_ui caller's
+            // .catch), so a render throw stays loud, as in the load path.
             const staleToken = this._historyLoadToken;
             this._beginReplayQuiesce(staleToken);
             this._refetchHistory(this.wsId, staleToken);
@@ -2394,16 +2398,20 @@ class Pane {
                   // !_replayQueue: yield to an in-flight quiesced
                   // fetch (the idle-edge backstop shares this token)
                   // instead of stomping its queue for a same-token
-                  // double-render.
+                  // double-render.  Fire-and-forget like the backstop:
+                  // no composer state to strand here, so a render throw is
+                  // left loud/uncaught (see the backstop's note).
                   this._beginReplayQuiesce(token);
                   this._refetchHistory(this.wsId, token);
                 }
               }, 2000);
             }
             if (token !== this._historyLoadToken && this.wsId !== editWs) {
-              // Cross-ws supersession: release the latch + busy so the
-              // composer recovers; the edit belongs to a pane state that
-              // no longer exists.
+              // Cross-ws supersession: drop the pending edit + release
+              // busy so the composer recovers; the edit belongs to a pane
+              // state that no longer exists.  (_historyStale is NOT touched
+              // here — it clears only on a successful replayHistory render;
+              // the composer send path never consults the latch.)
               this._pendingEditSend = null;
               this.setBusy(false);
               return;
