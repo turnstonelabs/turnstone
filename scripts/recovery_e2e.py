@@ -3089,11 +3089,13 @@ def run_coord_orphan_rewind(chrome: str) -> str:
 
     port = _free_port()
     node = _boot_node(port=port)
-    # 60s of pacing: the hard-killed node's session thread keeps running
+    # ~200s of pacing: the hard-killed node's session thread keeps running
     # this bash in-process and persists its result at natural completion —
-    # it must outlive the whole post-kill observation window or the
-    # "unresulted orphan" silently resolves mid-scenario.
-    paced = parallel_bash_script({"g6": "for i in $(seq 1 1200); do echo g6-$i; sleep 0.05; done"})
+    # it must outlive the scenario's WORST-CASE deadline sum (join 20s +
+    # boot 10s + orphan 30s + rewind 5s + heal 15s + verdict 15s ≈ 95s,
+    # plus setup) or the "unresulted orphan" silently resolves
+    # mid-scenario and the detector degrades to a false READY.
+    paced = parallel_bash_script({"g6": "for i in $(seq 1 4000); do echo g6-$i; sleep 0.05; done"})
     ws_id = node.create_workstream(paced, final_text_script("g6-done"), name="browser-coord-orphan")
     profile = Path(_scratch()) / "chrome-coord-orphan-rewind"
     proc, cdp_port = _launch_chrome(chrome, profile)

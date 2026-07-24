@@ -712,7 +712,7 @@ def test_coordinator_history_stale_latch_contract():
         "exists to kill."
     )
     retry_arm = body.index("staleRetryTimer = setTimeout")
-    retry_fire = _strip_comments(body[retry_arm : retry_arm + 900])
+    retry_fire = _strip_comments(body[retry_arm : body.index("}, 2000);", retry_arm)])
     assert "!refetchesInFlight" in retry_fire, (
         "the retry's fire guard must yield to an in-flight refetch "
         "(mirrors interactive's !_replayQueue pin)."
@@ -803,9 +803,7 @@ def test_coordinator_history_stale_latch_contract():
         "the wipe must sit between the failure guard and the latch-clear "
         "— every gate skip above the wipe then leaves the latch set."
     )
-    gate_code = "\n".join(
-        line for line in body[hist_guard:wipe].splitlines() if not line.lstrip().startswith("//")
-    )
+    gate_code = _strip_comments(body[hist_guard:wipe])
     for term, why in (
         ("if (seq !== refetchSeq) return;", "dispatch-currency (seq)"),
         (
@@ -875,9 +873,7 @@ def test_coordinator_history_stale_latch_contract():
         "anywhere else either leaks dead ids (gate stuck) or drains live "
         "ones (gate forged open)."
     )
-    cst_code = "\n".join(
-        line for line in cst_slice.splitlines() if not line.lstrip().startswith("//")
-    )
+    cst_code = _strip_comments(cst_slice)
     assert "liveToolCalls" not in cst_code, (
         "closeStreamTransport must not touch the live set (r7): transport "
         "death is not a retirement event — a stale id fails CLOSED, an "
@@ -900,18 +896,12 @@ def test_coordinator_history_stale_latch_contract():
         )
     fetch_end = body.index("\n  function ", fetch_start + 1)
     fetch_body = body[fetch_start:fetch_end]
-    fetch_code = "\n".join(
-        line for line in fetch_body.splitlines() if not line.lstrip().startswith("//")
-    )
+    fetch_code = _strip_comments(fetch_body)
     assert fetch_code.count("liveToolCalls") == 1, (
         "refetchHistory may READ the live set exactly once (the gate) "
         "and never write it — a render that touched liveness could "
         "forge the very signal that guards it (the r6 lesson)."
     )
-    # The seq stamp's PRODUCER must sit above the await, or the
-    # last-dispatch-wins gate is permanently vacuous (a stamp captured
-    # after the await always equals refetchSeq) — the twin of the
-    # refetchesInFlight bracket pin.
     # The await must be BOUNDED (r7): an accepted-but-never-answered
     # /history would pin refetchesInFlight above zero for the life of
     # the page and every heal would yield forever.
@@ -921,6 +911,10 @@ def test_coordinator_history_stale_latch_contract():
         "unbounded await pins the in-flight counter and permanently "
         "disables both heals."
     )
+    # The seq stamp's PRODUCER must sit above the await, or the
+    # last-dispatch-wins gate is permanently vacuous (a stamp captured
+    # after the await always equals refetchSeq) — the twin of the
+    # refetchesInFlight bracket pin.
     assert body.count("const seq = ++refetchSeq;") == 1, (
         "refetchHistory must stamp its dispatch exactly once."
     )
@@ -928,6 +922,62 @@ def test_coordinator_history_stale_latch_contract():
         "the seq stamp must be captured BEFORE the await — captured "
         "after, it always equals refetchSeq and the currency gate never "
         "fires."
+    )
+
+    # The bound must actually be WIRED (r8): the signal must reach
+    # getJSON and getJSON must forward its init — the pinned abort/
+    # clearTimeout strings alone survive a dead bound.
+    assert "{ signal: histCtrl.signal }" in fetch_code, (
+        "the abort signal must reach the fetch — an unforwarded "
+        "controller aborts nothing and the await is unbounded again."
+    )
+    assert "function getJSON(url, init)" in body and (
+        'Object.assign({ credentials: "include" }, init || {})' in body
+    ), (
+        "getJSON must forward its init while preserving credentials — "
+        "narrowing it back to getJSON(url) silently unwires the bound."
+    )
+    # destroy() must abort the in-flight fetch (dead-not-inert, the
+    # staleRetryTimer ruling applied to the r7 bound).
+    assert "activeHistCtrl.abort()" in _strip_comments(destroy_slice), (
+        "destroy() must abort any in-flight /history — the 15s bound "
+        "alone pins the destroyed closure until it fires."
+    )
+
+    # 9. Rewind-freshness epoch (r8): the #884 single-flight can hand a
+    #    joiner a pre-rewind payload; only a dispatch that post-dates
+    #    the latest clear_ui may CLEAR the latch.  Producer: the bump
+    #    sits in the clear_ui case before the latch set; the capture
+    #    sits beside seq, before the await; the clear is conditional.
+    assert body.count("clearUiEpoch++;") == 1, (
+        "clearUiEpoch must bump in exactly one place (clear_ui arrival)."
+    )
+    cu_case = body.index('case "clear_ui"')
+    bump = body.index("clearUiEpoch++;")
+    assert cu_case < bump < set_site, (
+        "the epoch bump must sit inside the clear_ui case BEFORE the "
+        "latch set, so the pre-rewind flight window is stamped closed "
+        "before any dispatch can capture the old epoch."
+    )
+    assert body.count("const epoch = clearUiEpoch;") == 1, (
+        "refetchHistory must capture the epoch exactly once."
+    )
+    assert body.index("const epoch = clearUiEpoch;", fetch_start) < awt, (
+        "the epoch capture must sit BEFORE the await, beside seq."
+    )
+    assert "if (epoch === clearUiEpoch) {" in fetch_code, (
+        "the latch clear must be epoch-conditional — an unconditional "
+        "clear lets a joined pre-rewind #884 flight reopen the "
+        "over-rewind window through the server seam."
+    )
+    epoch_gate = body.index("if (epoch === clearUiEpoch) {", fetch_start)
+    assert wipe < epoch_gate, (
+        "the epoch condition guards the CLEAR (below the wipe), not the "
+        "render — a pre-rewind payload may paint (stale-but-real) but "
+        "must not clear the latch."
+    )
+    assert body.index("historyStale = false;", fetch_start) > epoch_gate, (
+        "the latch clear must sit inside the epoch-conditional block."
     )
 
 
