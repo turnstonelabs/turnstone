@@ -23,6 +23,7 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario rewind-window     # E2 (#890)
     python3 scripts/recovery_e2e.py --scenario rewind-failed-window  # E3 (#890)
     python3 scripts/recovery_e2e.py --scenario stale-backstop    # E4 (#890)
+    python3 scripts/recovery_e2e.py --scenario hidden-retry      # E5 (#900)
     python3 scripts/recovery_e2e.py --scenario coord-rewind-window        # G1 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-rewind-failed-window # G2 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-stale-backstop       # G3 (#894)
@@ -96,6 +97,25 @@ by exactly ONE (the backstop's single fetch — the plain fourth turn emits no
 clear_ui).  All polls are deadline-bounded so a regressed looping backstop
 stamps a clean FAILED, never a hang.  Stamps
 ``RECOVERY-READY-STALEBACKSTOP-heal1-sse0``.
+
+Scenario E5 (hidden-retry): the clear_ui retry's stream-liveness fire guard
+(#900 — the interactive mirror of G5, filed from the #894 campaign's
+backport set).  ``disconnectSSE`` deliberately leaves the 2s retry ARMED
+(transport-only redials keep the pending heal intent), so a close-on-hide
+inside the arm window lets it fire with the transport DOWN.  A seedless
+``_refetchHistory`` then renders /history's as-of-now truth while
+``_lastEventId`` stays frozen at the last delivered id — and the show-edge
+reconnect presents that frozen cursor, so the server's replay_ok slice
+repaints every turn the hidden render just committed (only ``system_turn``
+and compaction markers carry id dedup; content and tool rows do not).  The
+detector is a NON-OCCURRENCE counted at the fault layer: ``history_requests``
+UNCHANGED across the hidden window (``hidden0``), which regresses to
+``hidden1`` the moment the ``evtSource.readyState === OPEN`` term is
+removed.  A replay_ok reconnect carries no synthetic ``state_change``, so
+the latch survives ``__show`` — the accepted liveness lag — and the heal
+rides a plain send's ORGANIC settle into the transport-free backstop, hence
+exactly ONE new SSE open across show + heal.  Stamps
+``RECOVERY-READY-HIDDENRETRY-hidden0-heal1``.
 
 The #894 coordinator ports (G family — the coord pane's ``historyStale``
 latch; coord state is closure-private, so where E2-E4 read pane fields the
@@ -787,6 +807,58 @@ PAGE_HTML = r"""<!doctype html>
               histDelta +
               "-gated" +
               gatedPosts +
+              "-posts" +
+              posts +
+              "-rows" +
+              userRows;
+        };
+      } else if (scenario === "hidden-retry") {
+        // Scenario E5 — the retry's stream-liveness fire guard (#900, the
+        // E-family mirror of coord's G5).  disconnectSSE deliberately
+        // LEAVES the 2s retry armed (transport-only redials keep the heal
+        // intent), so a close-on-hide inside the arm window lets it fire
+        // with the transport down.  A seedless _refetchHistory then paints
+        // /history's as-of-now truth while _lastEventId stays frozen where
+        // the stream stopped delivering — and the show-edge reconnect
+        // presents that frozen cursor, so the server's replay_ok slice
+        // repaints every turn the hidden render already committed (content
+        // and tool rows carry no id dedup).  The fire guard's
+        // ``evtSource.readyState === OPEN`` term skips the hidden firing
+        // instead: hiddenDelta 0 is the NON-OCCURRENCE detector, and it
+        // regresses to 1 the moment the term is removed.
+        //
+        // A replay_ok reconnect carries no synthetic state_change (only
+        // fresh/truncated replays do), so the latch stays closed across
+        // __show — the accepted liveness-lag residual, not a defect.  The
+        // heal rides the runner's plain send, whose ORGANIC turn-settle
+        // idle edge fires the transport-free backstop on the live stream.
+        window.__verifyHiddenRetry = function (
+          hiddenDelta,
+          healed,
+          showSse,
+          posts,
+        ) {
+          const userRows =
+            pane.messagesEl.querySelectorAll(".msg.user").length;
+          // hidden0 = the retry did NOT fetch while the transport was down
+          //   (the guard held — the whole point of the scenario).
+          // heal1 = after __show + a plain send, the backstop's refetch
+          //   rebuilt the rewound (ONE user turn) + sent (a second)
+          //   transcript => TWO user rows with the sentinel.
+          // showSse 1 = exactly ONE new EventSource across show + heal (the
+          //   show edge's own reconnect; the transport-free heal adds none).
+          // posts 2 = the healed render reopened the gate and a fresh
+          //   rewind landed.
+          const ok =
+            hiddenDelta === 0 && healed && showSse === 1 && posts === 2;
+          document.title = ok
+            ? "RECOVERY-READY-HIDDENRETRY-hidden0-heal1"
+            : "RECOVERY-FAILED-HIDDENRETRY-hidden" +
+              hiddenDelta +
+              "-heal" +
+              (healed ? 1 : 0) +
+              "-sse" +
+              showSse +
               "-posts" +
               posts +
               "-rows" +
@@ -2557,6 +2629,119 @@ def run_stale_backstop(chrome: str) -> str:
         node.stop()
 
 
+_ROWS_JS = "window.__pane.messagesEl.querySelectorAll('.msg.user').length"
+
+
+def run_hidden_retry(chrome: str) -> str:
+    """Scenario E5 — the clear_ui retry's stream-liveness fire guard (#900,
+    the interactive mirror of coord's G5).  ``disconnectSSE`` deliberately
+    leaves the 2s retry ARMED — transport-only redials keep the pending heal
+    intent — so a close-on-hide landing inside the arm window lets the retry
+    fire with the transport down.  A seedless ``_refetchHistory`` then
+    renders /history's as-of-now truth while ``_lastEventId`` stays frozen at
+    the last delivered id, and the show-edge reconnect presents that frozen
+    cursor: the server answers replay_ok and the slice repaints every turn
+    the hidden render just committed (only ``system_turn`` and compaction
+    markers carry id dedup — content and tool rows do not, and the render has
+    just reset the streaming refs and the announce map).
+
+    THE DETECTOR is a NON-OCCURRENCE, counted at the fault layer:
+    ``history_requests`` must be UNCHANGED across the whole hidden window.
+    Remove the ``evtSource.readyState === OPEN`` term and the hidden fetch
+    lands, stamping hidden1 — the scenario's negative control.
+
+    A replay_ok reconnect carries NO synthetic ``state_change`` (only
+    fresh/truncated replays do), so the latch stays closed across ``__show``:
+    that is the accepted liveness-lag residual, and no timer may shortcut it.
+    The heal therefore rides the runner's plain send (sends are never
+    latch-gated), whose ORGANIC turn-settle idle edge fires the
+    TRANSPORT-FREE backstop on the now-live stream — hence exactly ONE new
+    SSE open across show + heal (the show edge's own; the heal adds zero)."""
+    from tests._sse_recovery_server import final_text_script
+
+    node, ws_id = _seed_three_completed_turns(
+        "browser-hidden-retry",
+        extra_scripts=(final_text_script(BACKSTOP_SENTINEL),),
+    )
+    profile = Path(_scratch()) / "chrome-hidden-retry"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=hidden-retry"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        # First paint MUST succeed — arm the forced failure only afterwards.
+        if not _poll_until(lambda: cdp.evaluate(_ROWS_JS) == 3, 20, 0.2):
+            raise AssertionError("hidden-retry: three user rows never rendered")
+        # The stream must be OPEN before the hide, or close-on-hide has
+        # nothing to tear down and the scenario proves nothing.
+        if not _poll_until(lambda: node.events_requests >= 1, 10, 0.05):
+            raise AssertionError("hidden-retry: SSE stream never opened")
+        node.fail_history(1)
+        if not cdp.evaluate("window.__clickRewind(1)"):
+            raise AssertionError("hidden-retry: second-row rewind button missing")
+        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
+            raise AssertionError("hidden-retry: rewind never POSTed")
+        if not _poll_until(lambda: node.history_fail_remaining == 0, 15):
+            raise AssertionError("hidden-retry: forced /history failure never fired")
+        # Hide IMMEDIATELY — well inside the 2s arm window (the poll above
+        # settles ~0.3s after the failure).  close-on-hide tears the
+        # transport down and deliberately leaves the retry armed.
+        cdp.evaluate("window.__hide && window.__hide()")
+        if not _poll_until(lambda: cdp.evaluate("window.__pane.evtSource === null"), 5, 0.05):
+            raise AssertionError("hidden-retry: close-on-hide never dropped the transport")
+        hidden_baseline = node.history_requests
+        # NON-occurrence window: the retry fires at ~2s post-failure, so give
+        # it 3.5s.  Without the guard this poll returns True (the hidden fetch
+        # lands) and hidden_delta stamps 1.
+        _poll_until(lambda: node.history_requests != hidden_baseline, 3.5, 0.1)
+        hidden_delta = node.history_requests - hidden_baseline
+        # The latch must still be SET — a skipped retry heals nothing, which
+        # is exactly why the backstop still owns the repair below.
+        latch_held = cdp.evaluate("window.__pane._historyStale === true")
+        # Show: the reconnect presents the frozen cursor (replay_ok, nothing
+        # lost) and carries no synthetic state_change, so the latch survives
+        # it.  A plain send then drives the ORGANIC settle the backstop needs.
+        events_before_show = node.events_requests
+        cdp.evaluate("window.__show && window.__show()")
+        if not _poll_until(lambda: node.events_requests == events_before_show + 1, 10, 0.05):
+            raise AssertionError("hidden-retry: show-edge reconnect never arrived")
+        _send_in_page(cdp, "fourth turn")
+        healed = _poll_until(
+            lambda: cdp.evaluate(
+                _ROWS_JS
+                + " === 2 && window.__pane._historyStale === false"
+                + " && (window.__pane.messagesEl.textContent||'').includes("
+                + json.dumps(BACKSTOP_SENTINEL)
+                + ")"
+            ),
+            20,
+            0.2,
+        )
+        show_sse = node.events_requests - events_before_show
+        if healed:
+            if not cdp.evaluate("window.__clickRewind(0)"):
+                raise AssertionError("hidden-retry: healed-row rewind button missing")
+            _poll_until(lambda: node.rewind_requests == 2, 8, 0.05)
+        posts = node.rewind_requests
+        print(
+            f"  hidden-retry hidden_delta={hidden_delta} latch_held={latch_held} "
+            f"healed={healed} show_sse={show_sse} posts={posts}"
+        )
+        if not latch_held:
+            raise AssertionError("hidden-retry: latch cleared without a render")
+        cdp.evaluate(
+            f"window.__verifyHiddenRetry({hidden_delta}, "
+            f"{'true' if healed else 'false'}, {show_sse}, {posts})"
+        )
+        return _poll_title(cdp, 15)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
 _COORD_ROWS_JS = "document.getElementById('coord-messages').querySelectorAll('.msg.user').length"
 
 
@@ -3374,6 +3559,7 @@ def main() -> None:
             "rewind-window",
             "rewind-failed-window",
             "stale-backstop",
+            "hidden-retry",
             "coord-rewind-window",
             "coord-rewind-failed-window",
             "coord-stale-backstop",
@@ -3433,6 +3619,10 @@ def main() -> None:
     if args.scenario in ("stale-backstop", "all"):
         verdict = run_stale_backstop(chrome)
         print(f"scenario E4 (stalebackstop): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("hidden-retry", "all"):
+        verdict = run_hidden_retry(chrome)
+        print(f"scenario E5 (hiddenretry): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     if args.scenario in ("coord-rewind-window", "all"):
         verdict = run_coord_rewind_window(chrome)
