@@ -677,26 +677,13 @@ function createCoordinatorPane(root, wsId, opts) {
   // an older snapshot landing late can neither double-render nor clear
   // the staleness latch over a newer truth.
   let refetchSeq = 0;
-  // Rewind-freshness epoch (r8): bumped at every clear_ui ARRIVAL.  A
-  // refetch dispatch captures it, and only a render whose dispatch
-  // post-dates the latest clear_ui may CLEAR the staleness latch.  The
-  // server's #884 /history single-flight can hand a joiner a payload
-  // whose load_messages ran BEFORE the rewind committed (the flight
-  // key is (ws_id, limit); joining is invisible to the client) — that
-  // pre-rewind payload may still PAINT (stale-but-real posture, the
-  // affordance gate holds) but must not clear the latch, or the exact
-  // over-rewind window this latch exists to close reopens through the
-  // server seam.  The un-cleared latch arms the retry, whose fresh
-  // dispatch starts a NEW flight (the old one popped at settle) and
-  // heals with post-rewind truth.
-  let clearUiEpoch = 0;
-  // The newest in-flight /history's AbortController — destroy() aborts it
+  // EVERY in-flight /history AbortController — destroy() aborts them all
   // so a slow fetch cannot pin the destroyed pane's closure for the
   // bound's full 15s (the same dead-not-inert ruling destroy() applies
-  // to staleRetryTimer).  Overlapping dispatches: each finally releases
-  // only its OWN handle, so the newest in-flight controller stays
-  // reachable for the teardown abort.
-  let activeHistCtrl = null;
+  // to staleRetryTimer).  A Set, not a single slot (r9): overlapping
+  // dispatches settle in any order, and a newest-wins slot nulled by
+  // the newer dispatch's finally left the OLDER fetch unabortable.
+  const histCtrls = new Set();
   // call_ids of tool calls whose results are still ARRIVING ON THE LIVE
   // STREAM — the render-time gate's tool-phase liveness signal.  Fed
   // ONLY by live SSE events (tool_pending / tool_info add, tool_result
@@ -3744,7 +3731,6 @@ function createCoordinatorPane(root, wsId, opts) {
         // decl).  The cosmetic [data-busy] grey-out for this window stays a
         // deferred parity item (#890 PR ruling) — the handler-side
         // ``busy || historyStale`` gate carries the correctness.
-        clearUiEpoch++;
         historyStale = true;
         refetchHistory()
           .then(() => {
@@ -5853,7 +5839,6 @@ function createCoordinatorPane(root, wsId, opts) {
     // mid-render.  The seq stamp makes overlapping dispatches resolve
     // last-dispatch-wins at the render-time gate.
     const seq = ++refetchSeq;
-    const epoch = clearUiEpoch;
     refetchesInFlight++;
     // Bound the await (r7): the counter and both heals gate on this
     // fetch settling.  A /history that is accepted and never answered
@@ -5865,7 +5850,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // retry on later organic edges against a fresh attempt.
     const histCtrl =
       typeof AbortController === "function" ? new AbortController() : null;
-    activeHistCtrl = histCtrl;
+    if (histCtrl) histCtrls.add(histCtrl);
     const histTimer = histCtrl
       ? setTimeout(() => histCtrl.abort(), 15000)
       : null;
@@ -5879,7 +5864,7 @@ function createCoordinatorPane(root, wsId, opts) {
       hist = null;
     } finally {
       if (histTimer) clearTimeout(histTimer);
-      if (activeHistCtrl === histCtrl) activeHistCtrl = null;
+      if (histCtrl) histCtrls.delete(histCtrl);
       refetchesInFlight--;
     }
     // A FAILED fetch keeps the pane intact: the wipe + tracking resets
@@ -6000,18 +5985,20 @@ function createCoordinatorPane(root, wsId, opts) {
     // latch set (which is what arms the retry/backstop), while a mid-render
     // throw doesn't re-close a pane whose replaceChildren already
     // committed (a partially painted FRESH transcript at worst
-    // UNDER-counts, the safe direction).  The ONLY latch-clear site —
-    // and epoch-conditional (r8): a dispatch that PREDATES the latest
-    // clear_ui may have joined a pre-rewind #884 server flight; its
-    // payload may paint (stale-but-real) but must not clear the latch
-    // (see clearUiEpoch's decl) — the surviving latch arms the retry,
-    // whose fresh dispatch heals with post-rewind truth.
-    if (epoch === clearUiEpoch) {
-      historyStale = false;
-      if (staleRetryTimer) {
-        clearTimeout(staleRetryTimer);
-        staleRetryTimer = null;
-      }
+    // UNDER-counts, the safe direction).  The ONLY latch-clear site.
+    // Freshness layers (r9 accounting): a dispatch that PREDATES the
+    // latest clear_ui never reaches here at all — clear_ui always
+    // dispatches immediately after arriving, so a stale-epoch dispatch
+    // is also a stale-SEQ dispatch and the currency gate above discards
+    // it (an r8 epoch guard here was unreachable and was removed).  The
+    // remaining freshness hazard — a CURRENT dispatch joining a
+    // pre-rewind server flight — is closed server-side: the #884 flight
+    // key folds in the ws's truncation generation.
+    historyStale = false;
+    if (staleRetryTimer) {
+      clearTimeout(staleRetryTimer);
+      staleRetryTimer = null;
+  
     }
     toolRows.clear();
     activeBatch = null;
@@ -6341,17 +6328,17 @@ function createCoordinatorPane(root, wsId, opts) {
       clearTimeout(staleRetryTimer);
       staleRetryTimer = null;
     }
-    // Abort any in-flight /history for the same reason: the 15s bound
+    // Abort every in-flight /history for the same reason: the 15s bound
     // alone would keep the detached pane's closure alive until it fired
-    // (the settled fetch's render then discards via the !hist path).
-    if (activeHistCtrl) {
+    // (the settled fetches' renders then discard via the !hist path).
+    histCtrls.forEach((c) => {
       try {
-        activeHistCtrl.abort();
+        c.abort();
       } catch (_) {
         /* noop */
       }
-      activeHistCtrl = null;
-    }
+    });
+    histCtrls.clear();
     [
       cancelTimeoutId,
       forceTimeoutId,

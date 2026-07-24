@@ -6965,16 +6965,6 @@ class ChatSession:
         does; a later resume rehydrates ``[summary] + [surviving tail]`` and the
         two reconcile.
         """
-        # History generation (#894/#884 seam): every truncation bumps the
-        # counter the /history single-flight folds into its flight key, so
-        # a request dispatched AFTER a rewind/retry can never join a flight
-        # whose load_messages ran BEFORE it (a joined pre-rewind payload
-        # rendered as fresh truth on the coordinator and reopened the
-        # over-rewind window the #894 client latch closes).  Bumped before
-        # the storage write on purpose: the in-memory tail is already
-        # trimmed by both callers, and a spuriously fresh flight is
-        # harmless while a wrongly-joined one is not.
-        self._history_generation += 1
         if removed_count <= 0:
             return
         # The caller already truncated self.messages (rewind/retry both trim
@@ -7000,6 +6990,19 @@ class ChatSession:
             # summarized prefix — skip rather than risk it; resume reconciles.
             return
         delete_messages_after(self._ws_id, max(floor, total - removed_count))
+        # History generation (#894/#884 seam): every truncation bumps the
+        # counter the /history single-flight folds into its flight key, so
+        # a request dispatched AFTER a rewind/retry can never join a flight
+        # whose load_messages ran BEFORE it (a joined pre-rewind payload
+        # rendered as fresh truth on the coordinator and reopened the
+        # over-rewind window the #894 client latch closes).  Bumped AFTER
+        # the storage delete: flights rebuild from storage, so a flight
+        # keyed with the OLD generation that reads post-delete rows is the
+        # harmless spuriously-fresh direction, while a NEW-generation
+        # flight reading pre-delete rows would be the wrongly-joined one —
+        # and the early-return error paths above (count/floor unavailable,
+        # delete skipped) correctly leave the generation unbumped.
+        self._history_generation += 1
 
     def rewind(self, n: int) -> int:
         """Drop the last *n* complete turns from the conversation.

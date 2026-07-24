@@ -1548,8 +1548,9 @@ class TestHistoryCoalescing:
     """Single-flight coalescing of concurrent ``/history`` requests (#884).
 
     The matrix these tests assert: join-vs-miss × gates-per-request ×
-    failed-vs-clean shared draw × key isolation × no cross-flight
-    caching × owner cancellation.  Driven through ``httpx.ASGITransport``
+    failed-vs-clean shared draw × key isolation (ws, limit, AND the
+    #894 truncation generation) × no cross-flight caching × owner
+    cancellation.  Driven through ``httpx.ASGITransport``
     on a private loop because ``TestClient`` cannot hold two requests in
     flight at once.
 

@@ -158,8 +158,9 @@ turn), posts 1, ``history_requests`` grew.  Stamps
 ``RECOVERY-READY-COORDORPHANREWIND-posts1-rows1-orphan0``.
 
 Scenario G7 (coord-joined-flight, #894 r8): the joined-flight window.
-Two browsers on one ws; ``delay_load`` parks B's pre-rewind /history
-flight open INSIDE ``load_messages`` (the flight layer — the fault
+One browser plus a background GET ("viewer B") on one ws;
+``delay_load`` parks B's pre-rewind /history flight open INSIDE
+``load_messages`` (the flight layer — the fault
 layer's ``delay_history`` cannot overlap flights); A rewinds mid-hold.
 A's clear_ui refetch must MISS the held flight — the server folds the
 truncation generation into the #884 flight key — proven by
@@ -319,6 +320,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -1978,7 +1980,8 @@ def _poll_until(pred: Any, timeout: float, interval: float = 0.1) -> bool:
 def _send_in_page(cdp: CDP, message: str) -> None:
     """POST /send from inside the page via the pane's own authFetch (cookie
     auth, node-proxy base) — the one shared shape for scenarios that drive a
-    turn mid-flight (E1/E4/G3).  A raw POST emits no live user row, so the sent
+    turn mid-flight (the shared shape for every scenario that drives a
+    turn outside the composer).  A raw POST emits no live user row, so the sent
     turn appears only via the next /history render."""
     cdp.evaluate(
         "window.authFetch('/v1/api/workstreams/' + "
@@ -3245,9 +3248,10 @@ def run_coord_joined_flight(chrome: str) -> str:
     Choreography: page A paints three rows; ``delay_load`` then holds
     every reconstruction open INSIDE ``load_messages`` (the flight
     layer — ``delay_history`` sleeps in the fault layer, before the
-    route, where flights never overlap); page B (a second browser on
-    the SAME ws) navigates, parking a pre-rewind flight; A rewinds
-    mid-hold — its clear_ui refetch must MISS B's held flight
+    route, where flights never overlap); a background authenticated GET
+    ("viewer B" — a raw request enters ``load_messages`` identically,
+    without a second browser's cost) parks a pre-rewind flight; A
+    rewinds mid-hold — its clear_ui refetch must MISS B's held flight
     (``load_calls`` grows by TWO: a joined request never enters
     ``load_messages`` — the e2e twin of the unit test's proof) and
     render the POST-rewind single row once the holds release.  Pre-fix
@@ -3255,11 +3259,8 @@ def run_coord_joined_flight(chrome: str) -> str:
     truth."""
     node, ws_id = _seed_three_completed_turns("browser-coord-joined-flight")
     profile_a = Path(_scratch()) / "chrome-coord-joined-a"
-    profile_b = Path(_scratch()) / "chrome-coord-joined-b"
     proc_a, cdp_port_a = _launch_chrome(chrome, profile_a)
-    proc_b = None
     cdp_a: CDP | None = None
-    cdp_b: CDP | None = None
     try:
         cdp_a = CDP(_page_ws_url(cdp_port_a))
         url = f"{node.base_url}/coord-recovery?ws_id={ws_id}&scenario=coord-joined-flight"
@@ -3271,12 +3272,23 @@ def run_coord_joined_flight(chrome: str) -> str:
         load_baseline = node.load_calls
         # Hold every reconstruction open INSIDE load_messages (the flight
         # layer — delay_history sleeps in the fault layer, before the
-        # route, where flights never overlap), then park B's pre-rewind
-        # flight under the hold.
+        # route, where flights never overlap), then park the pre-rewind
+        # flight under the hold.  The parked "viewer B" is a plain
+        # authenticated GET on a background thread: a raw request enters
+        # load_messages identically, and a second headless browser added
+        # ~300 MB + seconds of launch for no additional proof.
         node.delay_load(3000)
-        proc_b, cdp_port_b = _launch_chrome(chrome, profile_b)
-        cdp_b = CDP(_page_ws_url(cdp_port_b))
-        _set_cookie_and_navigate(cdp_b, node.base_url, node.token, url)
+
+        def _b_get() -> None:
+            req = urllib.request.Request(
+                f"{node.base_url}/v1/api/workstreams/{ws_id}/history",
+                headers={"Cookie": f"turnstone_auth_server={node.token}"},
+            )
+            with contextlib.suppress(Exception):
+                urllib.request.urlopen(req, timeout=30).read()
+
+        b_thread = threading.Thread(target=_b_get, daemon=True)
+        b_thread.start()
         if not _poll_until(lambda: node.load_calls == load_baseline + 1, 15, 0.05):
             raise AssertionError("coord-joined-flight: B's flight never entered load_messages")
         # A rewinds mid-hold: second row -> 2 turns -> server keeps one
@@ -3304,11 +3316,7 @@ def run_coord_joined_flight(chrome: str) -> str:
     finally:
         if cdp_a is not None:
             cdp_a.close()
-        if cdp_b is not None:
-            cdp_b.close()
         _kill(proc_a)
-        if proc_b is not None:
-            _kill(proc_b)
         node.stop()
 
 

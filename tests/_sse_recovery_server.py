@@ -152,11 +152,18 @@ class RecoveryServer:
         # singleton's load_messages; restored in stop().
         self._load_delay_ms = 0
         self._load_calls = 0
+        # load_messages runs on asyncio.to_thread WORKERS, and delay_load
+        # exists precisely to overlap two of them — unlike the
+        # single-writer HTTP counters, this one has genuine concurrent
+        # writers, so the increment takes a lock (a lost update would
+        # false-FAIL G7's load_delta === 2, or mask a third load).
+        self._load_calls_lock = threading.Lock()
         _storage_obj = get_storage()
         self._orig_load_messages = _storage_obj.load_messages
 
         def _delayed_load(*a: Any, **k: Any) -> Any:
-            self._load_calls += 1
+            with self._load_calls_lock:
+                self._load_calls += 1
             result = self._orig_load_messages(*a, **k)
             # Sleep AFTER the load: the held flight must hold the data it
             # actually read (its transaction point), so a flight parked

@@ -3438,7 +3438,8 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
     inline on the event loop).
 
     Restart-herd coalescing (issue #884): concurrent requests for the
-    same ``(ws_id, limit)`` share ONE reconstruction (single-flight) —
+    same ``(ws_id, limit, history_generation)`` share ONE reconstruction
+    (single-flight) —
     after a node restart every open pane resyncs via REST ``/history``
     inside the same jitter window, and each un-coalesced request repeats
     the full ``load_messages`` → decoration → projection pipeline
@@ -3457,7 +3458,11 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         cfg: per-kind policy bundle.
     """
 
-    # In-flight reconstructions, keyed ``(ws_id, limit)``.  Holds ONLY
+    # In-flight reconstructions, keyed ``(ws_id, limit,
+    # history_generation)`` — the third component isolates flights across
+    # rewind/retry truncations (see ChatSession._persist_truncation), so
+    # a post-truncation request can never join a pre-truncation
+    # reconstruction.  Holds ONLY
     # live flights — each task pops its own key in a ``finally`` before
     # completing, so a later request can never read a completed (stale)
     # result: this map is a single-flight, not a cache.  Scoped to this

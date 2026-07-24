@@ -608,7 +608,11 @@ def test_coordinator_history_stale_latch_contract():
          the r6 critical; never plain busy — the r5 critical), the
          optimistic busySource flavor, and stream-OPENness.  The
          latch-clear sits below every skip point, so a skipped render
-         can never reopen the affordances over a stale DOM.
+         can never reopen the affordances over a stale DOM.  (Joined
+         pre-rewind server flights are closed SERVER-side — the #884
+         flight key folds in the truncation generation; an r8
+         client-epoch guard here was unreachable, being redundant with
+         the seq gate, and was removed in r9.)
     """
     from pathlib import Path
 
@@ -939,45 +943,12 @@ def test_coordinator_history_stale_latch_contract():
     )
     # destroy() must abort the in-flight fetch (dead-not-inert, the
     # staleRetryTimer ruling applied to the r7 bound).
-    assert "activeHistCtrl.abort()" in _strip_comments(destroy_slice), (
-        "destroy() must abort any in-flight /history — the 15s bound "
-        "alone pins the destroyed closure until it fires."
-    )
-
-    # 9. Rewind-freshness epoch (r8): the #884 single-flight can hand a
-    #    joiner a pre-rewind payload; only a dispatch that post-dates
-    #    the latest clear_ui may CLEAR the latch.  Producer: the bump
-    #    sits in the clear_ui case before the latch set; the capture
-    #    sits beside seq, before the await; the clear is conditional.
-    assert body.count("clearUiEpoch++;") == 1, (
-        "clearUiEpoch must bump in exactly one place (clear_ui arrival)."
-    )
-    cu_case = body.index('case "clear_ui"')
-    bump = body.index("clearUiEpoch++;")
-    assert cu_case < bump < set_site, (
-        "the epoch bump must sit inside the clear_ui case BEFORE the "
-        "latch set, so the pre-rewind flight window is stamped closed "
-        "before any dispatch can capture the old epoch."
-    )
-    assert body.count("const epoch = clearUiEpoch;") == 1, (
-        "refetchHistory must capture the epoch exactly once."
-    )
-    assert body.index("const epoch = clearUiEpoch;", fetch_start) < awt, (
-        "the epoch capture must sit BEFORE the await, beside seq."
-    )
-    assert "if (epoch === clearUiEpoch) {" in fetch_code, (
-        "the latch clear must be epoch-conditional — an unconditional "
-        "clear lets a joined pre-rewind #884 flight reopen the "
-        "over-rewind window through the server seam."
-    )
-    epoch_gate = body.index("if (epoch === clearUiEpoch) {", fetch_start)
-    assert wipe < epoch_gate, (
-        "the epoch condition guards the CLEAR (below the wipe), not the "
-        "render — a pre-rewind payload may paint (stale-but-real) but "
-        "must not clear the latch."
-    )
-    assert body.index("historyStale = false;", fetch_start) > epoch_gate, (
-        "the latch clear must sit inside the epoch-conditional block."
+    destroy_code = _strip_comments(destroy_slice)
+    assert "histCtrls.forEach" in destroy_code and ".abort()" in destroy_code, (
+        "destroy() must abort EVERY in-flight /history (a Set — a "
+        "newest-wins single slot left older overlapping fetches "
+        "unabortable); the 15s bound alone pins the destroyed closure "
+        "until it fires."
     )
 
 
