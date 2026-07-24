@@ -25,6 +25,7 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario stale-backstop    # E4 (#890)
     python3 scripts/recovery_e2e.py --scenario hidden-retry      # E5 (#900)
     python3 scripts/recovery_e2e.py --scenario await-window-gate # E6 (#900)
+    python3 scripts/recovery_e2e.py --scenario destroy-invalidation # E7 (#900)
     python3 scripts/recovery_e2e.py --scenario coord-rewind-window        # G1 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-rewind-failed-window # G2 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-stale-backstop       # G3 (#894)
@@ -424,7 +425,10 @@ PAGE_HTML = r"""<!doctype html>
       window.showLogin = function () {};
     </script>
     <script type="module">
-      import { InteractivePane } from "/shared/interactive.js";
+      import {
+        InteractivePane,
+        createInteractivePane,
+      } from "/shared/interactive.js";
 
       const q = new URLSearchParams(location.search);
       const wsId = q.get("ws_id");
@@ -439,8 +443,25 @@ PAGE_HTML = r"""<!doctype html>
 
       // REAL pane against THIS origin (base=""): real authFetch (cookie) and
       // real EventSource. The default host provides all SSE seams.
-      const pane = new InteractivePane(wsId, { base: "" });
-      document.getElementById("mount").appendChild(pane.el);
+      //
+      // E7 mounts through the FACTORY instead, because the factory closure is
+      // the only thing that owns destroy() — every other interactive scenario
+      // drives the Pane class directly, so the controller's TERMINAL seam had
+      // no browser coverage at all.  Scenario-scoped on purpose: the factory
+      // owns its own connect()/recover-beat lifecycle, and switching the
+      // other scenarios onto it would change what they are testing.
+      let ctl = null;
+      let pane;
+      if (scenario === "destroy-invalidation") {
+        ctl = createInteractivePane(document.getElementById("mount"), wsId, {
+          base: "",
+        });
+        pane = ctl.pane;
+        window.__ctl = ctl;
+      } else {
+        pane = new InteractivePane(wsId, { base: "" });
+        document.getElementById("mount").appendChild(pane.el);
+      }
       pane.wsId = wsId;
       window.__pane = pane;
 
@@ -546,8 +567,13 @@ PAGE_HTML = r"""<!doctype html>
         };
       }
 
-      // First paint the REAL way: /history then connect SSE.
-      pane._loadHistoryThenConnect(wsId);
+      // First paint the REAL way: /history then connect SSE.  Under the
+      // factory that load is owned by connect() (which also seeds the
+      // empty state), and going through it is the point of E7 — the
+      // in-flight load destroy() must invalidate is the one connect()
+      // starts.
+      if (ctl) ctl.connect();
+      else pane._loadHistoryThenConnect(wsId);
 
       // Shared by the rewind scenarios (E2/E3): click the REAL rewind
       // button on the idx-th user row.  Depends only on `pane`.
@@ -905,6 +931,33 @@ PAGE_HTML = r"""<!doctype html>
               (latchHeld ? 1 : 0) +
               "-heal" +
               (healed ? 1 : 0);
+        };
+      } else if (scenario === "destroy-invalidation") {
+        // Scenario E7 — destroy()'s load-token bump (#900).  destroy() used
+        // to bump nothing, so a /history still in flight at teardown kept
+        // passing every post-await gate: its .finally reopened an
+        // EventSource on the DETACHED pane and re-registered the
+        // document-level visibilitychange listener destroy had just
+        // removed, and that stream's onerror re-armed the host recover beat
+        // forever (it gives up only on `dead`, which destroy never sets).
+        // A closed tab therefore held a node connection and a 5s reconnect
+        // beat for the life of the page.
+        window.__verifyDestroyInvalidation = function (sseOpens) {
+          // detached = destroy() removed the pane element; visNull = no
+          // handler was re-registered behind it; sseOpens 0 = the held load
+          // resolved WITHOUT reconnecting (the fault-layer non-occurrence
+          // detector — it stamps 1 the moment the bump is removed).
+          const detached = !pane.el.parentNode;
+          const visNull = pane._visHandler === null;
+          const ok = sseOpens === 0 && detached && visNull;
+          document.title = ok
+            ? "RECOVERY-READY-DESTROYINVAL-sse0-vis0"
+            : "RECOVERY-FAILED-DESTROYINVAL-sse" +
+              sseOpens +
+              "-detached" +
+              (detached ? 1 : 0) +
+              "-vis" +
+              (visNull ? 1 : 0);
         };
       }
     </script>
@@ -2884,6 +2937,71 @@ def run_await_window_gate(chrome: str) -> str:
         node.stop()
 
 
+def run_destroy_invalidation(chrome: str) -> str:
+    """Scenario E7 — destroy()'s load-token bump (#900).  The ONLY interactive
+    scenario that mounts through ``createInteractivePane``: every other one
+    drives the ``Pane`` class directly, so the factory closure that owns
+    ``destroy()`` had no browser coverage at all — and destroy() is where the
+    #900 backport's largest hole lived.
+
+    ``destroy()`` bumped no load token, so a ``/history`` still in flight at
+    teardown kept passing every post-await gate.  The worst leg is
+    ``_loadHistoryThenConnect``'s ``.finally``: it reopened an ``EventSource``
+    on the DETACHED pane and re-registered the document-level
+    ``visibilitychange`` listener ``_removeVisibilityHandler`` had just
+    dropped — and that stream's ``onerror`` re-armed the host recover beat
+    indefinitely, because it gives up only on ``dead``, which ``destroy()``
+    never sets.  A closed tab kept a node connection and a 5s reconnect beat
+    for the life of the page.
+
+    The runner holds the FIRST ``/history`` open at the fault layer, destroys
+    the controller mid-flight, and lets the load resolve into the void.
+    DETECTOR: ``events_requests`` must still be 0 — the load resolved without
+    reconnecting — with the pane detached and ``_visHandler`` null behind it.
+    Remove the bump and the ``.finally`` fires: sse1, and a non-null handler
+    still bound to the document."""
+    node, ws_id = _seed_three_completed_turns("browser-destroy-invalidation")
+    profile = Path(_scratch()) / "chrome-destroy-invalidation"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        # Hold the FIRST /history — the one connect() dispatches — so the
+        # teardown lands with the load genuinely outstanding.
+        node.delay_history(4000)
+        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=destroy-invalidation"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        # history_requests counts on ARRIVAL, before the hold sleeps.
+        if not _poll_until(lambda: node.history_requests >= 1, 20, 0.05):
+            raise AssertionError("destroy-invalidation: the first /history never arrived")
+        # Non-vacuity: nothing may have connected yet, or the .finally under
+        # test has already run and the scenario proves nothing.
+        if node.events_requests != 0:
+            raise AssertionError(
+                f"destroy-invalidation: stream opened before teardown "
+                f"(events_requests={node.events_requests})"
+            )
+        if not cdp.evaluate("!!window.__ctl"):
+            raise AssertionError("destroy-invalidation: page did not mount through the factory")
+        cdp.evaluate("window.__ctl.destroy()")
+        if not _poll_until(lambda: cdp.evaluate("!window.__pane.el.parentNode"), 5, 0.05):
+            raise AssertionError("destroy-invalidation: destroy() never detached the pane")
+        # Let the held fetch resolve and its .finally run.  The wait must
+        # outlast the hold, or a 0 here would only mean "not yet".
+        node.delay_history(0)
+        _poll_until(lambda: node.events_requests != 0, 8, 0.1)
+        sse_opens = node.events_requests
+        vis_null = cdp.evaluate("window.__pane._visHandler === null")
+        print(f"  destroy-invalidation sse_opens={sse_opens} vis_null={vis_null}")
+        cdp.evaluate(f"window.__verifyDestroyInvalidation({sse_opens})")
+        return _poll_title(cdp, 15)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
 _COORD_ROWS_JS = "document.getElementById('coord-messages').querySelectorAll('.msg.user').length"
 
 
@@ -3703,6 +3821,7 @@ def main() -> None:
             "stale-backstop",
             "hidden-retry",
             "await-window-gate",
+            "destroy-invalidation",
             "coord-rewind-window",
             "coord-rewind-failed-window",
             "coord-stale-backstop",
@@ -3770,6 +3889,10 @@ def main() -> None:
     if args.scenario in ("await-window-gate", "all"):
         verdict = run_await_window_gate(chrome)
         print(f"scenario E6 (awaitgate): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("destroy-invalidation", "all"):
+        verdict = run_destroy_invalidation(chrome)
+        print(f"scenario E7 (destroyinval): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     if args.scenario in ("coord-rewind-window", "all"):
         verdict = run_coord_rewind_window(chrome)
