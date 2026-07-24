@@ -2093,11 +2093,11 @@ def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None
         body,
     ), "connectSSE must gate ?last_event_id= on connectCursor != null"
     # (2) cleared only by a successful full render — below the !hist guard,
-    # riding the wipe — and never by the teardown paths.  (Window sized
-    # past the #894 latch/render-gate comment blocks; the invariant is the
-    # ORDER, not the density.)
+    # riding the wipe — and never by the teardown paths.  (Sliced to the
+    # next function boundary; the invariant is the ORDER, not the
+    # density, and a char-count window rots as at-site comments grow.)
     start = body.index("async function refetchHistory(seedCursor = false)")
-    fn = body[start : start + 8000]
+    fn = body[start : body.index("\n  function ", start + 1)]
     guard = fn.index("if (!hist) return;")
     clear = fn.index("truncatedFromCursor = null;")
     assert guard < clear, "the record must only clear once a payload rendered"

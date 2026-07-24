@@ -557,10 +557,10 @@ def test_coordinator_refetch_failure_preserves_the_pane():
     )
     body = coord_js.read_text(encoding="utf-8")
     start = body.index("async function refetchHistory(seedCursor = false)")
-    # Window sized to reach the early-reset block past the #894 latch-clear
-    # and render-gate comments; the pinned invariant is the ORDER below,
-    # not the density.
-    fn = body[start : start + 8000]
+    # Slice to the next function boundary — the pinned invariant is the
+    # ORDER below, not the density, and a char-count window dies with a
+    # bare ValueError every time an at-site comment grows.
+    fn = body[start : body.index("\n  function ", start + 1)]
     guard = fn.index("if (!hist) return;")
     wipe = fn.index("messagesEl.replaceChildren();")
     resets = fn.index("toolRows.clear();")
@@ -600,13 +600,15 @@ def test_coordinator_history_stale_latch_contract():
       6. destroy() cancels staleRetryTimer (terminal-only) while
          closeStreamTransport does NOT (transport redials keep the heal
          intent alive).
-      7. The render-time gate (r5-derived): refetchHistory re-checks
-         DOM-live-state (content refs / the --running batch marker / the optimistic-send
-         flavor of busy — never plain busy, the r5 critical), dispatch
-         currency (seq), and seedless stream-OPENness AFTER the await and
-         BEFORE the wipe — and the latch-clear sits below every skip
-         point, so a skipped render can never reopen the affordances over
-         a stale DOM.
+      7. The render-time gate (r5/r6-derived): refetchHistory re-checks,
+         AFTER the await and BEFORE the wipe, the UNIVERSAL terms —
+         dispatch currency (seq) and the content refs — and the
+         SEEDLESS-only terms: the event-driven live-tool-call set (never
+         a DOM probe, which the render's own orphan repaint can forge —
+         the r6 critical; never plain busy — the r5 critical), the
+         optimistic busySource flavor, and stream-OPENness.  The
+         latch-clear sits below every skip point, so a skipped render
+         can never reopen the affordances over a stale DOM.
     """
     from pathlib import Path
 
@@ -761,14 +763,12 @@ def test_coordinator_history_stale_latch_contract():
     )
 
     # 6. Teardown: terminal cancel in destroy(); NOT in closeStreamTransport.
-    destroy_slice = body[body.index("function destroy()") :]
-    destroy_slice = destroy_slice[: destroy_slice.index("\n  function ")]
+    destroy_slice = _fn_slice("destroy()")
     assert "clearTimeout(staleRetryTimer)" in destroy_slice, (
         "destroy() must cancel the stale retry timer or it fires into "
         "detached DOM (and pins the closure)."
     )
-    cst_start = body.index("function closeStreamTransport()")
-    cst_slice = body[cst_start : body.index("\n  function ", cst_start + 1)]
+    cst_slice = _fn_slice("closeStreamTransport()")
     assert "clearTimeout(staleRetryTimer)" not in cst_slice, (
         "closeStreamTransport must NOT cancel the stale retry — transport "
         "redials keep the pending heal intent (terminal-only cancel)."
@@ -808,7 +808,7 @@ def test_coordinator_history_stale_latch_contract():
         ),
         ("!seedCursor &&", "seedless scoping"),
         ('busySource === "optimistic"', "optimistic-row"),
-        ('messagesEl.querySelector(".conv-batch--running")', "executing-batch"),
+        ("liveToolCalls.size > 0", "live-tool-call"),
         ("evtSource.readyState !== EventSource.OPEN", "stream-OPENness"),
     ):
         assert term in gate_code, (
@@ -823,7 +823,7 @@ def test_coordinator_history_stale_latch_contract():
     )
     for term in (
         'busySource === "optimistic"',
-        ".conv-batch--running",
+        "liveToolCalls.size",
         "evtSource.readyState !== EventSource.OPEN",
     ):
         assert seedless_at < gate_code.index(term), (
@@ -838,6 +838,47 @@ def test_coordinator_history_stale_latch_contract():
         "_editAndResend flips busy before its POST and /rewind emits no "
         "state_change, so a busy term skips the truncation render the "
         "rewind exists to produce)."
+    )
+
+    # 8. Live-set discipline (r6): the tool-phase liveness signal is fed
+    #    ONLY by live SSE events and drained at settle/teardown edges —
+    #    and NO render path may touch it.  The r6 critical: the render's
+    #    own replay paints orphan batches with the same --running class
+    #    the live path uses, so a DOM-derived probe let one orphan paint
+    #    poison every seedless heal for the life of the page.
+    assert body.count("liveToolCalls.add(") == 2, (
+        "liveToolCalls must be fed by exactly the two live announce "
+        "events (tool_pending + tool_info)."
+    )
+    assert body.count("liveToolCalls.delete(") == 1, (
+        "tool_result must retire its call_id from the live set."
+    )
+    assert body.count("liveToolCalls.clear()") == 2, (
+        "the live set must drain at the settle edge (idle/error) AND at "
+        "closeStreamTransport — leftover ids are dead calls whose "
+        "results will never arrive."
+    )
+    fetch_end = body.index("\n  function ", fetch_start + 1)
+    fetch_body = body[fetch_start:fetch_end]
+    fetch_code = "\n".join(
+        line for line in fetch_body.splitlines() if not line.lstrip().startswith("//")
+    )
+    assert fetch_code.count("liveToolCalls") == 1, (
+        "refetchHistory may READ the live set exactly once (the gate) "
+        "and never write it — a render that touched liveness could "
+        "forge the very signal that guards it (the r6 lesson)."
+    )
+    # The seq stamp's PRODUCER must sit above the await, or the
+    # last-dispatch-wins gate is permanently vacuous (a stamp captured
+    # after the await always equals refetchSeq) — the twin of the
+    # refetchesInFlight bracket pin.
+    assert body.count("const seq = ++refetchSeq;") == 1, (
+        "refetchHistory must stamp its dispatch exactly once."
+    )
+    assert body.index("const seq = ++refetchSeq;", fetch_start) < awt, (
+        "the seq stamp must be captured BEFORE the await — captured "
+        "after, it always equals refetchSeq and the currency gate never "
+        "fires."
     )
 
 

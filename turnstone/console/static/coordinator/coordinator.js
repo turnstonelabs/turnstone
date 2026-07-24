@@ -677,6 +677,29 @@ function createCoordinatorPane(root, wsId, opts) {
   // an older snapshot landing late can neither double-render nor clear
   // the staleness latch over a newer truth.
   let refetchSeq = 0;
+  // call_ids of tool calls whose results are still ARRIVING ON THE LIVE
+  // STREAM — the render-time gate's tool-phase liveness signal.  Fed
+  // ONLY by live SSE events (tool_pending / tool_info add, tool_result
+  // deletes) and drained at every settle edge (state_change idle/error —
+  // a leftover id there is a dead call whose result will never come) and
+  // at closeStreamTransport (a dead transport delivers no more results;
+  // a live batch re-announces through the reconnect's replay).  NEVER
+  // touched by any render: that is the r6 lesson — refetchHistory's own
+  // replay path paints orphan batches (committed tool_calls with no
+  // persisted result) with the same .conv-batch--running class the live
+  // path uses, and nothing ever strips a dead orphan's class, so a
+  // DOM-derived liveness probe would let one orphan paint poison every
+  // seedless heal for the life of the page (rewind/edit permanently
+  // dead).  Reachability ruling (r6, verified against post-kill
+  // /history): TODAY no persisted orphan exists — the server
+  // synthesizes a result for interrupted tool calls at recovery
+  // ("Cancelled by user. Outcome UNKNOWN"), and the G6 harness scenario
+  // pins that server invariant.  The event-driven encoding stands
+  // regardless, as the client-side backstop for any future crash path
+  // that skips synthesis: liveness is read from the channel that
+  // creates the hazard — the stream — never from DOM the render path
+  // can forge.
+  const liveToolCalls = new Set();
   // The cursor position a replay_truncated envelope was received AT — i.e.
   // "a gap of lost events exists BELOW this cursor".  Keep-oldest: set only
   // when null (repeated envelopes for the same unrepaired gap must not
@@ -2553,6 +2576,11 @@ function createCoordinatorPane(root, wsId, opts) {
       clearTimeout(truncatedResyncTimer);
       truncatedResyncTimer = null;
     }
+    // A dead transport delivers no more results: drain the live-call set
+    // so stale ids can't hold the render gate closed.  A genuinely live
+    // batch re-announces through the reconnect's replay (tool_pending /
+    // tool_info redeliver), which re-adds its ids.
+    liveToolCalls.clear();
     // staleRetryTimer is deliberately NOT cancelled here — it is a
     // REST-refetch heal, not transport state, and a transport-only redial
     // must keep the pending heal intent (terminal-only cancel; see its
@@ -3276,6 +3304,7 @@ function createCoordinatorPane(root, wsId, opts) {
         noteStreamOverflow();
         break;
       case "tool_result":
+        liveToolCalls.delete(ev.call_id || "");
         appendToolResult(
           ev.name || "tool",
           ev.call_id || "",
@@ -3518,6 +3547,11 @@ function createCoordinatorPane(root, wsId, opts) {
           // server-side coalescing (#884).  If that herd ever measures
           // hot, sweep BOTH clients' idle-edge consumers together — do not
           // patch just this one.
+          // Settle edge: the turn is over, so any id still in the live
+          // set is a dead call whose result will never arrive — drain it
+          // or the residue would hold the render gate's tool-phase term
+          // closed forever (see liveToolCalls' decl).
+          liveToolCalls.clear();
           if (pendingTruncatedResync) {
             pendingTruncatedResync = false;
             recordTruncatedGap();
@@ -3849,6 +3883,9 @@ function createCoordinatorPane(root, wsId, opts) {
         // Reuses the --running placeholder (subtle accent rail, no actions)
         // the replay path already knows how to upgrade; the ``announce`` flag
         // only swaps the kicker to "Evaluating" while the judge runs.
+        (ev.items || []).forEach((it) => {
+          if (it.call_id) liveToolCalls.add(it.call_id);
+        });
         appendToolBatch(ev.items || [], {
           announce: true,
           running: true,
@@ -3870,6 +3907,9 @@ function createCoordinatorPane(root, wsId, opts) {
         // — the tool starts executing the moment auto-approval lands,
         // and the batch should show the same RUNNING indicator the
         // replay path renders for an unresolved committed turn.
+        (ev.items || []).forEach((it) => {
+          if (it.call_id) liveToolCalls.add(it.call_id);
+        });
         appendToolBatch(ev.items || [], { auto: true, running: true });
         break;
       // Child-workstream fan-out routed through the coordinator's own
@@ -5825,19 +5865,25 @@ function createCoordinatorPane(root, wsId, opts) {
     // - SEEDLESS-only, because the seeded flows deliberately render
     //   over/instead-of these states (keying on the seedCursor ARG, not
     //   caller identity):
-    //   . .conv-batch--running — an executing tool batch
-    //     (_setBatchRunning / _unsetBatchRunningIfAllResults strip the
-    //     class only when every row has its result).  NOT activeBatch —
-    //     that is the pending-APPROVAL tracker (set only for
-    //     opts.pending batches; the r5 re-derivation initially made
-    //     exactly that mistake).  On a seedless caller the stream is
-    //     live, so the class means results are still streaming into
-    //     those rows — wiping orphans them.  On the SEEDED resync the
-    //     marker can be a DEAD turn's residue (node died mid-batch; no
-    //     result will ever strip the class) and the render IS the
-    //     recovery — the replay adopts hist.cursor and rebuilds any
-    //     genuinely live turn.  Blocking that render wedged the
-    //     coord-restart recovery outright (r5 family-run find).
+    //   . liveToolCalls.size — a tool batch whose results are still
+    //     arriving on the live stream; wiping would orphan the rows the
+    //     stream keeps writing into.  EVENT-DRIVEN by construction (see
+    //     the decl): the r5 shape probed the DOM for
+    //     .conv-batch--running, but this render's own replay path
+    //     paints orphan batches (committed tool_calls, no persisted
+    //     result) with that same class and nothing ever strips a dead
+    //     orphan's — one orphan paint would poison every seedless heal
+    //     for the life of the page (the r6 find; unreachable today
+    //     because recovery synthesizes results for interrupted calls —
+    //     G6 pins that server invariant — but the encoding stands as
+    //     the client-side backstop).  NOT activeBatch either — that is
+    //     the pending-APPROVAL tracker (the r5 re-derivation's first
+    //     mistake).  Liveness comes from the stream, never from DOM a
+    //     render can forge.  The SEEDED resync bypasses the term: after
+    //     a node dies mid-batch the render IS the recovery — the replay
+    //     adopts hist.cursor and rebuilds any genuinely live turn
+    //     (blocking that render wedged coord-restart outright, the r5
+    //     family-run find).
     //   . busySource === "optimistic" — coordSend's pre-POST flip, the
     //     one busy flavor that marks un-committed DOM (an optimistic
     //     row the snapshot may not carry; see setBusy's contract).  The
@@ -5865,7 +5911,7 @@ function createCoordinatorPane(root, wsId, opts) {
     if (
       !seedCursor &&
       (busySource === "optimistic" ||
-        messagesEl.querySelector(".conv-batch--running") ||
+        liveToolCalls.size > 0 ||
         !evtSource ||
         evtSource.readyState !== EventSource.OPEN)
     )

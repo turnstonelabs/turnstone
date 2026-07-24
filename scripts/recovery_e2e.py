@@ -28,6 +28,7 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario coord-stale-backstop       # G3 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-heal-midturn         # G4 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-hidden-retry         # G5 (#894)
+    python3 scripts/recovery_e2e.py --scenario coord-orphan-rewind        # G6 (#894 r6)
     python3 scripts/recovery_e2e.py --scenario roster-restart    # F1 (#881)
     python3 scripts/recovery_e2e.py --scenario roster-restart-native  # F2 (#881)
     python3 scripts/recovery_e2e.py --scenario both   # A+B only (legacy)
@@ -140,6 +141,19 @@ until the runner drives an ORGANIC settle with a plain send; that idle edge fire
 stream (exactly ONE new SSE open across show + heal — the user-driven
 reconnect; the heal adds zero).  Stamps
 ``RECOVERY-READY-COORDHIDDENRETRY-hidden0-heal1``.
+
+Scenario G6 (coord-orphan-rewind, #894 r6): the orphan-synthesis
+tripwire.  The r6 review traced the poisoned-pane hazard — an unresulted
+committed tool_calls turn renders as a ``--running`` placeholder no
+result ever strips, and a DOM-probed gate read it as live, killing every
+seedless render.  The server keeps that state unreachable by
+synthesizing results for interrupted calls at recovery (verified via
+post-kill /history); the client is hardened independently (event-driven
+live-call set, pinned render-untouchable).  This scenario pins the
+SERVER invariant: after a mid-bash kill + reboot the batch renders
+RESULTED (no residue) and the seedless rewind flow works (rows 0,
+``history_requests`` grew, posts 1).  Stamps
+``RECOVERY-READY-COORDORPHANREWIND-posts1-rows0``.
 
 Scenario A (storm): the page connects, POSTs ``/send`` on stream-open (so
 the listener is registered first), the node runs a 4-parallel-bash
@@ -1033,9 +1047,11 @@ COORD_PAGE_HTML = r"""<!doctype html>
       // G5 — the retry's stream-liveness fire guard (#894 r4): a retry
       // armed before a close-on-hide must NOT fetch while the transport
       // is down (hiddenDelta 0 — a seedless render past the frozen
-      // cursor double-renders on the show-edge replay); the show edge's
-      // synthetic idle hands the heal to the backstop (one user-driven
-      // SSE open, rows healed, gate reopened).
+      // cursor double-renders on the show-edge replay); the show edge
+      // only restores the transport (replay_ok carries no synthetic
+      // state_change), and the heal rides the next ORGANIC settle — the
+      // runner's plain send (one user-driven SSE open, rows healed,
+      // gate reopened).
       window.__verifyCoordHiddenRetry = function (
         hiddenDelta,
         healed,
@@ -1056,6 +1072,33 @@ COORD_PAGE_HTML = r"""<!doctype html>
             posts +
             "-rows" +
             userRows;
+      };
+
+      // G6 — the orphan-synthesis tripwire (#894 r6): the server must
+      // synthesize a result for tool calls interrupted by a node death
+      // (else the recovery render paints a --running placeholder no
+      // result ever strips — the poisoned-pane precondition the r6
+      // review traced; the client is hardened via the event-driven
+      // live-call set, but this server invariant keeps the state
+      // unreachable).  Post-recovery the seedless rewind flow must work
+      // end to end: rows 0, no --running residue, posts 1.
+      window.__verifyCoordOrphanRewind = function (posts, histDelta) {
+        const userRows = _coordUserRows();
+        const orphan =
+          document
+            .getElementById("coord-messages")
+            .querySelector(".conv-batch--running") !== null;
+        const ok = posts === 1 && histDelta >= 1 && userRows === 0 && !orphan;
+        document.title = ok
+          ? "RECOVERY-READY-COORDORPHANREWIND-posts1-rows0"
+          : "RECOVERY-FAILED-COORDORPHANREWIND-posts" +
+            posts +
+            "-hist" +
+            histDelta +
+            "-rows" +
+            userRows +
+            "-orphan" +
+            (orphan ? 1 : 0);
       };
 
       window.__verifyCoordRestart = function () {
@@ -2808,10 +2851,10 @@ def run_coord_heal_midturn(chrome: str) -> str:
     episode; exactly TWO /history fetches (the skipped one + the heal).
 
     Detector honesty: ``history_delta == 2`` is the DISCRIMINATING bit,
-    and the skip it witnesses rides the ``.conv-batch--running`` DOM
-    marker — turn 5 is in its TOOL phase at resolution (content refs
-    null), so this scenario is the behavioral detector for the gate's
-    tool-phase branch (the content-ref branch and the liveness statement
+    and the skip it witnesses rides the event-driven live-tool-call set
+    (fed by turn 5's live tool_pending announce) — turn 5 is in its TOOL
+    phase at resolution (content refs null), so this scenario is the
+    behavioral detector for the gate's tool-phase branch (the content-ref branch and the liveness statement
     carry structural pins; G5 covers the hidden-retry liveness path).
     Gate-stripped code renders the held fetch early, which CLEARS the
     latch, kills the backstop refire, and stamps ``hist1`` (plus
@@ -2937,8 +2980,10 @@ def run_coord_hidden_retry(chrome: str) -> str:
     ``lastEventId``; the show-edge reconnect replays from that frozen
     cursor and double-renders every turn the hidden render already painted.
     The ``evtSource`` fire-guard term skips the hidden firing instead
-    (hiddenDelta 0); on show, the reconnect's synthetic idle re-fires the
-    TRANSPORT-FREE backstop, which heals on the live stream.
+    (hiddenDelta 0); the show edge only restores the transport
+    (replay_ok carries no synthetic state_change), and the heal rides
+    the runner's plain send, whose organic turn-settle idle edge fires
+    the TRANSPORT-FREE backstop on the live stream.
 
     A replay_ok reconnect (frozen cursor, nothing lost) carries no
     synthetic state_change — only fresh/truncated replays do — so the
@@ -3032,6 +3077,125 @@ def run_coord_hidden_retry(chrome: str) -> str:
         node.stop()
 
 
+def run_coord_orphan_rewind(chrome: str) -> str:
+    """Scenario G6 — the orphan-synthesis tripwire (#894 r6).  The r6
+    review traced a client-side hazard: an unresulted committed
+    tool_calls turn ("orphan") would render as a ``.conv-batch--running``
+    placeholder no result ever strips, and the r5 DOM-probed gate read
+    that residue as live — poisoning every seedless render for the life
+    of the page.  Empirically the trigger state is UNREACHABLE today:
+    the server synthesizes a result for interrupted tool calls at
+    recovery ("Cancelled by user. Outcome UNKNOWN" — verified via
+    post-kill /history), so no persisted orphan exists.  The client was
+    hardened anyway (the gate's tool-phase term is the EVENT-DRIVEN
+    live-call set, pinned render-untouchable), because that server
+    invariant is all that stands between a future crash path and the
+    poisoned-pane state.
+
+    THIS SCENARIO PINS THE SERVER INVARIANT, not the client encoding
+    (with synthesis present a DOM-probe gate also passes — the client
+    discipline is carried by the static pin set): after a mid-bash node
+    kill + reboot, the recovery render must show the batch RESULTED (no
+    --running residue) and the seedless rewind flow must work end to
+    end (rows 0, posts 1, history_requests grew).  If recovery
+    synthesis ever regresses, this stamps the residue — surfacing
+    exactly the state that would re-expose the hardened client."""
+    from tests._sse_recovery_server import final_text_script, parallel_bash_script
+
+    port = _free_port()
+    node = _boot_node(port=port)
+    paced = parallel_bash_script({"g6": "for i in $(seq 1 60); do echo g6-$i; sleep 0.05; done"})
+    ws_id = node.create_workstream(paced, final_text_script("g6-done"), name="browser-coord-orphan")
+    profile = Path(_scratch()) / "chrome-coord-orphan-rewind"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/coord-recovery?ws_id={ws_id}&scenario=coord-orphan-rewind"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        # First poll on this page (no seeded rows to wait for), so the
+        # evaluate can race the page load and return None — coalesce.
+        if not _poll_until(lambda: (cdp.evaluate("window.__esOpens") or 0) >= 1, 15, 0.05):
+            raise AssertionError("coord-orphan-rewind: SSE stream never opened")
+        # Drive the paced turn and kill the node while its bash streams —
+        # the tool rows on screen prove the batch was mid-flight.
+        _send_in_page(cdp, "run a turn")
+        if not _poll_until(
+            lambda: (
+                cdp.evaluate(
+                    "document.getElementById('coord-messages')"
+                    ".querySelectorAll('.conv-row[data-call-id]').length"
+                )
+                >= 1
+            ),
+            15,
+            0.2,
+        ):
+            raise AssertionError("coord-orphan-rewind: tool rows never painted")
+        node.stop()
+        node = _boot_node(port=port)
+        node.open_workstream(ws_id)
+        # The pane's reconnect machinery (native retry -> truncated resync
+        # -> seeded render) repaints the interrupted turn.  The SERVER
+        # INVARIANT under test: recovery synthesized a result for the
+        # killed call, so the batch renders RESULTED — one user row, tool
+        # rows present, NO --running residue.
+        if not _poll_until(
+            lambda: (
+                cdp.evaluate(_COORD_ROWS_JS) == 1
+                and (
+                    cdp.evaluate(
+                        "document.getElementById('coord-messages')"
+                        ".querySelectorAll('.conv-row[data-call-id]').length"
+                    )
+                    or 0
+                )
+                >= 1
+                and not cdp.evaluate(
+                    "document.getElementById('coord-messages')"
+                    ".querySelector('.conv-batch--running') !== null"
+                )
+            ),
+            30,
+            0.3,
+        ):
+            raise AssertionError(
+                "coord-orphan-rewind: recovery never rendered the synthesized "
+                "(resulted) batch — either the reconnect failed or recovery "
+                "synthesis regressed (a --running residue is exactly the "
+                "poisoned-pane precondition)"
+            )
+        hist_baseline = node.history_requests
+        # Rewind the sole user row — the full seedless flow must work
+        # after a kill+reboot recovery (clear_ui render lands, latch
+        # clears).
+        if not cdp.evaluate("window.__clickCoordRewind(0)"):
+            raise AssertionError("coord-orphan-rewind: rewind button missing")
+        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
+            raise AssertionError("coord-orphan-rewind: rewind never POSTed")
+        healed = _poll_until(
+            lambda: (
+                cdp.evaluate(_COORD_ROWS_JS) == 0
+                and not cdp.evaluate(
+                    "document.getElementById('coord-messages')"
+                    ".querySelector('.conv-batch--running') !== null"
+                )
+            ),
+            15,
+            0.2,
+        )
+        hist_delta = node.history_requests - hist_baseline
+        posts = node.rewind_requests
+        print(f"  coord-orphan-rewind healed={healed} hist_delta={hist_delta} posts={posts}")
+        cdp.evaluate(f"window.__verifyCoordOrphanRewind({posts}, {hist_delta})")
+        return _poll_title(cdp, 15)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
 def _wait_state(node: Any, ws_id: str, state: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -3082,6 +3246,7 @@ def main() -> None:
             "coord-stale-backstop",
             "coord-heal-midturn",
             "coord-hidden-retry",
+            "coord-orphan-rewind",
             "roster-restart",
             "roster-restart-native",
             "both",
@@ -3154,6 +3319,10 @@ def main() -> None:
     if args.scenario in ("coord-hidden-retry", "all"):
         verdict = run_coord_hidden_retry(chrome)
         print(f"scenario G5 (coord-hiddenretry): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("coord-orphan-rewind", "all"):
+        verdict = run_coord_orphan_rewind(chrome)
+        print(f"scenario G6 (coord-orphanrewind): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     if args.scenario in ("roster-restart", "all"):
         verdict = run_roster_restart(chrome)
