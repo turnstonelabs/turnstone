@@ -3466,7 +3466,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
     # isolation of every other lifted verb.  Touched only from the event
     # loop thread — no lock needed; the ``limit`` component is required
     # (a limit=10 caller must not receive a limit=500 payload).
-    flights: dict[tuple[str, int], asyncio.Task[_HistoryFlightResult]] = {}
+    flights: dict[tuple[str, int, int], asyncio.Task[_HistoryFlightResult]] = {}
 
     async def history(request: Request) -> Response:
         if cfg.permission_gate is not None:
@@ -3547,7 +3547,19 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # existence, limit) and must stay above it: a request may only
         # join a flight after its own gates passed.  Everything below is
         # the caller-independent reconstruction, shared via ``flights``.
-        key = (ws_id, limit)
+        # The ws's truncation generation joins the key (#894): a request
+        # dispatched after a rewind/retry must never join a flight whose
+        # load_messages ran before it — the joined pre-rewind payload
+        # reads as fresh truth client-side (the dispatch stamp is
+        # current) and reopened the over-rewind window.  Cold workstream:
+        # generation 0; the first post-load truncation bumps to 1, so a
+        # cold flight can never be joined across a rewind either.
+        live_gen = (
+            getattr(live_session, "_history_generation", 0)
+            if live_session is not None
+            else 0
+        )
+        key = (ws_id, limit, live_gen)
         task = flights.get(key)
         joined = task is not None
         if task is None:
@@ -3595,7 +3607,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         return JSONResponse({"ws_id": ws_id, "messages": messages, "cursor": cursor})
 
     async def _run_flight(
-        key: tuple[str, int],
+        key: tuple[str, int, int],
         mgr: SessionManager,
         storage: Any,
         app_state: Any,

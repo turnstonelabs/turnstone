@@ -1661,6 +1661,9 @@ class ChatSession:
         self._persona_memory: bool
         self._apply_persona_snapshot(persona_snapshot)
         self._title_generated = False
+        # Monotonic truncation counter — folded into the /history
+        # single-flight key (see _persist_truncation).
+        self._history_generation = 0
         self._read_files: set[str] = set()
         # Session-monotonic run counter for sub-agent id minting (see
         # ``_run_agent``): the parent call id alone can repeat across runs (a
@@ -6962,6 +6965,16 @@ class ChatSession:
         does; a later resume rehydrates ``[summary] + [surviving tail]`` and the
         two reconcile.
         """
+        # History generation (#894/#884 seam): every truncation bumps the
+        # counter the /history single-flight folds into its flight key, so
+        # a request dispatched AFTER a rewind/retry can never join a flight
+        # whose load_messages ran BEFORE it (a joined pre-rewind payload
+        # rendered as fresh truth on the coordinator and reopened the
+        # over-rewind window the #894 client latch closes).  Bumped before
+        # the storage write on purpose: the in-memory tail is already
+        # trimmed by both callers, and a spuriously fresh flight is
+        # harmless while a wrongly-joined one is not.
+        self._history_generation += 1
         if removed_count <= 0:
             return
         # The caller already truncated self.messages (rewind/retry both trim
