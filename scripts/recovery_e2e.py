@@ -142,18 +142,19 @@ stream (exactly ONE new SSE open across show + heal — the user-driven
 reconnect; the heal adds zero).  Stamps
 ``RECOVERY-READY-COORDHIDDENRETRY-hidden0-heal1``.
 
-Scenario G6 (coord-orphan-rewind, #894 r6): the orphan-synthesis
-tripwire.  The r6 review traced the poisoned-pane hazard — an unresulted
-committed tool_calls turn renders as a ``--running`` placeholder no
-result ever strips, and a DOM-probed gate read it as live, killing every
-seedless render.  The server keeps that state unreachable by
-synthesizing results for interrupted calls at recovery (verified via
-post-kill /history); the client is hardened independently (event-driven
-live-call set, pinned render-untouchable).  This scenario pins the
-SERVER invariant: after a mid-bash kill + reboot the batch renders
-RESULTED (no residue) and the seedless rewind flow works (rows 0,
-``history_requests`` grew, posts 1).  Stamps
-``RECOVERY-READY-COORDORPHANREWIND-posts1-rows0``.
+Scenario G6 (coord-orphan-rewind, #894 r6/r7): the poisoned-pane
+detector.  A HARD mid-tool node kill (``stop(hard=True)`` — graceful
+close would synthesize a cancel result and mask the state; boot-time
+rehydration synthesizes nothing, r7-verified) leaves the committed
+tool_calls turn unresulted; recovery paints it as a ``--running``
+placeholder no result ever strips.  The r5 DOM-probed gate read that
+residue as live and skipped every seedless render — rewind/edit
+permanently dead.  The event-driven live-call set is empty for the
+orphan, so the rewind must render THROUGH it: residue asserted PRESENT
+post-recovery, then the orphan is wiped and the rewound truth paints
+(the server keeps the user message and removes the unresulted assistant
+turn), posts 1, ``history_requests`` grew.  Stamps
+``RECOVERY-READY-COORDORPHANREWIND-posts1-rows1-orphan0``.
 
 Scenario A (storm): the page connects, POSTs ``/send`` on stream-open (so
 the listener is registered first), the node runs a 4-parallel-bash
@@ -1074,23 +1075,28 @@ COORD_PAGE_HTML = r"""<!doctype html>
             userRows;
       };
 
-      // G6 — the orphan-synthesis tripwire (#894 r6): the server must
-      // synthesize a result for tool calls interrupted by a node death
-      // (else the recovery render paints a --running placeholder no
-      // result ever strips — the poisoned-pane precondition the r6
-      // review traced; the client is hardened via the event-driven
-      // live-call set, but this server invariant keeps the state
-      // unreachable).  Post-recovery the seedless rewind flow must work
-      // end to end: rows 0, no --running residue, posts 1.
+      // G6 — the poisoned-pane detector (#894 r6/r7): a HARD node kill
+      // leaves the tool call genuinely unresulted (only a graceful
+      // close synthesizes a cancel result), so recovery paints a
+      // --running orphan no result ever strips.  The event-driven
+      // live-call set is empty for it, so the seedless rewind flow
+      // must work THROUGH the residue: orphan wiped, rewound truth
+      // painted (the user message stays — rewind-for-retry), posts 1.
+      // A DOM-probed gate reads the residue as live and never renders.
       window.__verifyCoordOrphanRewind = function (posts, histDelta) {
         const userRows = _coordUserRows();
         const orphan =
           document
             .getElementById("coord-messages")
             .querySelector(".conv-batch--running") !== null;
-        const ok = posts === 1 && histDelta >= 1 && userRows === 0 && !orphan;
+        // Rewound truth: the server removes the UNRESULTED assistant turn
+        // but keeps the user message (rewind-for-retry), so success is
+        // ONE user row with the residue gone.  The failure mode (a gate
+        // that reads the residue as live and skips) is rows1 WITH
+        // orphan1 and no render — the orphan bit discriminates.
+        const ok = posts === 1 && histDelta >= 1 && userRows === 1 && !orphan;
         document.title = ok
-          ? "RECOVERY-READY-COORDORPHANREWIND-posts1-rows0"
+          ? "RECOVERY-READY-COORDORPHANREWIND-posts1-rows1-orphan0"
           : "RECOVERY-FAILED-COORDORPHANREWIND-posts" +
             posts +
             "-hist" +
@@ -2693,6 +2699,33 @@ def run_coord_rewind_failed_window(chrome: str) -> str:
         node.stop()
 
 
+def _coord_stick_latch(cdp: CDP, node: Any, tag: str) -> None:
+    """The shared G3/G4 prologue: paint three rows, gate on the SSE open,
+    then stick the staleness latch — fail_history(2) exhausts the rewind's
+    clear_ui refetch AND its one bounded 2s retry, so only an organic
+    idle-edge heal can clear it.  Extracted so G4's premise (latch stuck
+    exactly as in G3) is enforced by construction, the same rationale
+    _seed_three_completed_turns documents for the E family."""
+    if not _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
+        raise AssertionError(f"{tag}: three user rows never rendered")
+    if not _poll_until(lambda: cdp.evaluate("window.__esOpens") >= 1, 10, 0.05):
+        raise AssertionError(f"{tag}: SSE stream never opened")
+    node.fail_history(2)
+    if not cdp.evaluate("window.__clickCoordRewind(1)"):
+        raise AssertionError(f"{tag}: second-row rewind button missing")
+    if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
+        raise AssertionError(f"{tag}: first rewind never POSTed")
+    if not _poll_until(lambda: node.history_fail_remaining == 0, 20):
+        raise AssertionError(f"{tag}: the two forced /history failures never both fired")
+    assert node.history_fail_remaining == 0, f"{tag}: fail budget not consumed"
+    stale_rows = cdp.evaluate(_COORD_ROWS_JS)
+    if stale_rows != 3:
+        raise AssertionError(
+            f"{tag}: failed fetches did not preserve the transcript "
+            f"(user rows={stale_rows}, expected 3)"
+        )
+
+
 def run_coord_stale_backstop(chrome: str) -> str:
     """Scenario G3 — the coordinator ``historyStale`` latch's TRANSPORT-FREE
     idle-edge backstop (#894, the coord port of E4).  The DOUBLE-failure
@@ -2732,39 +2765,7 @@ def run_coord_stale_backstop(chrome: str) -> str:
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
         # Wait for the initial /history to paint all three user rows.  This
         # load MUST succeed, so arm the forced failures only AFTERWARDS.
-        if not _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
-            raise AssertionError("coord-stale-backstop: three user rows never rendered")
-        # SSE-open gate — see run_coord_rewind_window: a pre-connect rewind
-        # drops its clear_ui and false-fails the scenario.
-        if not _poll_until(lambda: cdp.evaluate("window.__esOpens") >= 1, 10, 0.05):
-            raise AssertionError("coord-stale-backstop: SSE stream never opened")
-        # Arm TWO forced /history 500s: the rewind's clear_ui refetch AND its
-        # one bounded 2s retry both fail, so ONLY the organic idle-edge
-        # backstop can clear the latch.
-        node.fail_history(2)
-        # Click #1 — the REAL rewind on the SECOND user row: POSTs (the
-        # authoritative rewind commits server-side to ONE user turn), the
-        # server emits clear_ui, and its refetch 500s (fault 2 -> 1).
-        if not cdp.evaluate("window.__clickCoordRewind(1)"):
-            raise AssertionError("coord-stale-backstop: second-row rewind button missing")
-        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
-            raise AssertionError("coord-stale-backstop: first rewind never POSTed")
-        # Both the clear_ui refetch AND the 2s retry must fire and fail
-        # (fault 2 -> 1 -> 0): history_fail_remaining == 0 proves both
-        # consumed.  The retry fires ~2s after the first failure.
-        if not _poll_until(lambda: node.history_fail_remaining == 0, 20):
-            raise AssertionError(
-                "coord-stale-backstop: the two forced /history failures never both fired"
-            )
-        # Backend proof the failures actually happened (never scripted absence).
-        assert node.history_fail_remaining == 0, "coord-stale-backstop: fail budget not consumed"
-        # The stale transcript is intact — the failed fetches wiped nothing.
-        stale_rows = cdp.evaluate(_COORD_ROWS_JS)
-        if stale_rows != 3:
-            raise AssertionError(
-                f"coord-stale-backstop: failed fetches did not preserve the "
-                f"transcript (user rows={stale_rows}, expected 3)"
-            )
+        _coord_stick_latch(cdp, node, "coord-stale-backstop")
         # Click #2 — rewind on the FIRST user row while the latch is set:
         # gated, POST non-occurrence confirmed over a bounded window.
         if not cdp.evaluate("window.__clickCoordRewind(0)"):
@@ -2881,25 +2882,7 @@ def run_coord_heal_midturn(chrome: str) -> str:
         cdp = CDP(_page_ws_url(cdp_port))
         url = f"{node.base_url}/coord-recovery?ws_id={ws_id}&scenario=coord-heal-midturn"
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
-        if not _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
-            raise AssertionError("coord-heal-midturn: three user rows never rendered")
-        # SSE-open gate — see run_coord_rewind_window.
-        if not _poll_until(lambda: cdp.evaluate("window.__esOpens") >= 1, 10, 0.05):
-            raise AssertionError("coord-heal-midturn: SSE stream never opened")
-        # G3 prologue: latch stuck after clear_ui refetch + retry both 500.
-        node.fail_history(2)
-        if not cdp.evaluate("window.__clickCoordRewind(1)"):
-            raise AssertionError("coord-heal-midturn: second-row rewind button missing")
-        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
-            raise AssertionError("coord-heal-midturn: first rewind never POSTed")
-        if not _poll_until(lambda: node.history_fail_remaining == 0, 20):
-            raise AssertionError("coord-heal-midturn: the two forced failures never both fired")
-        stale_rows = cdp.evaluate(_COORD_ROWS_JS)
-        if stale_rows != 3:
-            raise AssertionError(
-                f"coord-heal-midturn: failed fetches did not preserve the transcript "
-                f"(user rows={stale_rows}, expected 3)"
-            )
+        _coord_stick_latch(cdp, node, "coord-heal-midturn")
         events_baseline = node.events_requests
         history_baseline = node.history_requests
         # Hold every /history long enough for turn 5 to start under it, but
@@ -3078,33 +3061,39 @@ def run_coord_hidden_retry(chrome: str) -> str:
 
 
 def run_coord_orphan_rewind(chrome: str) -> str:
-    """Scenario G6 — the orphan-synthesis tripwire (#894 r6).  The r6
-    review traced a client-side hazard: an unresulted committed
-    tool_calls turn ("orphan") would render as a ``.conv-batch--running``
-    placeholder no result ever strips, and the r5 DOM-probed gate read
-    that residue as live — poisoning every seedless render for the life
-    of the page.  Empirically the trigger state is UNREACHABLE today:
-    the server synthesizes a result for interrupted tool calls at
-    recovery ("Cancelled by user. Outcome UNKNOWN" — verified via
-    post-kill /history), so no persisted orphan exists.  The client was
-    hardened anyway (the gate's tool-phase term is the EVENT-DRIVEN
-    live-call set, pinned render-untouchable), because that server
-    invariant is all that stands between a future crash path and the
-    poisoned-pane state.
+    """Scenario G6 — the poisoned-pane detector (#894 r6/r7).  A node
+    killed MID-TOOL leaves the committed tool_calls turn genuinely
+    unresulted in storage (r7-verified: only a GRACEFUL close synthesizes
+    the "Cancelled by user" result via session.cancel(); boot-time
+    rehydration synthesizes nothing — so ``stop(hard=True)`` models the
+    real SIGKILL/OOM crash).  The recovery render paints that orphan as
+    a ``.conv-batch--running`` placeholder no result will ever strip.
+    The r5 DOM-probed gate read the residue as "live" and skipped every
+    subsequent SEEDLESS render for the life of the page: rewinds
+    committed server-side but never rendered, the latch stuck, and
+    rewind/edit went permanently dead.  The event-driven live-call set
+    is EMPTY for an orphan (nothing announced it on the live stream
+    since the reconnect), so the rewind's clear_ui render must proceed
+    THROUGH the residue: the orphan batch is wiped, the rewound truth
+    paints (the server keeps the user message and removes the unresulted
+    assistant turn — rewind-for-retry), and the latch clears.
 
-    THIS SCENARIO PINS THE SERVER INVARIANT, not the client encoding
-    (with synthesis present a DOM-probe gate also passes — the client
-    discipline is carried by the static pin set): after a mid-bash node
-    kill + reboot, the recovery render must show the batch RESULTED (no
-    --running residue) and the seedless rewind flow must work end to
-    end (rows 0, posts 1, history_requests grew).  If recovery
-    synthesis ever regresses, this stamps the residue — surfacing
-    exactly the state that would re-expose the hardened client."""
+    This is the client hardening's behavioral detector: the runner
+    asserts the residue IS present after recovery (the poisoned-pane
+    precondition manifested), then that the seedless rewind flow works
+    end to end regardless (posts 1, history_requests grew, one user row
+    and no residue in the end state).  DOM-probe gate code fails the
+    heal poll with the residue still standing — the orphan bit is the
+    discriminator."""
     from tests._sse_recovery_server import final_text_script, parallel_bash_script
 
     port = _free_port()
     node = _boot_node(port=port)
-    paced = parallel_bash_script({"g6": "for i in $(seq 1 60); do echo g6-$i; sleep 0.05; done"})
+    # 60s of pacing: the hard-killed node's session thread keeps running
+    # this bash in-process and persists its result at natural completion —
+    # it must outlive the whole post-kill observation window or the
+    # "unresulted orphan" silently resolves mid-scenario.
+    paced = parallel_bash_script({"g6": "for i in $(seq 1 1200); do echo g6-$i; sleep 0.05; done"})
     ws_id = node.create_workstream(paced, final_text_script("g6-done"), name="browser-coord-orphan")
     profile = Path(_scratch()) / "chrome-coord-orphan-rewind"
     proc, cdp_port = _launch_chrome(chrome, profile)
@@ -3132,26 +3121,26 @@ def run_coord_orphan_rewind(chrome: str) -> str:
             0.2,
         ):
             raise AssertionError("coord-orphan-rewind: tool rows never painted")
-        node.stop()
+        node.stop(hard=True)
         node = _boot_node(port=port)
         node.open_workstream(ws_id)
+        # A hard-crashed reborn node answers the page's stale-high cursor
+        # with a SILENT fresh stream — no replay_truncated (the honest-
+        # truncation signal rides state a graceful stop persists; a crash
+        # never writes it — pre-existing server hole, tracked separately).
+        # The realistic operator recovery is a page RELOAD: init's seeded
+        # /history render paints the orphan deterministically.
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
         # The pane's reconnect machinery (native retry -> truncated resync
-        # -> seeded render) repaints the interrupted turn.  The SERVER
-        # INVARIANT under test: recovery synthesized a result for the
-        # killed call, so the batch renders RESULTED — one user row, tool
-        # rows present, NO --running residue.
+        # -> seeded render) repaints the interrupted turn.  With a HARD
+        # kill the tool call is genuinely unresulted, so the recovery
+        # render shows the ORPHAN: one user row, a --running placeholder
+        # batch no result will ever strip — the poisoned-pane
+        # precondition, now manifested for real.
         if not _poll_until(
             lambda: (
                 cdp.evaluate(_COORD_ROWS_JS) == 1
-                and (
-                    cdp.evaluate(
-                        "document.getElementById('coord-messages')"
-                        ".querySelectorAll('.conv-row[data-call-id]').length"
-                    )
-                    or 0
-                )
-                >= 1
-                and not cdp.evaluate(
+                and cdp.evaluate(
                     "document.getElementById('coord-messages')"
                     ".querySelector('.conv-batch--running') !== null"
                 )
@@ -3160,10 +3149,9 @@ def run_coord_orphan_rewind(chrome: str) -> str:
             0.3,
         ):
             raise AssertionError(
-                "coord-orphan-rewind: recovery never rendered the synthesized "
-                "(resulted) batch — either the reconnect failed or recovery "
-                "synthesis regressed (a --running residue is exactly the "
-                "poisoned-pane precondition)"
+                "coord-orphan-rewind: recovery never painted the orphan "
+                "--running residue (hard kill did not leave the tool call "
+                "unresulted, or the reconnect failed)"
             )
         hist_baseline = node.history_requests
         # Rewind the sole user row — the full seedless flow must work
@@ -3173,9 +3161,12 @@ def run_coord_orphan_rewind(chrome: str) -> str:
             raise AssertionError("coord-orphan-rewind: rewind button missing")
         if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
             raise AssertionError("coord-orphan-rewind: rewind never POSTed")
+        # Rewound truth: the server removes the unresulted assistant turn
+        # and KEEPS the user message — success is one user row, residue
+        # gone (a skipped render leaves the residue standing instead).
         healed = _poll_until(
             lambda: (
-                cdp.evaluate(_COORD_ROWS_JS) == 0
+                cdp.evaluate(_COORD_ROWS_JS) == 1
                 and not cdp.evaluate(
                     "document.getElementById('coord-messages')"
                     ".querySelector('.conv-batch--running') !== null"

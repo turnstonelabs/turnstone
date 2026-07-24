@@ -665,6 +665,9 @@ def test_coordinator_history_stale_latch_contract():
     #    ELSE-IF of the truncated consumer (mutual exclusion: the
     #    truncated branch's own reload heals the latch too; two separate
     #    ifs would run both heals on one idle edge).
+    def _strip_comments(text: str) -> str:
+        return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//"))
+
     trunc_arm = body.index("if (pendingTruncatedResync)")
     backstop = body.index("historyStale &&", trunc_arm)
     assert "} else if (" in body[trunc_arm:backstop], (
@@ -672,7 +675,9 @@ def test_coordinator_history_stale_latch_contract():
         "pendingTruncatedResync consumer, never an independent if."
     )
     idle_block_end = body.index('ev.state === "running"', backstop)
-    backstop_arm = body[backstop:idle_block_end]
+    # Comment-stripped: the arm's at-site ruling comments name every
+    # guard term, so raw-window presence asserts would go vacuous.
+    backstop_arm = _strip_comments(body[backstop:idle_block_end])
     assert "refetchHistory();" in backstop_arm, (
         "the staleness backstop must heal via a plain seedless refetchHistory()."
     )
@@ -707,7 +712,7 @@ def test_coordinator_history_stale_latch_contract():
         "exists to kill."
     )
     retry_arm = body.index("staleRetryTimer = setTimeout")
-    retry_fire = body[retry_arm : retry_arm + 700]
+    retry_fire = _strip_comments(body[retry_arm : retry_arm + 900])
     assert "!refetchesInFlight" in retry_fire, (
         "the retry's fire guard must yield to an in-flight refetch "
         "(mirrors interactive's !_replayQueue pin)."
@@ -781,13 +786,14 @@ def test_coordinator_history_stale_latch_contract():
     #    terms: dispatch currency (seq) and the content refs (skipping
     #    always beats stranding a ref; seeded callers null theirs before
     #    fetching, so it never blocks them).  SEEDLESS-only terms —
-    #    keyed on the seedCursor ARG: the .conv-batch--running marker
-    #    (on a live stream it means results are streaming into those
-    #    rows; on the SEEDED resync it can be a dead turn's residue and
-    #    the render IS the recovery — a universal term wedged
-    #    coord-restart outright), the optimistic-send busySource flavor,
-    #    and stream-OPENness (CONNECTING keeps the handle with a frozen
-    #    cursor and a pending replay).  Plain ``busy`` must not appear:
+    #    keyed on the seedCursor ARG: the event-driven live-tool-call
+    #    set (liveToolCalls — never a DOM probe, which the render's own
+    #    orphan repaint forges: the r6 critical; on the SEEDED resync
+    #    even genuine residue must not block — the render IS the
+    #    recovery, and a universal term wedged coord-restart outright),
+    #    the optimistic-send busySource flavor, and stream-OPENness
+    #    (CONNECTING keeps the handle with a frozen cursor and a
+    #    pending replay).  Plain ``busy`` must not appear:
     #    it means a turn is EXECUTING, not that this DOM holds live
     #    state (the r5 critical).
     hist_guard = body.index("if (!hist) return;", fetch_start)
@@ -853,11 +859,45 @@ def test_coordinator_history_stale_latch_contract():
     assert body.count("liveToolCalls.delete(") == 1, (
         "tool_result must retire its call_id from the live set."
     )
-    assert body.count("liveToolCalls.clear()") == 2, (
-        "the live set must drain at the settle edge (idle/error) AND at "
-        "closeStreamTransport — leftover ids are dead calls whose "
-        "results will never arrive."
+    assert body.count("liveToolCalls.clear()") == 1, (
+        "the live set must drain at the settle edge ONLY — a "
+        "closeStreamTransport drain fails OPEN (the reconnect replay "
+        "does not re-announce a live batch, so an emptied set lets a "
+        "post-redial seedless render wipe the live batch: the r7 major)."
     )
+    settle_block = body[
+        body.index('if (ev.state === "idle" || ev.state === "error") {') : body.index(
+            'ev.state === "running"'
+        )
+    ]
+    assert "liveToolCalls.clear()" in settle_block, (
+        "the one drain must sit inside the idle/error settle block — "
+        "anywhere else either leaks dead ids (gate stuck) or drains live "
+        "ones (gate forged open)."
+    )
+    cst_code = "\n".join(
+        line for line in cst_slice.splitlines() if not line.lstrip().startswith("//")
+    )
+    assert "liveToolCalls" not in cst_code, (
+        "closeStreamTransport must not touch the live set (r7): transport "
+        "death is not a retirement event — a stale id fails CLOSED, an "
+        "emptied set fails OPEN into the wipe.  (The at-site ruling "
+        "comment may name it; the CODE may not.)"
+    )
+    tool_result_block = body[
+        body.index('case "tool_result":') : body.index(
+            "case ", body.index('case "tool_result":') + 10
+        )
+    ]
+    assert "liveToolCalls.delete(" in tool_result_block, (
+        "tool_result must retire its call_id inside its own case arm."
+    )
+    for case_name in ('case "tool_pending":', 'case "tool_info":'):
+        case_block = body[body.index(case_name) : body.index("break;", body.index(case_name))]
+        assert "liveToolCalls.add(" in case_block, (
+            f"{case_name} must feed the live set inside its own case arm "
+            "(the live announce events are the ONLY producers)."
+        )
     fetch_end = body.index("\n  function ", fetch_start + 1)
     fetch_body = body[fetch_start:fetch_end]
     fetch_code = "\n".join(
@@ -872,6 +912,15 @@ def test_coordinator_history_stale_latch_contract():
     # last-dispatch-wins gate is permanently vacuous (a stamp captured
     # after the await always equals refetchSeq) — the twin of the
     # refetchesInFlight bracket pin.
+    # The await must be BOUNDED (r7): an accepted-but-never-answered
+    # /history would pin refetchesInFlight above zero for the life of
+    # the page and every heal would yield forever.
+    assert "histCtrl.abort()" in fetch_code and "clearTimeout(histTimer)" in fetch_code, (
+        "refetchHistory must bound its fetch with the AbortController + "
+        "flat-timeout shape (and clear the timer in the finally) — an "
+        "unbounded await pins the in-flight counter and permanently "
+        "disables both heals."
+    )
     assert body.count("const seq = ++refetchSeq;") == 1, (
         "refetchHistory must stamp its dispatch exactly once."
     )

@@ -432,11 +432,34 @@ class RecoveryServer:
 
     # -- teardown ------------------------------------------------------------
 
-    def stop(self) -> None:
-        with contextlib.suppress(Exception):
-            for ws in list(self._manager.list_all()):
-                with contextlib.suppress(Exception):
-                    self._manager.close(ws.id)
+    def stop(self, *, hard: bool = False) -> None:
+        """Stop the node.
+
+        ``hard=True`` skips the per-workstream ``manager.close`` sweep — a
+        graceful close routes through ``cleanup_session_ui`` →
+        ``session.cancel()``, whose bash cancel path PERSISTS a
+        synthesized "Cancelled by user" result while the old node is
+        still alive, which masks crash states.  A hard stop leaves any
+        in-flight tool call genuinely unresulted in storage, modelling a
+        SIGKILL/OOM death (the coord-orphan-rewind scenario's premise).
+        Everything else (server exit, sockets, patched-default restore)
+        is identical.
+        """
+        if not hard:
+            with contextlib.suppress(Exception):
+                for ws in list(self._manager.list_all()):
+                    with contextlib.suppress(Exception):
+                        self._manager.close(ws.id)
+        else:
+            # A crash does not drain open SSE streams: force_exit makes
+            # uvicorn drop live connections instead of waiting on them
+            # (graceful shutdown would hang on the pane's EventSource and
+            # the 20s join below would time out with the old server still
+            # serving).  NOTE: the killed workstream's in-flight tool keeps
+            # executing on this process's session thread and will persist
+            # its result at natural completion — hard-kill scenarios must
+            # use a paced tool that outlives their observation window.
+            self._server.force_exit = True
         self._server.should_exit = True
         self._thread.join(timeout=20)
         with contextlib.suppress(Exception):

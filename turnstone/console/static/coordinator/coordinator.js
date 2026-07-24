@@ -680,10 +680,15 @@ function createCoordinatorPane(root, wsId, opts) {
   // call_ids of tool calls whose results are still ARRIVING ON THE LIVE
   // STREAM — the render-time gate's tool-phase liveness signal.  Fed
   // ONLY by live SSE events (tool_pending / tool_info add, tool_result
-  // deletes) and drained at every settle edge (state_change idle/error —
-  // a leftover id there is a dead call whose result will never come) and
-  // at closeStreamTransport (a dead transport delivers no more results;
-  // a live batch re-announces through the reconnect's replay).  NEVER
+  // deletes) and drained at the settle edge ONLY (state_change
+  // idle/error — a leftover id there is a dead call whose result will
+  // never come).  Retirement policy (r7): an id leaves on its RESULT,
+  // at the SETTLE edge, or with pane death — transport death is NOT a
+  // retirement event, because the reconnect replay does not re-announce
+  // a live batch (verified: replay_ok yields only events past the
+  // cursor; the fresh/truncated replay yields no tool_pending/tool_info)
+  // — a stale id fails CLOSED (skip, latch survives, settle heals),
+  // while an empty set fails OPEN into the wipe.  NEVER
   // touched by any render: that is the r6 lesson — refetchHistory's own
   // replay path paints orphan batches (committed tool_calls with no
   // persisted result) with the same .conv-batch--running class the live
@@ -2507,12 +2512,14 @@ function createCoordinatorPane(root, wsId, opts) {
     });
   }
 
-  function getJSON(url) {
+  function getJSON(url, init) {
     const fn = typeof authFetch === "function" ? authFetch : fetch;
-    return fn(url, { credentials: "include" }).then((r) => {
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    });
+    return fn(url, Object.assign({ credentials: "include" }, init || {})).then(
+      (r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      },
+    );
   }
 
   // ------------------------------------------------------------------
@@ -2576,11 +2583,20 @@ function createCoordinatorPane(root, wsId, opts) {
       clearTimeout(truncatedResyncTimer);
       truncatedResyncTimer = null;
     }
-    // A dead transport delivers no more results: drain the live-call set
-    // so stale ids can't hold the render gate closed.  A genuinely live
-    // batch re-announces through the reconnect's replay (tool_pending /
-    // tool_info redeliver), which re-adds its ids.
-    liveToolCalls.clear();
+    // liveToolCalls is deliberately NOT drained here (r7 ruling): the
+    // reconnect replay does NOT re-announce a live batch — replay_ok
+    // yields only events past lastEventId (the announce sits below it)
+    // and the coord fresh/truncated replay yields connected/status/
+    // pending-cards/verdicts, never tool_pending or tool_info — so a
+    // drain here left the render gate's tool-phase term EMPTY across
+    // every mid-batch redial and a slow seedless refetch resolving
+    // after the reopen wiped the live batch (fails OPEN).  A stale id
+    // instead fails CLOSED — a skipped render leaves the staleness
+    // latch set and heals at the next organic settle — and retirement
+    // is fully covered without this site: results still arrive through
+    // replay_ok (tool_result deletes), every fresh/truncated reconnect
+    // carries a synthetic state_change whose settle edge clears, and
+    // destroy() ends the closure.
     // staleRetryTimer is deliberately NOT cancelled here — it is a
     // REST-refetch heal, not transport state, and a transport-only redial
     // must keep the pending heal intent (terminal-only cancel; see its
@@ -5817,14 +5833,29 @@ function createCoordinatorPane(root, wsId, opts) {
     // last-dispatch-wins at the render-time gate.
     const seq = ++refetchSeq;
     refetchesInFlight++;
+    // Bound the await (r7): the counter and both heals gate on this
+    // fetch settling.  A /history that is accepted and never answered
+    // (wedged node, stalled response body) would otherwise pin
+    // refetchesInFlight above zero for the life of the page and every
+    // heal would yield forever — beyond the ruled settle-lag.  Same
+    // AbortController + flat-timeout shape as coordSend's /send bound;
+    // an abort lands in the catch, the latch survives, and the heals
+    // retry on later organic edges against a fresh attempt.
+    const histCtrl =
+      typeof AbortController === "function" ? new AbortController() : null;
+    const histTimer = histCtrl
+      ? setTimeout(() => histCtrl.abort(), 15000)
+      : null;
     try {
       hist = await getJSON(
         "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
+        histCtrl ? { signal: histCtrl.signal } : undefined,
       );
     } catch (e) {
       console.warn("coord history fetch failed", e);
       hist = null;
     } finally {
+      if (histTimer) clearTimeout(histTimer);
       refetchesInFlight--;
     }
     // A FAILED fetch keeps the pane intact: the wipe + tracking resets
