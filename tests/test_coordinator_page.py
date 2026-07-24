@@ -943,6 +943,21 @@ def test_coordinator_history_stale_latch_contract():
     )
     # destroy() must abort the in-flight fetch (dead-not-inert, the
     # staleRetryTimer ruling applied to the r7 bound).
+    # Producer pins first — the destroy() consumer sweep below is
+    # satisfiable by an always-empty Set without them.
+    assert body.count("histCtrls.add(histCtrl)") == 1, (
+        "every dispatch must register its controller in the abort Set."
+    )
+    assert body.count("histCtrls.delete(histCtrl)") == 1, (
+        "the fetch finally must release its own controller — without the "
+        "delete the Set grows for the life of the pane."
+    )
+    assert body.index("histCtrls.add(histCtrl)", fetch_start) < awt, (
+        "the controller must be registered BEFORE the await."
+    )
+    assert fin < body.index("histCtrls.delete(histCtrl)", fetch_start), (
+        "the controller release must sit in the fetch finally."
+    )
     destroy_code = _strip_comments(destroy_slice)
     assert "histCtrls.forEach" in destroy_code and ".abort()" in destroy_code, (
         "destroy() must abort EVERY in-flight /history (a Set — a "

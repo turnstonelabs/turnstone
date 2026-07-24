@@ -77,7 +77,7 @@ class NullUI:
         pass
 
 
-def _make_session(tmp_db) -> ChatSession:
+def _make_session(tmp_db, ws_id: str | None = None) -> ChatSession:
     return ChatSession(
         client=MagicMock(),
         model="test-model",
@@ -86,6 +86,7 @@ def _make_session(tmp_db) -> ChatSession:
         temperature=0.5,
         max_tokens=4096,
         tool_timeout=30,
+        ws_id=ws_id,
     )
 
 
@@ -439,16 +440,7 @@ def test_truncation_bumps_history_generation(tmp_db) -> None:
 
     storage = get_storage()
     storage.register_workstream("ws-gen-pin", kind="interactive", user_id="test-user")
-    session = ChatSession(
-        client=MagicMock(),
-        model="test-model",
-        ui=NullUI(),
-        instructions="",
-        temperature=0.5,
-        max_tokens=4096,
-        tool_timeout=30,
-        ws_id="ws-gen-pin",
-    )
+    session = _make_session(tmp_db, ws_id="ws-gen-pin")
     _populate_simple(session)
     for role, content in (
         ("user", "Hello"),

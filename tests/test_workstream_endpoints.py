@@ -2401,6 +2401,9 @@ class TestHistoryReasoningRehydration:
         provider_data = json.dumps([{"type": "thinking", "thinking": "hidden", "signature": "s"}])
         _inject_storage.save_message(ws_id, "assistant", "Answer.", provider_data=provider_data)
         live_session = SimpleNamespace(
+            # The real Workstream carries .session (ChatSession | None);
+            # the flight key's typed generation read requires the shape.
+            session=None,
             id=ws_id,
             _registry=SimpleNamespace(
                 get_config=lambda alias: SimpleNamespace(surface_persisted_reasoning=False)

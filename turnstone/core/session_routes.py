@@ -3471,7 +3471,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
     # isolation of every other lifted verb.  Touched only from the event
     # loop thread — no lock needed; the ``limit`` component is required
     # (a limit=10 caller must not receive a limit=500 payload).
-    flights: dict[tuple[str, int, int], asyncio.Task[_HistoryFlightResult]] = {}
+    flights: dict[tuple[str, int, int | None], asyncio.Task[_HistoryFlightResult]] = {}
 
     async def history(request: Request) -> Response:
         if cfg.permission_gate is not None:
@@ -3562,10 +3562,17 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # mgr.get returns the Workstream WRAPPER — the counter lives on
         # its ChatSession (the G7 harness caught a direct getattr
         # silently defaulting to 0 forever, which re-enabled joining).
-        live_gen = (
-            getattr(getattr(live_session, "session", None), "_history_generation", 0)
-            if live_session is not None
-            else 0
+        # Typed access, not getattr chains, so mypy carries the shape.
+        # A cold/detached workstream keys on None, NEVER 0: an eviction
+        # or close landing inside a held flight's window would otherwise
+        # let a post-truncation request join a generation-0 live flight
+        # (rewinds need a live session, so two COLD flights are always
+        # mutually safe — and a rehydrated session restarting at 0 can
+        # never share the manager slot with its evicted predecessor).
+        live_gen: int | None = (
+            live_session.session._history_generation
+            if live_session is not None and live_session.session is not None
+            else None
         )
         key = (ws_id, limit, live_gen)
         task = flights.get(key)
@@ -3615,7 +3622,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         return JSONResponse({"ws_id": ws_id, "messages": messages, "cursor": cursor})
 
     async def _run_flight(
-        key: tuple[str, int, int],
+        key: tuple[str, int, int | None],
         mgr: SessionManager,
         storage: Any,
         app_state: Any,

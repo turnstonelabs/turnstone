@@ -2747,7 +2747,16 @@ def _coord_stick_latch(cdp: CDP, node: Any, tag: str) -> None:
     clear_ui refetch AND its one bounded 2s retry, so only an organic
     idle-edge heal can clear it.  Extracted so G4's premise (latch stuck
     exactly as in G3) is enforced by construction, the same rationale
-    _seed_three_completed_turns documents for the E family."""
+    _seed_three_completed_turns documents for the E family.
+
+    RULED (r10): G2/G5 deliberately keep their single-failure prologues
+    inline rather than adopting this helper — their baseline captures
+    and phase timings interleave INTO the prologue steps (G2 snapshots
+    history_requests before the click; G5 hides the instant the fail
+    budget drains), so a parameterized version would need a flag per
+    divergence and obscure the choreography it exists to clarify.  The
+    helper serves the two double-failure scenarios whose premise must
+    match exactly."""
     if not _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
         raise AssertionError(f"{tag}: three user rows never rendered")
     if not _poll_until(lambda: cdp.evaluate("window.__esOpens") >= 1, 10, 0.05):

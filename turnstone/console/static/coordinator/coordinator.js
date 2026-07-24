@@ -5998,7 +5998,7 @@ function createCoordinatorPane(root, wsId, opts) {
     if (staleRetryTimer) {
       clearTimeout(staleRetryTimer);
       staleRetryTimer = null;
-  
+
     }
     toolRows.clear();
     activeBatch = null;
