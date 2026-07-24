@@ -2804,7 +2804,16 @@ def run_await_window_gate(chrome: str) -> str:
     after ``history_requests`` proves the held fetch both arrived AND
     returned.  Without the gate the render lands and stamps rows1-latch0,
     because a successful replayHistory is the latch's only clear site."""
-    node, ws_id = _seed_three_completed_turns("browser-await-window-gate")
+    from tests._sse_recovery_server import final_text_script
+
+    # The heal-driving send needs its OWN scripted turn: an exhausted script
+    # queue still settles (into the error arm, which the backstop also
+    # consumes), so relying on it would let this scenario pass for a reason
+    # it does not name.
+    node, ws_id = _seed_three_completed_turns(
+        "browser-await-window-gate",
+        extra_scripts=(final_text_script(BACKSTOP_SENTINEL),),
+    )
     profile = Path(_scratch()) / "chrome-await-window-gate"
     proc, cdp_port = _launch_chrome(chrome, profile)
     cdp: CDP | None = None
@@ -2852,7 +2861,13 @@ def run_await_window_gate(chrome: str) -> str:
             raise AssertionError("await-window-gate: show-edge reconnect never arrived")
         _send_in_page(cdp, "fourth turn")
         healed = _poll_until(
-            lambda: cdp.evaluate(_ROWS_JS + " === 2 && window.__pane._historyStale === false"),
+            lambda: cdp.evaluate(
+                _ROWS_JS
+                + " === 2 && window.__pane._historyStale === false"
+                + " && (window.__pane.messagesEl.textContent||'').includes("
+                + json.dumps(BACKSTOP_SENTINEL)
+                + ")"
+            ),
             20,
             0.2,
         )
