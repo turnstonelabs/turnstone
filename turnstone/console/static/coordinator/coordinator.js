@@ -669,6 +669,14 @@ function createCoordinatorPane(root, wsId, opts) {
   // ``if (!hist)`` is synchronous, so no timer or SSE handler can observe
   // the counter mid-render.
   let refetchesInFlight = 0;
+  // Monotonic refetchHistory dispatch stamp.  Each call captures
+  // ``++refetchSeq`` before its await; the render-time gate discards any
+  // payload whose stamp is no longer current, so overlapping fetches
+  // (reachable via another actor's clear_ui racing a heal) resolve
+  // last-DISPATCH-wins deterministically instead of last-RESPONSE-wins —
+  // an older snapshot landing late can neither double-render nor clear
+  // the staleness latch over a newer truth.
+  let refetchSeq = 0;
   // The cursor position a replay_truncated envelope was received AT — i.e.
   // "a gap of lost events exists BELOW this cursor".  Keep-oldest: set only
   // when null (repeated envelopes for the same unrepaired gap must not
@@ -3532,31 +3540,41 @@ function createCoordinatorPane(root, wsId, opts) {
             // with /history down that is a zero-backoff disconnect/refetch/
             // reconnect storm against a recovering node (interactive.js's
             // round-5 critical), self-sustaining until /history recovers.
-            // A plain REST refetch emits zero SSE events, so the trigger
-            // edge is only ever organic (turn-settle driven; the server
-            // pushes no state_change heartbeats) and the loop is
-            // structurally impossible.  Stream death has its own owners
-            // (EventSource native auto-reconnect, the truncated resync in
-            // the branch above — whose heal legitimately IS a reconnect:
-            // its stream is dead, this arm's is alive) and the else-if
-            // keeps the truncated branch's reload from doubling up (its
-            // render clears this latch too).
+            // A plain REST refetch emits zero SSE events, so this heal
+            // never CAUSES its own trigger and the self-loop is
+            // structurally impossible.  Precision on the trigger edges
+            // (r5): turn settles are the main one, but fresh/truncated
+            // SSE replays also carry a synthetic state_change (replay_ok
+            // does not) — so a latched pane pays one refetch per
+            // reconnect too.  That edge is bounded by the reconnect
+            // machinery's own jitter/backoff, is user/transport-driven
+            // rather than heal-driven, and the restart-herd /history load
+            // is bounded server-side by #884's single-flight — ruled
+            // acceptable; do NOT bolt a client-side limiter onto this arm
+            // (and never a transport-touching one).  Stream death has its
+            // own owners (EventSource native auto-reconnect, the
+            // truncated resync in the branch above — whose heal
+            // legitimately IS a reconnect: its stream is dead, this arm's
+            // is alive) and the else-if keeps the truncated branch's
+            // reload from doubling up (its render clears this latch too).
             //
             // The ref guards are a DELIBERATE divergence from the
             // interactive template (which omits them on its backstop):
             // interactive's replayHistory resets the streaming refs on
             // every render, coord's refetchHistory does not — and this arm
-            // also serves state_change:error edges, where no stream_end ran
-            // finishAssistantStream and a live-bubble ref can survive.
-            // Firing then would replaceChildren the bubble out from under
-            // the dangling ref; skipping defers the heal to the next
-            // organic settle (that turn's stream_end nulls the refs).
-            // Correctness never rides this arm — the busy||historyStale
-            // gate carries it; heals are liveness only.  Accepted liveness
-            // lag (ruled): if /history recovers while the pane sits idle
-            // untouched, rewind/edit stay closed until the next organic
-            // settle — strictly safer than the storm.  Do not add ANY
-            // transport-touching timer to shorten it.
+            // also serves state_change:error edges, where no stream_end
+            // ran finishAssistantStream and a live-bubble ref can
+            // survive.  Post-r5 the render-time gate in refetchHistory
+            // carries the wipe-safety correctness; these fire-time guards
+            // are the efficiency layer — they skip a fetch whose payload
+            // the gate would discard (a latched pane draining a K-deep
+            // send queue still pays one discarded fetch per settle edge
+            // it loses the race on; ruled acceptable — per-pane cost
+            // rides organic edges only and #884 coalesces the herd).
+            // Accepted liveness lag (ruled): if /history recovers while
+            // the pane sits idle untouched, rewind/edit stay closed until
+            // the next organic settle — strictly safer than the storm.
+            // Do not add ANY transport-touching timer to shorten it.
             //
             // Fire-and-forget, seedless: the stream is alive so lastEventId
             // must not rewind; no composer state rides this heal (that is
@@ -3678,11 +3696,12 @@ function createCoordinatorPane(root, wsId, opts) {
             // in flight (!refetchesInFlight — yield instead of stomping it
             // with a same-snapshot double render), mid-turn (!busy — the
             // idle-edge backstop owns the busy case, e.g. the edit-resend
-            // dispatched below), a live bubble (the ref guards are
-            // LOAD-BEARING: refetchHistory does not reset streaming refs,
-            // so a wipe would strand a dangling ref), or torn down
-            // (visHandler — destroy() also cancels this timer outright,
-            // but coordCloseSession only nulls visHandler).
+            // dispatched below), a live bubble (the ref guards skip a
+            // fetch whose payload refetchHistory's render-time gate would
+            // discard — the gate carries the wipe-safety correctness,
+            // these are the efficiency layer), or torn down (visHandler —
+            // destroy() also cancels this timer outright, but
+            // coordCloseSession only nulls visHandler).
             //
             // The ARM is visHandler-gated too: this .then can settle AFTER
             // a teardown (destroy/close-session during the in-flight
@@ -3703,17 +3722,20 @@ function createCoordinatorPane(root, wsId, opts) {
                   !currentAssistantEl &&
                   !currentReasoningEl &&
                   visHandler &&
-                  evtSource
+                  evtSource &&
+                  evtSource.readyState === EventSource.OPEN
                 ) {
-                  // evtSource: a seedless heal must not render past a
-                  // frozen cursor (close-on-hide keeps this timer armed by
-                  // design, so the fire can land with the transport down)
-                  // — skip; the latch survives and the show-edge
-                  // reconnect's synthetic idle hands the heal to the
-                  // backstop.  The backstop itself needs no such term: it
-                  // runs inside SSE dispatch, so its stream is live by
+                  // Stream must be OPEN, not merely present: close-on-hide
+                  // keeps this timer armed by design (the fire can land
+                  // with the transport down), and a CONNECTING source has
+                  // a frozen cursor with a pending replay — a seedless
+                  // fetch then would render past it (double-render when
+                  // the replay lands).  Skip instead; the latch survives
+                  // and the next organic settle re-fires the backstop.
+                  // The backstop itself needs no such term: it runs
+                  // inside SSE dispatch, so its stream is live by
                   // construction.  refetchHistory's render-time gate
-                  // re-checks both invariants across the await window.
+                  // re-checks every invariant across the await window.
                   // Fire-and-forget, seedless (live stream — lastEventId
                   // must not rewind); a render throw stays loud, as on the
                   // backstop.
@@ -5751,7 +5773,9 @@ function createCoordinatorPane(root, wsId, opts) {
     // in-flight fetch (see refetchesInFlight's decl).  Only the fetch
     // needs bracketing: the render below runs synchronously after the
     // await, so no timer or SSE handler can observe the counter
-    // mid-render.
+    // mid-render.  The seq stamp makes overlapping dispatches resolve
+    // last-dispatch-wins at the render-time gate.
+    const seq = ++refetchSeq;
     refetchesInFlight++;
     try {
       hist = await getJSON(
@@ -5775,41 +5799,77 @@ function createCoordinatorPane(root, wsId, opts) {
     // refetch.)  Success ordering is unchanged: the wipe always ran
     // after the await, never as immediate feedback.
     if (!hist) return;
-    // RENDER-TIME gate (#894 r4): the await above is a real window — pane
-    // state can change between a caller's fire-time checks and this
-    // render, and only THIS site can see across it (chokepoint, not
-    // per-caller guards).  Two invariants must hold at the wipe itself:
+    // RENDER-TIME gate (#894 r4, re-derived r5): the await above is a
+    // real window — pane state can change between a caller's fire-time
+    // checks and this render, and only THIS site can see across it
+    // (chokepoint, not per-caller guards).  The gate reads DOM-LIVE-STATE
+    // signals, never plain ``busy`` — that distinction is the r5 lesson:
+    // ``busy`` means "a turn is executing", not "this DOM holds live turn
+    // state", and the two diverge exactly where it hurt.  _editAndResend
+    // flips busy BEFORE its POST and /rewind emits only clear_ui (no
+    // state_change), so a busy term skipped the truncation render the
+    // rewind exists to produce and appended the resent bubble onto the
+    // PRE-rewind transcript; /retry's regenerated turn likewise raced its
+    // own clear_ui refetch.  A skipped render must only ever mean "the
+    // wipe would destroy live DOM" or "the paint would outrun the
+    // cursor":
     //
-    // 1. No live turn mid-stream.  A turn can START during the fetch (the
-    //    server drains queued sends at exactly the idle edges the
-    //    backstop rides; another operator on a shared coordinator can
-    //    send any time; coordSend paints an optimistic user row).  This
-    //    render does not reset the streaming refs, so replaceChildren
-    //    would detach the live bubble — every remaining token renders
-    //    into the dangling ref (invisible), and the optimistic user row
-    //    is destroyed with nothing to repaint it.  Skip instead: if the
-    //    staleness latch is set it stays set (clear is below), the gate
-    //    stays closed, and the turn's own settle re-fires the backstop.
-    // 2. Seedless renders need an IDLE pane on a LIVE stream.  busy: the
-    //    ref check above only sees the CONTENT phase — a turn in its tool
-    //    phase has null content refs but live tool rows, and the wipe +
-    //    toolRows.clear() below would orphan them mid-stream identically.
-    //    evtSource: a seedless render must not advance the DOM past a
-    //    frozen lastEventId (hide/suspend can land mid-fetch) — the
-    //    show-edge reconnect replays from the frozen cursor and every
-    //    turn this render already painted would render twice.  Seeded
-    //    callers (init, loadHistoryThenReconnect) own their reconnect
-    //    flow — they adopt hist.cursor below, and the truncated resync
-    //    legitimately rebuilds MID-turn — so both requirements key on the
-    //    seedCursor ARG, not caller identity.  On skip the latch
-    //    survives; the next organic settle (or the show-edge reconnect's
-    //    synthetic idle) re-fires the backstop.
+    // - seq (universal): a newer dispatch supersedes this payload
+    //   (last-DISPATCH-wins; see refetchSeq's decl).
+    // - content refs (universal): a live bubble ref means the stream is
+    //   mid-CONTENT — wiping detaches the node every remaining token
+    //   renders into.  Universal because skipping always beats
+    //   stranding a ref, and the seeded callers null their refs before
+    //   fetching anyway (loadHistoryThenReconnect explicitly; init
+    //   pre-connect), so this never blocks them.
+    // - SEEDLESS-only, because the seeded flows deliberately render
+    //   over/instead-of these states (keying on the seedCursor ARG, not
+    //   caller identity):
+    //   . .conv-batch--running — an executing tool batch
+    //     (_setBatchRunning / _unsetBatchRunningIfAllResults strip the
+    //     class only when every row has its result).  NOT activeBatch —
+    //     that is the pending-APPROVAL tracker (set only for
+    //     opts.pending batches; the r5 re-derivation initially made
+    //     exactly that mistake).  On a seedless caller the stream is
+    //     live, so the class means results are still streaming into
+    //     those rows — wiping orphans them.  On the SEEDED resync the
+    //     marker can be a DEAD turn's residue (node died mid-batch; no
+    //     result will ever strip the class) and the render IS the
+    //     recovery — the replay adopts hist.cursor and rebuilds any
+    //     genuinely live turn.  Blocking that render wedged the
+    //     coord-restart recovery outright (r5 family-run find).
+    //   . busySource === "optimistic" — coordSend's pre-POST flip, the
+    //     one busy flavor that marks un-committed DOM (an optimistic
+    //     row the snapshot may not carry; see setBusy's contract).  The
+    //     seeded resync renders through it: dead-stream recovery
+    //     outranks a transient row, matching pre-#894 behavior.  The
+    //     clear_ui .then's edit-resend paints under plain "server" busy
+    //     instead; its narrower wipe window (a second actor's clear_ui
+    //     inside the resend's commit gap) is accepted — the resent
+    //     message re-appears at its turn's settle heal, and pre-#894
+    //     behavior there was an over-rewind.
+    //   . stream-OPENness — CONNECTING is NOT live (native
+    //     auto-reconnect keeps the handle with a frozen lastEventId and
+    //     a pending replay; painting past the cursor double-renders
+    //     when that replay lands; hide/suspend null the handle
+    //     outright).  The seeded flows own their reconnect and adopt
+    //     hist.cursor below.
     //
-    // The callers' fire-time ref/stream guards remain as the efficiency
-    // layer (skip the pointless fetch); THIS gate is the correctness
-    // carrier.
+    // On every skip the staleness latch survives (clear is below), the
+    // affordance gate stays closed, and the next organic settle re-fires
+    // the backstop.  The callers' fire-time guards remain as the
+    // efficiency layer (skip the pointless fetch); THIS gate is the
+    // correctness carrier.
+    if (seq !== refetchSeq) return;
     if (currentAssistantEl || currentReasoningEl) return;
-    if (!seedCursor && (busy || !evtSource)) return;
+    if (
+      !seedCursor &&
+      (busySource === "optimistic" ||
+        messagesEl.querySelector(".conv-batch--running") ||
+        !evtSource ||
+        evtSource.readyState !== EventSource.OPEN)
+    )
+      return;
     messagesEl.replaceChildren();
     // A full committed-history render repairs any recorded truncation gap —
     // whether this render came from the truncated resync itself or from an

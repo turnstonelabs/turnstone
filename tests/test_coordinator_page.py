@@ -600,6 +600,13 @@ def test_coordinator_history_stale_latch_contract():
       6. destroy() cancels staleRetryTimer (terminal-only) while
          closeStreamTransport does NOT (transport redials keep the heal
          intent alive).
+      7. The render-time gate (r5-derived): refetchHistory re-checks
+         DOM-live-state (content refs / the --running batch marker / the optimistic-send
+         flavor of busy — never plain busy, the r5 critical), dispatch
+         currency (seq), and seedless stream-OPENness AFTER the await and
+         BEFORE the wipe — and the latch-clear sits below every skip
+         point, so a skipped render can never reopen the affordances over
+         a stale DOM.
     """
     from pathlib import Path
 
@@ -704,21 +711,26 @@ def test_coordinator_history_stale_latch_contract():
         "(mirrors interactive's !_replayQueue pin)."
     )
     assert "visHandler" in retry_fire, (
-        "the retry's fire guard must carry the teardown sentinel — it is "
-        "the SOLE protection for the coordCloseSession path, which nulls "
-        "visHandler but does not cancel the timer."
+        "the retry's fire guard must carry the teardown sentinel for the "
+        "coordCloseSession path, which nulls visHandler but does not "
+        "cancel the timer (evtSource is also null there post-suspend, "
+        "but the sentinel is the durable term)."
     )
     assert "!currentAssistantEl" in retry_fire and "!currentReasoningEl" in retry_fire, (
-        "the retry's ref guards are LOAD-BEARING (coord's refetchHistory "
-        "does not reset streaming refs) — must not be deleted to match "
-        "interactive's quiesce-protected shape."
+        "the retry's ref guards skip a pointless fetch whose payload the "
+        "render-time gate would discard (the chokepoint carries the "
+        "correctness; these are the efficiency layer — keep them)."
     )
-    assert "visHandler &&\n                  evtSource\n                ) {" in body, (
-        "the retry's fire guard must require a live stream (evtSource): "
-        "close-on-hide keeps this timer armed by design, and a seedless "
-        "heal on a dead stream renders past the frozen cursor (replay "
-        "double-render on the show edge).  Exact-tail pin so a comment "
-        "mention cannot satisfy it; re-anchor if the guard reflows."
+    assert (
+        "visHandler &&\n                  evtSource &&\n"
+        "                  evtSource.readyState === EventSource.OPEN\n"
+        "                ) {" in body
+    ), (
+        "the retry's fire guard must require an OPEN stream — not handle "
+        "existence: CONNECTING keeps the handle with a frozen cursor and "
+        "a pending replay, and a seedless heal then double-renders when "
+        "the replay lands.  Exact-tail pin so a comment mention cannot "
+        "satisfy it; re-anchor if the guard reflows."
     )
     assert "if (staleRetryTimer) clearTimeout(staleRetryTimer);" in body, (
         "re-arming on a newer clear_ui must cancel the pending timer "
@@ -748,24 +760,6 @@ def test_coordinator_history_stale_latch_contract():
         "the very window the yield guards protect."
     )
 
-    # 7. Render-time gate: the post-await re-checks must sit between the
-    #    failure guard and the wipe.  The await is a real window — a turn
-    #    can START mid-fetch (refs re-check; a wipe then would detach the
-    #    live bubble and lose the turn into the dangling ref), and a
-    #    seedless render must not paint past a frozen cursor when the
-    #    stream died mid-fetch (hide/suspend) or the show-edge replay
-    #    double-renders.  Caller-side guards cannot see across the await;
-    #    only this chokepoint can.
-    hist_guard = body.index("if (!hist) return;", fetch_start)
-    ref_gate = body.index("if (currentAssistantEl || currentReasoningEl) return;", fetch_start)
-    live_gate = body.index("if (!seedCursor && (busy || !evtSource)) return;", fetch_start)
-    wipe = body.index("messagesEl.replaceChildren();", fetch_start)
-    assert hist_guard < ref_gate < wipe and hist_guard < live_gate < wipe, (
-        "refetchHistory must re-check the live-turn refs AND seedless "
-        "stream-liveness AFTER the await and BEFORE the wipe — the "
-        "render-time correctness carrier for every caller."
-    )
-
     # 6. Teardown: terminal cancel in destroy(); NOT in closeStreamTransport.
     destroy_slice = body[body.index("function destroy()") :]
     destroy_slice = destroy_slice[: destroy_slice.index("\n  function ")]
@@ -778,6 +772,72 @@ def test_coordinator_history_stale_latch_contract():
     assert "clearTimeout(staleRetryTimer)" not in cst_slice, (
         "closeStreamTransport must NOT cancel the stale retry — transport "
         "redials keep the pending heal intent (terminal-only cancel)."
+    )
+
+    # 7. Render-time gate (r5-derived, seedless-scoped after the
+    #    coord-restart family find): the post-await re-checks sit between
+    #    the failure guard and the wipe, so the latch-clear (below the
+    #    wipe) sits below every skip point by construction.  Universal
+    #    terms: dispatch currency (seq) and the content refs (skipping
+    #    always beats stranding a ref; seeded callers null theirs before
+    #    fetching, so it never blocks them).  SEEDLESS-only terms —
+    #    keyed on the seedCursor ARG: the .conv-batch--running marker
+    #    (on a live stream it means results are streaming into those
+    #    rows; on the SEEDED resync it can be a dead turn's residue and
+    #    the render IS the recovery — a universal term wedged
+    #    coord-restart outright), the optimistic-send busySource flavor,
+    #    and stream-OPENness (CONNECTING keeps the handle with a frozen
+    #    cursor and a pending replay).  Plain ``busy`` must not appear:
+    #    it means a turn is EXECUTING, not that this DOM holds live
+    #    state (the r5 critical).
+    hist_guard = body.index("if (!hist) return;", fetch_start)
+    wipe = body.index("messagesEl.replaceChildren();", fetch_start)
+    latch_clear = body.index("historyStale = false;", fetch_start)
+    assert hist_guard < wipe < latch_clear, (
+        "the wipe must sit between the failure guard and the latch-clear "
+        "— every gate skip above the wipe then leaves the latch set."
+    )
+    gate_code = "\n".join(
+        line for line in body[hist_guard:wipe].splitlines() if not line.lstrip().startswith("//")
+    )
+    for term, why in (
+        ("if (seq !== refetchSeq) return;", "dispatch-currency (seq)"),
+        (
+            "if (currentAssistantEl || currentReasoningEl) return;",
+            "universal content-ref",
+        ),
+        ("!seedCursor &&", "seedless scoping"),
+        ('busySource === "optimistic"', "optimistic-row"),
+        ('messagesEl.querySelector(".conv-batch--running")', "executing-batch"),
+        ("evtSource.readyState !== EventSource.OPEN", "stream-OPENness"),
+    ):
+        assert term in gate_code, (
+            f"the render-time gate must carry the {why} term (in CODE, not a comment)."
+        )
+    seedless_at = gate_code.index("!seedCursor &&")
+    assert gate_code.index("if (seq !== refetchSeq) return;") < seedless_at, (
+        "seq currency must be checked before the seedless group."
+    )
+    assert gate_code.index("if (currentAssistantEl || currentReasoningEl) return;") < seedless_at, (
+        "the universal ref check must precede the seedless group."
+    )
+    for term in (
+        'busySource === "optimistic"',
+        ".conv-batch--running",
+        "evtSource.readyState !== EventSource.OPEN",
+    ):
+        assert seedless_at < gate_code.index(term), (
+            f"{term} must live INSIDE the !seedCursor group — the seeded "
+            "resync renders over a dead --running batch / an optimistic "
+            "row deliberately (blocking it wedges the coord-restart "
+            "recovery)."
+        )
+    assert not re.search(r"\bbusy\b(?!Source)", gate_code), (
+        "plain busy must not gate the render — busy means a turn is "
+        "EXECUTING, not that this DOM holds live state (the r5 critical: "
+        "_editAndResend flips busy before its POST and /rewind emits no "
+        "state_change, so a busy term skips the truncation render the "
+        "rewind exists to produce)."
     )
 
 

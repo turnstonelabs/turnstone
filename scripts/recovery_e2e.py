@@ -133,10 +133,10 @@ Scenario G5 (coord-hidden-retry, #894 r4): the retry's stream-liveness
 fire guard.  A retry armed before close-on-hide must NOT fetch while the
 transport is down (a seedless render past the frozen ``lastEventId``
 double-renders on the show-edge replay): ``history_requests`` UNCHANGED
-across the hidden fire window (``hidden0``).  A quiet reconnect delivers
-no state_change edge, so post-show the latch stays closed (the accepted
-liveness-lag residual) until the runner drives an ORGANIC settle with a
-plain send; that idle edge fires the TRANSPORT-FREE backstop on the live
+across the hidden fire window (``hidden0``).  A replay_ok reconnect
+carries no synthetic state_change (only fresh/truncated replays do), so
+post-show the latch stays closed (the accepted liveness-lag residual)
+until the runner drives an ORGANIC settle with a plain send; that idle edge fires the TRANSPORT-FREE backstop on the live
 stream (exactly ONE new SSE open across show + heal — the user-driven
 reconnect; the heal adds zero).  Stamps
 ``RECOVERY-READY-COORDHIDDENRETRY-hidden0-heal1``.
@@ -958,6 +958,42 @@ COORD_PAGE_HTML = r"""<!doctype html>
             userRows;
       };
 
+      // G3 — the TRANSPORT-FREE idle-edge backstop.  Mirrors
+      // __verifyStaleBackstop; the storm assertion is sseDelta === 0 (the
+      // heal opened ZERO EventSource connections — a reconnecting backstop
+      // bumps events_requests once per reconnect and self-triggers).  The
+      // latch-cleared proof is the reopen POST (posts 2), not a field read:
+      // coord's latch is closure-private.
+      window.__verifyCoordStaleBackstop = function (
+        healed,
+        sseDelta,
+        histDelta,
+        gatedPosts,
+        posts,
+      ) {
+        const userRows = _coordUserRows();
+        const ok =
+          healed &&
+          sseDelta === 0 &&
+          histDelta === 1 &&
+          gatedPosts === 1 &&
+          posts === 2;
+        document.title = ok
+          ? "RECOVERY-READY-COORDSTALEBACKSTOP-heal1-sse0"
+          : "RECOVERY-FAILED-COORDSTALEBACKSTOP-heal" +
+            (healed ? 1 : 0) +
+            "-sse" +
+            sseDelta +
+            "-hist" +
+            histDelta +
+            "-gated" +
+            gatedPosts +
+            "-posts" +
+            posts +
+            "-rows" +
+            userRows;
+      };
+
       // G4 — the render-time gate (#894 r4): a turn that STARTS during a
       // heal's in-flight /history must SURVIVE its resolution (the gate
       // skips the wipe; pre-gate code detached the live turn into a
@@ -1022,42 +1058,6 @@ COORD_PAGE_HTML = r"""<!doctype html>
             userRows;
       };
 
-      // G3 — the TRANSPORT-FREE idle-edge backstop.  Mirrors
-      // __verifyStaleBackstop; the storm assertion is sseDelta === 0 (the
-      // heal opened ZERO EventSource connections — a reconnecting backstop
-      // bumps events_requests once per reconnect and self-triggers).  The
-      // latch-cleared proof is the reopen POST (posts 2), not a field read:
-      // coord's latch is closure-private.
-      window.__verifyCoordStaleBackstop = function (
-        healed,
-        sseDelta,
-        histDelta,
-        gatedPosts,
-        posts,
-      ) {
-        const userRows = _coordUserRows();
-        const ok =
-          healed &&
-          sseDelta === 0 &&
-          histDelta === 1 &&
-          gatedPosts === 1 &&
-          posts === 2;
-        document.title = ok
-          ? "RECOVERY-READY-COORDSTALEBACKSTOP-heal1-sse0"
-          : "RECOVERY-FAILED-COORDSTALEBACKSTOP-heal" +
-            (healed ? 1 : 0) +
-            "-sse" +
-            sseDelta +
-            "-hist" +
-            histDelta +
-            "-gated" +
-            gatedPosts +
-            "-posts" +
-            posts +
-            "-rows" +
-            userRows;
-      };
-
       window.__verifyCoordRestart = function () {
         // Same contract as Scenario B, read off the coordinator's public
         // chrome + the transport wrapper (idle is asserted SERVER-side by
@@ -1091,7 +1091,6 @@ COORD_PAGE_HTML = r"""<!doctype html>
   </body>
 </html>
 """
-
 
 # ---------------------------------------------------------------------------
 # Minimal dependency-free CDP client (WebSocket over a raw socket).
@@ -2808,17 +2807,19 @@ def run_coord_heal_midturn(chrome: str) -> str:
     seeds two/three gone.  Storm proof: zero SSE opens across the whole
     episode; exactly TWO /history fetches (the skipped one + the heal).
 
-    Detector honesty: ``history_delta == 2`` is the DISCRIMINATING bit.
+    Detector honesty: ``history_delta == 2`` is the DISCRIMINATING bit,
+    and the skip it witnesses rides the ``.conv-batch--running`` DOM
+    marker — turn 5 is in its TOOL phase at resolution (content refs
+    null), so this scenario is the behavioral detector for the gate's
+    tool-phase branch (the content-ref branch and the liveness statement
+    carry structural pins; G5 covers the hidden-retry liveness path).
     Gate-stripped code renders the held fetch early, which CLEARS the
     latch, kills the backstop refire, and stamps ``hist1`` (plus
     downstream posts/rows drift).  The ``mid1`` bit alone cannot
-    discriminate here: the early render repaints all three user rows from
-    the snapshot (the rewind pre-dates turn 4, so /history already
-    carries turns 4 and 5's user rows), and turn 5's tool phase has null
-    content refs — its per-token loss surface is the TOOL rows, which
-    this scenario does not fingerprint.  On gated code ``mid1`` asserts
-    the stronger continuous-visibility claim (nothing wiped at any
-    point)."""
+    discriminate: the early render repaints all three user rows from the
+    snapshot (the rewind pre-dates turn 4, so /history already carries
+    turns 4 and 5's user rows).  On gated code ``mid1`` asserts the
+    stronger continuous-visibility claim (nothing wiped at any point)."""
     from tests._sse_recovery_server import final_text_script, parallel_bash_script
 
     paced5 = parallel_bash_script({"g4": "for i in $(seq 1 50); do echo g4-$i; sleep 0.05; done"})
@@ -2939,8 +2940,9 @@ def run_coord_hidden_retry(chrome: str) -> str:
     (hiddenDelta 0); on show, the reconnect's synthetic idle re-fires the
     TRANSPORT-FREE backstop, which heals on the live stream.
 
-    A quiet reconnect delivers NO state_change edge, so the latch stays
-    closed after __show until the next ORGANIC settle — exactly the
+    A replay_ok reconnect (frozen cursor, nothing lost) carries no
+    synthetic state_change — only fresh/truncated replays do — so the
+    latch stays closed after __show until the next ORGANIC settle — exactly the
     accepted-residual ruling (heals ride organic edges; no timer may
     shortcut the lag).  The runner drives that settle with a plain send
     (sends are never latch-gated), whose turn-settle idle edge fires the
@@ -2987,9 +2989,11 @@ def run_coord_hidden_retry(chrome: str) -> str:
         # (the hidden fetch lands) and hiddenDelta stamps 1.
         _poll_until(lambda: node.history_requests != hidden_baseline, 3.5, 0.1)
         hidden_delta = node.history_requests - hidden_baseline
-        # Show: the reconnect presents the frozen cursor.  A quiet
-        # reconnect delivers NO state_change edge (the latch-closed lag is
-        # the accepted residual), so wait for the reconnect itself, then
+        # Show: the reconnect presents the frozen cursor and replays
+        # replay_ok (nothing lost), which carries NO synthetic
+        # state_change (only fresh/truncated replays do — the
+        # latch-closed lag is the accepted residual).  Wait for the
+        # reconnect itself, then
         # drive an ORGANIC settle with a plain send — its idle edge fires
         # the TRANSPORT-FREE backstop on the live stream and the heal
         # renders the rewound (ONE) + sent (a second) transcript.
