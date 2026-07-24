@@ -29,6 +29,7 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario coord-heal-midturn         # G4 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-hidden-retry         # G5 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-orphan-rewind        # G6 (#894 r6)
+    python3 scripts/recovery_e2e.py --scenario coord-joined-flight        # G7 (#894 r8)
     python3 scripts/recovery_e2e.py --scenario roster-restart    # F1 (#881)
     python3 scripts/recovery_e2e.py --scenario roster-restart-native  # F2 (#881)
     python3 scripts/recovery_e2e.py --scenario both   # A+B only (legacy)
@@ -155,6 +156,19 @@ post-recovery, then the orphan is wiped and the rewound truth paints
 (the server keeps the user message and removes the unresulted assistant
 turn), posts 1, ``history_requests`` grew.  Stamps
 ``RECOVERY-READY-COORDORPHANREWIND-posts1-rows1-orphan0``.
+
+Scenario G7 (coord-joined-flight, #894 r8): the joined-flight window.
+Two browsers on one ws; ``delay_load`` parks B's pre-rewind /history
+flight open INSIDE ``load_messages`` (the flight layer — the fault
+layer's ``delay_history`` cannot overlap flights); A rewinds mid-hold.
+A's clear_ui refetch must MISS the held flight — the server folds the
+truncation generation into the #884 flight key — proven by
+``load_calls`` growing TWO (a joined request never enters
+``load_messages``) and A rendering the post-rewind single row.
+Pre-fix, A JOINED the pre-rewind flight (loads1), painted three stale
+rows as fresh truth, and cleared the latch — the over-rewind window
+through the server seam.  Stamps
+``RECOVERY-READY-COORDJOINEDFLIGHT-posts1-loads2-rows1``.
 
 Scenario A (storm): the page connects, POSTs ``/send`` on stream-open (so
 the listener is registered first), the node runs a 4-parallel-bash
@@ -1105,6 +1119,31 @@ COORD_PAGE_HTML = r"""<!doctype html>
             userRows +
             "-orphan" +
             (orphan ? 1 : 0);
+      };
+
+      // G7 — the joined-flight window (#894 r8): a clear_ui refetch
+      // dispatched after a rewind must MISS any in-flight pre-rewind
+      // /history reconstruction (the server folds the truncation
+      // generation into its #884 flight key).  Pre-fix, the join handed
+      // A a pre-rewind payload that painted as fresh truth and cleared
+      // the latch — histDelta 1 (joined, one reconstruction) and three
+      // stale rows; fixed, A draws its own flight — histDelta 2, the
+      // rewound single row.
+      window.__verifyCoordJoinedFlight = function (posts, loadDelta) {
+        const userRows = _coordUserRows();
+        // loadDelta === 2: A's post-rewind dispatch entered load_messages
+        // itself (a joined request never does — the flight-layer miss
+        // proof).  userRows === 1: the post-rewind truth painted; the
+        // joined pre-rewind payload paints three.
+        const ok = posts === 1 && loadDelta === 2 && userRows === 1;
+        document.title = ok
+          ? "RECOVERY-READY-COORDJOINEDFLIGHT-posts1-loads2-rows1"
+          : "RECOVERY-FAILED-COORDJOINEDFLIGHT-posts" +
+            posts +
+            "-loads" +
+            loadDelta +
+            "-rows" +
+            userRows;
       };
 
       window.__verifyCoordRestart = function () {
@@ -3189,6 +3228,90 @@ def run_coord_orphan_rewind(chrome: str) -> str:
         node.stop()
 
 
+def run_coord_joined_flight(chrome: str) -> str:
+    """Scenario G7 — the joined-flight window (#894 r8).  The #884
+    /history single-flight coalesces concurrent requests per
+    (ws_id, limit); before the r8 server fix a clear_ui refetch
+    dispatched AFTER a rewind could JOIN a flight whose load_messages
+    ran BEFORE the truncation committed — the joined pre-rewind payload
+    painted as fresh truth (the client's dispatch stamp is current; the
+    staleness is the flight's transaction point) and cleared the latch:
+    the original over-rewind window, resurrected through the server
+    seam.  The fix folds ChatSession._history_generation (bumped in
+    _persist_truncation, the shared rewind/retry chokepoint) into the
+    flight key, so post-truncation dispatches can never join
+    pre-truncation flights.
+
+    Choreography: page A paints three rows; ``delay_load`` then holds
+    every reconstruction open INSIDE ``load_messages`` (the flight
+    layer — ``delay_history`` sleeps in the fault layer, before the
+    route, where flights never overlap); page B (a second browser on
+    the SAME ws) navigates, parking a pre-rewind flight; A rewinds
+    mid-hold — its clear_ui refetch must MISS B's held flight
+    (``load_calls`` grows by TWO: a joined request never enters
+    ``load_messages`` — the e2e twin of the unit test's proof) and
+    render the POST-rewind single row once the holds release.  Pre-fix
+    stamps loads1 (joined) with three stale rows painted as fresh
+    truth."""
+    node, ws_id = _seed_three_completed_turns("browser-coord-joined-flight")
+    profile_a = Path(_scratch()) / "chrome-coord-joined-a"
+    profile_b = Path(_scratch()) / "chrome-coord-joined-b"
+    proc_a, cdp_port_a = _launch_chrome(chrome, profile_a)
+    proc_b = None
+    cdp_a: CDP | None = None
+    cdp_b: CDP | None = None
+    try:
+        cdp_a = CDP(_page_ws_url(cdp_port_a))
+        url = f"{node.base_url}/coord-recovery?ws_id={ws_id}&scenario=coord-joined-flight"
+        _set_cookie_and_navigate(cdp_a, node.base_url, node.token, url)
+        if not _poll_until(lambda: cdp_a.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
+            raise AssertionError("coord-joined-flight: A's three user rows never rendered")
+        if not _poll_until(lambda: (cdp_a.evaluate("window.__esOpens") or 0) >= 1, 10, 0.05):
+            raise AssertionError("coord-joined-flight: A's SSE stream never opened")
+        load_baseline = node.load_calls
+        # Hold every reconstruction open INSIDE load_messages (the flight
+        # layer — delay_history sleeps in the fault layer, before the
+        # route, where flights never overlap), then park B's pre-rewind
+        # flight under the hold.
+        node.delay_load(3000)
+        proc_b, cdp_port_b = _launch_chrome(chrome, profile_b)
+        cdp_b = CDP(_page_ws_url(cdp_port_b))
+        _set_cookie_and_navigate(cdp_b, node.base_url, node.token, url)
+        if not _poll_until(lambda: node.load_calls == load_baseline + 1, 15, 0.05):
+            raise AssertionError("coord-joined-flight: B's flight never entered load_messages")
+        # A rewinds mid-hold: second row -> 2 turns -> server keeps one
+        # user turn.  Its clear_ui refetch must MISS B's pre-rewind
+        # flight (fresh arrival = baseline + 2, the join-miss proof).
+        if not cdp_a.evaluate("window.__clickCoordRewind(1)"):
+            raise AssertionError("coord-joined-flight: second-row rewind button missing")
+        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
+            raise AssertionError("coord-joined-flight: rewind never POSTed")
+        # The MISS proof at the flight layer: A's post-rewind dispatch
+        # must enter load_messages itself (a JOINED request never does) —
+        # the e2e twin of the unit test's load_calls == 2.
+        joined_miss = _poll_until(lambda: node.load_calls == load_baseline + 2, 8, 0.05)
+        # The holds release (~3s); A must render the POST-rewind truth
+        # (pre-fix, the joined pre-rewind payload paints THREE rows).
+        healed = _poll_until(lambda: cdp_a.evaluate(_COORD_ROWS_JS) == 1, 12, 0.2)
+        load_delta = node.load_calls - load_baseline
+        posts = node.rewind_requests
+        print(
+            f"  coord-joined-flight joined_miss={joined_miss} healed={healed} "
+            f"load_delta={load_delta} posts={posts}"
+        )
+        cdp_a.evaluate(f"window.__verifyCoordJoinedFlight({posts}, {load_delta})")
+        return _poll_title(cdp_a, 15)
+    finally:
+        if cdp_a is not None:
+            cdp_a.close()
+        if cdp_b is not None:
+            cdp_b.close()
+        _kill(proc_a)
+        if proc_b is not None:
+            _kill(proc_b)
+        node.stop()
+
+
 def _wait_state(node: Any, ws_id: str, state: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -3240,6 +3363,7 @@ def main() -> None:
             "coord-heal-midturn",
             "coord-hidden-retry",
             "coord-orphan-rewind",
+            "coord-joined-flight",
             "roster-restart",
             "roster-restart-native",
             "both",
@@ -3316,6 +3440,10 @@ def main() -> None:
     if args.scenario in ("coord-orphan-rewind", "all"):
         verdict = run_coord_orphan_rewind(chrome)
         print(f"scenario G6 (coord-orphanrewind): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("coord-joined-flight", "all"):
+        verdict = run_coord_joined_flight(chrome)
+        print(f"scenario G7 (coord-joinedflight): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     if args.scenario in ("roster-restart", "all"):
         verdict = run_roster_restart(chrome)

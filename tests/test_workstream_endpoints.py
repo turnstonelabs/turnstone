@@ -1681,7 +1681,12 @@ class TestHistoryCoalescing:
         # The scaffold's MagicMock ws: pin the generation to a real int so
         # the key is deterministic, as the live session attribute is.
         mock_ws = app.state.workstreams.get("ws-flight-gen")
-        mock_ws._history_generation = 0
+        # The counter lives on the WRAPPED ChatSession (ws.session), not
+        # the workstream — pin the real shape so a route reading the
+        # wrong object cannot pass against this mock (the G7 harness
+        # caught exactly that: a direct getattr on the wrapper defaulted
+        # to 0 forever and re-enabled joining).
+        mock_ws.session._history_generation = 0
 
         async def drive() -> tuple[httpx.Response, httpx.Response]:
             caplog.set_level(logging.DEBUG, logger="turnstone.core.session_routes")
@@ -1691,7 +1696,7 @@ class TestHistoryCoalescing:
                 await _until(lambda: gated.load_calls == 1)
                 # The rewind commits mid-flight: the truncation chokepoint
                 # bumps the generation.
-                mock_ws._history_generation = 1
+                mock_ws.session._history_generation = 1
                 t2 = asyncio.create_task(c.get(url))
                 # Positive edge for the MISS: t2's own load_messages entry
                 # bumps the counter before the gate can park it.

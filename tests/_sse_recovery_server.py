@@ -148,6 +148,29 @@ class RecoveryServer:
         self._adapter.attach(self._manager)
         WebUI._workstream_mgr = self._manager
 
+        # delay_load knob state (see the method): wraps the storage
+        # singleton's load_messages; restored in stop().
+        self._load_delay_ms = 0
+        self._load_calls = 0
+        _storage_obj = get_storage()
+        self._orig_load_messages = _storage_obj.load_messages
+
+        def _delayed_load(*a: Any, **k: Any) -> Any:
+            self._load_calls += 1
+            result = self._orig_load_messages(*a, **k)
+            # Sleep AFTER the load: the held flight must hold the data it
+            # actually read (its transaction point), so a flight parked
+            # across a rewind genuinely carries PRE-rewind rows — a
+            # pre-load sleep would read post-rewind storage and mask a
+            # wrongly-joined flight as fresh truth.
+            d = self._load_delay_ms
+            if d > 0:
+                time.sleep(d / 1000.0)
+            return result
+
+        _storage_obj.load_messages = _delayed_load  # type: ignore[method-assign]
+        self._patched_storage = _storage_obj
+
         # Optional small listener-queue cap. The cap is a default arg on the
         # registration methods with no config/env override, so lower it by
         # patching their ``__defaults__`` (restored on stop). fix-3's
@@ -413,6 +436,28 @@ class RecoveryServer:
     # increment/decrement and the runner thread's read each atomic, and the
     # arm-then-consume ordering means they never race.
 
+    def delay_load(self, ms: int) -> None:
+        """Hold ``storage.load_messages`` itself open for ``ms`` (0 = off).
+
+        ``delay_history`` sleeps in the FAULT LAYER — before the route —
+        so two delayed requests never overlap inside the #884 flight
+        machinery (the first flight completes and pops before the second
+        arrives at the route).  This knob sleeps INSIDE the shared
+        reconstruction's ``load_messages`` (sync, called via
+        ``asyncio.to_thread`` — the sleep parks only that worker), which
+        is the same layer the unit tests gate, so held flights genuinely
+        overlap and join/miss behavior is observable end to end via
+        ``load_calls``.
+        """
+        self._load_delay_ms = ms
+
+    @property
+    def load_calls(self) -> int:
+        """``load_messages`` entries (pre-sleep) — the flight-layer twin
+        of ``history_requests`` (which counts HTTP arrivals): a JOINED
+        request never enters ``load_messages``, so join=1 / miss=2."""
+        return self._load_calls
+
     def fail_history(self, count: int) -> None:
         """Make the next ``count`` ``GET …/history`` responses a 500 — the
         failed refetch the #890 guard-before-wipe must survive."""
@@ -470,6 +515,9 @@ class RecoveryServer:
         # Restore any patched cap defaults.
         for meth, defaults in self._orig_defaults:
             meth.__defaults__ = defaults
+        # Restore the storage singleton's load_messages (delay_load knob).
+        with contextlib.suppress(Exception):
+            self._patched_storage.load_messages = self._orig_load_messages  # type: ignore[method-assign]
 
 
 def make_listen_socket(port: int, *, sndbuf: int = _DEFAULT_SNDBUF) -> socket.socket:

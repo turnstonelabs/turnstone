@@ -3554,8 +3554,11 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # current) and reopened the over-rewind window.  Cold workstream:
         # generation 0; the first post-load truncation bumps to 1, so a
         # cold flight can never be joined across a rewind either.
+        # mgr.get returns the Workstream WRAPPER — the counter lives on
+        # its ChatSession (the G7 harness caught a direct getattr
+        # silently defaulting to 0 forever, which re-enabled joining).
         live_gen = (
-            getattr(live_session, "_history_generation", 0)
+            getattr(getattr(live_session, "session", None), "_history_generation", 0)
             if live_session is not None
             else 0
         )
