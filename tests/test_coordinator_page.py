@@ -558,8 +558,9 @@ def test_coordinator_refetch_failure_preserves_the_pane():
     body = coord_js.read_text(encoding="utf-8")
     start = body.index("async function refetchHistory(seedCursor = false)")
     # Window sized to reach the early-reset block past the #894 latch-clear
-    # comments; the pinned invariant is the ORDER below, not the density.
-    fn = body[start : start + 5000]
+    # and render-gate comments; the pinned invariant is the ORDER below,
+    # not the density.
+    fn = body[start : start + 8000]
     guard = fn.index("if (!hist) return;")
     wipe = fn.index("messagesEl.replaceChildren();")
     resets = fn.index("toolRows.clear();")
@@ -651,9 +652,16 @@ def test_coordinator_history_stale_latch_contract():
     )
 
     # 4. Transport-free backstop: the arm after the truncated consumer
-    #    refetches over REST and never reconnects.
+    #    refetches over REST and never reconnects — and it must be the
+    #    ELSE-IF of the truncated consumer (mutual exclusion: the
+    #    truncated branch's own reload heals the latch too; two separate
+    #    ifs would run both heals on one idle edge).
     trunc_arm = body.index("if (pendingTruncatedResync)")
     backstop = body.index("historyStale &&", trunc_arm)
+    assert "} else if (" in body[trunc_arm:backstop], (
+        "the staleness backstop must be the else-if sibling of the "
+        "pendingTruncatedResync consumer, never an independent if."
+    )
     idle_block_end = body.index('ev.state === "running"', backstop)
     backstop_arm = body[backstop:idle_block_end]
     assert "refetchHistory();" in backstop_arm, (
@@ -668,6 +676,12 @@ def test_coordinator_history_stale_latch_contract():
         "the backstop must yield to an in-flight refetch — without the "
         "guard it stomps a same-snapshot fetch with a double render "
         "(mirrors interactive's !_replayQueue pin)."
+    )
+    assert "!currentAssistantEl" in backstop_arm and "!currentReasoningEl" in backstop_arm, (
+        "the backstop's ref guards are LOAD-BEARING (coord's "
+        "refetchHistory does not reset streaming refs, and this arm "
+        "serves error edges where no stream_end nulled them) — a "
+        "simplify-to-match-interactive edit must not delete them."
     )
 
     # 5. Bounded retry: exactly one arm site; the ARM is teardown-gated;
@@ -694,13 +708,28 @@ def test_coordinator_history_stale_latch_contract():
         "the SOLE protection for the coordCloseSession path, which nulls "
         "visHandler but does not cancel the timer."
     )
+    assert "!currentAssistantEl" in retry_fire and "!currentReasoningEl" in retry_fire, (
+        "the retry's ref guards are LOAD-BEARING (coord's refetchHistory "
+        "does not reset streaming refs) — must not be deleted to match "
+        "interactive's quiesce-protected shape."
+    )
+    assert "visHandler &&\n                  evtSource\n                ) {" in body, (
+        "the retry's fire guard must require a live stream (evtSource): "
+        "close-on-hide keeps this timer armed by design, and a seedless "
+        "heal on a dead stream renders past the frozen cursor (replay "
+        "double-render on the show edge).  Exact-tail pin so a comment "
+        "mention cannot satisfy it; re-anchor if the guard reflows."
+    )
     assert "if (staleRetryTimer) clearTimeout(staleRetryTimer);" in body, (
         "re-arming on a newer clear_ui must cancel the pending timer "
         "first, or a double clear_ui leaks a timer."
     )
     # The consumer pins above are only meaningful while the PRODUCER
     # brackets every fetch: without the ++/-- pair the counter is
-    # permanently 0 and both yield guards pass vacuously.
+    # permanently 0 and both yield guards pass vacuously.  Count alone
+    # is not enough — the ORDER is the bracket (an increment moved below
+    # the await leaves the counter 0 during every fetch with both counts
+    # intact), so pin inc < await < finally < dec inside refetchHistory.
     assert body.count("refetchesInFlight++") == 1, (
         "refetchHistory must increment the in-flight counter before its "
         "await — the yield guards read it."
@@ -708,6 +737,33 @@ def test_coordinator_history_stale_latch_contract():
     assert body.count("refetchesInFlight--") == 1, (
         "the in-flight counter must decrement in exactly one place (the "
         "fetch finally) so every exit rebalances it."
+    )
+    inc = body.index("refetchesInFlight++", fetch_start)
+    awt = body.index("await getJSON(", fetch_start)
+    fin = body.index("} finally {", fetch_start)
+    dec = body.index("refetchesInFlight--", fetch_start)
+    assert inc < awt < fin < dec, (
+        "the counter must bracket the await window: increment BEFORE the "
+        "fetch, decrement in its finally — any other order un-brackets "
+        "the very window the yield guards protect."
+    )
+
+    # 7. Render-time gate: the post-await re-checks must sit between the
+    #    failure guard and the wipe.  The await is a real window — a turn
+    #    can START mid-fetch (refs re-check; a wipe then would detach the
+    #    live bubble and lose the turn into the dangling ref), and a
+    #    seedless render must not paint past a frozen cursor when the
+    #    stream died mid-fetch (hide/suspend) or the show-edge replay
+    #    double-renders.  Caller-side guards cannot see across the await;
+    #    only this chokepoint can.
+    hist_guard = body.index("if (!hist) return;", fetch_start)
+    ref_gate = body.index("if (currentAssistantEl || currentReasoningEl) return;", fetch_start)
+    live_gate = body.index("if (!seedCursor && (busy || !evtSource)) return;", fetch_start)
+    wipe = body.index("messagesEl.replaceChildren();", fetch_start)
+    assert hist_guard < ref_gate < wipe and hist_guard < live_gate < wipe, (
+        "refetchHistory must re-check the live-turn refs AND seedless "
+        "stream-liveness AFTER the await and BEFORE the wipe — the "
+        "render-time correctness carrier for every caller."
     )
 
     # 6. Teardown: terminal cancel in destroy(); NOT in closeStreamTransport.

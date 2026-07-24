@@ -3702,8 +3702,18 @@ function createCoordinatorPane(root, wsId, opts) {
                   !busy &&
                   !currentAssistantEl &&
                   !currentReasoningEl &&
-                  visHandler
+                  visHandler &&
+                  evtSource
                 ) {
+                  // evtSource: a seedless heal must not render past a
+                  // frozen cursor (close-on-hide keeps this timer armed by
+                  // design, so the fire can land with the transport down)
+                  // — skip; the latch survives and the show-edge
+                  // reconnect's synthetic idle hands the heal to the
+                  // backstop.  The backstop itself needs no such term: it
+                  // runs inside SSE dispatch, so its stream is live by
+                  // construction.  refetchHistory's render-time gate
+                  // re-checks both invariants across the await window.
                   // Fire-and-forget, seedless (live stream — lastEventId
                   // must not rewind); a render throw stays loud, as on the
                   // backstop.
@@ -5765,6 +5775,41 @@ function createCoordinatorPane(root, wsId, opts) {
     // refetch.)  Success ordering is unchanged: the wipe always ran
     // after the await, never as immediate feedback.
     if (!hist) return;
+    // RENDER-TIME gate (#894 r4): the await above is a real window — pane
+    // state can change between a caller's fire-time checks and this
+    // render, and only THIS site can see across it (chokepoint, not
+    // per-caller guards).  Two invariants must hold at the wipe itself:
+    //
+    // 1. No live turn mid-stream.  A turn can START during the fetch (the
+    //    server drains queued sends at exactly the idle edges the
+    //    backstop rides; another operator on a shared coordinator can
+    //    send any time; coordSend paints an optimistic user row).  This
+    //    render does not reset the streaming refs, so replaceChildren
+    //    would detach the live bubble — every remaining token renders
+    //    into the dangling ref (invisible), and the optimistic user row
+    //    is destroyed with nothing to repaint it.  Skip instead: if the
+    //    staleness latch is set it stays set (clear is below), the gate
+    //    stays closed, and the turn's own settle re-fires the backstop.
+    // 2. Seedless renders need an IDLE pane on a LIVE stream.  busy: the
+    //    ref check above only sees the CONTENT phase — a turn in its tool
+    //    phase has null content refs but live tool rows, and the wipe +
+    //    toolRows.clear() below would orphan them mid-stream identically.
+    //    evtSource: a seedless render must not advance the DOM past a
+    //    frozen lastEventId (hide/suspend can land mid-fetch) — the
+    //    show-edge reconnect replays from the frozen cursor and every
+    //    turn this render already painted would render twice.  Seeded
+    //    callers (init, loadHistoryThenReconnect) own their reconnect
+    //    flow — they adopt hist.cursor below, and the truncated resync
+    //    legitimately rebuilds MID-turn — so both requirements key on the
+    //    seedCursor ARG, not caller identity.  On skip the latch
+    //    survives; the next organic settle (or the show-edge reconnect's
+    //    synthetic idle) re-fires the backstop.
+    //
+    // The callers' fire-time ref/stream guards remain as the efficiency
+    // layer (skip the pointless fetch); THIS gate is the correctness
+    // carrier.
+    if (currentAssistantEl || currentReasoningEl) return;
+    if (!seedCursor && (busy || !evtSource)) return;
     messagesEl.replaceChildren();
     // A full committed-history render repairs any recorded truncation gap —
     // whether this render came from the truncated resync itself or from an
