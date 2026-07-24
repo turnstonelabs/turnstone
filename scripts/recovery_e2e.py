@@ -24,6 +24,7 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario rewind-failed-window  # E3 (#890)
     python3 scripts/recovery_e2e.py --scenario stale-backstop    # E4 (#890)
     python3 scripts/recovery_e2e.py --scenario hidden-retry      # E5 (#900)
+    python3 scripts/recovery_e2e.py --scenario await-window-gate # E6 (#900)
     python3 scripts/recovery_e2e.py --scenario coord-rewind-window        # G1 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-rewind-failed-window # G2 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-stale-backstop       # G3 (#894)
@@ -116,6 +117,21 @@ the latch survives ``__show`` — the accepted liveness lag — and the heal
 rides a plain send's ORGANIC settle into the transport-free backstop, hence
 exactly ONE new SSE open across show + heal.  Stamps
 ``RECOVERY-READY-HIDDENRETRY-hidden0-heal1``.
+
+Scenario E6 (await-window-gate): the seedless render's cursor-safety gate
+(#900) — the AWAIT-window half E5 cannot reach, since E5's retry never
+fetches at all.  Here the retry fires with the transport OPEN (its fire
+guard passes) and its /history is HELD at the fault layer while a
+close-on-hide drops the stream underneath it, so the payload resolves onto a
+dead transport: rendering it would commit as-of-now truth with
+``_lastEventId`` frozen BELOW the rows painted — E5's double-render, reached
+through a window no fire-time check can see.  The render-time gate declines
+and takes the failed-fetch path instead.  DETECTOR: the stale-but-real
+PRE-rewind transcript must survive the RESOLVED fetch — THREE user rows and
+the latch still SET (``replayHistory`` is the latch's only clear site, so a
+held latch proves no render ran); without the gate it stamps rows1-latch0.
+The repair still arrives on the organic settle the transport-free backstop
+owns.  Stamps ``RECOVERY-READY-AWAITGATE-rows3-latch1``.
 
 The #894 coordinator ports (G family — the coord pane's ``historyStale``
 latch; coord state is closure-private, so where E2-E4 read pane fields the
@@ -863,6 +879,32 @@ PAGE_HTML = r"""<!doctype html>
               posts +
               "-rows" +
               userRows;
+        };
+      } else if (scenario === "await-window-gate") {
+        // Scenario E6 — the seedless render's cursor-safety gate (#900).
+        // The retry fires on a LIVE stream (its fire guard passes) and its
+        // /history is held open while a close-on-hide drops the transport
+        // underneath it.  Rendering that payload would commit as-of-now
+        // truth with _lastEventId frozen BELOW the rows painted — E5's
+        // double-render, reached through a window no fire-time check can
+        // see.  The render-time gate declines and takes the failed-fetch
+        // path: no wipe, quiesce released, latch intact.
+        window.__verifyAwaitWindowGate = function (rows, latchHeld, healed) {
+          // rows3 = the stale-but-real PRE-rewind transcript survived a
+          //   resolved fetch (without the gate the post-rewind render lands
+          //   and this reads 1).  latch1 = nothing cleared it — replayHistory
+          //   is its only clear site, so a held latch proves no render ran.
+          //   heal1 = the repair still arrives, on the organic settle the
+          //   transport-free backstop owns.
+          const ok = rows === 3 && latchHeld && healed;
+          document.title = ok
+            ? "RECOVERY-READY-AWAITGATE-rows3-latch1"
+            : "RECOVERY-FAILED-AWAITGATE-rows" +
+              rows +
+              "-latch" +
+              (latchHeld ? 1 : 0) +
+              "-heal" +
+              (healed ? 1 : 0);
         };
       }
     </script>
@@ -2742,6 +2784,91 @@ def run_hidden_retry(chrome: str) -> str:
         node.stop()
 
 
+def run_await_window_gate(chrome: str) -> str:
+    """Scenario E6 — the seedless render's cursor-safety gate (#900), the
+    AWAIT-window half E5 cannot reach: E5's retry never fetches, so only a
+    fetch that STARTS on a live stream and resolves onto a dead one exercises
+    the render-time check.
+
+    The retry fires with the transport OPEN (its fire guard passes), and its
+    /history is held at the fault layer while a close-on-hide tears the
+    stream down underneath it.  Rendering that payload would commit
+    /history's as-of-now truth with ``_lastEventId`` frozen BELOW the rows
+    painted — the same frozen-cursor double-render E5 guards at fire time,
+    reached through a window no fire-time check can see.  The gate declines
+    the render and takes the failed-fetch path instead: no wipe, quiesce
+    released, latch intact for the backstop.
+
+    DETECTOR: the stale transcript must survive the resolved fetch — THREE
+    user rows still standing (the pre-rewind truth) with the latch still SET,
+    after ``history_requests`` proves the held fetch both arrived AND
+    returned.  Without the gate the render lands and stamps rows1-latch0,
+    because a successful replayHistory is the latch's only clear site."""
+    node, ws_id = _seed_three_completed_turns("browser-await-window-gate")
+    profile = Path(_scratch()) / "chrome-await-window-gate"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=await-window-gate"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        if not _poll_until(lambda: cdp.evaluate(_ROWS_JS) == 3, 20, 0.2):
+            raise AssertionError("await-window-gate: three user rows never rendered")
+        if not _poll_until(lambda: node.events_requests >= 1, 10, 0.05):
+            raise AssertionError("await-window-gate: SSE stream never opened")
+        # The rewind's own clear_ui refetch fails, arming the 2s retry with
+        # the latch set and the transcript stale-but-real.
+        node.fail_history(1)
+        if not cdp.evaluate("window.__clickRewind(1)"):
+            raise AssertionError("await-window-gate: second-row rewind button missing")
+        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
+            raise AssertionError("await-window-gate: rewind never POSTed")
+        if not _poll_until(lambda: node.history_fail_remaining == 0, 15):
+            raise AssertionError("await-window-gate: forced /history failure never fired")
+        # Hold the RETRY's fetch open.  history_requests counts on ARRIVAL,
+        # before the hold sleeps, so the bump below is the in-flight edge.
+        retry_baseline = node.history_requests
+        node.delay_history(3000)
+        # The tab stays VISIBLE here — the retry must pass its fire guard,
+        # or this scenario degenerates into E5 and proves nothing.
+        if not _poll_until(lambda: node.history_requests == retry_baseline + 1, 6, 0.05):
+            raise AssertionError("await-window-gate: the retry never fetched on the live stream")
+        # Kill the transport mid-await.  The payload is already committed
+        # server-side; only the RENDER decision is still open.
+        cdp.evaluate("window.__hide && window.__hide()")
+        if not _poll_until(lambda: cdp.evaluate("window.__pane.evtSource === null"), 5, 0.05):
+            raise AssertionError("await-window-gate: close-on-hide never dropped the transport")
+        # Let the held fetch resolve, then let the render decision settle.
+        node.delay_history(0)
+        if not _poll_until(lambda: cdp.evaluate("window.__pane._replayQueue === null"), 12, 0.1):
+            raise AssertionError("await-window-gate: the quiesce never released")
+        rows = cdp.evaluate(_ROWS_JS)
+        latch_held = cdp.evaluate("window.__pane._historyStale === true")
+        # The heal still belongs to the backstop: show, then drive an organic
+        # settle with a plain send and watch the rewound truth land.
+        events_before_show = node.events_requests
+        cdp.evaluate("window.__show && window.__show()")
+        if not _poll_until(lambda: node.events_requests == events_before_show + 1, 10, 0.05):
+            raise AssertionError("await-window-gate: show-edge reconnect never arrived")
+        _send_in_page(cdp, "fourth turn")
+        healed = _poll_until(
+            lambda: cdp.evaluate(_ROWS_JS + " === 2 && window.__pane._historyStale === false"),
+            20,
+            0.2,
+        )
+        print(f"  await-window-gate rows={rows} latch_held={latch_held} healed={healed}")
+        cdp.evaluate(
+            f"window.__verifyAwaitWindowGate({rows}, "
+            f"{'true' if latch_held else 'false'}, {'true' if healed else 'false'})"
+        )
+        return _poll_title(cdp, 15)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
 _COORD_ROWS_JS = "document.getElementById('coord-messages').querySelectorAll('.msg.user').length"
 
 
@@ -3560,6 +3687,7 @@ def main() -> None:
             "rewind-failed-window",
             "stale-backstop",
             "hidden-retry",
+            "await-window-gate",
             "coord-rewind-window",
             "coord-rewind-failed-window",
             "coord-stale-backstop",
@@ -3623,6 +3751,10 @@ def main() -> None:
     if args.scenario in ("hidden-retry", "all"):
         verdict = run_hidden_retry(chrome)
         print(f"scenario E5 (hiddenretry): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("await-window-gate", "all"):
+        verdict = run_await_window_gate(chrome)
+        print(f"scenario E6 (awaitgate): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     if args.scenario in ("coord-rewind-window", "all"):
         verdict = run_coord_rewind_window(chrome)
