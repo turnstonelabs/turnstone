@@ -377,6 +377,24 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
         "this._refetchHistory("
     ), "clear_ui must arm the quiesce BEFORE the fetch"
 
+    # Render-time cursor-safety gate (#900): a SEEDLESS render commits
+    # /history's as-of-now truth without advancing _lastEventId, so
+    # committing it while the transport is down strands the cursor below
+    # the rows just painted and the next connect's replay paints them
+    # again.  The gate must be seedless-SCOPED — _loadHistoryThenConnect
+    # disconnects first, so its evtSource is null for its whole fetch and
+    # gating it would break every first paint, ws switch and resync.
+    ref = body.index("async _refetchHistory(wsId, token, seedCursor = false) {")
+    ref_seg = body[ref : body.index("\n  _beginReplayQuiesce(token) {", ref)]
+    gate = ref_seg.index("const cursorSafe =")
+    assert "seedCursor ||" in ref_seg[gate : gate + 200], (
+        "the render-time gate must exempt seeded (disconnect-first) loads (#900)"
+    )
+    assert "this.evtSource.readyState === EventSource.OPEN" in ref_seg[gate : gate + 200]
+    assert "if (data && cursorSafe) {" in ref_seg, (
+        "the seedless render must be gated on a live cursor (#900)"
+    )
+
     # Failure branch: quiesce release only.
     fail = body.index("Failed fetch = DOM + ref + repair-intent no-op")
     fail_seg = body[fail : fail + 1100]
@@ -469,16 +487,42 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
     assert "!this._replayQueue &&" in cl_seg[retry : retry + 700], (
         "the clear_ui retry must yield to an in-flight quiesced fetch"
     )
+    # ...and must not fire against a DOWN transport (#900): disconnectSSE
+    # deliberately keeps the timer armed, so a hidden tab / degraded
+    # cooldown / native redial can hold the fire.  A seedless refetch then
+    # paints rows the frozen _lastEventId still sits below, and the next
+    # connect replays that slice on top.  OPEN, not merely present — a
+    # CONNECTING source has a frozen cursor with a replay pending.
+    assert "this.evtSource.readyState === EventSource.OPEN" in cl_seg[retry:], (
+        "the clear_ui retry must require a live stream at fire time (#900)"
+    )
 
-    # Terminal teardown must cancel the failure retry: destroy() bumps
-    # no token and clears no latch, so an armed timer would otherwise
-    # pass its fire-time guards ~2s post-destroy and replayHistory into
-    # the detached pane.  (disconnectSSE deliberately does NOT cancel
-    # it — transport-only reconnects keep the pending heal intent.)
+    # Terminal teardown must invalidate in-flight loads AND cancel the
+    # failure retry.  The token bump (#900) is the chokepoint: without it
+    # destroy() left _loadHistoryThenConnect's .finally free to reopen an
+    # EventSource on the detached pane (re-registering the document-level
+    # visibilitychange listener destroy just removed), a settling
+    # _refetchHistory free to replayHistory into detached DOM, and the
+    # clear_ui .then free to RE-ARM the timer destroy had cancelled.  The
+    # clearTimeout stays because the timer may already be armed and a
+    # timer into a destroyed pane must be dead, not merely inert.
+    # (disconnectSSE deliberately does NOT cancel it — transport-only
+    # reconnects keep the pending heal intent.)
     dest = body.index("destroy() {")
-    dest_seg = body[dest : dest + 1600]
+    dest_seg = body[dest : body.index("\n    },", dest)]
     assert "clearTimeout(pane._staleRetryTimer);" in dest_seg, (
         "destroy() must cancel the clear_ui failure retry (#890)"
+    )
+    assert "pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;" in dest_seg, (
+        "destroy() must bump the load token to invalidate in-flight loads (#900)"
+    )
+    # Same rule on the other terminal path: giveUp() already bumped the
+    # token, so the timer is inert there — but inert is not dead.
+    give = body.index("const giveUp = function () {")
+    give_seg = body[give : body.index("\n  };", give)]
+    assert "pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;" in give_seg
+    assert "clearTimeout(pane._staleRetryTimer);" in give_seg, (
+        "giveUp() must cancel the clear_ui failure retry too (#900 symmetry)"
     )
 
 

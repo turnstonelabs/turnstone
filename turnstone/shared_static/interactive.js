@@ -266,6 +266,23 @@ class Pane {
     // _beginReplayQuiesce.  {token, events[]} or null.  (The truncated
     // resync no longer quiesces: it tears the stream down first, so no
     // live events exist during its rebuild.)
+    //
+    // This is also why interactive needs no dispatch-seq stamp
+    // (coordinator.js's refetchSeq / refetchesInFlight — #894 r5, ruled
+    // NOT APPLICABLE here at #900): same-token /history fetches cannot
+    // overlap.  Every seedless refetch arms this queue synchronously
+    // before its await, handleEvent queues ALL events while it is armed —
+    // clear_ui included — and the backlog flushes from _endReplayQuiesce,
+    // which runs in _refetchHistory's finally AFTER the render.  So a
+    // clear_ui arriving under an in-flight heal is serialized behind it
+    // rather than racing it, and a fetch dispatched BEFORE a clear_ui
+    // cannot still be running when the latch is set (same ordering) —
+    // which is also what keeps replayHistory's latch clear honest.  The
+    // one unquiesced fetch, _loadHistoryThenConnect's, disconnects the
+    // transport first AND bumps the load token.  Coord needed the stamp
+    // precisely because it has no quiesce (see its refetchesInFlight
+    // declaration).  Ship a stamp here only if a seedless refetch ever
+    // starts without arming this queue.
     this._replayQueue = null;
     // Transcript-staleness latch (#890): TRUE = the visible transcript
     // no longer matches the server's conversation STRUCTURE.  Set at
@@ -1762,6 +1779,13 @@ class Pane {
     // with no reconnect — strand the omitted turn).
     const id = wsId || this.wsId;
     let data = null;
+    // Deliberately unbounded and unabortable, deferred not overlooked
+    // (#900): coordinator.js carries an AbortController set plus a 15s
+    // bound so destroy() can cut a slow /history loose.  Here the load
+    // token already makes a post-teardown settle render-inert, so the
+    // residual is a detached closure pinned for the request's life — a
+    // resource cost, not a correctness defect.  It belongs with the
+    // shared recovery core rather than a third hand-port.
     try {
       const r = await authFetch(
         this._base +
@@ -1780,7 +1804,43 @@ class Pane {
       this._endReplayQuiesce(token);
       return;
     }
-    if (data) {
+    // Render-time transport gate (#900) — the correctness half of the
+    // clear_ui retry's fire-time OPEN term, covering the AWAIT window the
+    // fire-time check cannot: a hide edge, an onerror redial, or degraded
+    // entry can tear the transport down while THIS fetch is outstanding.
+    // A SEEDLESS render commits /history's as-of-now truth while leaving
+    // _lastEventId where the stream stopped delivering, so any turn
+    // committed during the outage gets painted with the cursor still
+    // BELOW it — the next connect presents that cursor, the server
+    // answers replay_ok, and the slice paints a second time (only
+    // system_turn and compaction markers carry id dedup; content and tool
+    // rows do not, and replayHistory has just reset the streaming refs and
+    // the announce map).  Handled exactly like a failed fetch below: no
+    // wipe, the latch survives, the quiesce releases, and the retry /
+    // idle-edge backstop own the heal.
+    //
+    // seedCursor renders are EXEMPT by construction and must stay so: their
+    // only caller is _loadHistoryThenConnect, which disconnects FIRST
+    // (evtSource is null for its whole fetch) and reconnects from
+    // data.cursor in its .finally — that adoption is what makes its render
+    // cursor-safe.
+    //
+    // SCOPE, ruled (#900): this ports the stream-OPENness term of
+    // coordinator.js's render-time gate and deliberately NOT its liveness
+    // terms (liveToolCalls / optimistic busySource / content refs).
+    // Interactive's replay quiesce holds every LIVE SSE event across the
+    // await, so no stream-driven turn state can appear beneath a render
+    // that is already committed — coord needed those terms because it has
+    // no quiesce.  Known residual, accepted: the user's own send is not an
+    // SSE event, so a send landing inside the await has its optimistic row
+    // wiped by the render.  The message is already committed server-side
+    // and a DOM short one user row can only UNDER-count a later rewind —
+    // non-destructive, the same ruling the Route-L reload carries at
+    // _historyStale's declaration.
+    const cursorSafe =
+      seedCursor ||
+      (!!this.evtSource && this.evtSource.readyState === EventSource.OPEN);
+    if (data && cursorSafe) {
       // Fresh-connect fast-forward: when the trailing turn is an
       // executing in-flight tool batch the server can replay, /history
       // returns a non-null ``cursor`` (a Last-Event-ID) and OMITS that
@@ -1807,7 +1867,9 @@ class Pane {
       }
     } else {
       // Failed fetch = DOM + ref + repair-intent no-op (#890, the G3
-      // guard-before-wipe ported from coordinator.js refetchHistory).
+      // guard-before-wipe ported from coordinator.js refetchHistory) —
+      // and, since #900, the same no-op for a good payload the
+      // cursor-safety gate above declined to render.
       // The prior transcript stays on screen: no wipe ever ran (see
       // the clear_ui case), and appending an empty-state hint below
       // real content was the old resync-route wart.  The streaming
@@ -2393,7 +2455,9 @@ class Pane {
                   !this._replayQueue &&
                   !this.busy &&
                   !this.currentAssistantEl &&
-                  !this.currentReasoningEl
+                  !this.currentReasoningEl &&
+                  this.evtSource &&
+                  this.evtSource.readyState === EventSource.OPEN
                 ) {
                   // !_replayQueue: yield to an in-flight quiesced
                   // fetch (the idle-edge backstop shares this token)
@@ -2401,6 +2465,26 @@ class Pane {
                   // double-render.  Fire-and-forget like the backstop:
                   // no composer state to strand here, so a render throw is
                   // left loud/uncaught (see the backstop's note).
+                  //
+                  // The stream must be OPEN, not merely present (#900):
+                  // disconnectSSE deliberately keeps this timer armed, so
+                  // the fire can land with the transport down — hidden tab
+                  // (close-on-hide), degraded catch-up cooldown, or a
+                  // CLOSED source — and a CONNECTING one has a frozen
+                  // cursor with a replay pending.  A seedless refetch then
+                  // paints rows the frozen _lastEventId still sits BELOW,
+                  // and the next connect replays that slice on top (see
+                  // _refetchHistory's render-time gate for the full
+                  // trace).  Skipping keeps the latch, so the idle-edge
+                  // backstop heals at the next settle — the accepted
+                  // liveness lag already ruled there.  NOTE the polarity
+                  // is deliberately the OPPOSITE of the host recover
+                  // beat's `readyState !== CLOSED`: that one asks "is
+                  // native reconnect still working the problem" (don't
+                  // stomp it), this one asks "is the cursor live" (a
+                  // reconnecting stream's is not).  The backstop needs no
+                  // such term — it runs inside SSE dispatch, so its
+                  // stream is live by construction.
                   this._beginReplayQuiesce(token);
                   this._refetchHistory(this.wsId, token);
                 }
@@ -3184,6 +3268,16 @@ class Pane {
     // The render also restores structural truth — clear the staleness
     // latch (its ONLY clear site) and cancel any pending clear_ui
     // failure retry, which exists to produce exactly this render.
+    //
+    // The clear assumes every successful render is POST-rewind truth.
+    // Two seams could break that assumption and both are closed (#900):
+    // server-side, a post-rewind request joining a pre-rewind #884
+    // coalescing flight — the flight key carries the workstream's
+    // truncation generation (#894), and make_history_handler is the
+    // SHARED body behind both clients' /history mounts, so interactive
+    // inherits it; client-side, a pre-clear_ui fetch landing after the
+    // latch was set — the replay quiesce makes that ordering unreachable
+    // (see the _replayQueue declaration).
     this._historyStale = false;
     if (this._staleRetryTimer) {
       clearTimeout(this._staleRetryTimer);
@@ -4943,6 +5037,15 @@ function createInteractivePane(root, wsId, opts) {
     // Invalidate any in-flight history load: its .finally would otherwise
     // reopen a stream for a session we just declared dead.
     pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;
+    // Same dead-not-inert rule destroy() applies (#900): the bump above
+    // already fails the retry's fire guard, but a pane whose session is
+    // gone must not hold a live timer — /history would 404 anyway, and a
+    // give-up is not always followed by a destroy (the shell can leave a
+    // dead-but-visible pane parked behind its reconnect banner).
+    if (pane._staleRetryTimer) {
+      clearTimeout(pane._staleRetryTimer);
+      pane._staleRetryTimer = null;
+    }
     pane.disconnectSSE();
     // Detach the visibility handler and clear the hide-close marker: a dead
     // controller must NOT be resurrected by a tab-visibility change.  Without
@@ -5093,12 +5196,28 @@ function createInteractivePane(root, wsId, opts) {
         clearTimeout(recoverTimer);
         recoverTimer = null;
       }
+      // Invalidate any in-flight history load — the SAME bump giveUp()
+      // makes, and for the same reason (#900): the load token is the one
+      // chokepoint every post-await consumer already reads, so one write
+      // here closes all four escapes at once.  Without it destroy() was
+      // the WEAKER terminal path: (1) _loadHistoryThenConnect's .finally
+      // (token gate) reopened an EventSource on the detached pane AND
+      // re-registered the document-level visibilitychange listener
+      // _removeVisibilityHandler drops below — whose onerror then re-armed
+      // the host recover beat forever, since it gives up only on `dead`,
+      // which destroy never sets; (2) a settling _refetchHistory passed
+      // its supersession check and replayHistory'd into the detached DOM;
+      // (3) the clear_ui .then re-armed _staleRetryTimer AFTER the cancel
+      // below (its arm guard is latch + token, and destroy touched
+      // neither).  Every future terminal path must bump this too.
+      pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;
       // The clear_ui failure retry survives everything EXCEPT a token
-      // bump — and destroy() bumps nothing, so an armed retry would
-      // fire ~2s post-destroy, pass its guards (latch still set, refs
-      // null), and replayHistory into the detached pane.  Cancel it
-      // here, terminal-only: disconnectSSE must NOT cancel it —
-      // transport-only reconnects keep the pending heal intent.
+      // bump, so the bump above already renders a firing inert — but a
+      // timer into a destroyed pane must be DEAD, not merely inert (it
+      // pins the closure for its remaining delay), so cancel an
+      // already-armed one here.  Terminal-only: disconnectSSE must NOT
+      // cancel it — transport-only reconnects keep the pending heal
+      // intent.
       if (pane._staleRetryTimer) {
         clearTimeout(pane._staleRetryTimer);
         pane._staleRetryTimer = null;
