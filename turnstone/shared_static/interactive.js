@@ -63,6 +63,7 @@ import {
   DEGRADED_COOLDOWN_MAX_MS,
   DEGRADED_COOLDOWN_RESET_MS,
   TRUNCATED_RESYNC_JITTER_MS,
+  STALE_RETRY_JITTER_MS,
   overflowWindowTripped,
   degradedCooldownStep,
 } from "./sse_overflow.js";
@@ -262,6 +263,14 @@ class Pane {
     this.projectName = "";
     this._lastStatusEvt = null;
     this._historyLoadToken = 0;
+    // Monotonic STREAM-generation counter (#900), bumped only in
+    // evtSource.onopen.  _refetchHistory captures it at dispatch and its
+    // render-time gate requires it unchanged, so a transport that dropped
+    // and re-established across a seedless fetch's await cannot be mistaken
+    // for one that never moved — readyState reads OPEN in both cases.
+    // Must stay initialised: undefined would make every compare NaN-false
+    // and silently decline every seedless render for the life of the pane.
+    this._connectEpoch = 0;
     // Event backlog while a clear_ui rebuild is in flight — see
     // _beginReplayQuiesce.  {token, events[]} or null.  (The truncated
     // resync no longer quiesces: it tears the stream down first, so no
@@ -484,8 +493,16 @@ class Pane {
       this.evtSource.close();
       this.evtSource = null;
     }
-    // Deliberately NOT cleared here: _agentCards/_agentOrphans and any armed
-    // _replayQueue.  disconnectSSE also runs for transport-only reconnects
+    // Deliberately NOT cleared here: _agentCards/_agentOrphans, any armed
+    // _replayQueue, and _staleRetryTimer.  The retry's survival is
+    // load-bearing, not an oversight: it is a REST heal, not transport
+    // state, so a transport-only redial must keep the pending repair intent
+    // — and it is precisely why that timer can fire against a dead stream,
+    // which is what its OPEN fire-guard term exists to handle.  Cancelling
+    // it here would silently make that guard unreachable.  Terminal-only
+    // cancel (destroy/giveUp); pinned negatively in
+    // tests/test_interactive_pane_js.py.  disconnectSSE also runs for
+    // transport-only reconnects
     // (connectSSE's first line, the host's 5s recovery beat) where the DOM
     // survives — wiping the card map there made the next child event build a
     // DUPLICATE agent card beside the still-attached one, and cancelling
@@ -1426,6 +1443,20 @@ class Pane {
     this.evtSource = new EventSource(evtUrl);
 
     this.evtSource.onopen = () => {
+      // Connection generation (#900) — bumped HERE and nowhere else, because
+      // "a stream generation began" is the only thing a cursor can be
+      // anchored to.  onopen is the sole site that means that: per spec the
+      // announce-the-connection step fires `open` for EVERY established
+      // connection, including the ones the browser's own reestablish loop
+      // produces — and a NATIVE auto-reconnect calls neither connectSSE nor
+      // disconnectSSE (see onerror below), so those two are blind to the
+      // case this exists for.  connectSSE would also FALSE-bump on the
+      // document.hidden early return above, which establishes nothing.  And
+      // a close()d source can never fire a late open (the spec's queued task
+      // early-returns on readyState CLOSED), so a discarded stream cannot
+      // bump a generation the pane has moved past.  Read once, by
+      // _refetchHistory's render-time gate.
+      this._connectEpoch += 1;
       this.retryDelay = 1000;
       this.statusBarEl.classList.remove("ws-sb-disconnected");
       if (this._lastStatusEvt) this.updateStatus(this._lastStatusEvt);
@@ -1778,14 +1809,27 @@ class Pane {
     // transient reconnect, or — on a re-render that trims an orphan
     // with no reconnect — strand the omitted turn).
     const id = wsId || this.wsId;
+    // Stream generation at DISPATCH (#900), captured at entry rather than
+    // beside the await — it mirrors coordinator.js refetchHistory's
+    // `const seq = ++refetchSeq;`, and entry-capture can only ever decline
+    // MORE if a future edit inserts transport-touching work ahead of the
+    // fetch, which is the safe direction.
+    const epoch = this._connectEpoch;
     let data = null;
     // Deliberately unbounded and unabortable, deferred not overlooked
-    // (#900): coordinator.js carries an AbortController set plus a 15s
-    // bound so destroy() can cut a slow /history loose.  Here the load
-    // token already makes a post-teardown settle render-inert, so the
-    // residual is a detached closure pinned for the request's life — a
-    // resource cost, not a correctness defect.  It belongs with the
-    // shared recovery core rather than a third hand-port.
+    // (#900, tracked as #905): coordinator.js carries an AbortController
+    // set plus a 15s bound so destroy() can cut a slow /history loose.
+    // Here the load token already makes a post-teardown settle
+    // render-inert, so the residual is a resource cost, not a correctness
+    // defect.  The honest bound is wider than "one request": authFetch
+    // retries up to three attempts, sleeping Retry-After on 429 and doing
+    // a refresh round-trip on 401, so the detached pane's closure stays
+    // reachable for all of it — and that same unbounded await is what
+    // makes the slow transport-bounce cases (recover beat ~5s, degraded
+    // timer 15-120s) reachable by the epoch gate below.  REOPEN when a
+    // /history blocks long enough for the pin to matter (large-session
+    // resume), or with the shared recovery core, which should own one
+    // implementation rather than a third hand-port.
     try {
       const r = await authFetch(
         this._base +
@@ -1837,9 +1881,40 @@ class Pane {
     // and a DOM short one user row can only UNDER-count a later rewind —
     // non-destructive, the same ruling the Route-L reload carries at
     // _historyStale's declaration.
+    // The generation term is what makes this gate total rather than
+    // point-in-time (#900 r2).  A transport that DROPPED and finished
+    // RE-ESTABLISHING inside the await — natively, or via a hide/show, the
+    // recover beat, or the degraded timer — reads back `OPEN` and is
+    // indistinguishable from one that never moved.  It is not: the redial
+    // presented the frozen _lastEventId, the server answered replay_ok, and
+    // the quiesce BUFFERED that slice, so rendering here would commit the
+    // same turns the flush is about to repaint on top.  Only a counter can
+    // see it — object identity cannot, since a native reconnect reuses the
+    // same EventSource.  (Do NOT cite coordinator.js's REMOVED r8 epoch as
+    // precedent: that one was a clear_ui/truncation-generation stamp made
+    // redundant by its seq gate.  This is a connection generation — a
+    // different value with a different matrix.)
+    //
+    // KNOWN FALSE-DECLINE, accepted: if the reconnect answered fresh or
+    // truncated rather than replay_ok, its slice carries no ring content and
+    // the render would have been safe.  Cost is one wasted /history, and it
+    // self-heals — the flushed synthetic state_change lands in the idle-edge
+    // backstop, or the truncated handler schedules a seeded resync.
+    //
+    // (Coord's half of this gate is tracked as #904 — its exposure is a
+    // race rather than this determinism, so it is not ported blind.)
+    //
+    // KNOWN RESIDUAL, server-side-blocked (#903): a refetch DISPATCHED in
+    // the gap between onopen and the replay slice actually arriving captures
+    // an already-bumped generation and still renders past the frozen cursor.
+    // replay_ok emits no end-of-replay marker, so no client-side signal
+    // exists to gate on; closing it needs a server change.  Narrow (the
+    // replay almost always beats a fresh HTTP round-trip) but real.
     const cursorSafe =
       seedCursor ||
-      (!!this.evtSource && this.evtSource.readyState === EventSource.OPEN);
+      (!!this.evtSource &&
+        this.evtSource.readyState === EventSource.OPEN &&
+        this._connectEpoch === epoch);
     if (data && cursorSafe) {
       // Fresh-connect fast-forward: when the trailing turn is an
       // executing in-flight tool batch the server can replay, /history
@@ -2447,48 +2522,65 @@ class Pane {
             // case).
             if (this._historyStale && token === this._historyLoadToken) {
               if (this._staleRetryTimer) clearTimeout(this._staleRetryTimer);
-              this._staleRetryTimer = setTimeout(() => {
-                this._staleRetryTimer = null;
-                if (
-                  token === this._historyLoadToken &&
-                  this._historyStale &&
-                  !this._replayQueue &&
-                  !this.busy &&
-                  !this.currentAssistantEl &&
-                  !this.currentReasoningEl &&
-                  this.evtSource &&
-                  this.evtSource.readyState === EventSource.OPEN
-                ) {
-                  // !_replayQueue: yield to an in-flight quiesced
-                  // fetch (the idle-edge backstop shares this token)
-                  // instead of stomping its queue for a same-token
-                  // double-render.  Fire-and-forget like the backstop:
-                  // no composer state to strand here, so a render throw is
-                  // left loud/uncaught (see the backstop's note).
-                  //
-                  // The stream must be OPEN, not merely present (#900):
-                  // disconnectSSE deliberately keeps this timer armed, so
-                  // the fire can land with the transport down — hidden tab
-                  // (close-on-hide), degraded catch-up cooldown, or a
-                  // CLOSED source — and a CONNECTING one has a frozen
-                  // cursor with a replay pending.  A seedless refetch then
-                  // paints rows the frozen _lastEventId still sits BELOW,
-                  // and the next connect replays that slice on top (see
-                  // _refetchHistory's render-time gate for the full
-                  // trace).  Skipping keeps the latch, so the idle-edge
-                  // backstop heals at the next settle — the accepted
-                  // liveness lag already ruled there.  NOTE the polarity
-                  // is deliberately the OPPOSITE of the host recover
-                  // beat's `readyState !== CLOSED`: that one asks "is
-                  // native reconnect still working the problem" (don't
-                  // stomp it), this one asks "is the cursor live" (a
-                  // reconnecting stream's is not).  The backstop needs no
-                  // such term — it runs inside SSE dispatch, so its
-                  // stream is live by construction.
-                  this._beginReplayQuiesce(token);
-                  this._refetchHistory(this.wsId, token);
-                }
-              }, 2000);
+              this._staleRetryTimer = setTimeout(
+                () => {
+                  this._staleRetryTimer = null;
+                  if (
+                    token === this._historyLoadToken &&
+                    this._historyStale &&
+                    !this._replayQueue &&
+                    !this.busy &&
+                    !this.currentAssistantEl &&
+                    !this.currentReasoningEl &&
+                    this.evtSource &&
+                    this.evtSource.readyState === EventSource.OPEN
+                  ) {
+                    // !_replayQueue: yield to an in-flight quiesced
+                    // fetch (the idle-edge backstop shares this token)
+                    // instead of stomping its queue for a same-token
+                    // double-render.  Fire-and-forget like the backstop:
+                    // no composer state to strand here, so a render throw is
+                    // left loud/uncaught (see the backstop's note).
+                    //
+                    // The stream must be OPEN, not merely present (#900):
+                    // disconnectSSE deliberately keeps this timer armed, so
+                    // the fire can land with the transport down — hidden tab
+                    // (close-on-hide), degraded catch-up cooldown, or a
+                    // CLOSED source — and a CONNECTING one has a frozen
+                    // cursor with a replay pending.  A seedless refetch then
+                    // paints rows the frozen _lastEventId still sits BELOW,
+                    // and the next connect replays that slice on top (see
+                    // _refetchHistory's render-time gate for the full
+                    // trace).  Skipping keeps the latch, so the idle-edge
+                    // backstop heals at the next settle — the accepted
+                    // liveness lag already ruled there.  NOTE the polarity
+                    // is deliberately the OPPOSITE of the host recover
+                    // beat's `readyState !== CLOSED`: that one asks "is
+                    // native reconnect still working the problem" (don't
+                    // stomp it), this one asks "is the cursor live" (a
+                    // reconnecting stream's is not).  The idle-edge backstop
+                    // needs no such term, but NOT because its stream is live
+                    // by construction — it isn't.  handleEvent also runs from
+                    // _endReplayQuiesce's flush, which fires AFTER a seedless
+                    // fetch settles, so a state_change:idle queued during that
+                    // fetch reaches the backstop with the transport already
+                    // down.  What covers it is _refetchHistory's render-time
+                    // gate: the backstop's refetch is seedless, so the gate
+                    // declines it and the cost is one wasted /history, never a
+                    // double-render.  Add a fire-time term there only if a
+                    // backstop refetch is ever dispatched somewhere the
+                    // render-time gate does not cover.
+                    this._beginReplayQuiesce(token);
+                    this._refetchHistory(this.wsId, token);
+                  }
+                  // ADDITIVE spread over the 2000 floor: one clear_ui reaches
+                  // every listener on the ws, so an un-spread retry re-fetches
+                  // in lockstep across tabs.  The floor is load-bearing (the
+                  // e2e non-occurrence windows size on it) — jitter up, never
+                  // down.  Mirrored in coordinator.js; the constant is shared.
+                },
+                2000 + Math.random() * STALE_RETRY_JITTER_MS,
+              );
             }
             if (token !== this._historyLoadToken && this.wsId !== editWs) {
               // Cross-ws supersession: drop the pending edit + release

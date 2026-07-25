@@ -716,7 +716,11 @@ def test_coordinator_history_stale_latch_contract():
         "exists to kill."
     )
     retry_arm = body.index("staleRetryTimer = setTimeout")
-    retry_fire = _strip_comments(body[retry_arm : body.index("}, 2000);", retry_arm)])
+    # Anchor on the delay EXPRESSION's opening, not on a literal `}, 2000);`
+    # — #900 made the delay `2000 + Math.random() * STALE_RETRY_JITTER_MS`,
+    # and a literal anchor raises ValueError (the suite ERRORS instead of
+    # failing) the moment the spread changes.
+    retry_fire = _strip_comments(body[retry_arm : body.index("STALE_RETRY_JITTER_MS", retry_arm)])
     assert "!refetchesInFlight" in retry_fire, (
         "the retry's fire guard must yield to an in-flight refetch "
         "(mirrors interactive's !_replayQueue pin)."
@@ -732,11 +736,13 @@ def test_coordinator_history_stale_latch_contract():
         "render-time gate would discard (the chokepoint carries the "
         "correctness; these are the efficiency layer — keep them)."
     )
-    assert (
-        "visHandler &&\n                  evtSource &&\n"
-        "                  evtSource.readyState === EventSource.OPEN\n"
-        "                ) {" in body
-    ), (
+    # Whitespace-normalised, not indentation-exact: #900 made the delay an
+    # expression, which reflowed setTimeout to prettier's multi-line call form
+    # and re-indented this whole callback body.  Still an ORDERED-tail pin, so
+    # a mere comment mention cannot satisfy it.
+    cond_start = body.index("if (", retry_arm)
+    guard = " ".join(body[cond_start : body.index(") {", cond_start)].split())
+    assert guard.endswith("visHandler && evtSource && evtSource.readyState === EventSource.OPEN"), (
         "the retry's fire guard must require an OPEN stream — not handle "
         "existence: CONNECTING keeps the handle with a frozen cursor and "
         "a pending replay, and a seedless heal then double-renders when "

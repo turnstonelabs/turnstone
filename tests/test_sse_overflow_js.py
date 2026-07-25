@@ -29,7 +29,7 @@ _SSE_OVERFLOW = _ROOT / "turnstone/shared_static/sse_overflow.js"
 
 
 def test_module_exports_constants_and_pure_helpers() -> None:
-    """The single source of truth exports the five tuning constants and the two
+    """The single source of truth exports the seven tuning constants and the two
     pure helpers.  Both panes import these by name (pinned in their own suites),
     so a rename here is a breaking change that must surface loudly."""
     body = _SSE_OVERFLOW.read_text(encoding="utf-8")
@@ -39,6 +39,13 @@ def test_module_exports_constants_and_pure_helpers() -> None:
         ("DEGRADED_COOLDOWN_BASE_MS", "15000"),
         ("DEGRADED_COOLDOWN_MAX_MS", "120000"),
         ("DEGRADED_COOLDOWN_RESET_MS", "300000"),
+        ("TRUNCATED_RESYNC_JITTER_MS", "10000"),
+        # ADDITIVE over the retry's 2000 floor, and deliberately NOT the
+        # truncated-resync spread: this one works against #884's /history
+        # single-flight, so it stays small enough to sit inside a typical
+        # flight.  Both e2e non-occurrence detectors size their windows on
+        # the floor plus this value.
+        ("STALE_RETRY_JITTER_MS", "500"),
     ):
         assert f"export const {const} = {value};" in body, f"missing export const {const}"
     assert "export function overflowWindowTripped(" in body

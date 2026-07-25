@@ -45,6 +45,22 @@ export const DEGRADED_COOLDOWN_RESET_MS = 300000;
 // total per-restart fetch count.
 export const TRUNCATED_RESYNC_JITTER_MS = 10000;
 
+// Spread for the clear_ui staleness retry, ADDITIVE over a 2000 ms floor
+// (`2000 + Math.random() * this`).  One clear_ui fans out to every listener
+// on the workstream, so an un-spread retry makes N tabs re-fetch /history in
+// near-lockstep — and #900 widened that arm: a render the cursor-safety gate
+// declines now leaves the latch set, so a SUCCESSFUL fetch can arm the retry
+// too, and the decline trigger (transport down) is itself herd-shaped.
+//
+// Deliberately small, and deliberately NOT TRUNCATED_RESYNC_JITTER_MS: this
+// spread works AGAINST #884's `(ws_id, limit, generation)` single-flight,
+// which coalesces a lockstep herd into one reconstruction.  Spreading past a
+// typical flight duration de-coalesces it — lower peak, higher total. 500 ms
+// keeps the window comparable to a flight while still breaking lockstep.
+// The 2000 floor is load-bearing for the e2e non-occurrence detectors (they
+// size their windows on it); raising this constant requires widening those.
+export const STALE_RETRY_JITTER_MS = 500;
+
 // Rolling-window trip check.  Prunes `times` in place (entries older than
 // windowMs against nowMs) and reports whether count-or-more remain.  A
 // standalone pure function so the trip logic can be lifted verbatim into a

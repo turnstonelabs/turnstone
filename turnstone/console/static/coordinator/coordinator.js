@@ -57,6 +57,7 @@ import {
   DEGRADED_COOLDOWN_MAX_MS,
   DEGRADED_COOLDOWN_RESET_MS,
   TRUNCATED_RESYNC_JITTER_MS,
+  STALE_RETRY_JITTER_MS,
   overflowWindowTripped,
   degradedCooldownStep,
 } from "/shared/sse_overflow.js";
@@ -3770,35 +3771,43 @@ function createCoordinatorPane(root, wsId, opts) {
             // pane UI, so the user's committed edit still delivers.
             if (historyStale && visHandler) {
               if (staleRetryTimer) clearTimeout(staleRetryTimer);
-              staleRetryTimer = setTimeout(() => {
-                staleRetryTimer = null;
-                if (
-                  historyStale &&
-                  !refetchesInFlight &&
-                  !busy &&
-                  !currentAssistantEl &&
-                  !currentReasoningEl &&
-                  visHandler &&
-                  evtSource &&
-                  evtSource.readyState === EventSource.OPEN
-                ) {
-                  // Stream must be OPEN, not merely present: close-on-hide
-                  // keeps this timer armed by design (the fire can land
-                  // with the transport down), and a CONNECTING source has
-                  // a frozen cursor with a pending replay — a seedless
-                  // fetch then would render past it (double-render when
-                  // the replay lands).  Skip instead; the latch survives
-                  // and the next organic settle re-fires the backstop.
-                  // The backstop itself needs no such term: it runs
-                  // inside SSE dispatch, so its stream is live by
-                  // construction.  refetchHistory's render-time gate
-                  // re-checks every invariant across the await window.
-                  // Fire-and-forget, seedless (live stream — lastEventId
-                  // must not rewind); a render throw stays loud, as on the
-                  // backstop.
-                  refetchHistory();
-                }
-              }, 2000);
+              staleRetryTimer = setTimeout(
+                () => {
+                  staleRetryTimer = null;
+                  if (
+                    historyStale &&
+                    !refetchesInFlight &&
+                    !busy &&
+                    !currentAssistantEl &&
+                    !currentReasoningEl &&
+                    visHandler &&
+                    evtSource &&
+                    evtSource.readyState === EventSource.OPEN
+                  ) {
+                    // Stream must be OPEN, not merely present: close-on-hide
+                    // keeps this timer armed by design (the fire can land
+                    // with the transport down), and a CONNECTING source has
+                    // a frozen cursor with a pending replay — a seedless
+                    // fetch then would render past it (double-render when
+                    // the replay lands).  Skip instead; the latch survives
+                    // and the next organic settle re-fires the backstop.
+                    // The backstop itself needs no such term: it runs
+                    // inside SSE dispatch, so its stream is live by
+                    // construction.  refetchHistory's render-time gate
+                    // re-checks every invariant across the await window.
+                    // Fire-and-forget, seedless (live stream — lastEventId
+                    // must not rewind); a render throw stays loud, as on the
+                    // backstop.
+                    refetchHistory();
+                  }
+                  // ADDITIVE spread over the 2000 floor: one clear_ui reaches
+                  // every listener on the ws, so an un-spread retry re-fetches
+                  // in lockstep across tabs.  The floor is load-bearing (the
+                  // e2e non-occurrence windows size on it) — jitter up, never
+                  // down.  Mirrored in interactive.js; the constant is shared.
+                },
+                2000 + Math.random() * STALE_RETRY_JITTER_MS,
+              );
             }
             if (!_pendingEditSend) return;
             const editText = _pendingEditSend;
@@ -5998,7 +6007,6 @@ function createCoordinatorPane(root, wsId, opts) {
     if (staleRetryTimer) {
       clearTimeout(staleRetryTimer);
       staleRetryTimer = null;
-
     }
     toolRows.clear();
     activeBatch = null;

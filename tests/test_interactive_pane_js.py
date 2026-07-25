@@ -387,12 +387,71 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
     ref = body.index("async _refetchHistory(wsId, token, seedCursor = false) {")
     ref_seg = body[ref : body.index("\n  _beginReplayQuiesce(token) {", ref)]
     gate = ref_seg.index("const cursorSafe =")
-    assert "seedCursor ||" in ref_seg[gate : gate + 200], (
+    gate_seg = ref_seg[gate : ref_seg.index(";", gate)]
+    assert "seedCursor ||" in gate_seg, (
         "the render-time gate must exempt seeded (disconnect-first) loads (#900)"
     )
-    assert "this.evtSource.readyState === EventSource.OPEN" in ref_seg[gate : gate + 200]
+    assert "this.evtSource.readyState === EventSource.OPEN" in gate_seg
+    # Connection-generation term (#900 r2): readyState alone cannot see a
+    # transport that DROPPED and finished RE-ESTABLISHING inside the await —
+    # it reads OPEN either way, while the redial re-presented the frozen
+    # cursor and the quiesce buffered the replay the render would duplicate.
+    # Object identity is not a substitute: a NATIVE reconnect reuses the same
+    # EventSource, so only a counter can see it.
+    assert "this._connectEpoch === epoch" in gate_seg, (
+        "the seedless render must require an unchanged stream generation (#900)"
+    )
     assert "if (data && cursorSafe) {" in ref_seg, (
         "the seedless render must be gated on a live cursor (#900)"
+    )
+    # Captured at DISPATCH, not read live at render time — a live read would
+    # compare the epoch against itself and the term would be vacuous.
+    assert "const epoch = this._connectEpoch;" in ref_seg, (
+        "the gate must compare against the generation captured at dispatch (#900)"
+    )
+    assert ref_seg.index("const epoch = this._connectEpoch;") < ref_seg.index("await authFetch("), (
+        "the generation must be captured BEFORE the fetch await (#900)"
+    )
+
+    # The bump belongs to onopen and NOWHERE else.  A native auto-reconnect
+    # calls neither connectSSE nor disconnectSSE, so those two are blind to
+    # the very case the term exists for; connectSSE would additionally
+    # FALSE-bump on its document.hidden early return, which establishes no
+    # stream.  Absence from both is therefore load-bearing, not incidental.
+    assert "this._connectEpoch = 0;" in body, (
+        "the generation must be initialised — undefined makes every compare "
+        "NaN-false and silently declines every seedless render (#900)"
+    )
+    onopen = body.index("this.evtSource.onopen = () => {")
+    onopen_seg = body[onopen : body.index("\n    };", onopen)]
+    assert "this._connectEpoch += 1;" in onopen_seg, (
+        "the stream generation must be bumped in onopen — the only site that "
+        "fires for a NATIVE auto-reconnect (#900)"
+    )
+    conn = body.index("connectSSE(wsId) {")
+    assert "_connectEpoch" not in _strip_comments(body[conn:onopen]), (
+        "connectSSE must NOT bump the generation — it would false-bump on the "
+        "document.hidden early return, which establishes no stream (#900)"
+    )
+    dis = re.search(r"\n  disconnectSSE\(\) \{(.*?)\n  \}\n", body, re.S)
+    assert dis is not None, "disconnectSSE not found"
+    # Comment-stripped: the method's inventory comment NAMES both fields as
+    # deliberately-not-cleared, which is the ruling — assert on code only.
+    dis_code = _strip_comments(dis.group(1))
+    assert "_connectEpoch" not in dis_code, (
+        "disconnectSSE must NOT bump the generation — a teardown is decided "
+        "by the presence term, and a re-establish by the next onopen (#900)"
+    )
+    # THE load-bearing negative: disconnectSSE deliberately does NOT cancel
+    # the clear_ui retry (transport-only redials keep the pending heal
+    # intent).  That is exactly why the retry can fire against a dead
+    # transport, which is what its OPEN fire-guard term exists to handle —
+    # so a "symmetry" cleanup adding the cancel here would silently make
+    # that guard unreachable and E5's detector vacuous, with nothing else
+    # failing.  Coord pins the same invariant (test_coordinator_page.py).
+    assert "_staleRetryTimer" not in dis_code, (
+        "disconnectSSE must NOT cancel the clear_ui failure retry — "
+        "transport-only reconnects keep the pending heal intent (#890/#900)"
     )
 
     # Failure branch: quiesce release only.
