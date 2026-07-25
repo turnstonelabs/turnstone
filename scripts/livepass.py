@@ -45,6 +45,22 @@ Shell harness (?split=): right (default) · down · three · none — boots the
   document.title stamps SPLIT-READY-<visible cells> on success and
   SPLIT-FAILED-<reason> when a driven split was denied — judge the focused
   cell's top accent bar, the separators, and the .shown tab marker.
+Proxy-brand harness (/proxybrand/livepass.html): back-to-console from a
+  PROXIED node view, driven end to end.  An iframe hosts a node page built
+  from the REAL shell.js rail plus the REAL _JS_PROXY_SHIM (read out of
+  turnstone/console/server.py by text, never imported -- scripts/ has no
+  sys.path guard, so an import would silently pick up site-packages).  The
+  host clicks the brand's child span and, because the shim navigates the
+  FRAME away, reads the frame's post-navigation location from the surviving
+  top page.  document.title stamps PROXYBRAND-READY, or
+  PROXYBRAND-FAILED-<reason>: sub-not-repointed-server (nothing wired),
+  showhome-also-ran (shell.js won the click), nav-<path> (went somewhere
+  other than the console root), sub-not-console-<text>, aria-not-repointed,
+  no-navigation, no-brand, no-sub.  Needs --virtual-time-budget=9000;
+  there is nothing to screenshot.  Read the verdict from <title> --
+  both literals also appear in the host page's inline script, so a bare
+  grep over --dump-dom output false-positives.
+
 Attachments harness (/attachments/livepass.html): the composer attachment
   chips + the sent-message attachment pills, both driven through the REAL
   code paths — createAttachmentController.rehydrate() builds the chips and
@@ -141,6 +157,24 @@ def extract_admin_fragment() -> str:
     start = html.index('<div id="admin-layout"')
     end = html.index("<!-- /admin-layout -->") + len("<!-- /admin-layout -->")
     return html[start:end]
+
+
+def extract_proxy_shim(prefix: str = "/node/livepass-node") -> str:
+    """Pull ``_JS_PROXY_SHIM`` out of console/server.py BY TEXT, not import.
+
+    ``scripts/`` has no ``sys.path`` guard, so ``import turnstone`` from here
+    resolves to whatever is installed in site-packages rather than this
+    checkout -- silently building the page from a DIFFERENT version of the
+    shim than the one you are trying to verify.  Read the source instead.
+    """
+    src = (ROOT / "turnstone/console/server.py").read_text(encoding="utf-8")
+    m = re.search(r'^_JS_PROXY_SHIM = """\\\n(.*?)^"""', src, re.S | re.M)
+    if not m:
+        raise SystemExit(
+            "livepass: could not find _JS_PROXY_SHIM in turnstone/console/server.py "
+            "-- the constant was renamed or reshaped; update extract_proxy_shim()."
+        )
+    return m.group(1).replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
 
 
 def inject(template: str, marker: str, payload: str) -> str:
@@ -658,6 +692,108 @@ SHELL_TEMPLATE = """<!doctype html>
 # call the same window.buildAttachmentPreview).  The page frame is harness-only
 # chrome and not under review; the chips row and the pill row are.
 # --------------------------------------------------------------------------
+
+# The PROXIED NODE page: the real L-shell (so the rail brand is the real
+# element, with the real shell.js click listener on it) plus the real proxy
+# shim injected exactly where proxy_index puts it -- first thing inside
+# <body>, ahead of the deferred shell.js module.  caps mirror a NODE, not
+# the console: brandSub "server" is what the shim has to overwrite, and
+# leaving it "console" would make the host's /console/i check vacuous.
+PROXYBRAND_FRAME_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>proxied node</title>
+    <link rel="stylesheet" href="shared/base.css" />
+    <link rel="stylesheet" href="shared/ui-base.css" />
+    <link rel="stylesheet" href="static/style.css" />
+    <link rel="stylesheet" href="shared/shell.css" />
+  </head>
+  <body>
+    <!-- SHIM:BEGIN -->
+    <!-- SHIM:END -->
+    <div id="header" style="display: none"><div id="status-bar"></div></div>
+    <div id="main" style="padding: 18px">
+      <h2 style="margin: 0 0 8px">Node dashboard</h2>
+    </div>
+    <div id="view-admin" style="display: none"></div>
+    <script>
+      window.TURNSTONE_SHELL_CAPS = { cluster: false, brandSub: "server" };
+      window.TS_APP = {
+        boot() {},
+        getClusterState() { return { nodes: {} }; },
+        onRender() {},
+      };
+      window.TS_ADMIN = {};
+      // Record on the PARENT, which survives the frame's navigation.
+      // A flag on the frame's own window dies with the document, so the
+      // host would read undefined and pass -- a check that cannot fail.
+      window.showHome = function () {
+        try { window.parent.__showHomeRan = true; } catch (e) {}
+      };
+    </script>
+    <script type="module" src="shared/shell.js"></script>
+  </body>
+</html>
+"""
+
+# The HOST page.  The shim navigates the FRAME to "/", which would destroy
+# any verdict stamped inside it -- so the surviving top page reads the
+# frame's post-navigation location and stamps its own title instead.  No
+# landing page at "/" is needed (the harness root serves a directory
+# listing) and no CDP client either.
+PROXYBRAND_HOST_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>proxybrand livepass</title>
+    <style>
+      html, body { margin: 0; height: 100%; }
+      iframe { width: 100%; height: 100%; border: 0; }
+    </style>
+  </head>
+  <body>
+    <iframe id="frame" src="frame.html"></iframe>
+    <script>
+      const frame = document.getElementById("frame");
+      let phase = 0;
+      const fail = (r) => { phase = 9; document.title = "PROXYBRAND-FAILED-" + r; };
+
+      frame.addEventListener("load", () => {
+        if (phase === 9) return;
+        if (phase === 0) {
+          const doc = frame.contentDocument;
+          const brand = doc.querySelector(".rail-brand .brand-home");
+          if (!brand) return fail("no-brand");
+          const sub = brand.querySelector(".brand-sub");
+          if (!sub) return fail("no-sub");
+          const text = sub.textContent.trim();
+          if (text === "server") return fail("sub-not-repointed-server");
+          if (!/console/i.test(text)) return fail("sub-not-console-" + text);
+          if (brand.getAttribute("aria-label") !== "Back to console")
+            return fail("aria-not-repointed");
+          phase = 1;
+          // Click the CHILD span, as a real user does: the shim must match
+          // via contains(), not target identity.
+          sub.click();
+          setTimeout(() => { if (phase === 1) fail("no-navigation"); }, 2000);
+          return;
+        }
+        const path = frame.contentWindow.location.pathname;
+        const ranShowHome = !!window.__showHomeRan;
+        phase = 2;
+        if (path !== "/") return fail("nav-" + path);
+        if (ranShowHome) return fail("showhome-also-ran");
+        // Sticky, mirroring fail(): a third load must not re-stamp.
+        phase = 9;
+        document.title = "PROXYBRAND-READY";
+      });
+    </script>
+  </body>
+</html>
+"""
+
+
 ATTACH_TEMPLATE = """<!doctype html>
 <html lang="en">
   <head>
@@ -1482,6 +1618,17 @@ def build(out: Path) -> None:
     symlink(pf / "static", ROOT / "turnstone/ui/static")
     (pf / "livepass.html").write_text(PERF_TEMPLATE, encoding="utf-8")
     print(f"{pf}/livepass.html — long-session perf baseline (real InteractivePane)")
+
+    pb = out / "proxybrand"
+    pb.mkdir(parents=True, exist_ok=True)
+    symlink(pb / "shared", ROOT / "turnstone/shared_static")
+    symlink(pb / "static", ROOT / "turnstone/ui/static")
+    shim = "<script>" + extract_proxy_shim() + "</script>"
+    (pb / "frame.html").write_text(
+        inject(PROXYBRAND_FRAME_TEMPLATE, "SHIM", shim), encoding="utf-8"
+    )
+    (pb / "livepass.html").write_text(PROXYBRAND_HOST_TEMPLATE, encoding="utf-8")
+    print(f"{pb}/livepass.html — back-to-console brand (real shell.js + real shim)")
 
 
 class _PerfStore:

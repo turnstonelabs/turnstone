@@ -180,7 +180,7 @@ const INTERACTIVE_DEFAULT_HOST = {
   // EventSource (re)opened — the dual of onStreamError.  The console pane host
   // uses it to reset its terminal-failure counter (see createInteractivePane).
   onStreamOpen() {},
-  // Where the ``--skip-permissions`` banner lands (standalone: #ui-header).
+  // Where the ``--skip-permissions`` banner lands.
   warningTarget(pane) {
     return pane.messagesEl;
   },

@@ -1843,6 +1843,169 @@ class TestConsoleProxy:
 # ---------------------------------------------------------------------------
 
 
+_BRAND_HARNESS = r"""
+// Faithful two-walk DOM click dispatch.  The capture flag is RECORDED: an
+// earlier version of this harness dropped it, which silently encoded the
+// false premise that at target both phases fire in registration order, and
+// so wrongly rejected a same-element capture listener that Chrome accepts.
+// `document` is a real path member, so its non-capture listeners are
+// modelled too.  stopPropagation gates the walk BETWEEN nodes without
+// suppressing the rest of the current node's listeners.
+const order = [];
+const navigations = [];
+
+function fail(msg) { throw new Error(msg); }
+
+function makeEl(cls, tag) {
+  return {
+    className: cls || "", tagName: tag || "DIV", attrs: {},
+    children: [], parent: null, textContent: "", listeners: [],
+    setAttribute(k, v) { this.attrs[k] = v; },
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; },
+    appendChild(c) { c.parent = this; this.children.push(c); return c; },
+    addEventListener(type, fn, capture) {
+      this.listeners.push([type, fn, capture === true]);
+    },
+    removeEventListener() {},
+    contains(n) { while (n) { if (n === this) return true; n = n.parent; } return false; },
+    querySelector(sel) { return find(this, sel); },
+  };
+}
+
+function hasClass(el, c) {
+  return (" " + el.className + " ").includes(" " + c + " ");
+}
+
+// Descendant combinator: the last token must match, and for a two-token
+// selector some ancestor must match the first.
+function find(root, sel) {
+  const parts = sel.trim().split(/\s+/).map((t) => t.replace(/^\./, ""));
+  const want = parts[parts.length - 1];
+  const anc = parts.length > 1 ? parts[0] : null;
+  const walk = (el) => {
+    for (const c of el.children) {
+      if (hasClass(c, want)) {
+        if (!anc) return c;
+        for (let p = c.parent; p; p = p.parent) if (hasClass(p, anc)) return c;
+      }
+      const hit = walk(c);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return walk(root);
+}
+
+// The rail as shell.js builds it: .rail-brand > .brand-home > .brand-sub,
+// with .rail-collapse a SIBLING of .brand-home inside .rail-brand.
+const root = makeEl("root");
+const railBrand = makeEl("rail-brand");
+const brand = makeEl("brand-home", "BUTTON");
+const sub = makeEl("brand-sub");
+sub.textContent = "server";
+root.appendChild(railBrand);
+railBrand.appendChild(brand);
+brand.appendChild(makeEl("brand-mark"));
+brand.appendChild(sub);
+const collapse = makeEl("rail-collapse", "BUTTON");
+railBrand.appendChild(collapse);
+
+// shell.js's own bubble-phase handler on the same element.
+brand.addEventListener("click", () => order.push("showHome"));
+
+const documentNode = makeEl("document-node");
+const document = {
+  readyState: "loading",
+  querySelector: (sel) => find(root, sel),
+  getElementById: () => null,
+  createElement: (tag) => makeEl("", tag.toUpperCase()),
+  addEventListener(type, fn, capture) {
+    documentNode.listeners.push([type, fn, capture === true]);
+  },
+  removeEventListener() {},
+};
+
+class FakeES { close() {} }
+const window = {
+  fetch: () => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }),
+  EventSource: FakeES,
+};
+// Recording href setter.  A plain string initialised to the node root made
+// "never navigated" and "navigated to the node root" produce identical
+// failures; these are different bugs and must read differently.
+let _href = "/node/n1/current";
+Object.defineProperty(window, "location", {
+  value: Object.defineProperty({}, "href", {
+    get: () => _href,
+    set: (v) => { _href = v; navigations.push(v); order.push("nav"); },
+  }),
+});
+
+function dispatchClick(target) {
+  const path = [];
+  for (let n = target; n; n = n.parent) path.push(n);
+  path.push(documentNode);
+  let stopped = false;
+  const ev = {
+    target, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+    stopPropagation() { stopped = true; },
+  };
+  const invoke = (node, phase) => {
+    for (const [type, fn, capture] of node.listeners.slice()) {
+      if (type !== "click") continue;
+      if (phase === "capturing" && !capture) continue;
+      if (phase === "bubbling" && capture) continue;
+      fn.call(node, ev);
+    }
+  };
+  for (let i = path.length - 1; i >= 0; i--) {
+    invoke(path[i], "capturing");
+    if (stopped) return ev;
+  }
+  for (let i = 0; i < path.length; i++) {
+    invoke(path[i], "bubbling");
+    if (stopped) return ev;
+  }
+  return ev;
+}
+
+new Function("window", "document", SHIM)(window, document);
+
+const ready = documentNode.listeners.filter(([t]) => t === "DOMContentLoaded");
+if (!ready.length) fail("shim never registered a DOMContentLoaded hook");
+for (const [, fn] of ready) fn();
+
+// Post-wire, pre-click: the affordance must be visible and labelled.
+// aria-label first: it separates "nothing ran at all" from "only the
+// sub-label repoint was lost", which otherwise trip the same assertion.
+if (brand.getAttribute("aria-label") !== "Back to console")
+  fail("aria-label not repointed: " + brand.getAttribute("aria-label"));
+if (sub.textContent === "server")
+  fail("brand-sub still reads 'server' - no visible way back");
+if (!/console/i.test(sub.textContent))
+  fail("brand-sub does not name the console: " + sub.textContent);
+
+// Click a CHILD span, as a real user does: the handler must match via
+// contains(), not target identity.
+const ev = dispatchClick(sub);
+
+if (!ev.defaultPrevented)
+  fail("shim did not preventDefault on the brand click");
+if (!navigations.length)
+  fail("brand click did not navigate at all (order=[" + order.join(",") + "])");
+if (navigations[navigations.length - 1] !== "/")
+  fail("brand navigated to " + navigations[navigations.length - 1] + ", expected /");
+if (order.join(",") !== "nav")
+  fail("expected order [nav], got [" + order.join(",") + "]");
+
+// A sibling control inside .rail-brand must not be hijacked.
+const before = navigations.length;
+dispatchClick(collapse);
+if (navigations.length !== before) fail("sibling .rail-collapse click was hijacked");
+"""
+
+
 class TestProxyRewriting:
     """Test the JS shim and HTML rewriting logic."""
 
@@ -1860,96 +2023,110 @@ class TestProxyRewriting:
         assert "window.fetch" in _JS_PROXY_SHIM
         assert "window.EventSource" in _JS_PROXY_SHIM
 
-    def test_js_shim_carries_node_id_placeholder(self):
-        """The picker reads the current node_id from the shim's _nodeId
-        closure variable; the placeholder must be present and substitutable."""
+    def test_js_shim_repoints_rail_brand_at_console(self, tmp_path):
+        """Runtime guard: clicking the rail brand on a proxied page must
+        navigate to the console root, not run shell.js's showHome().
+
+        Executed under node against a stub DOM rather than asserted as
+        substrings: the previous back-to-console affordance (the picker's
+        menu item) was lost precisely because its ``#ui-header`` anchor
+        stopped existing while every string-presence assertion kept passing.
+        A string assertion cannot see a selector that stopped matching, so
+        ``tests/test_shell_js.py`` guards the selector literals themselves.
+
+        Expected click orders were MEASURED in Chrome, not reasoned: a
+        correct wiring gives ``[nav]``, a document bubble listener gives
+        ``[showHome, nav]``, and dropping stopPropagation gives
+        ``[nav, showHome]``.
+
+        ``new Function(...)`` in the harness doubles as the shim's only
+        syntax check in the default CI lane -- ``node --check`` never sees
+        this string, since it lives in a Python constant.
+        """
+        import subprocess
+
         from turnstone.console.server import _JS_PROXY_SHIM
 
-        assert "NODE_ID_PLACEHOLDER" in _JS_PROXY_SHIM
-        replaced = _JS_PROXY_SHIM.replace("NODE_ID_PLACEHOLDER", "node-a")
-        assert "node-a" in replaced
-        assert "NODE_ID_PLACEHOLDER" not in replaced
-
-    def test_js_shim_includes_picker_pieces(self):
-        """Picker logic ships in the same IIFE as the prefix shim — verify
-        the moving parts are present so a future refactor doesn't silently
-        drop them.  /v1/api/cluster/nodes is the lazy-fetch target;
-        #ui-header is the DOM anchor; console-node-pill is the trigger
-        class; ws-tab-dropdown is the menu shell we share with the
-        workstream chevron menu (style + behaviour parity); ArrowDown is
-        the keyboard-nav primitive that disambiguates this from a plain
-        click-only menu."""
-        from turnstone.console.server import _JS_PROXY_SHIM
-
-        # limit=1000 matches the collector's hard cap; without it the
-        # picker would silently drop nodes past the 100-default in
-        # clusters with >100 nodes.
-        assert "/v1/api/cluster/nodes?limit=1000" in _JS_PROXY_SHIM
-        assert "ui-header" in _JS_PROXY_SHIM
-        assert "console-node-pill" in _JS_PROXY_SHIM
-        assert "ws-tab-dropdown" in _JS_PROXY_SHIM
-        assert "ArrowDown" in _JS_PROXY_SHIM
-        assert "DOMContentLoaded" in _JS_PROXY_SHIM
-
-    def test_proxy_style_drops_banner_styles(self):
-        """The legacy banner CSS classes (.console-banner, .ts-header-back-link
-        offsets, .dashboard-overlay top:32px hack) should be gone — the new
-        picker lives inside #ui-header and doesn't need overlay offsets."""
-        from turnstone.console.server import _CONSOLE_PROXY_STYLE
-
-        assert ".console-banner" not in _CONSOLE_PROXY_STYLE
-        assert "dashboard-overlay" not in _CONSOLE_PROXY_STYLE
-        assert ".console-node-pill" in _CONSOLE_PROXY_STYLE
-        assert ".console-node-menu" in _CONSOLE_PROXY_STYLE
-
-    def test_proxy_style_uses_canonical_degraded_color(self):
-        """Degraded health dot must use --accent (the canonical "needs
-        attention" token used by the cluster-overview node table at
-        console/static/style.css:548) and not --yellow.  Yellow is reserved
-        for the dash-state attention dot, a stronger signal."""
-        from turnstone.console.server import _CONSOLE_PROXY_STYLE
-
-        assert "console-node-menu-item-dot--degraded" in _CONSOLE_PROXY_STYLE
-        # The degraded rule sits on its own line; assert it uses --accent
-        # by checking the CSS substring has --accent and not --yellow.
-        idx = _CONSOLE_PROXY_STYLE.find("console-node-menu-item-dot--degraded")
-        rule = _CONSOLE_PROXY_STYLE[idx : idx + 200]
-        assert "var(--accent)" in rule
-        assert "var(--yellow)" not in rule
-
-    def test_html_rewriting_changes_static_paths(self):
-        """Simulate the proxy_index rewriting logic."""
-        sample_html = (
-            '<link rel="stylesheet" href="/static/style.css">\n'
-            '<script src="/static/app.js"></script>'
+        shim = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps("/node/n1"))
+        script = tmp_path / "brand_harness.mjs"
+        script.write_text(
+            "const SHIM = " + json.dumps(shim) + ";\n" + _BRAND_HARNESS,
+            encoding="utf-8",
         )
-        prefix = "/node/test-node"
-        rewritten = sample_html.replace('href="/static/', f'href="{prefix}/static/')
-        rewritten = rewritten.replace('src="/static/', f'src="{prefix}/static/')
-        assert "/node/test-node/static/style.css" in rewritten
-        assert "/node/test-node/static/app.js" in rewritten
-        # Originals should be gone
-        assert 'href="/static/' not in rewritten
-        assert 'src="/static/' not in rewritten
-
-    def test_shim_injection_after_body(self):
-        """Simulate the proxy shim injection — the shim ships the node-id
-        and prefix as JS literals and renders the picker at runtime, so
-        we assert the substituted JS literals land in the page."""
-        from turnstone.console.server import _CONSOLE_PROXY_STYLE, _JS_PROXY_SHIM
-
-        sample_html = "<html><body><div>content</div></body></html>"
-        prefix = "/node/node-a"
-        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix)).replace(
-            '"NODE_ID_PLACEHOLDER"', json.dumps("node-a")
+        try:
+            proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=15)
+        except FileNotFoundError:
+            pytest.skip("node binary not available on PATH")
+        assert proc.returncode == 0, (
+            f"rail-brand back-to-console runtime check failed.\n"
+            f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
         )
-        injection = _CONSOLE_PROXY_STYLE + "<script>" + shim_js + "</script>"
-        result = sample_html.replace("<body>", "<body>" + injection, 1)
-        assert '"node-a"' in result
-        assert '"/node/node-a"' in result
-        assert "PREFIX_PLACEHOLDER" not in result
-        assert "NODE_ID_PLACEHOLDER" not in result
-        assert result.startswith("<html><body><style>")
+
+    def test_shim_injection_after_body(self, monkeypatch):
+        """Drive the REAL ``proxy_index`` against the REAL node index page.
+
+        The previous version asserted ``startswith("<html><body><script>")``
+        on a string the test itself had concatenated three lines earlier --
+        unconditionally true, and green even if proxy_index stopped
+        injecting entirely.
+
+        Feeding the real ``turnstone/ui/static/index.html`` also pins
+        something nothing else does: the injection is a literal
+        ``page.replace("<body>", ...)``, so the day that file grows a
+        ``<body class="...">`` attribute the ENTIRE shim silently vanishes --
+        prefix rewriting included, not just back-to-console.
+        """
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import httpx
+
+        from turnstone.console import server as csrv
+
+        index = (
+            Path(__file__).resolve().parent.parent / "turnstone/ui/static/index.html"
+        ).read_text(encoding="utf-8")
+        assert "<body>" in index, (
+            "the node index no longer has a bare <body>; proxy_index's "
+            "literal replace() would silently inject nothing at all."
+        )
+
+        upstream = httpx.Response(
+            200,
+            content=index.encode(),
+            headers={"content-type": "text/html; charset=utf-8"},
+            request=httpx.Request("GET", "http://n:1/"),
+        )
+
+        async def _mock_get(*a, **kw):
+            return upstream
+
+        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client.get = MagicMock(side_effect=_mock_get)
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
+            path_params={"node_id": "node-a"},
+            url=SimpleNamespace(query=""),
+        )
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda r: {})
+        monkeypatch.setattr(csrv, "_get_server_url", lambda r, n: "http://n:1")
+
+        resp = asyncio.run(csrv.proxy_index(request))
+        assert resp.status_code == 200
+        body = resp.body.decode()
+
+        # The shim is injected, and injected at <body> rather than appended.
+        assert "<body><script>" in body, "shim not injected immediately after <body>"
+        assert '"/node/node-a"' in body, "prefix literal missing from the shim"
+        assert "PREFIX_PLACEHOLDER" not in body
+        assert "wireBrandHome" in body, "back-to-console wiring absent from the page"
+        # Static + shared rewriting still happen on the same pass.
+        assert 'href="/static/' not in body
+        assert 'src="/static/' not in body
+        assert "/node/node-a/static/" in body
+        assert 'href="/shared/' not in body
+        assert "/node/node-a/shared/" in body
 
 
 # ---------------------------------------------------------------------------
@@ -2180,23 +2357,6 @@ class TestProxySharedStatic:
         assert "/node/test-node/static/app.js" in rewritten
         assert 'href="/shared/' not in rewritten
         assert 'src="/shared/' not in rewritten
-
-    def test_proxy_shim_injected_in_html(self):
-        """Verify shim is injected as inline script in proxied HTML."""
-
-        from turnstone.console.server import _JS_PROXY_SHIM
-
-        sample_html = "<html><body><div>content</div></body></html>"
-        prefix = "/node/test-node"
-        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix)).replace(
-            '"NODE_ID_PLACEHOLDER"', json.dumps("test-node")
-        )
-        shim = "<script>" + shim_js + "</script>"
-        result = sample_html.replace("<body>", "<body>" + shim, 1)
-        assert "<script>" in result
-        assert "/node/test-node" in result
-        assert "window.fetch" in result
-        assert "window.EventSource" in result
 
     def test_proxy_shared_static_unknown_node_returns_404(self):
         from starlette.testclient import TestClient
