@@ -364,7 +364,7 @@ class ModelCapabilities:
     # invalidating the cached prefix.  When False, ``system``-role messages must
     # be hoisted into the top-level ``system`` param (the universal fallback).
     # Available on the Claude API only (NOT Bedrock / Vertex / Foundry), on
-    # claude-opus-4-8 (validated header-less) and claude-fable-5 (same
+    # every row that sets this flag (validated header-less on claude-opus-4-8;
     # documented wire surface); no beta header required.
     supports_mid_conversation_system: bool = False
     # Phase 3 reranker calibration — populated by calibrate-on-detect; read by
