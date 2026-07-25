@@ -62,6 +62,8 @@ from turnstone.prompts import ClientType
 from turnstone.server import WebUI, create_app
 
 if TYPE_CHECKING:
+    from collections.abc import MutableMapping
+
     from turnstone.core.workstream import Workstream
 
 _JWT_SECRET = "sse-recovery-e2e-jwt-secret-minimum-32-chars!"
@@ -230,6 +232,10 @@ class RecoveryServer:
         # write atomic, so these need no lock even though the uvicorn loop
         # thread increments/decrements them while the runner thread reads.
         self.history_requests = 0
+        # /history responses the PRODUCTION route answered 200 (not the
+        # fault layer's injected 500s).  See _fault_app for why arrival
+        # counting cannot substitute.
+        self.history_ok = 0
         self.rewind_requests = 0
         # Per-ws SSE connection opens (``GET …/events`` — the EventSource the
         # pane's connectSSE builds).  A TRANSPORT-FREE heal (the #890 idle-edge
@@ -256,6 +262,11 @@ class RecoveryServer:
                 path = scope.get("path", "")
                 method = scope.get("method", "")
                 if path.endswith("/history") and method == "GET":
+                    # ARRIVAL, never move.  Scenarios that hold a request open
+                    # use this bump as the IN-FLIGHT edge (E6/E7/G1/G7 say so
+                    # at their poll sites); counting on forward instead would
+                    # delay it past the hold and silently stop those scenarios
+                    # testing anything.
                     self.history_requests += 1
                     if self._history_delay_ms > 0:
                         await asyncio.sleep(self._history_delay_ms / 1000.0)
@@ -270,6 +281,26 @@ class RecoveryServer:
                         )
                         await send({"type": "http.response.body", "body": b'{"error": "injected"}'})
                         return
+
+                    # Successful-RESPONSE counter, distinct from the arrival
+                    # bump above.  A scenario asserting that a render was
+                    # DECLINED needs to know a good payload actually existed —
+                    # otherwise "the client refused to render" and "there was
+                    # nothing to render" produce identical observables (no
+                    # wipe, latch held).  Arrival cannot prove that, and
+                    # neither can an injected-fail budget: a PRODUCTION-side
+                    # 500/404 would slip through both.  Reading the real
+                    # status off the response start is the only honest signal.
+                    async def _counting_send(message: MutableMapping[str, Any]) -> None:
+                        if (
+                            message.get("type") == "http.response.start"
+                            and message.get("status") == 200
+                        ):
+                            self.history_ok += 1
+                        await send(message)
+
+                    await production_app(scope, receive, _counting_send)
+                    return
                 elif path.endswith("/rewind") and method == "POST":
                     self.rewind_requests += 1
                 elif path.endswith("/events") and method == "GET":

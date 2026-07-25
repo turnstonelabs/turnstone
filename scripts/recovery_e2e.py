@@ -26,6 +26,7 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario hidden-retry      # E5 (#900)
     python3 scripts/recovery_e2e.py --scenario await-window-gate # E6 (#900)
     python3 scripts/recovery_e2e.py --scenario destroy-invalidation # E7 (#900)
+    python3 scripts/recovery_e2e.py --scenario reconnect-in-await # E8 (#900 r2)
     python3 scripts/recovery_e2e.py --scenario coord-rewind-window        # G1 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-rewind-failed-window # G2 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-stale-backstop       # G3 (#894)
@@ -133,6 +134,21 @@ the latch still SET (``replayHistory`` is the latch's only clear site, so a
 held latch proves no render ran); without the gate it stamps rows1-latch0.
 The repair still arrives on the organic settle the transport-free backstop
 owns.  Stamps ``RECOVERY-READY-AWAITGATE-rows3-latch1``.
+
+Scenario E8 (reconnect-in-await): the stream-generation term (#900 r2), and
+the FIRST detector here that can observe a double render at all.  Every other
+scenario counts ``.msg.user`` rows, and user rows never travel on the SSE
+stream, so none of them can see the artefact this campaign prevents — E8
+counts a sentinel's OCCURRENCES in the transcript text instead.  The retry
+fires with the transport OPEN, its /history is held, and inside that await the
+transport DROPS and RE-ESTABLISHES: ``readyState`` reads OPEN afterwards
+exactly as before, so neither the presence nor the readyState term can tell
+the two apart, but the redial re-presented the frozen cursor, the server
+answered replay_ok, and the quiesce BUFFERED that slice — rendering commits
+the turn and the flush repaints it.  The connection generation is the only
+term that sees it (object identity cannot: a native reconnect reuses the same
+EventSource).  Verified by control: stripping the term stamps ``dupes2``.
+Stamps ``RECOVERY-READY-RECONNECTAWAIT-dupes1-healed1``.
 
 The #894 coordinator ports (G family — the coord pane's ``historyStale``
 latch; coord state is closure-private, so where E2-E4 read pane fields the
@@ -386,6 +402,20 @@ SECOND_SENTINEL = "SECOND-a7f3"
 # proves the sent turn reached the healed /history render, distinct from
 # everything else on screen.
 BACKSTOP_SENTINEL = "BACKSTOP-b2e4"
+# Scenario E8's duplicate-detector sentinel.  Its whole job is to be COUNTED,
+# not merely found: the artefact #900's stream-generation term prevents is a
+# turn rendered twice, and every other detector in this file counts
+# ``.msg.user`` rows — which never travel on the SSE stream, so none of them
+# can see it.
+DUPLICATE_SENTINEL = "DUPE-c9a7"
+
+# Row-count selectors, hoisted above every runner that uses them (#900 r2):
+# eight inline copies had accumulated ABOVE the old definition site, so the
+# duplication was invisible to anyone reading top-down.  Python resolves
+# module names at CALL time, so the old placement worked — it just could
+# not be adopted by the runners that needed it most.
+_ROWS_JS = "window.__pane.messagesEl.querySelectorAll('.msg.user').length"
+_COORD_ROWS_JS = "document.getElementById('coord-messages').querySelectorAll('.msg.user').length"
 
 # Scenario G4 (coord-heal-midturn) sentinels: turn 4's final text (the
 # settle that fires the held backstop fetch) and turn 5's final text (the
@@ -577,6 +607,32 @@ PAGE_HTML = r"""<!doctype html>
 
       // Shared by the rewind scenarios (E2/E3): click the REAL rewind
       // button on the idx-th user row.  Depends only on `pane`.
+      // Count a sentinel's OCCURRENCES in the transcript text.  Every other
+      // detector in this harness counts `.msg.user` rows, and user rows are
+      // never emitted on the SSE stream — so none of them can observe a turn
+      // rendered twice.  Counting text is structure-agnostic: it catches a
+      // duplicate assistant bubble, a duplicate tool block, or both.
+      window.__countSentinel = function (s) {
+        const text = pane.messagesEl.textContent || "";
+        let n = 0;
+        let i = text.indexOf(s);
+        while (i !== -1) {
+          n += 1;
+          i = text.indexOf(s, i + s.length);
+        }
+        return n;
+      };
+      // Drop and re-establish the transport in place — scenario E8's
+      // reconnect-inside-the-await.  Deliberately NOT __hide()/__show():
+      // a hide leaves evtSource null, which the gate's presence term
+      // already decides, so the negative control would pass for the wrong
+      // reason.  This lands OPEN with a bumped generation, which only the
+      // generation term can see.
+      window.__redial = function () {
+        pane.disconnectSSE();
+        pane.connectSSE(pane.wsId);
+      };
+
       window.__clickRewind = function (idx) {
         const rows = pane.messagesEl.querySelectorAll(".msg.user");
         const row = rows[idx];
@@ -930,6 +986,41 @@ PAGE_HTML = r"""<!doctype html>
               "-latch" +
               (latchHeld ? 1 : 0) +
               "-heal" +
+              (healed ? 1 : 0);
+        };
+      } else if (scenario === "reconnect-in-await") {
+        // Scenario E8 — the stream-generation term (#900 r2).  A transport
+        // that DROPS and finishes RE-ESTABLISHING inside a seedless
+        // /history await reads back readyState OPEN, indistinguishable from
+        // one that never moved.  It is not: the redial re-presented the
+        // frozen _lastEventId, the server answered replay_ok, and the
+        // quiesce BUFFERED that slice — so a render here commits turns the
+        // flush is about to repaint on top.  Only a connection counter can
+        // see it; object identity cannot, because a NATIVE reconnect reuses
+        // the same EventSource object.
+        //
+        // THE DETECTOR IS A COUNT, not a presence check.  Both the fixed and
+        // the broken build end up SHOWING the turn — the difference is
+        // whether it appears once (render declined, the flushed replay
+        // paints it) or twice (render committed, then the flush repeats it).
+        window.__verifyReconnectInAwait = function (dupes, healed) {
+          // dupes is THE discriminator: the turn committed during the
+          //   transport gap must appear EXACTLY once.  2 is the double
+          //   render this scenario exists for.
+          // healed is the CONVERGENCE leg, not a discriminator — it holds in
+          //   both builds, and is asserted so a "no duplicates" verdict can
+          //   never be earned by rendering nothing at all.  Unlike E6 (tab
+          //   stays hidden, so the declined render's flushed settle edge
+          //   finds a dead transport and the latch stays set), here the
+          //   stream is LIVE at flush time: the queued settle fires the
+          //   transport-free backstop, whose own fetch has a stable
+          //   generation and lands.  A declined render still converges.
+          const ok = dupes === 1 && healed;
+          document.title = ok
+            ? "RECOVERY-READY-RECONNECTAWAIT-dupes1-healed1"
+            : "RECOVERY-FAILED-RECONNECTAWAIT-dupes" +
+              dupes +
+              "-healed" +
               (healed ? 1 : 0);
         };
       } else if (scenario === "destroy-invalidation") {
@@ -2379,9 +2470,7 @@ def run_rewind_window(chrome: str) -> str:
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
         # Wait for the initial /history to paint all three user rows.
         if not _poll_until(
-            lambda: (
-                cdp.evaluate("window.__pane.messagesEl.querySelectorAll('.msg.user').length") == 3
-            ),
+            lambda: cdp.evaluate(_ROWS_JS) == 3,
             20,
             0.2,
         ):
@@ -2411,8 +2500,7 @@ def run_rewind_window(chrome: str) -> str:
         _poll_until(
             lambda: (
                 (not cdp.evaluate("window.__pane._replayQueue != null"))
-                and cdp.evaluate("window.__pane.messagesEl.querySelectorAll('.msg.user').length")
-                == 1
+                and cdp.evaluate(_ROWS_JS) == 1
             ),
             8,
         )
@@ -2449,9 +2537,7 @@ def run_rewind_failed_window(chrome: str) -> str:
         # Wait for the initial /history to paint all three user rows.  This
         # load MUST succeed, so arm the forced failure only AFTERWARDS.
         if not _poll_until(
-            lambda: (
-                cdp.evaluate("window.__pane.messagesEl.querySelectorAll('.msg.user').length") == 3
-            ),
+            lambda: cdp.evaluate(_ROWS_JS) == 3,
             20,
             0.2,
         ):
@@ -2500,7 +2586,7 @@ def run_rewind_failed_window(chrome: str) -> str:
                 "rewind-failed-window: failed fetch did not settle to latch-held/quiesce-released"
             )
         # The stale transcript is intact — the failed fetch wiped nothing.
-        stale_rows = cdp.evaluate("window.__pane.messagesEl.querySelectorAll('.msg.user').length")
+        stale_rows = cdp.evaluate(_ROWS_JS)
         if stale_rows != 3:
             raise AssertionError(
                 f"rewind-failed-window: failed fetch did not preserve the transcript "
@@ -2522,9 +2608,7 @@ def run_rewind_failed_window(chrome: str) -> str:
         # (same arithmetic as run_rewind_window).  Poll to a deadline rather
         # than sleeping the 2s timer + 3s hold.
         healed = _poll_until(
-            lambda: (
-                cdp.evaluate("window.__pane.messagesEl.querySelectorAll('.msg.user').length") == 1
-            ),
+            lambda: cdp.evaluate(_ROWS_JS) == 1,
             10,
             0.2,
         )
@@ -2603,9 +2687,7 @@ def run_stale_backstop(chrome: str) -> str:
         # Wait for the initial /history to paint all three user rows.  This
         # load MUST succeed, so arm the forced failures only AFTERWARDS.
         if not _poll_until(
-            lambda: (
-                cdp.evaluate("window.__pane.messagesEl.querySelectorAll('.msg.user').length") == 3
-            ),
+            lambda: cdp.evaluate(_ROWS_JS) == 3,
             20,
             0.2,
         ):
@@ -2646,7 +2728,7 @@ def run_stale_backstop(chrome: str) -> str:
                 "stale-backstop: aftermath did not settle to latch-held/quiesce-released"
             )
         # The stale transcript is intact — the failed fetches wiped nothing.
-        stale_rows = cdp.evaluate("window.__pane.messagesEl.querySelectorAll('.msg.user').length")
+        stale_rows = cdp.evaluate(_ROWS_JS)
         if stale_rows != 3:
             raise AssertionError(
                 f"stale-backstop: failed fetches did not preserve the transcript "
@@ -2678,7 +2760,7 @@ def run_stale_backstop(chrome: str) -> str:
         # regressed looping backstop times out to a clean FAILED, never a hang.
         healed = _poll_until(
             lambda: cdp.evaluate(
-                "window.__pane.messagesEl.querySelectorAll('.msg.user').length === 2 "
+                _ROWS_JS + " === 2 "
                 "&& window.__pane._historyStale === false "
                 "&& (window.__pane.messagesEl.textContent||'').includes("
                 + json.dumps(BACKSTOP_SENTINEL)
@@ -2722,9 +2804,6 @@ def run_stale_backstop(chrome: str) -> str:
             cdp.close()
         _kill(proc)
         node.stop()
-
-
-_ROWS_JS = "window.__pane.messagesEl.querySelectorAll('.msg.user').length"
 
 
 def run_hidden_retry(chrome: str) -> str:
@@ -2789,7 +2868,13 @@ def run_hidden_retry(chrome: str) -> str:
         # NON-occurrence window: the retry fires at ~2s post-failure, so give
         # it 3.5s.  Without the guard this poll returns True (the hidden fetch
         # lands) and hidden_delta stamps 1.
-        _poll_until(lambda: node.history_requests != hidden_baseline, 3.5, 0.1)
+        # Window = the 2000 ms floor + the jitter ceiling + slack.  The
+        # retry's delay is `2000 + rand*STALE_RETRY_JITTER_MS` (#900), so a
+        # window sized on the floor alone would close BEFORE a
+        # top-of-range firing and report hidden0 for the wrong reason —
+        # the detector would go vacuous and its negative control would
+        # silently stop working.  Raise this with the constant.
+        _poll_until(lambda: node.history_requests != hidden_baseline, 4.5, 0.1)
         hidden_delta = node.history_requests - hidden_baseline
         # The latch must still be SET — a skipped retry heals nothing, which
         # is exactly why the backstop still owns the repair below.
@@ -2853,10 +2938,18 @@ def run_await_window_gate(chrome: str) -> str:
     released, latch intact for the backstop.
 
     DETECTOR: the stale transcript must survive the resolved fetch — THREE
-    user rows still standing (the pre-rewind truth) with the latch still SET,
-    after ``history_requests`` proves the held fetch both arrived AND
-    returned.  Without the gate the render lands and stamps rows1-latch0,
-    because a successful replayHistory is the latch's only clear site."""
+    user rows still standing (the pre-rewind truth) with the latch still SET.
+    Without the gate the render lands and stamps rows1-latch0, because a
+    successful replayHistory is the latch's only clear site.
+
+    NON-VACUITY is the load-bearing part here, and ``history_requests`` cannot
+    carry it: that counter bumps on ARRIVAL, before the hold and before any
+    status is chosen, so "the gate declined a good payload" and "there was no
+    good payload" would stamp identical observables (no wipe either way, latch
+    held either way).  ``history_ok`` — incremented only when the PRODUCTION
+    route answers 200 — is what proves a renderable payload actually existed,
+    and it closes the production-side-failure hole an injected-fail budget
+    cannot see."""
     from tests._sse_recovery_server import final_text_script
 
     # The heal-driving send needs its OWN scripted turn: an exhausted script
@@ -2890,6 +2983,7 @@ def run_await_window_gate(chrome: str) -> str:
         # Hold the RETRY's fetch open.  history_requests counts on ARRIVAL,
         # before the hold sleeps, so the bump below is the in-flight edge.
         retry_baseline = node.history_requests
+        ok_baseline = node.history_ok
         node.delay_history(3000)
         # The tab stays VISIBLE here — the retry must pass its fire guard,
         # or this scenario degenerates into E5 and proves nothing.
@@ -2900,10 +2994,20 @@ def run_await_window_gate(chrome: str) -> str:
         cdp.evaluate("window.__hide && window.__hide()")
         if not _poll_until(lambda: cdp.evaluate("window.__pane.evtSource === null"), 5, 0.05):
             raise AssertionError("await-window-gate: close-on-hide never dropped the transport")
-        # Let the held fetch resolve, then let the render decision settle.
+        # Clear the knob for any LATER arrival; the already-held fetch is
+        # sleeping on the duration it captured at arrival and serves that
+        # out regardless — which is why the poll below must outlast it.
         node.delay_history(0)
         if not _poll_until(lambda: cdp.evaluate("window.__pane._replayQueue === null"), 12, 0.1):
             raise AssertionError("await-window-gate: the quiesce never released")
+        # The payload must have been GOOD — otherwise a declined render and a
+        # failed fetch are indistinguishable (see the docstring).
+        if not _poll_until(lambda: node.history_ok >= ok_baseline + 1, 12, 0.1):
+            raise AssertionError(
+                "await-window-gate: the held /history never answered 200 "
+                f"(history_ok={node.history_ok}, baseline={ok_baseline}) — "
+                "a declined render cannot be distinguished from a failed fetch"
+            )
         rows = cdp.evaluate(_ROWS_JS)
         latch_held = cdp.evaluate("window.__pane._historyStale === true")
         # The heal still belongs to the backstop: show, then drive an organic
@@ -2929,6 +3033,119 @@ def run_await_window_gate(chrome: str) -> str:
             f"window.__verifyAwaitWindowGate({rows}, "
             f"{'true' if latch_held else 'false'}, {'true' if healed else 'false'})"
         )
+        return _poll_title(cdp, 15)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
+def run_reconnect_in_await(chrome: str) -> str:
+    """Scenario E8 — the stream-generation term (#900 r2), and the first
+    detector in this harness that can observe a DOUBLE RENDER at all.
+
+    Every other scenario counts ``.msg.user`` rows, and user rows never travel
+    on the SSE stream (a /send emits none — only /history replay paints them),
+    so none of them can see the artefact this whole campaign prevents: a turn
+    rendered twice.  E8 counts a sentinel's OCCURRENCES in the transcript text
+    instead, which is structure-agnostic across duplicate assistant bubbles and
+    duplicate tool blocks.
+
+    The window: the clear_ui retry fires with the transport OPEN, its /history
+    is held at the fault layer, and inside that await the transport DROPS and
+    RE-ESTABLISHES.  ``readyState`` reads OPEN afterwards exactly as it did
+    before, so neither the presence term nor the readyState term can tell the
+    two apart — but the redial re-presented the frozen ``_lastEventId``, the
+    server answered ``replay_ok`` with the turn committed during the gap, and
+    the replay quiesce BUFFERED that slice.  Rendering then commits the turn,
+    and ``_endReplayQuiesce`` repaints it on top: two copies.
+
+    With the generation term the render is declined, the stale-but-real
+    transcript survives, and the flushed replay paints the new turn exactly
+    ONCE.  Strip the term and the same run stamps ``dupes2``.
+
+    The redial is a REAL disconnect+connect, deliberately not ``__hide()``:
+    a hide leaves ``evtSource`` null, which the presence term already decides,
+    so a hide-based control would pass for the wrong reason."""
+    from tests._sse_recovery_server import final_text_script
+
+    node, ws_id = _seed_three_completed_turns(
+        "browser-reconnect-in-await",
+        extra_scripts=(final_text_script(DUPLICATE_SENTINEL),),
+    )
+    profile = Path(_scratch()) / "chrome-reconnect-in-await"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=reconnect-in-await"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        if not _poll_until(lambda: cdp.evaluate(_ROWS_JS) == 3, 20, 0.2):
+            raise AssertionError("reconnect-in-await: three user rows never rendered")
+        if not _poll_until(lambda: node.events_requests >= 1, 10, 0.05):
+            raise AssertionError("reconnect-in-await: SSE stream never opened")
+        # Arm the latch: the rewind's own clear_ui refetch fails, leaving the
+        # stale transcript up and the bounded retry armed.
+        node.fail_history(1)
+        if not cdp.evaluate("window.__clickRewind(1)"):
+            raise AssertionError("reconnect-in-await: second-row rewind button missing")
+        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
+            raise AssertionError("reconnect-in-await: rewind never POSTed")
+        if not _poll_until(lambda: node.history_fail_remaining == 0, 15):
+            raise AssertionError("reconnect-in-await: forced /history failure never fired")
+        # Hold the RETRY's fetch wide open — everything below happens inside
+        # its await.  history_requests counts on ARRIVAL, so the bump is the
+        # in-flight edge.
+        retry_baseline = node.history_requests
+        ok_baseline = node.history_ok
+        node.delay_history(6000)
+        if not _poll_until(lambda: node.history_requests == retry_baseline + 1, 8, 0.05):
+            raise AssertionError("reconnect-in-await: the retry never fetched on the live stream")
+        # (1) Drop the transport.  The cursor freezes here.
+        cdp.evaluate("window.__pane.disconnectSSE()")
+        if not _poll_until(lambda: cdp.evaluate("window.__pane.evtSource === null"), 5, 0.05):
+            raise AssertionError("reconnect-in-await: the transport never dropped")
+        # (2) Commit a turn while the stream is DOWN, so the server holds
+        #     events past the frozen cursor with no way to have delivered them.
+        # Runner-side send + the real turn-complete barrier: the page's
+        # stream is down, so driving this from the browser would prove
+        # nothing extra and only add a timing race.
+        node.send(ws_id, "gap turn")
+        node.wait_turn(ws_id)
+        # (3) Re-establish, still inside the await.  This is the whole point:
+        #     readyState goes back to OPEN, so only the generation moved.
+        cdp.evaluate("window.__redial()")
+        if not _poll_until(
+            lambda: cdp.evaluate(
+                "!!window.__pane.evtSource && "
+                "window.__pane.evtSource.readyState === EventSource.OPEN"
+            ),
+            10,
+            0.05,
+        ):
+            raise AssertionError("reconnect-in-await: the redial never reached OPEN")
+        # Release the knob for later arrivals; the held fetch serves out its
+        # own 6000 ms regardless, which is what the polls below outlast.
+        node.delay_history(0)
+        if not _poll_until(lambda: node.history_ok >= ok_baseline + 1, 15, 0.1):
+            raise AssertionError(
+                "reconnect-in-await: the held /history never answered 200 — "
+                "a declined render cannot be distinguished from a failed fetch"
+            )
+        # Settle to the CONVERGED end state before counting.  The declined
+        # render leaves the latch set, its flushed settle edge fires the
+        # backstop, and the backstop's own fetch — stable generation, live
+        # stream — lands the rewound-plus-gap transcript (2 user rows, latch
+        # cleared).  Counting before that would race the heal.
+        healed = _poll_until(
+            lambda: cdp.evaluate(_ROWS_JS + " === 2 && window.__pane._historyStale === false"),
+            25,
+            0.2,
+        )
+        dupes = cdp.evaluate(f"window.__countSentinel({json.dumps(DUPLICATE_SENTINEL)})")
+        print(f"  reconnect-in-await dupes={dupes} healed={healed}")
+        cdp.evaluate(f"window.__verifyReconnectInAwait({dupes}, {'true' if healed else 'false'})")
         return _poll_title(cdp, 15)
     finally:
         if cdp is not None:
@@ -2986,8 +3203,11 @@ def run_destroy_invalidation(chrome: str) -> str:
         cdp.evaluate("window.__ctl.destroy()")
         if not _poll_until(lambda: cdp.evaluate("!window.__pane.el.parentNode"), 5, 0.05):
             raise AssertionError("destroy-invalidation: destroy() never detached the pane")
-        # Let the held fetch resolve and its .finally run.  The wait must
-        # outlast the hold, or a 0 here would only mean "not yet".
+        # Hygiene only: this cannot release the in-flight hold (the fault
+        # layer captured the duration at arrival), and no further /history
+        # is expected here.  The non-occurrence poll below therefore has to
+        # outlast the REMAINING hold — raising delay_history above without
+        # raising that deadline would make this detector vacuous.
         node.delay_history(0)
         _poll_until(lambda: node.events_requests != 0, 8, 0.1)
         sse_opens = node.events_requests
@@ -3000,9 +3220,6 @@ def run_destroy_invalidation(chrome: str) -> str:
             cdp.close()
         _kill(proc)
         node.stop()
-
-
-_COORD_ROWS_JS = "document.getElementById('coord-messages').querySelectorAll('.msg.user').length"
 
 
 def run_coord_rewind_window(chrome: str) -> str:
@@ -3511,7 +3728,13 @@ def run_coord_hidden_retry(chrome: str) -> str:
         # NON-occurrence window: the retry fires at ~2s post-failure; give
         # it 3.5s.  Without the evtSource guard this poll returns True
         # (the hidden fetch lands) and hiddenDelta stamps 1.
-        _poll_until(lambda: node.history_requests != hidden_baseline, 3.5, 0.1)
+        # Window = the 2000 ms floor + the jitter ceiling + slack.  The
+        # retry's delay is `2000 + rand*STALE_RETRY_JITTER_MS` (#900), so a
+        # window sized on the floor alone would close BEFORE a
+        # top-of-range firing and report hidden0 for the wrong reason —
+        # the detector would go vacuous and its negative control would
+        # silently stop working.  Raise this with the constant.
+        _poll_until(lambda: node.history_requests != hidden_baseline, 4.5, 0.1)
         hidden_delta = node.history_requests - hidden_baseline
         # Show: the reconnect presents the frozen cursor and replays
         # replay_ok (nothing lost), which carries NO synthetic
@@ -3822,6 +4045,7 @@ def main() -> None:
             "hidden-retry",
             "await-window-gate",
             "destroy-invalidation",
+            "reconnect-in-await",
             "coord-rewind-window",
             "coord-rewind-failed-window",
             "coord-stale-backstop",
@@ -3893,6 +4117,10 @@ def main() -> None:
     if args.scenario in ("destroy-invalidation", "all"):
         verdict = run_destroy_invalidation(chrome)
         print(f"scenario E7 (destroyinval): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("reconnect-in-await", "all"):
+        verdict = run_reconnect_in_await(chrome)
+        print(f"scenario E8 (reconnectawait): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     if args.scenario in ("coord-rewind-window", "all"):
         verdict = run_coord_rewind_window(chrome)
