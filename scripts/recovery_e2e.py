@@ -113,8 +113,10 @@ repaints every turn the hidden render just committed (only ``system_turn``
 and compaction markers carry id dedup; content and tool rows do not).  The
 detector is a NON-OCCURRENCE counted at the fault layer: ``history_requests``
 UNCHANGED across the hidden window (``hidden0``), which regresses to
-``hidden1`` the moment the ``evtSource.readyState === OPEN`` term is
-removed.  A replay_ok reconnect carries no synthetic ``state_change``, so
+``hidden1`` the moment the guard's transport clause is removed.  Note the
+scope: a hide nulls ``evtSource``, so this exercises the PRESENCE term only —
+the ``readyState`` half needs a redial in progress, which no fault primitive
+produces deterministically (see the runner's docstring).  A replay_ok reconnect carries no synthetic ``state_change``, so
 the latch survives ``__show`` — the accepted liveness lag — and the heal
 rides a plain send's ORGANIC settle into the transport-free backstop, hence
 exactly ONE new SSE open across show + heal.  Stamps
@@ -605,8 +607,6 @@ PAGE_HTML = r"""<!doctype html>
       if (ctl) ctl.connect();
       else pane._loadHistoryThenConnect(wsId);
 
-      // Shared by the rewind scenarios (E2/E3): click the REAL rewind
-      // button on the idx-th user row.  Depends only on `pane`.
       // Count a sentinel's OCCURRENCES in the transcript text.  Every other
       // detector in this harness counts `.msg.user` rows, and user rows are
       // never emitted on the SSE stream — so none of them can observe a turn
@@ -633,6 +633,8 @@ PAGE_HTML = r"""<!doctype html>
         pane.connectSSE(pane.wsId);
       };
 
+      // Shared by the rewind scenarios (E2/E3): click the REAL rewind
+      // button on the idx-th user row.  Depends only on `pane`.
       window.__clickRewind = function (idx) {
         const rows = pane.messagesEl.querySelectorAll(".msg.user");
         const row = rows[idx];
@@ -923,7 +925,9 @@ PAGE_HTML = r"""<!doctype html>
         // and tool rows carry no id dedup).  The fire guard's
         // ``evtSource.readyState === OPEN`` term skips the hidden firing
         // instead: hiddenDelta 0 is the NON-OCCURRENCE detector, and it
-        // regresses to 1 the moment the term is removed.
+        // regresses to 1 the moment the transport clause is removed.  Scope:
+        // a hide nulls evtSource, so this reaches the PRESENCE term only —
+        // not the readyState half, which needs a redial in progress.
         //
         // A replay_ok reconnect carries no synthetic state_change (only
         // fresh/truncated replays do), so the latch stays closed across
@@ -2821,8 +2825,19 @@ def run_hidden_retry(chrome: str) -> str:
 
     THE DETECTOR is a NON-OCCURRENCE, counted at the fault layer:
     ``history_requests`` must be UNCHANGED across the whole hidden window.
-    Remove the ``evtSource.readyState === OPEN`` term and the hidden fetch
-    lands, stamping hidden1 — the scenario's negative control.
+    Remove the transport clause from the fire guard and the hidden fetch lands,
+    stamping hidden1 — the scenario's negative control.
+
+    SCOPE, stated precisely (do not overclaim it): a hide nulls ``evtSource``
+    outright, and ``connectSSE`` early-returns while ``document.hidden``, so
+    this scenario can only ever exercise the guard's PRESENCE term
+    (``this.evtSource &&``).  It structurally cannot produce the non-null,
+    not-OPEN source the ``readyState === OPEN`` term exists for — that state
+    needs a native redial in progress, which no fault primitive here produces
+    deterministically.  The readyState half is therefore covered by REASONING
+    plus coord parity, not by this scenario; its correctness twin IS covered,
+    by E6/E8 through ``_refetchHistory``'s render-time gate.  Same true of
+    coord's G5.
 
     A replay_ok reconnect carries NO synthetic ``state_change`` (only
     fresh/truncated replays do), so the latch stays closed across ``__show``:
@@ -2865,9 +2880,10 @@ def run_hidden_retry(chrome: str) -> str:
         if not _poll_until(lambda: cdp.evaluate("window.__pane.evtSource === null"), 5, 0.05):
             raise AssertionError("hidden-retry: close-on-hide never dropped the transport")
         hidden_baseline = node.history_requests
-        # NON-occurrence window: the retry fires at ~2s post-failure, so give
-        # it 3.5s.  Without the guard this poll returns True (the hidden fetch
-        # lands) and hidden_delta stamps 1.
+        # NON-occurrence window: the retry fires at STALE_RETRY_BASE_MS plus up
+        # to STALE_RETRY_JITTER_MS, so the window must outlast floor+ceiling.
+        # Without the guard this poll returns True (the hidden fetch lands) and
+        # hidden_delta stamps 1.
         # Window = the 2000 ms floor + the jitter ceiling + slack.  The
         # retry's delay is `2000 + rand*STALE_RETRY_JITTER_MS` (#900), so a
         # window sized on the floor alone would close BEFORE a
@@ -3125,6 +3141,18 @@ def run_reconnect_in_await(chrome: str) -> str:
             0.05,
         ):
             raise AssertionError("reconnect-in-await: the redial never reached OPEN")
+        # NON-VACUITY, the leg this scenario turns on: the held fetch must
+        # still be OUTSTANDING right now.  If it already resolved — a slow box
+        # can push the disconnect/send/wait_turn/redial sequence past the hold
+        # — the payload landed while evtSource was still null, the PRESENCE
+        # term declined it, and a green verdict would never have touched the
+        # generation term at all.
+        if node.history_ok != ok_baseline:
+            raise AssertionError(
+                "reconnect-in-await: the held /history resolved BEFORE the "
+                f"redial (history_ok={node.history_ok}, baseline={ok_baseline}) "
+                "— the generation term was never exercised; raise the hold"
+            )
         # Release the knob for later arrivals; the held fetch serves out its
         # own 6000 ms regardless, which is what the polls below outlast.
         node.delay_history(0)
@@ -3186,6 +3214,7 @@ def run_destroy_invalidation(chrome: str) -> str:
         # Hold the FIRST /history — the one connect() dispatches — so the
         # teardown lands with the load genuinely outstanding.
         node.delay_history(4000)
+        ok_baseline = node.history_ok
         url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=destroy-invalidation"
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
         # history_requests counts on ARRIVAL, before the hold sleeps.
@@ -3210,6 +3239,15 @@ def run_destroy_invalidation(chrome: str) -> str:
         # raising that deadline would make this detector vacuous.
         node.delay_history(0)
         _poll_until(lambda: node.events_requests != 0, 8, 0.1)
+        # sse_opens == 0 only means "nothing connected in 8s".  Prove the held
+        # load actually SETTLED inside that window, or the .finally under test
+        # never ran and the non-occurrence is measuring nothing.
+        if node.history_ok < ok_baseline + 1:
+            raise AssertionError(
+                "destroy-invalidation: the held /history never resolved inside "
+                f"the observation window (history_ok={node.history_ok}) — the "
+                ".finally under test never ran"
+            )
         sse_opens = node.events_requests
         vis_null = cdp.evaluate("window.__pane._visHandler === null")
         print(f"  destroy-invalidation sse_opens={sse_opens} vis_null={vis_null}")
@@ -3725,8 +3763,9 @@ def run_coord_hidden_retry(chrome: str) -> str:
         # transport down but deliberately leaves the retry timer armed.
         cdp.evaluate("window.__hide && window.__hide()")
         hidden_baseline = node.history_requests
-        # NON-occurrence window: the retry fires at ~2s post-failure; give
-        # it 3.5s.  Without the evtSource guard this poll returns True
+        # NON-occurrence window: the retry fires at STALE_RETRY_BASE_MS plus up
+        # to STALE_RETRY_JITTER_MS, so the window must outlast floor+ceiling.
+        # Without the evtSource guard this poll returns True
         # (the hidden fetch lands) and hiddenDelta stamps 1.
         # Window = the 2000 ms floor + the jitter ceiling + slack.  The
         # retry's delay is `2000 + rand*STALE_RETRY_JITTER_MS` (#900), so a

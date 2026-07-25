@@ -716,10 +716,20 @@ def test_coordinator_history_stale_latch_contract():
         "exists to kill."
     )
     retry_arm = body.index("staleRetryTimer = setTimeout")
-    # Anchor on the delay EXPRESSION's opening, not on a literal `}, 2000);`
-    # — #900 made the delay `2000 + Math.random() * STALE_RETRY_JITTER_MS`,
-    # and a literal anchor raises ValueError (the suite ERRORS instead of
-    # failing) the moment the spread changes.
+    # #900 made the delay an expression over two SHARED constants, so the old
+    # literal `}, 2000);` anchor is gone.  Assert the new anchor EXISTS before
+    # slicing on it: `.index` would raise ValueError and the suite would ERROR
+    # with an anonymous traceback rather than fail on a named assertion, which
+    # is the exact failure mode this re-anchor exists to remove.  Coord and
+    # interactive must carry the identical expression or the herd-spread
+    # invariant silently forks.
+    # Unwindowed on purpose: the expression occurs exactly once in coord, so a
+    # fixed slice buys nothing and can truncate mid-expression (it did).
+    # Locality is established by the retry_fire slice below, which starts at
+    # the arm — this assertion only has to prove the anchor exists at all.
+    assert "STALE_RETRY_BASE_MS + Math.random() * STALE_RETRY_JITTER_MS" in body, (
+        "the coord retry must keep the shared floor + jitter (#900)"
+    )
     retry_fire = _strip_comments(body[retry_arm : body.index("STALE_RETRY_JITTER_MS", retry_arm)])
     assert "!refetchesInFlight" in retry_fire, (
         "the retry's fire guard must yield to an in-flight refetch "

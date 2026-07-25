@@ -555,6 +555,14 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
     assert "this.evtSource.readyState === EventSource.OPEN" in cl_seg[retry:], (
         "the clear_ui retry must require a live stream at fire time (#900)"
     )
+    # The delay is floor + spread, both from the SHARED module: one clear_ui
+    # reaches every listener on the ws, so an un-spread retry re-fetches in
+    # lockstep across tabs, and the floor is what the e2e non-occurrence
+    # windows size themselves on.  Coord carries the identical expression —
+    # this pin is what keeps the two from drifting.
+    assert "STALE_RETRY_BASE_MS + Math.random() * STALE_RETRY_JITTER_MS" in cl_seg[retry:], (
+        "the clear_ui retry must keep the shared floor + jitter (#900)"
+    )
 
     # Terminal teardown must invalidate in-flight loads AND cancel the
     # failure retry.  The token bump (#900) is the chokepoint: without it

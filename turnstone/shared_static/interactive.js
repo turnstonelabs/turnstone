@@ -64,6 +64,7 @@ import {
   DEGRADED_COOLDOWN_RESET_MS,
   TRUNCATED_RESYNC_JITTER_MS,
   STALE_RETRY_JITTER_MS,
+  STALE_RETRY_BASE_MS,
   overflowWindowTripped,
   degradedCooldownStep,
 } from "./sse_overflow.js";
@@ -2579,7 +2580,7 @@ class Pane {
                   // e2e non-occurrence windows size on it) — jitter up, never
                   // down.  Mirrored in coordinator.js; the constant is shared.
                 },
-                2000 + Math.random() * STALE_RETRY_JITTER_MS,
+                STALE_RETRY_BASE_MS + Math.random() * STALE_RETRY_JITTER_MS,
               );
             }
             if (token !== this._historyLoadToken && this.wsId !== editWs) {
