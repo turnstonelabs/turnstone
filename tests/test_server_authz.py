@@ -1987,6 +1987,20 @@ class TestCompactCommandDispatch:
         # re-attempted) and nothing was dispatched behind the user's back.
         wait_until(lambda: calls["n"] >= 2, timeout=8.0)
         assert ws.session.sends == []
+        # ``calls["n"]`` increments as the FIRST statement of the attempt, so
+        # the counter crosses 2 while the drain still holds the entry CLAIMED
+        # (popped, dispatch in flight).  Retract only scans ``_pending_sends``
+        # and correctly answers not_found for a claimed entry, so firing the
+        # DELETE off the counter alone races the crash path's re-insert and
+        # loses whenever the re-insert is slower than the request -- which it
+        # is under pytest, where the log handlers make the intervening
+        # ``log.exception`` roughly as expensive as wait_until's poll interval.
+        # Wait for the state this test is actually about: the entry BACK on
+        # the list, mid-crash-loop, retractable.
+        wait_until(
+            lambda: any(e.msg_id == msg_id for e in list(ws._pending_sends)),
+            timeout=8.0,
+        )
         d = client.request(
             "DELETE",
             f"/v1/api/workstreams/{ws_id}/send",
