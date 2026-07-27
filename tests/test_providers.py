@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -1353,6 +1354,71 @@ class TestAnthropicProvider:
         assert _normalize_finish_reason("max_tokens") == "length"
         assert _normalize_finish_reason("other_reason") == "other_reason"
 
+    def test_refusal_normalized_to_content_filter(self) -> None:
+        """Safety-classifier declines (Opus 5 / Fable 5) arrive as a 200 with
+        stop_reason="refusal".  It must NOT fall through as the raw string: the
+        drain gate only errors on an ABSENT finish reason, so an unmapped
+        "refusal" lands a declined turn as a complete result.  content_filter
+        is the OpenAI-vocabulary equivalent both consumers already handle."""
+        from turnstone.core.providers._anthropic import _normalize_finish_reason
+
+        assert _normalize_finish_reason("refusal") == "content_filter"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_refusal_logs_the_providers_own_word(self, mock_ensure: MagicMock, caplog) -> None:
+        """Normalization is lossy, so this log is the only site that still holds
+        the raw stop reason — a classifier decline is indistinguishable from an
+        ordinary content filter once collapsed onto ``content_filter``."""
+        events = [
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="partial"),
+            _anthropic_event("message_delta", stop_reason="refusal"),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        with caplog.at_level(logging.INFO, logger="turnstone.core.providers._anthropic"):
+            list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-opus-5",
+                    messages=[{"role": "user", "content": "go"}],
+                )
+            )
+
+        assert any("anthropic.refusal" in r.message for r in caplog.records)
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_ordinary_turn_logs_no_refusal(self, mock_ensure: MagicMock, caplog) -> None:
+        """Non-vacuity, and the defect the RAW-value gate exists to prevent.
+
+        Normalization rewrites ``end_turn`` and ``tool_use`` as well, so gating
+        the log on ``normalized != raw`` fires on every ordinary turn in every
+        lane rather than only on a decline.
+        """
+        events = [
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="hello"),
+            _anthropic_event("message_delta", stop_reason="end_turn"),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        with caplog.at_level(logging.INFO, logger="turnstone.core.providers._anthropic"):
+            list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-opus-5",
+                    messages=[{"role": "user", "content": "go"}],
+                )
+            )
+
+        assert not any("anthropic.refusal" in r.message for r in caplog.records)
+
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_drained_stream_basic(self, mock_ensure: MagicMock) -> None:
         client = MagicMock()
@@ -1917,6 +1983,39 @@ class TestAnthropicHelpers:
         assert caps.context_window == 1000000
         assert caps.supports_temperature is False
         assert caps.thinking_display == "summarized"
+        assert caps.supports_mid_conversation_system is True
+
+    def test_capabilities_opus_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert "xhigh" in caps.effort_levels
+        assert "max" in caps.effort_levels
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+
+    def test_capabilities_opus_5_dated(self) -> None:
+        """A dated snapshot resolves via longest-prefix match, and must NOT
+        fall back to _ANTHROPIC_DEFAULT (which has no effort support)."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-5-20260724")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_effort is True
         assert caps.supports_mid_conversation_system is True
 
     def test_capabilities_opus_4_8(self) -> None:
@@ -4479,6 +4578,32 @@ class TestAnthropicPromptCaching:
             tools=None,
         )
         assert kwargs["output_config"] == {"effort": "xhigh"}
+
+    def test_opus_5_max_effort_still_sends_explicit_adaptive_thinking(self) -> None:
+        """Opus 5's two breaking changes are unreachable ONLY because this lane
+        always writes thinking explicitly.  Observe the artefact directly: at
+        effort=max the payload must carry an explicit adaptive thinking dict
+        (never omitted -> the changed on-by-default default cannot bite) and
+        must never carry type="disabled" (which 400s at xhigh/max).  If a
+        future edit adds a disabled branch, this fails instead of shipping a
+        400 to production."""
+        caps = self.provider.get_capabilities("claude-opus-5")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="max",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-5",
+            tools=None,
+        )
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": "max"}
+        # Sampling params are a 400 on this model — the row declares
+        # supports_temperature=False, so temperature must not reach the wire.
+        assert "temperature" not in kwargs
 
     def test_xhigh_effort_snaps_to_max_on_opus_4_6(self) -> None:
         """Opus 4.6 declares (low, medium, high, max) — a knob of xhigh

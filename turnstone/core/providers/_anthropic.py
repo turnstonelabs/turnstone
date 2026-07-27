@@ -158,6 +158,36 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_reasoning_replay=True,
         supports_mid_conversation_system=True,
     ),
+    # Opus 5: same wire surface as opus-4-8.  Two of this model's documented
+    # breaking changes are unreachable from this lane, and stay that way only
+    # while thinking_mode is "adaptive":
+    #   * thinking is ON by default when the param is omitted (opus-4-8 omitted
+    #     meant OFF) — we never omit it, the adaptive branch in
+    #     _build_thinking_and_kwargs always writes an explicit {"type":
+    #     "adaptive"}, so the changed default cannot reach us.
+    #   * thinking={"type": "disabled"} is a 400 at effort xhigh/max — that
+    #     branch does not exist here (same reasoning as the fable-5 row above).
+    # Adding a disabled-thinking branch to this lane re-opens both; gate it on
+    # effort <= high if that ever happens.
+    # This model's safety classifiers can also decline a request with
+    # stop_reason="refusal" on an HTTP 200 — normalized in
+    # _normalize_finish_reason, see the note there.
+    "claude-opus-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+    ),
     "claude-opus-4-8": ModelCapabilities(
         context_window=1000000,
         max_output_tokens=128000,
@@ -1121,7 +1151,28 @@ class AnthropicProvider:
                         cache_read_tokens=cr,
                     )
                 if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
-                    sc.finish_reason = _normalize_finish_reason(event.delta.stop_reason)
+                    raw_stop = event.delta.stop_reason
+                    sc.finish_reason = _normalize_finish_reason(raw_stop)
+                    if raw_stop == "refusal":
+                        # Normalization is lossy and this is the only site that
+                        # still holds the provider's own word: a safety-classifier
+                        # decline is indistinguishable from an ordinary content
+                        # filter once collapsed onto "content_filter".  Record it
+                        # here rather than plumb a raw field through StreamChunk
+                        # for a consumer that does not exist yet.  Gate on the RAW
+                        # value, not on (normalized != raw) — normalization
+                        # rewrites end_turn and tool_use too, so an inequality
+                        # test fires on every ordinary turn in every lane.
+                        # ``stop_details`` rides the same event and is populated
+                        # exactly when the stop reason is a refusal; its
+                        # ``category`` is the one distinction an operator acts
+                        # on.  ``getattr`` keeps this floor-safe on SDKs that
+                        # predate the field.
+                        details = getattr(event.delta, "stop_details", None)
+                        log.info(
+                            "anthropic.refusal: classifier declined the turn (category=%s)",
+                            getattr(details, "category", None),
+                        )
                     emitted_finish = True
                     # Emit all raw content blocks for multi-turn preservation
                     _attach_terminal_blocks(sc)
@@ -1234,6 +1285,18 @@ def _normalize_finish_reason(reason: str) -> str:
     if reason == "pause_turn":
         # Server-side tool (web search) paused a long turn; treat as stop
         return "stop"
+    if reason == "refusal":
+        # A safety classifier declined the request.  This arrives as a
+        # SUCCESSFUL HTTP 200 with content empty (declined before any output)
+        # or partial (declined mid-stream), so nothing upstream raises — the
+        # drain gate only errors on an ABSENT finish reason.  "content_filter"
+        # is the
+        # OpenAI-vocabulary equivalent this function normalizes onto, and both
+        # consumers already handle it: ChatSession._stream_response warns the
+        # user, and the sub-agent loop stops early instead of flailing on an
+        # empty turn.  Falling through to the raw "refusal" string instead
+        # would land a truncated answer as a complete result.
+        return "content_filter"
     return reason
 
 

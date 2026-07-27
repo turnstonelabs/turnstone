@@ -557,7 +557,10 @@ def test_coordinator_refetch_failure_preserves_the_pane():
     )
     body = coord_js.read_text(encoding="utf-8")
     start = body.index("async function refetchHistory(seedCursor = false)")
-    fn = body[start : start + 3000]
+    # Slice to the next function boundary — the pinned invariant is the
+    # ORDER below, not the density, and a char-count window dies with a
+    # bare ValueError every time an at-site comment grows.
+    fn = body[start : body.index("\n  function ", start + 1)]
     guard = fn.index("if (!hist) return;")
     wipe = fn.index("messagesEl.replaceChildren();")
     resets = fn.index("toolRows.clear();")
@@ -567,6 +570,417 @@ def test_coordinator_refetch_failure_preserves_the_pane():
         "a DOM no-op."
     )
     assert re.search(r"if \(!hist\) return;", fn), "failure guard missing"
+
+
+def test_coordinator_history_stale_latch_contract():
+    """#894 (the #890 port): a rewind/edit clicked during a clear_ui refetch
+    window — or after a FAILED refetch — must not count the stale pre-rewind
+    DOM.  Pins the latch's structural contract:
+
+      1. clear_ui sets ``historyStale = true`` BEFORE its seedless
+         ``refetchHistory()`` call (the only set site), so the gate closes
+         for the whole fetch window.
+      2. The DOM-counting affordances gate on ``busy || historyStale``
+         (_rewindToMessage / _editAndResend / _startEdit); _rewindToTurns
+         and _retryLast stay busy-only (explicit-arg / no-DOM-count paths —
+         the at-site rulings).
+      3. ``historyStale = false`` lives ONLY below the ``if (!hist)
+         return;`` failure guard in refetchHistory: a failed fetch keeps
+         the latch set (a refetch-in-flight flag would reopen on exactly
+         that exit — the over-rewind aftermath).
+      4. The idle-edge backstop is TRANSPORT-FREE: the arm behind the
+         pendingTruncatedResync consumer heals via plain
+         ``refetchHistory()``, never ``loadHistoryThenReconnect()`` —
+         a reconnecting heal draws the server's synthetic
+         state_change:idle back into its own trigger (the #890 round-5
+         zero-backoff storm).
+      5. The retry is bounded by construction: ``staleRetryTimer =
+         setTimeout`` appears exactly once (the clear_ui .then), so no
+         path — including the retry's own — can re-arm it.
+      6. destroy() cancels staleRetryTimer (terminal-only) while
+         closeStreamTransport does NOT (transport redials keep the heal
+         intent alive).
+      7. The render-time gate (r5/r6-derived): refetchHistory re-checks,
+         AFTER the await and BEFORE the wipe, the UNIVERSAL terms —
+         dispatch currency (seq) and the content refs — and the
+         SEEDLESS-only terms: the event-driven live-tool-call set (never
+         a DOM probe, which the render's own orphan repaint can forge —
+         the r6 critical; never plain busy — the r5 critical), the
+         optimistic busySource flavor, and stream-OPENness.  The
+         latch-clear sits below every skip point, so a skipped render
+         can never reopen the affordances over a stale DOM.  (Joined
+         pre-rewind server flights are closed SERVER-side — the #884
+         flight key folds in the truncation generation; an r8
+         client-epoch guard here was unreachable, being redundant with
+         the seq gate, and was removed in r9.)
+    """
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    # 1. Set site: inside the clear_ui case, before the refetch call.
+    assert body.count("historyStale = true;") == 1, (
+        "historyStale must be set in exactly one place (clear_ui arrival)."
+    )
+    clear_case = body.index('case "clear_ui"')
+    set_site = body.index("historyStale = true;")
+    refetch_call = body.index("refetchHistory()", clear_case)
+    assert clear_case < set_site < refetch_call, (
+        "clear_ui must latch historyStale BEFORE calling refetchHistory() "
+        "so the gate covers the whole fetch window."
+    )
+
+    # 2. Gates: DOM-counting affordances latch-gated; explicit-arg /
+    #    no-count paths stay busy-only.
+    def _fn_slice(name: str) -> str:
+        start = body.index("function " + name)
+        return body[start : body.index("\n  function ", start + 1)]
+
+    for gated in ("_rewindToMessage", "_editAndResend", "_startEdit"):
+        assert "if (busy || historyStale) return;" in _fn_slice(gated), (
+            f"{gated} must gate on busy || historyStale (#894)."
+        )
+    for ungated in ("_rewindToTurns", "_retryLast"):
+        sl = _fn_slice(ungated)
+        assert "if (busy) return;" in sl and "busy || historyStale" not in sl, (
+            f"{ungated} must stay busy-only (at-site ruling: explicit turn "
+            "count / no DOM count — latch-gating it blocks legitimate calls)."
+        )
+
+    # 3. Clear site: exactly one assignment to false (past the decl),
+    #    below the failure guard.
+    clears = re.findall(r"(?<!let )historyStale = false;", body)
+    assert len(clears) == 1, (
+        "historyStale must clear in exactly one place (refetchHistory's success path)."
+    )
+    fetch_start = body.index("async function refetchHistory(seedCursor = false)")
+    guard = body.index("if (!hist) return;", fetch_start)
+    clear_site = body.index("historyStale = false;", fetch_start)
+    assert guard < clear_site, (
+        "the latch clear must sit BELOW the failure guard — a failed fetch "
+        "keeps the latch set (that survival arms the retry/backstop)."
+    )
+
+    # 4. Transport-free backstop: the arm after the truncated consumer
+    #    refetches over REST and never reconnects — and it must be the
+    #    ELSE-IF of the truncated consumer (mutual exclusion: the
+    #    truncated branch's own reload heals the latch too; two separate
+    #    ifs would run both heals on one idle edge).
+    def _strip_comments(text: str) -> str:
+        return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//"))
+
+    trunc_arm = body.index("if (pendingTruncatedResync)")
+    backstop = body.index("historyStale &&", trunc_arm)
+    assert "} else if (" in body[trunc_arm:backstop], (
+        "the staleness backstop must be the else-if sibling of the "
+        "pendingTruncatedResync consumer, never an independent if."
+    )
+    idle_block_end = body.index('ev.state === "running"', backstop)
+    # Comment-stripped: the arm's at-site ruling comments name every
+    # guard term, so raw-window presence asserts would go vacuous.
+    backstop_arm = _strip_comments(body[backstop:idle_block_end])
+    assert "refetchHistory();" in backstop_arm, (
+        "the staleness backstop must heal via a plain seedless refetchHistory()."
+    )
+    assert "loadHistoryThenReconnect();" not in backstop_arm, (
+        "TRANSPORT-FREE ruling: the staleness backstop must never "
+        "reconnect — a reload's fresh reconnect draws the synthetic "
+        "state_change:idle back into this trigger (zero-backoff storm)."
+    )
+    assert "!refetchesInFlight" in backstop_arm, (
+        "the backstop must yield to an in-flight refetch — without the "
+        "guard it stomps a same-snapshot fetch with a double render "
+        "(mirrors interactive's !_replayQueue pin)."
+    )
+    assert "!currentAssistantEl" in backstop_arm and "!currentReasoningEl" in backstop_arm, (
+        "the backstop's ref guards are LOAD-BEARING (coord's "
+        "refetchHistory does not reset streaming refs, and this arm "
+        "serves error edges where no stream_end nulled them) — a "
+        "simplify-to-match-interactive edit must not delete them."
+    )
+
+    # 5. Bounded retry: exactly one arm site; the ARM is teardown-gated;
+    #    the fire guard yields to an in-flight fetch and carries the
+    #    teardown sentinel.
+    assert body.count("staleRetryTimer = setTimeout") == 1, (
+        "the stale retry must be armed in exactly one place (clear_ui "
+        ".then) — bounded by construction."
+    )
+    assert body.count("if (historyStale && visHandler) {") == 1, (
+        "the arm must be gated on the teardown sentinel too — the "
+        "clear_ui .then can settle after destroy()/coordCloseSession, "
+        "and an ungated arm recreates the orphan timer destroy's cancel "
+        "exists to kill."
+    )
+    retry_arm = body.index("staleRetryTimer = setTimeout")
+    # #900 made the delay an expression over two SHARED constants, so the old
+    # literal `}, 2000);` anchor is gone.  Assert the new anchor EXISTS before
+    # slicing on it: `.index` would raise ValueError and the suite would ERROR
+    # with an anonymous traceback rather than fail on a named assertion, which
+    # is the exact failure mode this re-anchor exists to remove.  Coord and
+    # interactive must carry the identical expression or the herd-spread
+    # invariant silently forks.
+    # Unwindowed on purpose: the expression occurs exactly once in coord, so a
+    # fixed slice buys nothing and can truncate mid-expression (it did).
+    # Locality is established by the retry_fire slice below, which starts at
+    # the arm — this assertion only has to prove the anchor exists at all.
+    assert "STALE_RETRY_BASE_MS + Math.random() * STALE_RETRY_JITTER_MS" in body, (
+        "the coord retry must keep the shared floor + jitter (#900)"
+    )
+    retry_fire = _strip_comments(body[retry_arm : body.index("STALE_RETRY_JITTER_MS", retry_arm)])
+    assert "!refetchesInFlight" in retry_fire, (
+        "the retry's fire guard must yield to an in-flight refetch "
+        "(mirrors interactive's !_replayQueue pin)."
+    )
+    assert "visHandler" in retry_fire, (
+        "the retry's fire guard must carry the teardown sentinel for the "
+        "coordCloseSession path, which nulls visHandler but does not "
+        "cancel the timer (evtSource is also null there post-suspend, "
+        "but the sentinel is the durable term)."
+    )
+    assert "!currentAssistantEl" in retry_fire and "!currentReasoningEl" in retry_fire, (
+        "the retry's ref guards skip a pointless fetch whose payload the "
+        "render-time gate would discard (the chokepoint carries the "
+        "correctness; these are the efficiency layer — keep them)."
+    )
+    # Whitespace-normalised, not indentation-exact: #900 made the delay an
+    # expression, which reflowed setTimeout to prettier's multi-line call form
+    # and re-indented this whole callback body.  Still an ORDERED-tail pin, so
+    # a mere comment mention cannot satisfy it.
+    cond_start = body.index("if (", retry_arm)
+    guard = " ".join(body[cond_start : body.index(") {", cond_start)].split())
+    assert guard.endswith("visHandler && evtSource && evtSource.readyState === EventSource.OPEN"), (
+        "the retry's fire guard must require an OPEN stream — not handle "
+        "existence: CONNECTING keeps the handle with a frozen cursor and "
+        "a pending replay, and a seedless heal then double-renders when "
+        "the replay lands.  Exact-tail pin so a comment mention cannot "
+        "satisfy it; re-anchor if the guard reflows."
+    )
+    assert "if (staleRetryTimer) clearTimeout(staleRetryTimer);" in body, (
+        "re-arming on a newer clear_ui must cancel the pending timer "
+        "first, or a double clear_ui leaks a timer."
+    )
+    # The consumer pins above are only meaningful while the PRODUCER
+    # brackets every fetch: without the ++/-- pair the counter is
+    # permanently 0 and both yield guards pass vacuously.  Count alone
+    # is not enough — the ORDER is the bracket (an increment moved below
+    # the await leaves the counter 0 during every fetch with both counts
+    # intact), so pin inc < await < finally < dec inside refetchHistory.
+    assert body.count("refetchesInFlight++") == 1, (
+        "refetchHistory must increment the in-flight counter before its "
+        "await — the yield guards read it."
+    )
+    assert body.count("refetchesInFlight--") == 1, (
+        "the in-flight counter must decrement in exactly one place (the "
+        "fetch finally) so every exit rebalances it."
+    )
+    inc = body.index("refetchesInFlight++", fetch_start)
+    awt = body.index("await getJSON(", fetch_start)
+    fin = body.index("} finally {", fetch_start)
+    dec = body.index("refetchesInFlight--", fetch_start)
+    assert inc < awt < fin < dec, (
+        "the counter must bracket the await window: increment BEFORE the "
+        "fetch, decrement in its finally — any other order un-brackets "
+        "the very window the yield guards protect."
+    )
+
+    # 6. Teardown: terminal cancel in destroy(); NOT in closeStreamTransport.
+    destroy_slice = _fn_slice("destroy()")
+    assert "clearTimeout(staleRetryTimer)" in destroy_slice, (
+        "destroy() must cancel the stale retry timer or it fires into "
+        "detached DOM (and pins the closure)."
+    )
+    cst_slice = _fn_slice("closeStreamTransport()")
+    assert "clearTimeout(staleRetryTimer)" not in cst_slice, (
+        "closeStreamTransport must NOT cancel the stale retry — transport "
+        "redials keep the pending heal intent (terminal-only cancel)."
+    )
+
+    # 7. Render-time gate (r5-derived, seedless-scoped after the
+    #    coord-restart family find): the post-await re-checks sit between
+    #    the failure guard and the wipe, so the latch-clear (below the
+    #    wipe) sits below every skip point by construction.  Universal
+    #    terms: dispatch currency (seq) and the content refs (skipping
+    #    always beats stranding a ref; seeded callers null theirs before
+    #    fetching, so it never blocks them).  SEEDLESS-only terms —
+    #    keyed on the seedCursor ARG: the event-driven live-tool-call
+    #    set (liveToolCalls — never a DOM probe, which the render's own
+    #    orphan repaint forges: the r6 critical; on the SEEDED resync
+    #    even genuine residue must not block — the render IS the
+    #    recovery, and a universal term wedged coord-restart outright),
+    #    the optimistic-send busySource flavor, and stream-OPENness
+    #    (CONNECTING keeps the handle with a frozen cursor and a
+    #    pending replay).  Plain ``busy`` must not appear:
+    #    it means a turn is EXECUTING, not that this DOM holds live
+    #    state (the r5 critical).
+    hist_guard = body.index("if (!hist) return;", fetch_start)
+    wipe = body.index("messagesEl.replaceChildren();", fetch_start)
+    latch_clear = body.index("historyStale = false;", fetch_start)
+    assert hist_guard < wipe < latch_clear, (
+        "the wipe must sit between the failure guard and the latch-clear "
+        "— every gate skip above the wipe then leaves the latch set."
+    )
+    gate_code = _strip_comments(body[hist_guard:wipe])
+    for term, why in (
+        ("if (seq !== refetchSeq) return;", "dispatch-currency (seq)"),
+        (
+            "if (currentAssistantEl || currentReasoningEl) return;",
+            "universal content-ref",
+        ),
+        ("!seedCursor &&", "seedless scoping"),
+        ('busySource === "optimistic"', "optimistic-row"),
+        ("liveToolCalls.size > 0", "live-tool-call"),
+        ("evtSource.readyState !== EventSource.OPEN", "stream-OPENness"),
+    ):
+        assert term in gate_code, (
+            f"the render-time gate must carry the {why} term (in CODE, not a comment)."
+        )
+    seedless_at = gate_code.index("!seedCursor &&")
+    assert gate_code.index("if (seq !== refetchSeq) return;") < seedless_at, (
+        "seq currency must be checked before the seedless group."
+    )
+    assert gate_code.index("if (currentAssistantEl || currentReasoningEl) return;") < seedless_at, (
+        "the universal ref check must precede the seedless group."
+    )
+    for term in (
+        'busySource === "optimistic"',
+        "liveToolCalls.size",
+        "evtSource.readyState !== EventSource.OPEN",
+    ):
+        assert seedless_at < gate_code.index(term), (
+            f"{term} must live INSIDE the !seedCursor group — the seeded "
+            "resync renders over a dead --running batch / an optimistic "
+            "row deliberately (blocking it wedges the coord-restart "
+            "recovery)."
+        )
+    assert not re.search(r"\bbusy\b(?!Source)", gate_code), (
+        "plain busy must not gate the render — busy means a turn is "
+        "EXECUTING, not that this DOM holds live state (the r5 critical: "
+        "_editAndResend flips busy before its POST and /rewind emits no "
+        "state_change, so a busy term skips the truncation render the "
+        "rewind exists to produce)."
+    )
+
+    # 8. Live-set discipline (r6): the tool-phase liveness signal is fed
+    #    ONLY by live SSE events and drained at settle/teardown edges —
+    #    and NO render path may touch it.  The r6 critical: the render's
+    #    own replay paints orphan batches with the same --running class
+    #    the live path uses, so a DOM-derived probe let one orphan paint
+    #    poison every seedless heal for the life of the page.
+    assert body.count("liveToolCalls.add(") == 2, (
+        "liveToolCalls must be fed by exactly the two live announce "
+        "events (tool_pending + tool_info)."
+    )
+    assert body.count("liveToolCalls.delete(") == 1, (
+        "tool_result must retire its call_id from the live set."
+    )
+    assert body.count("liveToolCalls.clear()") == 1, (
+        "the live set must drain at the settle edge ONLY — a "
+        "closeStreamTransport drain fails OPEN (the reconnect replay "
+        "does not re-announce a live batch, so an emptied set lets a "
+        "post-redial seedless render wipe the live batch: the r7 major)."
+    )
+    settle_block = body[
+        body.index('if (ev.state === "idle" || ev.state === "error") {') : body.index(
+            'ev.state === "running"'
+        )
+    ]
+    assert "liveToolCalls.clear()" in settle_block, (
+        "the one drain must sit inside the idle/error settle block — "
+        "anywhere else either leaks dead ids (gate stuck) or drains live "
+        "ones (gate forged open)."
+    )
+    cst_code = _strip_comments(cst_slice)
+    assert "liveToolCalls" not in cst_code, (
+        "closeStreamTransport must not touch the live set (r7): transport "
+        "death is not a retirement event — a stale id fails CLOSED, an "
+        "emptied set fails OPEN into the wipe.  (The at-site ruling "
+        "comment may name it; the CODE may not.)"
+    )
+    tool_result_block = body[
+        body.index('case "tool_result":') : body.index(
+            "case ", body.index('case "tool_result":') + 10
+        )
+    ]
+    assert "liveToolCalls.delete(" in tool_result_block, (
+        "tool_result must retire its call_id inside its own case arm."
+    )
+    for case_name in ('case "tool_pending":', 'case "tool_info":'):
+        case_block = body[body.index(case_name) : body.index("break;", body.index(case_name))]
+        assert "liveToolCalls.add(" in case_block, (
+            f"{case_name} must feed the live set inside its own case arm "
+            "(the live announce events are the ONLY producers)."
+        )
+    fetch_end = body.index("\n  function ", fetch_start + 1)
+    fetch_body = body[fetch_start:fetch_end]
+    fetch_code = _strip_comments(fetch_body)
+    assert fetch_code.count("liveToolCalls") == 1, (
+        "refetchHistory may READ the live set exactly once (the gate) "
+        "and never write it — a render that touched liveness could "
+        "forge the very signal that guards it (the r6 lesson)."
+    )
+    # The await must be BOUNDED (r7): an accepted-but-never-answered
+    # /history would pin refetchesInFlight above zero for the life of
+    # the page and every heal would yield forever.
+    assert "histCtrl.abort()" in fetch_code and "clearTimeout(histTimer)" in fetch_code, (
+        "refetchHistory must bound its fetch with the AbortController + "
+        "flat-timeout shape (and clear the timer in the finally) — an "
+        "unbounded await pins the in-flight counter and permanently "
+        "disables both heals."
+    )
+    # The seq stamp's PRODUCER must sit above the await, or the
+    # last-dispatch-wins gate is permanently vacuous (a stamp captured
+    # after the await always equals refetchSeq) — the twin of the
+    # refetchesInFlight bracket pin.
+    assert body.count("const seq = ++refetchSeq;") == 1, (
+        "refetchHistory must stamp its dispatch exactly once."
+    )
+    assert body.index("const seq = ++refetchSeq;", fetch_start) < awt, (
+        "the seq stamp must be captured BEFORE the await — captured "
+        "after, it always equals refetchSeq and the currency gate never "
+        "fires."
+    )
+
+    # The bound must actually be WIRED (r8): the signal must reach
+    # getJSON and getJSON must forward its init — the pinned abort/
+    # clearTimeout strings alone survive a dead bound.
+    assert "{ signal: histCtrl.signal }" in fetch_code, (
+        "the abort signal must reach the fetch — an unforwarded "
+        "controller aborts nothing and the await is unbounded again."
+    )
+    assert "function getJSON(url, init)" in body and (
+        'Object.assign({ credentials: "include" }, init || {})' in body
+    ), (
+        "getJSON must forward its init while preserving credentials — "
+        "narrowing it back to getJSON(url) silently unwires the bound."
+    )
+    # destroy() must abort the in-flight fetch (dead-not-inert, the
+    # staleRetryTimer ruling applied to the r7 bound).
+    # Producer pins first — the destroy() consumer sweep below is
+    # satisfiable by an always-empty Set without them.
+    assert body.count("histCtrls.add(histCtrl)") == 1, (
+        "every dispatch must register its controller in the abort Set."
+    )
+    assert body.count("histCtrls.delete(histCtrl)") == 1, (
+        "the fetch finally must release its own controller — without the "
+        "delete the Set grows for the life of the pane."
+    )
+    assert body.index("histCtrls.add(histCtrl)", fetch_start) < awt, (
+        "the controller must be registered BEFORE the await."
+    )
+    assert fin < body.index("histCtrls.delete(histCtrl)", fetch_start), (
+        "the controller release must sit in the fetch finally."
+    )
+    destroy_code = _strip_comments(destroy_slice)
+    assert "histCtrls.forEach" in destroy_code and ".abort()" in destroy_code, (
+        "destroy() must abort EVERY in-flight /history (a Set — a "
+        "newest-wins single slot left older overlapping fetches "
+        "unabortable); the 15s bound alone pins the destroyed closure "
+        "until it fires."
+    )
 
 
 def test_coordinator_js_early_paints_pending_tool_calls():

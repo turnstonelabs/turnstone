@@ -2535,7 +2535,7 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'test'", specifier = ">=3.9" },
     { name = "alembic", specifier = ">=1.14" },
     { name = "altair", specifier = ">=6.0" },
-    { name = "anthropic", specifier = ">=0.108" },
+    { name = "anthropic", specifier = ">=0.117" },
     { name = "bcrypt", specifier = ">=4.0" },
     { name = "croniter", specifier = ">=3.0" },
     { name = "cryptography", specifier = ">=48.0.1" },

@@ -1548,8 +1548,9 @@ class TestHistoryCoalescing:
     """Single-flight coalescing of concurrent ``/history`` requests (#884).
 
     The matrix these tests assert: join-vs-miss × gates-per-request ×
-    failed-vs-clean shared draw × key isolation × no cross-flight
-    caching × owner cancellation.  Driven through ``httpx.ASGITransport``
+    failed-vs-clean shared draw × key isolation (ws, limit, AND the
+    #894 truncation generation) × no cross-flight caching × owner
+    cancellation.  Driven through ``httpx.ASGITransport``
     on a private loop because ``TestClient`` cannot hold two requests in
     flight at once.
 
@@ -1658,6 +1659,60 @@ class TestHistoryCoalescing:
         contents = [m.get("content") for m in r1.json()["messages"]]
         assert contents == ["hello", "hi there"]
         assert gated.load_calls == 1
+
+    def test_history_rewind_mid_flight_starts_fresh_flight(
+        self, _inject_storage: Any, caplog: Any
+    ) -> None:
+        """#894: the flight key folds in the ws's truncation generation, so
+        a request dispatched AFTER a rewind/retry can never join a flight
+        whose ``load_messages`` ran before it.  A joined pre-rewind payload
+        reads as fresh truth client-side (the client's dispatch stamp is
+        current — the staleness is the flight's transaction point, which
+        only the server can see) and reopened the coordinator's
+        over-rewind window through this seam.
+
+        Choreography mirrors the join test's positive edges: the owner
+        parks in ``load_messages`` under generation 0; the mid-flight
+        rewind commit is simulated by bumping ``_history_generation``
+        (``ChatSession._persist_truncation``'s bump, the shared
+        rewind/retry chokepoint); the second request must MISS the held
+        flight (``load_calls`` -> 2, no ``ws.history.coalesced`` record)
+        and draw its own reconstruction."""
+        gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-gen")
+        # The scaffold's MagicMock ws: pin the generation to a real int so
+        # the key is deterministic, as the live session attribute is.
+        mock_ws = app.state.workstreams.get("ws-flight-gen")
+        # The counter lives on the WRAPPED ChatSession (ws.session), not
+        # the workstream — pin the real shape so a route reading the
+        # wrong object cannot pass against this mock (the G7 harness
+        # caught exactly that: a direct getattr on the wrapper defaulted
+        # to 0 forever and re-enabled joining).
+        mock_ws.session._history_generation = 0
+
+        async def drive() -> tuple[httpx.Response, httpx.Response]:
+            caplog.set_level(logging.DEBUG, logger="turnstone.core.session_routes")
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                t1 = asyncio.create_task(c.get(url))
+                await _until(lambda: gated.load_calls == 1)
+                # The rewind commits mid-flight: the truncation chokepoint
+                # bumps the generation.
+                mock_ws.session._history_generation = 1
+                t2 = asyncio.create_task(c.get(url))
+                # Positive edge for the MISS: t2's own load_messages entry
+                # bumps the counter before the gate can park it.
+                await _until(lambda: gated.load_calls == 2)
+                gated.gate.set()
+                r1, r2 = await asyncio.gather(t1, t2)
+                return r1, r2
+
+        r1, r2 = asyncio.run(drive())
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        # Two reconstructions, zero joins: the post-rewind request never
+        # shared the pre-rewind flight.
+        assert gated.load_calls == 2
+        assert not any("ws.history.coalesced ws=" in rec.getMessage() for rec in caplog.records)
 
     def test_failed_shared_draw_not_fanned_out_to_joiner(
         self, _inject_storage: Any, caplog: Any
@@ -2346,6 +2401,9 @@ class TestHistoryReasoningRehydration:
         provider_data = json.dumps([{"type": "thinking", "thinking": "hidden", "signature": "s"}])
         _inject_storage.save_message(ws_id, "assistant", "Answer.", provider_data=provider_data)
         live_session = SimpleNamespace(
+            # The real Workstream carries .session (ChatSession | None);
+            # the flight key's typed generation read requires the shape.
+            session=None,
             id=ws_id,
             _registry=SimpleNamespace(
                 get_config=lambda alias: SimpleNamespace(surface_persisted_reasoning=False)

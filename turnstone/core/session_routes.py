@@ -3438,7 +3438,8 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
     inline on the event loop).
 
     Restart-herd coalescing (issue #884): concurrent requests for the
-    same ``(ws_id, limit)`` share ONE reconstruction (single-flight) —
+    same ``(ws_id, limit, history_generation)`` share ONE reconstruction
+    (single-flight) —
     after a node restart every open pane resyncs via REST ``/history``
     inside the same jitter window, and each un-coalesced request repeats
     the full ``load_messages`` → decoration → projection pipeline
@@ -3457,7 +3458,11 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         cfg: per-kind policy bundle.
     """
 
-    # In-flight reconstructions, keyed ``(ws_id, limit)``.  Holds ONLY
+    # In-flight reconstructions, keyed ``(ws_id, limit,
+    # history_generation)`` — the third component isolates flights across
+    # rewind/retry truncations (see ChatSession._persist_truncation), so
+    # a post-truncation request can never join a pre-truncation
+    # reconstruction.  Holds ONLY
     # live flights — each task pops its own key in a ``finally`` before
     # completing, so a later request can never read a completed (stale)
     # result: this map is a single-flight, not a cache.  Scoped to this
@@ -3466,7 +3471,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
     # isolation of every other lifted verb.  Touched only from the event
     # loop thread — no lock needed; the ``limit`` component is required
     # (a limit=10 caller must not receive a limit=500 payload).
-    flights: dict[tuple[str, int], asyncio.Task[_HistoryFlightResult]] = {}
+    flights: dict[tuple[str, int, int | None], asyncio.Task[_HistoryFlightResult]] = {}
 
     async def history(request: Request) -> Response:
         if cfg.permission_gate is not None:
@@ -3547,7 +3552,29 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # existence, limit) and must stay above it: a request may only
         # join a flight after its own gates passed.  Everything below is
         # the caller-independent reconstruction, shared via ``flights``.
-        key = (ws_id, limit)
+        # The ws's truncation generation joins the key (#894): a request
+        # dispatched after a rewind/retry must never join a flight whose
+        # load_messages ran before it — the joined pre-rewind payload
+        # reads as fresh truth client-side (the dispatch stamp is
+        # current) and reopened the over-rewind window.  Cold workstream:
+        # generation 0; the first post-load truncation bumps to 1, so a
+        # cold flight can never be joined across a rewind either.
+        # mgr.get returns the Workstream WRAPPER — the counter lives on
+        # its ChatSession (the G7 harness caught a direct getattr
+        # silently defaulting to 0 forever, which re-enabled joining).
+        # Typed access, not getattr chains, so mypy carries the shape.
+        # A cold/detached workstream keys on None, NEVER 0: an eviction
+        # or close landing inside a held flight's window would otherwise
+        # let a post-truncation request join a generation-0 live flight
+        # (rewinds need a live session, so two COLD flights are always
+        # mutually safe — and a rehydrated session restarting at 0 can
+        # never share the manager slot with its evicted predecessor).
+        live_gen: int | None = (
+            live_session.session._history_generation
+            if live_session is not None and live_session.session is not None
+            else None
+        )
+        key = (ws_id, limit, live_gen)
         task = flights.get(key)
         joined = task is not None
         if task is None:
@@ -3595,7 +3622,7 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         return JSONResponse({"ws_id": ws_id, "messages": messages, "cursor": cursor})
 
     async def _run_flight(
-        key: tuple[str, int],
+        key: tuple[str, int, int | None],
         mgr: SessionManager,
         storage: Any,
         app_state: Any,

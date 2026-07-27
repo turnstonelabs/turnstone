@@ -2093,9 +2093,11 @@ def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None
         body,
     ), "connectSSE must gate ?last_event_id= on connectCursor != null"
     # (2) cleared only by a successful full render — below the !hist guard,
-    # riding the wipe — and never by the teardown paths.
+    # riding the wipe — and never by the teardown paths.  (Sliced to the
+    # next function boundary; the invariant is the ORDER, not the
+    # density, and a char-count window rots as at-site comments grow.)
     start = body.index("async function refetchHistory(seedCursor = false)")
-    fn = body[start : start + 4500]
+    fn = body[start : body.index("\n  function ", start + 1)]
     guard = fn.index("if (!hist) return;")
     clear = fn.index("truncatedFromCursor = null;")
     assert guard < clear, "the record must only clear once a payload rendered"
@@ -2190,14 +2192,18 @@ def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None
     assert "console.warn(" in rec.group(1)
     # (9) repair-intent supersession lives in refetchHistory's success path
     # — record + deferred latch + pending timer, all below the !hist guard
-    # — and clear_ui carries no path-local cancel.
+    # — and clear_ui carries no path-local cancel of the TRUNCATED repair
+    # intent.  Pin the specific timer, not all clearTimeout: #894's
+    # staleRetryTimer re-arm cancel in clear_ui is the staleness latch's
+    # own machinery, deliberately armed there (see the coord latch-contract
+    # test), not a truncated-repair cancel.
     assert "pendingTruncatedResync = false;" in fn
     assert "clearTimeout(truncatedResyncTimer)" in fn
     assert guard < fn.index("pendingTruncatedResync = false;")
     assert guard < fn.index("clearTimeout(truncatedResyncTimer)")
     cu = re.search(r'case "clear_ui": \{(.*?)\n      \}', body, re.S)
     assert cu is not None, "clear_ui case not found"
-    assert "clearTimeout" not in cu.group(1)
+    assert "clearTimeout(truncatedResyncTimer)" not in cu.group(1)
 
 
 def test_coord_detects_server_restart_by_backwards_event_id() -> None:

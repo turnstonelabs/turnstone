@@ -1661,6 +1661,9 @@ class ChatSession:
         self._persona_memory: bool
         self._apply_persona_snapshot(persona_snapshot)
         self._title_generated = False
+        # Monotonic truncation counter — folded into the /history
+        # single-flight key (see _persist_truncation).
+        self._history_generation = 0
         self._read_files: set[str] = set()
         # Session-monotonic run counter for sub-agent id minting (see
         # ``_run_agent``): the parent call id alone can repeat across runs (a
@@ -4806,7 +4809,7 @@ class ChatSession:
         :func:`turnstone.core.lowering.fold_system_turns`: non-native
         models get each turn wrapped as a nonce-delimited
         ``[start system-reminder]`` block on the preceding turn; native
-        mid-conversation-system models (claude-opus-4-8, claude-fable-5)
+        mid-conversation-system models (rows with the capability flag)
         keep them inline for the Anthropic converter to emit as real
         ``system`` messages.
 
@@ -7069,6 +7072,19 @@ class ChatSession:
             # summarized prefix — skip rather than risk it; resume reconciles.
             return
         delete_messages_after(self._ws_id, max(floor, total - removed_count))
+        # History generation (#894/#884 seam): every truncation bumps the
+        # counter the /history single-flight folds into its flight key, so
+        # a request dispatched AFTER a rewind/retry can never join a flight
+        # whose load_messages ran BEFORE it (a joined pre-rewind payload
+        # rendered as fresh truth on the coordinator and reopened the
+        # over-rewind window the #894 client latch closes).  Bumped AFTER
+        # the storage delete: flights rebuild from storage, so a flight
+        # keyed with the OLD generation that reads post-delete rows is the
+        # harmless spuriously-fresh direction, while a NEW-generation
+        # flight reading pre-delete rows would be the wrongly-joined one —
+        # and the early-return error paths above (count/floor unavailable,
+        # delete skipped) correctly leave the generation unbumped.
+        self._history_generation += 1
 
     def rewind(self, n: int) -> int:
         """Drop the last *n* complete turns from the conversation.

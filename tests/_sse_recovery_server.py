@@ -62,6 +62,8 @@ from turnstone.prompts import ClientType
 from turnstone.server import WebUI, create_app
 
 if TYPE_CHECKING:
+    from collections.abc import MutableMapping
+
     from turnstone.core.workstream import Workstream
 
 _JWT_SECRET = "sse-recovery-e2e-jwt-secret-minimum-32-chars!"
@@ -148,6 +150,36 @@ class RecoveryServer:
         self._adapter.attach(self._manager)
         WebUI._workstream_mgr = self._manager
 
+        # delay_load knob state (see the method): wraps the storage
+        # singleton's load_messages; restored in stop().
+        self._load_delay_ms = 0
+        self._load_calls = 0
+        # load_messages runs on asyncio.to_thread WORKERS, and delay_load
+        # exists precisely to overlap two of them — unlike the
+        # single-writer HTTP counters, this one has genuine concurrent
+        # writers, so the increment takes a lock (a lost update would
+        # false-FAIL G7's load_delta === 2, or mask a third load).
+        self._load_calls_lock = threading.Lock()
+        _storage_obj = get_storage()
+        self._orig_load_messages = _storage_obj.load_messages
+
+        def _delayed_load(*a: Any, **k: Any) -> Any:
+            with self._load_calls_lock:
+                self._load_calls += 1
+            result = self._orig_load_messages(*a, **k)
+            # Sleep AFTER the load: the held flight must hold the data it
+            # actually read (its transaction point), so a flight parked
+            # across a rewind genuinely carries PRE-rewind rows — a
+            # pre-load sleep would read post-rewind storage and mask a
+            # wrongly-joined flight as fresh truth.
+            d = self._load_delay_ms
+            if d > 0:
+                time.sleep(d / 1000.0)
+            return result
+
+        _storage_obj.load_messages = _delayed_load  # type: ignore[method-assign]
+        self._patched_storage = _storage_obj
+
         # Optional small listener-queue cap. The cap is a default arg on the
         # registration methods with no config/env override, so lower it by
         # patching their ``__defaults__`` (restored on stop). fix-3's
@@ -200,6 +232,10 @@ class RecoveryServer:
         # write atomic, so these need no lock even though the uvicorn loop
         # thread increments/decrements them while the runner thread reads.
         self.history_requests = 0
+        # /history responses the PRODUCTION route answered 200 (not the
+        # fault layer's injected 500s).  See _fault_app for why arrival
+        # counting cannot substitute.
+        self.history_ok = 0
         self.rewind_requests = 0
         # Per-ws SSE connection opens (``GET …/events`` — the EventSource the
         # pane's connectSSE builds).  A TRANSPORT-FREE heal (the #890 idle-edge
@@ -226,6 +262,11 @@ class RecoveryServer:
                 path = scope.get("path", "")
                 method = scope.get("method", "")
                 if path.endswith("/history") and method == "GET":
+                    # ARRIVAL, never move.  Scenarios that hold a request open
+                    # use this bump as the IN-FLIGHT edge (E6/E7/G1/G7 say so
+                    # at their poll sites); counting on forward instead would
+                    # delay it past the hold and silently stop those scenarios
+                    # testing anything.
                     self.history_requests += 1
                     if self._history_delay_ms > 0:
                         await asyncio.sleep(self._history_delay_ms / 1000.0)
@@ -240,6 +281,26 @@ class RecoveryServer:
                         )
                         await send({"type": "http.response.body", "body": b'{"error": "injected"}'})
                         return
+
+                    # Successful-RESPONSE counter, distinct from the arrival
+                    # bump above.  A scenario asserting that a render was
+                    # DECLINED needs to know a good payload actually existed —
+                    # otherwise "the client refused to render" and "there was
+                    # nothing to render" produce identical observables (no
+                    # wipe, latch held).  Arrival cannot prove that, and
+                    # neither can an injected-fail budget: a PRODUCTION-side
+                    # 500/404 would slip through both.  Reading the real
+                    # status off the response start is the only honest signal.
+                    async def _counting_send(message: MutableMapping[str, Any]) -> None:
+                        if (
+                            message.get("type") == "http.response.start"
+                            and message.get("status") == 200
+                        ):
+                            self.history_ok += 1
+                        await send(message)
+
+                    await production_app(scope, receive, _counting_send)
+                    return
                 elif path.endswith("/rewind") and method == "POST":
                     self.rewind_requests += 1
                 elif path.endswith("/events") and method == "GET":
@@ -413,6 +474,28 @@ class RecoveryServer:
     # increment/decrement and the runner thread's read each atomic, and the
     # arm-then-consume ordering means they never race.
 
+    def delay_load(self, ms: int) -> None:
+        """Hold ``storage.load_messages`` itself open for ``ms`` (0 = off).
+
+        ``delay_history`` sleeps in the FAULT LAYER — before the route —
+        so two delayed requests never overlap inside the #884 flight
+        machinery (the first flight completes and pops before the second
+        arrives at the route).  This knob sleeps INSIDE the shared
+        reconstruction's ``load_messages`` (sync, called via
+        ``asyncio.to_thread`` — the sleep parks only that worker), which
+        is the same layer the unit tests gate, so held flights genuinely
+        overlap and join/miss behavior is observable end to end via
+        ``load_calls``.
+        """
+        self._load_delay_ms = ms
+
+    @property
+    def load_calls(self) -> int:
+        """``load_messages`` entries (pre-sleep) — the flight-layer twin
+        of ``history_requests`` (which counts HTTP arrivals): a JOINED
+        request never enters ``load_messages``, so join=1 / miss=2."""
+        return self._load_calls
+
     def fail_history(self, count: int) -> None:
         """Make the next ``count`` ``GET …/history`` responses a 500 — the
         failed refetch the #890 guard-before-wipe must survive."""
@@ -432,11 +515,35 @@ class RecoveryServer:
 
     # -- teardown ------------------------------------------------------------
 
-    def stop(self) -> None:
-        with contextlib.suppress(Exception):
-            for ws in list(self._manager.list_all()):
-                with contextlib.suppress(Exception):
-                    self._manager.close(ws.id)
+    def stop(self, *, hard: bool = False) -> None:
+        """Stop the node.
+
+        ``hard=True`` skips the per-workstream ``manager.close`` sweep — a
+        graceful close routes through ``cleanup_session_ui`` →
+        ``session.cancel()``, whose bash cancel path PERSISTS a
+        synthesized "Cancelled by user" result while the old node is
+        still alive, which masks crash states.  A hard stop leaves any
+        in-flight tool call genuinely unresulted in storage, modelling a
+        SIGKILL/OOM death (the coord-orphan-rewind scenario's premise).
+        The 2s graceful-shutdown timeout (uvicorn config) force-closes
+        open SSE streams, and the lifespan teardown still runs, so the
+        #885 daemon threads are joined on both paths.
+        """
+        if not hard:
+            with contextlib.suppress(Exception):
+                for ws in list(self._manager.list_all()):
+                    with contextlib.suppress(Exception):
+                        self._manager.close(ws.id)
+        # hard=True relies on ``timeout_graceful_shutdown=2`` (set in the
+        # uvicorn config above) to force-close the pane's EventSource:
+        # should_exit alone still runs the ASGI lifespan teardown, so the
+        # #885 daemon threads and the sse_executor are joined either way
+        # (``force_exit`` would SKIP the lifespan and leak them — the
+        # fanout thread blocks on queue.get() forever).  NOTE: the killed
+        # workstream's in-flight tool keeps executing on this process's
+        # session thread and persists its result at natural completion —
+        # hard-kill scenarios must use a paced tool that outlives their
+        # observation window.
         self._server.should_exit = True
         self._thread.join(timeout=20)
         with contextlib.suppress(Exception):
@@ -446,6 +553,9 @@ class RecoveryServer:
         # Restore any patched cap defaults.
         for meth, defaults in self._orig_defaults:
             meth.__defaults__ = defaults
+        # Restore the storage singleton's load_messages (delay_load knob).
+        with contextlib.suppress(Exception):
+            self._patched_storage.load_messages = self._orig_load_messages  # type: ignore[method-assign]
 
 
 def make_listen_socket(port: int, *, sndbuf: int = _DEFAULT_SNDBUF) -> socket.socket:

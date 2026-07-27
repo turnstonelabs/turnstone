@@ -1132,3 +1132,130 @@ def test_popup_menu_shared_helper() -> None:
     assert 'prefer: "up"' in shell, (
         "the footer chip sits at the viewport bottom — the menu pops upward"
     )
+
+
+def _strip_js_comments_local(src: str) -> str:
+    """Copy-local of ``tests/test_app_js.py``'s helper (house convention:
+    these guard files stay import-independent of each other).
+
+    Needed because a bare ``"brand-home" in body`` substring test is a FALSE
+    guard -- that string also appears in prose comments, so it would stay
+    green after the class it names was renamed away.
+    """
+    out: list[str] = []
+    n = len(src)
+    i = 0
+    in_str: str | None = None
+    while i < n:
+        ch = src[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        # Line comment: replace with spaces up to newline (preserve
+        # length so downstream offset math still works).
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            if j == -1:
+                j = n
+            out.append(" " * (j - i))
+            i = j
+            continue
+        # Block comment: replace with spaces up to closing */.
+        if ch == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2)
+            if j == -1:
+                out.append(" " * (n - i))
+                i = n
+                continue
+            out.append(" " * (j + 2 - i))
+            i = j + 2
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def test_proxy_shim_selectors_still_exist_in_shell_js() -> None:
+    """The console's proxy shim reaches across a process boundary into this
+    file's DOM: ``turnstone/console/server.py::_JS_PROXY_SHIM`` is injected
+    into a PROXIED node page and selects ``.rail-brand .brand-home`` and
+    ``.brand-sub`` -- classes only shell.js emits.  Nothing links the two,
+    and the shim fails SOFT (``if (!brand) return;``), so renaming a class
+    here silently removes the only way back to the console from a node view.
+
+    That is precisely how the PREVIOUS affordance died: the node picker
+    anchored to ``#ui-header``, the L-shell renovation deleted that element,
+    and every string-presence assertion stayed green for two minor releases.
+    This guard exists so the replacement cannot die the same way.
+
+    The class names are DERIVED from the shim's own querySelector calls, not
+    hardcoded here, so adding a selector there without emitting it here fails.
+    """
+    from turnstone.console.server import _JS_PROXY_SHIM
+
+    selectors = re.findall(r'querySelector\("([^"]+)"\)', _JS_PROXY_SHIM)
+    classes = {c for sel in selectors for c in re.findall(r"\.([A-Za-z0-9_-]+)", sel)}
+
+    # Vacuity floor.  Without this, deleting wireBrandHome entirely would
+    # yield an empty set and make the loop below pass trivially -- a guard
+    # that goes green when the thing it guards is removed is not a guard.
+    assert classes >= {"rail-brand", "brand-home", "brand-sub"}, (
+        "the proxy shim no longer selects the rail-brand trio; derived "
+        f"{sorted(classes)}.  If back-to-console moved to a different anchor, "
+        "update this guard to match the new one -- do not delete it."
+    )
+
+    body = _strip_js_comments_local(_SHELL_JS.read_text(encoding="utf-8"))
+
+    # Names alone are NOT enough.  The shim's selector is a DESCENDANT
+    # selector, so shell.js emitting all three classes while re-parenting
+    # .brand-home out of .rail-brand would leave this guard green and
+    # querySelector returning null -- the picker's death, one refactor later.
+    # Pin the two containment edges, deriving the local variable names from
+    # source so renaming them stays green and re-parenting does not.
+    holder = {}
+    for cls in ("rail-brand", "brand-home"):
+        m = re.search(
+            r"(?:const|let|var)\s+(\w+)\s*=\s*make\(\s*\"[^\"]+\"\s*,\s*\""
+            + re.escape(cls)
+            + r"\"",
+            body,
+        )
+        assert m, (
+            f'shell.js no longer builds "{cls}" via a make(...) assignment; '
+            "re-derive this structural guard against the new shape rather "
+            "than deleting it -- the shim selects .rail-brand .brand-home."
+        )
+        holder[cls] = m.group(1)
+
+    assert f"{holder['rail-brand']}.append({holder['brand-home']})" in body, (
+        'shell.js no longer appends "brand-home" into "rail-brand"; the '
+        "shim's descendant selector .rail-brand .brand-home would return "
+        "null and back-to-console would silently stop working."
+    )
+    assert re.search(
+        re.escape(holder["brand-home"]) + r"\.append\(\s*make\(\s*\"span\"\s*,\s*\"brand-sub\"",
+        body,
+    ), (
+        'shell.js no longer appends "brand-sub" into "brand-home"; the shim '
+        "reads the sub-label via brand.querySelector('.brand-sub') and would "
+        "silently skip the visible 'back to console' cue."
+    )
+
+    for cls in sorted(classes):
+        assert f'"{cls}"' in body, (
+            f'shell.js no longer emits the class "{cls}", which '
+            "turnstone/console/server.py::_JS_PROXY_SHIM selects on when the "
+            "console proxies a node.  The shim fails soft, so this rename "
+            "would silently disable back-to-console.  Update the shim's "
+            "querySelector calls in the same change."
+        )
