@@ -1415,6 +1415,10 @@ def _tool_turn_meta(
 # ---------------------------------------------------------------------------
 
 
+class BackendAuthUnavailableError(RuntimeError):
+    """A fail-closed dynamic model credential could not be resolved."""
+
+
 class ChatSession:
     # The mid-turn interjection queue's cap — an ALIAS of the shared
     # per-workstream backpressure bound (see workstream.PENDING_SENDS_MAX):
@@ -1806,6 +1810,10 @@ class ChatSession:
         # _task_tools, no listeners, no resource/prompt catalogs, and the
         # refresh callbacks stay inert (they all guard on _mcp_client).
         # Task agents keep their native tools; only the MCP surface closes.
+        # Model authentication is host infrastructure, not an MCP tool-surface
+        # capability. Preserve the raw manager even when the persona gate hides
+        # MCP tools, resources, and prompts or a resume drops that surface.
+        self._mcp_mint_client = mcp_client
         self._mcp_client = mcp_client if self._persona_mcp else None
         # True when a real client was withheld by the persona gate (as
         # opposed to no MCP in the deployment at all).  Mid-session
@@ -3227,6 +3235,10 @@ class ChatSession:
         self._set_session_tools([])
         self._render_agent_tool_descriptions()
 
+    def set_model_mint_client(self, client: MCPClientManager | None) -> None:
+        """Update the ungated model-auth manager after a runtime registry reload."""
+        self._mcp_mint_client = client
+
     def _handle_mcp_refresh(self, arg: str) -> None:
         """Handle ``/mcp refresh [server]``."""
         assert self._mcp_client is not None
@@ -4518,12 +4530,17 @@ class ChatSession:
             return None
         from turnstone.core.perception import describe_cached, describe_peek
 
-        # Peek the (alias, content_hash) memo BEFORE building parts: for a PDF,
+        # Peek the (principal, alias, content_hash) memo BEFORE building parts: for a PDF,
         # _perception_parts rasterizes every page, but describe_cached returns a
         # memoized description without touching parts on a hit — so on a cross-send
         # hit the rasterize would be pure waste.
         content_hash = str(att.get("attachment_id"))
-        text = describe_peek(alias=alias, content_hash=content_hash)
+        principal_id = (self._mcp_effective_user_id or "").strip()
+        text = describe_peek(
+            principal_id=principal_id,
+            alias=alias,
+            content_hash=content_hash,
+        )
         if text is None:
             parts = self._perception_parts(att, kind)
             if not parts:
@@ -4532,6 +4549,7 @@ class ChatSession:
                 provider=provider,
                 client=client,
                 model=model,
+                principal_id=principal_id,
                 alias=alias,
                 content_hash=content_hash,
                 parts=parts,
@@ -4544,6 +4562,9 @@ class ChatSession:
                 registry=self._registry,
                 config_store=self._config_store,
                 capabilities=caps,
+                # The memo is partitioned by the same effective principal used
+                # by the resolver, so delegated output cannot cross users.
+                backend_auth_resolver=self._model_backend_auth_token,
             )
         if not text:
             return None
@@ -5140,6 +5161,7 @@ class ChatSession:
             registry=self._registry,
             capabilities=caps,
             config_store=self._config_store,
+            backend_auth_resolver=self._model_backend_auth_token,
         )
         result = model_turn(
             lane,
@@ -5154,10 +5176,6 @@ class ChatSession:
             # MUST keep None — it runs on parallel tool threads and a
             # registration would clobber the main stream's _cancel_stream.
             cancel_ref=cancel_ref,
-            # Per-user OBO backend auth (see main loop) — utility completions on
-            # an entra_obo alias mint under the same driver; static aliases and
-            # userless internal calls resolve None and keep the static key.
-            obo_api_key=self._model_obo_token(lane.alias),
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
@@ -5383,6 +5401,10 @@ class ChatSession:
             if tracker:
                 tracker.record_success()
             return result
+        except BackendAuthUnavailableError:
+            # Explicit fail-closed policy: never reinterpret an authentication
+            # refusal as backend health and never route it to a static fallback.
+            raise
         except Exception as primary_err:
             if tracker:
                 tracker.record_failure()
@@ -5442,6 +5464,8 @@ class ChatSession:
             if fb_tracker:
                 fb_tracker.record_success()
             return result
+        except BackendAuthUnavailableError:
+            raise
         except Exception as fb_err:
             if fb_tracker:
                 fb_tracker.record_failure()
@@ -5490,14 +5514,14 @@ class ChatSession:
             role_counts,
         )
         msgs = self._maybe_attach_vllm_chat_reasoning(msgs, prov, model_alias)
-        # Per-user OBO backend auth: bind the minted token as the SDK client's
+        # Dynamic backend auth: bind the minted token as the SDK client's
         # api_key (with_options reuses the connection pool) so it becomes the
         # provider's own credential header — extra_headers can't override the
         # Anthropic SDK's x-api-key. None → the backend's static key stands.
         # Resolved once, outside the retry loop.
-        obo_key = self._model_obo_token(model_alias or "")
-        if obo_key:
-            client = client.with_options(api_key=obo_key)
+        backend_auth_token = self._model_backend_auth_token(model_alias or "")
+        if backend_auth_token:
+            client = client.with_options(api_key=backend_auth_token)
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             self._check_cancelled()
@@ -5982,73 +6006,107 @@ class ChatSession:
         """
         return self._acting_user_id or self._mcp_user_id
 
-    def _model_obo_token(self, alias: str) -> str | None:
-        """Resolve the per-user OBO access token for an OBO-enabled backend.
+    def _model_backend_auth_token(self, alias: str) -> str | None:
+        """Resolve the delegated-user or app-identity credential for *alias*.
 
-        When *alias*'s ModelConfig has ``auth_mode == "entra_obo"`` and a user
-        is driving the turn, mint a per-user Entra OBO access token for the
-        model's ``obo_audience`` and return it.  The caller binds it as the SDK
-        client's ``api_key`` (via ``with_options``, which reuses the connection
-        pool) so the SDK emits it as its own credential header — deliberately
-        NOT an injected ``extra_headers`` value, which the Anthropic SDK will
-        not let override its ``x-api-key``.
+        The caller binds the returned token as the SDK client's ``api_key`` via
+        ``with_options``, which preserves the connection pool and lets each SDK
+        emit its native credential header. Header injection is deliberately not
+        used: Anthropic does not allow ``extra_headers`` to replace ``x-api-key``.
 
-        Returns ``None`` (leave the static key in place) for static aliases, an
-        empty/unknown alias, missing user context (CLI / eval / coordinator /
-        service turns, where ``_mcp_effective_user_id`` is empty), or a failed
-        mint — so the call still goes through on the backend's static credential.
-        The minted token is cached in the DB (``mcp_user_tokens``, shared across
-        worker nodes) per (user, audience), so a warm call is one cache read
-        rather than a re-mint. A fallback with a user present is logged (below)
-        so a silent drop to the static/placeholder credential is never invisible.
+        Every session-owned lane, including judge, output guard, and perception,
+        resolves through this same effective principal. ``entra_app`` remains an
+        explicit model-definition choice; it is never inferred from a missing
+        user or failed OBO mint.
+
+        A dynamic alias with no static key always fails closed rather than
+        issuing the SDK-construction placeholder. When a real static key exists,
+        mint failures retain that explicit fallback unless the operator enables
+        ``model.auth_fail_closed``. An ``entra_obo`` call with no user always
+        fails closed regardless of fallback policy.
         """
         registry = self._registry
-        mcp = self._mcp_client
-        if registry is None or mcp is None or not alias or not registry.has_alias(alias):
+        if registry is None or not alias:
             return None
         try:
             cfg = registry.get_config(alias)
-        except ValueError:
+        except (KeyError, ValueError):
             return None
         mode = getattr(cfg, "auth_mode", "static")
         if mode not in ("entra_obo", "entra_app") or not cfg.obo_audience:
             return None
+        has_static_key = bool(getattr(cfg, "api_key", ""))
+        configured_fail_closed = bool(
+            self._config_store is not None
+            and self._config_store.get("model.auth_fail_closed")
+        )
+        must_fail_closed = configured_fail_closed or not has_static_key
+        user_id = ""
+        if mode == "entra_obo":
+            user_id = (self._mcp_effective_user_id or "").strip()
+            if not user_id:
+                log.warning(
+                    "model_obo.no_user_context",
+                    alias=alias,
+                    audience=cfg.obo_audience,
+                    has_static_key=has_static_key,
+                )
+                raise BackendAuthUnavailableError(
+                    f"Delegated backend authentication has no user for model alias {alias!r}"
+                )
+        mcp = self._mcp_mint_client
+        if mcp is None:
+            log.warning(
+                "model_backend_auth.mint_client_unavailable",
+                alias=alias,
+                auth_mode=mode,
+                audience=cfg.obo_audience,
+                has_static_key=has_static_key,
+            )
+            if must_fail_closed:
+                raise BackendAuthUnavailableError(
+                    f"Dynamic backend authentication unavailable for model alias {alias!r}"
+                )
+            return None
         if mode == "entra_app":
             # App/managed identity via client-credentials — Turnstone's own SSO
-            # app reg, no user needed, so this also covers utility / coordinator
-            # / service / CLI turns. The gateway resolves it to one shared
-            # virtual account (no per-user attribution).
+            # app reg. This is used only when the model definition explicitly
+            # selects entra_app; missing OBO context never switches grant modes.
+            # The gateway resolves it to one shared virtual account (no per-user
+            # attribution).
             token = mcp.mint_app_token_sync(audience=cfg.obo_audience)
             if not token:
                 log.warning(
                     "model_app.fallback_to_static",
                     alias=alias,
                     audience=cfg.obo_audience,
-                    has_static_key=bool(getattr(cfg, "api_key", "")),
+                    has_static_key=has_static_key,
                 )
+                if must_fail_closed:
+                    raise BackendAuthUnavailableError(
+                        f"App backend authentication unavailable for model alias {alias!r}"
+                    )
                 return None
             return token
         # entra_obo — per-user On-Behalf-Of.
-        user_id = (self._mcp_effective_user_id or "").strip()
-        if not user_id:
-            # Expected for utility / CLI / eval / coordinator / service turns —
-            # no user to mint on behalf of, so the static credential stands.
-            log.debug("model_obo.no_user_context", alias=alias, audience=cfg.obo_audience)
-            return None
         token = mcp.mint_model_obo_token_sync(user_id=user_id, audience=cfg.obo_audience)
         if not token:
             # A user IS driving but the mint yielded nothing (no captured
             # credential, decrypt failure, or the AS rejected the grant). Never
-            # silent: the request now goes out on the backend's STATIC credential
-            # — and when no api_key is set that is the unusable placeholder the
-            # backend rejects with an opaque 401. Surface the cause on our side.
+            # silent: when the operator explicitly configured a static key and
+            # left fail-closed off, that key stands; a keyless alias raises below
+            # and can never issue its SDK-construction placeholder.
             log.warning(
                 "model_obo.fallback_to_static",
                 alias=alias,
                 user_id=user_id,
                 audience=cfg.obo_audience,
-                has_static_key=bool(getattr(cfg, "api_key", "")),
+                has_static_key=has_static_key,
             )
+            if must_fail_closed:
+                raise BackendAuthUnavailableError(
+                    f"Delegated backend authentication unavailable for model alias {alias!r}"
+                )
             return None
         return token
 
@@ -8673,6 +8731,9 @@ class ChatSession:
                 session_model_alias=self._model_alias or "",
                 # For the temperature ladder's global rung (model.temperature).
                 config_store=self._config_store,
+                # The verdict belongs to this turn and carries the same acting
+                # principal as the model/tool activity it evaluates.
+                backend_auth_resolver=self._model_backend_auth_token,
             )
         except Exception:
             log.warning("judge.init_failed", exc_info=True)
@@ -8710,6 +8771,7 @@ class ChatSession:
                 session_model_alias=self._model_alias or "",
                 # For the temperature ladder's global rung (model.temperature).
                 config_store=self._config_store,
+                backend_auth_resolver=self._model_backend_auth_token,
             )
         except Exception:
             log.warning("output_guard_judge.init_failed", exc_info=True)
@@ -16108,6 +16170,8 @@ class ChatSession:
             capabilities=agent_caps,
             config_store=self._config_store,
         )
+        # Resolve once per sub-agent run, outside its request retry loop.
+        agent_backend_auth_token = self._model_backend_auth_token(lane.alias)
 
         def _api_call(
             turns: list[Turn],
@@ -16142,9 +16206,7 @@ class ChatSession:
                         or (self.reasoning_effort if same_lane else None),
                         mint=mint,
                         wire_id_map=wire_id_map,
-                        # Per-user OBO backend auth for the sub-agent lane (see
-                        # main loop); None for static aliases / userless turns.
-                        obo_api_key=self._model_obo_token(lane.alias),
+                        backend_auth_token=agent_backend_auth_token,
                     )
                     # Sub-agent turns bypass on_status — record per-turn so
                     # task-agent spend is visible in the dashboard, attributed

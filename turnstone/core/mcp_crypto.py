@@ -626,11 +626,20 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     user_scoped_count = sum(
         1 for row in storage.list_mcp_servers() if is_user_scoped_auth(row.get("auth_type"))
     )
+    model_registry = getattr(app_state, "registry", None) or getattr(
+        app_state, "coord_registry", None
+    )
+    dynamic_model_auth = bool(
+        model_registry is not None
+        and hasattr(model_registry, "has_dynamic_auth")
+        and model_registry.has_dynamic_auth()
+    )
 
-    if user_scoped_count > 0 and cipher_cfg is None:
+    if (user_scoped_count > 0 or dynamic_model_auth) and cipher_cfg is None:
         log.error(
-            "mcp.oauth: %d server(s) configured with auth_type='oauth_user'/'oauth_obo' but %s",
+            "mcp.oauth: %d user-scoped MCP server(s), dynamic_model_auth=%s, but %s",
             user_scoped_count,
+            dynamic_model_auth,
             _STARTUP_KEY_REQUIRED_HINT,
         )
         raise SystemExit(1)

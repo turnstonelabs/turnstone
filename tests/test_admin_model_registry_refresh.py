@@ -86,6 +86,8 @@ def _seed_model_def(
     model: str,
     base_url: str = "http://localhost:8000/v1",
     enabled: bool = True,
+    auth_mode: str = "static",
+    obo_audience: str = "",
 ) -> None:
     """Insert a model definition row directly via the storage API."""
     storage.create_model_definition(
@@ -99,6 +101,8 @@ def _seed_model_def(
         capabilities="{}",
         enabled=enabled,
         created_by="admin",
+        auth_mode=auth_mode,
+        obo_audience=obo_audience,
     )
 
 
@@ -838,9 +842,196 @@ def _make_client(storage: SQLiteBackend, registry: ModelRegistry | None) -> Test
     app.state.collector.get_all_nodes.return_value = []
     app.state.proxy_client = MagicMock()
     app.state.config_store = MagicMock()
+    app.state.config_store.get.side_effect = lambda key, default=None: (
+        "api://approved" if key == "model.auth_audience_allowlist" else default
+    )
+    app.state.oidc_config = SimpleNamespace(obo_grant_profile="entra")
     client = TestClient(app)
     client.headers.update({"X-Test-User": "admin", "X-Test-Perms": "admin.models"})
     return client
+
+
+def test_create_rejects_unknown_auth_mode(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={"alias": "bad-auth", "model": "x", "auth_mode": "bogus"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "auth_mode" in resp.json()["error"]
+
+
+def test_create_rejects_entra_obo_without_audience(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={"alias": "missing-aud", "model": "x", "auth_mode": "entra_obo"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "obo_audience" in resp.json()["error"]
+
+
+def test_update_rejects_entra_obo_when_stored_audience_empty(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"auth_mode": "entra_obo"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "obo_audience" in resp.json()["error"]
+
+
+def test_update_rejects_clearing_audience_on_entra_obo(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="entra_obo",
+        obo_audience="api://approved",
+    )
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"obo_audience": ""},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "obo_audience" in resp.json()["error"]
+
+
+def test_dynamic_auth_create_requires_admin_mcp(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": "gateway",
+            "model": "x",
+            "auth_mode": "entra_obo",
+            "obo_audience": "api://approved",
+        },
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert "admin.mcp" in resp.json()["error"]
+
+
+def test_dynamic_auth_create_rejects_unapproved_audience(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    client.headers.update({"X-Test-User": "admin", "X-Test-Perms": "admin.models,admin.mcp"})
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": "gateway",
+            "model": "x",
+            "auth_mode": "entra_obo",
+            "obo_audience": "api://not-approved",
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "allowlist" in resp.json()["error"]
+
+
+def test_dynamic_alias_base_url_change_requires_admin_mcp(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        base_url="https://approved.example/v1",
+        auth_mode="entra_obo",
+        obo_audience="api://approved",
+    )
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"base_url": "https://attacker.example/v1"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert "admin.mcp" in resp.json()["error"]
+    assert storage.get_model_definition("m1")["base_url"] == "https://approved.example/v1"
+
+
+def test_entra_app_create_rejects_non_entra_profile(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+    client.headers.update({"X-Test-User": "admin", "X-Test-Perms": "admin.models,admin.mcp"})
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": "gateway",
+            "model": "x",
+            "auth_mode": "entra_app",
+            "obo_audience": "api://approved",
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "obo_grant_profile='entra'" in resp.json()["error"]
+
+
+def test_unchanged_dynamic_auth_fields_do_not_require_admin_mcp(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The admin form always submits both fields; equality, not presence,
+    decides whether the capability-escalation permission is needed."""
+    from turnstone.console import server as server_module
+
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="entra_obo",
+        obo_audience="api://approved",
+    )
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    monkeypatch.setattr(
+        server_module,
+        "_ensure_console_mcp_client",
+        lambda _app: {"skipped": "test"},
+    )
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={
+            "auth_mode": "entra_obo",
+            "obo_audience": "api://approved",
+            "temperature": 0.4,
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
 
 
 def test_create_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:

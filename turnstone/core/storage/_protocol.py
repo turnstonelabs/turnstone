@@ -2257,9 +2257,11 @@ class StorageBackend(Protocol):
         an *idle* refresh token can't expire one between a user's real sessions.
         Deliberately UNFILTERED by ``expires_at``: an expired access token backed
         by a live refresh token is still a consented, reconcilable grant. Only
-        ``auth_type='oauth_user'`` servers ever write these rows, so a static /
-        no-auth server is structurally absent; ciphertext columns are never
-        touched — only the identity + timestamp cross the wire.
+        The storage query joins ``mcp_servers`` and keeps only
+        ``auth_type='oauth_user'`` rows. Other auth paths also use the token
+        table as a mint cache, but they are not refresh-grant sweep targets.
+        Ciphertext columns are never touched — only identity + timestamp cross
+        the wire.
         """
         ...
 
@@ -2417,6 +2419,8 @@ class StorageBackend(Protocol):
         reasoning_effort: str | None = None,
         surface_persisted_reasoning: bool = True,
         replay_reasoning_to_model: bool = False,
+        auth_mode: str = "static",
+        obo_audience: str = "",
     ) -> None:
         """Create a model definition. No-op if definition_id already exists."""
         ...

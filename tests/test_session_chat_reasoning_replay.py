@@ -50,8 +50,11 @@ def _vllm_registry(*, replay: bool = True, alias: str = "qwen3") -> Any:
         replay_reasoning_to_model=replay,
         capabilities={},
         server_compat={"server_type": "vllm"},
+        auth_mode="static",
+        obo_audience="",
     )
     return SimpleNamespace(
+        has_alias=lambda a: a == alias,
         get_config=lambda a: cfg if a == alias else (_ for _ in ()).throw(KeyError(a)),
     )
 
@@ -61,8 +64,11 @@ def _registry_with_server_type(server_type: str, *, replay: bool = True) -> Any:
         replay_reasoning_to_model=replay,
         capabilities={},
         server_compat={"server_type": server_type},
+        auth_mode="static",
+        obo_audience="",
     )
     return SimpleNamespace(
+        has_alias=lambda _alias: True,
         get_config=lambda _alias: cfg,
     )
 

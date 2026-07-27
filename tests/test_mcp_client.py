@@ -974,6 +974,22 @@ class TestCreateMcpClient:
         with patch("turnstone.core.mcp_client.load_mcp_config", return_value={}):
             assert create_mcp_client(storage=storage) is None
 
+    def test_required_constructs_empty_manager_for_model_auth(self):
+        """Dynamic model auth needs the mint loop even with zero MCP servers."""
+        from turnstone.core.mcp_client import create_mcp_client
+
+        storage = MagicMock()
+        storage.list_mcp_servers.return_value = []
+        with (
+            patch("turnstone.core.mcp_client.load_mcp_config", return_value={}),
+            patch("turnstone.core.mcp_client.MCPClientManager") as cls,
+        ):
+            result = create_mcp_client(storage=storage, required=True)
+
+        assert result is cls.return_value
+        cls.assert_called_once_with({})
+        cls.return_value.start.assert_called_once_with()
+
     def test_pool_only_rows_construct_manager(self):
         """Pool-backed rows alone must construct an empty-config manager.
 

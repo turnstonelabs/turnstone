@@ -979,6 +979,7 @@ class IntentJudge:
         model_registry: Any | None = None,
         session_model_alias: str = "",
         config_store: Any | None = None,
+        backend_auth_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._config = config
         self._rule_registry = rule_registry
@@ -987,6 +988,7 @@ class IntentJudge:
         # global ``model.temperature``) resolve like every other lane.
         self._model_registry = model_registry
         self._config_store = config_store
+        self._backend_auth_resolver = backend_auth_resolver
         # The caller (ChatSession) resolves the session model's real caps from
         # _get_capabilities (config/registry-aware) and passes them in; they are
         # this judge's wire capabilities and window when it inherits the session
@@ -1353,6 +1355,7 @@ class IntentJudge:
             registry=self._model_registry,
             capabilities=self._capabilities,
             config_store=self._config_store,
+            backend_auth_resolver=self._backend_auth_resolver,
         )
 
         # Multi-turn judge loop

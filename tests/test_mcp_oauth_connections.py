@@ -380,6 +380,25 @@ class TestListConnections:
         names = [c["server_name"] for c in resp.json()["connections"]]
         assert names == ["srv-oauth"]
 
+    def test_list_connections_hides_synthetic_model_cache_rows(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        token_store = _make_token_store(storage)
+        _seed_oauth_user_server(storage)
+        _seed_user_token(token_store)
+        _seed_user_token(
+            token_store,
+            server_name="__model_obo__:api-model",
+            refresh_token=None,
+        )
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        with TestClient(app) as client:
+            resp = client.get("/v1/api/mcp/oauth/connections")
+
+        assert resp.status_code == 200
+        assert [row["server_name"] for row in resp.json()["connections"]] == ["srv-oauth"]
+
 
 # ---------------------------------------------------------------------------
 # DELETE /connections/{server_name}
@@ -387,6 +406,24 @@ class TestListConnections:
 
 
 class TestRevokeConnection:
+    def test_revoke_synthetic_model_cache_is_always_409_without_existence_oracle(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        token_store = _make_token_store(storage)
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        with TestClient(app) as client:
+            absent = client.delete("/v1/api/mcp/oauth/connections/__model_obo__:absent")
+            _seed_user_token(
+                token_store,
+                server_name="__model_obo__:present",
+                refresh_token=None,
+            )
+            present = client.delete("/v1/api/mcp/oauth/connections/__model_obo__:present")
+
+        assert absent.status_code == present.status_code == 409
+        assert absent.json() == present.json()
+        assert token_store.get_user_token("user-1", "__model_obo__:present") is not None
+
     def test_revoke_connection_obo_server_409_and_keeps_row(
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:

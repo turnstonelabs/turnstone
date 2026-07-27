@@ -170,6 +170,16 @@ class TestRequiredScope:
     def test_post_unknown_path_needs_read(self):
         assert required_scope("POST", "/api/unknown") == "read"
 
+    def test_model_auth_cache_invalidation_needs_approve(self):
+        assert required_scope("POST", "/api/_internal/model-auth-cache-invalidate") == "approve"
+        assert (
+            required_scope(
+                "POST",
+                "/v1/api/_internal/model-auth-cache-invalidate",
+            )
+            == "approve"
+        )
+
     def test_v1_post_send_needs_write(self):
         assert required_scope("POST", "/v1/api/workstreams/abc/send") == "write"
 

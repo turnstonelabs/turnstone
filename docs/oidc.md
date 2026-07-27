@@ -134,6 +134,24 @@ This knob only affects the login-flow IdP configured here. OAuth
 endpoints advertised by remote MCP servers are untrusted input and are
 always held to the strict public-address rule.
 
+### Model gateway credentials
+
+The same OIDC registration can authenticate model gateways. A model definition
+with `auth_mode = "entra_obo"` redeems the driving user's captured credential
+for its exact `obo_audience`; `auth_mode = "entra_app"` uses the registration's
+client ID and secret with Entra client credentials. Both bind the result through
+the provider SDK's native credential option rather than injecting an override
+header. The grant mode is never inferred: missing user context or a failed OBO
+mint cannot switch an `entra_obo` definition to client credentials.
+
+`entra_obo` requires `capture_user_credential = true`, the MCP encryption key,
+and delegated/admin-consented permission to the audience. `entra_app` requires
+`obo_grant_profile = "entra"` and a confidential-client secret; RFC 8693
+client-credentials is not implemented. Configure the permitted resource IDs in
+the runtime setting `model.auth_audience_allowlist` before saving dynamic model
+definitions. See [Settings](settings.md#model-backend-authentication) for
+permissions, failure policy, and lane identity rules.
+
 ### config.toml alternative
 
 ```toml

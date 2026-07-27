@@ -18,6 +18,19 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **Per-model Entra gateway authentication.** Model definitions can bind either
+  a caller-delegated OBO token (`entra_obo`) or a shared app-identity token
+  (`entra_app`) through the provider SDK credential surface. Mints reuse the
+  encrypted cluster token cache, refresh-rotation CAS, and advisory locking;
+  add a host-local memo, failure cooldown, long-lived mint HTTP client, audience
+  allow-list/permission boundary, identity-unlink purge, and optional
+  `model.auth_fail_closed` refusal policy. Delegated identity now propagates
+  through judge, output-guard, and principal-scoped perception lanes, and
+  unattended watch restoration reacquires the persisted workstream owner.
+  Ownerless OBO calls and dynamic aliases without a real static fallback always
+  fail closed; grant modes are never silently switched. Static authentication
+  remains the default.
+
 - **Compaction is visible now: lifecycle events, a progress bar, and a
   persistent transcript card.** Context compaction (manual `/compact` and
   auto) emits a first-class `compaction` SSE event

@@ -32,7 +32,8 @@ from tests._helpers import patch_session_storage
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import dicts_from_turns
-from turnstone.core.watch import WatchRunner
+from turnstone.core.watch import WatchRunner, WatchWorkstreamUnrestorable
+from turnstone.server import _watch_restore_owner
 
 
 class _NullUI:
@@ -42,7 +43,7 @@ class _NullUI:
         return MagicMock()
 
 
-def _make_session() -> ChatSession:
+def _make_session(*, user_id: str = "") -> ChatSession:
     """Real ChatSession with the same minimal setup the unit-test suite
     uses; no LLM calls happen until a chat-loop method is exercised
     (and even then the LLM provider is patched).
@@ -55,7 +56,26 @@ def _make_session() -> ChatSession:
         temperature=0.5,
         max_tokens=4096,
         tool_timeout=30,
+        user_id=user_id,
     )
+
+
+def test_watch_restore_owner_requires_persisted_principal() -> None:
+    storage = MagicMock()
+    storage.get_workstream_owner.return_value = "user-123"
+    assert _watch_restore_owner(storage, "ws-1") == "user-123"
+
+    storage.get_workstream_owner.return_value = ""
+    with pytest.raises(WatchWorkstreamUnrestorable):
+        _watch_restore_owner(storage, "ws-unowned")
+
+    storage.get_workstream_owner.return_value = None
+    with pytest.raises(WatchWorkstreamUnrestorable):
+        _watch_restore_owner(storage, "ws-missing")
+
+    storage.get_workstream_owner.side_effect = RuntimeError("storage unavailable")
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        _watch_restore_owner(storage, "ws-transient")
 
 
 def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
@@ -217,7 +237,8 @@ def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, m
 
     # Stage 1 — build the original session and persist a message so
     # ``session.resume`` finds the ws_id in storage.
-    original = _make_session()
+    owner_id = "user-123"
+    original = _make_session(user_id=owner_id)
     original_ws_id = original._ws_id
     # Persist a stub user message so ``load_messages(original_ws_id)``
     # returns something non-empty (resume short-circuits on empty).
@@ -235,7 +256,11 @@ def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, m
         new session adopts the original ws_id), wire the dispatch
         closure, return the dispatch fn.
         """
-        new_session = _make_session()
+        owner_storage = MagicMock()
+        owner_storage.get_workstream_owner.return_value = owner_id
+        new_session = _make_session(
+            user_id=_watch_restore_owner(owner_storage, ws_id),
+        )
         ok = new_session.resume(ws_id)
         assert ok, "resume should succeed against a non-empty message log"
         new_session.set_watch_runner(runner)
@@ -266,6 +291,7 @@ def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, m
     rehydrated = rehydrated_holder["session"]
     assert rehydrated is not original
     assert rehydrated._ws_id == original_ws_id
+    assert rehydrated._mcp_effective_user_id == owner_id
 
     # The watch payload landed on the rehydrated session's queue, not on
     # the (now-evicted) original session's queue.

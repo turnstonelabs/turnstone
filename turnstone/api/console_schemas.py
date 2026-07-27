@@ -1011,8 +1011,8 @@ class ModelDefinitionInfo(BaseModel):
     reasoning_effort: str | None = None
     surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
-    # "static" (send api_key) or "entra_obo" (mint a per-user OBO token for
-    # obo_audience at call time — see model_definitions migration 068).
+    # "static" (send api_key), "entra_obo" (delegated-user token), or
+    # "entra_app" (shared app token) for obo_audience at call time.
     auth_mode: str = "static"
     obo_audience: str = ""
     source: str = ""

@@ -2181,6 +2181,10 @@ class TestUserTokenFreshnessSweep:
     property — total invisibility to static / no-auth deployments."""
 
     def _wire(self, mgr: MCPClientManager, storage: SQLiteBackend, cipher: Any) -> None:
+        # The storage drive-set now authoritatively joins mcp_servers and keeps
+        # oauth_user rows; mirror production instead of relying on orphan token
+        # rows that the pre-model-cache query happened to enumerate.
+        _seed_oauth_server(storage)
         mgr.set_storage(storage)
         mgr.set_app_state(_make_app_state(storage, cipher=cipher))
         mgr._oauth_user_server_names = {"pool-srv"}
@@ -2546,6 +2550,8 @@ class TestUserTokenFreshnessSweep:
 
     def test_reconcile_targets_pairs_expiry_unfiltered_with_last_exercised(self, storage) -> None:
         cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="srv-a", server_id="srv-a-id")
+        _seed_oauth_server(storage, name="srv-b", server_id="srv-b-id")
         # alice consents to two servers → two rows.
         _seed_user_token(storage, cipher, user_id="alice", server_name="srv-a")
         _seed_user_token(storage, cipher, user_id="alice", server_name="srv-b")
@@ -2553,6 +2559,14 @@ class TestUserTokenFreshnessSweep:
         # consented, reconcilable grant, so bob must be enumerated.
         _seed_user_token(
             storage, cipher, user_id="bob", server_name="srv-a", expires_in_seconds=-999
+        )
+        # Synthetic model mint-cache rows share the table but never drive the
+        # oauth_user refresh-token keepalive sweep.
+        _seed_user_token(
+            storage,
+            cipher,
+            user_id="alice",
+            server_name="__model_obo__:api-model",
         )
         targets = storage.list_mcp_user_token_reconcile_targets()
         # (user, server) identity, all three grants present regardless of expiry.

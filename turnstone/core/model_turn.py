@@ -374,6 +374,9 @@ class ModelLane:
     registry: ModelRegistry | None = None
     temperature: float | None = None
     reasoning_effort: str | None = None
+    # Runtime credential resolver supplied by the host that owns OAuth state.
+    # Kept on the lane because this synchronous module has no manager singleton.
+    backend_auth_resolver: Callable[[str], str | None] | None = None
 
 
 def resolve_lane(
@@ -386,6 +389,7 @@ def resolve_lane(
     capabilities: ModelCapabilities | None = None,
     extra_params: dict[str, Any] | None | EllipsisType = ...,
     config_store: Any | None = None,
+    backend_auth_resolver: Callable[[str], str | None] | None = None,
 ) -> ModelLane:
     """Build a :class:`ModelLane`, resolving what the caller didn't supply.
 
@@ -428,6 +432,7 @@ def resolve_lane(
         registry=registry,
         temperature=resolve_temperature_setting(cfg, config_store),
         reasoning_effort=resolve_effort_setting(cfg, config_store),
+        backend_auth_resolver=backend_auth_resolver,
     )
 
 
@@ -636,7 +641,7 @@ def model_turn(
     wire_id_map: dict[str, str] | None = None,
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     cancel_ref: list[Any] | None = None,
-    obo_api_key: str | None = None,
+    backend_auth_token: str | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
 
@@ -700,15 +705,17 @@ def model_turn(
     aborted *cancel_ref* suppresses retries — a deadline that closed the
     stream must not have the request resurrected behind its back.
 
-    *obo_api_key* is the per-user OBO access token for an
-    ``auth_mode='entra_obo'`` backend.  When set, the call is issued on
+    *backend_auth_token* is a delegated-user or app-identity credential for a
+    dynamically authenticated backend. When set, the call is issued on
     ``lane.client.with_options(api_key=...)`` — a copy that reuses the
     client's connection pool but swaps the credential, so the SDK emits it as
     its own auth header (``x-api-key`` for Anthropic, ``Authorization: Bearer``
     for OpenAI-style).  This is deliberately NOT header injection via
     ``extra_headers``: the Anthropic SDK does not let ``extra_headers``
     override its ``x-api-key``, so an injected header is silently dropped.
-    ``None`` leaves the lane's static client credential in place.
+    ``None`` leaves the lane's static client credential in place. When the
+    explicit argument is absent, ``lane.backend_auth_resolver`` resolves it
+    once before the drain-retry loop.
     """
     if mint is not None and wire_id_map is None:
         raise ValueError(
@@ -736,6 +743,16 @@ def model_turn(
         or (lane.capabilities.default_reasoning_effort if lane.capabilities else None)
         or None
     )
+    resolved_backend_auth = backend_auth_token
+    if resolved_backend_auth is None and lane.backend_auth_resolver is not None:
+        resolved_backend_auth = lane.backend_auth_resolver(lane.alias)
+    # Bind once: SDK ``with_options`` preserves the base transport/pool while
+    # replacing only the provider credential. A drain retry reuses this client.
+    call_client = (
+        lane.client.with_options(api_key=resolved_backend_auth)
+        if resolved_backend_auth
+        else lane.client
+    )
     attempt = 0
     while True:
         # ``create_streaming`` stays OUTSIDE the try: every adapter issues
@@ -743,10 +760,9 @@ def model_turn(
         # request-level retry), so an exception from it is a request-time
         # failure that already got its retries; only drain-time failures
         # are mid-stream deaths the SDK could never see.
-        # OBO backends bind the per-user token as the client's api_key so the
-        # SDK emits it as its own auth header; with_options reuses the pool.
+        # Dynamic backends bind the token as the client's api_key so the SDK
+        # emits it as its own auth header; with_options reuses the pool.
         # (extra_headers can't override the Anthropic SDK's x-api-key.)
-        call_client = lane.client.with_options(api_key=obo_api_key) if obo_api_key else lane.client
         chunks = lane.provider.create_streaming(
             client=call_client,
             model=lane.model,

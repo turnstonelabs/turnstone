@@ -700,6 +700,7 @@ APPROVE_PATHS: frozenset[str] = frozenset(
     {
         "/api/_internal/config-reload",
         "/api/_internal/mcp-reload",
+        "/api/_internal/model-auth-cache-invalidate",
         "/api/_internal/model-reload",
     }
 )

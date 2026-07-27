@@ -7,6 +7,7 @@ model auto-detection, workstream management, and the main() REPL entry point.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import logging
 import os
@@ -1242,7 +1243,41 @@ def main() -> None:
     mcp_client = create_mcp_client(
         getattr(args, "mcp_config", None),
         storage=_get_storage(),
+        required=registry.has_dynamic_auth(),
     )
+    if mcp_client is not None:
+        cli_auth_storage = _get_storage()
+        mcp_client.set_storage(cli_auth_storage)
+        if registry.has_dynamic_auth():
+            # The CLI has no ASGI lifespan, but app-identity model auth needs
+            # the same discovered OIDC config and encrypted token store as the
+            # server hosts. The mint HTTP client itself belongs to mcp-loop.
+            from types import SimpleNamespace
+
+            from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
+            from turnstone.core.oidc import (
+                close_oidc_state,
+                initialize_oidc_state,
+                load_oidc_config,
+            )
+
+            cli_auth_state = SimpleNamespace(
+                auth_storage=cli_auth_storage,
+                oidc_config=load_oidc_config(),
+                registry=registry,
+            )
+
+            async def _initialize_cli_auth_state() -> None:
+                await initialize_oidc_state(cli_auth_state)
+                # Login/JWKS callbacks do not exist in the CLI. Close their
+                # client while retaining the discovered token endpoint.
+                await close_oidc_state(cli_auth_state)
+
+            asyncio.run(_initialize_cli_auth_state())
+            initialize_mcp_crypto_state(cli_auth_state, node_id="cli")
+            cli_auth_state.mcp_oauth_refresh_locks = {}
+            cli_auth_state.mcp_oauth_refresh_backoff = {}
+            mcp_client.set_app_state(cli_auth_state)
 
     # apply_config() merges [judge] config.toml values into args as
     # Output_guard and redact_secrets default to True, enabling the heuristic

@@ -53,6 +53,30 @@ def _build_registry() -> dict[str, SettingDef]:
             "without restarting.",
         ),
         SettingDef(
+            "model.auth_audience_allowlist",
+            "str",
+            "",
+            "Comma- or newline-separated model gateway audience allow-list",
+            "model",
+            help="Exact Entra resource App ID URIs that model definitions may redeem. "
+            "Required before an administrator can save entra_obo or entra_app auth. "
+            "Use literal values such as api://<application-id>; no wildcard or host "
+            "matching is performed.",
+        ),
+        SettingDef(
+            "model.auth_fail_closed",
+            "bool",
+            False,
+            "Refuse dynamic-auth model calls when token minting fails",
+            "model",
+            help="When enabled, an entra_obo or entra_app model call is refused if its "
+            "runtime credential cannot be minted. This also prevents routing that "
+            "failure into the model fallback chain. A delegated call without a user, "
+            "or any dynamic alias without a real static key, always refuses regardless "
+            "of this setting. Leave disabled only to permit fallback to an explicitly "
+            "configured static key after a mint failure.",
+        ),
+        SettingDef(
             "model.temperature",
             "float",
             None,

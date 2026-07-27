@@ -89,6 +89,19 @@ class _InjectAuthNoMcpMiddleware(BaseHTTPMiddleware):
         return resp
 
 
+class _InjectServiceAuthMiddleware(BaseHTTPMiddleware):
+    """Inject the cluster service identity used for internal cache eviction."""
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        request.state.auth_result = AuthResult(
+            user_id="console-proxy",
+            scopes=frozenset({"read", "approve", "service"}),
+            token_source="console",
+        )
+        resp: Response = await call_next(request)
+        return resp
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -149,6 +162,7 @@ def _routes_with_internal() -> list[Mount]:
         internal_mcp_refresh_one,
         internal_mcp_reload,
         internal_mcp_status,
+        internal_model_auth_cache_invalidate,
     )
 
     return [
@@ -166,6 +180,11 @@ def _routes_with_internal() -> list[Mount]:
                 Route(
                     "/api/_internal/mcp-reconnect/{name}",
                     internal_mcp_reconnect_one,
+                    methods=["POST"],
+                ),
+                Route(
+                    "/api/_internal/model-auth-cache-invalidate",
+                    internal_model_auth_cache_invalidate,
                     methods=["POST"],
                 ),
             ],
@@ -2466,6 +2485,62 @@ class TestInternalMcpReloadEndpoint:
         assert data["updated"] == ["c"]
 
 
+class TestInternalModelAuthCacheInvalidateEndpoint:
+    def test_service_identity_evicts_only_delegated_model_memo(self) -> None:
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectServiceAuthMiddleware)],
+        )
+        app.state.mcp_client = MagicMock()
+        app.state.mcp_client.invalidate_model_mint_memo_sync.return_value = 2
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/v1/api/_internal/model-auth-cache-invalidate",
+            json={"user_id": "user-x"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok", "evicted": 2}
+        app.state.mcp_client.invalidate_model_mint_memo_sync.assert_called_once_with(
+            user_id="user-x",
+            server_prefix="__model_obo__:",
+        )
+
+    def test_non_service_identity_is_rejected(self) -> None:
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.mcp_client = MagicMock()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/v1/api/_internal/model-auth-cache-invalidate",
+            json={"user_id": "user-x"},
+        )
+
+        assert response.status_code == 403
+        app.state.mcp_client.invalidate_model_mint_memo_sync.assert_not_called()
+
+    @pytest.mark.parametrize("body", [{}, {"user_id": ""}, {"user_id": "bad\nid"}])
+    def test_invalid_user_id_is_rejected(self, body: dict[str, str]) -> None:
+        app = Starlette(
+            routes=_routes_with_internal(),
+            middleware=[Middleware(_InjectServiceAuthMiddleware)],
+        )
+        app.state.mcp_client = MagicMock()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/v1/api/_internal/model-auth-cache-invalidate",
+            json=body,
+        )
+
+        assert response.status_code == 400
+        app.state.mcp_client.invalidate_model_mint_memo_sync.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # _notify_nodes_mcp_refresh_one / _notify_nodes_mcp_reconnect_one
 # ---------------------------------------------------------------------------
@@ -3229,11 +3304,19 @@ class TestEnsureConsoleMcpClient:
     lazy-construct/reconcile path, shared by the reload fan-out (all
     admin-write producers) and the operator POST /reload."""
 
-    def _app(self, *, manager: Any = None, config_path: Any = None) -> Any:
+    def _app(
+        self,
+        *,
+        manager: Any = None,
+        config_path: Any = None,
+        dynamic_model_auth: bool = False,
+    ) -> Any:
         import types
 
         state = types.SimpleNamespace()
         state.auth_storage = MagicMock()
+        state.coord_registry = MagicMock()
+        state.coord_registry.has_dynamic_auth.return_value = dynamic_model_auth
         cs = MagicMock()
         cs.get.side_effect = lambda k, d=None: config_path if k == "mcp.config_path" else d
         state.config_store = cs
@@ -3263,12 +3346,29 @@ class TestEnsureConsoleMcpClient:
             app = self._app(config_path="/etc/turnstone/mcp.json")
             out = _ensure_console_mcp_client(app)
             create.assert_called_once_with(
-                "/etc/turnstone/mcp.json", storage=app.state.auth_storage
+                "/etc/turnstone/mcp.json",
+                storage=app.state.auth_storage,
+                required=False,
             )
             inst = create.return_value
             assert app.state.mcp_client is inst
+            inst.set_storage.assert_called_once_with(app.state.auth_storage)
+            inst.set_app_state.assert_called_once_with(app.state)
             inst.reconcile_sync.assert_called_once_with(app.state.auth_storage)
             assert out is inst.reconcile_sync.return_value
+
+    def test_dynamic_model_auth_requires_manager_without_mcp_servers(self):
+        from unittest.mock import patch
+
+        with patch("turnstone.core.mcp_client.create_mcp_client") as create:
+            app = self._app(dynamic_model_auth=True)
+            _ensure_console_mcp_client(app)
+
+        create.assert_called_once_with(
+            None,
+            storage=app.state.auth_storage,
+            required=True,
+        )
 
     def test_nothing_configured_skips(self):
         """create_mcp_client returning None (no DB rows, no file config)
@@ -3293,7 +3393,12 @@ class TestEnsureConsoleMcpClient:
 
         constructed: list[Any] = []
 
-        def _slow_create(config_path: Any = None, *, storage: Any = None) -> Any:
+        def _slow_create(
+            config_path: Any = None,
+            *,
+            storage: Any = None,
+            required: bool = False,
+        ) -> Any:
             time.sleep(0.05)
             mgr = MagicMock()
             mgr.reconcile_sync.return_value = {"added": [], "removed": [], "updated": []}

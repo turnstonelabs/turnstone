@@ -37,6 +37,8 @@ from turnstone.core.model_turn import model_turn, resolve_lane
 from turnstone.core.trajectory import AttachmentRef, Role, TextBlock, Turn
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turnstone.core.providers._protocol import LLMProvider
 
 log = get_logger(__name__)
@@ -79,6 +81,7 @@ def describe(
     registry: Any | None = None,
     config_store: Any | None = None,
     capabilities: Any | None = None,
+    backend_auth_resolver: Callable[[str], str | None] | None = None,
 ) -> str:
     """Perceive ``parts`` via the perception model, returning the text.
 
@@ -120,6 +123,7 @@ def describe(
         registry=registry,
         config_store=config_store,
         capabilities=capabilities,
+        backend_auth_resolver=backend_auth_resolver,
     )
     try:
         result = model_turn(
@@ -140,7 +144,12 @@ def describe(
 # subsequent turn.
 _CACHE_MAX = 256
 _cache_lock = threading.Lock()
-_cache: dict[str, str] = {}
+_cache: dict[tuple[str, str, str], str] = {}
+
+
+def _cache_key(*, principal_id: str, alias: str, content_hash: str) -> tuple[str, str, str]:
+    """Partition perceived content by the identity that authorized the call."""
+    return (principal_id, alias, content_hash)
 
 
 def _clear_perception_cache_for_test() -> None:
@@ -153,6 +162,7 @@ def describe_cached(
     provider: LLMProvider,
     client: Any,
     model: str,
+    principal_id: str,
     alias: str,
     content_hash: str,
     parts: list[dict[str, Any]],
@@ -160,14 +170,17 @@ def describe_cached(
     registry: Any | None = None,
     config_store: Any | None = None,
     capabilities: Any | None = None,
+    backend_auth_resolver: Callable[[str], str | None] | None = None,
 ) -> str:
     """Memoized, non-raising :func:`describe` for the wire fallback.
 
-    Keyed by ``(alias, content_hash)``.  Returns ``""`` on a backend failure (a
-    placeholder is rendered upstream) and does *not* cache failures, so a
-    transient outage doesn't poison the memo.
+    Keyed by ``(principal_id, alias, content_hash)``. The principal partition is
+    load-bearing for delegated backend authentication: a description produced
+    under one user's OBO grant must never be served to another user without a
+    call authorized as that user. Returns ``""`` on a backend failure (a
+    placeholder is rendered upstream) and does *not* cache failures.
     """
-    key = f"{alias}:{content_hash}"
+    key = _cache_key(principal_id=principal_id, alias=alias, content_hash=content_hash)
     with _cache_lock:
         if key in _cache:
             return _cache[key]
@@ -182,6 +195,7 @@ def describe_cached(
             registry=registry,
             config_store=config_store,
             capabilities=capabilities,
+            backend_auth_resolver=backend_auth_resolver,
         )
     except PerceptionBackendError as exc:
         log.warning("perception fallback failed (alias=%s): %s", alias, exc)
@@ -193,13 +207,14 @@ def describe_cached(
     return text
 
 
-def describe_peek(*, alias: str, content_hash: str) -> str | None:
-    """Return the memoized description for ``(alias, content_hash)`` without
-    computing, or ``None`` if absent.
+def describe_peek(*, principal_id: str, alias: str, content_hash: str) -> str | None:
+    """Return the principal-scoped memoized description without computing.
 
     Lets the wire resolver skip the expensive parts build (a PDF rasterize) when
     the description is already memoized from an earlier send — :func:`describe_cached`
     ignores ``parts`` on a hit, so building them first would be pure waste.
     """
     with _cache_lock:
-        return _cache.get(f"{alias}:{content_hash}")
+        return _cache.get(
+            _cache_key(principal_id=principal_id, alias=alias, content_hash=content_hash)
+        )

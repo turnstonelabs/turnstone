@@ -54,6 +54,51 @@ When a per-model override is `NULL` (empty in the UI), the global default is
 used. Switching models via `/model <alias>` re-resolves sampling parameters
 from the new model's overrides or global defaults.
 
+### Model backend authentication
+
+Model definitions support three backend credential modes:
+
+| `auth_mode` | Identity sent to the model gateway |
+|-------------|------------------------------------|
+| `static` | The definition's stored `api_key`. |
+| `entra_obo` | A caller-delegated Entra access token minted from that user's captured OIDC credential. |
+| `entra_app` | A shared app-identity token minted with Turnstone's OIDC client credentials. |
+
+Dynamic modes require an exact `obo_audience` resource App ID URI. Before an
+admin can save one, an operator must add that literal audience to
+`model.auth_audience_allowlist` (comma- or newline-separated). Wildcards and
+base-URL host matching are intentionally unsupported. Changing dynamic auth,
+its audience, or the gateway `base_url` also requires `admin.mcp`; service
+tokens do not bypass this capability-escalation gate.
+
+`entra_app` is supported only with `[oidc] obo_grant_profile = "entra"`.
+Judge, output-guard, perception, utility, and sub-agent lanes inherit the
+session's effective user for `entra_obo`. The perception memo is partitioned by
+that principal as well as alias and content hash, so a result authorized as one
+user cannot be served to another. Scheduled and wake-driven work retains the
+workstream owner even when no user is connected. Eval and optimizer lanes are
+registry-less development tools and therefore do not use dynamic model
+authentication.
+
+`entra_app` is an explicit model-definition choice; Turnstone never changes a
+failed or ownerless `entra_obo` call into a client-credentials grant. An
+`entra_obo` call with no effective user always refuses. A dynamic alias without
+a real static key also always refuses instead of issuing its SDK-construction
+placeholder. When a real static key is explicitly configured, mint failures
+may use it by default; set `model.auth_fail_closed = true` to prohibit even that
+fallback. A refusal is not routed through the model fallback chain.
+
+Dynamic token caches are encrypted in `mcp_user_tokens`, shared across nodes,
+and memoized on each host. Unlinking a user's OIDC identity purges their
+`entra_obo` rows and memo entries. `entra_app` rows belong to the shared
+`__app__` identity and are not user-deprovisioned; after client-credential
+revocation, an already-minted app bearer remains usable until its recorded
+expiry.
+
+`obo_audience` is literal and capped at 2048 characters. Environment-variable
+expansion is deliberately not applied, so the allow-list decision cannot vary
+by node or expand beyond the persisted boundary.
+
 ### Responses output controls (per-model)
 
 Models whose capability table declares Responses output controls expose two
@@ -124,7 +169,7 @@ initialization:
 
 | Section | Settings |
 |---------|----------|
-| `model` | default_alias, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
+| `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |

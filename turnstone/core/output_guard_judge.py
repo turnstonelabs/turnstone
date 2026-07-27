@@ -58,6 +58,7 @@ from turnstone.core.trajectory import Turn
 
 if TYPE_CHECKING:
     import threading
+    from collections.abc import Callable
 
     from turnstone.core.judge import JudgeConfig
     from turnstone.core.providers._protocol import LLMProvider, ModelCapabilities
@@ -271,6 +272,7 @@ class OutputGuardJudge:
         session_capabilities: ModelCapabilities | None = None,
         session_model_alias: str = "",
         config_store: Any | None = None,
+        backend_auth_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._config = config
         # Carried into the per-evaluation ModelLane so extra_params, the
@@ -278,6 +280,7 @@ class OutputGuardJudge:
         # registry like every other lane.
         self._model_registry = model_registry
         self._config_store = config_store
+        self._backend_auth_resolver = backend_auth_resolver
         # Caller's resolved session-model caps (config/registry-aware): the wire
         # capabilities + window when this judge inherits the session model, and
         # the alias path's window fallback.  The window comes ONLY from these
@@ -538,6 +541,7 @@ class OutputGuardJudge:
             registry=self._model_registry,
             capabilities=self._capabilities,
             config_store=self._config_store,
+            backend_auth_resolver=self._backend_auth_resolver,
         )
         # Sampling deliberately not pinned (house rule) — the lane inherits
         # the guard model's full assignment scheme, effort included: a

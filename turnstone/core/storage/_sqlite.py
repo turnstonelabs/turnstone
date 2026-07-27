@@ -4976,8 +4976,9 @@ class SQLiteBackend:
         token row — the freshness sweep's drive set + keepalive-refresh signal.
 
         Unfiltered by expiry: an expired access token with a live refresh token
-        is still a consented grant the sweep must keep hot. Only ``oauth_user``
-        servers write these rows; no ciphertext is projected.
+        is still a consented grant the sweep must keep hot. Joined to
+        ``mcp_servers`` so only ``oauth_user`` grants drive the sweep; synthetic
+        model mint-cache rows are excluded. No ciphertext is projected.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -4986,6 +4987,13 @@ class SQLiteBackend:
                     mcp_user_tokens.c.server_name,
                     sa.func.coalesce(mcp_user_tokens.c.last_refreshed, mcp_user_tokens.c.created),
                 )
+                .select_from(
+                    mcp_user_tokens.join(
+                        mcp_servers,
+                        mcp_servers.c.name == mcp_user_tokens.c.server_name,
+                    )
+                )
+                .where(mcp_servers.c.auth_type == "oauth_user")
             ).fetchall()
         return [(row[0], row[1], row[2]) for row in rows]
 

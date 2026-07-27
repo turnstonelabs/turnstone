@@ -1001,6 +1001,37 @@ class TestRegistryReload:
         assert "a" in reg._providers
         assert reg._providers["a"] is provider_before
 
+    def test_reload_drops_client_when_auth_mode_changes(self) -> None:
+        """Client construction chooses a placeholder from auth_mode, so a mode
+        change must rebuild even when URL and stored api_key are unchanged."""
+        models = {
+            "a": ModelConfig(
+                "a",
+                "http://x/v1",
+                "",
+                "m",
+                provider="openai",
+                auth_mode="static",
+            )
+        }
+        reg = ModelRegistry(models=models, default="a")
+        reg._clients["a"] = MagicMock()
+
+        new_models = {
+            "a": ModelConfig(
+                "a",
+                "http://x/v1",
+                "",
+                "m",
+                provider="openai",
+                auth_mode="entra_app",
+                obo_audience="api://gateway",
+            )
+        }
+        reg.reload(new_models, "a")
+
+        assert "a" not in reg._clients
+
     def test_reload_drops_provider_when_provider_string_changes(self) -> None:
         """A provider-type swap (e.g. openai → anthropic) drops both the
         client AND the provider so the next resolve picks up the right

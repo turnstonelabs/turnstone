@@ -1,13 +1,10 @@
-"""Add per-model OBO auth columns to model_definitions.
+"""Add dynamic backend-auth columns to model_definitions.
 
-Lets a model backend authenticate to its gateway with a per-user Entra
-On-Behalf-Of access token instead of a single static ``api_key``.  When
-``auth_mode='entra_obo'`` the worker mints a token for ``obo_audience`` from
-the calling user's captured refresh credential (the same credential the
-``oauth_obo`` MCP servers redeem — see migration 067) and sends it as the
-backend's credential, falling back to the static ``api_key`` when there is no
-user context.  ``auth_mode='static'`` (the default) is the pre-existing
-behaviour, so existing rows are untouched.
+Lets a model backend authenticate with a caller-delegated Entra token
+(``entra_obo``), a shared app-identity token (``entra_app``), or the existing
+static ``api_key``. Dynamic modes mint for ``obo_audience`` at call time and
+bind that credential through the provider SDK. ``static`` remains the default,
+so existing rows are untouched.
 
 Revision ID: 068
 Revises: 067

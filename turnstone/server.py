@@ -816,6 +816,30 @@ def _watch_fire_wake_fn(ws: Workstream) -> Callable[[], object]:
     return lambda: wake_workstream_if_pending(ws, trigger="watch-fire")
 
 
+def _watch_restore_owner(storage: Any, ws_id: str) -> str:
+    """Resolve the principal an unattended watch restore must execute as.
+
+    ``None`` means the target workstream no longer exists and ``""`` means a
+    legacy/unowned row. Neither may be turned into an anonymous, auto-approved
+    model call. Storage errors deliberately propagate so the restore caller can
+    retry them as transient failures.
+    """
+    from turnstone.core.watch import WatchWorkstreamUnrestorable
+
+    owner = storage.get_workstream_owner(ws_id)
+    if owner is None:
+        log.warning("watch_restore: ws %s no longer exists", ws_id)
+        raise WatchWorkstreamUnrestorable(ws_id)
+    resolved = str(owner).strip()
+    if not resolved:
+        log.error(
+            "watch_restore: refusing unattended restore for unowned ws %s",
+            ws_id,
+        )
+        raise WatchWorkstreamUnrestorable(ws_id)
+    return resolved
+
+
 def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
     """Post-load hook for the lifted interactive ``open`` body.
 
@@ -4166,6 +4190,28 @@ def internal_model_reload(request: Request) -> JSONResponse:
     finally:
         new_registry.shutdown()
 
+    # A model may switch from static to dynamic auth while the node has no MCP
+    # servers. Ensure the dedicated mint loop exists after the registry reload;
+    # model auth must not depend on an unrelated MCP catalog being configured.
+    if registry.has_dynamic_auth() and getattr(request.app.state, "mcp_client", None) is None:
+        from turnstone.core.mcp_client import MCPClientManager
+
+        mcp_mgr = MCPClientManager({})
+        mcp_mgr.start()
+        mcp_mgr.set_storage(storage)
+        mcp_mgr.set_app_state(request.app.state)
+        request.app.state.mcp_client = mcp_mgr
+        mcp_ref = getattr(request.app.state, "mcp_ref", None)
+        if mcp_ref is not None:
+            mcp_ref[0] = mcp_mgr
+        workstreams = getattr(request.app.state, "workstreams", None)
+        if workstreams is not None:
+            with contextlib.suppress(Exception):
+                for ws in workstreams.list_all():
+                    session = getattr(ws, "session", None)
+                    if session is not None:
+                        session.set_model_mint_client(mcp_mgr)
+
     # Ensure health trackers exist for any newly-added backends
     health_reg = getattr(request.app.state, "health_registry", None)
     if health_reg:
@@ -4205,8 +4251,48 @@ def internal_model_status(request: Request) -> JSONResponse:
             "temperature": cfg.temperature,
             "max_tokens": cfg.max_tokens,
             "reasoning_effort": cfg.reasoning_effort,
+            "auth_mode": cfg.auth_mode,
+            "obo_audience": cfg.obo_audience,
         }
     return JSONResponse({"models": models})
+
+
+async def internal_model_auth_cache_invalidate(request: Request) -> JSONResponse:
+    """Evict one user's delegated model-token memo from this node.
+
+    Identity unlink deletes the authoritative cache rows in shared storage, then
+    the console fans this service-only request to every node.  Without the
+    in-process eviction, a warm node could keep using the deleted bearer until
+    its access-token expiry.
+    """
+    auth_result = getattr(getattr(request, "state", None), "auth_result", None)
+    if auth_result is None or not auth_result.has_scope("service"):
+        return JSONResponse({"error": "Service scope required"}, status_code=403)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    user_id = body.get("user_id") if isinstance(body, dict) else None
+    if (
+        not isinstance(user_id, str)
+        or not user_id
+        or len(user_id) > 512
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in user_id)
+    ):
+        return JSONResponse({"error": "Invalid user_id"}, status_code=400)
+
+    mcp_mgr = getattr(request.app.state, "mcp_client", None)
+    if mcp_mgr is None:
+        return JSONResponse({"status": "noop", "evicted": 0})
+
+    from turnstone.core.mcp_oauth import MODEL_OBO_CACHE_PREFIX
+
+    evicted = mcp_mgr.invalidate_model_mint_memo_sync(
+        user_id=user_id,
+        server_prefix=MODEL_OBO_CACHE_PREFIX,
+    )
+    return JSONResponse({"status": "ok", "evicted": evicted})
 
 
 def _collect_node_models_metadata(app_state: Any) -> tuple[str, str, str] | None:
@@ -5131,6 +5217,11 @@ def create_app(
                         methods=["POST"],
                     ),
                     Route("/api/_internal/model-status", internal_model_status),
+                    Route(
+                        "/api/_internal/model-auth-cache-invalidate",
+                        internal_model_auth_cache_invalidate,
+                        methods=["POST"],
+                    ),
                 ],
             ),
             Route("/health", health),
@@ -5431,6 +5522,7 @@ def main() -> None:
     mcp_client = create_mcp_client(
         mcp_config_cli or config_store.get("mcp.config_path") or None,
         storage=_get_storage(),
+        required=registry.has_dynamic_auth(),
     )
     # Mutable ref so session_factory always sees the latest MCP client,
     # including ones created by internal_mcp_reload after startup.
@@ -5731,7 +5823,21 @@ def main() -> None:
             raise WatchWorkstreamUnrestorable(ws_id) from exc
 
         try:
-            ws = manager.create(user_id="", name="watch-restore", **persona_kwargs)
+            owner_id = _watch_restore_owner(_get_storage(), ws_id)
+        except WatchWorkstreamUnrestorable:
+            raise
+        except Exception:
+            # An owner read is authoritative for the execution principal. A
+            # storage blip is retryable; anonymous execution is not.
+            log.warning(
+                "watch_restore: owner lookup failed for ws %s (treating as transient)",
+                ws_id,
+                exc_info=True,
+            )
+            return None
+
+        try:
+            ws = manager.create(user_id=owner_id, name="watch-restore", **persona_kwargs)
         except RuntimeError:
             # TRANSIENT: all restore slots active right now.  Return None so
             # the runner holds the reminder and retries on a later tick.
@@ -5828,7 +5934,19 @@ def main() -> None:
         if not target_id:
             log.error("Workstream not found: %s", args.resume)
             sys.exit(1)
-        ws = manager.create(user_id="", name="resumed", **_resume_persona_kwargs(target_id))
+        try:
+            resume_owner = _watch_restore_owner(_get_storage(), target_id)
+        except WatchWorkstreamUnrestorable:
+            log.error("Cannot resume unowned workstream: %s", target_id)
+            sys.exit(1)
+        except Exception:
+            log.exception("Cannot resolve owner for workstream: %s", target_id)
+            sys.exit(1)
+        ws = manager.create(
+            user_id=resume_owner,
+            name="resumed",
+            **_resume_persona_kwargs(target_id),
+        )
         if not isinstance(ws.ui, WebUI):
             raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
         if args.skip_permissions or config_store.get("tools.skip_permissions"):

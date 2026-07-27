@@ -87,12 +87,13 @@ def test_describe_empty_parts_skips_backend() -> None:
     assert prov.calls == 0
 
 
-def test_describe_cached_memoizes_by_alias_and_hash() -> None:
+def test_describe_cached_memoizes_by_principal_alias_and_hash() -> None:
     prov = _StubProvider(content="desc")
     kw: dict[str, Any] = {
         "provider": prov,
         "client": object(),
         "model": "m",
+        "principal_id": "user-a",
         "alias": "omni",
         "content_hash": "h1",
         "parts": _parts(),
@@ -102,6 +103,8 @@ def test_describe_cached_memoizes_by_alias_and_hash() -> None:
     assert prov.calls == 1  # second served from cache
     perception.describe_cached(**{**kw, "content_hash": "h2"})
     assert prov.calls == 2  # distinct hash → fresh perceive
+    perception.describe_cached(**{**kw, "principal_id": "user-b"})
+    assert prov.calls == 3  # same content under another user's grant → fresh perceive
 
 
 def test_describe_cached_does_not_cache_failures() -> None:
@@ -110,6 +113,7 @@ def test_describe_cached_does_not_cache_failures() -> None:
         "provider": prov,
         "client": object(),
         "model": "m",
+        "principal_id": "user-a",
         "alias": "omni",
         "content_hash": "h",
         "parts": _parts(),
@@ -120,7 +124,14 @@ def test_describe_cached_does_not_cache_failures() -> None:
 
 
 def test_describe_peek_returns_none_when_absent() -> None:
-    assert perception.describe_peek(alias="omni", content_hash="missing") is None
+    assert (
+        perception.describe_peek(
+            principal_id="user-a",
+            alias="omni",
+            content_hash="missing",
+        )
+        is None
+    )
 
 
 def test_describe_peek_returns_cached_without_recompute() -> None:
@@ -129,6 +140,7 @@ def test_describe_peek_returns_cached_without_recompute() -> None:
         "provider": prov,
         "client": object(),
         "model": "m",
+        "principal_id": "user-a",
         "alias": "omni",
         "content_hash": "h",
         "parts": _parts(),
@@ -137,5 +149,20 @@ def test_describe_peek_returns_cached_without_recompute() -> None:
     assert prov.calls == 1
     # Peek serves the memoized text and never re-invokes the backend — this is
     # what lets the wire resolver skip the PDF rasterize on a cross-send hit.
-    assert perception.describe_peek(alias="omni", content_hash="h") == "desc"
+    assert (
+        perception.describe_peek(
+            principal_id="user-a",
+            alias="omni",
+            content_hash="h",
+        )
+        == "desc"
+    )
+    assert (
+        perception.describe_peek(
+            principal_id="user-b",
+            alias="omni",
+            content_hash="h",
+        )
+        is None
+    )
     assert prov.calls == 1

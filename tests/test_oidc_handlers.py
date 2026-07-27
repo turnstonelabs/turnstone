@@ -10,7 +10,7 @@ from __future__ import annotations
 import urllib.parse
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from starlette.applications import Starlette
@@ -1144,6 +1144,16 @@ class TestAdminOIDCIdentities:
         )
         app.state.auth_storage = storage
         app.state.mcp_token_store = store
+        app.state.mcp_client = MagicMock()
+        app.state.collector = MagicMock()
+        app.state.collector.get_all_nodes.return_value = [
+            {"node_id": "node-1", "server_url": "https://node-1.example"}
+        ]
+        app.state.proxy_client = MagicMock()
+        app.state.proxy_client.post = AsyncMock(return_value=SimpleNamespace(status_code=200))
+        app.state.proxy_token_mgr = SimpleNamespace(
+            bearer_header={"Authorization": "Bearer service-token"}
+        )
         client = TestClient(app, raise_server_exceptions=False)
 
         storage.create_oidc_identity(issuer, "sub-1", "user-x", "x@example.com")
@@ -1166,15 +1176,50 @@ class TestAdminOIDCIdentities:
             as_issuer=issuer,
             audience="api://mcp-a",
         )
+        store.create_user_token(
+            "user-x",
+            "__model_obo__:api://model-a",
+            access_token="model-at",
+            refresh_token=None,
+            expires_at="2026-12-31T00:00:00",
+            scopes=None,
+            as_issuer=issuer,
+            audience="api://model-a",
+        )
+        # Shared app-identity rows are deliberately not tied to this user.
+        store.create_user_token(
+            "__app__",
+            "__model_app__:api://model-a",
+            access_token="app-at",
+            refresh_token=None,
+            expires_at="2026-12-31T00:00:00",
+            scopes=None,
+            as_issuer=issuer,
+            audience="api://model-a",
+        )
 
         resp = client.delete(f"/v1/api/admin/oidc-identities?issuer={issuer}&subject=sub-1")
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["obo_credential_revoked"] is True
-        assert body["obo_cache_rows_purged"] == 1
+        assert body["obo_cache_rows_purged"] == 2
         # Credential gone → no future mints; cache row gone → no live cached bearer.
         assert store.get_oidc_credential("user-x", issuer) is None
         assert storage.get_mcp_user_token("user-x", "obo-srv") is None
+        assert storage.get_mcp_user_token("user-x", "__model_obo__:api://model-a") is None
+        assert storage.get_mcp_user_token("__app__", "__model_app__:api://model-a") is not None
+        app.state.mcp_client.invalidate_model_mint_memo_sync.assert_called_once_with(
+            user_id="user-x",
+            server_prefix="__model_obo__:",
+        )
+        app.state.proxy_client.post.assert_awaited_once_with(
+            "https://node-1.example/v1/api/_internal/model-auth-cache-invalidate",
+            headers={"Authorization": "Bearer service-token"},
+            json={"user_id": "user-x"},
+            timeout=5,
+        )
+        assert body["model_memo_nodes_invalidated"] == 1
+        assert body["model_memo_nodes_failed"] == 0
 
     def test_delete_nonexistent_returns_404(self, admin_client: TestClient) -> None:
         resp = admin_client.delete(

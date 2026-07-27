@@ -76,6 +76,48 @@ def _lane(provider: _FakeProvider, **kw: Any) -> ModelLane:
     return ModelLane(provider=provider, client=object(), model="m", **kw)
 
 
+def test_backend_auth_token_binds_sdk_credential_once() -> None:
+    """Dynamic credentials use SDK with_options, not an override header."""
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    base_client = MagicMock()
+    bound_client = object()
+    base_client.with_options.return_value = bound_client
+    lane = ModelLane(provider=provider, client=base_client, model="m", alias="gateway")
+
+    result = model_turn(
+        lane,
+        [Turn.user("hello")],
+        backend_auth_token="minted-token",
+    )
+
+    assert result.content == "ok"
+    base_client.with_options.assert_called_once_with(api_key="minted-token")
+    assert provider.calls[0]["client"] is bound_client
+    assert "extra_headers" not in provider.calls[0]
+
+
+def test_entra_app_lane_resolver_never_issues_placeholder_client() -> None:
+    """A resolver-carrying lane binds its app token before the provider call."""
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    placeholder_client = MagicMock(name="backend-auth-placeholder-unused")
+    bound_client = object()
+    placeholder_client.with_options.return_value = bound_client
+    resolver = MagicMock(return_value="app-token")
+    lane = ModelLane(
+        provider=provider,
+        client=placeholder_client,
+        model="m",
+        alias="app-gateway",
+        backend_auth_resolver=resolver,
+    )
+
+    model_turn(lane, [Turn.user("hello")])
+
+    resolver.assert_called_once_with("app-gateway")
+    placeholder_client.with_options.assert_called_once_with(api_key="app-token")
+    assert provider.calls[0]["client"] is bound_client
+
+
 class _FlakyProvider:
     """Scripted drain-time deaths: each script entry is either a
     ``CompletionResult`` (streamed normally) or an exception instance

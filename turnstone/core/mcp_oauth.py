@@ -2275,6 +2275,8 @@ async def _read_obo_credential(
     user_id: str,
     server_name: str,
     issuer: str,
+    *,
+    prune_on_missing: bool = True,
 ) -> TokenLookupResult | OIDCCredentialPlain:
     """Read the captured IdP credential, classifying absence and undecryptability.
 
@@ -2284,10 +2286,24 @@ async def _read_obo_credential(
     ``get_oidc_credential`` raises ``MCPTokenDecryptError``; catching it here
     keeps the mint path's classified-result contract intact (a raw exception
     would escape ``_dispatch_pool`` into the session's generic error path).
+    Model-backend mints pass ``prune_on_missing=False`` because they arm a
+    cooldown on this outcome and are still holding their synthetic cache lock;
+    the classified MCP path retains the default cleanup semantics.
     """
     try:
         credential = await asyncio.to_thread(token_store.get_oidc_credential, user_id, issuer)
     except MCPTokenDecryptError as exc:
+        if not prune_on_missing:
+            log.warning(
+                "mcp_server.oauth.obo_credential_decrypt_failed",
+                user_id=user_id,
+                server_name=server_name,
+                exc_info=True,
+            )
+            return TokenLookupResult(
+                kind="decrypt_failure",
+                decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
+            )
         return _decrypt_failure_result(
             app_state,
             user_id,
@@ -2297,6 +2313,8 @@ async def _read_obo_credential(
         )
     if credential is None:
         # No captured credential → the consent affordance is a re-login.
+        if not prune_on_missing:
+            return TokenLookupResult(kind="missing")
         return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
     return credential
 
@@ -2682,7 +2700,7 @@ async def get_obo_access_token_classified(
 
 
 # ---------------------------------------------------------------------------
-# Model-provider OBO — per-user token for an LLM gateway
+# Model-provider dynamic authentication
 # ---------------------------------------------------------------------------
 # Deliberately lighter than get_obo_access_token_classified: a model backend is
 # ONE resource addressed by a single audience, redeemed identically for every
@@ -2691,9 +2709,131 @@ async def get_obo_access_token_classified(
 # legs, credential store, RT-rotation CAS, cluster credential lock, AND the same
 # ``mcp_user_tokens`` mint-cache row the classified path uses (refresh_token=NULL,
 # "cache, not custody") — keyed under a synthetic ``__model_obo__:<audience>``
-# server name.  Caching in the DB rather than per-process means the minted token
-# is shared across worker nodes (a user tapping any worker reuses it instead of
-# re-minting) and is inspectable/decodable for debugging.
+# server name. The DB row shares the token across workers; a loop-local memo
+# avoids a SQL read + decrypt on every warm model turn.
+
+MODEL_OBO_CACHE_PREFIX = "__model_obo__:"
+MODEL_APP_CACHE_PREFIX = "__model_app__:"
+_SYNTHETIC_TOKEN_PREFIXES = (MODEL_OBO_CACHE_PREFIX, MODEL_APP_CACHE_PREFIX)
+
+
+def _model_mint_memo(app_state: Any) -> dict[tuple[str, str], MCPUserTokenPlain]:
+    """Return the mcp-loop-owned model-token memo."""
+    memo = getattr(app_state, "model_auth_token_cache", None)
+    if not isinstance(memo, dict):
+        memo = {}
+        app_state.model_auth_token_cache = memo
+    return memo
+
+
+def invalidate_model_mint_memo(
+    app_state: Any,
+    *,
+    user_id: str,
+    server_prefix: str = MODEL_OBO_CACHE_PREFIX,
+) -> int:
+    """Remove memo entries for one principal and synthetic-key prefix.
+
+    This must run on the manager's MCP loop. OIDC unlink schedules it there
+    alongside deleting the corresponding DB rows, so the in-process fast path
+    cannot extend a revoked bearer beyond the purge.
+    """
+    memo = _model_mint_memo(app_state)
+    keys = [key for key in memo if key[0] == user_id and key[1].startswith(server_prefix)]
+    for key in keys:
+        memo.pop(key, None)
+    return len(keys)
+
+
+async def _serve_fresh_mint_cache(
+    *,
+    app_state: Any,
+    token_store: MCPTokenStore,
+    user_id: str,
+    cache_server: str,
+    audience: str,
+    scopes: str,
+) -> str | None:
+    """Serve a fresh model-mint token from the loop memo or encrypted DB row."""
+    key = (user_id, cache_server)
+    memo = _model_mint_memo(app_state)
+    plain = memo.get(key)
+    if _is_fresh_obo_cache_row(plain, audience, scopes) and plain is not None:
+        return plain["access_token"]
+    memo.pop(key, None)
+    try:
+        plain = await asyncio.to_thread(token_store.get_user_token, user_id, cache_server)
+    except MCPTokenDecryptError:
+        # A mint-cache row encrypted under a retired key is only a cache miss.
+        return None
+    if not _is_fresh_obo_cache_row(plain, audience, scopes) or plain is None:
+        return None
+    memo[key] = plain
+    return plain["access_token"]
+
+
+def _memoize_minted_token(
+    app_state: Any,
+    *,
+    user_id: str,
+    cache_server: str,
+    access_token: str,
+    expires_at: str | None,
+    scopes: str,
+    issuer: str,
+    audience: str,
+) -> None:
+    """Install a freshly minted token in the loop-local memo."""
+    now = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
+    _model_mint_memo(app_state)[(user_id, cache_server)] = {
+        "user_id": user_id,
+        "server_name": cache_server,
+        "access_token": access_token,
+        "refresh_token": None,
+        "expires_at": expires_at,
+        "scopes": scopes or None,
+        "as_issuer": issuer,
+        "audience": audience,
+        "created": now,
+        "last_refreshed": now,
+    }
+
+
+@contextlib.asynccontextmanager
+async def _enter_mint_client(app_state: Any) -> Any:
+    """Yield the MCP-loop-owned mint client, with a temporary test fallback."""
+    injected_client: httpx.AsyncClient | None = getattr(app_state, "obo_http_client", None)
+    if injected_client is not None:
+        yield injected_client
+        return
+    async with httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT) as mint_client:
+        yield mint_client
+
+
+def _prune_model_mint_lock_when_idle(
+    app_state: Any,
+    user_id: str,
+    cache_server: str,
+    lock: asyncio.Lock,
+) -> None:
+    """Prune a synthetic lock after queued waiters have had a chance to acquire it."""
+
+    def _drop_if_idle() -> None:
+        locks = getattr(app_state, "mcp_oauth_refresh_locks", None)
+        waiters = getattr(lock, "_waiters", None)
+        if (
+            isinstance(locks, dict)
+            and locks.get((user_id, cache_server)) is lock
+            and not lock.locked()
+            and not waiters
+        ):
+            locks.pop((user_id, cache_server), None)
+
+    _drop_if_idle()
+    # A released lock with a queued waiter is intentionally retained. Give the
+    # waiter priority, then let the last participant prune on its own return.
+    if getattr(app_state, "mcp_oauth_refresh_locks", {}).get((user_id, cache_server)) is lock:
+        asyncio.get_running_loop().call_soon(_drop_if_idle)
 
 
 def _model_obo_cache_server(audience: str) -> str:
@@ -2704,7 +2844,7 @@ def _model_obo_cache_server(audience: str) -> str:
     key and the ``__model_obo__:<audience>`` single-flight lock.  The ``__model_obo__:``
     prefix keeps these cache rows distinguishable from real oauth_user server rows.
     """
-    return f"__model_obo__:{audience}"
+    return f"{MODEL_OBO_CACHE_PREFIX}{audience}"
 
 
 async def mint_obo_access_token(
@@ -2712,7 +2852,6 @@ async def mint_obo_access_token(
     app_state: Any,
     user_id: str,
     audience: str,
-    scopes: str = "",
     force_refresh: bool = False,
 ) -> str | None:
     """Per-user Entra OBO access token for an arbitrary resource *audience*.
@@ -2745,22 +2884,27 @@ async def mint_obo_access_token(
     profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
     mint = _OBO_MINT_LEGS.get(profile)
     if mint is None:
+        log.warning("model_obo.unsupported_grant_profile", profile=profile)
         return None
     issuer = str(getattr(oidc_config, "issuer", "") or "")
-    # The entra leg pins ``<audience>/.default`` and ignores oauth_scopes; only
-    # rfc8693 applies a scope restriction (mirrors the classified path).
-    effective_scopes = "" if profile == "entra" else scopes
-
     cache_server = _model_obo_cache_server(audience)
-    if not force_refresh:
-        try:
-            plain = await asyncio.to_thread(token_store.get_user_token, user_id, cache_server)
-        except MCPTokenDecryptError:
-            # A mint-cache row we can't decrypt (key rotated away) is a miss, not
-            # a fatal error — re-mint rather than fail the model call.
-            plain = None
-        if _is_fresh_obo_cache_row(plain, audience, effective_scopes) and plain is not None:
-            return plain["access_token"]
+    cached_token = await _serve_fresh_mint_cache(
+        app_state=app_state,
+        token_store=token_store,
+        user_id=user_id,
+        cache_server=cache_server,
+        audience=audience,
+        scopes="",
+    )
+    if cached_token and not force_refresh:
+        _clear_refresh_backoff(app_state, user_id, cache_server)
+        return cached_token
+    # The model cache key is intentionally the cooldown key. The shared
+    # ``__obo__:<issuer>`` credential key is also used by MCP OBO dispatch;
+    # arming it here would let one broken model audience suppress every OBO
+    # tool for this user.
+    if not cached_token and _refresh_in_cooldown(app_state, user_id, cache_server):
+        return None
 
     # Single-flight the mint: a per-(user, audience) asyncio lock for local
     # coalescing, then the SAME per-(user, issuer) credential lock + cluster
@@ -2772,97 +2916,124 @@ async def mint_obo_access_token(
     credential_key = f"__obo__:{issuer}"
     credential_lock = _refresh_lock_for(app_state, user_id, credential_key)
     pg_lock = await _acquire_pg_refresh_lock(storage, user_id, credential_key)
-    async with lock, credential_lock, pg_lock:
-        if not force_refresh:
-            try:
-                plain = await asyncio.to_thread(token_store.get_user_token, user_id, cache_server)
-            except MCPTokenDecryptError:
-                plain = None
-            if _is_fresh_obo_cache_row(plain, audience, effective_scopes) and plain is not None:
-                return plain["access_token"]
+    try:
+        async with lock, credential_lock, pg_lock:
+            cached_token = await _serve_fresh_mint_cache(
+                app_state=app_state,
+                token_store=token_store,
+                user_id=user_id,
+                cache_server=cache_server,
+                audience=audience,
+                scopes="",
+            )
+            if cached_token and not force_refresh:
+                _clear_refresh_backoff(app_state, user_id, cache_server)
+                return cached_token
+            if not cached_token and _refresh_in_cooldown(app_state, user_id, cache_server):
+                return None
 
-        credential = await _read_obo_credential(
-            app_state, token_store, user_id, "__model_obo__", issuer
-        )
-        if isinstance(credential, TokenLookupResult):
-            # missing credential or decrypt failure → caller falls back to static
-            return None
+            credential = await _read_obo_credential(
+                app_state,
+                token_store,
+                user_id,
+                cache_server,
+                issuer,
+                prune_on_missing=False,
+            )
+            if isinstance(credential, TokenLookupResult):
+                _arm_cooldown(app_state, user_id, cache_server)
+                return None
 
-        async def _persist_rotation(new_credential_rt: str) -> None:
-            # Best-effort, same contract as the classified path: the mint already
-            # produced a working token, so a storage hiccup on the rotation
-            # write-back must not discard it or escape as a raw exception.
+            async def _persist_rotation(new_credential_rt: str) -> None:
+                # Best-effort, same contract as the classified path: the mint
+                # already produced a working token, so rotation write-back
+                # failure must not discard it.
+                try:
+                    await asyncio.to_thread(
+                        token_store.update_oidc_credential_after_redeem,
+                        user_id,
+                        issuer,
+                        refresh_token=new_credential_rt,
+                        expected_current=credential["refresh_token"],
+                    )
+                except Exception:
+                    log.error(
+                        "model_obo.rotation_persist_failed",
+                        user_id=user_id,
+                        audience=audience,
+                        exc_info=True,
+                    )
+
             try:
-                await asyncio.to_thread(
-                    token_store.update_oidc_credential_after_redeem,
-                    user_id,
-                    issuer,
-                    refresh_token=new_credential_rt,
-                    expected_current=credential["refresh_token"],
-                )
-            except Exception:
-                log.error(
-                    "model_obo.rotation_persist_failed",
+                async with _enter_mint_client(app_state) as mint_client:
+                    tokens = await mint(
+                        oidc_config=oidc_config,
+                        credential_refresh_token=credential["refresh_token"],
+                        audience=audience,
+                        scopes="",
+                        http_client=mint_client,
+                        persist_rotation=_persist_rotation,
+                    )
+            except MCPOAuthRefreshFailed:
+                _arm_cooldown(app_state, user_id, cache_server)
+                log.warning(
+                    "model_obo.mint_failed",
                     user_id=user_id,
                     audience=audience,
                     exc_info=True,
                 )
+                return None
 
-        injected_client: httpx.AsyncClient | None = getattr(app_state, "obo_http_client", None)
-        try:
-            async with contextlib.AsyncExitStack() as mint_stack:
-                mint_client: httpx.AsyncClient
-                if injected_client is not None:
-                    mint_client = injected_client
-                else:
-                    mint_client = await mint_stack.enter_async_context(
-                        httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT)
-                    )
-                tokens = await mint(
-                    oidc_config=oidc_config,
-                    credential_refresh_token=credential["refresh_token"],
+            access_token = tokens.get("access_token")
+            if not isinstance(access_token, str) or not access_token:
+                _arm_cooldown(app_state, user_id, cache_server)
+                log.warning(
+                    "model_obo.mint_missing_access_token",
+                    user_id=user_id,
                     audience=audience,
-                    scopes=effective_scopes,
-                    http_client=mint_client,
-                    persist_rotation=_persist_rotation,
                 )
-        except MCPOAuthRefreshFailed:
-            log.warning("model_obo.mint_failed", user_id=user_id, audience=audience, exc_info=True)
-            return None
-
-        access_token = tokens.get("access_token")
-        if not isinstance(access_token, str) or not access_token:
-            log.warning("model_obo.mint_missing_access_token", user_id=user_id, audience=audience)
-            return None
-        try:
-            await _persist_obo_cache_row(
-                token_store,
-                user_id,
-                cache_server,
+                return None
+            expires_at = _expires_at_from_response(
+                tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
+            )
+            try:
+                await _persist_obo_cache_row(
+                    token_store,
+                    user_id,
+                    cache_server,
+                    access_token=access_token,
+                    expires_at=expires_at,
+                    scopes="",
+                    issuer=issuer,
+                    audience=audience,
+                )
+            except Exception:
+                log.warning(
+                    "model_obo.cache_persist_failed",
+                    user_id=user_id,
+                    audience=audience,
+                    exc_info=True,
+                )
+            _memoize_minted_token(
+                app_state,
+                user_id=user_id,
+                cache_server=cache_server,
                 access_token=access_token,
-                expires_at=_expires_at_from_response(
-                    tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
-                ),
-                scopes=effective_scopes,
+                expires_at=expires_at,
+                scopes="",
                 issuer=issuer,
                 audience=audience,
             )
-        except Exception:
-            # Best-effort, mirroring the classified path: the mint already produced
-            # a working token, so a cache-write hiccup must not discard it.
-            log.warning(
-                "model_obo.cache_persist_failed",
+            _clear_refresh_backoff(app_state, user_id, cache_server)
+            log.info(
+                "model_obo.minted",
                 user_id=user_id,
                 audience=audience,
-                exc_info=True,
+                cache_server=cache_server,
             )
-        log.info(
-            "model_obo.minted",
-            user_id=user_id,
-            audience=audience,
-            cache_server=cache_server,
-        )
-        return access_token
+            return access_token
+    finally:
+        _prune_model_mint_lock_when_idle(app_state, user_id, cache_server, lock)
 
 
 # ---------------------------------------------------------------------------
@@ -2885,7 +3056,7 @@ def _model_app_cache_server(audience: str) -> str:
     ``__app__`` pseudo-user; the ``__model_app__:`` prefix keeps them distinct
     from per-user OBO rows (``__model_obo__:``) and real oauth_user server rows.
     """
-    return f"__model_app__:{audience}"
+    return f"{MODEL_APP_CACHE_PREFIX}{audience}"
 
 
 async def mint_app_access_token(
@@ -2913,11 +3084,13 @@ async def mint_app_access_token(
     oidc_config = getattr(app_state, "oidc_config", None)
     if oidc_config is None or not getattr(oidc_config, "enabled", False):
         return None
+    profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
+    if profile != "entra":
+        log.warning("model_app.unsupported_grant_profile", profile=profile)
+        return None
     client_id = str(getattr(oidc_config, "client_id", "") or "")
     client_secret = str(getattr(oidc_config, "client_secret", "") or "")
     token_endpoint = str(getattr(oidc_config, "token_endpoint", "") or "")
-    if not (client_id and client_secret and token_endpoint):
-        return None
     token_store: MCPTokenStore | None = getattr(app_state, "mcp_token_store", None)
     storage = _get_storage(app_state)
     if token_store is None or storage is None:
@@ -2925,77 +3098,103 @@ async def mint_app_access_token(
     issuer = str(getattr(oidc_config, "issuer", "") or "")
 
     cache_server = _model_app_cache_server(audience)
-    if not force_refresh:
-        try:
-            plain = await asyncio.to_thread(
-                token_store.get_user_token, _APP_CACHE_USER, cache_server
-            )
-        except MCPTokenDecryptError:
-            plain = None
-        if _is_fresh_obo_cache_row(plain, audience, "") and plain is not None:
-            return plain["access_token"]
+    cached_token = await _serve_fresh_mint_cache(
+        app_state=app_state,
+        token_store=token_store,
+        user_id=_APP_CACHE_USER,
+        cache_server=cache_server,
+        audience=audience,
+        scopes="",
+    )
+    if cached_token and not force_refresh:
+        _clear_refresh_backoff(app_state, _APP_CACHE_USER, cache_server)
+        return cached_token
+    if not cached_token and _refresh_in_cooldown(app_state, _APP_CACHE_USER, cache_server):
+        return None
+    if not (client_id and client_secret and token_endpoint):
+        _arm_cooldown(app_state, _APP_CACHE_USER, cache_server)
+        log.warning(
+            "model_app.credentials_unavailable",
+            has_client_id=bool(client_id),
+            has_client_secret=bool(client_secret),
+            has_token_endpoint=bool(token_endpoint),
+        )
+        return None
 
     # Single-flight the mint. No per-user credential to rotate, so only the
     # per-audience local + cluster lock is taken (no credential lock).
     lock = _refresh_lock_for(app_state, _APP_CACHE_USER, cache_server)
     pg_lock = await _acquire_pg_refresh_lock(storage, _APP_CACHE_USER, cache_server)
-    async with lock, pg_lock:
-        if not force_refresh:
+    try:
+        async with lock, pg_lock:
+            cached_token = await _serve_fresh_mint_cache(
+                app_state=app_state,
+                token_store=token_store,
+                user_id=_APP_CACHE_USER,
+                cache_server=cache_server,
+                audience=audience,
+                scopes="",
+            )
+            if cached_token and not force_refresh:
+                _clear_refresh_backoff(app_state, _APP_CACHE_USER, cache_server)
+                return cached_token
+            if not cached_token and _refresh_in_cooldown(app_state, _APP_CACHE_USER, cache_server):
+                return None
+
             try:
-                plain = await asyncio.to_thread(
-                    token_store.get_user_token, _APP_CACHE_USER, cache_server
-                )
-            except MCPTokenDecryptError:
-                plain = None
-            if _is_fresh_obo_cache_row(plain, audience, "") and plain is not None:
-                return plain["access_token"]
-
-        injected_client: httpx.AsyncClient | None = getattr(app_state, "obo_http_client", None)
-        try:
-            async with contextlib.AsyncExitStack() as mint_stack:
-                mint_client: httpx.AsyncClient
-                if injected_client is not None:
-                    mint_client = injected_client
-                else:
-                    mint_client = await mint_stack.enter_async_context(
-                        httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT)
+                async with _enter_mint_client(app_state) as mint_client:
+                    tokens = await _obo_token_post(
+                        token_endpoint=token_endpoint,
+                        data={
+                            "grant_type": "client_credentials",
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "scope": f"{audience}/.default",
+                        },
+                        http_client=mint_client,
+                        leg="client-credentials",
                     )
-                tokens = await _obo_token_post(
-                    token_endpoint=token_endpoint,
-                    data={
-                        "grant_type": "client_credentials",
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "scope": f"{audience}/.default",
-                    },
-                    http_client=mint_client,
-                    leg="client-credentials",
-                )
-        except MCPOAuthRefreshFailed:
-            log.warning("model_app.mint_failed", audience=audience, exc_info=True)
-            return None
+            except MCPOAuthRefreshFailed:
+                _arm_cooldown(app_state, _APP_CACHE_USER, cache_server)
+                log.warning("model_app.mint_failed", audience=audience, exc_info=True)
+                return None
 
-        access_token = tokens.get("access_token")
-        if not isinstance(access_token, str) or not access_token:
-            log.warning("model_app.mint_missing_access_token", audience=audience)
-            return None
-        try:
-            await _persist_obo_cache_row(
-                token_store,
-                _APP_CACHE_USER,
-                cache_server,
+            access_token = tokens.get("access_token")
+            if not isinstance(access_token, str) or not access_token:
+                _arm_cooldown(app_state, _APP_CACHE_USER, cache_server)
+                log.warning("model_app.mint_missing_access_token", audience=audience)
+                return None
+            expires_at = _expires_at_from_response(
+                tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
+            )
+            try:
+                await _persist_obo_cache_row(
+                    token_store,
+                    _APP_CACHE_USER,
+                    cache_server,
+                    access_token=access_token,
+                    expires_at=expires_at,
+                    scopes="",
+                    issuer=issuer,
+                    audience=audience,
+                )
+            except Exception:
+                log.warning("model_app.cache_persist_failed", audience=audience, exc_info=True)
+            _memoize_minted_token(
+                app_state,
+                user_id=_APP_CACHE_USER,
+                cache_server=cache_server,
                 access_token=access_token,
-                expires_at=_expires_at_from_response(
-                    tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
-                ),
+                expires_at=expires_at,
                 scopes="",
                 issuer=issuer,
                 audience=audience,
             )
-        except Exception:
-            log.warning("model_app.cache_persist_failed", audience=audience, exc_info=True)
-        log.info("model_app.minted", audience=audience, cache_server=cache_server)
-        return access_token
+            _clear_refresh_backoff(app_state, _APP_CACHE_USER, cache_server)
+            log.info("model_app.minted", audience=audience, cache_server=cache_server)
+            return access_token
+    finally:
+        _prune_model_mint_lock_when_idle(app_state, _APP_CACHE_USER, cache_server, lock)
 
 
 def _token_needs_refresh(expires_at: str | None) -> bool:
@@ -4061,7 +4260,16 @@ async def _handle_mcp_oauth_list_connections_inner(request: Request) -> Response
             obo_names = await asyncio.to_thread(obo_server_names, storage)
         except Exception:
             obo_names = set()
-    return JSONResponse({"connections": [r for r in rows if r["server_name"] not in obo_names]})
+    return JSONResponse(
+        {
+            "connections": [
+                r
+                for r in rows
+                if r["server_name"] not in obo_names
+                and not str(r["server_name"]).startswith(_SYNTHETIC_TOKEN_PREFIXES)
+            ]
+        }
+    )
 
 
 async def handle_mcp_oauth_revoke_connection(request: Request) -> Response:
@@ -4194,6 +4402,19 @@ async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Respons
     server_name = request.path_params.get("server_name", "").strip()
     if not server_name:
         return JSONResponse({"error": "Missing server_name"}, status_code=400)
+    # Synthetic model rows are mint caches, not user-revocable MCP
+    # connections. Check before row existence to avoid a 404/409 oracle for
+    # whether this user currently has a token for a guessed audience.
+    if server_name.startswith(_SYNTHETIC_TOKEN_PREFIXES):
+        return JSONResponse(
+            {
+                "error": (
+                    "This is an internal model-authentication cache, not an MCP "
+                    "connection. It cannot be disconnected from this endpoint."
+                )
+            },
+            status_code=409,
+        )
 
     storage = _get_storage(request.app.state)
     if storage is None:
