@@ -14,7 +14,13 @@ database:
     port: 5432
     database: turnstone
     username: turnstone
+    # Secret holding the password for `username`. Leave empty to supply
+    # `password` inline below instead.
     existingSecret: ""
+    # Key within existingSecret holding the password. CloudNativePG
+    # generates "password"; other operators differ.
+    existingSecretPasswordKey: password
+    password: ""
     sslmode: prefer
 
 # -- Bitnami PostgreSQL subchart

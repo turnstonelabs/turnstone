@@ -36,8 +36,9 @@ spec:
             - secretRef:
                 name: {{ include "turnstone.llm.secretName" . }}
                 optional: true
-          {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
           env:
+            {{- include "turnstone.db.env" . | nindent 12 }}
+          {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
             - name: TURNSTONE_JWT_SECRET
               valueFrom:
                 secretKeyRef:

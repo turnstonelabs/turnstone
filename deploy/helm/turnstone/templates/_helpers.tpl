@@ -111,6 +111,62 @@ Determine the PostgreSQL username.
 {{- end }}
 
 {{/*
+Determine the secret holding the PostgreSQL password.
+
+An external database may point at a secret the chart does not own (a
+CloudNativePG-generated secret, an External Secrets target, ...), in
+which case the key name is rarely "POSTGRES_PASSWORD" — hence the
+companion existingSecretPasswordKey.
+
+Otherwise fall back to the chart's application secret, which is
+llm.existingSecret when the operator supplies one. That fallback must
+not be hardcoded to "<fullname>-secrets": templates/secret.yaml is
+skipped entirely when llm.existingSecret is set, so hardcoding it would
+point every workload at a Secret that is never created.
+*/}}
+{{- define "turnstone.db.secretName" -}}
+{{- if and (not .Values.postgresql.enabled) .Values.database.external.existingSecret }}
+{{- .Values.database.external.existingSecret }}
+{{- else }}
+{{- include "turnstone.llm.secretName" . }}
+{{- end }}
+{{- end }}
+
+{{- define "turnstone.db.passwordKey" -}}
+{{- if and (not .Values.postgresql.enabled) .Values.database.external.existingSecret }}
+{{- .Values.database.external.existingSecretPasswordKey | default "password" }}
+{{- else }}
+{{- printf "POSTGRES_PASSWORD" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Database environment shared by the server, console and migrate Job.
+
+Every value except the password is rendered inline rather than pulled
+from the ConfigMap via envFrom. The migrate Job is a pre-install hook,
+and Helm creates ordinary resources only after hooks finish, so any
+envFrom dependency would leave the hook stuck in
+CreateContainerConfigError on a ConfigMap that does not exist yet.
+
+POSTGRES_PASSWORD must still precede TURNSTONE_DB_URL: the kubelet
+expands $(VAR) only against env entries declared earlier in the list, so
+a later definition would leave a literal "$(POSTGRES_PASSWORD)" in the
+URL.
+*/}}
+{{- define "turnstone.db.env" -}}
+- name: TURNSTONE_DB_BACKEND
+  value: {{ .Values.database.backend | quote }}
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "turnstone.db.secretName" . }}
+      key: {{ include "turnstone.db.passwordKey" . }}
+- name: TURNSTONE_DB_URL
+  value: "postgresql+psycopg://{{ include "turnstone.postgresql.username" . }}:$(POSTGRES_PASSWORD)@{{ include "turnstone.postgresql.host" . }}:{{ include "turnstone.postgresql.port" . }}/{{ include "turnstone.postgresql.database" . }}{{ if and (not .Values.postgresql.enabled) .Values.database.external.sslmode }}?sslmode={{ .Values.database.external.sslmode }}{{ end }}"
+{{- end }}
+
+{{/*
 Determine the secret name for LLM API keys.
 */}}
 {{- define "turnstone.llm.secretName" -}}

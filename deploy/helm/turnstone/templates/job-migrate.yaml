@@ -17,7 +17,12 @@ spec:
         {{- include "turnstone.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: migrate
     spec:
-      serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      # Deliberately not turnstone.serviceAccountName: this Job is a
+      # pre-install hook, and Helm creates the chart's ServiceAccount only
+      # after hooks complete, so referencing it deadlocks the install with
+      # "error looking up service account". The migration talks to
+      # PostgreSQL and never to the Kubernetes API, so the namespace
+      # default ServiceAccount is sufficient.
       restartPolicy: OnFailure
       containers:
         - name: migrate
@@ -27,12 +32,9 @@ spec:
             - python
             - -m
             - turnstone.core.storage._migrate
-          envFrom:
-            - configMapRef:
-                name: {{ include "turnstone.fullname" . }}-config
-            - secretRef:
-                name: {{ include "turnstone.llm.secretName" . }}
-                optional: true
+          # No envFrom: see turnstone.db.env. As a pre-install hook this
+          # Job runs before the ConfigMap exists. The chart's Secret is
+          # reachable — it carries matching hook annotations at a lower
+          # weight — but only for the password, by secretKeyRef.
           env:
-            - name: TURNSTONE_DB_URL
-              value: "postgresql+psycopg://$(TURNSTONE_DB_USER):$(POSTGRES_PASSWORD)@$(TURNSTONE_DB_HOST):$(TURNSTONE_DB_PORT)/$(TURNSTONE_DB_NAME)"
+            {{- include "turnstone.db.env" . | nindent 12 }}
