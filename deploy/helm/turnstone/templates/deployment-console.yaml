@@ -7,6 +7,17 @@ metadata:
     app.kubernetes.io/component: console
 spec:
   replicas: {{ .Values.console.replicas }}
+  {{- if eq (int .Values.console.replicas) 1 }}
+  # The console registers itself under the fixed service_id "console" and
+  # deregisters on shutdown. Under RollingUpdate the outgoing pod's
+  # deregister runs *after* the incoming pod registers and deletes its
+  # row -- and the heartbeat only touches last_heartbeat, so the row is
+  # never recreated and the console stays invisible in the registry until
+  # the next clean start. Recreate orders shutdown strictly before
+  # startup. Only valid at one replica; see console.replicas.
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "turnstone.selectorLabels" . | nindent 6 }}
