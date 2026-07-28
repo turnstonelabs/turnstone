@@ -38,6 +38,15 @@ spec:
                 optional: true
           env:
             {{- include "turnstone.db.env" . | nindent 12 }}
+            # Self-registration URL for the service registry. Unlike a
+            # server node the console is one logical endpoint behind its
+            # Service, so the Service DNS name is correct here. Without
+            # it the console registers gethostname() (its pod name),
+            # which no server node can resolve. Stops at ".svc" rather
+            # than assuming a "cluster.local" DNS domain, which is
+            # configurable per cluster.
+            - name: TURNSTONE_CONSOLE_URL
+              value: "http://{{ include "turnstone.fullname" . }}-console.{{ .Release.Namespace }}.svc:{{ .Values.console.service.port }}"
           {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
             - name: TURNSTONE_JWT_SECRET
               valueFrom:

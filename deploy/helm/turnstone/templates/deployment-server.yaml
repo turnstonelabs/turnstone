@@ -40,6 +40,19 @@ spec:
                 optional: true
           env:
             {{- include "turnstone.db.env" . | nindent 12 }}
+            # Each replica is a distinct node in the rendezvous ring, so it
+            # must advertise an address that reaches *itself*. The Service
+            # DNS name would load-balance across every replica, sending
+            # console traffic routed for node A to an arbitrary pod; the
+            # default (gethostname(), i.e. the pod name) is not resolvable
+            # at all. The pod IP is unique, routable in-cluster, and
+            # re-registered on every start, so churn is self-healing.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: TURNSTONE_ADVERTISE_URL
+              value: "http://$(POD_IP):{{ .Values.server.service.port }}"
           {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
             - name: TURNSTONE_JWT_SECRET
               valueFrom:
