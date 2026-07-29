@@ -823,6 +823,21 @@ def _run_and_score_subprocess(params: dict[str, Any]) -> dict[str, Any]:
     run_tokens = 0
 
     try:
+        return _run_and_score_with(client, params, case, run_tokens)
+    finally:
+        # Pool workers are reused across work items, so an unclosed
+        # client accumulates one live transport per item inside the
+        # worker process for the life of the sweep.
+        with contextlib.suppress(Exception):
+            client.close()
+
+
+def _run_and_score_with(
+    client: Any, params: dict[str, Any], case: dict[str, Any], run_tokens: int
+) -> dict[str, Any]:
+    """The body of :func:`_run_and_score_subprocess`, client lifetime
+    owned by the caller."""
+    try:
         run_result = _run_single_test(
             client=client,
             model=params["model"],
