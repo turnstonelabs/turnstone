@@ -7857,7 +7857,8 @@ class ChatSession:
     def _carry_budget_chars(self, carries: int = 1) -> int:
         """Per-carry char budget for content carried VERBATIM across a
         compaction — the continuation hint's quote of the user's last
-        message, and the wind-down spill.
+        message, the wind-down spill, and (coordinators only) the
+        ``## Handles`` block.
 
         A quarter of the window per carry, clamped so ALL concurrent carries
         fit what the window spares after the summary output reserve AND the
@@ -8148,6 +8149,198 @@ class ChatSession:
                         raise _CompactionIrreducibleError from e2
                     budget = max(self._MIN_SUMMARY_BUDGET_CHARS, budget // 2)
 
+    # -- Coordinator handles across a compaction --------------------------------
+    #
+    # A handle is an id PAIRED with what it refers to: a task id with its title
+    # and status, a child workstream id with what that child is called and what
+    # state it is in.  Both halves are load-bearing — an id with no meaning can't
+    # be used, a meaning with no id can't be acted on — and the pairing lived only
+    # in the transcript, which compaction replaces.  A summary optimising for
+    # density drops bare hex ids as noise, and a coordinator that loses the
+    # pairing can neither update its own tasks nor collect a finished child's
+    # results.  It is exactly the coordinator most likely to be idle holding
+    # unfinished work.
+    #
+    # The harness holds both halves, so the harness writes them.  The compactor
+    # prompts are IDENTICAL for both session kinds and say nothing about handles:
+    # asking the summarizer to transcribe ids would spend attention budget to get
+    # a strictly worse answer (a model-copied id is fallible, and a section the
+    # model invents can contradict the one storage would have rendered).  Same
+    # lowering rule the idle-tasks nudge follows — what the controller knows, the
+    # controller states, rather than paying a round-trip to have the plant fetch
+    # it back.
+    #
+    # Complementary to that nudge, not redundant with it.  The nudge is
+    # ids-and-statuses only, deliberately carrying no titles because "the
+    # association an id needs is already in its transcript" — the premise
+    # compaction breaks.  This block is where the association survives; the nudge
+    # remains the authoritative LIVE SET at wake time, read fresh.  Both read the
+    # same storage, so neither is a cache of the other.
+    #
+    # Interactive sessions have neither a task envelope nor children: both reads
+    # are skipped and nothing is appended, so their compaction output is byte for
+    # byte what it was.
+    _HANDLES_HEADING = "\n\n## Handles\n"
+    _HANDLES_PROVENANCE = (
+        "Read from storage at compaction time, not carried over from the summary "
+        "above — these ids are exact.\n"
+    )
+    _HANDLES_TASKS_MORE = "  … and {n} more — call `tasks(action='list')` for the full list.\n"
+    _HANDLES_CHILDREN_MORE = "  … and {n} more — call `list_workstreams` for the full list.\n"
+
+    def _coordinator_handle_rows(self) -> tuple[list[str], list[str]]:
+        """Render this coordinator's handles as ``(task_lines, child_lines)``.
+
+        ``([], [])`` whenever there can be no handles — an interactive session
+        (no task envelope, no children), a coordinator with no coord client
+        (eval / rehydration shells), or both reads coming back empty.
+
+        Both reads are same-process storage reads on the worker thread that is
+        already running the compaction (``tasks_get`` decodes the workstream's
+        config row; ``list_children`` is a single ``list_workstreams`` query), so
+        this costs no round-trip and no lock the tool path doesn't already take.
+
+        NEVER raises.  A failed read costs this block's precision, never the
+        compaction: the summary is correct without it, and trading a whole
+        history swap for a side read would be the worse failure by far.  Same
+        isolation the idle observer's children probe keeps.
+
+        Sanitiser ruling, one oracle for the whole block — ``sanitize_display``:
+
+        * Model-authored text (titles, notes, child names) is sanitised.  The
+          control class is what this render actually needs: these are single-line
+          list rows, and a newline inside a title would forge a sibling row the
+          model then reads as a real task.  That class is identical in both
+          sanitisers, so nothing about the structural guarantee turns on the
+          choice.  The guarantee is exactly that — STRUCTURAL, one row per real
+          handle.  A title can still mention an id-shaped string inline, which is
+          left alone because it fails safe: an id no envelope holds resolves to
+          "not found", never to another row.
+        * Angle brackets are KEPT, which is the whole difference from
+          ``sanitize_name``.  Deleting them silently rewrites ordinary planning
+          text ("cut p99 to <200ms" → "cut p99 to 200ms"), inverting a constraint
+          the coordinator is working to — and it would buy nothing here: these
+          titles are the coordinator's own, and already reach this same model
+          verbatim through its own ``tasks(action='list')`` results on this same
+          assistant channel.  The nudge bodies delete brackets because they are
+          interpolated into a SYSTEM turn; this block is not.
+        * Ids take the sanitiser as an ALTERATION CHECK rather than a filter: a
+          row whose id would be altered is DROPPED, never mangled, because a
+          mangled id renders a handle that cannot resolve — worse than an absent
+          one.  Task ids are server-minted (``tsk_`` + token_hex) but read back
+          out of a JSON blob a hand-edited DB can leave ragged; ws_ids are
+          primary keys and can't be ragged, but they take the same check so the
+          block has one rule rather than two.
+        """
+        if self._kind != WorkstreamKind.COORDINATOR or self._coord_client is None:
+            return [], []
+
+        def _clean(value: Any) -> str:
+            return sanitize_display(str(value or "").strip())
+
+        def _id(value: Any) -> str:
+            """The alteration check: '' for an id that isn't usable as-is."""
+            raw = str(value or "").strip()
+            return raw if raw and sanitize_display(raw) == raw else ""
+
+        task_lines: list[str] = []
+        child_lines: list[str] = []
+        try:
+            envelope = self._coord_client.tasks_get(self._ws_id)
+            for task in envelope.get("tasks", []):
+                if not isinstance(task, dict):
+                    continue
+                task_id = _id(task.get("id"))
+                if not task_id:
+                    continue
+                line = f"- `{task_id}` [{_clean(task.get('status')) or 'unknown'}] "
+                line += _clean(task.get("title"))
+                child_ws_id = _id(task.get("child_ws_id"))
+                if child_ws_id:
+                    line += f" → child `{child_ws_id}`"
+                note = _clean(task.get("note"))
+                if note:
+                    line += f" (note: {note})"
+                task_lines.append(line + "\n")
+        except Exception:
+            log.warning("compaction.handles_read_failed", source="tasks", exc_info=True)
+        try:
+            children = self._coord_client.list_children(self._ws_id).get("children", [])
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                ws_id = _id(child.get("ws_id"))
+                if not ws_id:
+                    continue
+                state = _clean(child.get("state")) or "unknown"
+                child_lines.append(f"- `{ws_id}` [{state}] {_clean(child.get('name'))}\n")
+        except Exception:
+            log.warning("compaction.handles_read_failed", source="children", exc_info=True)
+        return task_lines, child_lines
+
+    @staticmethod
+    def _fit_handle_rows(heading: str, rows: list[str], budget: int, more: str) -> str:
+        """One handles section, fitted to ``budget`` chars — never mid-row.
+
+        Rows are whole handles, so truncation drops them at their boundary and
+        names how many went: cutting head+tail through a list the way
+        :meth:`_truncate_block` does would leave a half-copied id, which is worse
+        than an absent one (it renders a call that can't resolve).  ``more``
+        formats the count with an authoritative-source pointer, so the block is
+        never the last word on what exists.
+
+        The returned text is always ``<= budget`` (``""`` when even the heading
+        plus pointer won't fit): each kept row was admitted only after the
+        pointer covering everything still behind it was accounted for.
+        """
+        if not rows or budget <= 0:
+            return ""
+        kept: list[str] = []
+        used = len(heading)
+        for i, row in enumerate(rows):
+            behind = len(rows) - (i + 1)
+            pointer = more.format(n=behind) if behind else ""
+            if used + len(row) + len(pointer) > budget:
+                break
+            kept.append(row)
+            used += len(row)
+        dropped = len(rows) - len(kept)
+        if not kept:
+            pointer = more.format(n=dropped)
+            return heading + pointer if len(heading) + len(pointer) <= budget else ""
+        return heading + "".join(kept) + (more.format(n=dropped) if dropped else "")
+
+    def _render_handles_block(
+        self, task_lines: list[str], child_lines: list[str], budget: int
+    ) -> str:
+        """Assemble the ``## Handles`` block within ``budget`` chars.
+
+        Tasks are served first — the coordinator's own plan, and the only place
+        the id→title pairing survives at all — but children are reserved up to
+        half the room so a long task list can't starve them off the page; what
+        they don't need goes back to the tasks.  Headings carry the TOTAL count,
+        so a truncated section still tells the model how much it isn't seeing.
+        """
+        prefix = self._HANDLES_HEADING + self._HANDLES_PROVENANCE
+        spare = budget - len(prefix)
+        if spare <= 0:
+            return ""
+        child_heading = f"\nChild workstreams ({len(child_lines)}):\n"
+        child_full = len(child_heading) + sum(len(line) for line in child_lines)
+        reserved = min(child_full, spare // 2) if child_lines else 0
+        tasks = self._fit_handle_rows(
+            f"\nTasks ({len(task_lines)}):\n",
+            task_lines,
+            spare - reserved,
+            self._HANDLES_TASKS_MORE,
+        )
+        children = self._fit_handle_rows(
+            child_heading, child_lines, spare - len(tasks), self._HANDLES_CHILDREN_MORE
+        )
+        if not tasks and not children:
+            return ""
+        return prefix + tasks + children
+
     def _compact_messages(
         self,
         auto: bool = False,
@@ -8377,6 +8570,12 @@ class ChatSession:
         record, and the plan must cross a compaction copied, not paraphrased —
         the summarizer also reads the spill, but its paraphrase must not be
         the only survivor.
+
+        A coordinator additionally gets a ``## Handles`` block appended by the
+        same shell concatenation — its task and child-workstream ids paired with
+        what they refer to, read from storage here rather than transcribed by the
+        summarizer (:meth:`_coordinator_handle_rows`).  Interactive sessions have
+        no handles and get nothing.
         """
         # Presentation label derived from the one semantic flag — deriving
         # locally makes an auto=True/trigger="manual" drift impossible.
@@ -8470,11 +8669,25 @@ class ChatSession:
             spill = to_summarize[-1]
             if spill.role is Role.ASSISTANT:
                 spill_text = (spill.text or "").strip()
-        carries = (1 if spill_text else 0) + (1 if last_user_content else 0)
+
+        # The coordinator's handles are the third carry.  They land in the same
+        # post-compaction prompt as the other two, so they take a share of the
+        # same budget rather than a private one — a block sized outside that
+        # split is the same stacking the spill/hint pair was sized to prevent.
+        # Read BEFORE the count so the count and the render see one answer: a
+        # block that exists but wasn't counted is precisely the under-count the
+        # shared budget exists to make impossible.
+        task_lines, child_lines = self._coordinator_handle_rows()
+        handles = bool(task_lines or child_lines)
+        carries = (1 if spill_text else 0) + (1 if last_user_content else 0) + (1 if handles else 0)
         carry_budget = self._carry_budget_chars(carries) if carries else 0
 
-        # Wind-down first, then how to resume — the summary reads: sections,
+        # Handles first (state the harness knows exactly), then wind-down, then
+        # how to resume — the summary reads: sections, the ids still in play,
         # what the model recorded, then the ask to continue from.
+        if handles:
+            summary += self._render_handles_block(task_lines, child_lines, carry_budget)
+
         carry_truncated = False
         if spill_text:
             carry_truncated = len(spill_text) > carry_budget
