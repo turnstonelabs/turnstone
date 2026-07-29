@@ -321,6 +321,160 @@ class TestPreviewSanitization:
 
 
 # ---------------------------------------------------------------------------
+# mrkdwn field escaping
+# ---------------------------------------------------------------------------
+
+
+class TestMrkdwnFieldEscaping:
+    """User/model-authored fields must reach the Slack wire entity-escaped
+    while the bot's own mrkdwn framing stays live."""
+
+    def test_approval_card_escapes_hostile_fields(self) -> None:
+        from turnstone.channels.slack.routes import SlackRoute
+        from turnstone.sdk.events import ApproveRequestEvent
+
+        bot, _router, client = _make_bot()
+
+        event = ApproveRequestEvent(
+            ws_id="ws-1",
+            cycle_id="cyc-1",
+            items=[
+                {
+                    "call_id": "c-1",
+                    "func_name": "tasks",
+                    "approval_label": "@everyone <cmd>",
+                    "preview": "title=<!channel> ping <@U123> a & b <tag>",
+                    "needs_approval": True,
+                }
+            ],
+        )
+        route = SlackRoute(channel="C01SAPU5414", user_id="U9", thread_ts="1.2")
+        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+
+        client.chat_postMessage.assert_awaited_once()
+        body = client.chat_postMessage.call_args[1]["blocks"][0]["text"]["text"]
+        # Broadcast keywords, raw mention syntax, and entities arrive escaped.
+        assert "&lt;!channel&gt;" in body
+        assert "&lt;@U123&gt;" in body
+        assert "a &amp; b &lt;tag&gt;" in body
+        assert "&lt;cmd&gt;" in body
+        assert "<!channel>" not in body
+        assert "<@U123>" not in body
+        # A literal @everyone is inert outside angle brackets — kept as-is.
+        assert "@everyone" in body
+        # Bot-authored framing stays live mrkdwn.
+        assert body.startswith("*Tool Approval Required*")
+        assert "```" in body
+
+    def test_policy_deny_notice_escapes_names_but_feedback_stays_verbatim(self) -> None:
+        from turnstone.channels._routing import PolicyVerdict
+        from turnstone.channels.slack.routes import SlackRoute
+        from turnstone.sdk.events import ApproveRequestEvent
+
+        bot, router, client = _make_bot()
+        router.evaluate_tool_policies = AsyncMock(
+            return_value=PolicyVerdict(kind="deny", denied_tools=["evil<!channel>tool"])
+        )
+
+        event = ApproveRequestEvent(
+            ws_id="ws-1",
+            cycle_id="cyc-1",
+            items=[{"call_id": "c-1", "func_name": "evil<!channel>tool", "needs_approval": True}],
+        )
+        route = SlackRoute(channel="C01SAPU5414", user_id="U9", thread_ts="1.2")
+        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+
+        # Slack-rendered notice is escaped...
+        text = client.chat_postMessage.call_args[1]["text"]
+        assert "evil&lt;!channel&gt;tool" in text
+        assert "<!channel>" not in text
+        # ...but the feedback routed back to the server stays verbatim —
+        # projection happens per audience at render, never upstream.
+        router.send_approval.assert_awaited_once_with(
+            "ws-1",
+            "cyc-1",
+            approved=False,
+            feedback="Blocked by tool policy: evil<!channel>tool",
+        )
+
+    def test_intent_verdict_escapes_judge_fields(self) -> None:
+        from turnstone.channels.slack.bot import PendingApproval
+        from turnstone.channels.slack.routes import SlackRoute
+        from turnstone.sdk.events import IntentVerdictEvent
+
+        bot, _router, client = _make_bot()
+        bot._pending_approval[("ws-1", "cyc-1")] = PendingApproval(  # type: ignore[attr-defined]
+            channel="C1",
+            message_ts="999.000",
+            owner_user_id="U9",
+            cycle_id="cyc-1",
+            call_ids=frozenset({"c-1"}),
+        )
+
+        event = IntentVerdictEvent(
+            ws_id="ws-1",
+            call_id="c-1",
+            func_name="bash <!everyone>",
+            risk_level="high",
+            confidence=0.9,
+            intent_summary="pings <!channel> & <@U123>",
+        )
+        route = SlackRoute(channel="C1", user_id="U9", thread_ts="1.2")
+        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+
+        client.chat_update.assert_awaited_once()
+        blocks = client.chat_update.call_args[1]["blocks"]
+        verdict_text = blocks[-1]["text"]["text"]
+        assert "bash &lt;!everyone&gt;" in verdict_text
+        assert "pings &lt;!channel&gt; &amp; &lt;@U123&gt;" in verdict_text
+        assert "<!channel>" not in verdict_text
+        assert "<!everyone>" not in verdict_text
+        # Bot framing survives around the escaped fields.
+        assert verdict_text.startswith("*Judge Verdict: ")
+
+    def test_error_event_escapes_hostile_message(self) -> None:
+        from turnstone.channels.slack.routes import SlackRoute
+        from turnstone.sdk.events import ErrorEvent
+
+        bot, _router, client = _make_bot()
+
+        event = ErrorEvent(ws_id="ws-1", message="boom <!channel> & <@U123>")
+        route = SlackRoute(channel="C1", user_id="U9", thread_ts="1.2")
+        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+
+        text = client.chat_postMessage.call_args[1]["text"]
+        assert text.startswith("*Error:* ")
+        assert "boom &lt;!channel&gt; &amp; &lt;@U123&gt;" in text
+        assert "<!channel>" not in text
+
+    def test_send_escapes_notification_content(self) -> None:
+        bot, _router, client = _make_bot()
+
+        _run(
+            bot.send(  # type: ignore[attr-defined]
+                "C01SAPU5414:U12345",
+                "Task '<!channel> deploy & retry <now>' is idle",
+            )
+        )
+
+        text = client.chat_postMessage.call_args[1]["text"]
+        assert "&lt;!channel&gt; deploy &amp; retry &lt;now&gt;" in text
+        assert "<!channel>" not in text
+
+    def test_session_opener_mention_survives_unescaped(self) -> None:
+        """The opener's ``<@user>`` mention is bot-authored mrkdwn at a
+        trusted callsite — per-field escaping must never reach it."""
+        bot, router, client = _make_bot()
+        router.get_or_create_workstream = AsyncMock(return_value=("ws-new", True))
+
+        body = {"channel_id": "C01SAPU5414", "user_id": "U777", "text": ""}
+        _run(bot._on_slash_command(AsyncMock(), body))  # type: ignore[attr-defined]
+
+        texts = [c.kwargs.get("text", "") for c in client.chat_postMessage.call_args_list]
+        assert any("<@U777> started a turnstone session." in t for t in texts)
+
+
+# ---------------------------------------------------------------------------
 # StreamingMessage
 # ---------------------------------------------------------------------------
 

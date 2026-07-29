@@ -281,6 +281,12 @@ class TurnstoneBot:
             command_prefix="!ts ",
             intents=intents,
             help_command=None,
+            # Client-level default applied to every message create (plain
+            # sends, edits, embeds): approval headers, previews, and
+            # notification bodies carry user/model-authored text verbatim,
+            # so mention resolution (@everyone/@here, users, roles) is
+            # suppressed on the wire rather than by mutating the text.
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
         # Attach ourselves so cogs can access the TurnstoneBot instance.
