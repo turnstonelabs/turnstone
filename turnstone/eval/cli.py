@@ -184,8 +184,12 @@ def main() -> None:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="Sampling temperature (default: 0.7)",
+        default=None,
+        help=(
+            "Sampling temperature. Omitted from the wire by default so "
+            "the alias / stored setting / serving default applies — the "
+            "same assignment scheme production runs"
+        ),
     )
     parser.add_argument(
         "--max-tokens",
@@ -195,9 +199,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="medium",
+        default=None,
         choices=["low", "medium", "high"],
-        help="Reasoning effort (default: medium)",
+        help=(
+            "Reasoning effort. Omitted from the wire by default — a "
+            "code-chosen token is unvetted and can flip thinking on for "
+            "lanes the operator never engaged"
+        ),
     )
     parser.add_argument(
         "--context-window",
