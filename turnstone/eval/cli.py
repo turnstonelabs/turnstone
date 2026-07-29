@@ -200,11 +200,11 @@ def main() -> None:
     parser.add_argument(
         "--reasoning-effort",
         default=None,
-        choices=["low", "medium", "high"],
         help=(
-            "Reasoning effort. Omitted from the wire by default — a "
-            "code-chosen token is unvetted and can flip thinking on for "
-            "lanes the operator never engaged"
+            "Reasoning effort, forwarded verbatim — the model's chat "
+            "template is the sole authority on valid tokens (vocabularies "
+            "differ per model; some know only high/max). Omitted from the "
+            "wire by default"
         ),
     )
     parser.add_argument(
