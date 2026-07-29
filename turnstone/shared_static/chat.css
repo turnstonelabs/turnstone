@@ -1118,32 +1118,70 @@
   word-break: break-word;
 }
 
-/* Idle-children card — the coordinator-only ``idle_children`` operator-context
-   system turn lists the child workstreams still running while the coordinator
-   went idle.  Built by ``appendIdleChildren`` (coord). */
-.msg.idle-children {
+/* Idle cards — the coordinator-only ``idle_children`` / ``idle_tasks``
+   operator-context system turns.  ``idle_children`` lists the child
+   workstreams still running while the coordinator went idle; ``idle_tasks``
+   lists the open tasks it still holds, independently of the children state,
+   so the two can co-deliver in one drain (tasks first).  Built by
+   ``appendIdleChildren`` / ``appendIdleTasks`` (coord).
+
+   The two are the same class of notice ("you went idle with N outstanding")
+   and deliberately share one accent and one set of rules — grouped rather
+   than duplicated so a restyle of one can't silently skip the other.  The
+   needs-you signal lives on the per-task status chip in the tasks pane, not
+   on this card; giving the card its own alarm colour would double-count it. */
+.msg.idle-children,
+.msg.idle-tasks {
   border-left-color: var(--yellow);
   padding: 6px 10px;
 }
-.msg.idle-children .msg-idle-header {
+.msg.idle-children .msg-idle-header,
+.msg.idle-tasks .msg-idle-header {
   color: var(--yellow);
   font-weight: 600;
   font-size: 11px;
   text-transform: lowercase;
   margin-bottom: 4px;
 }
-.msg.idle-children .msg-idle-list {
+.msg.idle-children .msg-idle-list,
+.msg.idle-tasks .msg-idle-list {
   margin: 0;
   padding-left: 16px;
 }
-.msg.idle-children .msg-idle-child {
+.msg.idle-children .msg-idle-child,
+.msg.idle-tasks .msg-idle-child {
   font-size: 12px;
   color: var(--ink-3);
 }
-.msg.idle-children .msg-idle-child-state {
+.msg.idle-children .msg-idle-child-state,
+.msg.idle-tasks .msg-idle-child-state {
   color: var(--ink-4);
   margin-left: 6px;
   font-size: 11px;
+}
+/* The id column, on both cards: a name is not an identity (a task's title
+   may be empty, a child's name may be empty or bracket-only), so each row
+   carries an identifying string of its own — the task id, or the child's
+   ws_id prefix.  Grouped for the same reason as the rules above: an
+   unstyled ident column would butt straight up against the name. */
+.msg.idle-children .msg-idle-child-ident,
+.msg.idle-tasks .msg-idle-child-ident {
+  color: var(--ink-4);
+  font-size: 11px;
+  margin-right: 6px;
+}
+/* Tasks-only: the per-task note, and the overflow line past the
+   producer's display cap. */
+.msg.idle-tasks .msg-idle-note {
+  color: var(--ink-4);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg.idle-tasks .msg-idle-more {
+  color: var(--ink-4);
+  font-size: 11px;
+  margin-top: 4px;
 }
 
 /* Important user interjection — a ``!!!``-prefixed queued message that drained

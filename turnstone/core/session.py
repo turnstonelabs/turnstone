@@ -114,15 +114,20 @@ from turnstone.core.memory_relevance import (
     score_memories,
 )
 from turnstone.core.metacognition import (
-    MEMORY_NUDGE_TYPES,
     NUDGE_COMPACTION_RESUME,
     NUDGE_COMPACTION_RESUME_NO_RECALL,
+    NUDGE_REQUIRED_TOOL,
+    TASK_NOTE_MAX,
+    TASK_TITLE_MAX,
     RepeatDetector,
     detect_completion,
     detect_correction,
     format_nudge,
+    sanitize_display,
     sanitize_payload,
     should_nudge,
+    task_too_long_message,
+    task_unrenderable_message,
 )
 from turnstone.core.model_turn import (
     ModelTurnResult,
@@ -861,6 +866,16 @@ _LIST_NODES_RESERVED_ARGS: frozenset[str] = frozenset(
 # unspecified ordering inside ``_execute_tools``'s ThreadPoolExecutor.
 _TASKS_READ_ACTIONS: frozenset[str] = frozenset({"list"})
 _TASKS_WRITE_ACTIONS: frozenset[str] = frozenset({"add", "update", "remove", "reorder"})
+
+# Per-field character budget for the tasks approval preview/header.  The
+# operator rules on the preview, so over-budget fields are cut with
+# ``honest_truncate``'s explicit marker, never a bare slice — a bare
+# ``[:60]`` reads as the whole argument, and with ``TASK_NOTE_MAX`` /
+# ``TASK_TITLE_MAX`` at 200 the half the operator never saw can be the
+# half naming the destructive option.  NOT ``judge.arg_budget_chars()``:
+# that is the judge-context budget (thousands of chars), which would make
+# the preview slice a no-op.
+_TASK_PREVIEW_FIELD_CHARS = 60
 
 # Matches resource paths referenced in skill content (scripts/foo.py, etc.)
 _RESOURCE_PATH_RE = re.compile(
@@ -1726,6 +1741,13 @@ class ChatSession:
         # correction nudges on top of it) and so the synthesized user
         # message gets stamped ``_source`` for audit / replay distinction.
         self._wake_source_tag: str = ""
+        # True between an abandoned generation (cancel / interrupt /
+        # fatal error) and the next real (non-wake) ``send`` — the
+        # liveness wake's own synthetic send leaves it set (see the
+        # clearing site in ``send()``).  Read by producers that must
+        # not treat the IDLE that such a path emits as an invitation
+        # to wake the workstream back up.
+        self._generation_abandoned: bool = False
         # Nudge entries pre-drained by ``deliver_wake_nudge_from_queue``
         # — handed to ``_emit_pending_user_nudges`` so the synthesized
         # send doesn't re-drain (and so we can bail out before send when
@@ -3938,18 +3960,26 @@ class ChatSession:
             self._watch_runner.remove_dispatch_fn(old_ws_id, owner=old_fn)
 
     def _nudges_enabled(self, nudge_type: str) -> bool:
-        """Config gate + persona lever 4 for metacognitive nudges.
+        """Config gate + required-tool visibility for ADVICE nudges.
 
-        Memory-directed nudge types (``MEMORY_NUDGE_TYPES``) are suppressed
-        whenever the persona's envelope hides the memory tool — the lever
-        being off OR an allowlist that hides ``memory`` (a tool_search
-        expansion that re-adds it re-enables them) — because their copy
-        directs the model at that tool.  Every other nudge type passes
-        straight through to the config gate.
+        Tool-directed nudge types (``NUDGE_REQUIRED_TOOL`` — the memory
+        set plus ``idle_tasks``) are suppressed whenever the persona's
+        envelope hides the tool their copy names: the memory lever being
+        off OR an allowlist that hides the tool (a tool_search expansion
+        that re-adds it re-enables them).  A nudge instructing the model
+        at a tool it cannot see produces "I don't have access" apology
+        loops.  Types with no required tool pass straight through to the
+        config gate.
+
+        LIVENESS nudges never reach this method: ``idle_children`` (the
+        coordinator wake for active children) is deliberately not gated
+        on ``memory.nudges`` — see the classification ruling in
+        :mod:`turnstone.console.coordinator_idle_observer`.
         """
         if not self._mem_cfg.nudges:
             return False
-        return nudge_type not in MEMORY_NUDGE_TYPES or self._persona_tool_visible("memory")
+        required = NUDGE_REQUIRED_TOOL.get(nudge_type)
+        return required is None or self._persona_tool_visible(required)
 
     def _init_system_messages(self) -> None:
         """Build the system/developer prefix messages.
@@ -6100,6 +6130,20 @@ class ChatSession:
             self._budget_exhausted = False
             self._budget_warned = False
         self._notify_count = 0
+        # Cleared per REAL send: set by ``_drain_pending_advisories`` on
+        # every abandoned-generation path so the IDLE those paths emit
+        # can be told apart from an IDLE a turn reached under its own
+        # power.  A wake send must NOT clear it — the liveness wake
+        # fires on an abandoned generation by design, and letting its
+        # own synthetic ``send("", from_wake=True)`` erase the latch
+        # would hand the advice path the wake turn's terminal IDLE with
+        # the suppression gone: Stop would buy exactly the task-reminder
+        # resume it exists to prevent, one bracket late.  Same wake/real
+        # discrimination the observer's cap-reset path applies via
+        # ``_wake_source_tag``, expressed through ``from_wake`` because
+        # this chokepoint receives it directly.
+        if not from_wake:
+            self._generation_abandoned = False
         # Per-send cooperative-compaction latch: each send starts a fresh
         # advise→compact cycle, so reset here.  This single chokepoint covers
         # the cancel / error / superseded / resume / clear / new exits that
@@ -6834,7 +6878,20 @@ class ChatSession:
         a wake earned by a NEW event) without ever being the wake reason.
         Stale entries are handled at drain time by their ``valid_until``
         predicates.
+
+        Demoting is necessary but NOT sufficient, because the
+        ``_emit_state("idle")`` that follows fans out synchronously to
+        state subscribers — and a producer reacting to that IDLE can
+        enqueue a NEW wake-eligible entry after this demote has run,
+        re-arming the very wake the demote exists to disarm (the
+        ``IdleNudgeWatcher`` is itself a subscriber on the same fan-out,
+        so it sees the new entry before any later cleanup could reach
+        it).  The latch set here is how such producers tell this IDLE
+        apart from one a turn reached under its own power; it is cleared
+        at the top of the next real (non-wake) ``send`` — the rationale
+        lives at the clearing site.
         """
+        self._generation_abandoned = True
         self._nudge_queue.clear_channels({"tool", "user"})
         self._nudge_queue.demote_channel("any", QUIET_CHANNEL)
 
@@ -8952,6 +9009,22 @@ class ChatSession:
                         fa_tasks["status"] = it.get("status")
                     if "child_ws_id" in it:
                         fa_tasks["child_ws_id"] = it.get("child_ws_id")
+                    if "note" in it:
+                        # Free text the model authored — the judge must see
+                        # it or it rules on a mutation whose payload is
+                        # hidden from it.  Follows ``child_ws_id``, NOT
+                        # ``title``: a ``None`` passes through as-is so it
+                        # honestly reads as "unchanged", because unlike a
+                        # title an empty note is a legal value (it clears
+                        # the field).  Collapsing ``None`` to ``""`` here
+                        # would show the judge a clear that was never
+                        # requested.  Truncate only an actual string.
+                        note_val = it.get("note")
+                        fa_tasks["note"] = (
+                            honest_truncate(note_val, arg_budget)
+                            if isinstance(note_val, str)
+                            else note_val
+                        )
                 it["func_args"] = fa_tasks
             elif name == "read_resource":
                 # Gated MCP resource read.  The URI is the risk surface
@@ -11765,7 +11838,7 @@ class ChatSession:
         Drains the queue inline (running every entry's ``valid_until``
         predicate) BEFORE synthesizing the empty user turn — bails if
         no entry survives the predicate check.  Without this, the
-        watcher's ``len(queue)`` peek can succeed on entries whose
+        watcher's ``has_pending`` peek can succeed on entries whose
         predicate later drops them inside ``_emit_pending_user_nudges``'s
         drain, leaving us synthesizing an empty user turn with no nudge
         context (and risking provider rejection of empty user content).
@@ -14124,11 +14197,84 @@ class ChatSession:
             "execute": self._exec_tasks,
             "action": action,
         }
+
+        # Deferred import shared by every mutating branch below — ONE site,
+        # above the branches, so per-branch copies cannot drift.  Deferred
+        # to keep ``judge`` (and its provider-client dependencies) off this
+        # module's import cost until a tasks mutation actually needs a
+        # preview; NOT a cycle guard — no judge<->session import cycle
+        # exists at HEAD.
+        from turnstone.core.judge import honest_truncate
+
+        def _pf(value: str) -> str:
+            """Preview-field render for the approval surface.
+
+            EVERY model-controlled string on the header/preview goes
+            through here — ``task_id``/``status``/``child_ws_id``/reorder
+            ids included, not just free text: a newline in ``task_id``
+            forges an extra header line in the channel formatter and in
+            ``buildConvCmd``'s line-classified command view, and a bidi
+            override reorders the decision the operator reads.
+
+            ``sanitize_display``, not ``sanitize_name``: this is an
+            OPERATOR surface, so angle brackets are kept — the operator
+            must approve the text that will be stored, and a title of
+            "cut p99 latency to <200ms" previewed as "...to 200ms" asked
+            them to approve the opposite constraint.  A non-empty value
+            that sanitises to nothing (all control/zero-width/bidi) still
+            renders an explicit marker.  Keep that marker
+            angle-bracket-free: brackets now arrive here from model text
+            unchanged, so a ``<unrenderable>``-shaped marker would read
+            as one more model-authored title.  It must never collapse to
+            ``""`` either, or it collides with the ``'-'`` explicit-clear
+            convention and vanishes from the surface the operator rules
+            on.
+            """
+            display = honest_truncate(sanitize_display(value), _TASK_PREVIEW_FIELD_CHARS)
+            if value and not display:
+                return f"[unrenderable: {len(value)} chars]"
+            return display
+
+        def _unrenderable(prefix: str, field: str, raw: str) -> dict[str, Any]:
+            """Reject-with-hint for stored text that sanitises to nothing.
+
+            The gate that decides is ``coordinator_client``'s; this early
+            refusal spares the operator an approval card for a call that
+            cannot land, and is the one the model ALWAYS hits first.  The
+            sentence is therefore not restated — it comes from
+            ``task_unrenderable_message``, which the write path reads too
+            — and only the action prefix is added here, so a batched
+            update names the row that failed.  Held as two literals, a
+            one-sided narrowing told the model two different reasons for
+            one refusal depending on which layer it reached.
+            """
+            return self._coord_tool_error(
+                call_id,
+                "tasks",
+                f"{prefix}: {task_unrenderable_message(field, len(raw))}",
+            )
+
+        def _too_long(prefix: str, field: str, length: int, cap: int) -> dict[str, Any]:
+            """Reject-with-hint for an over-cap task field.
+
+            Same shape and the same reason as ``_unrenderable`` above:
+            the write path's gate decides, this one refuses early, and
+            the wording comes from ``task_too_long_message`` rather than
+            a second literal.  Both layers read the caps from
+            ``turnstone.core.metacognition`` too, so they cannot disagree
+            about the number either.
+            """
+            return self._coord_tool_error(
+                call_id,
+                "tasks",
+                f"{prefix}: {task_too_long_message(field, length, cap)}",
+            )
+
         if action == "add":
             # Reject non-string title / status / child_ws_id up front so
             # a malformed model call (``title=42``) produces a clean tool
             # error rather than an AttributeError during ``.strip()``.
-            for field_name in ("title", "status", "child_ws_id"):
+            for field_name in ("title", "status", "child_ws_id", "note"):
                 raw = args.get(field_name)
                 if raw is not None and not isinstance(raw, str):
                     return self._coord_tool_error(
@@ -14139,11 +14285,59 @@ class ChatSession:
                 return self._coord_tool_error(call_id, "tasks", "add: title is required")
             status = self._coord_str_arg(args, "status", "pending").strip() or "pending"
             child_ws_id = self._coord_str_arg(args, "child_ws_id").strip()
-            item["header"] = f"\u2699 tasks add: {title[:60]}"
-            item["preview"] = f"status={status} child_ws_id={child_ws_id or '-'}"
+            note = self._coord_str_arg(args, "note").strip()
+            # Over-cap fields are refused here for the same reason the
+            # unrenderable ones below are: ``tasks_add`` will refuse them,
+            # so an approval card for one costs the operator a decision on
+            # a call that cannot land.  LENGTH BEFORE RENDERABILITY, on
+            # the stripped value — the write path's per-field masking
+            # order, so a 250-char run of zero-widths hears "too long" at
+            # BOTH layers instead of "unrenderable" here and "too long"
+            # there.  NOT gated: ``child_ws_id``.  The write path has no
+            # length cap for it, and gating it here alone would build the
+            # reverse split — prepare refusing what the write path stores
+            # — which is the divergence class this early copy exists to
+            # remove.
+            if len(title) > TASK_TITLE_MAX:
+                return _too_long("add", "title", len(title), TASK_TITLE_MAX)
+            if len(note) > TASK_NOTE_MAX:
+                return _too_long("add", "note", len(note), TASK_NOTE_MAX)
+            # Reject-with-hint for text that sanitises to NOTHING — the
+            # genuinely-invisible class only (control chars, zero-width
+            # runs, bidi overrides, tag chars): stored verbatim it would
+            # render on no operator surface while ``tasks(list)`` feeds
+            # it back to the model every call — the write path
+            # (``tasks_add``) rejects it authoritatively too; this early
+            # copy spares the operator an approval card for a call that
+            # cannot land.  The oracle is ``sanitize_display``, the same
+            # function both copies use, so a title of "<>" is storable
+            # (it renders) and prepare and write can never disagree about
+            # what is renderable.
+            if not sanitize_display(title):
+                return _unrenderable("add", "title", title)
+            if note and not sanitize_display(note):
+                return _unrenderable("add", "note", note)
+            # The approval preview reads the RAW tool args, before any
+            # write, so the storage-side sanitiser never sees these
+            # bytes.  The operator rules on this string — a bidi
+            # override or zero-width run here renders them a decision
+            # different from the one they are approving.  Render every
+            # model-controlled field through ``_pf``; ``item[...]`` stays
+            # raw so ``_exec_tasks`` still hands the write path what the
+            # model actually sent.
+            item["header"] = f"\u2699 tasks add: {_pf(title)}"
+            # The note rides the preview because it is the operator-facing
+            # payload of the mutation — approving a ``needs_user`` task
+            # without seeing what the coordinator is asking for defeats the
+            # point of the approval.
+            add_bits = [f"status={_pf(status)}", f"child_ws_id={_pf(child_ws_id) or '-'}"]
+            if note:
+                add_bits.append(f"note={_pf(note)}")
+            item["preview"] = " ".join(add_bits)
             item["title"] = title
             item["status"] = status
             item["child_ws_id"] = child_ws_id
+            item["note"] = note
         elif action == "update":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
@@ -14158,10 +14352,12 @@ class ChatSession:
             upd_title: Any = args.get("title")
             upd_status: Any = args.get("status")
             upd_child: Any = args.get("child_ws_id")
+            upd_note: Any = args.get("note")
             for field_name, field_val in (
                 ("title", upd_title),
                 ("status", upd_status),
                 ("child_ws_id", upd_child),
+                ("note", upd_note),
             ):
                 if field_val is not None and not isinstance(field_val, str):
                     return self._coord_tool_error(
@@ -14169,30 +14365,107 @@ class ChatSession:
                         "tasks",
                         f"update: {field_name} must be a string",
                     )
-            if upd_title is None and upd_status is None and upd_child is None:
+            # ``note`` counts toward "something to update" — a note-only
+            # update (recording what the coordinator needs from the
+            # operator without touching status) is a legitimate call, and
+            # omitting it here would reject the exact shape the idle-tasks
+            # nudge tells the model to make.
+            if upd_title is None and upd_status is None and upd_child is None and upd_note is None:
                 return self._coord_tool_error(
                     call_id,
                     "tasks",
-                    "update: at least one of title / status / child_ws_id is required",
+                    "update: at least one of title / status / child_ws_id / note is required",
                 )
-            item["header"] = f"\u2699 tasks update: {task_id}"
+            # Strip ONCE, here — every string field, not just the note —
+            # so the preview, the judge projection, and ``tasks_update``
+            # all see the same value.  A whitespace-only note otherwise
+            # previews as a note being SET (truthy before the strip)
+            # while execute strips it to ``""`` and takes the CLEAR
+            # branch — the operator approves "set a note" and the tool
+            # deletes one.  A whitespace-only title/status/child_ws_id
+            # previewed as ``[unrenderable: N chars]`` — the marker for
+            # the genuinely-invisible steering class — when the model
+            # authored ordinary spaces; stripped, the marker's trigger
+            # is that class only, and a whitespace-only ``child_ws_id``
+            # previews as the explicit clear (``-``) it now performs.
+            # The strip must preserve ``None`` ("unchanged"): only a
+            # present string is stripped, and ``""`` (clear/empty) stays
+            # distinct from ``None`` throughout.
+            if isinstance(upd_title, str):
+                upd_title = upd_title.strip()
+            if isinstance(upd_status, str):
+                upd_status = upd_status.strip()
+            if isinstance(upd_child, str):
+                upd_child = upd_child.strip()
+            if isinstance(upd_note, str):
+                upd_note = upd_note.strip()
+            # The length gates, mirroring the add branch — and NOTE
+            # BEFORE TITLE across the two fields, which is the order
+            # ``tasks_update`` actually evaluates in: it checks the note
+            # before the row loop and the title inside it.  Title-first
+            # here would make the two layers name a DIFFERENT field when
+            # an update is over cap on both, and the claim being made is
+            # the same hint per field at both layers.
+            if isinstance(upd_note, str) and len(upd_note) > TASK_NOTE_MAX:
+                return _too_long("update", "note", len(upd_note), TASK_NOTE_MAX)
+            if isinstance(upd_title, str) and len(upd_title) > TASK_TITLE_MAX:
+                return _too_long("update", "title", len(upd_title), TASK_TITLE_MAX)
+            # For a task_id that does not exist the write path answers
+            # "task not found" for an over-cap TITLE (the row loop never
+            # matches) while still answering "note too long" for an
+            # over-cap note.  Both layers reject either way, so this gate
+            # refuses nothing the write path would have stored — the same
+            # nuance the landed renderability reject on this branch has.
+            #
+            # The renderability rejects below keep the OPPOSITE cross-field
+            # order (title first, while the write path checks the note
+            # first).  That divergence shipped already, needs two
+            # simultaneously-unrenderable fields to reach, and stays.
+            # Reject-with-hint, mirroring the add branch: a title/note
+            # that sanitises to nothing must never reach the approval
+            # card; its preview would read as absent (title) or as the
+            # explicit CLEAR marker (note=-) while execute stores the raw
+            # payload, so the operator would approve the opposite of what
+            # runs.  upd_note == "" stays a legal CLEAR, not rejected.
+            if isinstance(upd_title, str) and upd_title and not sanitize_display(upd_title):
+                return _unrenderable("update", "title", upd_title)
+            if upd_note and not sanitize_display(upd_note):
+                return _unrenderable("update", "note", upd_note)
+
+            item["header"] = f"\u2699 tasks update: {_pf(task_id)}"
             bits: list[str] = []
+            # Preview strings are rendered through ``_pf`` and NOT stored
+            # back onto the item — the approval surface reads raw args
+            # before any write, so the storage sanitiser never sees them,
+            # while ``item[...]`` must stay raw for the write path:
+            # ``task_id`` feeds ``tasks_update``/``tasks_remove`` by exact
+            # match and ``task_ids`` feeds the reorder permutation check,
+            # so sanitising the STORED values would silently turn every
+            # mutation into "task not found".
             if upd_title is not None:
-                bits.append(f"title={upd_title[:60]}")
+                bits.append(f"title={_pf(upd_title)}")
             if upd_status is not None:
-                bits.append(f"status={upd_status}")
+                bits.append(f"status={_pf(upd_status)}")
             if upd_child is not None:
-                bits.append(f"child_ws_id={upd_child or '-'}")
+                bits.append(f"child_ws_id={_pf(upd_child) or '-'}")
+            if upd_note is not None:
+                # ``or '-'`` renders an explicit clear (``""``) the same
+                # way ``child_ws_id`` renders one, so the operator sees
+                # "note=-" rather than an empty tail.  The sanitise-to-
+                # empty case cannot reach here (rejected above), so ``-``
+                # is unambiguous again.
+                bits.append(f"note={_pf(upd_note) or '-'}")
             item["preview"] = " ".join(bits)
             item["task_id"] = task_id
             item["title"] = upd_title
             item["status"] = upd_status
             item["child_ws_id"] = upd_child
+            item["note"] = upd_note
         elif action == "remove":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
                 return self._coord_tool_error(call_id, "tasks", "remove: task_id is required")
-            item["header"] = f"\u2699 tasks remove: {task_id}"
+            item["header"] = f"\u2699 tasks remove: {_pf(task_id)}"
             item["preview"] = ""
             item["task_id"] = task_id
         elif action == "reorder":
@@ -14202,7 +14475,9 @@ class ChatSession:
                     call_id, "tasks", "reorder: task_ids must be a list of strings"
                 )
             item["header"] = f"\u2699 tasks reorder: {len(raw_ids)} ids"
-            item["preview"] = ",".join(raw_ids[:6]) + ("..." if len(raw_ids) > 6 else "")
+            item["preview"] = ",".join(_pf(x) for x in raw_ids[:6]) + (
+                "..." if len(raw_ids) > 6 else ""
+            )
             item["task_ids"] = raw_ids
         return item
 
@@ -14222,6 +14497,7 @@ class ChatSession:
                     title=item["title"],
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
+                    note=item["note"],
                 )
             elif action == "update":
                 result = self._coord_client.tasks_update(
@@ -14230,6 +14506,7 @@ class ChatSession:
                     title=item["title"],
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
+                    note=item["note"],
                 )
             elif action == "remove":
                 result = self._coord_client.tasks_remove(self._ws_id, task_id=item["task_id"])

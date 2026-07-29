@@ -3397,3 +3397,28 @@ def test_reload_toast_console_phrasing_pins() -> None:
     assert '"Reload sent to console"' in js
     assert '"; console reload failed"' in js
     assert "!consoleFailed &&" in js
+
+
+def test_every_system_turn_source_has_a_fallback_label() -> None:
+    """``OPERATOR_SOURCE_LABELS`` must cover every SYSTEM_TURN_SOURCES
+    member, carded or not — a missing entry leaks the raw ``_source``
+    ("operator · idle_children").
+
+    Two routes reach the label: uncarded kinds (compaction_pending,
+    background_shell_exit, participant_joined) have no dispatch branch
+    and arrive on EVERY render; carded kinds arrive when a replayed
+    turn's persisted ``_source_meta`` is absent, because every card
+    dispatch is guarded on the turn carrying ``meta``.  ``compaction`` is
+    the one exception — handled first and unguarded in both panes.
+
+    Pinned as a set comparison rather than named entries so the next
+    source added to the Python vocabulary fails here instead of leaking
+    silently."""
+    from turnstone.core.tool_advisory import SYSTEM_TURN_SOURCES
+
+    root = Path(__file__).resolve().parent.parent
+    utils = (root / "turnstone/shared_static/utils.js").read_text(encoding="utf-8")
+    block = utils.split("const OPERATOR_SOURCE_LABELS = {", 1)[1].split("};", 1)[0]
+    labelled = {ln.split(":", 1)[0].strip() for ln in block.splitlines() if ":" in ln}
+    missing = set(SYSTEM_TURN_SOURCES) - labelled - {"compaction"}
+    assert not missing, f"system turn sources with no operator label: {sorted(missing)}"

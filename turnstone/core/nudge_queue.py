@@ -98,6 +98,13 @@ class NudgeQueue:
         self._items: deque[Entry] = deque()
         self._seq = 0
         self._lock = threading.Lock()
+        # Monotonic count of :meth:`drain_entries` invocations, exposed
+        # via :meth:`drain_pass`.  Every ``valid_until`` predicate a
+        # given ``drain_entries`` call evaluates observes the same
+        # value, and the next call observes a larger one — the identity
+        # a consumer needs to memoise an expensive shared read for
+        # exactly one drain pass (no wall-clock TTL).
+        self._drain_pass = 0
 
     def enqueue(
         self,
@@ -159,6 +166,10 @@ class NudgeQueue:
         its staleness predicate.
         """
         with self._lock:
+            # New pass FIRST, empty or not: a pass-scoped predicate memo
+            # keyed on :meth:`drain_pass` must never see two invocations
+            # share a value.
+            self._drain_pass += 1
             if not self._items:
                 return []
             # Fast path: every entry matches → swap deque rather than
@@ -217,8 +228,23 @@ class NudgeQueue:
                 )
         return out
 
+    def drain_pass(self) -> int:
+        """The current :meth:`drain_entries` invocation count.
+
+        A ``valid_until`` predicate runs inside exactly one drain pass,
+        so a consumer that must answer one expensive question COHERENTLY
+        for every entry that pass evaluates (the coordinator observer's
+        children read) keys its memo on ``(scope, drain_pass())`` — the
+        same value within a pass, a different value across passes, and
+        no wall clock anywhere.  Predicates evaluate outside the queue
+        lock, so taking it briefly here cannot deadlock.
+        """
+        with self._lock:
+            return self._drain_pass
+
     def __len__(self) -> int:
-        """Current depth.  Used by the future IdleNudgeWatcher gate."""
+        """Current depth.  Tests and introspection; the idle-wake gate
+        reads :meth:`has_pending` instead."""
         with self._lock:
             return len(self._items)
 

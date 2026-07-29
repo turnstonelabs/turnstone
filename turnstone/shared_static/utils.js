@@ -48,9 +48,22 @@ export function formatCount(n) {
 // Friendly display label for an operator-context system turn's `_source`.
 // The metacognition nudge types (metacognition._NUDGE_MAP, mirrored in
 // tool_advisory.SYSTEM_TURN_SOURCES) collapse to one "metacognition" category;
-// the other generic-bubble sources are humanized.  Carded kinds (watch_triggered
-// / output_guard / idle_children / user_interjection) render via their own
-// builders and never reach this label.
+// the other generic-bubble sources are humanized.
+//
+// The map must cover EVERY member of tool_advisory.SYSTEM_TURN_SOURCES,
+// carded or not, because a missing entry falls through to the raw
+// `_source` ("operator · idle_children") — the regression
+// test_app_js.test_operator_nudge_labels_use_shared_helper guards.
+//
+// Two ways a source reaches this label:
+//   * uncarded kinds (compaction_pending / background_shell_exit /
+//     participant_joined) have no dispatch branch at all, so they reach
+//     it on EVERY render;
+//   * carded kinds reach it when a replayed turn's persisted
+//     `_source_meta` is absent or unparseable, because every card
+//     dispatch is guarded on the turn carrying `meta`.
+// `compaction` is the one exception — handled first and unguarded in
+// both panes, so it never arrives here.
 const OPERATOR_SOURCE_LABELS = {
   correction: "metacognition",
   denial: "metacognition",
@@ -60,6 +73,14 @@ const OPERATOR_SOURCE_LABELS = {
   repeat: "metacognition",
   tool_error: "tool error",
   skill_hint: "skill hint",
+  idle_children: "idle children",
+  idle_tasks: "open tasks",
+  watch_triggered: "watch",
+  output_guard: "output guard",
+  user_interjection: "queued message",
+  compaction_pending: "context budget",
+  background_shell_exit: "background shell",
+  participant_joined: "participant",
 };
 export function operatorSourceLabel(source) {
   return OPERATOR_SOURCE_LABELS[source] || source || "operator";

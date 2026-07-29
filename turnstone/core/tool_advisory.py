@@ -125,6 +125,7 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
         "repeat",
         "compaction_pending",
         "idle_children",
+        "idle_tasks",
         "watch_triggered",
         # Background-shell exit notice (#817) — rides the same external-event
         # rail as ``watch_triggered``; carries ``shell_id`` / ``command`` /

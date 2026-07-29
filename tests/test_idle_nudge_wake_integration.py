@@ -32,6 +32,7 @@ from tests._helpers import wait_until as _wait_until
 from tests.test_session_manager import FakeStorage
 from turnstone.core import session_worker
 from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher, wake_workstream_if_pending
+from turnstone.core.metacognition import NUDGE_IDLE_TASKS_CHILDREN_CAVEAT
 from turnstone.core.session import ChatSession
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.trajectory import dicts_from_turns, turn_from_dict
@@ -471,11 +472,330 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
         idle_turns = [m for m in sys_turns if m["_source"] == "idle_children"]
         assert len(idle_turns) == 1
         text = idle_turns[0]["content"]
-        assert "research-pricing" in text
-        assert "draft-rfc" in text
         assert "child-a" in text
         assert "child-b" in text
         assert "wait_for_workstream" in text
+        # The roster is ids and states only — the children's model-authored
+        # names must not be lowered into the system turn.
+        assert "research-pricing" not in text
+        assert "draft-rfc" not in text
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
+
+
+def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db):
+    """The de-exclusivity ruling crossing every boundary end to end:
+    observer → queue → watcher → wake worker → transcript.
+
+    One IDLE event with BOTH conditions true must deliver BOTH system
+    turns in one synthetic wake turn, tasks first — the co-delivered
+    batch ends on the park instruction.  This is the only end-to-end
+    proof of the pair; the unit suite pins it at the queue only.
+    """
+    import json as _json
+
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+    from turnstone.core.workstream import WorkstreamKind as _Kind
+
+    mgr, adapter, storage = coord_mgr
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord", skill=None)
+        assert coord.session is not None
+
+        storage.register_workstream(
+            "child-a",
+            user_id="u1",
+            name="research-pricing",
+            kind=_Kind.INTERACTIVE,
+            parent_ws_id=coord.id,
+            state="running",
+        )
+        storage.save_workstream_config(
+            coord.id,
+            {
+                "tasks": _json.dumps(
+                    {
+                        "version": 1,
+                        "tasks": [
+                            {"id": "tsk_a", "title": "audit auth.py", "status": "in_progress"}
+                        ],
+                    }
+                )
+            },
+        )
+
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "spawn"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+        assert len(coord.session._nudge_queue) == 0
+        msgs = dicts_from_turns(coord.session.messages)
+        sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+        assert sys_sources == ["idle_tasks", "idle_children"]
+        tasks_text = next(
+            m["content"] for m in msgs if m.get("role") == "system" and m["_source"] == "idle_tasks"
+        )
+        # The counts line is the situation statement; the id block and
+        # the populated calls are under it, and no task TEXT rides along.
+        assert tasks_text.startswith("You still have 1 open task: 1 in_progress, 0 pending.")
+        assert chr(10) + "  - tsk_a (in_progress)" in tasks_text
+        assert "task_id='tsk_a'" in tasks_text
+        assert "audit auth.py" not in tasks_text
+        # The caveat branch the read selects when a live child row is
+        # really in storage — the populated half of the pair whose empty
+        # half is the test below.
+        assert "may still be running" in tasks_text
+        # CO-DELIVERY COHERENCE, end to end: both bodies in one drain now
+        # name the same child, from two independent storage reads.  The
+        # tasks body populates its blocked-on-a-child branch with the
+        # registered ws_id and emits the same ``wait_for_workstream``
+        # call shape the roster does — the inconsistency this change
+        # removed was one body handing over a runnable call while the
+        # other ended in the bare prose "then wait_for_workstream."
+        assert "child_ws_id='child-a'" in tasks_text
+        assert "wait_for_workstream(ws_ids=['child-a'], mode=\"any\", timeout=120)" in tasks_text
+        assert "research-pricing" not in tasks_text
+        children_text = next(
+            m["content"]
+            for m in msgs
+            if m.get("role") == "system" and m["_source"] == "idle_children"
+        )
+        # Ids-and-states roster: the child is named by its ws_id, never by
+        # its model-authored name.
+        assert "child-a" in children_text
+        assert "research-pricing" not in children_text
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
+
+
+def test_coord_idle_with_open_tasks_and_no_children_omits_the_caveat(coord_mgr, tmp_db):
+    """The childless sibling of the test above, over the same chain:
+    no child rows registered, so the enqueue-time existence aggregate
+    answers "none" and the DELIVERED body says nothing about children.
+
+    Asserted on the transcript rather than on the formatter's return,
+    because the claim is about what the coordinator is actually told:
+    the probe queries the storage backend through the real
+    ``count_workstreams_by_state``, and every boundary between that read
+    and the system turn — observer, queue, watcher, wake worker,
+    ``deliver_wake_nudge_from_queue`` — is production code.
+    """
+    import json as _json
+
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+
+    mgr, adapter, storage = coord_mgr
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord", skill=None)
+        assert coord.session is not None
+
+        storage.save_workstream_config(
+            coord.id,
+            {
+                "tasks": _json.dumps(
+                    {
+                        "version": 1,
+                        "tasks": [
+                            {"id": "tsk_a", "title": "audit auth.py", "status": "in_progress"}
+                        ],
+                    }
+                )
+            },
+        )
+
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "work"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+        assert len(coord.session._nudge_queue) == 0
+        msgs = dicts_from_turns(coord.session.messages)
+        sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+        assert sys_sources == ["idle_tasks"]
+        tasks_text = next(
+            m["content"] for m in msgs if m.get("role") == "system" and m["_source"] == "idle_tasks"
+        )
+        assert tasks_text.startswith("You still have 1 open task: 1 in_progress, 0 pending.")
+        assert "may still be running" not in tasks_text
+        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT not in tasks_text
+        # The nudge is otherwise the shipped one: the conditional drops
+        # a sentence, not the opener, the id block or the instructions.
+        assert "needs_user" in tasks_text
+        # End to end, through the REAL storage round-trip: the id that
+        # went into ``workstream_config`` comes back out populated into
+        # the branch calls the model is handed.
+        assert chr(10) + "  - tsk_a (in_progress)" in tasks_text
+        assert "task_id='tsk_a'" in tasks_text
+        assert "audit auth.py" not in tasks_text
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
+
+
+def test_stop_latch_survives_the_liveness_wake(coord_mgr, tmp_db):
+    """Operator Stop → liveness wake fires (by design) → the wake's own
+    send must NOT clear ``_generation_abandoned`` → advice stays
+    suppressed at the wake turn's terminal IDLE.
+
+    The latch is cleared at the top of ``send()`` — and the liveness
+    wake is itself a ``send("", from_wake=True)``, so an unconditional
+    clear let one class's machinery erase the other's suppression: Stop
+    bought exactly the task-reminder resume it exists to prevent, one
+    bracket late.  The wake send must leave the latch alone; a real
+    (non-wake) send is what lifts it.
+
+    Every boundary is production code except the LLM stream: observer →
+    queue → watcher → wake worker → ``deliver_wake_nudge_from_queue`` →
+    ``send("", from_wake=True)``.
+    """
+    import json as _json
+
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+    from turnstone.core.workstream import WorkstreamKind as _Kind
+
+    mgr, adapter, storage = coord_mgr
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord", skill=None)
+        assert coord.session is not None
+
+        # Both conditions hold: a running child (liveness) and an open
+        # task (advice).
+        storage.register_workstream(
+            "child-a",
+            user_id="u1",
+            name="research-pricing",
+            kind=_Kind.INTERACTIVE,
+            parent_ws_id=coord.id,
+            state="running",
+        )
+        storage.save_workstream_config(
+            coord.id,
+            {
+                "tasks": _json.dumps(
+                    {
+                        "version": 1,
+                        "tasks": [
+                            {"id": "tsk_a", "title": "audit auth.py", "status": "in_progress"}
+                        ],
+                    }
+                )
+            },
+        )
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "work"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+
+        # The operator presses Stop: the cancel path's real setter runs
+        # (latch + demote), then the abandoned turn's terminal IDLE fans
+        # out below.
+        coord.session._drain_pending_advisories()
+        assert coord.session._generation_abandoned is True
+        # Control the advice cooldown stamp: it must be the LATCH that
+        # suppresses idle_tasks throughout, never the per-class cooldown
+        # G1 reinstated — a stamp here would mask a broken latch.
+        assert coord.session._metacog_state.get("idle_tasks") is None
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+
+            # The abandoned generation's terminal IDLE.  Advice returns
+            # at the latch; liveness fires by design (the children's
+            # results still need collecting) and the watcher wakes the
+            # coordinator.
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+            msgs = dicts_from_turns(coord.session.messages)
+            sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+            assert sys_sources == ["idle_children"], "only the liveness wake may deliver"
+
+            # THE PIN: the wake's own send must not have cleared the
+            # latch.
+            assert coord.session._generation_abandoned is True
+
+            # The wake turn's terminal IDLE re-enters the observer (in
+            # production via the coordinator UI's state bridge).  The
+            # stamp store is still clean — the cooldown cannot be what
+            # refuses — and advice must STILL be suppressed by the latch.
+            coord.session._metacog_state.pop("idle_tasks", None)
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+            assert len(coord.session._nudge_queue) == 0
+            msgs = dicts_from_turns(coord.session.messages)
+            assert not any(
+                m.get("_source") == "idle_tasks" for m in msgs if m.get("role") == "system"
+            ), "Stop must keep suppressing advice across the wake"
+
+            # The control: a REAL send lifts the latch, and the next
+            # idle bracket's advice fires again.
+            coord.session.send("resume the audit work")
+            assert coord.session._generation_abandoned is False
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+        msgs = dicts_from_turns(coord.session.messages)
+        assert any(m.get("_source") == "idle_tasks" for m in msgs if m.get("role") == "system"), (
+            "a real send must restore the advice path"
+        )
     finally:
         watcher.shutdown()
         observer.shutdown()
@@ -567,7 +887,10 @@ def test_coord_idle_emitted_from_worker_thread_still_wakes(coord_mgr, tmp_db):
             m for m in msgs if m.get("role") == "system" and m["_source"] == "idle_children"
         ]
         assert len(idle_turns) == 1
-        assert "crawl-docs" in idle_turns[0]["content"]
+        # Ids-and-states roster: the child rides as its ws_id, never its
+        # model-authored name.
+        assert "child-x" in idle_turns[0]["content"]
+        assert "crawl-docs" not in idle_turns[0]["content"]
         assert "wait_for_workstream" in idle_turns[0]["content"]
     finally:
         watcher.shutdown()
