@@ -1400,6 +1400,28 @@ def make_cancel_handler(
                 # escape hatch for an already-wedged session, not a
                 # routine path.  Revisit if commands ever gain generation
                 # discipline.
+                #
+                # Abandon machinery FIRST — before the ownership clear
+                # and the idle emission below.  The latch and the queue
+                # demote are how subscribers on the IDLE fan-out (the
+                # idle observer's operator-Stop gate, the wake watcher)
+                # tell this operator-forced IDLE apart from a turn
+                # reaching idle under its own power.  The worker's own
+                # exception handler normally runs this, but the thread
+                # force-cancel abandons is stuck by definition and may
+                # not reach that handler for minutes — emitting IDLE
+                # first let advisories fire and wakes spawn against an
+                # operator who had just pressed Stop at its hardest.
+                # The abandoned thread re-running the drain at its
+                # eventual death is idempotent.
+                try:
+                    session._drain_pending_advisories()
+                except Exception:
+                    log.debug(
+                        "ws.cancel.abandon_latch_failed ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
                 with ws._lock:
                     ws.worker_thread = None
                     ws._worker_running = False
