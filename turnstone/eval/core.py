@@ -14,6 +14,7 @@ Dependency direction is strictly one-way: the optimizer imports from this
 module; this module never imports from the optimizer.
 """
 
+import contextlib
 import copy
 import json
 import math
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any
@@ -246,7 +248,12 @@ class HeadlessSession(ChatSession):
         agent_max_turns: int = -1,
         tool_truncation: int = 0,
         tool_overrides: dict[str, dict[str, Any]] | None = None,
+        **session_kwargs: Any,
     ) -> None:
+        # ``session_kwargs`` forwards straight to ``ChatSession`` so
+        # specialised eval sessions (the coordinator-mode nudge harness)
+        # can pass ``kind`` / ``coord_client`` / ``ws_id`` / ``user_id``
+        # without this class re-enumerating the whole constructor.
         super().__init__(
             client=client,
             model=model,
@@ -261,6 +268,7 @@ class HeadlessSession(ChatSession):
             auto_compact_pct=auto_compact_pct,
             agent_max_turns=agent_max_turns,
             tool_truncation=tool_truncation,
+            **session_kwargs,
         )
         self.tool_call_log: list[dict[str, Any]] = []
         self.auto_approve = True
@@ -300,11 +308,28 @@ class HeadlessSession(ChatSession):
         self.tool_call_log.
 
         Returns the tool call log: list of dicts with keys:
-            tool: str, args: dict, result: str (truncated), turn: int
+            tool: str, args: dict, result: str (truncated), ok: bool,
+            turn: int
         """
-        self.tool_call_log = []
         self.messages.append(Turn.user(user_input))
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
+        return self._run_headless_loop(max_turns=max_turns, verbose=verbose, log_prefix=log_prefix)
+
+    def _run_headless_loop(
+        self,
+        *,
+        max_turns: int = 10,
+        verbose: bool = False,
+        log_prefix: str = "",
+    ) -> list[dict[str, Any]]:
+        """The completion + tool loop shared by :meth:`send_headless`
+        (which appends a fresh user turn first) and the nudge eval's
+        wake-equivalent entry (which seeds ``self.messages`` directly —
+        an empty wake user turn followed by injected system turns,
+        mirroring ``send("", from_wake=True)``'s wire order — and must
+        NOT append another user turn).
+        """
+        self.tool_call_log = []
 
         # The eval lane — resolved once per run, like the sub-agent seam.
         # ``temperature`` relays the harness's operator-resolved knob per
@@ -317,11 +342,6 @@ class HeadlessSession(ChatSession):
             registry=self._registry,
             capabilities=self._get_capabilities(),
         )
-        # System prompts live as wire dicts on the session; bridge them to
-        # Turn IR once — they are invariant for the run (only __init__ /
-        # set_skill recompose them, both before send_headless).  Only the
-        # growing ``self.messages`` concatenation happens per turn.
-        system_turns = turns_from_dicts(self.system_messages)
 
         for turn in range(max_turns):
             if self._cancelled.is_set():
@@ -331,7 +351,20 @@ class HeadlessSession(ChatSession):
                 _log(f"{log_prefix}  turn {turn}: calling API...", dim=True)
 
             t0 = time.monotonic()
-            turns = system_turns + self.messages
+            # PRODUCTION WIRE, not a shortcut concatenation.  The send
+            # path lowers through ``_prepare_wire_messages``: sender
+            # labels, then ``fold_system_turns`` (which wraps
+            # mid-conversation operator turns in the nonce-fenced
+            # ``[start system-reminder]`` block for models whose
+            # capability row lacks native mid-conversation system
+            # support), then empty-user-turn drop, tool-arg
+            # legalization, and id repair.  Concatenating raw turns
+            # here sent a wire shape production never emits — it
+            # happened to be accepted by one endpoint and hard-rejected
+            # ("System message must be at the beginning") by another,
+            # and either way the nudge eval was measuring the wrong
+            # stimulus.
+            turns = turns_from_dicts(self._prepare_wire_messages(self._full_messages()))
 
             if self._cancelled.is_set():
                 break
@@ -417,6 +450,18 @@ class HeadlessSession(ChatSession):
                         "tool": func_name,
                         "args": args,
                         "result": output[:500],
+                        # Effect, not intent: whether the call LANDED, read
+                        # from the executor's own error state — every error
+                        # exit in ``_execute_tools`` / the per-tool execs
+                        # reports through ``_report_tool_result``, which
+                        # stamps ``_tool_error_flags[call_id]``.  Scorers
+                        # that ask "did this call change state?" (the nudge
+                        # eval's bookkeeping anchor) read this flag, never
+                        # the truncated result string: a rejected mutation
+                        # left everything untouched, and counting it as
+                        # bookkeeping credits the run with state it never
+                        # recorded.
+                        "ok": not self._tool_error_flags.get(tc_id, False),
                         "turn": turn,
                     }
                 )
@@ -445,6 +490,160 @@ class HeadlessSession(ChatSession):
 
 
 # ─── Test runner ─────────────────────────────────────────────────────────────
+
+
+def run_with_lifecycle(
+    *,
+    workdir_prefix: str,
+    setup: Callable[[str], None],
+    build_client: Callable[[], Any],
+    build_session: Callable[[Any], tuple[Any, Callable[[], list[dict[str, Any]]]]],
+    finish: Callable[[Any, list[dict[str, Any]]], dict[str, Any]],
+    test_timeout: int,
+    teardown_reset: Callable[[], None],
+    on_cwd_restore_failed: Callable[[str], None],
+    extra_close: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """THE per-run lifecycle, shared by both harnesses.
+
+    ``_run_single_test`` and ``eval.nudges._run_single_nudge`` used to
+    carry separate copies of this shape, and the copy drifted: the nudge
+    side lost the 3x transient retry and the executor wall-clock bound,
+    so a mid-sweep endpoint hiccup or a hung stream was scored as a body
+    regression — which the canary probe cannot see, because it samples
+    only sweep start and sweep end.  One helper, and the divergences
+    that are DELIBERATE (an extra close, the log sink) are parameters.
+
+    The phases, in order:
+
+    * *setup(workdir)* — once, inside the ``try`` whose ``finally`` owns
+      the teardown, so a raise during storage init or seeding cannot
+      strand the workdir on disk.  Only the temp dir and the cwd
+      snapshot precede the ``try``, because the ``finally`` reads both.
+      Callers resolve their own ``init_storage`` / ``reset_storage``
+      here (module-global lookups at call time, so tests can
+      monkeypatch each harness's module independently).
+    * *build_client()* / *build_session(client)* — once per attempt.
+      Build failures are NOT transient-retried: a constructor raise is a
+      harness defect, not an endpoint hiccup, and retrying it would buy
+      two more identical raises while leaking the two earlier clients
+      past the teardown (which closes only the last one built).
+    * *drive* (returned by ``build_session``) — submitted to a
+      one-worker executor and bounded by ``future.result(test_timeout)``.
+      The per-request httpx timeout cannot bound a STREAM: a trickling
+      response resets the read timeout indefinitely, so without the
+      wall clock a hung generation occupies a run slot forever.  On
+      timeout the session is DROPPED, not closed: the shutdown did not
+      wait, so the worker is still inside the drive, and ``close()``'s
+      bounded shell-join would trade a bounded leak for a blocked
+      teardown on exactly the run already over budget.
+    * transient failures retry up to 3 attempts with backoff.  Here the
+      future has already raised — the worker is DONE — so unlike the
+      timeout path the session is CLOSED before being replaced; the old
+      shape dropped it "for the timeout path's reason" on a path where
+      that reason does not hold, abandoning up to three fully-built
+      sessions (background shells included) per case.
+    * *finish(session, tool_log)* — the success extraction, run before
+      teardown so the caller reads a live session.
+
+    The teardown ordering invariants (no ORDINARY failure here may cost
+    the rest of the block, because what this block skips poisons every
+    SUBSEQUENT run of the sweep — the cleanup manufacturing exactly the
+    harness-attributed failures it exists to prevent):
+
+    * The cwd restore goes FIRST and is GUARDED.  Two raises still leave
+      this block early — the deliberately-unsuppressed storage reset,
+      and anything that is not an ``Exception`` (a Ctrl-C landing in the
+      bounded shell-join) — and the residues are not equal: a leaked
+      temp dir is inert and visible, while a process left chdir'd into a
+      deleted directory breaks the next run silently.  The restore
+      failure is LOGGED through the caller's sink and never re-raised:
+      this run's result is already computed and is still honest.
+    * Each close is suppressed ON ITS OWN, so an ordinary teardown
+      failure cannot take the closes after it, the storage reset or the
+      rmtree with it.  ``extra_close`` (the nudge harness's coordinator
+      client) runs after the session and transport closes, in its own
+      suppression: inside ``ChatSession.close()`` only the
+      ``_coord_client`` step is exception-guarded, so a raise before it
+      skips that client — the separate close is the LIVE one whenever
+      the session was never built or its close raised short of that
+      step.
+    * The reset is NOT suppressed — a failed reset leaves the singleton
+      non-``None`` and the next run raises at its first statement
+      anyway; suppression would only hide where the cascade started —
+      but it is NESTED over the ``rmtree`` so a failing reset cannot
+      strand the workdir: flattened, the setup-path defect reappears on
+      the teardown path, once per run, i.e. the defect inside the fix
+      for it.
+    """
+    workdir = tempfile.mkdtemp(prefix=workdir_prefix)
+    original_cwd = os.getcwd()
+    session: Any = None
+    run_client: Any = None
+    try:
+        setup(workdir)
+        _last_err: Exception | None = None
+        for _attempt in range(3):
+            run_client = build_client()
+            session, drive = build_session(run_client)
+            executor: ThreadPoolExecutor | None = None
+            try:
+                executor = ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(drive)
+                try:
+                    tool_log = future.result(timeout=test_timeout)
+                except FuturesTimeoutError:
+                    session._cancelled.set()
+                    run_client.close()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    executor = None
+                    # Dropped rather than closed, which also takes it out
+                    # of the teardown below — deliberately; see the
+                    # docstring's timeout paragraph.
+                    session = None
+                    raise TimeoutError(f"Test timed out after {test_timeout}s") from None
+                else:
+                    run_client.close()
+                    executor.shutdown(wait=False)
+                    executor = None
+                return finish(session, tool_log)
+            except TimeoutError:
+                raise
+            except Exception as _e:
+                _last_err = _e
+                run_client.close()
+                # The future has already raised, so the worker is done and
+                # closing is safe — the timeout path above is the ONLY one
+                # that must drop instead of close.
+                with contextlib.suppress(Exception):
+                    session.close()
+                session = None
+                if _attempt < 2:
+                    time.sleep(2**_attempt)
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=False)
+        raise _last_err or RuntimeError("the generation chain failed after 3 attempts")
+    finally:
+        # The reasoning for every guard and its order is in the
+        # docstring above — one essay, one implementation, two callers.
+        try:
+            os.chdir(original_cwd)
+        except Exception:
+            on_cwd_restore_failed(original_cwd)
+        with contextlib.suppress(Exception):
+            if session is not None:
+                session.close()
+        with contextlib.suppress(Exception):
+            if run_client is not None:
+                run_client.close()
+        if extra_close is not None:
+            with contextlib.suppress(Exception):
+                extra_close()
+        try:
+            teardown_reset()
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _run_single_test(
@@ -482,15 +681,26 @@ def _run_single_test(
 
     Returns dict with keys: tool_log, final_content, message_count,
     elapsed, usage.
-    """
-    workdir = tempfile.mkdtemp(prefix="turnstone_eval_")
-    original_cwd = os.getcwd()
-    eval_db = os.path.join(workdir, ".turnstone_eval.db")
-    reset_storage()
-    init_storage("sqlite", path=eval_db, run_migrations=False)
-    t0 = time.monotonic()
 
-    try:
+    The per-run lifecycle — attempt loop, wall-clock bound, teardown
+    ordering — is :func:`run_with_lifecycle`, shared with the nudge
+    harness; its docstring is the canonical statement of the reasoning.
+    What this harness parameterizes: there is no coordinator client, so
+    the session's own close is the whole instrument and no
+    ``extra_close`` is passed; the cwd-restore failure logs through
+    ``_log``.  The bounded shell-join that costs the nudge harness
+    nothing bites here — these sessions carry the interactive tool set,
+    so a case that leaves a background shell running pays it.  That is
+    the point, since nothing else reaps that thread; a run that timed
+    out is the one exception, and it opts out inside the helper.
+    """
+    state: dict[str, Any] = {}
+
+    def _setup(workdir: str) -> None:
+        eval_db = os.path.join(workdir, ".turnstone_eval.db")
+        reset_storage()
+        init_storage("sqlite", path=eval_db, run_migrations=False)
+        state["t0"] = time.monotonic()
         # Write setup files
         setup_files = list(case.get("setup", {}).get("files", {}).items())
         for path, content in setup_files:
@@ -522,100 +732,80 @@ def _run_single_test(
                 enabled=True,
             )
 
+    def _build_client() -> Any:
+        # Per-attempt client with request-level timeout so httpx aborts
+        # the HTTP request itself — no zombie connections on the server.
+        return OpenAI(
+            base_url=client.base_url,
+            api_key=client.api_key,
+            timeout=float(test_timeout),
+        )
+
+    def _build_session(run_client: Any) -> tuple[Any, Callable[[], list[dict[str, Any]]]]:
+        session = HeadlessSession(
+            client=run_client,
+            model=model,
+            # skill_mode uses turnstone's natural composition (no override)
+            # so the skill folds in wherever the checkout under test places
+            # a named skill (system message, or a separate context turn).
+            system_prompt_override=None if skill_mode else system_prompt,
+            instructions=None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tool_timeout=30,
+            reasoning_effort=reasoning_effort,
+            context_window=context_window,
+            tool_truncation=2000,
+            tool_overrides=tool_overrides,
+        )
+        if skill_mode and skill is not None:
+            # Activate the seeded skill via the production path:
+            # _load_skills() -> _init_system_messages() composes the
+            # skill body into session.system_messages.
+            session.set_skill(skill["name"])
         max_turns = case.get("max_turns", 15)
-        # Retry on transient API errors to avoid poisoning eval scores
-        tool_log: list[dict[str, Any]] = []
+
+        def _drive() -> list[dict[str, Any]]:
+            return session.send_headless(
+                case["user_prompt"],
+                max_turns=max_turns,
+                verbose=verbose,
+                log_prefix=log_prefix,
+            )
+
+        return session, _drive
+
+    def _finish(session: Any, tool_log: list[dict[str, Any]]) -> dict[str, Any]:
+        # Extract results before releasing session
         final_content = ""
-        message_count = 0
-        total_usage: dict[str, int] = {"prompt": 0, "completion": 0}
-        _last_err: Exception | None = None
-        for _attempt in range(3):
-            # Per-attempt client with request-level timeout so httpx aborts
-            # the HTTP request itself — no zombie connections on the server.
-            run_client = OpenAI(
-                base_url=client.base_url,
-                api_key=client.api_key,
-                timeout=float(test_timeout),
-            )
-            session = HeadlessSession(
-                client=run_client,
-                model=model,
-                # skill_mode uses turnstone's natural composition (no override)
-                # so the skill folds in wherever the checkout under test places
-                # a named skill (system message, or a separate context turn).
-                system_prompt_override=None if skill_mode else system_prompt,
-                instructions=None,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tool_timeout=30,
-                reasoning_effort=reasoning_effort,
-                context_window=context_window,
-                tool_truncation=2000,
-                tool_overrides=tool_overrides,
-            )
-            if skill_mode and skill is not None:
-                # Activate the seeded skill via the production path:
-                # _load_skills() -> _init_system_messages() composes the
-                # skill body into session.system_messages.
-                session.set_skill(skill["name"])
-            executor: ThreadPoolExecutor | None = None
-            try:
-                executor = ThreadPoolExecutor(max_workers=1)
-                future = executor.submit(
-                    session.send_headless,
-                    case["user_prompt"],
-                    max_turns=max_turns,
-                    verbose=verbose,
-                    log_prefix=log_prefix,
-                )
-                try:
-                    tool_log = future.result(timeout=test_timeout)
-                except FuturesTimeoutError:
-                    session._cancelled.set()
-                    run_client.close()
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    executor = None
-                    session = None  # type: ignore[assignment]
-                    raise TimeoutError(f"Test timed out after {test_timeout}s") from None
-                else:
-                    run_client.close()
-                    executor.shutdown(wait=False)
-                    executor = None
-
-                # Extract results before releasing session
-                for msg in reversed(session.messages):
-                    if msg.role is Role.ASSISTANT and msg.text:
-                        final_content = msg.text
-                        break
-                message_count = len(session.messages)
-                total_usage = session.total_usage
+        for msg in reversed(session.messages):
+            if msg.role is Role.ASSISTANT and msg.text:
+                final_content = msg.text
                 break
-            except TimeoutError:
-                raise
-            except Exception as _e:
-                _last_err = _e
-                run_client.close()
-                session = None  # type: ignore[assignment]
-                if _attempt < 2:
-                    time.sleep(2**_attempt)
-            finally:
-                if executor is not None:
-                    executor.shutdown(wait=False)
-        else:
-            raise _last_err or RuntimeError("send_headless failed after 3 attempts")
-
-        elapsed = time.monotonic() - t0
         return {
             "tool_log": tool_log,
             "final_content": final_content,
-            "message_count": message_count,
-            "elapsed": round(elapsed, 1),
-            "usage": total_usage,
+            "message_count": len(session.messages),
+            "elapsed": round(time.monotonic() - state["t0"], 1),
+            "usage": session.total_usage,
         }
-    finally:
-        reset_storage()
-        os.chdir(original_cwd)
-        shutil.rmtree(workdir, ignore_errors=True)
+
+    def _on_cwd_restore_failed(original_cwd: str) -> None:
+        _log(
+            f"{log_prefix}  cleanup: could not return to {original_cwd} "
+            "(later runs will fail early)"
+        )
+
+    return run_with_lifecycle(
+        workdir_prefix="turnstone_eval_",
+        setup=_setup,
+        build_client=_build_client,
+        build_session=_build_session,
+        finish=_finish,
+        test_timeout=test_timeout,
+        teardown_reset=reset_storage,
+        on_cwd_restore_failed=_on_cwd_restore_failed,
+    )
 
 
 def _run_and_score_subprocess(params: dict[str, Any]) -> dict[str, Any]:

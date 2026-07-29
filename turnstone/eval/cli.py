@@ -96,6 +96,49 @@ def _run_skill_adherence_cli(
     print(f"Results written to {args.output}")
 
 
+def _run_nudges_cli(args: argparse.Namespace, model: str, api_key: str) -> None:
+    """Drive :func:`turnstone.eval.nudges.run_nudge_response` and write
+    the per-arm grid to ``--output``.  Bars are the operator's to apply
+    after the baseline sweep — this prints rates, it does not judge
+    them."""
+    from turnstone.eval.nudges import run_nudge_response
+    from turnstone.eval.scenarios.nudges import NUDGE_CELLS
+
+    cells = NUDGE_CELLS
+    if args.cells:
+        wanted = {c.strip() for c in args.cells.split(",") if c.strip()}
+        unknown = wanted - {c["id"] for c in NUDGE_CELLS}
+        if unknown:
+            raise SystemExit(f"unknown cell ids: {sorted(unknown)}")
+        cells = [c for c in NUDGE_CELLS if c["id"] in wanted]
+    body_override_text = None
+    if args.body_override:
+        with open(args.body_override) as f:
+            body_override_text = f.read()
+
+    result = run_nudge_response(
+        base_url=args.base_url,
+        api_key=api_key,
+        model=model,
+        cells=cells,
+        # Precedence: CLI arg (non-None) > code default — the same rule as
+        # the two sibling resolution sites in this file.  ``or`` swallowed
+        # an explicit ``--n-runs 0``, which is the natural
+        # validate-and-canary dry run (both run before any generation).
+        n_runs=args.n_runs if args.n_runs is not None else 10,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        reasoning_effort=args.reasoning_effort,
+        context_window=args.context_window,
+        test_timeout=args.test_timeout,
+        body_override_text=body_override_text,
+        verbose=args.verbose,
+    )
+    with open(args.output, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"\n  results -> {args.output}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Headless measurement for turnstone (scores tool use against expected actions)",
@@ -113,7 +156,9 @@ def main() -> None:
     )
     parser.add_argument(
         "test_file",
-        help="Path to test cases JSON file",
+        nargs="?",
+        default=None,
+        help="Path to test cases JSON file (not used by --nudges, which carries its own cells)",
     )
     parser.add_argument(
         "--base-url",
@@ -192,6 +237,32 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--nudges",
+        action="store_true",
+        help=(
+            "Measure idle-nudge response behavior: seeded coordinator states x "
+            "stimulus arms, state-first scoring.  Cells ship in "
+            "turnstone.eval.scenarios.nudges; test_file is not used"
+        ),
+    )
+    parser.add_argument(
+        "--cells",
+        default=None,
+        help="--nudges: comma-separated cell ids to run (default: all)",
+    )
+    parser.add_argument(
+        "--body-override",
+        default=None,
+        help=(
+            "--nudges: path to a file whose content replaces "
+            "NUDGE_IDLE_TASKS_TAIL — the caveat and typed branches; the "
+            "counts opener is formatter-built — for this sweep (tuning "
+            "A/B only; the default is always the production body).  "
+            "Skips the no_caveat arm, whose ablation only means "
+            "anything against the body that ships"
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -216,6 +287,14 @@ def main() -> None:
         detected, _ = detect_model(client)
         assert detected is not None  # fatal=True guarantees non-None or SystemExit
         model = detected
+
+    # Nudge-response mode carries its own cells and uses the coordinator's
+    # natural composition — branch before the test_file / prompt paths.
+    if args.nudges:
+        _run_nudges_cli(args, model, api_key)
+        return
+    if args.test_file is None:
+        parser.error("test_file is required unless --nudges is given")
 
     # Skill-adherence mode is a distinct two-arm measurement — it uses natural
     # prompt composition (no --prompt), so branch before the initial-prompt path.
