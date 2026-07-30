@@ -263,11 +263,16 @@ def main() -> None:
         default=None,
         help=(
             "--nudges: path to a file whose content replaces "
-            "NUDGE_IDLE_TASKS_TAIL — the caveat and typed branches; the "
-            "counts opener is formatter-built — for this sweep (tuning "
-            "A/B only; the default is always the production body).  "
-            "Skips the no_caveat arm, whose ablation only means "
-            "anything against the body that ships"
+            "NUDGE_IDLE_TASKS_TAIL — the open-id block and typed "
+            "branches; the counts opener AND the per-child children "
+            "fact lines are formatter-built from seeded state, never "
+            "override text — for this sweep (candidate A/B only; the "
+            "default is always the production body).  Skips the "
+            "no_caveat arm, whose ablation only means anything against "
+            "the body that ships, and REFUSES childless cells at config "
+            "time: both select the childless branch, whose literal "
+            "door cut would silently strip a candidate that quotes the "
+            "shipped blocked-on-a-child branch"
         ),
     )
     parser.add_argument(

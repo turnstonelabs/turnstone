@@ -1,15 +1,18 @@
 """Tests for turnstone.core.metacognition — detection, nudging, formatting."""
 
+import pytest
+
 from turnstone.core.metacognition import (
     MEMORY_NUDGE_TYPES,
+    NUDGE_CHILD_STOPPED_STATES,
     NUDGE_COMPLETION,
     NUDGE_CORRECTION,
     NUDGE_DENIAL,
     NUDGE_IDLE_CHILDREN_DISPLAY_CAP,
+    NUDGE_IDLE_CHILDREN_HEADER,
     NUDGE_IDLE_CHILDREN_WAIT_CAP,
     NUDGE_IDLE_TASKS_CHILD_DOOR,
     NUDGE_IDLE_TASKS_CHILD_SLOT,
-    NUDGE_IDLE_TASKS_CHILDREN_CAVEAT,
     NUDGE_IDLE_TASKS_ID_SLOT,
     NUDGE_IDLE_TASKS_OPEN_LIST_SLOT,
     NUDGE_IDLE_TASKS_TAIL,
@@ -412,9 +415,42 @@ class TestFormatIdleChildrenNudge:
     def test_single_child_renders_id_and_state(self):
         children = [{"ws_id": "ws-abc12345", "state": "running"}]
         text = format_idle_children_nudge(children)
-        assert "ws-abc12 (running)" in text  # short-id form (8 chars) + state
+        assert "  - ws-abc12345 (running)" in text  # FULL id + state
         assert "wait_for_workstream" in text
-        assert "ws-abc12345" in text  # full id appears in the suggestion's ws_ids list
+        assert wait_call(["ws-abc12345"]) in text
+
+    def test_header_opens_with_the_drain_verified_fact_only(self):
+        """The body's first sentence is the one claim the drain predicate
+        re-verifies — children are still active.  "You are idle." led it
+        until 2026-07-29 and was dropped: a queued entry delivers at
+        whichever seam arrives next, and the predicate re-checks the
+        CHILDREN, never the coordinator's idleness, so that sentence
+        could be false at delivery.  The harness must not render a state
+        it does not hold.
+        """
+        text = format_idle_children_nudge([{"ws_id": "ws-abc12345", "state": "running"}])
+        assert text.startswith("These child workstreams are still active:")
+        assert text.startswith(NUDGE_IDLE_CHILDREN_HEADER)
+        assert "You are idle" not in text
+        assert "idle" not in NUDGE_IDLE_CHILDREN_HEADER
+
+    def test_bullets_carry_the_full_ws_id_as_a_handle(self):
+        """The roster exists to hand the model HANDLES for inspect /
+        message / wait, and ``_resolve_ws_ref`` refuses truncated ids by
+        design (near-miss ids are NEVER auto-resolved) — so an 8-char
+        prefix bullet was not a handle, it was a value the resolver
+        rejects sitting one line above the full id that works.  The
+        bullet and the wait line carry the SAME full id; prefixing for
+        readability is the FE's display concern, not this body's.
+        """
+        full = "a0b1c2d3e4f5061728394a5b6c7d8e9f"
+        text = format_idle_children_nudge([{"ws_id": full, "state": "running"}])
+        bullets = [ln for ln in text.splitlines() if ln.startswith("  - ")]
+        assert bullets == [f"  - {full} (running)"]
+        assert f"To block on them: {wait_call([full])}." in text
+        # MUTATION CONTROL for the truncation returning: no bullet
+        # carries the 8-char prefix form.
+        assert f"  - {full[:8]} (" not in text
 
     def test_model_authored_names_never_reach_the_body(self):
         """THE SAFE-HARNESS PIN.  A ``name`` key on the row — benign or
@@ -439,9 +475,9 @@ class TestFormatIdleChildrenNudge:
         text = format_idle_children_nudge(children)
         bullet_rows = [ln for ln in text.splitlines() if ln.startswith("  - ")]
         assert bullet_rows == [
-            "  - ws-real0 (running)",
-            "  - ws-evil0 (thinking)",
-            "  - ws-real0 (attention)",
+            "  - ws-real0001 (running)",
+            "  - ws-evil0002 (thinking)",
+            "  - ws-real0003 (attention)",
         ]
         # No name text, no fallback, no steering content anywhere.
         assert "benign-research" not in text
@@ -451,13 +487,11 @@ class TestFormatIdleChildrenNudge:
         assert "(unnamed)" not in text
 
     def test_under_display_cap_no_overflow_line(self):
-        # The id's first 8 chars must differ per row, or the prefix
-        # assertions cannot tell the bullets apart.
         children = [{"ws_id": f"ws{i:02d}-aaaaaa", "state": "running"} for i in range(3)]
         text = format_idle_children_nudge(children)
         assert "...and" not in text
         for i in range(3):
-            assert f"ws{i:02d}-aaa" in text  # the row's 8-char prefix
+            assert f"  - ws{i:02d}-aaaaaa (running)" in text  # the row's FULL id
 
     def test_over_display_cap_renders_overflow_line(self):
         n = NUDGE_IDLE_CHILDREN_DISPLAY_CAP + 4
@@ -470,7 +504,7 @@ class TestFormatIdleChildrenNudge:
         bullets = [ln for ln in text.splitlines() if ln.startswith("  - ")]
         assert len(bullets) == NUDGE_IDLE_CHILDREN_DISPLAY_CAP
         for i in range(NUDGE_IDLE_CHILDREN_DISPLAY_CAP):
-            assert f"ws{i:02d}-aaa" in bullets[i]
+            assert bullets[i] == f"  - ws{i:02d}-aaaaaa (thinking)"
 
     def test_over_wait_cap_truncates_suggestion_ws_ids(self):
         n = NUDGE_IDLE_CHILDREN_WAIT_CAP + 5
@@ -673,8 +707,9 @@ class TestSanitizePayload:
 
 
 class TestFormatIdleTasksNudge:
-    """The ``idle_tasks`` body — counts opener, caveat, the open-id
-    block, typed branches with populated calls, and NOTHING else.
+    """The ``idle_tasks`` body — counts opener, per-child observed fact
+    lines, the open-id block, typed branches with populated calls, and
+    NOTHING else.
 
     Adopted off the round-8 numbers: the counts candidate matched or
     beat the roster body on every childless cell with zero forbidden
@@ -687,20 +722,24 @@ class TestFormatIdleTasksNudge:
     and the controls here are the other half of that pair: ids and
     statuses appear, titles and notes cannot (the formatter is not given
     any), and every emitted call is populated from what the caller
-    observed rather than from an invented constant.
+    observed rather than from an invented constant.  Children content is
+    the same discipline one step further (the 2026-07-29 ruling): the
+    caller observed ``(ws_id, state)`` per child, so the body renders
+    that fact per child and never a hedge about it.
     """
 
     _OPEN = [("tsk_1", "in_progress"), ("tsk_2", "pending")]
 
     @staticmethod
-    def _fmt(counts=None, *, open_task_ids=None, child_ws_ids=None):
-        """Render the default two-open fixture with one live child.
+    def _fmt(counts=None, *, open_task_ids=None, children=None):
+        """Render the default two-open fixture with one running child.
 
-        ``child_ws_ids`` defaults to ``None`` — INDETERMINATE, which
-        keeps the caveat and populates no child slot — because that is
-        the value most assertions below want: the caveat-bearing body
-        with nothing about children fabricated into it.  Tests that care
-        about population pass a list.
+        ``children`` defaults to one RUNNING child — the children-aware
+        body, which is the fuller of the two forms — because that is
+        what most assertions below want.  Tests about the childless form
+        pass ``[]`` explicitly; there is no third state to default to
+        (the formatter takes a required list, and a failed production
+        read renders no body at all).
 
         The defaults live HERE and not on the formatter deliberately: a
         default on the production function would let a caller lose a
@@ -712,7 +751,7 @@ class TestFormatIdleTasksNudge:
             open_task_ids=(
                 TestFormatIdleTasksNudge._OPEN if open_task_ids is None else open_task_ids
             ),
-            child_ws_ids=child_ws_ids,
+            children=[("child-a", "running")] if children is None else children,
         )
 
     def test_empty_counts_return_empty_string(self):
@@ -776,26 +815,25 @@ class TestFormatIdleTasksNudge:
             "  - tsk_2 (pending)",
         ]
 
-    def test_the_entire_body_is_counts_line_plus_tail(self):
+    def test_the_entire_body_is_counts_line_facts_plus_tail(self):
         """The strongest control: byte-equality against the one constant
-        plus the formatter-built opener, modulo exactly the slot
-        operations the formatter declares.
+        plus the formatter-built opening fact block, modulo exactly the
+        slot operations the formatter declares.
 
         Spelling the operations out here is the point — anything smuggled
         into the body (a provenance sentence, an interpolated title, a
-        second wait call) lands outside this equality and fails it, and
-        any slot operation that is NOT one of these has to be added to
-        this test before it can ship.
+        second wait call, a hedge sentence riding back in beside the
+        fact lines) lands outside this equality and fails it, and any
+        slot operation that is NOT one of these has to be added to this
+        test before it can ship.
 
-        Both branches of the children conditional are byte-checked, and
-        the childless one is TWO literal cuts against the same constant:
-        the caveat sentence and the whole blocked-on-a-child branch.
-        Deriving the childless body from the childful one by a single
-        caveat cut is what the shipped code did for one release, and it
-        is exactly the bug — so this test can no longer be written that
-        way either.
+        Both branches of the children conditional are byte-checked: the
+        children-bearing form is opener + one fact line per child + the
+        populated tail, and the childless one is the door's literal cut
+        against the same constant with NO fact lines.
         """
         opener = "You still have 2 open tasks: 1 in_progress, 1 pending."
+        facts = chr(10) + "Child child-a is still running; check before redoing anything it owns."
         block = chr(10) * 2 + "  - tsk_1 (in_progress)" + chr(10) + "  - tsk_2 (pending)"
         childful = (
             NUDGE_IDLE_TASKS_TAIL.replace(NUDGE_IDLE_TASKS_OPEN_LIST_SLOT, block, 1)
@@ -803,15 +841,14 @@ class TestFormatIdleTasksNudge:
             .replace(NUDGE_IDLE_TASKS_ID_SLOT, "tsk_1")
             .replace(NUDGE_IDLE_TASKS_CHILD_SLOT, "child-a")
         )
-        assert self._fmt(child_ws_ids=["child-a"]) == opener + childful
+        assert self._fmt(children=[("child-a", "running")]) == opener + facts + childful
 
         childless = (
-            NUDGE_IDLE_TASKS_TAIL.replace(NUDGE_IDLE_TASKS_CHILDREN_CAVEAT, "", 1)
-            .replace(NUDGE_IDLE_TASKS_CHILD_DOOR, "", 1)
+            NUDGE_IDLE_TASKS_TAIL.replace(NUDGE_IDLE_TASKS_CHILD_DOOR, "", 1)
             .replace(NUDGE_IDLE_TASKS_OPEN_LIST_SLOT, block, 1)
             .replace(NUDGE_IDLE_TASKS_ID_SLOT, "tsk_1")
         )
-        assert self._fmt(child_ws_ids=[]) == opener + childless
+        assert self._fmt(children=[]) == opener + childless
 
     def test_escape_branch_precedes_resume_branch(self):
         """Branch order follows harm: guessing on an operator decision is
@@ -833,7 +870,7 @@ class TestFormatIdleTasksNudge:
         redoing a running child's work > a stale list > redone finished
         work.  The blocked-on-child branch is the second escape hatch —
         after the operator one, before "take it"."""
-        out = self._fmt(child_ws_ids=["a1b2c3d4e5f6"])
+        out = self._fmt(children=[("a1b2c3d4e5f6", "running")])
         # The id in this slot must be a BARE HEX string, matching
         # uuid4().hex ids and the FE link regex /^[a-f0-9]{8,64}$/i — a
         # "ws_"-prefixed example taught the model an id shape
@@ -851,53 +888,113 @@ class TestFormatIdleTasksNudge:
         assert out.index("needs_user") < out.index("child_ws_id=")
         assert out.index("child_ws_id=") < out.index("If the next step is yours")
 
-    def test_never_asserts_children_are_done(self):
+    def test_a_running_child_renders_the_running_fact_line(self):
         """This nudge can fire ALONE while children run (the liveness
         nudge can be blocked by its own cap or wait gate), so the
-        CHILDREN-PRESENT body must carry the may-still-be-running line —
-        deleting it reopens the resume-over-live-children hazard the old
-        cross-domain fire gate existed for.  The childless body carries
-        no children claim at all, which asserts nothing false
-        (``test_childless_body_says_nothing_about_children_at_all``)."""
-        assert "may still be running" in self._fmt()
+        CHILDREN-PRESENT body must carry the check-before-redoing
+        protection — deleting it reopens the resume-over-live-children
+        hazard the old cross-domain fire gate existed for.  It rides an
+        OBSERVED fact line, full id: the caller read the state this same
+        event, so the body states it rather than hedging about it."""
+        out = self._fmt(children=[("child-a", "running")])
+        assert (
+            chr(10) + "Child child-a is still running; check before redoing anything it owns."
+        ) in out
+
+    @pytest.mark.parametrize("state", ["thinking", "running", "attention"])
+    def test_every_non_stopped_live_state_reads_as_still_running(self, state):
+        out = self._fmt(children=[("child-a", state)])
+        assert "Child child-a is still running" in out
+        assert "has stopped" not in out
+
+    @pytest.mark.parametrize("state", sorted(NUDGE_CHILD_STOPPED_STATES))
+    def test_a_stopped_child_states_the_stop_and_the_immediate_wait(self, state):
+        """The stranded-child protection, per stopped state (idle AND
+        error — both are states ``wait_for_workstream`` treats as
+        terminal, so the line's wait-returns-immediately claim is true
+        for exactly this set).  The line asserts the stop and the cheap
+        check, NOTHING about results: "may hold uncollected results"
+        was cut as a fabrication — no read observed results existing.
+        This line is the C6b protection — the old caveat's "may have
+        finished" disjunct, now attached to the child it is true of,
+        and the check it invites finds whatever is actually there."""
+        out = self._fmt(children=[("child-a", state)])
+        assert (
+            chr(10) + "Child child-a has stopped — "
+            "wait_for_workstream returns immediately for it."
+        ) in out
+        assert "is still running" not in out.split(chr(10))[1]
+
+    def test_mixed_children_render_one_fact_line_each_in_read_order(self):
+        out = self._fmt(children=[("child-a", "running"), ("child-b", "idle")])
+        lines = out.split(chr(10))
+        assert lines[1] == (
+            "Child child-a is still running; check before redoing anything it owns."
+        )
+        assert lines[2] == (
+            "Child child-b has stopped — "
+            "wait_for_workstream returns immediately for it."
+        )
+
+    def test_no_hedge_survives_about_an_observed_state(self):
+        """MUTATION CONTROL for the retired caveat (ruled 2026-07-29):
+        the read returned each child's state, so "may still be running
+        or may have finished" was manufactured uncertainty, and "while
+        you worked" was manufactured context (the coordinator was IDLE).
+        Neither fabrication may ride back in under any children state.
+        """
+        for children in (
+            [],
+            [("child-a", "running")],
+            [("child-a", "idle")],
+            [("child-a", "running"), ("child-b", "idle")],
+        ):
+            out = self._fmt(children=children)
+            assert "may still be running" not in out, children
+            assert "may have finished" not in out, children
+            assert "while you worked" not in out, children
+            assert "Children of yours" not in out, children
 
     def test_childless_body_says_nothing_about_children_at_all(self):
         """An affirmative empty list — the caller observed no child in a
-        live state — removes EVERY children-bearing element: the caveat
-        sentence and the whole blocked-on-a-child branch.
+        live state — renders EVERY children-bearing element absent: no
+        fact lines and no blocked-on-a-child branch.
 
-        Removing only the sentence was the shipped behaviour for one
-        release, and it left the body omitting the claim about children
-        while keeping the instruction about children — two calls a
-        childless coordinator cannot make, pointing at a lookup that
-        returns nothing.  Both cuts are literal-anchored against their own
-        constants, so a reworded neighbour cannot shift either.
+        Omitting the facts while keeping the instruction was the shipped
+        behaviour for one release, and it left a childless coordinator
+        reading two calls it could not make, pointing at a lookup that
+        returns nothing.  The door cut is literal-anchored against its
+        own constant, so a reworded neighbour cannot shift it.
 
         Asserted first as ABSENCE OF THE TOPIC — no reworded branch could
-        satisfy it — and then as exact string differences, because a cut
-        that also took a neighbouring sentence, or that landed one
-        character off, would satisfy "the lines are gone" while shipping a
-        mangled paragraph.
+        satisfy it — and then as an exact string difference against the
+        children-bearing form, because a cut that also took a
+        neighbouring sentence, or that landed one character off, would
+        satisfy "the lines are gone" while shipping a mangled paragraph.
         """
-        dropped = self._fmt(child_ws_ids=[])
+        dropped = self._fmt(children=[])
 
-        for absent in ("child", "wait_for_workstream", "list_workstreams", "may still be running"):
+        for absent in ("child", "Child", "wait_for_workstream", "list_workstreams"):
             assert absent not in dropped, absent
-        # The INDETERMINATE body minus exactly those two literals.  The
-        # door's own ``task_id`` slot is already populated by the time it
-        # reaches a rendered body, so the literal cut against it has to be
-        # too — matching the constant raw here would silently no-op and
-        # this equality would then be comparing the wrong pair.
-        rendered_door = NUDGE_IDLE_TASKS_CHILD_DOOR.replace(NUDGE_IDLE_TASKS_ID_SLOT, "tsk_1")
-        hedged = self._fmt(child_ws_ids=None)
-        assert rendered_door in hedged
-        assert dropped == hedged.replace(NUDGE_IDLE_TASKS_CHILDREN_CAVEAT, "", 1).replace(
-            rendered_door, "", 1
+        # The children-bearing body minus exactly the fact line and the
+        # rendered door.  The door's own ``task_id`` slot is already
+        # populated by the time it reaches a rendered body, so the
+        # literal cut against it has to be too — matching the constant
+        # raw here would silently no-op and this equality would then be
+        # comparing the wrong pair.
+        rendered_door = (
+            NUDGE_IDLE_TASKS_CHILD_DOOR.replace(NUDGE_IDLE_TASKS_ID_SLOT, "tsk_1")
+            .replace(NUDGE_IDLE_TASKS_WAIT_SLOT, wait_call(["child-a"]), 1)
+            .replace(NUDGE_IDLE_TASKS_CHILD_SLOT, "child-a")
         )
-        # The opening paragraph the caveat cut leaves behind ends at the
-        # counts line it was appended to — the anchor the literal-replace
-        # rests on, and the whole reason the constant carries its own
-        # leading separator.
+        fact_line = (
+            chr(10) + "Child child-a is still running; check before redoing anything it owns."
+        )
+        childful = self._fmt(children=[("child-a", "running")])
+        assert rendered_door in childful
+        assert dropped == childful.replace(fact_line, "", 1).replace(rendered_door, "", 1)
+        # The opening paragraph the fact-line cut leaves behind ends at
+        # the counts line the lines rode under.
         assert dropped.startswith(
             "You still have 2 open tasks: 1 in_progress, 1 pending." + chr(10)
         )
@@ -909,67 +1006,52 @@ class TestFormatIdleTasksNudge:
             assert kept_fragment in dropped, kept_fragment
 
     def test_populated_child_slots_are_the_other_half_of_the_read(self):
-        """One value carries the caveat, the branch AND the branch's two
-        slots, so a non-empty list moves all of them.
+        """One value carries the fact lines, the branch AND the branch's
+        two slots, so a non-empty list moves all of them.
 
         This is the deliberate consequence of not splitting the read into
-        a bool beside a list: in production every one of those answers one
+        two derivations: in production every one of those answers one
         storage question, and two derivations of one question are two
-        things that can disagree — which is precisely how the sentence
-        came to be conditional while the branch below it was not.
+        things that can disagree — which is precisely how the children
+        sentence once came to be conditional while the branch below it
+        was not.
         """
-        populated = self._fmt(child_ws_ids=["child-a", "child-b"])
+        populated = self._fmt(children=[("child-a", "running"), ("child-b", "idle")])
 
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT in populated
+        assert "Child child-a is still running" in populated
+        assert "Child child-b has stopped" in populated
         assert NUDGE_IDLE_TASKS_CHILD_SLOT not in populated
         # The SCALAR slot takes one id; the LIST slot takes them all,
         # because a list has no wrong element to pick.
         assert "child_ws_id='child-a'" in populated
         assert f"    {wait_call(['child-a', 'child-b'])}" in populated
 
-    def test_caveat_rides_the_counts_line_as_its_second_sentence(self):
-        """The caveat's leading two-space separator makes it the second
-        sentence of the opening paragraph, exactly as it was the closing
-        sentence of the paragraph it used to ride."""
-        kept = self._fmt(child_ws_ids=["child-a"])
+    def test_fact_lines_ride_directly_under_the_counts_line(self):
+        """The opening fact block is one paragraph — the counts line
+        with the per-child lines directly beneath it, then the blank
+        line the tail's first element carries."""
+        kept = self._fmt(children=[("child-a", "running")])
         assert kept.startswith(
-            "You still have 2 open tasks: 1 in_progress, 1 pending.  Children of yours"
+            "You still have 2 open tasks: 1 in_progress, 1 pending." + chr(10) + "Child child-a"
         )
 
-    def test_indeterminate_children_keeps_the_caveat(self):
-        """``None`` is "the read failed", not "no children".
-
-        The hedge is unconditionally true, so keeping it can only ever be
-        uninformative; omitting it turns a failed read into an implied
-        all-clear.  Only an affirmative negative may select omission.
-
-        A failed read also populates NOTHING: an id invented from an
-        unknown answer would put a call the model cannot run in front of
-        it, which is precisely the failure the ``a1b2c3d4`` constant used
-        to cause.
-        """
-        hedged = self._fmt(child_ws_ids=None)
-
-        assert "may still be running" in hedged
-        assert hedged.count(NUDGE_IDLE_TASKS_CHILD_SLOT) == 2
-        assert f"    {NUDGE_IDLE_TASKS_WAIT_SLOT}" in hedged
-
-    def test_caveat_constant_is_the_tails_own_sentence(self):
-        """The constant and the tail are ONE sentence, not two copies.
+    def test_the_door_is_the_tails_own_literal(self):
+        """The constant and the tail are ONE text, not two copies.
 
         If the tail were reworded without the constant (or vice versa),
         the literal-anchored removal would silently no-op and every
-        childless body would ship the caveat again — a failure with no
-        symptom at the call site.
+        childless body would ship the children branch again — a failure
+        with no symptom at the call site.  With the caveat sentence
+        retired for formatter-built fact lines, the door is the tail's
+        ONLY children-bearing element, so this is the whole conditional.
         """
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT in NUDGE_IDLE_TASKS_TAIL
-        assert NUDGE_IDLE_TASKS_TAIL.count(NUDGE_IDLE_TASKS_CHILDREN_CAVEAT) == 1
-        # It carries its own leading sentence separator, so removing it
-        # cannot leave a double space or a hanging clause — the tail
-        # then opens directly on the branch paragraphs.
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT.startswith("  ")
-        stripped = NUDGE_IDLE_TASKS_TAIL.replace(NUDGE_IDLE_TASKS_CHILDREN_CAVEAT, "", 1)
-        assert stripped.startswith(NUDGE_IDLE_TASKS_OPEN_LIST_SLOT)
+        assert NUDGE_IDLE_TASKS_CHILD_DOOR in NUDGE_IDLE_TASKS_TAIL
+        assert NUDGE_IDLE_TASKS_TAIL.count(NUDGE_IDLE_TASKS_CHILD_DOOR) == 1
+        # The door carries its own leading blank line, so removing it
+        # cannot leave doubled spacing; and with no caveat in front of
+        # it the tail opens directly on the open-list slot.
+        assert NUDGE_IDLE_TASKS_CHILD_DOOR.startswith(chr(10) * 2)
+        assert NUDGE_IDLE_TASKS_TAIL.startswith(NUDGE_IDLE_TASKS_OPEN_LIST_SLOT)
 
     def test_every_slot_is_present_exactly_where_the_formatter_expects_it(self):
         """The slots and the tail are ONE text, not two copies — the same
@@ -1023,7 +1105,7 @@ class TestFormatIdleTasksNudge:
         call = wait_call(ids)
 
         assert call in format_idle_children_nudge([{"ws_id": i, "state": "running"} for i in ids])
-        assert call in self._fmt(child_ws_ids=ids)
+        assert call in self._fmt(children=[(ws_id, "running") for ws_id in ids])
 
     def test_ids_populate_every_call_and_nothing_else_does(self):
         """The open ids ride in two places and only two: the block, and
@@ -1066,6 +1148,30 @@ class TestFormatIdleTasksNudge:
             "  - tsk_good (pending)"
         ]
         assert mixed.count("task_id='tsk_good'") == 3
+
+    def test_a_hostile_status_drops_its_row_like_a_hostile_id(self):
+        """BOTH row fields take the alteration check, symmetrically: the
+        bullet interpolates the status beside the id, so a status the
+        strict sanitiser would alter is dropped with its row rather than
+        mangled into the body.  Unreachable through the production
+        producer — ``_open_tasks`` vocabulary-filters statuses — so this
+        pins the formatter's PUBLIC surface, where ``open_task_ids`` is
+        caller-supplied.  The counts stay the producer's mapping and are
+        untouched by the drop.
+        """
+        newline = chr(10)
+        out = self._fmt(
+            open_task_ids=[
+                ("tsk_bad", "pending" + newline + "  - tsk_forged (done)"),
+                ("tsk_good", "pending"),
+            ]
+        )
+        assert [ln for ln in out.split(newline) if ln.startswith("  - ")] == [
+            "  - tsk_good (pending)"
+        ]
+        assert "tsk_forged" not in out
+        assert out.count("task_id='tsk_good'") == 3
+        assert out.startswith("You still have 2 open tasks: 1 in_progress, 1 pending.")
 
     def test_no_system_reminder_envelope(self):
         """The body is raw text; the wire boundary folds it, not this."""

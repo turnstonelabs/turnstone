@@ -21,8 +21,9 @@ import pytest
 
 from turnstone.console.coordinator_idle_observer import _ACTIVE_CHILD_STATES
 from turnstone.core.metacognition import (
+    NUDGE_IDLE_TASKS_CHILD_DOOR,
     NUDGE_IDLE_TASKS_CHILD_SLOT,
-    NUDGE_IDLE_TASKS_CHILDREN_CAVEAT,
+    NUDGE_IDLE_TASKS_ID_SLOT,
 )
 from turnstone.core.session import COORDINATOR_TOOLS
 from turnstone.core.storage._registry import (
@@ -644,7 +645,7 @@ class TestSweepValidation:
     def test_no_caveat_arm_with_only_terminal_children_is_refused(self):
         """``closed`` / ``deleted`` are the strings the close and reap
         paths write, and they are NOT ``WorkstreamState`` members — a row
-        in one of them is gone, so the cell is childless for the caveat's
+        in one of them is gone, so the cell is childless for the body's
         purposes however many rows it declares."""
         for state in ("closed", "deleted"):
             cell = {
@@ -669,8 +670,8 @@ class TestSweepValidation:
     def test_no_caveat_arm_passes_on_any_live_child_including_idle(self):
         """EXISTENCE-in-a-live-state, deliberately broader than the pair
         arms' ACTIVE predicate: C6b's idle child — a child that finished
-        with results nobody collected — is precisely the state the
-        caveat's second disjunct covers, and it fails the pair-arm check
+        with results nobody collected — is precisely the row the
+        stopped-child fact line protects, and it fails the pair-arm check
         (``test_pair_arm_with_only_inactive_children_is_refused``) while
         passing this one.  Both are correct."""
         for state in sorted(_LIVE_CHILD_STATES):
@@ -695,6 +696,89 @@ class TestSweepValidation:
                 "tasks": [_OPEN_TASK],
             }
             _validate_cells([cell])
+
+    def test_a_childless_cell_is_refused_under_an_override(self):
+        """Item: an override sweep can no longer force children content
+        into a childless world, STRUCTURALLY.  A childless cell renders
+        the formatter's childless branch, whose literal door cut would
+        silently strip a candidate that quotes the shipped
+        blocked-on-a-child branch — so the sweep refuses the cell at
+        config validation, naming the cell and the reason, before any
+        model round-trip.  Without an override the same cell passes:
+        the shipped tail is exactly what the cut is defined against.
+        """
+        cell = {
+            "id": "X_override_childless",
+            "arms": [ARM_NUDGE],
+            "children": [],
+            "tasks": [_OPEN_TASK],
+        }
+        _validate_cells([cell])  # fine against the shipped body
+        with pytest.raises(SystemExit) as excinfo:
+            _validate_cells([cell], override_active=True)
+        message = str(excinfo.value)
+        assert "X_override_childless" in message, message
+        assert "body-override" in message, message
+        assert "live state" in message, message
+
+    def test_a_terminal_only_children_cell_is_refused_under_an_override(self):
+        """The refusal keys on the LIVE derivation, not the raw list: a
+        cell whose every child row is terminal is a childless world to
+        the formatter, so a raw-list predicate would wave it through and
+        the door cut would maul the candidate anyway."""
+        cell = {
+            "id": "X_override_terminal",
+            "arms": [ARM_NUDGE],
+            "children": [
+                {
+                    "ws_id": "ws-c1",
+                    "name": "auditor",
+                    "state": "closed",
+                    "transcript": [_ASSIGNMENT_ROW, _FINDINGS_ROW],
+                }
+            ],
+            "tasks": [_OPEN_TASK],
+        }
+        _validate_cells([cell])
+        with pytest.raises(SystemExit, match="X_override_terminal"):
+            _validate_cells([cell], override_active=True)
+
+    def test_a_live_child_cell_passes_under_an_override(self):
+        """The refusal is exactly as wide as the maul: any live-state
+        child row keeps the door in play, so the cell measures the
+        candidate as authored (idle included — the C6b class is a legal
+        override cell)."""
+        for state in ("running", "idle"):
+            cell = {
+                "id": f"X_override_{state}",
+                "arms": [ARM_NUDGE],
+                "children": [
+                    {
+                        "ws_id": "ws-c1",
+                        "name": "auditor",
+                        "state": state,
+                        "transcript": [_ASSIGNMENT_ROW]
+                        + ([_FINDINGS_ROW] if state == "idle" else []),
+                    }
+                ],
+                "tasks": [_OPEN_TASK],
+            }
+            _validate_cells([cell], override_active=True)
+
+    def test_the_shipped_cells_that_survive_an_override_are_the_children_ones(self):
+        """The shipped grid under ``--body-override``: exactly the two
+        children-bearing cells validate; every childless cell is refused
+        by name.  (An override sweep therefore runs with ``--cells
+        C6_co_delivery,C6b_stranded_children`` or a fixture edit — never
+        with a silently mauled childless body.)"""
+        with_children = [c for c in NUDGE_CELLS if _live_children(c.get("children") or [])]
+        assert {c["id"] for c in with_children} == {"C6_co_delivery", "C6b_stranded_children"}
+        _validate_cells(with_children, override_active=True)
+        for cell in NUDGE_CELLS:
+            if cell in with_children:
+                continue
+            with pytest.raises(SystemExit, match=cell["id"]):
+                _validate_cells([cell], override_active=True)
 
     def test_the_cells_that_declare_no_caveat_are_the_ones_with_children(self):
         """The shipped grid, named rather than assumed.
@@ -951,7 +1035,9 @@ class TestRefusalsPrecedeTheCanary:
     _SENTINEL = "canary-probe-entered"
 
     @classmethod
-    def _sweep(cls, monkeypatch, cells: list[dict[str, Any]]) -> None:
+    def _sweep(
+        cls, monkeypatch, cells: list[dict[str, Any]], *, override: str | None = None
+    ) -> None:
         from turnstone.eval import nudges as nudges_module
 
         def _probe_sentinel(*a: Any, **k: Any) -> bool:
@@ -968,6 +1054,7 @@ class TestRefusalsPrecedeTheCanary:
             model="eval-model",
             cells=cells,
             n_runs=1,
+            body_override_text=override,
         )
 
     def test_a_good_cell_reaches_the_probe(self, monkeypatch):
@@ -1000,6 +1087,20 @@ class TestRefusalsPrecedeTheCanary:
             with pytest.raises(SystemExit) as excinfo:
                 self._sweep(monkeypatch, [cell])
             assert self._SENTINEL not in str(excinfo.value), cell
+
+    def test_the_override_refusal_fires_before_the_probe(self, monkeypatch):
+        """The override-only class binds at the same point as every
+        other refusal: config time, zero model round-trips.  Both
+        directions, like the class docstring demands — the childless
+        cell refuses WITHOUT the sentinel, and the same cell without an
+        override reaches the probe (so the refusal really is
+        override-conditional)."""
+        cell = {"id": "X_t", "arms": [ARM_NUDGE], "children": [], "tasks": [_OPEN_TASK]}
+        with pytest.raises(SystemExit) as excinfo:
+            self._sweep(monkeypatch, [cell], override="Candidate wording.")
+        assert self._SENTINEL not in str(excinfo.value)
+        with pytest.raises(RuntimeError, match=self._SENTINEL):
+            self._sweep(monkeypatch, [cell])
 
     def test_a_duplicate_cell_id_fires_before_the_probe(self, monkeypatch):
         """The one refusal that reads the whole list rather than a
@@ -1067,13 +1168,14 @@ class TestStimulus:
 
     def test_bodies_are_production_rendered(self):
         """The eval carries no copy of the body: the real formatter over
-        the really-seeded envelope — the counts opener, the id block, the
-        co-delivery honesty line and the escape branch, populated with
-        the seeded id and the seeded child, and NO task text."""
+        the really-seeded envelope — the counts opener, the per-child
+        observed fact line, the id block and the escape branch,
+        populated with the seeded id and the seeded child, and NO task
+        text."""
         env = _envelope({"id": "tsk_1", "title": "audit auth.py", "status": "pending"})
-        body = render_tasks_body(env, child_ws_ids=["ws-c1"])
+        body = render_tasks_body(env, children=[("ws-c1", "running")])
         assert body.startswith("You still have 1 open task: 0 in_progress, 1 pending.")
-        assert "may still be running" in body
+        assert "Child ws-c1 is still running; check before redoing anything it owns." in body
         assert "needs_user" in body
         # The seeded id reaches the block AND the branch calls; the
         # seeded title reaches neither.
@@ -1088,32 +1190,32 @@ class TestStimulus:
         ablation cannot drift from the body that ships.
 
         THE ARM ABLATES THE BODY'S WHOLE CHILDREN AWARENESS, by design.
-        ``child_ws_ids`` governs the caveat sentence, the
+        The ``children`` pairs govern the per-child fact lines, the
         blocked-on-a-child branch and that branch's slots, because in
-        production all of them answer ONE storage read and a bool beside
-        a list is two derivations of one question.  So the arm asks a
-        single clean question — does this body need to mention children
-        at all? — rather than the narrower "what does the sentence buy?"
-        it was named for.  That is a better question, which is why the
-        arm is worth keeping; the name stays because archived sweeps
-        report under it.
+        production all of them answer ONE storage read and a second
+        derivation of it is a state where two answers can disagree.  So
+        the arm asks a single clean question — does this body need to
+        mention children at all? — rather than the narrower "what does
+        the sentence buy?" it was named for.  That is a better question,
+        which is why the arm is worth keeping; the name stays because
+        archived sweeps report under it.
 
         This scope is not drift.  It is what "the formatter's other
-        branch" MEANS now that one condition governs every
-        children-bearing element, and the alternative — a knob that
-        stripped the sentence while keeping the branch — would render a
-        body no coordinator receives, which is the one thing an eval arm
-        may never do.
+        branch" MEANS now that one read governs every children-bearing
+        element, and the alternative — a knob that stripped the fact
+        lines while keeping the branch — would render a body no
+        coordinator receives, which is the one thing an eval arm may
+        never do.
         """
         env = _envelope({"id": "tsk_1", "title": "audit auth.py", "status": "pending"})
-        kept = render_tasks_body(env, child_ws_ids=["ws-c1"])
-        ablated = render_tasks_body(env, child_ws_ids=[])
+        kept = render_tasks_body(env, children=[("ws-c1", "running")])
+        ablated = render_tasks_body(env, children=[])
 
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT in kept
+        assert "Child ws-c1 is still running" in kept
         assert "child_ws_id='ws-c1'" in kept
         # NOTHING about children survives the ablation — asserted as
         # absence of the topic, so a reworded branch cannot pass.
-        for absent in ("child", "wait_for_workstream", "list_workstreams", "may still be running"):
+        for absent in ("child", "Child", "wait_for_workstream", "list_workstreams"):
             assert absent not in ablated, absent
         # ...and nothing else moves.  The counts opener, the id block and
         # the remaining branches survive: this arm ablates an
@@ -1126,16 +1228,20 @@ class TestStimulus:
         turns = build_stimulus(ARM_NO_CAVEAT, envelope=env, children=[_LIVE_CHILD])
         assert turns[1]["content"] == ablated
 
-    def test_the_nudge_arm_derives_the_caveat_from_the_cells_children(self):
+    def test_the_nudge_arm_derives_the_children_facts_from_the_cells_children(self):
         """The ``nudge`` arm renders what a coordinator in that cell's
         state would really receive, which since the observer's probe
-        landed is two different bodies by cell class.
+        landed is two different bodies by cell class — and for the
+        children-bearing class, the OBSERVED per-state fact lines.
 
         The predicate is EXISTENCE in a live state, the observer's own:
-        an idle child keeps the caveat (it may hold results nobody
-        collected) while a terminal row does not count as a child at
-        all.  Deriving through ``_live_children`` rather than the pair
-        arms' active filter is what those two rows detect.
+        an idle child keeps its stopped-with-immediate-wait line (it
+        may hold results nobody collected) while a terminal row does not
+        count as a child at all.  Deriving through ``_live_children``
+        rather than the pair arms' active filter is what those two rows
+        detect — and the STATE riding beside the id is what makes the
+        idle row render as the fact it is instead of a running claim or
+        a hedge.
         """
         env = _envelope({"id": "tsk_1", "title": "audit auth.py", "status": "pending"})
 
@@ -1143,50 +1249,28 @@ class TestStimulus:
             turns = build_stimulus(ARM_NUDGE, envelope=env, children=children)
             return str(turns[1]["content"])
 
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT not in _body([])
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT in _body([_LIVE_CHILD])
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT in _body(
-            [{"ws_id": "ws-c1", "name": "auditor", "state": "idle"}]
+        assert "Child " not in _body([])
+        assert "Child ws-c1 is still running; check before redoing anything it owns." in _body(
+            [_LIVE_CHILD]
         )
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT not in _body(
-            [{"ws_id": "ws-c1", "name": "auditor", "state": "closed"}]
-        )
-
-    def test_an_indeterminate_read_renders_the_children_aware_body(self):
-        """``None`` reaches the formatter unchanged, and the formatter
-        hedges — the eval must not launder a failed read into a
-        measurement of the childless body.
-
-        It is the case a naive "drop when empty" gets wrong, and the one
-        that keeps the blocked-on-a-child branch alive on a failed read.
-        The branch is kept and its slots stay placeholders, which is the
-        honest state: the read that failed is the HARNESS's, so the
-        model's own ``list_workstreams()`` may well answer.  A formatter
-        that instead invented a ws_id from an unknown read would put a
-        call the model cannot run in front of it, which is the exact
-        failure the invented ``a1b2c3d4`` constant used to cause.
-        """
-        env = _envelope({"id": "tsk_1", "title": "audit auth.py", "status": "pending"})
-        hedged = render_tasks_body(env, child_ws_ids=None)
-        childless = render_tasks_body(env, child_ws_ids=[])
-
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT in hedged
-        assert "If an item is waiting on a child workstream" in hedged
-        # No fabricated child anywhere: an unknown read leaves both child
-        # slots as their honest placeholders.
-        assert "ws-c1" not in hedged
-        assert hedged.count(NUDGE_IDLE_TASKS_CHILD_SLOT) == 2
-        # The childless body is the same one minus every children-bearing
-        # element, so the hedged/childless pair is the whole conditional.
-        for absent in ("child", "wait_for_workstream", "list_workstreams"):
-            assert absent not in childless, absent
+        idle_body = _body([{"ws_id": "ws-c1", "name": "auditor", "state": "idle"}])
+        assert (
+            "Child ws-c1 has stopped — "
+            "wait_for_workstream returns immediately for it."
+        ) in idle_body
+        assert "Child " not in _body([{"ws_id": "ws-c1", "name": "auditor", "state": "closed"}])
+        # No hedge about an observed state, in any cell class.
+        for children in ([], [_LIVE_CHILD], [{"ws_id": "ws-c1", "state": "idle"}]):
+            body = _body(children)
+            assert "may still be running" not in body, children
+            assert "while you worked" not in body, children
 
     def test_ragged_envelope_rows_do_not_raise(self):
         env = _envelope(
             {"id": "tsk_1", "title": None, "status": "pending", "note": 42},
             "not-a-dict-row",
         )
-        body = render_tasks_body(env, child_ws_ids=["ws-c1"])
+        body = render_tasks_body(env, children=[("ws-c1", "running")])
         assert body.startswith("You still have 1 open task")
 
     def test_seed_transcript_pairs_calls_with_results(self):
@@ -1301,77 +1385,52 @@ class TestBodyOverrideSkip:
         assert "skipped" not in cell[arm]
         assert cell[arm]["n"] == 2
 
-    def test_override_never_applies_the_caveat_conditional(self):
-        """A candidate that keeps the caveat sentence verbatim while
-        rewording another paragraph is the LIKELIEST tuning shape there
-        is, and it is the one the literal-anchored cut would silently
-        maul: the sentence is present, so the removal lands, and a
-        childless cell would file a caveat-stripped candidate under the
-        heading of the wording the operator actually wrote.
+    def test_a_children_cell_measures_a_door_quoting_candidate_as_authored(self):
+        """The LIKELIEST candidate shape there is: one that keeps the
+        shipped blocked-on-a-child branch verbatim while rewording
+        another paragraph.  On a children cell — the only cell class an
+        override sweep still admits — the formatter's door cut never
+        runs (children are present), so the candidate's quoted branch
+        survives byte-exact and its slots are populated exactly as
+        production would populate the shipped text.  The childless cell
+        that would have mauled this candidate is refused at config time
+        (``test_a_childless_cell_is_refused_under_an_override``), which
+        is the structural half of the same protection.
 
-        So the conditional is off whenever an override is installed —
-        every arm, every cell, including the arm whose whole definition
-        is the other branch.  Asserted through the REAL override context
-        manager, because the mechanism under test is the one that swaps
-        the module constant.
+        Asserted through the REAL override context manager, because the
+        mechanism under test is the one that swaps the module constant.
         """
         from turnstone.eval import nudges as nudges_module
 
         env = _envelope({"id": "tsk_1", "title": "audit auth.py", "status": "pending"})
-        candidate = (
-            NUDGE_IDLE_TASKS_CHILDREN_CAVEAT
-            + chr(10) * 2
-            + "Reworded branch paragraph: use tasks(action='update', "
-            + "task_id='tsk_...', status='needs_user')."
-        )
+        candidate = "Reworded opening paragraph: reconcile your list." + NUDGE_IDLE_TASKS_CHILD_DOOR
         with nudges_module._body_override(candidate):
-            forced = render_tasks_body(env, child_ws_ids=[], override_active=True)
-            through_the_arm = build_stimulus(
-                ARM_NO_CAVEAT, envelope=env, children=[_LIVE_CHILD], override_active=True
-            )
-            # The control: without the override rule this is what the
-            # candidate would have been reported as.
-            unprotected = render_tasks_body(env, child_ws_ids=[])
+            rendered = render_tasks_body(env, children=[("ws-c1", "running")])
+            through_the_arm = build_stimulus(ARM_NUDGE, envelope=env, children=[_LIVE_CHILD])
+            # The control: the childless branch really would cut the
+            # quoted door out of this candidate — the maul the refusal
+            # and the skip exist to make unreachable.
+            mauled = render_tasks_body(env, children=[])
 
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT in forced
-        # The candidate tail rides byte-exact after the formatter-built
-        # counts opener — the opener is seeded state, not tuned text, so
-        # an override never touches it.
-        assert forced == "You still have 1 open task: 0 in_progress, 1 pending." + candidate
-        assert through_the_arm[1]["content"] == forced
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT not in unprotected, (
+        # Formatter-built facts lead; the candidate rides after them
+        # with its quoted door substituted, never stripped.
+        assert rendered.startswith(
+            "You still have 1 open task: 0 in_progress, 1 pending."
+            + chr(10)
+            + "Child ws-c1 is still running; check before redoing anything it owns."
+        )
+        assert "record the link and wait instead of redoing its work" in rendered
+        assert "child_ws_id='ws-c1'" in rendered
+        assert NUDGE_IDLE_TASKS_CHILD_SLOT not in rendered
+        # The candidate's own task-id slot has no open-list machinery in
+        # this candidate, so it substitutes from the seeded set like the
+        # shipped tail's would.
+        assert "task_id='tsk_1'" in rendered
+        assert NUDGE_IDLE_TASKS_ID_SLOT not in rendered
+        assert through_the_arm[1]["content"] == rendered
+        assert "record the link and wait instead of redoing its work" not in mauled, (
             "the control must show the cut really lands on candidate text"
         )
-
-    def test_the_runner_threads_the_override_flag_into_every_run(self, monkeypatch):
-        """The skip covers the two ablation arms; ``override_active`` is
-        what protects the REST of the grid, whose bodies are rendered
-        from the candidate text.  Pinned on the argument the runs receive
-        — a runner that computed the flag and dropped it would leave the
-        conditional live against unknown text, which is the whole class
-        the skip exists to close."""
-        from turnstone.eval import nudges as nudges_module
-
-        seen: list[bool] = []
-
-        def _fake_run(**kw: Any) -> dict[str, Any]:
-            seen.append(kw["override_active"])
-            return {"pass": True, "failures": [], "forbidden": [], "actions": ["tasks"]}
-
-        monkeypatch.setattr(nudges_module, "tool_call_canary", lambda *a, **k: True)
-        monkeypatch.setattr(nudges_module, "_run_single_nudge", _fake_run)
-        cells = [{"id": "X_tuning", "arms": [ARM_NUDGE], "tasks": [_OPEN_TASK]}]
-        for override, expected in (("Candidate wording.", True), (None, False)):
-            seen.clear()
-            run_nudge_response(
-                base_url="http://eval.invalid/v1",
-                api_key="x",
-                model="eval-model",
-                cells=cells,
-                n_runs=2,
-                body_override_text=override,
-            )
-            assert seen == [expected, expected], override
 
 
 class TestBodyFingerprint:
@@ -1385,7 +1444,9 @@ class TestBodyFingerprint:
     """
 
     @staticmethod
-    def _sweep(monkeypatch, *, override: str | None) -> dict[str, Any]:
+    def _sweep(
+        monkeypatch, *, override: str | None, cells: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         from turnstone.eval import nudges as nudges_module
 
         monkeypatch.setattr(nudges_module, "tool_call_canary", lambda *a, **k: True)
@@ -1398,7 +1459,9 @@ class TestBodyFingerprint:
             base_url="http://eval.invalid/v1",
             api_key="x",
             model="eval-model",
-            cells=[
+            cells=cells
+            if cells is not None
+            else [
                 {"id": "X_a", "arms": [ARM_NUDGE], "tasks": [_OPEN_TASK]},
                 {
                     "id": "X_b",
@@ -1436,21 +1499,52 @@ class TestBodyFingerprint:
     def test_the_fingerprint_is_of_the_effective_tail_under_an_override(self, monkeypatch):
         """Taken INSIDE the override context, so the hash is of the text
         the runs really saw — a fingerprint of the shipped tail under a
-        tuning sweep would be a false provenance stamp, which is worse
-        than none."""
+        candidate sweep would be a false provenance stamp, which is
+        worse than none.
+
+        An override sweep admits only children-bearing cells (the
+        childless class is refused at config time), so the default
+        two-cell fixture cannot serve here — both cells carry a live
+        child, and both stamp the ``children_present`` fact their runs
+        really rendered, DERIVED rather than forced by a flag.
+        """
         from turnstone.core import metacognition as metacog
 
         candidate = "Candidate wording under test."
-        out = self._sweep(monkeypatch, override=candidate)
+        out = self._sweep(
+            monkeypatch,
+            override=candidate,
+            cells=[
+                {
+                    "id": "X_b",
+                    "arms": [ARM_NUDGE],
+                    "children": [_LIVE_CHILD],
+                    "tasks": [_OPEN_TASK],
+                },
+                {
+                    "id": "X_c",
+                    "arms": [ARM_NUDGE],
+                    "children": [
+                        {
+                            "ws_id": "ws-c9",
+                            "name": "researcher",
+                            "state": "idle",
+                            "transcript": [
+                                _ASSIGNMENT_ROW,
+                                _FINDINGS_ROW,
+                            ],
+                        }
+                    ],
+                    "tasks": [_OPEN_TASK],
+                },
+            ],
+        )
 
         assert out["body"]["override"] is True
         assert out["body"]["tail_sha256"] == hashlib.sha256(candidate.encode()).hexdigest()
-        # The conditional is off under an override, on EVERY cell — so
-        # the childless cell stamps ``True`` here, matching the body its
-        # runs really received rather than the fact its fixture holds.
         assert out["body"]["cells"] == {
-            "X_a": {"children_present": True},
             "X_b": {"children_present": True},
+            "X_c": {"children_present": True},
         }
         # ...and the constant is restored afterwards, so the stamp is
         # not evidence of a leaked override.

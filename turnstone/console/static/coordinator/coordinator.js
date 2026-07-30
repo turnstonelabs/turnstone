@@ -1191,9 +1191,12 @@ function createCoordinatorPane(root, wsId, opts) {
   // vocabulary per surface-kind, not one rule for both cards.
   function appendIdleChildren(meta) {
     const children = Array.isArray(meta.children) ? meta.children : [];
-    // The ws_id prefix rides as `ident` — the same 8 chars the
-    // model-facing body's bullet carries — and is the row's identity
-    // column; a fresh row renders ident + state and nothing else.
+    // The ws_id's first 8 chars ride as `ident` — display formatting
+    // over the same full id the model-facing body's bullet carries
+    // whole (the bullet is a handle for the resolver, which refuses
+    // prefixes; this column is a label for the operator's eye) — and
+    // `ident` is the row's identity column; a fresh row renders
+    // ident + state and nothing else.
     const rows = children.map((c) => ({
       ident: c && c.ws_id ? String(c.ws_id).slice(0, 8) : "",
       name: c && c.name ? String(c.name) : "",

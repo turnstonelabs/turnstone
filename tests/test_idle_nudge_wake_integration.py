@@ -32,7 +32,7 @@ from tests._helpers import wait_until as _wait_until
 from tests.test_session_manager import FakeStorage
 from turnstone.core import session_worker
 from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher, wake_workstream_if_pending
-from turnstone.core.metacognition import NUDGE_IDLE_TASKS_CHILDREN_CAVEAT
+from turnstone.core.metacognition import NUDGE_IDLE_TASKS_CHILD_DOOR
 from turnstone.core.session import ChatSession
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.trajectory import dicts_from_turns, turn_from_dict
@@ -563,10 +563,15 @@ def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db
         assert chr(10) + "  - tsk_a (in_progress)" in tasks_text
         assert "task_id='tsk_a'" in tasks_text
         assert "audit auth.py" not in tasks_text
-        # The caveat branch the read selects when a live child row is
-        # really in storage — the populated half of the pair whose empty
-        # half is the test below.
-        assert "may still be running" in tasks_text
+        # The children-aware branch the read selects when a live child
+        # row is really in storage — the populated half of the pair
+        # whose empty half is the test below.  The fact line renders the
+        # OBSERVED state (registered running) with the full id, end to
+        # end through the real storage round-trip.
+        assert (
+            "Child child-a is still running; check before redoing anything it owns." in tasks_text
+        )
+        assert "may still be running" not in tasks_text
         # CO-DELIVERY COHERENCE, end to end: both bodies in one drain now
         # name the same child, from two independent storage reads.  The
         # tasks body populates its blocked-on-a-child branch with the
@@ -591,15 +596,16 @@ def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db
         observer.shutdown()
 
 
-def test_coord_idle_with_open_tasks_and_no_children_omits_the_caveat(coord_mgr, tmp_db):
+def test_coord_idle_with_open_tasks_and_no_children_omits_children_content(coord_mgr, tmp_db):
     """The childless sibling of the test above, over the same chain:
-    no child rows registered, so the enqueue-time existence aggregate
-    answers "none" and the DELIVERED body says nothing about children.
+    no child rows registered, so the enqueue-time live-children read
+    answers "none" and the DELIVERED body says nothing about children —
+    no fact lines, no blocked-on-a-child branch.
 
     Asserted on the transcript rather than on the formatter's return,
     because the claim is about what the coordinator is actually told:
-    the probe queries the storage backend through the real
-    ``count_workstreams_by_state``, and every boundary between that read
+    the body's children read queries the storage backend through the
+    real ``list_workstreams``, and every boundary between that read
     and the system turn — observer, queue, watcher, wake worker,
     ``deliver_wake_nudge_from_queue`` — is production code.
     """
@@ -659,10 +665,12 @@ def test_coord_idle_with_open_tasks_and_no_children_omits_the_caveat(coord_mgr, 
             m["content"] for m in msgs if m.get("role") == "system" and m["_source"] == "idle_tasks"
         )
         assert tasks_text.startswith("You still have 1 open task: 1 in_progress, 0 pending.")
-        assert "may still be running" not in tasks_text
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT not in tasks_text
+        assert "Child " not in tasks_text
+        assert "child" not in tasks_text
+        assert NUDGE_IDLE_TASKS_CHILD_DOOR not in tasks_text
         # The nudge is otherwise the shipped one: the conditional drops
-        # a sentence, not the opener, the id block or the instructions.
+        # the fact lines and the blocked-on-a-child branch, not the
+        # opener, the id block or the other instructions.
         assert "needs_user" in tasks_text
         # End to end, through the REAL storage round-trip: the id that
         # went into ``workstream_config`` comes back out populated into

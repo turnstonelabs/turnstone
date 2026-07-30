@@ -25,8 +25,8 @@ from turnstone.console.coordinator_idle_observer import (
     CoordinatorIdleObserver,
 )
 from turnstone.core.metacognition import (
+    NUDGE_CHILD_STOPPED_STATES,
     NUDGE_IDLE_TASKS_CHILD_SLOT,
-    NUDGE_IDLE_TASKS_CHILDREN_CAVEAT,
     NUDGE_IDLE_TASKS_ID_SLOT,
     NUDGE_IDLE_TASKS_WAIT_SLOT,
     NUDGE_REQUIRED_TOOL,
@@ -350,14 +350,14 @@ class TestEnqueueOnIdle:
         # Same set, same order, same count — one list underneath.
         assert [r["ws_id"] for r in rows] == ["child-a", "child-b", "child-c-longer-than-8"]
 
-        # The model-facing body: id-prefix + state bullets, byte-exact,
+        # The model-facing body: FULL id + state bullets, byte-exact,
         # so no fragment of any name — hostile or benign — can ride
         # along, and no ``(unnamed)`` fallback exists to stand in.
         bullets = [ln for ln in text.split(chr(10)) if ln.startswith("  - ")]
         assert bullets == [
             "  - child-a (running)",
             "  - child-b (thinking)",
-            "  - child-c- (running)",
+            "  - child-c-longer-than-8 (running)",
         ]
         assert "thinking>" not in text  # the tag, never the state word
         assert "200ms" not in text
@@ -370,13 +370,15 @@ class TestEnqueueOnIdle:
         for row in rows:
             assert set(row) == {"ws_id", "state"}
 
-        # IDENTITY.  The meta keeps ``ws_id`` raw on every row, and the
-        # FE derives its ident column from it (``String(c.ws_id).slice(0,
-        # 8)`` in ``appendIdleChildren``, pinned in test_coordinator_page),
-        # matching the 8-char prefix the body's own bullet renders.
+        # IDENTITY.  The meta keeps ``ws_id`` raw on every row; the body
+        # bullet carries the same full id (a HANDLE — the resolver
+        # refuses prefixes), and the FE derives its 8-char display ident
+        # from the meta (``String(c.ws_id).slice(0, 8)`` in
+        # ``appendIdleChildren``, pinned in test_coordinator_page) —
+        # formatting over one value, not a second value.
         assert all(r["ws_id"] for r in rows)
-        assert rows[2]["ws_id"][:8] == "child-c-"
-        assert "child-c-" in bullets[2]
+        assert rows[2]["ws_id"] == "child-c-longer-than-8"
+        assert bullets[2] == "  - child-c-longer-than-8 (running)"
 
     def test_idle_with_no_active_children_no_enqueue(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -773,12 +775,11 @@ class TestIdleTasks:
     The load-bearing case is ``test_active_children_co_deliver_with_
     idle_tasks``: the classes are independent conditions, so when both
     hold the pair CO-DELIVERS in one drain, tasks first.  Each body
-    asserts only its own domain — the tasks body carries the "children
-    may still be running" caveat whenever a live child row exists, and
-    says nothing about children when none does — so a consistent pair
-    is two true statements.  The thing that must never happen is a
-    STALE pair, which the per-path reads and per-entry predicates
-    prevent.
+    asserts only its own domain — the tasks body renders one observed
+    fact line per live child row, and says nothing about children when
+    none exists — so a consistent pair is two true statements.  The
+    thing that must never happen is a STALE pair, which the per-path
+    reads and per-entry predicates prevent.
     """
 
     def test_open_tasks_and_no_children_enqueues(self, coord_setup):
@@ -1376,14 +1377,18 @@ class TestIdleTasksMetadata:
         assert meta["counts"] == {"open": 1, "in_progress": 0, "pending": 1}
 
 
-class TestTasksBodyChildrenCaveat:
+class TestTasksBodyChildrenFacts:
     """Which BODY the tasks path enqueues, by observed children state.
 
-    The caveat is the one sentence in the tasks body that speaks about
-    the other domain.  It is conditioned on EXISTENCE — any child row in
-    a live state — and not on the liveness path's ACTIVE set, because an
-    idle child holding results nobody collected is exactly the "may have
-    finished while you worked" disjunct the sentence carries.
+    The per-child fact lines are the tasks body's one statement about
+    the other domain, and they render the OBSERVED ``(ws_id, state)``
+    the read returned — never a hedge about it (the retired caveat's
+    "may still be running or may have finished while you worked" was
+    manufactured uncertainty plus manufactured context, ruled out
+    2026-07-29).  They are conditioned on EXISTENCE — any child row in
+    a live state — and not on the liveness path's ACTIVE set, because
+    an idle child holding results nobody collected is exactly the row
+    the stopped-child line protects.
 
     Everything here is about CONTENT.  That the fire itself is
     untouched by any ANSWER these states return is
@@ -1406,7 +1411,7 @@ class TestTasksBodyChildrenCaveat:
         pending = ws.session._nudge_queue.pending_with_metadata("any")
         return next(entry for entry in pending if entry[0] == "idle_tasks")
 
-    def test_childless_body_omits_caveat_card_meta_unchanged(self, coord_setup):
+    def test_childless_body_omits_children_facts_card_meta_unchanged(self, coord_setup):
         """The measured harm, removed: a coordinator with no children is
         no longer told to go and check on children it does not have.
 
@@ -1418,28 +1423,38 @@ class TestTasksBodyChildrenCaveat:
         mgr, storage, ws = coord_setup
         _type, text, meta = self._fire(mgr, storage, ws)
 
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT not in text
-        assert "may still be running" not in text
-        # The rest of the body is untouched — this removes a sentence,
-        # not the opener it rides or the branches after it.
+        assert "Child " not in text
+        assert "child" not in text
+        # The rest of the body is untouched — this omits the fact lines,
+        # not the counts line they ride under or the branches after it.
         assert text.startswith("You still have 1 open task: 1 in_progress, 0 pending.")
         assert "needs_user" in text
         assert meta == {"counts": {"open": 1, "in_progress": 1, "pending": 0}}
 
     def test_idle_child_keeps_the_caveat(self, coord_setup):
-        """The stranded-children case: the load-bearing detector for
-        a probe wired to ``_ACTIVE_CHILD_STATES`` instead of
-        ``_LIVE_CHILD_STATES``, which no gate-matrix or metadata test
-        can see (they all seed running children or none).  Its siblings
-        are ``test_every_live_state_keeps_the_caveat[idle]`` and the
+        """The stranded-children case, and the C6b protection: the
+        stopped-child fact line must state the stop and the immediate
+        wait — the retired hedge's "may have finished" disjunct, now
+        attached to the one child it is true of, with the id the model
+        needs to check.  It asserts NOTHING about results ("may hold
+        uncollected results" was cut as a fabrication — no read ever
+        observed results existing); the immediate wait is the whole
+        protection, because checking is cheap and finds whatever is
+        there.  Load-bearing detector for a probe wired to
+        ``_ACTIVE_CHILD_STATES`` instead of ``_LIVE_CHILD_STATES``,
+        which no gate-matrix or metadata test can see (they all seed
+        running children or none).  Its siblings are
+        ``test_every_live_state_renders_its_fact_line[idle]`` and the
         eval-parity guard's ``idle_child`` scenario; this one carries
-        the reason.
+        the reason.  (The name predates the fact lines — "the caveat"
+        here IS the stopped-child line — and stays so the C6b pointer
+        in the fixture notes keeps resolving.)
 
         An idle child is not actionable — the liveness path will not
         nudge about it, which is why no co-delivered entry appears here
         — but it exists, and it may hold results nobody has collected.
-        Conditioning on the ACTIVE set would strip the hedge from the
-        one state whose protective disjunct is live.
+        Conditioning on the ACTIVE set would drop the line from the one
+        state whose protection is live.
         """
         mgr, storage, ws = coord_setup
         # ``_add_active_child`` seeds ANY state despite its name.
@@ -1447,36 +1462,53 @@ class TestTasksBodyChildrenCaveat:
 
         _type, text, _meta = self._fire(mgr, storage, ws)
 
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT in text
+        assert (
+            "Child child-a has stopped — wait_for_workstream returns immediately for it."
+        ) in text
+        # The observed state renders as itself — never the hedge, never
+        # the other state's line.
+        assert "Child child-a is still running" not in text
+        assert "may still be running" not in text
         # The liveness path stays out of it: an idle child is not
-        # actionable, so this really is the advice nudge alone hedging
+        # actionable, so this really is the advice nudge alone speaking
         # about a child nobody was woken for.
         assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
 
     @pytest.mark.parametrize("state", sorted(_LIVE_CHILD_STATES))
-    def test_every_live_state_keeps_the_caveat(self, coord_setup, state):
+    def test_every_live_state_renders_its_fact_line(self, coord_setup, state):
         """The membership is the enum, not a list someone maintains: a
         state added to ``WorkstreamState`` joins the live set with no
-        edit, and this parametrization grows with it."""
+        edit, and this parametrization grows with it.  Each state gets
+        the line that is TRUE of it: wait-terminal states (idle/error)
+        the stopped line with its immediate-wait point, everything else
+        the still-running line."""
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state=state)
 
         _type, text, _meta = self._fire(mgr, storage, ws)
 
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT in text
+        if state in NUDGE_CHILD_STOPPED_STATES:
+            assert (
+                "Child child-a has stopped — wait_for_workstream returns immediately for it."
+                in text
+            )
+        else:
+            assert "Child child-a is still running; check before redoing anything it owns." in text
 
     @pytest.mark.parametrize("state", ["closed", "deleted"])
     def test_terminal_child_rows_read_as_childless(self, coord_setup, state):
         """``closed`` and ``deleted`` are strings the close and reap
         paths write, and they are NOT ``WorkstreamState`` members — a
-        coordinator whose every child row is terminal has no children to
-        hedge about, however many rows storage still holds."""
+        coordinator whose every child row is terminal has no children
+        for the body to speak about, however many rows storage still
+        holds."""
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state=state)
 
         _type, text, _meta = self._fire(mgr, storage, ws)
 
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT not in text
+        assert "Child " not in text
+        assert "child" not in text
 
     def test_the_advice_fire_is_identical_across_every_answer_the_read_returns(self):
         """The ruling, restated to the width it actually holds: what the
@@ -1773,6 +1805,17 @@ class TestExecutableCalls:
         assert "child_ws_id='child-a'" in text
         assert "child_ws_id='child-b'" not in text
         assert NUDGE_IDLE_TASKS_CHILD_SLOT not in text
+        # ...and each child gets its OWN observed fact line, in read
+        # order — the running one the redo protection, the idle one the
+        # stop and the immediate wait — so the mixed state renders as
+        # two facts, never one hedge covering both.
+        lines = text.split(chr(10))
+        assert lines[1] == (
+            "Child child-a is still running; check before redoing anything it owns."
+        )
+        assert lines[2] == (
+            "Child child-b has stopped — wait_for_workstream returns immediately for it."
+        )
 
     def test_the_blocked_branch_is_a_call_not_prose(self, coord_setup):
         """MUTATION CONTROL: reverting the wait to prose fails here.
@@ -1830,9 +1873,8 @@ class TestExecutableCalls:
 
         text = self._body(mgr, storage, ws)
 
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT not in text
         assert NUDGE_IDLE_TASKS_CHILD_SLOT not in text
-        for fragment in ("child", "wait_for_workstream", "list_workstreams"):
+        for fragment in ("child", "Child", "wait_for_workstream", "list_workstreams"):
             assert fragment not in text, fragment
         # Two calls, not three — and the ones that remain are populated.
         assert self._task_id_args(text) == ["tsk_a"] * 2
@@ -1997,7 +2039,7 @@ class TestIndeterminateChildrenRead:
 
         pending = ws.session._nudge_queue.pending("any")
         assert [t for t, _ in pending] == ["idle_tasks"]
-        assert NUDGE_IDLE_TASKS_CHILDREN_CAVEAT not in pending[0][1]
+        assert "Child " not in pending[0][1]
 
     def test_liveness_does_not_fire_when_children_read_fails(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -3068,7 +3110,7 @@ class TestEvalParity:
     ``_open_task_ids``) and calls the real formatter — the eval carries
     no copy of any comprehension.  Sharing the derivation removes one
     drift class; this guard covers the one that remains: the OBSERVER's
-    plumbing (envelope read → counts + ids → ``child_ws_ids`` argument →
+    plumbing (envelope read → counts + ids → ``children`` argument →
     formatter → card meta) can still diverge from the eval's
     re-derivation over the same envelope, and every sweep would then
     score a body that is not the one shipping, with the merge decision
@@ -3079,13 +3121,13 @@ class TestEvalParity:
     re-derivations agreeing proves nothing about what production emits.
 
     Run on TWO coordinator states, because the body is not one string:
-    the caveat sentence AND the two child slots are conditioned on which
-    child rows exist, so "the eval renders what production renders" is
-    two claims, one per cell class, and a guard that only ever saw the
-    childless state would go green against an eval wired to the wrong
-    branch on every cell that has children.
+    the per-child fact lines AND the two child slots are conditioned on
+    which child rows exist, so "the eval renders what production
+    renders" is two claims, one per cell class, and a guard that only
+    ever saw the childless state would go green against an eval wired
+    to the wrong branch on every cell that has children.
 
-    ``expect_child_ws_ids`` is declared per scenario rather than derived,
+    ``expect_children`` is declared per scenario rather than derived,
     so each branch is a written-down claim about what production emits
     in that state rather than the same derivation run twice.  It is what
     makes a PARTIAL update fail: while the observer passed a literal
@@ -3093,29 +3135,30 @@ class TestEvalParity:
     flipped in the same commit that replaced that literal with a real
     read.  Either half of a pair like that landing alone trips here — an
     observer re-wired to a literal fails ``no_children``, and an eval
-    that stopped deriving the value fails it too.  Declaring the ID
-    rather than a bool is what extends that property to the populated
-    slots: an observer that read the right ROWS but projected the wrong
-    field would still have satisfied a bool.
+    that stopped deriving the value fails it too.  Declaring the
+    ``(ws_id, state)`` PAIR rather than a bool is what extends that
+    property to the fact lines and the populated slots: an observer that
+    read the right ROWS but projected the wrong field — or the id
+    without the state — would still have satisfied a bool.
     """
 
     @pytest.mark.parametrize(
-        ("children", "expect_child_ws_ids"),
+        ("children", "expect_children"),
         [
             pytest.param([], [], id="no_children"),
-            # An IDLE child: a row that exists (so the caveat speaks
+            # An IDLE child: a row that exists (so the fact lines speak
             # about something real) but that the liveness path will not
             # nudge about, so this scenario stays a single-entry
             # comparison rather than turning into a co-delivery test.
             # It is also the second detector for a read miswired to the
             # ACTIVE set — that bug renders the childless body here,
-            # against an eval that (correctly) derives the id.
+            # against an eval that (correctly) derives the pair.
             # ``child-1`` is ``_add_active_child``'s default ws_id.
-            pytest.param([{"state": "idle"}], ["child-1"], id="idle_child"),
+            pytest.param([{"state": "idle"}], [("child-1", "idle")], id="idle_child"),
         ],
     )
     def test_eval_stimulus_matches_production_formatter(
-        self, coord_setup, children, expect_child_ws_ids
+        self, coord_setup, children, expect_children
     ):
         mgr, storage, ws = coord_setup
         # ``_add_active_child`` seeds ANY state despite its name — it
@@ -3186,7 +3229,7 @@ class TestEvalParity:
 
         # 1. The model-facing body is byte-identical to the eval's, on
         #    the branch this coordinator state selects.
-        assert text == render_tasks_body(envelope, child_ws_ids=expect_child_ws_ids)
+        assert text == render_tasks_body(envelope, children=expect_children)
         assert text.startswith("You still have 6 open tasks: 2 in_progress, 4 pending.")
 
         # 2. The operator card records the counts the body told the

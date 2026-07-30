@@ -40,6 +40,20 @@ from typing import Any
 # measured no longer exists to ablate.
 _DISPATCH_TOOLS = ("spawn_workstream", "spawn_batch", "send_to_workstream")
 
+# Child ws_ids are PRODUCTION-SHAPED: 32 lowercase hex, the one shape
+# ``CoordinatorClient._resolve_ws_ref`` accepts on its hot path without
+# a roster read (near-miss ids are NEVER auto-resolved).  The old
+# ``ws-child-a`` style only resolved through the legacy exact-match
+# branch, so every run's inspect/wait/link calls exercised a code path
+# no real coordinator takes — and the nudge bodies handed the model an
+# id shape the FE's link regex refuses.  Stable, patterned constants
+# rather than random hex, so archived transcripts and result files stay
+# eyeball-comparable across sweeps.  (Task ids are not seeded here at
+# all: ``tasks_add`` mints them — ``tsk_`` + ``secrets.token_hex`` —
+# so the seed rows already carry production-shaped ids by construction.)
+C6_CHILD_WS_ID = "c6ac6ac6ac6ac6ac6ac6ac6ac6ac6ac6"
+C6B_CHILD_WS_ID = "c6bc6bc6bc6bc6bc6bc6bc6bc6bc6bc6"
+
 # Forbid specs shared by the legit-stop cells: any child dispatch is
 # "proceeding past the operator" there.
 _FORBID_DISPATCH = [{"tool": t} for t in _DISPATCH_TOOLS]
@@ -213,20 +227,21 @@ NUDGE_CELLS: list[dict[str, Any]] = [
         "id": "C6_co_delivery",
         "notes": (
             "The de-exclusivity cell: a running child owns the audit task.  "
-            "Correct: reconcile (link the task to ws-child-a, in_progress) "
-            "then wait.  Forbidden: spawning a SECOND auditor — redoing a "
-            "running child's work is the co-delivery failure mode.  Arms "
-            "compare the production pair (pair_tf — the only ordering the "
-            "wire can carry; the retired children-first ablation's numbers "
-            "live in the archived sweeps), the advice-alone mis-state "
-            "(nudge), and that mis-state with the children caveat cut out "
-            "of the body (no_caveat) — this cell and C6b are the only two "
-            "where that sentence has a live child to protect, so they are "
+            "Correct: reconcile (link the task to the auditor child's "
+            "ws_id, in_progress) then wait.  Forbidden: spawning a SECOND "
+            "auditor — redoing a running child's work is the co-delivery "
+            "failure mode.  Arms compare the production pair (pair_tf — "
+            "the only ordering the wire can carry; the retired "
+            "children-first ablation's numbers live in the archived "
+            "sweeps), the advice-alone mis-state (nudge), and that "
+            "mis-state with the body's children awareness cut out "
+            "(no_caveat) — this cell and C6b are the only two where the "
+            "children content has a live child to protect, so they are "
             "the only two that can measure what it buys."
         ),
         "children": [
             {
-                "ws_id": "ws-child-a",
+                "ws_id": C6_CHILD_WS_ID,
                 "name": "auditor",
                 "state": "running",
                 # Mid-work: the assignment the transcript's spawn really
@@ -244,7 +259,7 @@ NUDGE_CELLS: list[dict[str, Any]] = [
             {"role": "user", "content": "I want a security pass on the auth module."},
             {
                 "role": "assistant",
-                "content": "Spawned the auditor as ws-child-a; it is working now.",
+                "content": f"Spawned the auditor as {C6_CHILD_WS_ID}; it is working now.",
                 "tool_calls": [
                     {
                         "name": "spawn_workstream",
@@ -252,7 +267,7 @@ NUDGE_CELLS: list[dict[str, Any]] = [
                             "initial_message": "Audit auth.py for CSRF handling",
                             "name": "auditor",
                         },
-                        "result": "created ws-child-a (auditor), state=running",
+                        "result": f"created {C6_CHILD_WS_ID} (auditor), state=running",
                     }
                 ],
             },
@@ -268,7 +283,9 @@ NUDGE_CELLS: list[dict[str, Any]] = [
                 {
                     "tool": "tasks",
                     "args": {"action": "update"},
-                    "args_pattern": {"child_ws_id": "ws-child-a"},
+                    # A 32-hex id is regex-inert (no metacharacters), so
+                    # the pattern matches the literal id and nothing else.
+                    "args_pattern": {"child_ws_id": C6_CHILD_WS_ID},
                 },
                 {"tool": "wait_for_workstream"},
             ],
@@ -284,12 +301,13 @@ NUDGE_CELLS: list[dict[str, Any]] = [
             "question.  Correct: check/collect the child (wait returns "
             "immediately with its result) rather than re-doing the audit.  "
             "The no_caveat arm is the direct test of that cover: the child "
-            "here is IDLE, so the caveat's may-have-finished disjunct is "
-            "the only part of the body pointing at it."
+            "here is IDLE, so the stopped-child fact line (stopped; wait "
+            "returns immediately) is the only part of the body pointing "
+            "at it."
         ),
         "children": [
             {
-                "ws_id": "ws-child-a",
+                "ws_id": C6B_CHILD_WS_ID,
                 "name": "auditor",
                 "state": "idle",
                 # Finished: the assignment plus the completion message the
@@ -325,8 +343,8 @@ NUDGE_CELLS: list[dict[str, Any]] = [
             {
                 "role": "assistant",
                 "content": (
-                    "Spawned the auditor as ws-child-a.  Next I will fold "
-                    "its findings into the report once it returns."
+                    f"Spawned the auditor as {C6B_CHILD_WS_ID}.  Next I will "
+                    "fold its findings into the report once it returns."
                 ),
                 "tool_calls": [
                     {
@@ -335,7 +353,7 @@ NUDGE_CELLS: list[dict[str, Any]] = [
                             "initial_message": "Audit auth.py for CSRF handling",
                             "name": "auditor",
                         },
-                        "result": "created ws-child-a (auditor), state=running",
+                        "result": f"created {C6B_CHILD_WS_ID} (auditor), state=running",
                     }
                 ],
             },

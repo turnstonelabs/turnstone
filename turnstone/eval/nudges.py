@@ -156,19 +156,21 @@ _PAIR_ARMS: frozenset[str] = frozenset({ARM_PAIR_TF})
 # (:func:`_check_body_arms_have_an_open_task`).
 _TASKS_BODY_ARMS: frozenset[str] = KNOWN_ARMS - {ARM_BARE_CONTINUE}
 
-# Why :data:`ARM_NO_CAVEAT` cannot run under ``--body-override``.  Its
-# ablation is literal-anchored, so it does not maul unknown text — it
-# silently does nothing to a candidate that reworded the sentence, and
-# something worse to the likeliest candidate shape of all: one that
-# keeps the caveat verbatim while editing another paragraph still
-# contains the literal, so the cut would land and the sweep would file
-# a caveat-stripped candidate under the tuning heading.  The remedy: an
-# override measures candidate text exactly as authored
-# (:func:`render_tasks_body`'s ``override_active``), so the one arm
-# whose whole definition is "the other branch of the conditional" has
-# nothing to measure while an override is in play.  The cut now takes
-# the blocked-on-a-child BRANCH as well as the sentence, which widens
-# what a mauled candidate would lose without changing the reasoning.
+# Why :data:`ARM_NO_CAVEAT` cannot run under ``--body-override``.  The
+# arm renders the formatter's CHILDLESS branch, and that branch cuts the
+# blocked-on-a-child door out of the tail by literal match — an
+# operation defined against the shipped text.  Against candidate text
+# the cut does not maul unknown wording — it silently does nothing — but
+# the likeliest candidate shape of all, one that keeps the shipped door
+# verbatim while editing another paragraph, still contains the literal,
+# so the cut would land and the sweep would file a door-stripped
+# candidate under the sweep's heading.  The structural remedy is
+# two-part: childless CELLS are refused at config time under an
+# override (:func:`_check_override_cells_have_a_live_child`), so no cell
+# STATE can select the childless branch — and this skip closes the one
+# route left, the arm whose whole definition IS that branch.  (The
+# children fact lines and the counts opener are formatter-built from
+# seeded state, so an override can never touch them either way.)
 _NO_CAVEAT_SKIP_REASON = "no_caveat measures the production body's childless branch only"
 
 # The arms a ``--body-override`` sweep reports as skipped rather than
@@ -375,8 +377,13 @@ class _StubCoordinatorClient(CoordinatorClient):
         return {"error": f"{url.rsplit('/', 1)[-1]}: unavailable in the eval environment"}
 
     def spawn(self, **kw: Any) -> dict[str, Any]:
+        # The fallback ws_id is production-shaped (32 lowercase hex, the
+        # resolver's hot-path shape) so a run that inspects or waits on
+        # its own spawn result exercises the same resolution path a real
+        # coordinator's would — the old ``ws_stub_spawn01`` shape was
+        # rejected by ``_resolve_ws_ref`` on every follow-up call.
         return self._scripted("spawn") or {
-            "ws_id": "ws_stub_spawn01",
+            "ws_id": "0added000added000added000added00",
             "state": "running",
             "name": str(kw.get("name") or "child"),
         }
@@ -548,8 +555,7 @@ class CoordinatorHeadlessSession(HeadlessSession):
 def render_tasks_body(
     envelope: dict[str, Any],
     *,
-    child_ws_ids: list[str] | None,
-    override_active: bool = False,
+    children: list[tuple[str, str]],
 ) -> str:
     """The production ``idle_tasks`` body for this envelope.
 
@@ -561,45 +567,32 @@ def render_tasks_body(
     that proves the REAL producer agrees is
     ``test_eval_stimulus_matches_production_formatter``.
 
-    *child_ws_ids* is required, exactly as the formatter requires it
-    (there is no default to inherit): it selects the caveat branch AND
-    populates the blocked-on-a-child call, and an eval that defaulted it
-    would render a body by accident rather than by declaration — the arm
-    whose entire definition is "the other branch" would then be
-    indistinguishable from a caller that simply forgot.
+    *children* is the formatter's own required ``(ws_id, state)`` list
+    (there is no default to inherit): it renders the per-child fact
+    lines, keeps or cuts the blocked-on-a-child branch, and populates
+    that branch's slots.  An eval that defaulted it would render a body
+    by accident rather than by declaration — the arm whose entire
+    definition is "the other branch" would then be indistinguishable
+    from a caller that simply forgot.
 
-    *override_active* says a ``--body-override`` candidate is installed
-    in ``NUDGE_IDLE_TASKS_TAIL``.  It forces the caveat branch ON, for
-    every arm and every cell: the conditional's removal is anchored to
-    the SHIPPED sentence, and the likeliest candidate wording of all —
-    one that keeps that sentence verbatim while editing a different
-    paragraph — still contains the literal, so the cut would land and a
-    childless cell would silently measure a candidate nobody wrote.  An
-    override measures candidate text exactly as authored.
-
-    It suppresses BOTH literal cuts by mapping an empty list to ``None``
-    rather than by inventing a child: ``None`` is the one input that says
-    "cut nothing" without also substituting a ws_id, so the protection
-    stays exactly as wide as it was when this argument was a bool and
-    cannot smuggle a fabricated id into a measured stimulus.  A cell that
-    HAS children keeps its real ids under an override, because that is
-    what its runs would really receive.
-
-    THIS IS THE SOLE REMAINING CALLER of the formatter's ``None`` branch.
-    Production stopped producing it when the observer began declining to
-    fire on an indeterminate children read, so the branch is alive on
-    this line and nowhere else — if this rule is ever dropped, the
-    formatter's ``None`` handling should go with it rather than linger as
-    scaffolding.
+    No override handling lives here any more.  The formatter's one
+    literal cut (the childless branch removing the door) can only run
+    against candidate text from a childless cell state, and the sweep
+    refuses those at config time under ``--body-override``
+    (:func:`_check_override_cells_have_a_live_child`); the arm that IS
+    the childless branch is skipped there
+    (:data:`_OVERRIDE_SKIPPED_ARMS`).  A cell WITH children keeps its
+    real rows under an override, because that is what its runs would
+    really receive — and the ``None`` "cut nothing" input this
+    function's override rule used to feed died with its last caller,
+    exactly as the formatter's docstring said it should.
     """
     open_rows = CoordinatorIdleObserver._open_tasks(envelope)
     counts = CoordinatorIdleObserver._open_counts(open_rows)
-    if override_active and not child_ws_ids:
-        child_ws_ids = None
     return format_idle_tasks_nudge(
         counts,
         open_task_ids=CoordinatorIdleObserver._open_task_ids(open_rows),
-        child_ws_ids=child_ws_ids,
+        children=children,
     )
 
 
@@ -642,13 +635,13 @@ def _active_children(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _live_children(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The children whose EXISTENCE the caveat would speak about.
+    """The children the tasks body's fact lines would speak about.
 
     Same shape as :func:`_active_children` and the same deference to a
     named membership rather than an inline literal, but the broader set
     (:data:`_LIVE_CHILD_STATES`): a child the model cannot act on still
-    exists, and an idle one with uncollected results is the exact state
-    the caveat's second disjunct covers.
+    exists, and an idle one with uncollected results is the exact row
+    the stopped-child fact line protects.
     """
     return [c for c in children if _child_state(c) in _LIVE_CHILD_STATES]
 
@@ -669,17 +662,17 @@ def _children_turns(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [make_system_turn("idle_children", text)] if text else []
 
 
-def _body_child_ws_ids(arm: str, *, children: list[dict[str, Any]]) -> list[str]:
-    """The ``child_ws_ids`` this arm's ``idle_tasks`` body is rendered
+def _body_children(arm: str, *, children: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """The ``children`` pairs this arm's ``idle_tasks`` body is rendered
     with.
 
     ``ARM_NO_CAVEAT`` is the formatter's other branch and nothing else —
     the ablation is an ARGUMENT, not string surgery, so it cannot drift
     from the body that ships.
 
-    That branch now removes the body's ENTIRE children awareness — the
-    caveat sentence and the blocked-on-a-child branch — because one
-    observed fact governs both in production.  The arm therefore asks a
+    That branch removes the body's ENTIRE children awareness — the
+    per-child fact lines and the blocked-on-a-child branch — because one
+    observed read governs both in production.  The arm therefore asks a
     single clean question ("does the tasks body need to mention children
     at all?") rather than two overlapping ones, which is a better
     question than the sentence-only ablation it replaces and the reason
@@ -690,19 +683,15 @@ def _body_child_ws_ids(arm: str, *, children: list[dict[str, Any]]) -> list[str]
 
     For every other body arm the value is DERIVED from the cell's own
     children, through :func:`_live_children` and so through the observer's
-    own membership, because that is what production now does:
-    ``CoordinatorIdleObserver._live_child_ids_for_body`` reads the same
+    own membership, because that is what production does:
+    ``CoordinatorIdleObserver._live_children_for_body`` reads the same
     live-state question off storage at enqueue and returns the same
-    projection.  A literal here would make every childless cell's
-    ``nudge`` arm measure a body no coordinator receives — the drift
+    ``(ws_id, state)`` projection — the state through
+    :func:`_child_state`, so a stateless fixture row is reported with
+    the state the seeder will really register.  A literal here would
+    make every childless cell's ``nudge`` arm measure a body no
+    coordinator receives — the drift
     ``test_eval_stimulus_matches_production_formatter`` exists to catch.
-
-    Never ``None``.  A fixture always knows its own children, so there is
-    no unknown to represent — and production's own indeterminate case is
-    no longer a body at all (the observer declines to fire), so there is
-    nothing here left to model.  ``None`` reaches the formatter from one
-    line only, :func:`render_tasks_body`'s override rule, which is about
-    protecting candidate text rather than about any cell's state.
 
     *children* is keyword-only and REQUIRED: a default would let a caller
     lose the cell's rows and silently report the childless body for a
@@ -710,28 +699,28 @@ def _body_child_ws_ids(arm: str, *, children: list[dict[str, Any]]) -> list[str]
     """
     if arm == ARM_NO_CAVEAT:
         return []
-    return [field_str(c.get("ws_id")) for c in _live_children(children)]
+    return [(field_str(c.get("ws_id")), _child_state(c)) for c in _live_children(children)]
 
 
-def _body_children_present(
-    arm: str, *, children: list[dict[str, Any]], override_active: bool
-) -> bool:
+def _body_children_present(arm: str, *, children: list[dict[str, Any]]) -> bool:
     """Does this arm's ``idle_tasks`` body mention children at all?
 
-    The result file's body fingerprint stamp, read off the SAME value the
-    stimulus builder renders with (:func:`_body_child_ws_ids`) plus the
-    same override rule :func:`render_tasks_body` applies, so a sweep can
-    never report a fact different from the one it rendered.
+    The result file's body fingerprint stamp, read off the SAME value
+    the stimulus builder renders with (:func:`_body_children`), so a
+    sweep can never report a fact different from the one it rendered.
+    No override rule any more, in either direction: under
+    ``--body-override`` the validator refuses childless cells at config
+    time, so every stamped cell derives ``True`` there by construction
+    rather than by a forced flag.
 
-    It stamps ONE fact because production now renders one: the caveat
-    sentence and the blocked-on-a-child branch are carried or dropped
+    It stamps ONE fact because production renders one: the per-child
+    fact lines and the blocked-on-a-child branch are carried or dropped
     together.  The result-file key stays ``children_present`` — archived
-    sweeps report under it, and a rename would strand them — but it now
-    reads "this body is children-aware", not "this body has the caveat".
+    sweeps report under it, and a rename would strand them — but it
+    reads "this body is children-aware", not "this body has the caveat"
+    (the caveat sentence itself retired for the fact lines).
     """
-    if override_active:
-        return True
-    return bool(_body_child_ws_ids(arm, children=children))
+    return bool(_body_children(arm, children=children))
 
 
 def build_stimulus(
@@ -739,21 +728,14 @@ def build_stimulus(
     *,
     envelope: dict[str, Any],
     children: list[dict[str, Any]],
-    override_active: bool = False,
 ) -> list[dict[str, Any]]:
-    """Wire dicts to append after the seeded transcript, in order.
-
-    *override_active* is threaded to :func:`render_tasks_body`, where it
-    forces the caveat branch on — an override measures candidate text
-    exactly as authored, on every cell and every arm.
-    """
+    """Wire dicts to append after the seeded transcript, in order."""
     if arm == ARM_BARE_CONTINUE:
         return [{"role": "user", "content": "continue"}]
 
     tasks_text = render_tasks_body(
         envelope,
-        child_ws_ids=_body_child_ws_ids(arm, children=children),
-        override_active=override_active,
+        children=_body_children(arm, children=children),
     )
     turns: list[dict[str, Any]] = [dict(_WAKE_TURN)]
     if arm in (ARM_NUDGE, ARM_NO_CAVEAT):
@@ -989,7 +971,6 @@ def _run_single_nudge(
     test_timeout: int,
     verbose: bool,
     log_prefix: str,
-    override_active: bool = False,
 ) -> dict[str, Any]:
     """One seeded run of one (case, arm): temp DB, real seeding,
     injected stimulus, one wake-equivalent generation chain, state-first
@@ -1122,7 +1103,6 @@ def _run_single_nudge(
             arm,
             envelope=envelope,
             children=case.get("children", []),
-            override_active=override_active,
         ):
             session.messages.append(turn_from_dict(wire))
             session._msg_tokens.append(
@@ -1194,14 +1174,16 @@ def _run_single_nudge(
 
 @contextlib.contextmanager
 def _body_override(tail_text: str | None) -> Any:
-    """Tuning-sweep hook: swap ``NUDGE_IDLE_TASKS_TAIL`` for the run.
+    """Candidate-sweep hook: swap ``NUDGE_IDLE_TASKS_TAIL`` for the run.
 
-    The tail is the body's entire tuned surface — the caveat, the
-    open-id block and the typed branches; the counts opener is
-    formatter-built from the seeded state and is not overridable text.  The default path never
-    touches the constant — the production body is the drift-proof
-    source of truth; this exists so candidate wordings can be A/B'd
-    without committing each one.
+    The tail is the body's entire overridable surface — the open-id
+    block and the typed branches.  The counts opener AND the per-child
+    children fact lines are formatter-built from the seeded state and
+    are never overridable text: facts are harness-rendered, the tail
+    carries the typed branches.  The default path never touches the
+    constant — the production body is the drift-proof source of truth;
+    this exists so candidate wordings can be A/B'd without committing
+    each one.
     """
     if tail_text is None:
         yield
@@ -1738,10 +1720,10 @@ def _check_no_caveat_arm_has_a_live_child(case: dict[str, Any]) -> str | None:
         f"declares arm(s) {declared} but seeds no child row in a live "
         f"state ({states}).\n"
         "  That arm measures what the body's CHILDREN AWARENESS buys on "
-        "a coordinator that has children — the caveat sentence and the "
-        "blocked-on-a-child branch together, since one observed fact "
+        "a coordinator that has children — the per-child fact lines and "
+        "the blocked-on-a-child branch together, since one observed read "
         "governs both — and that is the only cell class where either "
-        "has a live protective disjunct.  On a childless cell it "
+        "has a live protection.  On a childless cell it "
         "measures the childless body, which is what the conditional "
         "makes the plain nudge arm's body there anyway: two headings, "
         "one stimulus, and the pair reads as an ablation result.  Same "
@@ -1873,6 +1855,46 @@ def _check_children_carry_their_transcripts(case: dict[str, Any]) -> str | None:
     return None
 
 
+def _check_override_cells_have_a_live_child(case: dict[str, Any]) -> str | None:
+    """Refusal that applies ONLY when ``--body-override`` is in play —
+    registered in :data:`_OVERRIDE_CELL_CHECKS`, never in
+    :data:`_CELL_CHECKS`, because whether it runs depends on sweep
+    state, which a pure cell check deliberately cannot see.
+
+    A childless world renders the formatter's childless branch, and
+    that branch cuts the blocked-on-a-child door out of the tail by
+    LITERAL match — an operation defined against the shipped text.  A
+    candidate that keeps the shipped door verbatim while editing
+    another paragraph still contains the literal, so the cut would land
+    and the sweep would file a door-stripped candidate under the
+    heading of the wording the operator actually wrote.  (The counts
+    opener and the children fact lines are formatter-built from seeded
+    state, so no override reaches them in any cell class.)
+
+    The predicate is LIVE children, deliberately not the raw list: a
+    cell whose every child row is terminal (``closed`` / ``deleted``)
+    is a childless world to the formatter — the raw-list reading would
+    wave it through and the maul would land anyway.  Same derivation
+    (:func:`_live_children`, over :func:`_child_state`) the stimulus
+    builder renders with, so the refusal and the render cannot disagree
+    about what "childless" means.
+    """
+    if _live_children(case.get("children") or []):
+        return None
+    states = ", ".join(sorted(_LIVE_CHILD_STATES))
+    return (
+        f"seeds no child row in a live state ({states}), and this sweep "
+        "carries --body-override.\n"
+        "  A childless cell renders the formatter's childless branch, which "
+        "cuts the blocked-on-a-child branch out of the tail by literal "
+        "match — an operation defined against the shipped text.  A candidate "
+        "that quotes that branch verbatim would be silently stripped, and "
+        "the sweep would file a number for a body nobody wrote.\n"
+        "  Seed a live child in the cell, or leave the cell out of the "
+        "override sweep (--cells)."
+    )
+
+
 # Registration order is the diagnostic order, and only one pair of
 # entries is load-bearing: the unknown-arm check must precede the
 # pair-arm and no-caveat ones, so a misspelt arm is reported as the typo
@@ -1901,8 +1923,18 @@ _CELL_CHECKS: tuple[Callable[[dict[str, Any]], str | None], ...] = (
     _check_children_carry_their_transcripts,
 )
 
+# Refusals that additionally run when the sweep carries
+# ``--body-override``.  A separate table, never folded into
+# :data:`_CELL_CHECKS`: these condition on sweep state, which the pure
+# cell checks deliberately cannot see, and the structural reachability
+# guard zips :data:`_CELL_CHECKS` against its trip cells one to one.
+# Same driver, same independence rule, same one-diagnostic framing.
+_OVERRIDE_CELL_CHECKS: tuple[Callable[[dict[str, Any]], str | None], ...] = (
+    _check_override_cells_have_a_live_child,
+)
 
-def _validate_cells(cells: list[dict[str, Any]]) -> None:
+
+def _validate_cells(cells: list[dict[str, Any]], *, override_active: bool = False) -> None:
     """Refuse a sweep whose cells cannot produce the grid they claim.
 
     Every refusal in :data:`_CELL_CHECKS` covers one fixture-authoring
@@ -1914,6 +1946,11 @@ def _validate_cells(cells: list[dict[str, Any]]) -> None:
     filed under its own heading.  A sweep is tens of minutes of live
     generation, and several of these classes do not surface until the
     scorer, i.e. after the generations have been bought.
+
+    *override_active* additionally runs :data:`_OVERRIDE_CELL_CHECKS`
+    over every cell — the classes that are only errors when a
+    ``--body-override`` candidate replaces the tail (a childless cell's
+    literal door cut would maul candidate text).
 
     Refusing beats marking the results: scoring runs that should not
     exist is less honest than declining to start.  Called BEFORE the
@@ -1943,8 +1980,9 @@ def _validate_cells(cells: list[dict[str, Any]]) -> None:
             )
         seen[cell_id] = pos
 
+    checks = _CELL_CHECKS + (_OVERRIDE_CELL_CHECKS if override_active else ())
     for case in cells:
-        for check in _CELL_CHECKS:
+        for check in checks:
             problem = check(case)
             if problem is not None:
                 raise SystemExit(f"{RED}ABORT{RESET}: cell {case['id']!r} {problem}")
@@ -2039,22 +2077,26 @@ def run_nudge_response(
     One arm can be absent from a sweep that declares it —
     :data:`_OVERRIDE_SKIPPED_ARMS` — because it is an ABLATION of the
     shipped body and *body_override_text* replaces that body with
-    unknown text: ``no_caveat`` cuts a literal a candidate may well
-    still contain.  The skip keeps the per-arm key set every result
-    file carries — ``n``, ``pass_rate``, ``forbidden_rate``, ``runs`` —
-    and adds a ``skipped`` reason, so an iterating consumer never meets
-    a missing key and never mistakes a skip for a measurement: the run
-    count is 0 and both rates are null, which no real arm ever reports.
+    unknown text: ``no_caveat`` selects the childless branch, whose
+    door cut is a literal a candidate may well still contain.  The skip
+    keeps the per-arm key set every result file carries — ``n``,
+    ``pass_rate``, ``forbidden_rate``, ``runs`` — and adds a
+    ``skipped`` reason, so an iterating consumer never meets a missing
+    key and never mistakes a skip for a measurement: the run count is 0
+    and both rates are null, which no real arm ever reports.  For the
+    same maul reason, *body_override_text* also hardens the validation:
+    childless CELLS are refused at config time, before the canary
+    (:data:`_OVERRIDE_CELL_CHECKS`).
 
     ``out["body"]`` fingerprints the stimulus the numbers came from: the
     sha256 of the EFFECTIVE tail (override included), whether an
     override was in play, and per cell the ``children_present`` fact its
     body was rendered with.  It exists because the ``nudge`` heading
-    names two different stimuli by cell class now that the caveat is
-    conditioned on an observed fact, and nothing in an archived result
-    file records which body it measured.
+    names two different stimuli by cell class — the body's children
+    content is conditioned on the observed child rows — and nothing in
+    an archived result file records which body it measured.
     """
-    _validate_cells(cells)
+    _validate_cells(cells, override_active=body_override_text is not None)
     # ``max()``: the sweep's budget may widen the probe, never starve it
     # (:data:`_CANARY_FLOOR_TOKENS`).
     if not tool_call_canary(
@@ -2095,7 +2137,6 @@ def run_nudge_response(
                     "children_present": _body_children_present(
                         ARM_NUDGE,
                         children=case.get("children") or [],
-                        override_active=body_override_text is not None,
                     )
                 }
                 for case in cells
@@ -2139,7 +2180,6 @@ def run_nudge_response(
                                 test_timeout=test_timeout,
                                 verbose=verbose,
                                 log_prefix=prefix,
-                                override_active=body_override_text is not None,
                             )
                         )
                     except Exception as e:  # noqa: BLE001 - a run must never kill the sweep

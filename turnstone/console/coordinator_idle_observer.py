@@ -23,16 +23,16 @@ event, and both nudges then fire and CO-DELIVER in one drain, tasks
 first — the grooming instruction is instant, the park instruction is
 open-ended, so the batch ends on the wait.  Each nudge asserts only its
 own domain: the tasks body never claims the children are gone — it
-carries the "children may still be running" caveat whenever any child
-row exists in a live state, because the liveness nudge can be blocked
-by its own cap or wait gate while advice fires alone, and on a
-coordinator with no children it says nothing about children at all.
-Either way a consistent pair is two true statements, not a
-contradiction.  One ordering caveat, accepted: a cross-bracket pair
-(an older queued ``idle_children`` surviving into a bracket that
-enqueues ``idle_tasks``) delivers children-first by seq; both entries
-are still predicate-valid, so that is a tuning miss, not a correctness
-one.  If evals show small models fumbling even the ordered pair, the
+renders one OBSERVED fact line per child row in a live state (still
+running, or stopped with the wait's immediate return noted), because
+the liveness nudge can be blocked by its own cap or wait gate while
+advice fires alone, and on a coordinator with no children it says
+nothing about children at all.  Either way a consistent pair is two
+true statements, not a contradiction.  One ordering caveat, accepted:
+a cross-bracket pair (an older queued ``idle_children`` surviving into
+a bracket that enqueues ``idle_tasks``) delivers children-first by
+seq; both entries are still predicate-valid, so that is a tuning miss,
+not a correctness one.  If evals show small models fumbling even the ordered pair, the
 named upgrade path is a single combined checkpoint type selected at
 produce time — do NOT reintroduce a cross-domain fire gate.
 
@@ -78,10 +78,10 @@ Gate order, ``idle_tasks``: coordinator-kind → operator-Stop gate
 EVENT closed) → cap + cooldown peek → asked-operator skip →
 wait-tool skip → envelope read (corrupt → no fire; a FAILED read
 fails the EVENT closed) →
-live-child id read (``[]``/ids → BODY CONTENT.  It runs after every
-gate it could otherwise perturb, and what it FINDS never changes
-whether this path fires — only a read that FAILS does, and that
-silences the event, not just this path) → permission check
+live-child ``(ws_id, state)`` read (``[]``/rows → BODY CONTENT.  It
+runs after every gate it could otherwise perturb, and what it FINDS
+never changes whether this path fires — only a read that FAILS does,
+and that silences the event, not just this path) → permission check
 (``nudge_allowed``) → atomic charge → enqueue → record.
 
 ONE rule spans both paths, from the owner and unqualified: these
@@ -158,11 +158,12 @@ _ACTIVE_CHILD_STATES: frozenset[str] = frozenset(
 
 # LIVE = the row still describes a child this coordinator has.  A
 # different question from the one above — "can the model act on it?" —
-# and the one the tasks body's children caveat speaks about, so it is a
-# strict superset: ``idle`` is in it precisely because an idle child is
-# the "may have finished while you worked" disjunct (a child that
-# finished with results nobody collected), and ``error`` is in it
-# because an errored child still owns the work it was given.
+# and the one the tasks body's children fact lines speak about, so it
+# is a strict superset: ``idle`` is in it precisely because an idle
+# child may hold results nobody collected — the stopped-child fact
+# line exists for exactly that row — and ``error`` is in it because an
+# errored child still owns the work it was given (and is stopped in
+# the same wait-terminal sense).
 #
 # Enum-derived rather than typed out.  ``WorkstreamState`` is exactly
 # {idle, thinking, running, attention, error}, and the terminal strings
@@ -446,11 +447,12 @@ class CoordinatorIdleObserver:
         put a ``list_workstreams`` round-trip on every coord state
         transition in the cluster.  The tasks path never GATES on what
         children are FOUND — each nudge asserts only its own domain;
-        once its own gates have passed it reads one live-child id list
-        of its own, to fill in the body it plans, never to decide
-        whether to fire (:meth:`_live_child_ids_for_body`).  Two paths,
-        two reads, and neither ANSWER is shared: the shape that would
-        tempt a shared read is the shape that re-couples the domains.
+        once its own gates have passed it reads one live-child
+        ``(ws_id, state)`` list of its own, to fill in the body it
+        plans, never to decide whether to fire
+        (:meth:`_live_children_for_body`).  Two paths, two reads, and
+        neither ANSWER is shared: the shape that would tempt a shared
+        read is the shape that re-couples the domains.
         What the event does share is the failure signal — one failed
         read anywhere silences both classes — which keys on a read
         FAILING, never on what it found.
@@ -729,8 +731,10 @@ class CoordinatorIdleObserver:
         # enum-derived state, neither of them user-authored text, so there
         # is no projection split here any more — the tasks path below keeps
         # its two-projection split because its fields ARE user-authored.
-        # The FE derives its ``ident`` column from ``ws_id`` (the same
-        # 8-char prefix the body's bullet carries).
+        # The FE derives its 8-char ``ident`` column from ``ws_id`` —
+        # display formatting over the same full id the body's bullet now
+        # carries whole (a bullet is a handle for the resolver, which
+        # refuses prefixes; an ident is a label for the operator's eye).
         children_meta = [
             {
                 "ws_id": c.get("ws_id", ""),
@@ -792,13 +796,14 @@ class CoordinatorIdleObserver:
         same-event ``idle_children`` (co-delivery, tasks first) or alone
         while children run and the liveness nudge is blocked by its own
         cap or wait gate.  The body never presumes the children are done
-        (its "children may still be running" caveat plus the
-        blocked-on-a-child branch are what make advice-alone honest
-        beside running children), and its drain predicate reads no
-        children at all.  The one children read this path makes
-        (:meth:`_live_child_ids_for_body`) is the post-gate live-child id
-        list that selects between the children-aware body and the
-        childless one and populates the former's slots.
+        (its per-child observed fact lines plus the blocked-on-a-child
+        branch are what make advice-alone honest beside running
+        children), and its drain predicate reads no children at all.
+        The one children read this path makes
+        (:meth:`_live_children_for_body`) is the post-gate live-child
+        ``(ws_id, state)`` list that selects between the children-aware
+        body and the childless one, feeds the fact lines, and populates
+        the branch's slots.
 
         It is NOT true that no outcome of that read can suppress the
         fire, and the earlier absolute saying so was wrong.  A read that
@@ -1005,9 +1010,12 @@ class CoordinatorIdleObserver:
         # which buys more storage traffic, aimed at the thing that just
         # failed.  Firing there adds load exactly where load is the
         # problem.  The hedge's own justification also dissolves under
-        # the prior question: the caveat exists to keep the BODY safe
-        # when children are unknown, but not sending a body is safe
-        # too — strictly safer, and free.
+        # the prior question: a hedge exists to keep the BODY safe when
+        # children are unknown, but not sending a body is safe too —
+        # strictly safer, and free.  (The same ruling later removed the
+        # hedge from the SUCCESSFUL-read body: the states are observed,
+        # so the body renders one fact line per child instead of "may
+        # still be running or may have finished".)
         #
         # BEFORE ANY CHARGE, structurally.  Plans carry no side effects,
         # and ``_on_idle`` reaches :meth:`_commit_plan` — where
@@ -1029,8 +1037,13 @@ class CoordinatorIdleObserver:
         # coord that gained a child inside that window — narrow, and
         # one-directional: a body with no children content asserts
         # NOTHING about children, while carrying it costs a measured
-        # ``list_workstreams`` round-trip on every childless bracket.  A
-        # NEW out-of-band creator class (task-agent lanes) widens the
+        # ``list_workstreams`` round-trip on every childless bracket.
+        # A fact line can likewise outlive its state (a running child
+        # idles before delivery), and that lands safe in the same
+        # direction: the running line's instruction is check-before-
+        # redoing, which is exactly right for a child that has just
+        # finished, and an idle child does not restart.  A NEW
+        # out-of-band creator class (task-agent lanes) widens the
         # window and must re-visit this condition.
         #
         # Cost: one ``list_workstreams`` fetch per IDLE event that clears
@@ -1039,14 +1052,14 @@ class CoordinatorIdleObserver:
         # needed ids to populate its calls with; the rate is unchanged and
         # the per-read cost is now the liveness path's, which is the trade
         # the discovery round-trip it removes is worth (see
-        # :meth:`_live_child_ids_for_body`).
-        child_ws_ids = self._live_child_ids_for_body(ws)
-        if child_ws_ids is None:
+        # :meth:`_live_children_for_body`).
+        children = self._live_children_for_body(ws)
+        if children is None:
             raise _StorageReadError("live_children")
         text = format_idle_tasks_nudge(
             open_counts,
             open_task_ids=open_task_ids,
-            child_ws_ids=child_ws_ids,
+            children=children,
         )
 
         # Bind identity by closure (never the live ``ws``).  The
@@ -1080,10 +1093,13 @@ class CoordinatorIdleObserver:
             # No children read, restated here because the temptation
             # recurs: an entry that outlives a bracket, survives a Stop
             # demotion, or is resurrected by a failed wake and then
-            # delivers beside live children is two true statements, not
-            # a contradiction — a caveat-bearing body covers that state
-            # explicitly, and a caveat-less one (enqueued when no live
-            # child row existed) asserts nothing about children at all.
+            # delivers beside live children stays two true-enough
+            # statements, not a contradiction — a children-bearing
+            # body's fact lines state what was observed at enqueue and
+            # their protections land safe under drift (a running child
+            # that idled still deserves check-before-redoing; an idle
+            # one does not restart), and a childless body asserts
+            # nothing about children at all.
             #
             # Corrupt envelope → drop, and a FAILED read → drop: a
             # failed storage read never delivers a nudge, at drain
@@ -1156,7 +1172,7 @@ class CoordinatorIdleObserver:
 
         This read serves the LIVENESS path only, and nothing here may be
         made to license or block the ADVICE fire on what it FINDS —
-        advice makes its own read (:meth:`_live_child_ids_for_body`),
+        advice makes its own read (:meth:`_live_children_for_body`),
         after its own gates, and a found-children outcome that skipped an
         advice fire would be the re-coupling this warning forbids.  A
         FAILED read is the one outcome that leaves this path's scope,
@@ -1252,10 +1268,12 @@ class CoordinatorIdleObserver:
         param into the aggregate (protocol change) or accept that the
         divergence lands in the safe direction — liveness over-delivers,
         and the body's live-child read that shares this asymmetry
-        (:meth:`_live_child_ids_for_body`) over-reports children, which
-        keeps a hedge that is unconditionally true and adds a ws_id to a
-        ``mode="any"`` wait that returns on the first finisher anyway.
-        The advice DRAIN predicate reads no children at all.
+        (:meth:`_live_children_for_body`) over-includes rows, which adds
+        a fact line that is still TRUE of the row it names (the line
+        renders the row's own observed state; only its kind diverged)
+        and a ws_id to a ``mode="any"`` wait that returns on the first
+        finisher anyway.  The advice DRAIN predicate reads no children
+        at all.
         """
         try:
             counts = self._storage.count_workstreams_by_state(
@@ -1271,19 +1289,22 @@ class CoordinatorIdleObserver:
             return None
         return any(counts.get(s, 0) > 0 for s in _ACTIVE_CHILD_STATES)
 
-    def _live_child_ids_for_body(self, ws: Workstream) -> list[str] | None:
+    def _live_children_for_body(self, ws: Workstream) -> list[tuple[str, str]] | None:
         """Enqueue-time answer to "which child rows of this coord are in
-        a live state?", for the ``idle_tasks`` BODY only.
+        a live state, and in which?", for the ``idle_tasks`` BODY only.
 
-        A (possibly empty) list of ``ws_id``\\ s on a successful read;
-        ``None`` when the read was INDETERMINATE (the query raised, or a
-        row was too ragged to classify).  The THREE-WAY return is the
-        point, and each value has a different consumer:
+        A (possibly empty) list of ``(ws_id, state)`` pairs on a
+        successful read; ``None`` when the read was INDETERMINATE (the
+        query raised, or a row was too ragged to classify).  The
+        THREE-WAY return is the point, and each value has a different
+        consumer:
 
         * ``[]`` and a NON-EMPTY list both reach
           :func:`~turnstone.core.metacognition.format_idle_tasks_nudge`
           and choose between the childless body and the children-aware
-          one.  These are the only two values production ever hands it.
+          one.  These are the only two values production ever hands it,
+          and since the formatter's children parameter became a required
+          list they are the only two it can express.
         * ``None`` never reaches the formatter at all: the caller raises
           it to the event level, before any charge, and NEITHER nudge is
           sent — a failed storage read fails the whole event closed
@@ -1296,20 +1317,24 @@ class CoordinatorIdleObserver:
         both falsy and mean opposite things: one is an answer, the other
         is the absence of one.
 
-        It returns IDS rather than the bool it once did because the body
-        now populates two child slots from them (the blocked-on-a-child
-        branch's ``child_ws_id`` and its ``wait_for_workstream`` call).
-        One value serves the caveat and the slots deliberately: a bool
-        beside a list is two derivations of one storage read, and the
-        state where they disagree — hedge kept, slots empty, or worse the
-        reverse — is unreachable when there is only one value.
+        It returns ``(ws_id, state)`` PAIRS rather than the bare ids it
+        once did because the body renders the observed STATE per child
+        (the fact lines) as well as populating the blocked-on-a-child
+        branch's two slots.  Bare ids forced the body to hedge about
+        states this very query had just read — "may still be running or
+        may have finished" — which is manufactured uncertainty, ruled
+        out 2026-07-29: the harness renders the fact it holds.  One
+        value serves the fact lines and the slots deliberately: a
+        second derivation of the same storage read is a state where the
+        two can disagree, which is unreachable when there is only one
+        value.
 
         Deliberately :data:`_LIVE_CHILD_STATES`, not
-        :data:`_ACTIVE_CHILD_STATES`: the caveat speaks about children
-        that EXIST, and an idle child holding results nobody collected
-        is exactly its "may have finished while you worked" disjunct.
-        Conditioning on the active set would strip the hedge from the
-        one state whose protective disjunct is live.
+        :data:`_ACTIVE_CHILD_STATES`: the fact lines speak about
+        children that EXIST, and an idle child holding results nobody
+        collected is exactly what the stopped-child line protects.
+        Conditioning on the active set would drop the line from the one
+        state whose protection is live.
 
         COST, changed and stated: this was a ``count_workstreams_by_state``
         aggregate while a bool was enough.  Ids need rows, so it is now a
@@ -1355,15 +1380,16 @@ class CoordinatorIdleObserver:
                 parent_ws_id=ws.id,
                 user_id=ws.user_id,
             )
-            out: list[str] = []
+            out: list[tuple[str, str]] = []
             for row in rows:
                 mapping = getattr(row, "_mapping", row)
-                if mapping["state"] not in _LIVE_CHILD_STATES:
+                state = mapping["state"]
+                if state not in _LIVE_CHILD_STATES:
                     continue
-                out.append(mapping["ws_id"])
+                out.append((mapping["ws_id"], state))
         except Exception:
             log.debug(
-                "coord_idle_observer.caveat_list_failed ws=%s",
+                "coord_idle_observer.body_children_list_failed ws=%s",
                 ws.id[:8],
                 exc_info=True,
             )
