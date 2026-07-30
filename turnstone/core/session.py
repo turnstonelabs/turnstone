@@ -147,6 +147,7 @@ from turnstone.core.nudge_queue import (
     QUIET_DRAIN,
     TOOL_DRAIN,
     USER_DRAIN,
+    WAKE_CHANNEL,
     WAKE_PENDING,
     Entry,
     NudgeQueue,
@@ -1729,6 +1730,9 @@ class ChatSession:
         #   - "any" entries drain at whichever seam fires first; used for
         #     wake-trigger-driven nudges that should not pin to a
         #     specific seam
+        #   - "wake" entries drain ONLY via ``deliver_wake_nudge_from_queue``
+        #     (the coordinator idle nudges); invisible to every other seam
+        #     and dropped — never demoted — on abandoned generations
         # Cooldown timestamps live separately in ``_metacog_state`` for
         # ``should_nudge`` gating.
         self._metacog_state: dict[str, float] = {}
@@ -6879,6 +6883,21 @@ class ChatSession:
         Stale entries are handled at drain time by their ``valid_until``
         predicates.
 
+        ``"wake"``-channel entries (the coordinator idle nudges) are
+        DROPPED, not demoted.  The quiet demote's whole value is that the
+        entry still delivers at a user or tool seam — and delivering
+        there is exactly what this class may never do: an idle nudge
+        speaks about an IDLE state, and quiet delivery would land it on
+        a later real turn describing a moment that no longer exists.
+        Dropping an already-charged entry is the accepted fail-closed
+        cost — the same pricing as the observer's drain-predicate ruling,
+        where a charged fire dies rather than deliver on a claim that
+        can't be re-validated.  "Liveness survives operator Stop" means
+        the NEXT idle event fires fresh (the observer's Stop gate
+        suppresses only the advice class, and its caps/plans re-derive
+        over fresh reads) — NOT that a queued entry outlives the Stop
+        and re-wakes the workstream later.
+
         Demoting is necessary but NOT sufficient, because the
         ``_emit_state("idle")`` that follows fans out synchronously to
         state subscribers — and a producer reacting to that IDLE can
@@ -6892,7 +6911,7 @@ class ChatSession:
         lives at the clearing site.
         """
         self._generation_abandoned = True
-        self._nudge_queue.clear_channels({"tool", "user"})
+        self._nudge_queue.clear_channels({"tool", "user", WAKE_CHANNEL})
         self._nudge_queue.demote_channel("any", QUIET_CHANNEL)
 
     def _synthesize_cancelled_results(self, reason: str) -> None:
@@ -9849,14 +9868,7 @@ class ChatSession:
         Returns ``True`` when any user row was appended (prefix or
         items), ``False`` when both were empty.
         """
-        from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
-
-        with self._queued_lock:
-            items = list(self._queued_messages.values())
-            self._queued_messages.clear()
-        queued_text = "\n\n".join(
-            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items
-        )
+        queued_text = self._pop_queued_messages_text()
         if not queued_text and not prefix:
             return False
 
@@ -9868,6 +9880,27 @@ class ChatSession:
             content = queued_text
         self._append_user_turn(content, ())
         return True
+
+    def _pop_queued_messages_text(self) -> str:
+        """Atomically drain ``_queued_messages`` and render the combined text.
+
+        The one rendering of the interjection queue as USER-turn content
+        — ``[IMPORTANT]``-prefixed per item priority, items joined by
+        blank lines — shared by :meth:`_flush_queued_messages` (the
+        in-send flush seams) and the wake path's interjection handoff in
+        :meth:`deliver_wake_nudge_from_queue`, so the two dispatch shapes
+        cannot drift.  Returns ``""`` when nothing was queued.  The pop
+        happens under ``_queued_lock`` and is destructive: the caller
+        owns delivery of whatever comes back.
+        """
+        from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
+
+        with self._queued_lock:
+            items = list(self._queued_messages.values())
+            self._queued_messages.clear()
+        return "\n\n".join(
+            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items
+        )
 
     def _collect_advisories(
         self,
@@ -11954,8 +11987,10 @@ class ChatSession:
         """Drain user-channel nudges from :class:`NudgeQueue` and append each
         as a first-class operator-context ``system`` turn AFTER the user turn.
 
-        Drains entries whose ``channel`` is in ``{"user", "any"}``;
-        ``"tool"`` entries stay queued for the next tool-result batch.
+        Drains entries whose ``channel`` is in :data:`USER_DRAIN`
+        (``{"user", "any", "quiet"}``); ``"tool"`` entries stay queued for
+        the next tool-result batch, and ``"wake"`` entries stay for the
+        idle wake — the one seam allowed to deliver them.
 
         Called by ``send`` immediately after :meth:`_append_user_turn`, so
         the system turns sit after the user turn they advise (uniform attach
@@ -12024,7 +12059,7 @@ class ChatSession:
         self._nudge_queue.enqueue(nudge_type, text, "tool")
 
     def deliver_wake_nudge_from_queue(self) -> None:
-        """Drive a synthetic empty user turn so any-channel nudges drain.
+        """Drive a synthetic empty user turn so wake-eligible nudges drain.
 
         The standard pipeline does the rendering: the ``send("")`` we
         trigger lands at ``_append_user_turn`` (which stamps
@@ -12060,7 +12095,71 @@ class ChatSession:
         inside ``send``.  System turns are persistent (not one-shot), so a
         post-retry stream failure leaves them in place — operator
         intervention is required for the underlying failure anyway.
+
+        A queued user interjection OWNS the idle seam (owner ruling,
+        2026-07-29): when ``_queued_messages`` is non-empty at wake time,
+        the synthetic wake turn yields to it — the wake-only idle nudges
+        are dropped and the interjection runs as a genuine user send
+        instead.  See the branch below for the mechanics and for why the
+        check lives HERE rather than at the watcher's gate.
         """
+        # INTERJECTION-OWNS-THE-SEAM.  A non-empty ``_queued_messages``
+        # means a user message is waiting for this exact slot: the model
+        # is idle, a worker (this one) owns the workstream, and the next
+        # turn is about to be spent.  Spending it on a self-addressed
+        # idle reminder while the user's words wait in a queue would be
+        # exactly backwards, so the wake yields:
+        #
+        # * The wake-only idle nudges are DROPPED, not deferred: their
+        #   channel may never ride a user/tool seam, and leaving them
+        #   queued would re-arm the wake gate at this worker's exit
+        #   backstop — delivering them seconds after the user's turn,
+        #   over reads that predate it.  The next genuine idle bracket
+        #   re-derives them over fresh reads: the interjection send is a
+        #   real (non-wake) send, so it clears ``_generation_abandoned``,
+        #   and its leave-IDLE fires the observer's cap reset (no
+        #   ``_wake_source_tag`` — the tag is deliberately NOT set on
+        #   this branch, so the turn counts as genuine everywhere).
+        # * ``"user"``/``"any"``/``"quiet"`` entries are NOT touched:
+        #   the interjection send is a legitimate user seam, and its own
+        #   ``_emit_pending_user_nudges`` drain delivers them right
+        #   after the user turn — better placed than on a synthetic
+        #   empty one.
+        # * The dispatch is ``send(text)``, never ``send("")`` + flush:
+        #   measured at this HEAD, ``send("")`` with a queued
+        #   interjection appends an EMPTY untagged user turn, answers
+        #   it, and only then flushes the queued text as a second user
+        #   turn — one assistant turn late, with a bogus empty user row
+        #   in history.  Popping first and sending the popped text runs
+        #   the same worker-thread path a real send takes and yields
+        #   exactly one user turn carrying the interjection.
+        #
+        # The check lives here — not at ``wake_workstream_if_pending`` —
+        # because this method runs ON the worker thread that owns the
+        # workstream slot, so it can legally run the full send; the
+        # watcher's gate runs on the state-transition thread and can only
+        # spawn-or-skip, and skipping there would strand the interjection
+        # with no consumer (nothing re-checks ``_queued_messages`` while
+        # idle).  A message queued AFTER this pop lands mid-send and
+        # rides the send's ordinary flush seams — the pre-existing
+        # mid-turn interjection behaviour of every send.
+        interjection = self._pop_queued_messages_text()
+        if interjection:
+            dropped = self._nudge_queue.clear_channels({WAKE_CHANNEL})
+            log.info(
+                "wake_nudge.interjection_owns_seam ws=%s dropped_wake_nudges=%d",
+                self._ws_id[:8],
+                dropped,
+            )
+            try:
+                self.send(interjection)
+            except GenerationCancelled:
+                # Same containment as the wake send below: this method IS
+                # the wake worker's run() closure and ``session_worker``
+                # catches only ``Exception``.
+                log.info("wake_nudge.interjection_cancelled ws=%s", self._ws_id[:8])
+            return
+
         # Two-pass drain: wake-eligible channels first.  ``"quiet"`` entries
         # (external events demoted by a user cancel) ride a wake earned by
         # others but never justify one — if every wake-eligible candidate
@@ -12070,6 +12169,9 @@ class ChatSession:
         # batch is re-sorted by queue insertion ``seq`` so cross-channel
         # chronology survives the two passes (a demoted poll-4 fire must
         # not render after the poll-5 fire that earned the wake).
+        # ``WAKE_PENDING`` includes the wake-only ``"wake"`` channel, so
+        # the idle nudges join this first pass — the wake is the single
+        # seam that may deliver them.
         drained = self._nudge_queue.drain_entries(WAKE_PENDING)
         if not drained:
             return
@@ -12119,16 +12221,24 @@ class ChatSession:
                 # send failure would respawn wake workers in an unbounded
                 # hot loop (persisting an orphan synthetic user turn per
                 # spin).  Losing a generation-scoped metacog hint on a
-                # rare failed wake is the strictly smaller harm.
+                # rare failed wake is the strictly smaller harm.  A
+                # ``"wake"``-channel idle nudge is DROPPED for the union
+                # of both reasons: quiet would deliver it at the user/tool
+                # seams its channel exists to be invisible to, and
+                # re-queueing it wake-eligible is the same hot loop as the
+                # ``"user"`` case.  Dropping a charged entry is this
+                # class's standing fail-closed price; the next genuine
+                # idle bracket re-derives it over fresh reads.
                 for reminder in undelivered:
                     recovered = entry_by_reminder.get(id(reminder))
                     if recovered is None or not recovered.text:
                         continue
-                    if recovered.channel == "user":
+                    if recovered.channel in ("user", WAKE_CHANNEL):
                         log.debug(
-                            "wake_nudge.user_advisory_dropped ws=%s type=%s",
+                            "wake_nudge.advisory_dropped ws=%s type=%s channel=%s",
                             self._ws_id[:8],
                             recovered.nudge_type,
+                            recovered.channel,
                         )
                         continue
                     self._nudge_queue.requeue(recovered, channel=QUIET_CHANNEL)

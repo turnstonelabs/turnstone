@@ -127,6 +127,7 @@ from turnstone.core.metacognition import (
     nudge_allowed,
     record_nudge,
 )
+from turnstone.core.nudge_queue import WAKE_CHANNEL
 from turnstone.core.trajectory import Role
 from turnstone.core.workstream import WorkstreamKind, WorkstreamState
 
@@ -625,10 +626,19 @@ class CoordinatorIdleObserver:
         if not self._try_charge(plan.ws_id, plan.nudge_type):
             return False
 
+        # WAKE-ONLY delivery discipline (owner ruling, 2026-07-29): both
+        # idle-nudge types ride the ``"wake"`` channel, which no user- or
+        # tool-seam drain ever matches.  Each body speaks about an IDLE
+        # state ("you went idle holding X"); delivered at a later user
+        # message or tool batch it would describe a moment that no longer
+        # exists, beside a user who just gave fresh instructions.  The
+        # wake is the ONLY door out of the queue for these entries —
+        # a Stop or an interjection-owned seam drops them, and the next
+        # genuine idle bracket re-derives fresh ones over fresh reads.
         session._nudge_queue.enqueue(
             plan.nudge_type,
             plan.text,
-            "any",
+            WAKE_CHANNEL,
             valid_until=plan.valid_until,
             metadata=plan.metadata,
         )
@@ -834,9 +844,10 @@ class CoordinatorIdleObserver:
         # ends in ``_emit_state("idle")``, and that IDLE reaches here —
         # so without this check pressing Stop on a coord holding open
         # tasks enqueues a wake-eligible entry AFTER the cancel path
-        # demoted the queue to quiet, and the watcher resumes the
-        # workstream seconds later.  The operator said stop; a task
-        # reminder is not a reason to override that.
+        # swept the queue's wake eligibility (``any`` demoted to quiet,
+        # ``wake`` dropped), and the watcher resumes the workstream
+        # seconds later.  The operator said stop; a task reminder is
+        # not a reason to override that.
         #
         # ADVICE only.  Liveness deliberately still fires: a cancelled
         # coordinator can still have children running whose results

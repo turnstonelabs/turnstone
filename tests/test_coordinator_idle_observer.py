@@ -259,7 +259,7 @@ class TestEnqueueOnIdle:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        snap = ws.session._nudge_queue.pending("any")
+        snap = ws.session._nudge_queue.pending("wake")
         assert len(snap) == 1
         nudge_type, text = snap[0]
         assert nudge_type == "idle_children"
@@ -287,7 +287,7 @@ class TestEnqueueOnIdle:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        snap = ws.session._nudge_queue.pending_with_metadata(channel="any")
+        snap = ws.session._nudge_queue.pending_with_metadata(channel="wake")
         assert len(snap) == 1
         meta = snap[0][2]
         assert meta == {
@@ -344,7 +344,7 @@ class TestEnqueueOnIdle:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        nudge_type, text, meta = ws.session._nudge_queue.drain({"any"})[0]
+        nudge_type, text, meta = ws.session._nudge_queue.drain({"wake"})[0]
         assert nudge_type == "idle_children"
         rows = meta["children"]
         # Same set, same order, same count — one list underneath.
@@ -506,7 +506,7 @@ class TestHardCap:
         for _ in range(4):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        snap = ws.session._nudge_queue.pending("any")
+        snap = ws.session._nudge_queue.pending("wake")
         assert len(snap) == 1
 
     def test_cap_resets_when_state_leaves_idle_without_wake(self, coord_setup):
@@ -525,10 +525,10 @@ class TestHardCap:
         # Burn the cap (one fire).
         for _ in range(3):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue.pending("any")) == 1
+        assert len(ws.session._nudge_queue.pending("wake")) == 1
 
         # Drain the queue (simulate the watcher delivering them).
-        ws.session._nudge_queue.drain({"any"})
+        ws.session._nudge_queue.drain({"wake"})
 
         # Real (non-wake) leave-IDLE: tag is empty.  Cap resets.
         ws.session._wake_source_tag = ""
@@ -537,7 +537,7 @@ class TestHardCap:
         # New IDLE — cap is fresh, fires again.  A real (non-wake) send
         # is the re-arm, not the clock.
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue.pending("any")) == 1
+        assert len(ws.session._nudge_queue.pending("wake")) == 1
 
     def test_cap_does_not_reset_during_wake_driven_exit(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -556,7 +556,7 @@ class TestHardCap:
         for _ in range(3):
             ws.session._metacog_state.clear()
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        ws.session._nudge_queue.drain({"any"})
+        ws.session._nudge_queue.drain({"wake"})
 
         # Wake-driven leave-IDLE: tag is set during the wake send.
         ws.session._wake_source_tag = "system_nudge"
@@ -566,7 +566,7 @@ class TestHardCap:
         # Cap should NOT have reset — re-IDLE shouldn't fire.
         ws.session._metacog_state.clear()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue.pending("any")) == 0
+        assert len(ws.session._nudge_queue.pending("wake")) == 0
 
 
 class TestCapSurvivesADrain:
@@ -595,15 +595,15 @@ class TestCapSurvivesADrain:
         observer.start()
 
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue.pending("any")) == 1
+        assert len(ws.session._nudge_queue.pending("wake")) == 1
 
         # Drain so the queue isn't the gate.
-        ws.session._nudge_queue.drain({"any"})
+        ws.session._nudge_queue.drain({"wake"})
 
         # Same bracket, slot already spent → the cap peek refuses before
         # the enqueue tail ever runs.
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert len(ws.session._nudge_queue.pending("any")) == 0
+        assert len(ws.session._nudge_queue.pending("wake")) == 0
 
 
 class TestStorageFailure:
@@ -643,11 +643,12 @@ class TestValidUntilPredicate:
         # Children now complete (storage shows none active).
         storage.children.clear()
 
-        # Drain at the user seam — predicate re-queries, finds 0 active,
-        # drops the entry without delivering.
-        from turnstone.core.nudge_queue import USER_DRAIN
+        # Drain at the wake seam (the one seam that reaches wake-channel
+        # entries) — predicate re-queries, finds 0 active, drops the
+        # entry without delivering.
+        from turnstone.core.nudge_queue import WAKE_PENDING
 
-        delivered = ws.session._nudge_queue.drain(USER_DRAIN)
+        delivered = ws.session._nudge_queue.drain(WAKE_PENDING)
         assert delivered == []
         assert len(ws.session._nudge_queue) == 0
 
@@ -666,9 +667,9 @@ class TestValidUntilPredicate:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         # Children still active → predicate returns True → entry delivers.
-        from turnstone.core.nudge_queue import USER_DRAIN
+        from turnstone.core.nudge_queue import WAKE_PENDING
 
-        delivered = ws.session._nudge_queue.drain(USER_DRAIN)
+        delivered = ws.session._nudge_queue.drain(WAKE_PENDING)
         assert len(delivered) == 1
         assert delivered[0][0] == "idle_children"
 
@@ -699,9 +700,9 @@ class TestValidUntilPredicate:
 
         storage.count_raises = True
 
-        from turnstone.core.nudge_queue import USER_DRAIN
+        from turnstone.core.nudge_queue import WAKE_PENDING
 
-        assert ws.session._nudge_queue.drain(USER_DRAIN) == []
+        assert ws.session._nudge_queue.drain(WAKE_PENDING) == []
         assert len(ws.session._nudge_queue) == 0
 
     def test_liveness_predicate_drops_when_children_finished(self, coord_setup):
@@ -722,9 +723,11 @@ class TestValidUntilPredicate:
 
         storage.children.clear()
 
-        from turnstone.core.nudge_queue import USER_DRAIN
+        from turnstone.core.nudge_queue import WAKE_PENDING
 
-        assert ws.session._nudge_queue.drain(USER_DRAIN) == []
+        assert ws.session._nudge_queue.drain(WAKE_PENDING) == []
+        # Consumed by the predicate, not skipped by the channel filter.
+        assert len(ws.session._nudge_queue) == 0
 
 
 class TestLifecycle:
@@ -743,7 +746,7 @@ class TestLifecycle:
         observer.start()  # no-op
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
         # Double-subscribe would have produced 2 entries.
-        assert len(ws.session._nudge_queue.pending("any")) == 1
+        assert len(ws.session._nudge_queue.pending("wake")) == 1
 
     def test_shutdown_unsubscribes(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -795,7 +798,7 @@ class TestIdleTasks:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        snap = ws.session._nudge_queue.pending("any")
+        snap = ws.session._nudge_queue.pending("wake")
         assert len(snap) == 1
         nudge_type, text = snap[0]
         assert nudge_type == "idle_tasks"
@@ -826,7 +829,7 @@ class TestIdleTasks:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_tasks", "idle_children"]
 
     def test_children_query_runs_at_most_once_per_idle_event(self, coord_setup):
@@ -907,7 +910,7 @@ class TestIdleTasks:
         """The park rule holds at drain: an escalation that lands
         between enqueue and delivery kills the queued entry for the
         same no-graph reason — advice fails closed."""
-        from turnstone.core.nudge_queue import USER_DRAIN
+        from turnstone.core.nudge_queue import WAKE_PENDING
 
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_live", "pending"))
@@ -916,7 +919,7 @@ class TestIdleTasks:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
 
         # The model (or a parallel actor) escalates before delivery.
         _set_tasks(
@@ -924,8 +927,10 @@ class TestIdleTasks:
             _task("tsk_live", "pending"),
             _task("tsk_question", "needs_user"),
         )
-        delivered = ws.session._nudge_queue.drain(USER_DRAIN)
+        delivered = ws.session._nudge_queue.drain(WAKE_PENDING)
         assert delivered == []
+        # Consumed by the predicate, not skipped by the channel filter.
+        assert len(ws.session._nudge_queue) == 0
 
     def test_no_tasks_row_does_not_fire(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -984,7 +989,7 @@ class TestIdleTasks:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_tasks"]
 
     def test_stored_task_text_never_reaches_the_body(self, coord_setup):
@@ -1020,7 +1025,7 @@ class TestIdleTasks:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        text = ws.session._nudge_queue.pending("any")[0][1]
+        text = ws.session._nudge_queue.pending("wake")[0][1]
         assert text.startswith("You still have 1 open task: 1 in_progress, 0 pending.")
         for fragment in ("URGENT", "escalate to prod", "need a decision", "tsk_fake"):
             assert fragment not in text, fragment
@@ -1042,7 +1047,7 @@ class TestIdleTasks:
         assert len(ws.session._nudge_queue) == 1
 
         _set_tasks(storage, _task("tsk_a", "done"))
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        assert ws.session._nudge_queue.drain({"wake"}) == []
 
     def test_predicate_survives_when_tasks_still_open(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -1053,7 +1058,7 @@ class TestIdleTasks:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        drained = ws.session._nudge_queue.drain({"any"})
+        drained = ws.session._nudge_queue.drain({"wake"})
         assert [d[0] for d in drained] == ["idle_tasks"]
 
 
@@ -1093,7 +1098,7 @@ class TestPerClassCaps:
             # Clear the stamp so the CAP is what refuses, not the
             # advice cooldown layered on top of it.
             ws.session._metacog_state.clear()
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
 
         # Children appear; the liveness slot is untouched by the advice
         # spend above.  Under a summed cap this produced NOTHING.
@@ -1101,7 +1106,7 @@ class TestPerClassCaps:
         for _ in range(3):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_tasks", "idle_children"]
 
     def test_liveness_cap_is_one(self, coord_setup):
@@ -1147,7 +1152,7 @@ class TestPerClassCaps:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_children"], "liveness ignores its stamp; advice is gated"
 
         # The advice refusal above was the cooldown, not the cap: age
@@ -1155,7 +1160,7 @@ class TestPerClassCaps:
         # slot fires.
         ws.session._metacog_state["idle_tasks"] = now - 301.0
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_children", "idle_tasks"]
 
         # Clearing every stamp buys nothing further: the caps still
@@ -1209,7 +1214,7 @@ class TestPerClassCaps:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == [
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == [
             "idle_tasks",
             "idle_children",
         ]
@@ -1222,13 +1227,13 @@ class TestPerClassCaps:
         ws.session._wake_source_tag = ""
         mgr.fire_state(ws.id, WorkstreamState.RUNNING)
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_children"]
 
         # The control: age the stamp past the window and the already
         # re-armed advice slot fires with no further leave-IDLE.
         ws.session._metacog_state["idle_tasks"] -= 301.0
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == [
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == [
             "idle_children",
             "idle_tasks",
         ]
@@ -1255,7 +1260,7 @@ class TestNudgesDisabledSwitch:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_children"]
 
     def test_tasks_suppressed_when_nudges_off(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -1312,7 +1317,7 @@ class TestNudgesDisabledSwitch:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_children"]
 
 
 class TestIdleTasksMetadata:
@@ -1340,7 +1345,7 @@ class TestIdleTasksMetadata:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        entries = ws.session._nudge_queue.drain({"any"})
+        entries = ws.session._nudge_queue.drain({"wake"})
         assert len(entries) == 1
         _type, text, meta = entries[0]
         assert meta == {"counts": {"open": 3, "in_progress": 1, "pending": 2}}
@@ -1369,7 +1374,7 @@ class TestIdleTasksMetadata:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        _type, _text, meta = ws.session._nudge_queue.drain({"any"})[0]
+        _type, _text, meta = ws.session._nudge_queue.drain({"wake"})[0]
         assert set(meta) == {"counts"}
         serialized = json.dumps(meta)
         for fragment in ("tsk_a", "steer", "200ms", "tsk_fake", "tasks", "total"):
@@ -1408,7 +1413,7 @@ class TestTasksBodyChildrenFacts:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        pending = ws.session._nudge_queue.pending_with_metadata("any")
+        pending = ws.session._nudge_queue.pending_with_metadata("wake")
         return next(entry for entry in pending if entry[0] == "idle_tasks")
 
     def test_childless_body_omits_children_facts_card_meta_unchanged(self, coord_setup):
@@ -1472,7 +1477,7 @@ class TestTasksBodyChildrenFacts:
         # The liveness path stays out of it: an idle child is not
         # actionable, so this really is the advice nudge alone speaking
         # about a child nobody was woken for.
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
 
     @pytest.mark.parametrize("state", sorted(_LIVE_CHILD_STATES))
     def test_every_live_state_renders_its_fact_line(self, coord_setup, state):
@@ -1555,7 +1560,7 @@ class TestTasksBodyChildrenFacts:
             observer.start()
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-            pending = ws.session._nudge_queue.pending_with_metadata("any")
+            pending = ws.session._nudge_queue.pending_with_metadata("wake")
             fired.append([t for t, _text, _meta in pending])
             metas.append(next(m for t, _text, m in pending if t == "idle_tasks"))
 
@@ -1585,7 +1590,7 @@ class TestTasksBodyChildrenFacts:
         observer.start()
 
         mgr.fire_state(ws.id, WorkstreamState.IDLE)  # spends the advice cap
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
         # The body's read is the UNFILTERED one; the liveness path's
         # ``kind=INTERACTIVE`` fetch runs on this fixture too and would
         # otherwise mask the very thing being counted.
@@ -1594,7 +1599,7 @@ class TestTasksBodyChildrenFacts:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)  # cap-refused, same bracket
 
         assert [c for c in storage.list_calls if c["kind"] is None] == before
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
 
     def test_the_probe_reads_the_coords_own_children_for_its_user(self, coord_setup):
         """Scoping, not just presence: the read is filtered to this
@@ -1654,7 +1659,7 @@ class TestExecutableCalls:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        pending = ws.session._nudge_queue.pending("any")
+        pending = ws.session._nudge_queue.pending("wake")
         return next(text for kind, text in pending if kind == "idle_tasks")
 
     @staticmethod
@@ -2007,7 +2012,7 @@ class TestIndeterminateChildrenRead:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
 
     def test_the_silence_does_not_spend_the_brackets_cap(self, coord_setup):
         """THE PROPERTY THAT MAKES THE SILENCE SAFE RATHER THAN MERELY
@@ -2030,14 +2035,14 @@ class TestIndeterminateChildrenRead:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
 
         # Storage recovers.  SAME bracket — nothing re-armed the cap —
         # so a spent slot would show up as continued silence.
         storage.list_raises = False
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        pending = ws.session._nudge_queue.pending("any")
+        pending = ws.session._nudge_queue.pending("wake")
         assert [t for t, _ in pending] == ["idle_tasks"]
         assert "Child " not in pending[0][1]
 
@@ -2074,7 +2079,7 @@ class TestIndeterminateChildrenRead:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_children"]
 
         # Bracket 2 (same bracket, no reset): tasks appear.  Liveness is
         # cap-blocked, so its children query must not run at all.
@@ -2090,7 +2095,7 @@ class TestIndeterminateChildrenRead:
         # assertion above is about liveness laziness and not about an
         # event in which nothing happened.
         assert [c for c in storage.list_calls if c["kind"] is None]
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_tasks"]
 
     def test_ragged_child_row_is_indeterminate_not_empty(self, coord_setup):
@@ -2115,7 +2120,7 @@ class TestIndeterminateChildrenRead:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
 
 
 class TestFailedReadSilencesTheEvent:
@@ -2154,7 +2159,7 @@ class TestFailedReadSilencesTheEvent:
         """The control that makes every silence below a measurement."""
         mgr, storage, ws, observer = self._arm()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_tasks", "idle_children"]
         assert self._charges(observer, ws) == {"idle_tasks": 1, "idle_children": 1}
 
@@ -2169,7 +2174,7 @@ class TestFailedReadSilencesTheEvent:
         mgr, storage, ws, observer = self._arm()
         storage.config_raises = True
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
         assert self._charges(observer, ws) == {}
 
     def test_a_failed_advice_children_read_silences_both_and_charges_neither(self):
@@ -2181,7 +2186,7 @@ class TestFailedReadSilencesTheEvent:
         mgr, storage, ws, observer = self._arm()
         storage.list_raises_when = lambda call: call["kind"] is None
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
         assert self._charges(observer, ws) == {}
 
     def test_a_failed_liveness_children_read_unqueues_the_already_planned_advice(self):
@@ -2194,7 +2199,7 @@ class TestFailedReadSilencesTheEvent:
         mgr, storage, ws, observer = self._arm()
         storage.list_raises_when = lambda call: call["kind"] is WorkstreamKind.INTERACTIVE
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
         assert self._charges(observer, ws) == {}
 
     def test_a_failed_nudges_enabled_read_silences_both(self):
@@ -2210,7 +2215,7 @@ class TestFailedReadSilencesTheEvent:
 
         ws.session._nudges_enabled = _boom  # type: ignore[method-assign]
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
         assert self._charges(observer, ws) == {}
 
     def test_a_failed_persona_visibility_read_silences_both(self):
@@ -2222,7 +2227,7 @@ class TestFailedReadSilencesTheEvent:
 
         ws.session._persona_tool_visible = _boom  # type: ignore[method-assign]
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
         assert self._charges(observer, ws) == {}
 
     def test_a_failed_cooldown_config_read_silences_both(self):
@@ -2242,7 +2247,7 @@ class TestFailedReadSilencesTheEvent:
 
         ws.session._mem_cfg = _CooldownRaises()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
         assert self._charges(observer, ws) == {}
 
     def test_recovery_in_the_same_bracket_fires_both(self):
@@ -2254,12 +2259,12 @@ class TestFailedReadSilencesTheEvent:
         mgr, storage, ws, observer = self._arm()
         storage.config_raises = True
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert ws.session._nudge_queue.pending("any") == []
+        assert ws.session._nudge_queue.pending("wake") == []
         assert self._charges(observer, ws) == {}
 
         storage.config_raises = False
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_tasks", "idle_children"]
         assert self._charges(observer, ws) == {"idle_tasks": 1, "idle_children": 1}
 
@@ -2278,7 +2283,7 @@ class TestFailedReadSilencesTheEvent:
             side_effect=RuntimeError("advice path bug"),
         ):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_children"]
         assert self._charges(observer, ws) == {"idle_children": 1}
 
@@ -2314,7 +2319,7 @@ class TestAdviceDrainPredicate:
         assert len(ws.session._nudge_queue) == 1
 
         _add_active_child(storage, ws_id="child-late", state="running")
-        drained = ws.session._nudge_queue.drain({"any"})
+        drained = ws.session._nudge_queue.drain({"wake"})
         assert [d[0] for d in drained] == ["idle_tasks"]
 
     def test_children_read_failure_is_irrelevant_to_the_advice_predicate(self, coord_setup):
@@ -2329,7 +2334,7 @@ class TestAdviceDrainPredicate:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         storage.count_raises = True
-        drained = ws.session._nudge_queue.drain({"any"})
+        drained = ws.session._nudge_queue.drain({"wake"})
         assert [d[0] for d in drained] == ["idle_tasks"]
 
     def test_delivered_when_a_new_task_replaced_the_resolved_one(self, coord_setup):
@@ -2350,7 +2355,7 @@ class TestAdviceDrainPredicate:
 
         # tsk_a done, a brand-new task opened in its place.
         _set_tasks(storage, _task("tsk_a", "done"), _task("tsk_new", "pending"))
-        assert [d[0] for d in ws.session._nudge_queue.drain({"any"})] == ["idle_tasks"]
+        assert [d[0] for d in ws.session._nudge_queue.drain({"wake"})] == ["idle_tasks"]
 
     def test_delivered_when_an_open_task_survives(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -2362,7 +2367,7 @@ class TestAdviceDrainPredicate:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         _set_tasks(storage, _task("tsk_a", "done"), _task("tsk_b", "pending"))
-        assert [d[0] for d in ws.session._nudge_queue.drain({"any"})] == ["idle_tasks"]
+        assert [d[0] for d in ws.session._nudge_queue.drain({"wake"})] == ["idle_tasks"]
 
     def test_dropped_when_no_open_task_remains(self, coord_setup):
         """The claim's one staleness condition: the open set is empty,
@@ -2377,7 +2382,7 @@ class TestAdviceDrainPredicate:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         _set_tasks(storage, _task("tsk_a", "done"), _task("tsk_b", "needs_user"))
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        assert ws.session._nudge_queue.drain({"wake"}) == []
 
     def test_dropped_when_the_envelope_read_fails(self, coord_setup):
         """A failed storage read never delivers a nudge — the fire-gate
@@ -2395,7 +2400,7 @@ class TestAdviceDrainPredicate:
         assert len(ws.session._nudge_queue) == 1
 
         storage.config_raises = True
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        assert ws.session._nudge_queue.drain({"wake"}) == []
         assert len(ws.session._nudge_queue) == 0
 
 
@@ -2419,7 +2424,7 @@ class TestRaggedTaskRows:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        _type, text, meta = ws.session._nudge_queue.drain({"any"})[0]
+        _type, text, meta = ws.session._nudge_queue.drain({"wake"})[0]
         assert text.startswith("You still have 1 open task: 0 in_progress, 1 pending.")
         assert meta == {"counts": {"open": 1, "in_progress": 0, "pending": 1}}
         assert "None" not in text
@@ -2439,7 +2444,7 @@ class TestRaggedTaskRows:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        snap = ws.session._nudge_queue.pending("any")
+        snap = ws.session._nudge_queue.pending("wake")
         assert len(snap) == 1
         assert snap[0][1].startswith("You still have 1 open task")
         assert "42" not in snap[0][1]
@@ -2482,9 +2487,9 @@ class TestAdviceIsIndependentOfLiveness:
         )
         ws.session._metacog_state.clear()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
 
-        drained = ws.session._nudge_queue.drain({"any"})
+        drained = ws.session._nudge_queue.drain({"wake"})
         assert [d[0] for d in drained] == ["idle_tasks"]
 
     def test_advice_delivers_while_liveness_is_capped(self, coord_setup):
@@ -2501,22 +2506,22 @@ class TestAdviceIsIndependentOfLiveness:
         # Liveness fires once, spending its single cap slot for this
         # bracket.  Clearing the queue does not give the slot back.
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_children"]
         ws.session._nudge_queue.clear()
 
         # Children finish, advice fires and queues.
         storage.children.clear()
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
 
         # Children come back while liveness is still capped out — the
         # queued advice entry survives and DELIVERS: its task claim is
         # true, and the children's return does not falsify it.
         _add_active_child(storage, ws_id="child-b", state="running")
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
-        drained = ws.session._nudge_queue.drain({"any"})
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
+        drained = ws.session._nudge_queue.drain({"wake"})
         assert [d[0] for d in drained] == ["idle_tasks"]
 
 
@@ -2552,7 +2557,7 @@ class TestDrainChildrenMemo:
         assert len(ws.session._nudge_queue) == 3
 
         before = len(storage.count_calls)
-        drained = ws.session._nudge_queue.drain({"any"})
+        drained = ws.session._nudge_queue.drain({"wake"})
         assert [d[0] for d in drained] == ["idle_children"] * 3
         assert len(storage.count_calls) - before == 1
 
@@ -2607,7 +2612,7 @@ class TestDrainChildrenMemo:
 
         storage.count_workstreams_by_state = _flaky
 
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        assert ws.session._nudge_queue.drain({"wake"}) == []
         assert reads["n"] == 1, "one read serves the whole pass"
 
     def test_previous_pass_answer_never_drops_a_fresh_entry(self, coord_setup):
@@ -2634,7 +2639,7 @@ class TestDrainChildrenMemo:
         # Children finish; the queued entry is correctly dropped and the
         # pass observes "no active children".
         storage.children.clear()
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        assert ws.session._nudge_queue.drain({"wake"}) == []
 
         # A real (non-wake) leave-IDLE re-arms the cap, a child spawns,
         # and the next bracket enqueues a fresh liveness entry.
@@ -2646,7 +2651,7 @@ class TestDrainChildrenMemo:
 
         # Drained immediately — well inside what any wall-clock TTL
         # would have reused — the fresh entry must DELIVER.
-        drained = ws.session._nudge_queue.drain({"any"})
+        drained = ws.session._nudge_queue.drain({"wake"})
         assert [d[0] for d in drained] == ["idle_children"]
 
 
@@ -2670,7 +2675,7 @@ class TestCoDelivery:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
 
         # Still the SAME bracket: nothing left IDLE, so no cap was
         # re-armed.  Advice already spent its one slot and is refused at
@@ -2679,13 +2684,16 @@ class TestCoDelivery:
         _add_active_child(storage, ws_id="child-a", state="running")
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_tasks", "idle_children"]
 
-    def test_co_delivery_survives_a_stop_demotion(self, coord_setup):
-        """An operator Stop demotes queued entries from "any" to
-        "quiet"; a later liveness fire must not disturb them — the
-        demoted advice entry rides the next legitimate seam."""
+    def test_stop_sweep_drops_wake_nudges_without_rearming_caps(self, coord_setup):
+        """An operator Stop DROPS queued wake-channel idle nudges — it
+        never demotes them to quiet, because quiet delivers at user/tool
+        seams and this class may never ride those.  The sweep is
+        queue-only: it neither re-arms a spent cap nor blocks a later
+        same-bracket liveness fire, and the dropped advice entry stays
+        gone until a real send re-arms the bracket."""
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")
@@ -2693,18 +2701,24 @@ class TestCoDelivery:
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
+
+        # The queue half of ``ChatSession._drain_pending_advisories`` —
+        # generation-scoped clears plus the wake drop, then the external
+        # demote (the fake session carries no real drain method; the
+        # real-session Stop behaviour is pinned in
+        # test_idle_nudge_wake_integration.py).
+        ws.session._nudge_queue.clear_channels({"tool", "user", "wake"})
         ws.session._nudge_queue.demote_channel("any", "quiet")
+        assert ws.session._nudge_queue.pending() == []
 
         # Advice already spent its slot for this bracket, so only
-        # liveness fires — demoting the queue moves entries between
-        # channels, it does not re-arm a cap.
+        # liveness fires on the next same-bracket IDLE — the sweep
+        # dropped entries, it did not re-arm a cap.
         _add_active_child(storage, ws_id="child-a", state="running")
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert [t for t, _ in ws.session._nudge_queue.pending()] == [
-            "idle_tasks",
-            "idle_children",
-        ]
+        assert [t for t, _ in ws.session._nudge_queue.pending()] == ["idle_children"]
 
     def test_refused_fire_does_not_disturb_the_sibling(self, coord_setup):
         """Cap-refused advice fires leave queued liveness entries
@@ -2725,7 +2739,7 @@ class TestCoDelivery:
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         for _ in range(3):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_children", "idle_tasks"]
 
     def test_both_types_drain_in_seq_order(self, coord_setup):
@@ -2742,7 +2756,7 @@ class TestCoDelivery:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        drained = ws.session._nudge_queue.drain({"any"})
+        drained = ws.session._nudge_queue.drain({"wake"})
         assert [d[0] for d in drained] == ["idle_tasks", "idle_children"]
 
 
@@ -2777,7 +2791,7 @@ class TestFailureIsolationAndBudget:
         ):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_children"]
 
     def test_liveness_path_fault_does_not_suppress_advice(self, coord_setup):
@@ -2796,7 +2810,7 @@ class TestFailureIsolationAndBudget:
         ):
             mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_tasks"]
 
     def test_refused_charge_does_not_burn_the_cooldown(self, coord_setup):
@@ -2868,7 +2882,7 @@ class TestParkGates:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        types = [t for t, _ in ws.session._nudge_queue.pending("any")]
+        types = [t for t, _ in ws.session._nudge_queue.pending("wake")]
         assert types == ["idle_children"]
 
     def test_advice_skipped_when_the_last_turn_used_the_wait_tool(self, coord_setup):
@@ -2914,14 +2928,14 @@ class TestCountsClaim:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        _type, text, meta = ws.session._nudge_queue.pending_with_metadata("any")[0]
+        _type, text, meta = ws.session._nudge_queue.pending_with_metadata("wake")[0]
         assert text.startswith("You still have 2 open tasks: 1 in_progress, 1 pending.")
         assert meta == {"counts": {"open": 2, "in_progress": 1, "pending": 1}}
         for fragment in ("tsk_a", "tsk_zz", "tsk_b"):
             assert fragment not in text, fragment
         assert chr(10) + "  - " not in text
         # The forged/bracketed ids do not perturb delivery either.
-        assert [d[0] for d in ws.session._nudge_queue.drain({"any"})] == ["idle_tasks"]
+        assert [d[0] for d in ws.session._nudge_queue.drain({"wake"})] == ["idle_tasks"]
 
     def test_partial_resolution_keeps_the_entry(self, coord_setup):
         """The old scope test in reverse: with more work than the old
@@ -2939,14 +2953,14 @@ class TestCountsClaim:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        _type, text, meta = ws.session._nudge_queue.pending_with_metadata("any")[0]
+        _type, text, meta = ws.session._nudge_queue.pending_with_metadata("wake")[0]
         assert meta == {"counts": {"open": 9, "in_progress": 0, "pending": 9}}
         assert text.startswith("You still have 9 open tasks: 0 in_progress, 9 pending.")
 
         # Resolve six of the nine; three stay open.
         resolved = [_task(f"tsk_{i}", "done" if i < 6 else "pending") for i in range(9)]
         _set_tasks(storage, *resolved)
-        assert [d[0] for d in ws.session._nudge_queue.drain({"any"})] == ["idle_tasks"]
+        assert [d[0] for d in ws.session._nudge_queue.drain({"wake"})] == ["idle_tasks"]
 
     def test_full_resolution_drops_the_entry(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -2958,7 +2972,7 @@ class TestCountsClaim:
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
         _set_tasks(storage, *[_task(f"tsk_{i}", "done") for i in range(9)])
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        assert ws.session._nudge_queue.drain({"wake"}) == []
 
 
 class TestRaggedStatus:
@@ -2979,7 +2993,7 @@ class TestRaggedStatus:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        snap = ws.session._nudge_queue.pending("any")
+        snap = ws.session._nudge_queue.pending("wake")
         assert len(snap) == 1
         # The ragged row is skipped, not counted: one open task, not two.
         assert snap[0][1].startswith("You still have 1 open task: 0 in_progress, 1 pending.")
@@ -3021,7 +3035,7 @@ class TestCancelledGenerationDoesNotRearmTheWake:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_children"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_children"]
 
     def test_advice_resumes_after_the_next_send_clears_the_latch(self, coord_setup):
         mgr, storage, ws = coord_setup
@@ -3039,7 +3053,7 @@ class TestCancelledGenerationDoesNotRearmTheWake:
         # test_idle_nudge_wake_integration.test_stop_latch_survives_the_liveness_wake.
         ws.session._generation_abandoned = False
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
-        assert [t for t, _ in ws.session._nudge_queue.pending("any")] == ["idle_tasks"]
+        assert [t for t, _ in ws.session._nudge_queue.pending("wake")] == ["idle_tasks"]
 
 
 class TestIdLessRowsFireAndValidate:
@@ -3067,7 +3081,7 @@ class TestIdLessRowsFireAndValidate:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        _type, text, meta = ws.session._nudge_queue.pending_with_metadata("any")[0]
+        _type, text, meta = ws.session._nudge_queue.pending_with_metadata("wake")[0]
         assert _type == "idle_tasks"
         assert text.startswith("You still have 2 open tasks: 1 in_progress, 1 pending.")
         assert meta == {"counts": {"open": 2, "in_progress": 1, "pending": 1}}
@@ -3085,7 +3099,7 @@ class TestIdLessRowsFireAndValidate:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        assert [d[0] for d in ws.session._nudge_queue.drain({"any"})] == ["idle_tasks"]
+        assert [d[0] for d in ws.session._nudge_queue.drain({"wake"})] == ["idle_tasks"]
 
     def test_id_less_rows_still_resolve_to_a_drop(self, coord_setup):
         """And the claim stays falsifiable without ids: close the open
@@ -3100,7 +3114,7 @@ class TestIdLessRowsFireAndValidate:
         assert len(ws.session._nudge_queue) == 1
 
         _set_tasks(storage, {"title": "no id", "status": "done"})
-        assert ws.session._nudge_queue.drain({"any"}) == []
+        assert ws.session._nudge_queue.drain({"wake"}) == []
 
 
 class TestEvalParity:
@@ -3208,7 +3222,7 @@ class TestEvalParity:
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
 
-        pending = ws.session._nudge_queue.pending_with_metadata("any")
+        pending = ws.session._nudge_queue.pending_with_metadata("wake")
         assert [t for t, _, _ in pending] == ["idle_tasks"]
         _type, text, meta = pending[0]
         assert meta is not None

@@ -22,6 +22,16 @@ Channels:
       ``"any"`` entries here: the external event (watch fire,
       background-shell exit) is still delivered at the next seam, but it
       must not wake the workstream the user just stopped.
+    * ``"wake"`` — delivers ONLY via the idle wake.  A member of
+      :data:`WAKE_PENDING` and of no drain set: invisible to
+      ``USER_DRAIN``, ``TOOL_DRAIN``, and the wake path's quiet
+      ride-along.  The idle-nudge producer
+      (``CoordinatorIdleObserver``) uses it because its entries speak
+      about an IDLE state — delivered at a user or tool seam they would
+      describe a moment that no longer exists.  A user cancel DROPS
+      pending ``"wake"`` entries rather than demoting them to
+      ``"quiet"``: demotion would hand them to exactly the seams this
+      channel exists to be invisible to.
 
 Drain preserves FIFO order; non-matching entries stay queued.  Each
 entry can carry an optional ``valid_until`` predicate that drain
@@ -46,8 +56,8 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-Channel = Literal["user", "tool", "any", "quiet"]
-_VALID_CHANNELS: frozenset[str] = frozenset({"user", "tool", "any", "quiet"})
+Channel = Literal["user", "tool", "any", "quiet", "wake"]
+_VALID_CHANNELS: frozenset[str] = frozenset({"user", "tool", "any", "quiet", "wake"})
 
 # Module-level filter constants — most callers want one of these and
 # pre-allocating spares us a frozenset construction at every drain seam.
@@ -57,7 +67,13 @@ TOOL_DRAIN: frozenset[str] = frozenset({"tool", "any", "quiet"})
 # waking an idle workstream.  Deliberately excludes ``"quiet"`` — entries a
 # user cancel demoted must ride the next legitimate seam/wake, never cause
 # one, or Stop is followed seconds later by an autonomous resume.
-WAKE_PENDING: frozenset[str] = frozenset({"user", "any"})
+# ``"wake"`` is a member here and NOWHERE else: the wake is both the only
+# seam that may deliver those entries and a seam they justify.
+WAKE_PENDING: frozenset[str] = frozenset({"user", "any", "wake"})
+# The wake-only channel, named once: the idle-nudge producer's enqueue
+# target, the abandoned-generation drop set (dropped, never demoted — see
+# the channel table above), and the interjection handoff's drop set.
+WAKE_CHANNEL: Channel = "wake"
 # The quiet channel, named once: the demotion target for external events a
 # user cancel must not let re-wake the workstream, and the ride-along drain
 # the wake path uses after its WAKE_PENDING pass.
