@@ -12096,8 +12096,8 @@ class ChatSession:
         post-retry stream failure leaves them in place — operator
         intervention is required for the underlying failure anyway.
 
-        A queued user interjection OWNS the idle seam (owner ruling,
-        2026-07-29): when ``_queued_messages`` is non-empty at wake time,
+        A queued user interjection OWNS the idle seam: when
+        ``_queued_messages`` is non-empty at wake time,
         the synthetic wake turn yields to it — the wake-only idle nudges
         are dropped and the interjection runs as a genuine user send
         instead.  See the branch below for the mechanics and for why the

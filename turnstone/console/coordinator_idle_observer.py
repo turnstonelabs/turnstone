@@ -626,7 +626,7 @@ class CoordinatorIdleObserver:
         if not self._try_charge(plan.ws_id, plan.nudge_type):
             return False
 
-        # WAKE-ONLY delivery discipline (owner ruling, 2026-07-29): both
+        # WAKE-ONLY delivery discipline: both
         # idle-nudge types ride the ``"wake"`` channel, which no user- or
         # tool-seam drain ever matches.  Each body speaks about an IDLE
         # state ("you went idle holding X"); delivered at a later user
@@ -923,7 +923,7 @@ class CoordinatorIdleObserver:
         open_tasks = self._open_tasks(envelope)
         if not open_tasks:
             return None
-        # PARK WHILE ANY TASK NEEDS THE USER (ruling, 2026-07-29).
+        # PARK WHILE ANY TASK NEEDS THE USER.
         # There is no task graph, so the harness cannot know whether an
         # open task is gated on a parked one's unanswered question —
         # task A ``in_progress`` may be waiting on exactly the decision
@@ -1334,7 +1334,7 @@ class CoordinatorIdleObserver:
         branch's two slots.  Bare ids forced the body to hedge about
         states this very query had just read — "may still be running or
         may have finished" — which is manufactured uncertainty, ruled
-        out 2026-07-29: the harness renders the fact it holds.  One
+        out: the harness renders the fact it holds.  One
         value serves the fact lines and the slots deliberately: a
         second derivation of the same storage read is a state where the
         two can disagree, which is unreachable when there is only one

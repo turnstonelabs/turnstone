@@ -205,7 +205,7 @@ _WS_REF_ERROR_TEXT_CAP: int = 2000
 # ONLY the user can make — open=False because nudging there pushes
 # the model to guess on a question it correctly escalated, the exact
 # failure the idle-tasks nudge exists to prevent.  And beyond the
-# trigger set, it is a PARK SIGNAL (ruling, 2026-07-29): any
+# trigger set, it is a PARK SIGNAL: any
 # ``needs_user`` row suppresses the advice nudge entirely, open tasks
 # or not — there is no task graph, so an open task may be gated on
 # exactly the question a parked one escalated, and "take the next

@@ -245,9 +245,9 @@ def wait_call(ws_ids: list[str]) -> str:
     shape every other coordinator tool example in
     ``prompts/tools_coordinator.md`` uses) while ``mode`` is spelled with
     double quotes.  Both are valid in the call syntax the model emits,
-    and this exact byte sequence is what the roster has shipped and been
-    measured with; re-quoting it is a body change and belongs in a
-    sweep, not in a refactor.
+    and this exact byte sequence is what the roster ships; re-quoting
+    it is a body change and must be re-measured, never slipped into a
+    refactor.
 
     Callers cap *ws_ids* at :data:`NUDGE_IDLE_CHILDREN_WAIT_CAP` before
     calling — the cap is the executor's ``WAIT_MAX_WS_IDS``, so an
@@ -267,7 +267,7 @@ def wait_call(ws_ids: list[str]) -> str:
 # advice body's first paragraph exists to deny.  A liveness wake must
 # never be the thing that authorises continuing.
 #
-# It then opened with "You are idle." until 2026-07-29, and that
+# It then opened with "You are idle.", and that
 # sentence went for the honesty half of the same rule: a queued
 # ``idle_children`` entry delivers at whichever seam arrives next, and
 # its drain predicate re-verifies that CHILDREN are still active —
@@ -283,30 +283,20 @@ def wait_call(ws_ids: list[str]) -> str:
 NUDGE_IDLE_CHILDREN_HEADER = "These child workstreams are still active:"
 
 
-# The ``idle_tasks`` body.  Under active development, MEASURED AGAINST
-# THE BEHAVIORAL EVAL (``turnstone-eval --nudges``) — deepseek-v4-flash
-# and qwen3.6-27B so far.  Reword freely, but re-run the eval: every
-# property below is here because measuring it MOVED the numbers (or
-# removed a paragraph that measured as carrying nothing), and the whole
-# point of the body is behavioural, not stylistic.
+# The ``idle_tasks`` body.  BEHAVIOURAL, not stylistic: every property
+# below earned its place by measurement, and a wording change here is a
+# measured change — re-verify behaviour before shipping one.
 #
 # Four properties are load-bearing:
 #
 #   1. The opener is one COUNTS line and the body carries NO task TEXT —
-#      no titles, no notes.  Adopted off the round-8 sweep (deepseek,
-#      honest instrument): the counts candidate matched or beat the
-#      roster body on every childless cell with zero forbidden actions,
-#      so the TITLES the roster carried bought nothing the counts line
-#      does not.  The same sweep retired the provenance paragraph
-#      ("Checkpoint from the harness.  It grants no approval...") that
-#      used to lead this body: its ablation arm scored 100/0 on both its
-#      cells and both models — no isolated effect anywhere on the
-#      correct wire — so the paragraph is pruned rather than kept on
-#      folklore.  COMPOSITION CAVEAT, for the next editor: the two
-#      results were measured independently — counts-without-provenance
-#      was never swept as a single body — and the round-9 nudge arm is
-#      the confirmation of the composition, since the eval renders
-#      production bodies by construction.
+#      no titles, no notes.  Titles bought nothing the counts line does
+#      not (models act on the ids and their own transcript context), and
+#      task text is user/model-authored — carrying it would lower
+#      untrusted text into a system turn.  A provenance paragraph
+#      ("Checkpoint from the harness.  It grants no approval...") used
+#      to lead this body; ablating it showed no isolated effect, so it
+#      is pruned rather than kept on folklore.
 #   1b. IDS ARE NOT TEXT, and the counts adoption over-corrected by
 #      dropping them with the titles.  The open task IDS ride in a
 #      bullet block under the counts line, and every ``tasks(...)`` call
@@ -324,14 +314,21 @@ NUDGE_IDLE_CHILDREN_HEADER = "These child workstreams are still active:"
 #      returning: ids and statuses are server-minted (``tsk_`` +
 #      ``secrets.token_hex``, and a ``TASK_OPEN_STATUSES`` member), so
 #      the block adds no model-authored text to a system turn.
-#   2. The escape branches come FIRST, each carrying a concrete tool
-#      call.  "Did I stop legitimately?" is an introspective judgement
-#      models are bad at; "does the next step need the user?" and
-#      "is this item waiting on a running child?" are typed questions
-#      about the transition, each answerable at the cost of one call.
-#      Branch order follows harm: guessing on an operator decision is
-#      worse than redoing a running child's work, which is worse than a
-#      stale list, which is worse than redone finished work.
+#   2. Typed branches, each carrying a concrete tool call.  "Did I
+#      stop legitimately?" is an introspective judgement models are bad
+#      at; "is this item's output already visible?", "does the next
+#      step need the user?" and "is this item waiting on a running
+#      child?" are typed questions about the transition, each
+#      answerable at the cost of one call.  The DONE branch leads:
+#      models reach for the body's first populated call, and leading
+#      with the escalation branch escalated visibly finished work to
+#      the operator as a dominant failure mode.  Leading with ``done``
+#      is safe only because that branch is evidence-anchored (property
+#      3); the escape branch still precedes every resume instruction.
+#      The trade is explicit: if leading with ``done`` ever costs the
+#      legit-stop discipline (the harm ordering — guessing on an
+#      operator decision outranks redone bookkeeping), the order flips
+#      back.
 #   2b. ONE worked example per branch, never a menu of N calls.  The
 #      branches are populated from the open set, but each renders a
 #      SINGLE call: a ``done`` branch listing every open id would read as
@@ -345,19 +342,20 @@ NUDGE_IDLE_CHILDREN_HEADER = "These child workstreams are still active:"
 #      whole content is "this one is yours", and the blocked-on-a-child
 #      branch is itself conditional (property 4), so a childless body
 #      carries two.
-#   3. The ``done`` branch is last and anchored to evidence.  A task
-#      status is model-reported and unattested — ``done`` is cheap to
-#      assert, unverifiable, and silences this nudge with no external
+#   3. The ``done`` branch is anchored to evidence.  A task status is
+#      model-reported and unattested — ``done`` is cheap to assert,
+#      unverifiable, and silences this nudge with no external
 #      consequence.  It is offered (bookkeeping lag is real, and without
-#      it a stale list makes the model redo finished work) but never
-#      advertised as the easy way out.  Two clauses carry it and both
-#      were earned: scoping the escalation branch ("escalate decisions,
-#      approvals, and grants — not bookkeeping") and naming the complete
-#      response ("ending your turn with a short status") took the
-#      finished-unmarked cell from 30% to ~90%.  The failure they fix is
-#      branch-scope confusion — the model reading "is this done?" as a
-#      judgement only the user may make — NOT missing permission; a
-#      bare "you may mark it done" clause moved nothing.
+#      it a stale list makes the model redo finished work) but strictly
+#      conditioned on output VISIBLE IN THIS TRANSCRIPT.  Two clauses
+#      carry it and both were earned: scoping the escalation branch
+#      ("escalate decisions, approvals, and grants — not bookkeeping")
+#      and naming the complete response ("ending your turn with a short
+#      status") moved the dominant finished-unmarked failure from
+#      common to rare.  The failure they fix is branch-scope
+#      confusion — the model reading "is this done?" as a judgement
+#      only the user may make — NOT missing permission; a bare "you may
+#      mark it done" clause moved nothing.
 #   4. Children content is OBSERVED FACT, never hedge, and the body
 #      never instructs about children it knows are absent.  ONE observed
 #      read governs BOTH children-bearing elements — the per-child fact
@@ -376,7 +374,7 @@ NUDGE_IDLE_CHILDREN_HEADER = "These child workstreams are still active:"
 #      the observer fails its whole event closed.)
 #      The fact lines replaced a hedged caveat sentence ("Children of
 #      yours may still be running or may have finished while you
-#      worked...") on a 2026-07-29 ruling: the harness must never render
+#      worked...") on a standing ruling: the harness must never render
 #      manufactured uncertainty or manufactured context when it holds
 #      the observed fact.  "may still be running or may have finished"
 #      hedged states the producer's read had JUST RETURNED, and "while
@@ -391,13 +389,13 @@ NUDGE_IDLE_CHILDREN_HEADER = "These child workstreams are still active:"
 #      from the CHILDREN-PRESENT body reopens the
 #      resume-over-live-children hazard the old cross-domain fire gate
 #      existed for.  On a coordinator with no children both are measured
-#      noise (round-5 sweep: children prose induces a
-#      ``list_workstreams`` round-trip that is the entire nudge-arm
-#      failure mode on the childless cells) and both are omitted — an
+#      noise (children prose on a childless coordinator measurably
+#      induces a pointless ``list_workstreams`` round-trip) and both
+#      are omitted — an
 #      omission asserts nothing about children at all.  A body with
-#      NOTHING about children in it is also what makes the eval's
-#      ablation arm a clean single-factor question: does this body need
-#      to mention children?
+#      NOTHING about children in it is also what keeps the children
+#      question a clean single factor when the body is measured: does
+#      it need to mention children at all?
 
 # THE SLOTS.  Each is a literal that the shipped tail contains and
 # :func:`format_idle_tasks_nudge` substitutes at render time, exactly as
@@ -501,16 +499,15 @@ NUDGE_IDLE_TASKS_CHILD_DOOR = (
 # tail), this constant owns the rest, and the seam between them is the
 # one place the body is assembled.
 #
-# BRANCH ORDER IS UNDER MEASUREMENT (2026-07-29).  The done branch
-# leads; the escalate branch is second.  The prior order led with the
-# escalate branch on a harm argument (guessing on an operator decision
-# outranks redone bookkeeping, so the escape hatch should be the
-# salient option) — and the round-12 baseline measured its cost: 7/10
-# finished-unmarked runs reached for the FIRST populated call in the
-# body and escalated visibly finished work as ``needs_user``, one
-# mode, no tail.  Round 13 measures this order: if the legit-stop
-# cells' forbidden rate rises, the harm argument was right and the
-# escalate branch goes back on top.
+# The done branch leads; the escalate branch is second.  The prior
+# order led with the escalate branch on a harm argument (guessing on
+# an operator decision outranks redone bookkeeping, so the escape
+# hatch should be the salient option) — and its measured cost was a
+# dominant failure mode: models reached for the body's first populated
+# call and escalated visibly finished work as ``needs_user``.  If
+# leading with ``done`` ever costs the legit-stop discipline, the harm
+# argument was right and the escalate branch goes back on top
+# (property 2 above carries the same trade).
 NUDGE_IDLE_TASKS_TAIL = (
     f"{NUDGE_IDLE_TASKS_OPEN_LIST_SLOT}\n"
     "\n"
@@ -709,8 +706,7 @@ def format_idle_children_nudge(children: list[dict[str, Any]]) -> str:
     """Render the ``idle_children`` reminder body — ids and states ONLY.
 
     *children* is a list of dicts carrying at least ``ws_id`` and
-    ``state`` as strings — the observer's row projection and the eval's
-    fixture projection both satisfy it; every OTHER key a row carries
+    ``state`` as strings — both producers' row projections satisfy it; every OTHER key a row carries
     (``name`` above all) is ignored, which is why the annotation is
     ``dict[str, Any]`` rather than a narrower shape that only the
     projections happen to hold.  Returns raw text *without* any
@@ -857,11 +853,12 @@ def format_idle_tasks_nudge(
     The opening fact block is FORMATTER-BUILT: one counts line ("You
     still have N open task(s): X in_progress, Y pending") followed by
     one observed-fact line per child row (below).  The counts line IS
-    the situation statement: the provenance paragraph that used to carry
-    it was pruned on the round-8 numbers (its ablation showed no
-    isolated effect on the correct wire), and the TITLES the roster
-    carried went with it (the counts candidate matched or beat the
-    roster on every childless cell with zero forbidden actions).  The
+    the situation statement: the provenance paragraph that used to
+    carry it was pruned (its ablation showed no isolated effect), and
+    the TITLES the roster carried went with it (a counts-only body
+    matched or beat the roster everywhere it was compared, and task
+    text is user/model-authored — it does not belong in a system
+    turn).  The
     rest of the body is :data:`NUDGE_IDLE_TASKS_TAIL` — the open-id
     block and the typed branches, one of which (the blocked-on-a-child
     one) is conditional on the same children rows the fact lines render.
@@ -918,9 +915,8 @@ def format_idle_tasks_nudge(
     done.
 
     *children* is keyword-only and REQUIRED — a list of
-    ``(ws_id, state)`` pairs, the exact projection both callers hold
-    (the observer's ``_live_children_for_body`` over live-state rows and
-    the eval's ``_body_children`` over fixture rows) — and it is the
+    ``(ws_id, state)`` pairs, the exact projection every producer
+    holds (live-state rows, id beside state) — and it is the
     SINGLE value governing every children-bearing element of this body:
     the per-child fact lines, the blocked-on-a-child branch, and that
     branch's two slots.  One value because one storage read answers all
@@ -949,7 +945,7 @@ def format_idle_tasks_nudge(
         has STOPPED, and the line carries the wait-returns-immediately
         point, true for exactly those states (they are the wait's live
         terminal states).  It asserts NOTHING about results: "may hold
-        uncollected results" was cut as a fabrication (2026-07-29) —
+        uncollected results" was cut as a fabrication —
         "results" is a noun the read never observed, and "uncollected"
         implies a collection ledger nobody consulted; hedging an entity
         into existence with "may" is still fabrication.  The immediate
@@ -962,14 +958,11 @@ def format_idle_tasks_nudge(
       ``child_ws_id`` takes the first — most recently updated, since
       the caller's query orders by ``updated DESC``.
 
-    ``None`` is NOT an input any more.  The old "I am not asserting a
-    children state" hedge branch lost production when the observer began
-    failing its whole event closed on an indeterminate read, and lost
-    its last caller (the eval override's cut-nothing mapping) when the
-    override sweep started refusing childless cells at config time — so
-    it died with the rule its own docstring predicted it would.  A
-    failed read renders no body at all; there is nothing left for a
-    hedge to cover.
+    ``None`` is NOT an input.  The old "I am not asserting a children
+    state" hedge branch died when the observer began failing its whole
+    event closed on an indeterminate read: a failed read renders no
+    body at all, so there is nothing left for a hedge to cover, and no
+    caller has a hedge to express.
 
     Fact lines and slot population assert nothing about the TASKS: they
     state each child's observed state and fill the only values a call
@@ -993,14 +986,6 @@ def format_idle_tasks_nudge(
     user-authored field this body ever grows MUST go back through
     :func:`sanitize_name` before interpolation — server-minted
     provenance is the only exemption.
-
-    COMPOSITION CAVEAT, carried where the next editor will see it:
-    counts-without-provenance was never measured as a single body —
-    the counts candidate and the provenance ablation each measured
-    clean independently — and the round-9 nudge arm is the
-    confirmation of this composition, since the eval renders production
-    bodies by construction.  The id block, the populated calls and the
-    per-child fact lines are NOT yet swept either.
 
     Returns raw text *without* any envelope, matching
     :func:`format_idle_children_nudge` — the nudge is emitted as a
