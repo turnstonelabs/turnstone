@@ -500,8 +500,26 @@ NUDGE_IDLE_TASKS_CHILD_DOOR = (
 # lines (FACTS ARE HARNESS-RENDERED, never part of the overridable
 # tail), this constant owns the rest, and the seam between them is the
 # one place the body is assembled.
+#
+# BRANCH ORDER IS UNDER MEASUREMENT (2026-07-29).  The done branch
+# leads; the escalate branch is second.  The prior order led with the
+# escalate branch on a harm argument (guessing on an operator decision
+# outranks redone bookkeeping, so the escape hatch should be the
+# salient option) — and the round-12 baseline measured its cost: 7/10
+# finished-unmarked runs reached for the FIRST populated call in the
+# body and escalated visibly finished work as ``needs_user``, one
+# mode, no tail.  Round 13 measures this order: if the legit-stop
+# cells' forbidden rate rises, the harm argument was right and the
+# escalate branch goes back on top.
 NUDGE_IDLE_TASKS_TAIL = (
     f"{NUDGE_IDLE_TASKS_OPEN_LIST_SLOT}\n"
+    "\n"
+    "If an item's output is visible in this transcript, record "
+    "it — ending your turn with a short status is a complete "
+    "response:\n"
+    "\n"
+    f"    tasks(action='update', task_id='{NUDGE_IDLE_TASKS_ID_SLOT}', "
+    "status='done')\n"
     "\n"
     "If the next step needs the user — a decision, an approval, a "
     "scope or credential you were not given — that is not yours to "
@@ -518,14 +536,7 @@ NUDGE_IDLE_TASKS_TAIL = (
     "confirmation."
     f"{NUDGE_IDLE_TASKS_CHILD_DOOR}\n"
     "\n"
-    "If the next step is yours to take, take it.\n"
-    "\n"
-    "If an item's output is visible in this transcript, record "
-    "it — ending your turn with a short status is a complete "
-    "response:\n"
-    "\n"
-    f"    tasks(action='update', task_id='{NUDGE_IDLE_TASKS_ID_SLOT}', "
-    "status='done')"
+    "If the next step is yours to take, take it."
 )
 
 

@@ -851,19 +851,25 @@ class TestFormatIdleTasksNudge:
         assert self._fmt(children=[]) == opener + childless
 
     def test_escape_branch_precedes_resume_branch(self):
-        """Branch order follows harm: guessing on an operator decision is
-        worse than a stale list.  A trailing caveat does not survive a
-        small model's read, so the escape hatch leads."""
+        """Branch order: the escape hatch still precedes "take it" — a
+        model must meet the operator branch before any resume
+        instruction, whatever leads the body."""
         out = self._fmt()
         assert out.index("needs_user") < out.index("If the next step is yours")
 
-    def test_offers_done_branch_last(self):
-        """Bookkeeping lag is real (without this branch a stale list makes
-        the model redo finished work), but ``done`` is model-reported and
-        unattested, so it is never the salient option."""
+    def test_offers_done_branch_first(self):
+        """UNDER MEASUREMENT (round 13): the done branch leads.  The
+        prior order led with the escalate branch on a harm argument
+        (guessing on an operator decision outranks redone bookkeeping,
+        so the escape hatch should be salient) — and the round-12
+        baseline measured its cost: 7/10 finished-unmarked runs reached
+        for the body's FIRST populated call and escalated visibly
+        finished work, one mode, no tail.  If round 13 moves the
+        legit-stop cells' forbidden rate up, the harm argument was
+        right and this pin flips back."""
         out = self._fmt()
         assert "status='done'" in out
-        assert out.index("needs_user") < out.index("status='done'")
+        assert out.index("status='done'") < out.index("needs_user")
 
     def test_blocked_on_child_branch_sits_between_escape_and_resume(self):
         """Branch order follows harm: guessing on an operator decision >
@@ -920,8 +926,7 @@ class TestFormatIdleTasksNudge:
         and the check it invites finds whatever is actually there."""
         out = self._fmt(children=[("child-a", state)])
         assert (
-            chr(10) + "Child child-a has stopped — "
-            "wait_for_workstream returns immediately for it."
+            chr(10) + "Child child-a has stopped — wait_for_workstream returns immediately for it."
         ) in out
         assert "is still running" not in out.split(chr(10))[1]
 
@@ -932,8 +937,7 @@ class TestFormatIdleTasksNudge:
             "Child child-a is still running; check before redoing anything it owns."
         )
         assert lines[2] == (
-            "Child child-b has stopped — "
-            "wait_for_workstream returns immediately for it."
+            "Child child-b has stopped — wait_for_workstream returns immediately for it."
         )
 
     def test_no_hedge_survives_about_an_observed_state(self):
