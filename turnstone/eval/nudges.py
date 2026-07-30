@@ -79,6 +79,7 @@ from turnstone.console.coordinator_idle_observer import (
 from turnstone.core import metacognition as _metacog
 from turnstone.core.child_event_bus import ChildEventBus
 from turnstone.core.log import get_logger
+from turnstone.core.memory import save_structured_memory
 from turnstone.core.metacognition import (
     field_str,
     format_idle_children_nudge,
@@ -789,6 +790,46 @@ def _seed_transcript(case: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _seed_world(storage: Any, case: dict[str, Any]) -> None:
+    """Seed the cell's TOOL-VISIBLE environment through production writers.
+
+    Every surface the model can observe must agree about the world's
+    age and contents.  The C1 confirm measured models sweeping memory /
+    skills / list_nodes, finding voids that contradicted a transcript
+    full of referents, and spawning investigators to resolve the
+    contradiction — the forbidden rate was measuring the fixture's
+    hollow tool-world, not dispatch discipline.
+
+    ``world.memory`` rows go through :func:`save_structured_memory`
+    (the same upsert the memory tool's save action commits, so the
+    memory tool's list/search reads them back exactly as production
+    rows).  ``world.nodes`` rows register through the service registry
+    plus node metadata — the two reads ``list_nodes`` intersects, so a
+    seeded node is live inside the heartbeat window by construction.
+
+    A seed failure raises: a partially-seeded world is the same
+    hollowness with worse deniability.
+    """
+    world = case.get("world") or {}
+    for row in world.get("memory", ()):
+        saved, _was_update = save_structured_memory(
+            row["name"],
+            row["content"],
+            row.get("description"),
+            row.get("type"),
+            scope=row.get("scope", "global"),
+            scope_id=row.get("scope_id", ""),
+        )
+        if saved is None:
+            raise RuntimeError(f"world.memory seed failed for {row['name']!r}")
+    for node in world.get("nodes", ()):
+        node_id = node["node_id"]
+        storage.register_service("server", node_id, node.get("url", f"http://{node_id}:8080"))
+        meta = [(k, str(v), "auto") for k, v in node.get("metadata", {}).items()]
+        if meta:
+            storage.set_node_metadata_bulk(node_id, meta)
+
+
 def _seed_tasks(
     coord_client: CoordinatorClient, ws_id: str, case: dict[str, Any]
 ) -> dict[int, str]:
@@ -1069,6 +1110,8 @@ def _run_single_nudge(
         # workstream that exists, and a fresh attempt rewrites them into
         # its fresh DB along with everything else.
         _seed_child_transcripts(storage, case)
+
+        _seed_world(storage, case)
 
         # A retried attempt replaces the previous attempt's client;
         # close the old transport so the retry cannot leak it (the
@@ -1905,6 +1948,41 @@ def _check_override_cells_have_a_live_child(case: dict[str, Any]) -> str | None:
 # INDEPENDENT and the driver runs every one of them, which is the
 # property that lets a new refusal be appended rather than threaded
 # (``test_no_refusal_is_reachable_only_behind_another_ones_early_out``).
+def _check_world_is_seedable(case: dict[str, Any]) -> str | None:
+    """Refuse a malformed ``world`` block before the canary spends a
+    request on it.
+
+    Recognized keys only (``memory`` / ``nodes``) — an unrecognized key
+    is a silent no-op seed, which reads as "seeded" while leaving the
+    hollow world the block exists to fill.  Memory rows need non-empty
+    string ``name`` and ``content`` (the production upsert's own
+    requirements, surfaced at authoring time); node rows need a
+    non-empty string ``node_id``.
+    """
+    world = case.get("world")
+    if world is None:
+        return None
+    if not isinstance(world, dict):
+        return "world must be a dict"
+    unknown = set(world) - {"memory", "nodes"}
+    if unknown:
+        return f"world has unrecognized keys {sorted(unknown)}"
+    for i, row in enumerate(world.get("memory", ())):
+        if not isinstance(row, dict):
+            return f"world.memory[{i}] must be a dict"
+        for field in ("name", "content"):
+            v = row.get(field)
+            if not isinstance(v, str) or not v.strip():
+                return f"world.memory[{i}].{field} must be a non-empty string"
+    for i, node in enumerate(world.get("nodes", ())):
+        if not isinstance(node, dict):
+            return f"world.nodes[{i}] must be a dict"
+        nid = node.get("node_id")
+        if not isinstance(nid, str) or not nid.strip():
+            return f"world.nodes[{i}].node_id must be a non-empty string"
+    return None
+
+
 _CELL_CHECKS: tuple[Callable[[dict[str, Any]], str | None], ...] = (
     _check_arms_are_a_string_list,
     _check_arms_are_declared,
@@ -1921,6 +1999,7 @@ _CELL_CHECKS: tuple[Callable[[dict[str, Any]], str | None], ...] = (
     _check_pair_arms_have_an_active_child,
     _check_no_caveat_arm_has_a_live_child,
     _check_children_carry_their_transcripts,
+    _check_world_is_seedable,
 )
 
 # Refusals that additionally run when the sweep carries

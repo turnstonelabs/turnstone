@@ -48,6 +48,7 @@ from turnstone.eval.nudges import (
     _seed_child_transcripts,
     _seed_tasks,
     _seed_transcript,
+    _seed_world,
     _StubCoordinatorClient,
     _validate_cells,
     build_stimulus,
@@ -147,6 +148,14 @@ def _trip_cells() -> list[dict[str, Any]]:
             "children": [{"ws_id": "ws-c1", "name": "auditor", "state": "idle"}],
             "tasks": [_OPEN_TASK],
         },
+        # A world block with an unrecognized key — a silent no-op seed —
+        # trips only the world-shape check.
+        {
+            "id": "X_t",
+            "arms": [ARM_NUDGE],
+            "tasks": [_OPEN_TASK],
+            "world": {"memroy": []},
+        },
     ]
 
 
@@ -229,6 +238,55 @@ class TestCellFixtures:
         bad = {"id": "X", "tasks": [{"title": "t", "status": "not-a-status"}]}
         with pytest.raises(ValueError, match="rejected"):
             _seed_tasks(client, "coord-eval-1", bad)
+
+
+class TestWorldSeeding:
+    """``world`` seeds the TOOL-VISIBLE environment through production
+    writers, and the proof is the production READS: the memory rows come
+    back through the same listing the memory tool serves, and the node
+    comes back through the real ``CoordinatorClient.list_nodes`` — the
+    service-registry liveness intersection included."""
+
+    _WORLD_CELL = {
+        "id": "X_world",
+        "tasks": [{"title": "t", "status": "pending"}],
+        "world": {
+            "memory": [
+                {
+                    "name": "proj-context",
+                    "content": "acme-api: staging tracks main.",
+                    "type": "reference",
+                }
+            ],
+            "nodes": [{"node_id": "node-t", "metadata": {"hostname": "node-t", "os": "linux"}}],
+        },
+    }
+
+    def test_memory_rows_read_back_through_the_production_listing(self, eval_storage):
+        from turnstone.core.memory import list_structured_memories
+
+        _seed_world(eval_storage, self._WORLD_CELL)
+        rows = list_structured_memories(scope="global")
+        by_name = {r["name"]: r for r in rows}
+        # The production writer normalizes names (normalize_key), so the
+        # seeded row reads back exactly as a model-saved one would.
+        assert "proj_context" in by_name
+        assert by_name["proj_context"]["content"] == "acme-api: staging tracks main."
+
+    def test_nodes_read_back_through_the_real_list_nodes(self, eval_storage):
+        _seed_world(eval_storage, self._WORLD_CELL)
+        client = _StubCoordinatorClient(
+            eval_storage, coord_ws_id="coord-eval-1", user_id="eval-user"
+        )
+        out = client.list_nodes()
+        ids = {n.get("node_id") for n in out.get("nodes", [])}
+        assert "node-t" in ids
+
+    def test_a_worldless_cell_seeds_nothing_and_raises_nothing(self, eval_storage):
+        from turnstone.core.memory import list_structured_memories
+
+        _seed_world(eval_storage, {"id": "X_plain", "tasks": []})
+        assert list_structured_memories(scope="global") == []
 
 
 class TestSweepValidation:
@@ -1255,8 +1313,7 @@ class TestStimulus:
         )
         idle_body = _body([{"ws_id": "ws-c1", "name": "auditor", "state": "idle"}])
         assert (
-            "Child ws-c1 has stopped — "
-            "wait_for_workstream returns immediately for it."
+            "Child ws-c1 has stopped — wait_for_workstream returns immediately for it."
         ) in idle_body
         assert "Child " not in _body([{"ws_id": "ws-c1", "name": "auditor", "state": "closed"}])
         # No hedge about an observed state, in any cell class.
