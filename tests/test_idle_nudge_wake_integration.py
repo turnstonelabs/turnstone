@@ -32,7 +32,10 @@ from tests._helpers import wait_until as _wait_until
 from tests.test_session_manager import FakeStorage
 from turnstone.core import session_worker
 from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher, wake_workstream_if_pending
-from turnstone.core.metacognition import NUDGE_IDLE_TASKS_CHILD_DOOR
+from turnstone.core.metacognition import (
+    NUDGE_CHILD_RUNNING_LINE,
+    NUDGE_IDLE_TASKS_CHILD_DOOR,
+)
 from turnstone.core.session import ChatSession
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.trajectory import dicts_from_turns, turn_from_dict
@@ -573,9 +576,7 @@ def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db
         # whose empty half is the test below.  The fact line renders the
         # OBSERVED state (registered running) with the full id, end to
         # end through the real storage round-trip.
-        assert (
-            "Child child-a is still running; check before redoing anything it owns." in tasks_text
-        )
+        assert NUDGE_CHILD_RUNNING_LINE.format(ws_id="child-a").removeprefix(chr(10)) in tasks_text
         assert "may still be running" not in tasks_text
         # CO-DELIVERY COHERENCE, end to end: both bodies in one drain now
         # name the same child, from two independent storage reads.  The
@@ -1223,9 +1224,9 @@ def test_interjection_handoff_dispatches_exactly_one_real_send(tmp_db):
     """The handoff's dispatch shape, pinned at the session boundary: a
     queued interjection plus queued wake nudges produce ONE ``send``
     call carrying the interjection text with ``from_wake`` unset — never
-    ``send("")`` (measured at this HEAD: that shape appends an empty
-    untagged user turn and delivers the interjection one assistant turn
-    late via the flush seam)."""
+    ``send("")`` (that shape appends an empty untagged user turn and
+    delivers the interjection one assistant turn late via the flush
+    seam)."""
     from tests._helpers import make_chat_session
 
     session = make_chat_session()
@@ -1252,3 +1253,156 @@ def test_interjection_handoff_dispatches_exactly_one_real_send(tmp_db):
     assert len(session._nudge_queue) == 0
     assert session._queued_messages == {}
     assert session._wake_source_tag == ""
+
+
+def test_interjection_handoff_contains_generation_cancelled(tmp_db):
+    """A Stop landing inside the handed-off interjection send must not
+    escape the wake worker: ``GenerationCancelled`` is a BaseException
+    ``session_worker`` does not catch.  Deliberately NO restore on this
+    arm — the Stop supersedes the queued words — so the queue stays
+    empty and the wake entries stay dropped."""
+    from tests._helpers import make_chat_session
+    from turnstone.core.session import GenerationCancelled
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session._nudge_queue.enqueue("idle_children", "children active", "wake")
+    session.queue_message("urgent question")
+
+    def _cancelled_send(*a: Any, **k: Any) -> None:
+        raise GenerationCancelled()
+
+    session.send = _cancelled_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()  # must not raise
+
+    assert len(session._nudge_queue) == 0
+    assert session._queued_messages == {}
+
+
+def test_interjection_handoff_restores_the_queue_when_send_raises(tmp_db):
+    """Any escape other than a cancel happened in send's preamble,
+    before the user turn was appended — the popped items must be
+    restored (ids and priorities intact) and the failure must surface,
+    so the next send's flush seams deliver the user's words instead of
+    a log line being their gravestone."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    _c, _p, msg_id = session.queue_message("!!!do not lose this")
+
+    def _exploding_send(*a: Any, **k: Any) -> None:
+        raise RuntimeError("preamble failure")
+
+    session.send = _exploding_send  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="preamble failure"):
+        session.deliver_wake_nudge_from_queue()
+
+    # Restored verbatim: same id, same cleaned text, same priority.
+    assert msg_id in session._queued_messages
+    text, priority = session._queued_messages[msg_id]
+    assert text == "do not lose this"
+    assert priority == "important"
+
+
+def test_interjection_handoff_does_not_restore_after_a_late_raise(tmp_db):
+    """send can raise from its LATE handlers, after the user turn was
+    appended and persisted — restoring there would deliver the user's
+    words twice at the next flush seam.  The length snapshot is the
+    discriminator: an appended turn means no restore."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session.queue_message("delivered then failed")
+
+    def _append_then_raise(text: str, *a: Any, **k: Any) -> None:
+        session.messages.append({"role": "user", "content": text})
+        raise RuntimeError("late failure")
+
+    session.send = _append_then_raise  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="late failure"):
+        session.deliver_wake_nudge_from_queue()
+
+    # The turn reached history; the queue must NOT get it back.
+    assert session._queued_messages == {}
+
+
+def test_a_retraction_during_the_handoff_is_honoured_by_the_restore(tmp_db):
+    """The DELETE route can land while the dispatcher holds the popped
+    items — it finds the id gone and answers as already-sent.  A
+    failure-path restore must not resurrect the message the user just
+    cancelled."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    _c, _p, keep_id = session.queue_message("keep this one")
+    _c, _p, retract_id = session.queue_message("cancel this one")
+
+    def _retract_mid_send(text: str, *a: Any, **k: Any) -> None:
+        session.dequeue_message(retract_id)
+        raise RuntimeError("preamble failure")
+
+    session.send = _retract_mid_send  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="preamble failure"):
+        session.deliver_wake_nudge_from_queue()
+
+    assert keep_id in session._queued_messages
+    assert retract_id not in session._queued_messages
+
+
+def test_interjection_handoff_skips_the_pop_when_budget_exhausted(tmp_db):
+    """On the budget latch ``send`` refuses without appending a turn
+    unless a human approves, and a wake is unattended — the handoff
+    must not pop (the message stays queued for the user's next real
+    send) and must fall through to the wake drain so the worker's exit
+    convergence holds."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    _c, _p, msg_id = session.queue_message("held message")
+    session._budget_exhausted = True
+
+    sends: list[tuple[Any, ...]] = []
+
+    def _recording_send(*a: Any, **k: Any) -> None:
+        sends.append((a, k))
+
+    session.send = _recording_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()
+
+    # No interjection dispatch; the wake drain path ran instead (the
+    # wake-eligible entry was drained toward the synthetic wake send).
+    assert msg_id in session._queued_messages
+    assert all(args != ("held message",) for args, _k in sends)
+    assert any(a == ("",) for a, _k in sends)
+
+
+def test_interjection_handoff_falls_through_on_content_free_items(tmp_db):
+    """A bare priority marker ('!!!') renders as nothing deliverable:
+    the handoff must not spend the seam on a content-free user turn —
+    the husk is discarded and the wake proceeds normally, nudges
+    intact."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session.queue_message("!!!")
+    session.queue_message("   ")
+
+    sends: list[tuple[Any, ...]] = []
+
+    def _recording_send(*a: Any, **k: Any) -> None:
+        sends.append((a, k))
+
+    session.send = _recording_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()
+
+    # The husks were consumed, no interjection turn was dispatched, and
+    # the wake path ran: the ONLY send is the wake's synthetic "" one —
+    # a reverted husk skip would dispatch a rendered husk turn here and
+    # fail the equality, so this line is the live mutation control.
+    assert session._queued_messages == {}
+    assert [a for a, _k in sends] == [("",)]

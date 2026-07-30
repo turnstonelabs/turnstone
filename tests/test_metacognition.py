@@ -4,6 +4,9 @@ import pytest
 
 from turnstone.core.metacognition import (
     MEMORY_NUDGE_TYPES,
+    NUDGE_CHILD_OVERFLOW_LINE,
+    NUDGE_CHILD_RUNNING_LINE,
+    NUDGE_CHILD_STOPPED_LINE,
     NUDGE_CHILD_STOPPED_STATES,
     NUDGE_COMPLETION,
     NUDGE_CORRECTION,
@@ -833,7 +836,7 @@ class TestFormatIdleTasksNudge:
         against the same constant with NO fact lines.
         """
         opener = "You still have 2 open tasks: 1 in_progress, 1 pending."
-        facts = chr(10) + "Child child-a is still running; check before redoing anything it owns."
+        facts = NUDGE_CHILD_RUNNING_LINE.format(ws_id="child-a")
         block = chr(10) * 2 + "  - tsk_1 (in_progress)" + chr(10) + "  - tsk_2 (pending)"
         childful = (
             NUDGE_IDLE_TASKS_TAIL.replace(NUDGE_IDLE_TASKS_OPEN_LIST_SLOT, block, 1)
@@ -903,9 +906,7 @@ class TestFormatIdleTasksNudge:
         OBSERVED fact line, full id: the caller read the state this same
         event, so the body states it rather than hedging about it."""
         out = self._fmt(children=[("child-a", "running")])
-        assert (
-            chr(10) + "Child child-a is still running; check before redoing anything it owns."
-        ) in out
+        assert (NUDGE_CHILD_RUNNING_LINE.format(ws_id="child-a")) in out
 
     @pytest.mark.parametrize("state", ["thinking", "running", "attention"])
     def test_every_non_stopped_live_state_reads_as_still_running(self, state):
@@ -925,20 +926,67 @@ class TestFormatIdleTasksNudge:
         finished" disjunct, now attached to the child it is true of,
         and the check it invites finds whatever is actually there."""
         out = self._fmt(children=[("child-a", state)])
-        assert (
-            chr(10) + "Child child-a has stopped — wait_for_workstream returns immediately for it."
-        ) in out
+        assert (NUDGE_CHILD_STOPPED_LINE.format(ws_id="child-a")) in out
         assert "is still running" not in out.split(chr(10))[1]
+
+    def test_fact_lines_cap_at_the_display_cap_with_a_counts_overflow(self):
+        """The body is a persistent system turn replayed every request,
+        so the fact block is bounded exactly as the roster body is:
+        display-capped lines plus one counts-only overflow line (no
+        ids — an id-less summary cannot dangle an unusable handle).
+        The wait slot keeps its own larger handle cap."""
+        n = NUDGE_IDLE_CHILDREN_DISPLAY_CAP + 3
+        children = [(f"{i:032x}", "running") for i in range(n)]
+        out = self._fmt(children=children)
+        lines = out.split(chr(10))
+        fact_lines = [ln for ln in lines if ln.startswith("Child ")]
+        assert len(fact_lines) == NUDGE_IDLE_CHILDREN_DISPLAY_CAP
+        assert NUDGE_CHILD_OVERFLOW_LINE.format(n=3).removeprefix(chr(10)) in lines
+        # No id from the overflowed rows appears anywhere in the body's
+        # fact block (the wait call may still carry them — its cap is
+        # larger by design).
+        overflowed = {f"{i:032x}" for i in range(NUDGE_IDLE_CHILDREN_DISPLAY_CAP, n)}
+        for ws_id in overflowed:
+            assert all(not ln.startswith(f"Child {ws_id}") for ln in lines)
+
+    def test_all_unusable_child_ids_render_the_childless_body(self):
+        """The door and the fact lines key on ONE condition — the
+        USABLE list.  A children list whose every id the sanitiser
+        rejects must render the childless body: keeping the branch
+        would ship the raw template slot into a system turn with zero
+        fact lines above it."""
+        out = self._fmt(children=[("bad<id>", "running"), ("", "idle")])
+        assert "Child " not in out
+        assert "waiting on a child workstream" not in out
+        assert NUDGE_IDLE_TASKS_CHILD_SLOT not in out
+
+    def test_mixed_state_overflow_makes_no_state_claim(self):
+        """The overflow line summarises rows the fact lines above may
+        have just called stopped — any state adjective would
+        reclassify them, so the line carries a count and nothing
+        else."""
+        n = NUDGE_IDLE_CHILDREN_DISPLAY_CAP + 2
+        children = [(f"{i:032x}", "idle" if i % 2 else "running") for i in range(n)]
+        out = self._fmt(children=children)
+        overflow = NUDGE_CHILD_OVERFLOW_LINE.format(n=2).removeprefix(chr(10))
+        assert overflow in out.split(chr(10))
+        for word in ("live", "running", "active"):
+            assert word not in overflow
+
+    def test_an_alterable_child_ws_id_is_dropped_never_mangled(self):
+        """The children projection takes the same alteration check as
+        the open-row fields: a ws_id the sanitiser would change is
+        dropped whole, so no forged or mangled handle can reach the
+        fact lines or the door slots."""
+        out = self._fmt(children=[("bad<id>", "running"), ("child-ok", "running")])
+        assert "bad" not in out
+        assert NUDGE_CHILD_RUNNING_LINE.format(ws_id="child-ok") in out
 
     def test_mixed_children_render_one_fact_line_each_in_read_order(self):
         out = self._fmt(children=[("child-a", "running"), ("child-b", "idle")])
         lines = out.split(chr(10))
-        assert lines[1] == (
-            "Child child-a is still running; check before redoing anything it owns."
-        )
-        assert lines[2] == (
-            "Child child-b has stopped — wait_for_workstream returns immediately for it."
-        )
+        assert lines[1] == (NUDGE_CHILD_RUNNING_LINE.format(ws_id="child-a").removeprefix(chr(10)))
+        assert lines[2] == (NUDGE_CHILD_STOPPED_LINE.format(ws_id="child-b").removeprefix(chr(10)))
 
     def test_no_hedge_survives_about_an_observed_state(self):
         """MUTATION CONTROL for the retired caveat (ruled 2026-07-29):
@@ -991,9 +1039,7 @@ class TestFormatIdleTasksNudge:
             .replace(NUDGE_IDLE_TASKS_WAIT_SLOT, wait_call(["child-a"]), 1)
             .replace(NUDGE_IDLE_TASKS_CHILD_SLOT, "child-a")
         )
-        fact_line = (
-            chr(10) + "Child child-a is still running; check before redoing anything it owns."
-        )
+        fact_line = NUDGE_CHILD_RUNNING_LINE.format(ws_id="child-a")
         childful = self._fmt(children=[("child-a", "running")])
         assert rendered_door in childful
         assert dropped == childful.replace(fact_line, "", 1).replace(rendered_door, "", 1)

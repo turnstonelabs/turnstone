@@ -1762,6 +1762,13 @@ class ChatSession:
         # Queued user turns never carry attachments — see
         # ``AttachmentsNotQueueableError`` for the role-ordering reason —
         # so the entry tuple is just ``(cleaned, priority)``.
+        # Ids retracted while a dispatcher held the popped items — the
+        # DELETE route can land during the handoff's in-flight send, find
+        # the id already popped, and answer "already sent"; a restore
+        # that resurrected it would deliver a message the user explicitly
+        # cancelled.  Written under ``_queued_lock``; cleared at each pop
+        # (a new window) and consumed by the restore.
+        self._retracted_while_popped: set[str] = set()
         self._queued_messages: collections.OrderedDict[str, tuple[str, str]] = (
             collections.OrderedDict()
         )
@@ -9779,9 +9786,20 @@ class ChatSession:
         return cleaned, priority, msg_id
 
     def dequeue_message(self, msg_id: str) -> bool:
-        """Remove a queued message by ID.  Returns True if removed."""
+        """Remove a queued message by ID.  Returns True if removed.
+
+        A miss is RECORDED, not just reported: during the wake handoff's
+        in-flight send the items live in the dispatcher's hands, so the
+        user's retraction cannot reach the queue — the ledger lets a
+        failure-path restore honour it instead of resurrecting a message
+        the user cancelled.  (A miss for an id that was simply already
+        delivered records harmlessly: the ledger is cleared at each pop
+        and consulted only by the restore.)
+        """
         with self._queued_lock:
             popped = self._queued_messages.pop(msg_id, None)
+            if popped is None:
+                self._retracted_while_popped.add(msg_id)
         return popped is not None
 
     def flush_queued_messages(self) -> bool:
@@ -9881,26 +9899,69 @@ class ChatSession:
         self._append_user_turn(content, ())
         return True
 
-    def _pop_queued_messages_text(self) -> str:
-        """Atomically drain ``_queued_messages`` and render the combined text.
+    def _pop_queued_messages(self) -> dict[str, tuple[str, str]]:
+        """Atomically drain ``_queued_messages``, returning the raw items.
 
-        The one rendering of the interjection queue as USER-turn content
-        — ``[IMPORTANT]``-prefixed per item priority, items joined by
-        blank lines — shared by :meth:`_flush_queued_messages` (the
-        in-send flush seams) and the wake path's interjection handoff in
-        :meth:`deliver_wake_nudge_from_queue`, so the two dispatch shapes
-        cannot drift.  Returns ``""`` when nothing was queued.  The pop
-        happens under ``_queued_lock`` and is destructive: the caller
-        owns delivery of whatever comes back.
+        The pop happens under ``_queued_lock`` and is destructive: the
+        caller owns delivery of whatever comes back, and a caller whose
+        delivery can fail restores the SAME mapping via
+        :meth:`_restore_queued_messages` — ids and priorities intact, so
+        the queued-id / send-id correspondence the delete route and the
+        pending rows rely on survives a failed dispatch.
+        """
+        with self._queued_lock:
+            items = dict(self._queued_messages)
+            self._queued_messages.clear()
+            self._retracted_while_popped.clear()
+        return items
+
+    def _restore_queued_messages(self, items: dict[str, tuple[str, str]]) -> None:
+        """Put popped items back at the FRONT of ``_queued_messages``.
+
+        The undo half of :meth:`_pop_queued_messages`, for a dispatcher
+        whose delivery failed before any turn was appended.  Restores
+        unconditionally — the items were already admitted, so
+        ``_QUEUE_MAX`` (an admission gate, not a storage invariant) does
+        not re-apply — and ahead of anything queued meanwhile, keeping
+        arrival order.
+        """
+        with self._queued_lock:
+            merged = {
+                mid: row for mid, row in items.items() if mid not in self._retracted_while_popped
+            }
+            merged.update(self._queued_messages)
+            self._queued_messages.clear()
+            self._queued_messages.update(merged)
+            self._retracted_while_popped.clear()
+
+    @staticmethod
+    def _render_queued_messages(items: dict[str, tuple[str, str]]) -> str:
+        """The one rendering of popped interjection items as USER-turn
+        content — ``[IMPORTANT]``-prefixed per item priority, items
+        joined by blank lines — shared by :meth:`_flush_queued_messages`
+        (the in-send flush seams) and the wake path's interjection
+        handoff in :meth:`deliver_wake_nudge_from_queue`, so the two
+        dispatch shapes cannot drift.
+
+        Content-free items are SKIPPED, mirroring ``_collect_advisories``:
+        a priority prefix with nothing behind it (a bare ``!!!``) must
+        not become a turn — rendered alone it would read as a truthy
+        ``"[IMPORTANT] "`` and buy a content-free user turn.  Returns
+        ``""`` when nothing renderable was queued.
         """
         from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
-        with self._queued_lock:
-            items = list(self._queued_messages.values())
-            self._queued_messages.clear()
         return "\n\n".join(
-            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items
+            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg
+            for msg, pri in items.values()
+            if msg.strip()
         )
+
+    def _pop_queued_messages_text(self) -> str:
+        """Pop-and-render in one step, for the flush seams whose delivery
+        cannot fail between pop and append (:meth:`_flush_queued_messages`
+        appends the turn immediately)."""
+        return self._render_queued_messages(self._pop_queued_messages())
 
     def _collect_advisories(
         self,
@@ -12097,11 +12158,11 @@ class ChatSession:
         intervention is required for the underlying failure anyway.
 
         A queued user interjection OWNS the idle seam: when
-        ``_queued_messages`` is non-empty at wake time,
-        the synthetic wake turn yields to it — the wake-only idle nudges
-        are dropped and the interjection runs as a genuine user send
-        instead.  See the branch below for the mechanics and for why the
-        check lives HERE rather than at the watcher's gate.
+        ``_queued_messages`` is non-empty at wake time, the synthetic
+        wake turn yields to it — the wake-only idle nudges are dropped
+        and the interjection runs as a genuine user send instead.  See
+        the branch below for the mechanics and for why the check lives
+        HERE rather than at the watcher's gate.
         """
         # INTERJECTION-OWNS-THE-SEAM.  A non-empty ``_queued_messages``
         # means a user message is waiting for this exact slot: the model
@@ -12126,13 +12187,13 @@ class ChatSession:
         #   after the user turn — better placed than on a synthetic
         #   empty one.
         # * The dispatch is ``send(text)``, never ``send("")`` + flush:
-        #   measured at this HEAD, ``send("")`` with a queued
-        #   interjection appends an EMPTY untagged user turn, answers
-        #   it, and only then flushes the queued text as a second user
-        #   turn — one assistant turn late, with a bogus empty user row
-        #   in history.  Popping first and sending the popped text runs
-        #   the same worker-thread path a real send takes and yields
-        #   exactly one user turn carrying the interjection.
+        #   ``send("")`` with a queued interjection appends an EMPTY
+        #   untagged user turn, answers it, and only then flushes the
+        #   queued text as a second user turn — one assistant turn late,
+        #   with a bogus empty user row in history.  Popping first and
+        #   sending the popped text runs the same worker-thread path a
+        #   real send takes and yields exactly one user turn carrying
+        #   the interjection.
         #
         # The check lives here — not at ``wake_workstream_if_pending`` —
         # because this method runs ON the worker thread that owns the
@@ -12143,22 +12204,75 @@ class ChatSession:
         # idle).  A message queued AFTER this pop lands mid-send and
         # rides the send's ordinary flush seams — the pre-existing
         # mid-turn interjection behaviour of every send.
-        interjection = self._pop_queued_messages_text()
-        if interjection:
-            dropped = self._nudge_queue.clear_channels({WAKE_CHANNEL})
-            log.info(
-                "wake_nudge.interjection_owns_seam ws=%s dropped_wake_nudges=%d",
-                self._ws_id[:8],
-                dropped,
-            )
-            try:
-                self.send(interjection)
-            except GenerationCancelled:
-                # Same containment as the wake send below: this method IS
-                # the wake worker's run() closure and ``session_worker``
-                # catches only ``Exception``.
-                log.info("wake_nudge.interjection_cancelled ws=%s", self._ws_id[:8])
-            return
+        #
+        # ``_budget_exhausted`` is checked BEFORE the pop: on that latch
+        # ``send`` refuses without appending a turn unless a human
+        # approves the override, and a wake is unattended — popping
+        # first would destroy the message on a refusal that raises
+        # nothing.  Skipping the branch (no pop) leaves the interjection
+        # queued for the user's next real send, where the approval
+        # prompt has someone in front of it, and falls through to the
+        # wake drain so this worker's exit keeps its convergence.
+        if not self._budget_exhausted:
+            popped = self._pop_queued_messages()
+            interjection = self._render_queued_messages(popped)
+            if interjection:
+                dropped = self._nudge_queue.clear_channels({WAKE_CHANNEL})
+                log.info(
+                    "wake_nudge.interjection_owns_seam ws=%s dropped_wake_nudges=%d",
+                    self._ws_id[:8],
+                    dropped,
+                )
+                appended_before = len(self.messages)
+                try:
+                    self.send(interjection)
+                except GenerationCancelled:
+                    # Same containment as the wake send below: this
+                    # method IS the wake worker's run() closure and
+                    # ``session_worker`` catches only ``Exception``.
+                    # Deliberately NO restore on this arm: a cancel here
+                    # is the operator's Stop, and re-arming their
+                    # pre-Stop words for a later seam would deliver a
+                    # message the Stop may have been meant to overtake.
+                    log.info("wake_nudge.interjection_cancelled ws=%s", self._ws_id[:8])
+                except BaseException:
+                    # A non-cancel escape can happen on either side of
+                    # the user-turn append: send's PREAMBLE can raise
+                    # before anything reached history (the popped items
+                    # would be destroyed with only a log line), but
+                    # send's LATE handlers re-raise after the turn was
+                    # appended AND persisted — restoring there would
+                    # deliver the user's words twice at the next flush
+                    # seam.  The length snapshot is the discriminator:
+                    # restore only when nothing was appended.  (A
+                    # mid-send compaction rewrites the list and could
+                    # coincidentally match the old length; compaction
+                    # implies the turn appended, so that corner
+                    # restores a duplicate — accepted as vanishingly
+                    # rare against the common preamble-loss case.)
+                    #
+                    # The wake entries stay dropped on this arm — caps
+                    # charged, nothing delivered, the accepted
+                    # fail-closed drop — and re-queueing them would
+                    # re-arm the worker-exit wake retry into a hot
+                    # loop against a persistently failing send.  The
+                    # restored interjection's re-arm is the user's next
+                    # send (its flush seams deliver the restored
+                    # items); a worker-exit re-check of the interjection
+                    # queue would close that window structurally.
+                    if len(self.messages) == appended_before:
+                        self._restore_queued_messages(popped)
+                    raise
+                return
+            if popped:
+                # Everything queued was content-free (a bare priority
+                # marker) — nothing to dispatch, nothing worth a turn.
+                # Fall through to the normal wake drain below.
+                log.info(
+                    "wake_nudge.interjection_empty ws=%s discarded=%d",
+                    self._ws_id[:8],
+                    len(popped),
+                )
 
         # Two-pass drain: wake-eligible channels first.  ``"quiet"`` entries
         # (external events demoted by a user cancel) ride a wake earned by

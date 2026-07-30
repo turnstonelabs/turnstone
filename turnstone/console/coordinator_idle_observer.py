@@ -31,10 +31,11 @@ nothing about children at all.  Either way a consistent pair is two
 true statements, not a contradiction.  One ordering caveat, accepted:
 a cross-bracket pair (an older queued ``idle_children`` surviving into
 a bracket that enqueues ``idle_tasks``) delivers children-first by
-seq; both entries are still predicate-valid, so that is a tuning miss,
-not a correctness one.  If evals show small models fumbling even the ordered pair, the
-named upgrade path is a single combined checkpoint type selected at
-produce time — do NOT reintroduce a cross-domain fire gate.
+seq; both entries are still predicate-valid, so that is a tuning
+miss, not a correctness one.  If small models measurably fumble even
+the ordered pair, the named upgrade path is a single combined
+checkpoint type selected at produce time — do NOT reintroduce a
+cross-domain fire gate.
 
 The class decides three behaviours, each ruled at its site:
 

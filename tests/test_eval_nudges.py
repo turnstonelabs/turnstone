@@ -21,6 +21,8 @@ import pytest
 
 from turnstone.console.coordinator_idle_observer import _ACTIVE_CHILD_STATES
 from turnstone.core.metacognition import (
+    NUDGE_CHILD_RUNNING_LINE,
+    NUDGE_CHILD_STOPPED_LINE,
     NUDGE_IDLE_TASKS_CHILD_DOOR,
     NUDGE_IDLE_TASKS_CHILD_SLOT,
     NUDGE_IDLE_TASKS_ID_SLOT,
@@ -281,6 +283,12 @@ class TestWorldSeeding:
         out = client.list_nodes()
         ids = {n.get("node_id") for n in out.get("nodes", [])}
         assert "node-t" in ids
+        # The FILTERED read is the sharp edge: filter values are
+        # JSON-encoded before comparison, so the seed must store them
+        # encoded exactly as production writers do or this matches
+        # nothing and the world is hollow for a filtering model.
+        filtered = client.list_nodes(filters={"os": "linux"})
+        assert {n.get("node_id") for n in filtered.get("nodes", [])} == {"node-t"}
 
     def test_a_worldless_cell_seeds_nothing_and_raises_nothing(self, eval_storage):
         from turnstone.core.memory import list_structured_memories
@@ -1038,6 +1046,39 @@ class TestSweepValidation:
             ]
         )
 
+    def test_world_memory_row_missing_content_is_refused(self):
+        """The field refusals are the only guard in front of
+        ``_seed_world``'s bare indexing — a regression here becomes a
+        mid-sweep KeyError after the canary spends round-trips.  Own
+        test, NOT a ``_trip_cells`` entry: that helper is zipped
+        ``strict=True`` against the check table."""
+        import re
+
+        cells = [
+            {
+                "id": "X_world_bad",
+                "arms": [ARM_NUDGE],
+                "tasks": [_OPEN_TASK],
+                "world": {"memory": [{"name": "x"}]},
+            }
+        ]
+        with pytest.raises(SystemExit, match=re.escape("world.memory[0].content")):
+            _validate_cells(cells)
+
+    def test_world_node_row_with_empty_id_is_refused(self):
+        import re
+
+        cells = [
+            {
+                "id": "X_world_bad",
+                "arms": [ARM_NUDGE],
+                "tasks": [_OPEN_TASK],
+                "world": {"nodes": [{"node_id": ""}]},
+            }
+        ]
+        with pytest.raises(SystemExit, match=re.escape("world.nodes[0].node_id")):
+            _validate_cells(cells)
+
     def test_a_later_bad_cell_still_refuses(self):
         """The scan covers the whole list, not just its head."""
         for bad in (
@@ -1233,7 +1274,7 @@ class TestStimulus:
         env = _envelope({"id": "tsk_1", "title": "audit auth.py", "status": "pending"})
         body = render_tasks_body(env, children=[("ws-c1", "running")])
         assert body.startswith("You still have 1 open task: 0 in_progress, 1 pending.")
-        assert "Child ws-c1 is still running; check before redoing anything it owns." in body
+        assert NUDGE_CHILD_RUNNING_LINE.format(ws_id="ws-c1").removeprefix(chr(10)) in body
         assert "needs_user" in body
         # The seeded id reaches the block AND the branch calls; the
         # seeded title reaches neither.
@@ -1308,13 +1349,11 @@ class TestStimulus:
             return str(turns[1]["content"])
 
         assert "Child " not in _body([])
-        assert "Child ws-c1 is still running; check before redoing anything it owns." in _body(
+        assert NUDGE_CHILD_RUNNING_LINE.format(ws_id="ws-c1").removeprefix(chr(10)) in _body(
             [_LIVE_CHILD]
         )
         idle_body = _body([{"ws_id": "ws-c1", "name": "auditor", "state": "idle"}])
-        assert (
-            "Child ws-c1 has stopped — wait_for_workstream returns immediately for it."
-        ) in idle_body
+        assert (NUDGE_CHILD_STOPPED_LINE.format(ws_id="ws-c1").removeprefix(chr(10))) in idle_body
         assert "Child " not in _body([{"ws_id": "ws-c1", "name": "auditor", "state": "closed"}])
         # No hedge about an observed state, in any cell class.
         for children in ([], [_LIVE_CHILD], [{"ws_id": "ws-c1", "state": "idle"}]):
@@ -1474,7 +1513,7 @@ class TestBodyOverrideSkip:
         assert rendered.startswith(
             "You still have 1 open task: 0 in_progress, 1 pending."
             + chr(10)
-            + "Child ws-c1 is still running; check before redoing anything it owns."
+            + NUDGE_CHILD_RUNNING_LINE.format(ws_id="ws-c1").removeprefix(chr(10))
         )
         assert "record the link and wait instead of redoing its work" in rendered
         assert "child_ws_id='ws-c1'" in rendered

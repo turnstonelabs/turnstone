@@ -25,6 +25,8 @@ from turnstone.console.coordinator_idle_observer import (
     CoordinatorIdleObserver,
 )
 from turnstone.core.metacognition import (
+    NUDGE_CHILD_RUNNING_LINE,
+    NUDGE_CHILD_STOPPED_LINE,
     NUDGE_CHILD_STOPPED_STATES,
     NUDGE_IDLE_TASKS_CHILD_SLOT,
     NUDGE_IDLE_TASKS_ID_SLOT,
@@ -1467,9 +1469,7 @@ class TestTasksBodyChildrenFacts:
 
         _type, text, _meta = self._fire(mgr, storage, ws)
 
-        assert (
-            "Child child-a has stopped — wait_for_workstream returns immediately for it."
-        ) in text
+        assert (NUDGE_CHILD_STOPPED_LINE.format(ws_id="child-a").removeprefix(chr(10))) in text
         # The observed state renders as itself — never the hedge, never
         # the other state's line.
         assert "Child child-a is still running" not in text
@@ -1493,12 +1493,9 @@ class TestTasksBodyChildrenFacts:
         _type, text, _meta = self._fire(mgr, storage, ws)
 
         if state in NUDGE_CHILD_STOPPED_STATES:
-            assert (
-                "Child child-a has stopped — wait_for_workstream returns immediately for it."
-                in text
-            )
+            assert NUDGE_CHILD_STOPPED_LINE.format(ws_id="child-a").removeprefix(chr(10)) in text
         else:
-            assert "Child child-a is still running; check before redoing anything it owns." in text
+            assert NUDGE_CHILD_RUNNING_LINE.format(ws_id="child-a").removeprefix(chr(10)) in text
 
     @pytest.mark.parametrize("state", ["closed", "deleted"])
     def test_terminal_child_rows_read_as_childless(self, coord_setup, state):
@@ -1815,12 +1812,8 @@ class TestExecutableCalls:
         # stop and the immediate wait — so the mixed state renders as
         # two facts, never one hedge covering both.
         lines = text.split(chr(10))
-        assert lines[1] == (
-            "Child child-a is still running; check before redoing anything it owns."
-        )
-        assert lines[2] == (
-            "Child child-b has stopped — wait_for_workstream returns immediately for it."
-        )
+        assert lines[1] == (NUDGE_CHILD_RUNNING_LINE.format(ws_id="child-a").removeprefix(chr(10)))
+        assert lines[2] == (NUDGE_CHILD_STOPPED_LINE.format(ws_id="child-b").removeprefix(chr(10)))
 
     def test_the_blocked_branch_is_a_call_not_prose(self, coord_setup):
         """MUTATION CONTROL: reverting the wait to prose fails here.

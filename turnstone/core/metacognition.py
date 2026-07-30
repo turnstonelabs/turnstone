@@ -384,18 +384,18 @@ NUDGE_IDLE_CHILDREN_HEADER = "These child workstreams are still active:"
 #      reported running (check before redoing what it owns), a stopped
 #      one is reported stopped (``wait_for_workstream`` returns
 #      immediately for it) — the protective points the hedge carried,
-#      each now attached to the child it is true of, and nothing about
-#      results, whose existence no read observed.  Deleting either children-bearing element
-#      from the CHILDREN-PRESENT body reopens the
-#      resume-over-live-children hazard the old cross-domain fire gate
-#      existed for.  On a coordinator with no children both are measured
-#      noise (children prose on a childless coordinator measurably
-#      induces a pointless ``list_workstreams`` round-trip) and both
-#      are omitted — an
-#      omission asserts nothing about children at all.  A body with
-#      NOTHING about children in it is also what keeps the children
-#      question a clean single factor when the body is measured: does
-#      it need to mention children at all?
+#      each now attached to the child it is true of, and nothing
+#      about results, whose existence no read observed.  Deleting
+#      either children-bearing element from the CHILDREN-PRESENT body
+#      reopens the resume-over-live-children hazard the old
+#      cross-domain fire gate existed for.  On a coordinator with no
+#      children both are measured noise (children prose on a childless
+#      coordinator measurably induces a pointless ``list_workstreams``
+#      round-trip) and both are omitted — an omission asserts nothing
+#      about children at all.  A body with NOTHING about children in
+#      it is also what keeps the children question a clean single
+#      factor when the body is measured: does it need to mention
+#      children at all?
 
 # THE SLOTS.  Each is a literal that the shipped tail contains and
 # :func:`format_idle_tasks_nudge` substitutes at render time, exactly as
@@ -422,11 +422,12 @@ NUDGE_IDLE_CHILDREN_HEADER = "These child workstreams are still active:"
 #     honest recovery — the harness holds no id and says so.
 #   * :data:`NUDGE_IDLE_TASKS_CHILD_SLOT` is a pure TEMPLATE VARIABLE.
 #     No production body can contain it.  The branch it sits in renders
-#     only when the caller passed child rows, and it is substituted
-#     whenever it renders; the one state that would leave it
-#     unsubstituted is a live child row with an empty ``ws_id`` (not
-#     producible — every creation path mints through ``uuid4().hex`` or
-#     ``secrets.token_hex``).  The INDETERMINATE-read state that once
+#     only when the caller passed at least one USABLE child row (id
+#     non-empty and unaltered by the sanitiser — the same filter that
+#     builds the fact lines), and it is substituted whenever it
+#     renders: a children list whose every id fails the filter cuts
+#     the branch whole, so no state can leave the slot unsubstituted
+#     in a rendered body.  The INDETERMINATE-read state that once
 #     rendered it is no longer even expressible: the formatter takes a
 #     required children list, and a failed read renders no body at all
 #     (the observer fails its whole event closed).
@@ -554,6 +555,29 @@ NUDGE_IDLE_TASKS_TAIL = (
 NUDGE_CHILD_STOPPED_STATES: frozenset[str] = frozenset(
     {WorkstreamState.IDLE.value, WorkstreamState.ERROR.value}
 )
+
+# The per-child fact-line templates, one per state class — named
+# constants like every other piece of body text in this module, so a
+# reword has ONE anchor (tests assert through these, never through
+# retyped literals) and the two forms cannot drift from what the
+# formatter renders.  ``{ws_id}`` is the only slot; each line carries
+# its own leading newline, the join idiom the fact block builds with.
+NUDGE_CHILD_RUNNING_LINE = (
+    "\nChild {ws_id} is still running; check before redoing anything it owns."
+)
+NUDGE_CHILD_STOPPED_LINE = (
+    "\nChild {ws_id} has stopped — wait_for_workstream returns immediately for it."
+)
+
+# Overflow line for a fact block that hits the display cap — the same
+# cap-and-summarise idiom :func:`format_idle_children_nudge` ships,
+# minted as a constant for the same one-anchor reason as the lines
+# above.  Counts only — no ids, and NO state claim: the unshown rows
+# mix running and stopped children, so any state adjective here would
+# reclassify some of them against the fact lines above (an id-less
+# summary also cannot dangle an unusable handle; the wait call above
+# the branches already carries handles up to its own larger cap).
+NUDGE_CHILD_OVERFLOW_LINE = "\n...and {n} more child workstream(s) not listed here."
 
 
 # ASCII control chars + Unicode steering vectors (bidi-override,
@@ -706,8 +730,9 @@ def format_idle_children_nudge(children: list[dict[str, Any]]) -> str:
     """Render the ``idle_children`` reminder body — ids and states ONLY.
 
     *children* is a list of dicts carrying at least ``ws_id`` and
-    ``state`` as strings — both producers' row projections satisfy it; every OTHER key a row carries
-    (``name`` above all) is ignored, which is why the annotation is
+    ``state`` as strings — both producers' row projections satisfy it;
+    every OTHER key a row carries (``name`` above all) is ignored,
+    which is why the annotation is
     ``dict[str, Any]`` rather than a narrower shape that only the
     projections happen to hold.  Returns raw text *without* any
     envelope; the nudge is emitted as a first-class
@@ -998,13 +1023,29 @@ def format_idle_tasks_nudge(
         return ""
     tail = NUDGE_IDLE_TASKS_TAIL
 
-    # ONE condition, BOTH children-bearing elements.  The per-child fact
-    # lines (built below, beside the opener) and the blocked-on-a-child
-    # branch are removed together or kept together, because a body that
-    # omits the facts about children while keeping the instruction about
-    # children is the defect this conditional exists to fix, one block
-    # lower down.  The cut is literal-anchored, never positional.
-    if not children:
+    # A falsy ws_id would render ``child_ws_id=''`` and a fact line
+    # with no handle — populated in appearance and unrunnable in fact,
+    # which is the shape this whole feature exists to remove — and an
+    # id the sanitiser would ALTER is dropped for the same
+    # drop-never-mangle rule the open-row fields take below: this is a
+    # public surface, and a ws_id carrying a newline or bracket would
+    # forge sibling fact lines inside a system turn.  Neither is
+    # producible today (every creation path mints through
+    # ``uuid4().hex`` or ``secrets.token_hex``), so both are guards
+    # against a future writer rather than live branches.
+    live = [(ws_id, state) for ws_id, state in children if ws_id and sanitize_name(ws_id) == ws_id]
+
+    # ONE condition, EVERY children-bearing element.  The per-child
+    # fact lines (built below, beside the opener), the
+    # blocked-on-a-child branch, and that branch's slots all key on the
+    # USABLE list: a body that omits the facts about children while
+    # keeping the instruction about children is the defect this
+    # conditional exists to fix, and a children list whose every id the
+    # sanitiser rejects is childless FOR RENDERING purposes — keeping
+    # the branch would ship the raw template slot into a system turn
+    # with zero fact lines above it, exactly that defect in its worst
+    # dress.  The cut is literal-anchored, never positional.
+    if not live:
         tail = tail.replace(NUDGE_IDLE_TASKS_CHILD_DOOR, "", 1)
 
     # BOTH row fields take the alteration check — see the docstring's
@@ -1027,17 +1068,6 @@ def format_idle_tasks_nudge(
     else:
         tail = tail.replace(NUDGE_IDLE_TASKS_OPEN_LIST_SLOT, "", 1)
 
-    # A falsy ws_id would render ``child_ws_id=''`` and a fact line with
-    # no handle — populated in appearance and unrunnable in fact, which
-    # is the shape this whole feature exists to remove.  Not producible
-    # today (every creation path mints through ``uuid4().hex`` or
-    # ``secrets.token_hex``), so this is a guard against a future writer
-    # rather than a live branch; it is one comprehension and it keeps
-    # "rendered ⇒ actionable" true by construction rather than by an
-    # argument about id minting three modules away.  Filtered for
-    # RENDERING only: the branch cut above read the raw list, so a child
-    # row that EXISTS without a usable id still keeps the branch.
-    live = [(ws_id, state) for ws_id, state in children if ws_id]
     if live:
         # The wait call FIRST: its slot literal contains the child slot,
         # so substituting the scalar first would consume the bytes this
@@ -1054,17 +1084,27 @@ def format_idle_tasks_nudge(
     # harness-rendered, the tail carries the typed branches.  Each line
     # states the observed fact (the caller's read, this same event) and
     # pairs it with the protection that is true FOR THAT STATE — no
-    # "may" about a state the read returned, no invented context.  The
-    # one "may" that remains is honest: whether a stopped child's
-    # results were collected is the thing the read did not observe.
+    # "may" about a state the read returned, no invented context, and
+    # nothing about results: the stopped line asserts the stop and the
+    # immediate wait, because whether the child produced anything is a
+    # thing no read observed and the cheap check finds whatever is
+    # there.  CAPPED at the roster formatter's display cap with a
+    # counts-only overflow line — the body is a persistent system turn
+    # replayed on every request, and an uncapped block would grow with
+    # every finished-but-unclosed child a coordinator accumulates; the
+    # wait slot above keeps its own larger cap (display-capped prose,
+    # handle-capped call, the split the roster body already ships).
+    shown = live[:NUDGE_IDLE_CHILDREN_DISPLAY_CAP]
     facts = "".join(
         (
-            f"\nChild {ws_id} has stopped — wait_for_workstream returns immediately for it."
+            NUDGE_CHILD_STOPPED_LINE
             if state in NUDGE_CHILD_STOPPED_STATES
-            else f"\nChild {ws_id} is still running; check before redoing anything it owns."
-        )
-        for ws_id, state in live
+            else NUDGE_CHILD_RUNNING_LINE
+        ).format(ws_id=ws_id)
+        for ws_id, state in shown
     )
+    if len(live) > len(shown):
+        facts += NUDGE_CHILD_OVERFLOW_LINE.format(n=len(live) - len(shown))
 
     split = ", ".join(f"{open_counts[status]} {status}" for status in sorted(open_counts))
     noun = "task" if total == 1 else "tasks"

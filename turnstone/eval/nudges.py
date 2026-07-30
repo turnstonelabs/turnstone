@@ -58,7 +58,7 @@ import hashlib
 import json
 import os
 import time
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from openai import OpenAI
 
@@ -346,6 +346,15 @@ class _StubCoordinatorClient(CoordinatorClient):
     (tokens, timestamps, elapsed); the STATES they assert are the
     fixture's own, never invented.
     """
+
+    # A seeded node's registry heartbeat is stamped once, at world-seed
+    # time, while the real client's liveness window assumes an active
+    # cluster re-stamping every few seconds.  A multi-turn run against a
+    # slow model can outlive the real 120s window, at which point
+    # ``list_nodes`` reports an empty cluster and the seeded world turns
+    # hollow mid-run, timing-dependently.  The eval world is static by
+    # construction, so its nodes are live for the whole run.
+    _NODES_HEARTBEAT_WINDOW_S: ClassVar[int] = 10**6
 
     def __init__(
         self,
@@ -825,7 +834,12 @@ def _seed_world(storage: Any, case: dict[str, Any]) -> None:
     for node in world.get("nodes", ()):
         node_id = node["node_id"]
         storage.register_service("server", node_id, node.get("url", f"http://{node_id}:8080"))
-        meta = [(k, str(v), "auto") for k, v in node.get("metadata", {}).items()]
+        # JSON-encoded exactly as every production writer stores these
+        # values — ``list_nodes`` re-encodes its filter values the same
+        # way before comparing, so a raw string here would never match a
+        # filtered lookup and the seeded world would stay hollow for a
+        # model that filters.
+        meta = [(k, json.dumps(v), "auto") for k, v in node.get("metadata", {}).items()]
         if meta:
             storage.set_node_metadata_bulk(node_id, meta)
 
