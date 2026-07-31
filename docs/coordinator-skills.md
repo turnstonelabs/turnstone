@@ -126,10 +126,11 @@ the skill should end on.
 
 `tasks` is the coordinator's scratchpad — a persisted, ordered
 list of rows with fields `{id, title, status, child_ws_id, created,
-updated}` that only this coordinator sees.  Children don't see it;
-the user does via the sidebar.  Five actions: `add`, `update`,
-`remove`, `reorder`, `list` (only `list` is auto-approved; the
-mutators go through the approval flow).
+updated}`, plus `note` on rows where one has been set (the key is
+absent otherwise), that only this coordinator sees.  Children don't
+see it; the user does via the sidebar.  Five actions: `add`,
+`update`, `remove`, `reorder`, `list` (only `list` is auto-approved;
+the mutators go through the approval flow).
 
 The input schema refers to rows by `task_id`; the persisted row
 object exposes the same id as `id`.  The `child_ws_id` field is a
@@ -142,11 +143,20 @@ A skill's initial prompt can seed the task list by calling
 `tasks(action="add", title=...)` as its very first tool calls —
 the user gets a visible plan before any child is spawned, and the
 coordinator's future self has something concrete to iterate on.
-Status transitions (`pending` → `in_progress` → `done` / `blocked`)
-are the skill's main feedback loop: mutate the task when the child
-covering it finishes, not when the child starts.  Use
-`tasks(action="update", task_id=..., child_ws_id=<ws_id>)` to
-link a task to the child that owns it once spawn returns.
+Status transitions (`pending` → `in_progress` → `done` / `blocked` /
+`needs_user`) are the skill's main feedback loop: mutate the task
+when the child covering it finishes, not when the child starts.
+`blocked` and `needs_user` are not interchangeable — `blocked` is a
+dependency the coordinator may be able to clear itself, while
+`needs_user` marks a task that cannot move without a decision,
+approval, or grant only the user can give.  The distinction is
+load-bearing: a coordinator that goes idle holding open tasks gets
+nudged to pick them back up — even when children are still running, so
+keep the matrix honest rather than expecting the reminder to wait for
+an all-clear — and `needs_user` is what tells that nudge the stop was
+deliberate.  Pair it with `note` to record what is being asked for.
+Use `tasks(action="update", task_id=..., child_ws_id=<ws_id>)` to link
+a task to the child that owns it once spawn returns.
 
 A final gotcha: parallel tool dispatch does NOT serialise reads
 after writes in the same batch.  If a skill issues an `update` and
@@ -297,11 +307,11 @@ and the coordinator's planning step is itself valuable.
 tasks(action='add', title='...') × N   # the plan, visible in the sidebar
 for task in tasks:
     spawn_workstream(skill=..., initial_message=task.brief)
-    tasks(action='update', task_id=task.id, notes='ws=<child_ws_id>')
+    tasks(action='update', task_id=task.id, note='ws=<child_ws_id>')
 wait_for_workstream(ws_ids=[...], mode='all', timeout=...)
 for child in children:
     inspect_workstream(ws_id=child)
-    tasks(action='update', task_id=..., status='done', notes='result summary')
+    tasks(action='update', task_id=..., status='done', note='result summary')
 → synthesise
 ```
 

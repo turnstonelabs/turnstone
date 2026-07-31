@@ -1403,8 +1403,24 @@ class CoordinatorTaskInfo(BaseModel):
 
     id: str
     title: str
-    status: str = Field(description="One of: pending / in_progress / done / blocked.")
+    status: str = Field(
+        description=(
+            "One of: pending / in_progress / done / blocked / needs_user.  "
+            "``blocked`` is waiting on a dependency the coordinator may clear "
+            "itself; ``needs_user`` is waiting on a decision only the "
+            "operator can make."
+        )
+    )
     child_ws_id: str = Field(default="")
+    note: str = Field(
+        default="",
+        description=(
+            "Optional one-sentence note, typically what the coordinator needs "
+            "from the operator on a ``needs_user`` task.  Absent from the "
+            "stored record when unset (there is no backfill for rows written "
+            "before the field existed), so it defaults to the empty string here."
+        ),
+    )
     created: str
     updated: str
 

@@ -1178,9 +1178,9 @@ def run_optimization(
     initial_prompt: str | None = None,
     n_runs: int | None = 3,
     max_iterations: int = 5,
-    temperature: float = 0.7,
+    temperature: float | None = None,
     max_tokens: int = 32768,
-    reasoning_effort: str = "medium",
+    reasoning_effort: str | None = None,
     output_file: str = "eval_results.json",
     context_window: int = 131072,
     verbose: bool = False,
@@ -1868,10 +1868,11 @@ def main() -> None:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="Sampling temperature for the model under test (default: 0.7; "
-        "meta lanes — diversifier/observer/analyst/optimizers — inherit "
-        "their own model's serving defaults)",
+        default=None,
+        help="Sampling temperature for the model under test. Omitted from "
+        "the wire by default so the alias / stored setting / serving "
+        "default applies; meta lanes — diversifier/observer/analyst/"
+        "optimizers — always inherit their own model's serving defaults",
     )
     parser.add_argument(
         "--max-tokens",
@@ -1881,10 +1882,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="medium",
-        choices=["low", "medium", "high"],
-        help="Reasoning effort for the model under test (default: medium; "
-        "meta lanes inherit their own model's defaults)",
+        default=None,
+        help="Reasoning effort for the model under test, forwarded "
+        "verbatim — the model's chat template is the sole authority on "
+        "valid tokens. Omitted from the wire by default; meta lanes "
+        "inherit their own model's defaults",
     )
     parser.add_argument(
         "--context-window",

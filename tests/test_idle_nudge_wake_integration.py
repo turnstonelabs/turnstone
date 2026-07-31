@@ -32,6 +32,10 @@ from tests._helpers import wait_until as _wait_until
 from tests.test_session_manager import FakeStorage
 from turnstone.core import session_worker
 from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher, wake_workstream_if_pending
+from turnstone.core.metacognition import (
+    NUDGE_CHILD_RUNNING_LINE,
+    NUDGE_IDLE_TASKS_CHILD_DOOR,
+)
 from turnstone.core.session import ChatSession
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.trajectory import dicts_from_turns, turn_from_dict
@@ -198,8 +202,14 @@ def _wait_for_worker_done(ws: Workstream, timeout: float = 5.0) -> None:
     raise AssertionError(f"worker thread for ws={ws.id[:8]} didn't exit within {timeout}s")
 
 
-def test_idle_event_through_real_session_manager_drives_wake_send(real_mgr, tmp_db):
+@pytest.mark.parametrize("channel", ["any", "wake"])
+def test_idle_event_through_real_session_manager_drives_wake_send(real_mgr, tmp_db, channel):
     """The full wake pipeline, no direct-injection shortcuts.
+
+    Parametrized over both wake-eligible producer channels: ``"any"``
+    (watch fires, external events) and ``"wake"`` (the coordinator idle
+    nudges' wake-only channel) — the watcher's ``WAKE_PENDING`` gate
+    must arm and the wake must deliver for each.
 
     Boundary path under test:
       enqueue → mgr.set_state(IDLE)
@@ -210,7 +220,7 @@ def test_idle_event_through_real_session_manager_drives_wake_send(real_mgr, tmp_
         → ChatSession.deliver_wake_nudge_from_queue (real)
         → ChatSession.send("") (real, with patched LLM stream)
         → _append_user_turn stamps ``_source``
-        → _attach_pending_user_reminders drains ``{"user","any"}``
+        → _attach_pending_user_reminders drains the wake batch
         → _apply_reminders_for_provider splices envelope onto empty content
     """
     mgr, _adapter = real_mgr
@@ -238,8 +248,7 @@ def test_idle_event_through_real_session_manager_drives_wake_send(real_mgr, tmp_
             # Suppress the auto-title side-thread; orthogonal to wake.
             ws.session._title_generated = True
 
-            # Enqueue an any-channel nudge — the future ``idle_children`` shape.
-            ws.session._nudge_queue.enqueue("idle_children", "your kids", "any")
+            ws.session._nudge_queue.enqueue("idle_children", "your kids", channel)
             assert len(ws.session._nudge_queue) == 1
 
             # Trigger IDLE.  This runs subscriber dispatch synchronously on
@@ -471,11 +480,336 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
         idle_turns = [m for m in sys_turns if m["_source"] == "idle_children"]
         assert len(idle_turns) == 1
         text = idle_turns[0]["content"]
-        assert "research-pricing" in text
-        assert "draft-rfc" in text
         assert "child-a" in text
         assert "child-b" in text
         assert "wait_for_workstream" in text
+        # The roster is ids and states only — the children's model-authored
+        # names must not be lowered into the system turn.
+        assert "research-pricing" not in text
+        assert "draft-rfc" not in text
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
+
+
+def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db):
+    """The de-exclusivity ruling crossing every boundary end to end:
+    observer → queue → watcher → wake worker → transcript.
+
+    One IDLE event with BOTH conditions true must deliver BOTH system
+    turns in one synthetic wake turn, tasks first — the co-delivered
+    batch ends on the park instruction.  This is the only end-to-end
+    proof of the pair; the unit suite pins it at the queue only.
+    """
+    import json as _json
+
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+    from turnstone.core.workstream import WorkstreamKind as _Kind
+
+    mgr, adapter, storage = coord_mgr
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord", skill=None)
+        assert coord.session is not None
+
+        storage.register_workstream(
+            "child-a",
+            user_id="u1",
+            name="research-pricing",
+            kind=_Kind.INTERACTIVE,
+            parent_ws_id=coord.id,
+            state="running",
+        )
+        storage.save_workstream_config(
+            coord.id,
+            {
+                "tasks": _json.dumps(
+                    {
+                        "version": 1,
+                        "tasks": [
+                            {"id": "tsk_a", "title": "audit auth.py", "status": "in_progress"}
+                        ],
+                    }
+                )
+            },
+        )
+
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "spawn"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+        assert len(coord.session._nudge_queue) == 0
+        msgs = dicts_from_turns(coord.session.messages)
+        sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+        assert sys_sources == ["idle_tasks", "idle_children"]
+        tasks_text = next(
+            m["content"] for m in msgs if m.get("role") == "system" and m["_source"] == "idle_tasks"
+        )
+        # The counts line is the situation statement; the id block and
+        # the populated calls are under it, and no task TEXT rides along.
+        assert tasks_text.startswith("You still have 1 open task: 1 in_progress, 0 pending.")
+        assert chr(10) + "  - tsk_a (in_progress)" in tasks_text
+        assert "task_id='tsk_a'" in tasks_text
+        assert "audit auth.py" not in tasks_text
+        # The children-aware branch the read selects when a live child
+        # row is really in storage — the populated half of the pair
+        # whose empty half is the test below.  The fact line renders the
+        # OBSERVED state (registered running) with the full id, end to
+        # end through the real storage round-trip.
+        assert NUDGE_CHILD_RUNNING_LINE.format(ws_id="child-a").removeprefix(chr(10)) in tasks_text
+        assert "may still be running" not in tasks_text
+        # CO-DELIVERY COHERENCE, end to end: both bodies in one drain now
+        # name the same child, from two independent storage reads.  The
+        # tasks body populates its blocked-on-a-child branch with the
+        # registered ws_id and emits the same ``wait_for_workstream``
+        # call shape the roster does — the inconsistency this change
+        # removed was one body handing over a runnable call while the
+        # other ended in the bare prose "then wait_for_workstream."
+        assert "child_ws_id='child-a'" in tasks_text
+        assert "wait_for_workstream(ws_ids=['child-a'], mode=\"any\", timeout=120)" in tasks_text
+        assert "research-pricing" not in tasks_text
+        children_text = next(
+            m["content"]
+            for m in msgs
+            if m.get("role") == "system" and m["_source"] == "idle_children"
+        )
+        # Ids-and-states roster: the child is named by its ws_id, never by
+        # its model-authored name.
+        assert "child-a" in children_text
+        assert "research-pricing" not in children_text
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
+
+
+def test_coord_idle_with_open_tasks_and_no_children_omits_children_content(coord_mgr, tmp_db):
+    """The childless sibling of the test above, over the same chain:
+    no child rows registered, so the enqueue-time live-children read
+    answers "none" and the DELIVERED body says nothing about children —
+    no fact lines, no blocked-on-a-child branch.
+
+    Asserted on the transcript rather than on the formatter's return,
+    because the claim is about what the coordinator is actually told:
+    the body's children read queries the storage backend through the
+    real ``list_workstreams``, and every boundary between that read
+    and the system turn — observer, queue, watcher, wake worker,
+    ``deliver_wake_nudge_from_queue`` — is production code.
+    """
+    import json as _json
+
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+
+    mgr, adapter, storage = coord_mgr
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord", skill=None)
+        assert coord.session is not None
+
+        storage.save_workstream_config(
+            coord.id,
+            {
+                "tasks": _json.dumps(
+                    {
+                        "version": 1,
+                        "tasks": [
+                            {"id": "tsk_a", "title": "audit auth.py", "status": "in_progress"}
+                        ],
+                    }
+                )
+            },
+        )
+
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "work"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+        assert len(coord.session._nudge_queue) == 0
+        msgs = dicts_from_turns(coord.session.messages)
+        sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+        assert sys_sources == ["idle_tasks"]
+        tasks_text = next(
+            m["content"] for m in msgs if m.get("role") == "system" and m["_source"] == "idle_tasks"
+        )
+        assert tasks_text.startswith("You still have 1 open task: 1 in_progress, 0 pending.")
+        assert "Child " not in tasks_text
+        assert "child" not in tasks_text
+        assert NUDGE_IDLE_TASKS_CHILD_DOOR not in tasks_text
+        # The nudge is otherwise the shipped one: the conditional drops
+        # the fact lines and the blocked-on-a-child branch, not the
+        # opener, the id block or the other instructions.
+        assert "needs_user" in tasks_text
+        # End to end, through the REAL storage round-trip: the id that
+        # went into ``workstream_config`` comes back out populated into
+        # the branch calls the model is handed.
+        assert chr(10) + "  - tsk_a (in_progress)" in tasks_text
+        assert "task_id='tsk_a'" in tasks_text
+        assert "audit auth.py" not in tasks_text
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
+
+
+def test_stop_latch_survives_the_liveness_wake(coord_mgr, tmp_db):
+    """Operator Stop → liveness wake fires (by design) → the wake's own
+    send must NOT clear ``_generation_abandoned`` → advice stays
+    suppressed at the wake turn's terminal IDLE.
+
+    The latch is cleared at the top of ``send()`` — and the liveness
+    wake is itself a ``send("", from_wake=True)``, so an unconditional
+    clear let one class's machinery erase the other's suppression: Stop
+    bought exactly the task-reminder resume it exists to prevent, one
+    bracket late.  The wake send must leave the latch alone; a real
+    (non-wake) send is what lifts it.
+
+    Every boundary is production code except the LLM stream: observer →
+    queue → watcher → wake worker → ``deliver_wake_nudge_from_queue`` →
+    ``send("", from_wake=True)``.
+    """
+    import json as _json
+
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+    from turnstone.core.workstream import WorkstreamKind as _Kind
+
+    mgr, adapter, storage = coord_mgr
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord", skill=None)
+        assert coord.session is not None
+
+        # Both conditions hold: a running child (liveness) and an open
+        # task (advice).
+        storage.register_workstream(
+            "child-a",
+            user_id="u1",
+            name="research-pricing",
+            kind=_Kind.INTERACTIVE,
+            parent_ws_id=coord.id,
+            state="running",
+        )
+        storage.save_workstream_config(
+            coord.id,
+            {
+                "tasks": _json.dumps(
+                    {
+                        "version": 1,
+                        "tasks": [
+                            {"id": "tsk_a", "title": "audit auth.py", "status": "in_progress"}
+                        ],
+                    }
+                )
+            },
+        )
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "work"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+
+        # The operator presses Stop: the cancel path's real setter runs
+        # (latch + demote), then the abandoned turn's terminal IDLE fans
+        # out below.
+        coord.session._drain_pending_advisories()
+        assert coord.session._generation_abandoned is True
+        # Control the advice cooldown stamp: it must be the LATCH that
+        # suppresses idle_tasks throughout, never the per-class cooldown
+        # G1 reinstated — a stamp here would mask a broken latch.
+        assert coord.session._metacog_state.get("idle_tasks") is None
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+
+            # The abandoned generation's terminal IDLE.  Advice returns
+            # at the latch; liveness fires by design (the children's
+            # results still need collecting) and the watcher wakes the
+            # coordinator.
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+            msgs = dicts_from_turns(coord.session.messages)
+            sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+            assert sys_sources == ["idle_children"], "only the liveness wake may deliver"
+
+            # THE PIN: the wake's own send must not have cleared the
+            # latch.
+            assert coord.session._generation_abandoned is True
+
+            # The wake turn's terminal IDLE re-enters the observer (in
+            # production via the coordinator UI's state bridge).  The
+            # stamp store is still clean — the cooldown cannot be what
+            # refuses — and advice must STILL be suppressed by the latch.
+            coord.session._metacog_state.pop("idle_tasks", None)
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+            assert len(coord.session._nudge_queue) == 0
+            msgs = dicts_from_turns(coord.session.messages)
+            assert not any(
+                m.get("_source") == "idle_tasks" for m in msgs if m.get("role") == "system"
+            ), "Stop must keep suppressing advice across the wake"
+
+            # The control: a REAL send lifts the latch, and the next
+            # idle bracket's advice fires again.
+            coord.session.send("resume the audit work")
+            assert coord.session._generation_abandoned is False
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+        msgs = dicts_from_turns(coord.session.messages)
+        assert any(m.get("_source") == "idle_tasks" for m in msgs if m.get("role") == "system"), (
+            "a real send must restore the advice path"
+        )
     finally:
         watcher.shutdown()
         observer.shutdown()
@@ -567,7 +901,10 @@ def test_coord_idle_emitted_from_worker_thread_still_wakes(coord_mgr, tmp_db):
             m for m in msgs if m.get("role") == "system" and m["_source"] == "idle_children"
         ]
         assert len(idle_turns) == 1
-        assert "crawl-docs" in idle_turns[0]["content"]
+        # Ids-and-states roster: the child rides as its ws_id, never its
+        # model-authored name.
+        assert "child-x" in idle_turns[0]["content"]
+        assert "crawl-docs" not in idle_turns[0]["content"]
         assert "wait_for_workstream" in idle_turns[0]["content"]
     finally:
         watcher.shutdown()
@@ -596,3 +933,476 @@ def test_wake_delivery_contains_generation_cancelled(tmp_db):
 
     assert session._wake_source_tag == ""
     assert session._wake_drained_reminders is None
+
+
+# ---------------------------------------------------------------------------
+# Wake-only channel discipline + the interjection-owns-the-seam handoff
+# ---------------------------------------------------------------------------
+
+
+def _patch_llm_surface(session: Any) -> tuple[Any, ...]:
+    """The file's standard LLM-stub patch set, for make_chat_session tests."""
+    return (
+        patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+        patch.object(
+            session, "_stream_response", return_value={"role": "assistant", "content": "ok"}
+        ),
+        patch.object(session, "_update_token_table"),
+        patch.object(session, "_print_status_line"),
+        patch.object(session, "_visible_memory_count", return_value=0),
+        patch("turnstone.core.session.save_message"),
+    )
+
+
+def test_wake_channel_survives_real_seam_drains_and_delivers_via_wake(tmp_db):
+    """Channel discipline at the REAL drain sites: a wake-channel idle
+    nudge is invisible to ``_emit_pending_user_nudges`` (the user-seam
+    drain) and to ``_collect_advisories`` (the tool-seam drain), then
+    delivers through the real ``deliver_wake_nudge_from_queue``."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._title_generated = True
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
+
+    p = _patch_llm_surface(session)
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        # Real user-seam drain: appends any drained entry as a system
+        # turn — a wake-channel entry must neither drain nor render.
+        session._emit_pending_user_nudges()
+        assert [m for m in dicts_from_turns(session.messages) if m.get("role") == "system"] == []
+        assert len(session._nudge_queue) == 2
+
+        # Real tool-seam drain (last result of a batch): same discipline.
+        specs = session._collect_advisories(None, "some_tool", True)
+        assert specs == []
+        assert len(session._nudge_queue) == 2
+
+        # The wake is the one seam that delivers them.
+        session.deliver_wake_nudge_from_queue()
+
+    msgs = dicts_from_turns(session.messages)
+    wake_msg = [m for m in msgs if m.get("role") == "user"][-1]
+    assert wake_msg["content"] == ""
+    assert wake_msg.get("_source") == "system_nudge"
+    sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+    assert sys_sources == ["idle_tasks", "idle_children"]
+    assert len(session._nudge_queue) == 0
+
+
+def test_stop_drops_wake_entries_while_quiet_externals_survive(tmp_db):
+    """Operator Stop (``_drain_pending_advisories``) DROPS wake-channel
+    idle nudges — both types — while ``any``-channel externals survive
+    demoted to quiet and still deliver at the next legitimate seam."""
+    from tests._helpers import make_chat_session
+    from turnstone.core.nudge_queue import USER_DRAIN, WAKE_PENDING
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("watch_triggered", "deploy finished", "any")
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
+
+    session._drain_pending_advisories()
+
+    kinds = [t for t, _ in session._nudge_queue.pending()]
+    assert kinds == ["watch_triggered"]  # both wake entries dropped, external kept
+    # Post-Stop quiescence: nothing may re-arm the wake gate...
+    assert not session._nudge_queue.has_pending(WAKE_PENDING)
+    # ...and the external still rides the next legitimate seam.
+    drained = session._nudge_queue.drain(USER_DRAIN)
+    assert [t for t, _x, _m in drained] == ["watch_triggered"]
+
+
+def test_wake_send_failure_drops_wake_entries_and_requeues_externals_quiet(tmp_db):
+    """The failed-wake recovery path: an ``any``-channel external is
+    given back on the quiet channel (seq preserved), while a
+    wake-channel idle nudge is DROPPED — quiet would deliver it at the
+    user/tool seams its channel exists to be invisible to, and a
+    wake-eligible requeue would re-arm the worker-exit backstop into a
+    hot loop."""
+    from tests._helpers import make_chat_session
+    from turnstone.core.session import GenerationCancelled
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("watch_triggered", "deploy finished", "any")
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
+
+    def _cancelled_send(*_a: Any, **_k: Any) -> None:
+        raise GenerationCancelled
+
+    session.send = _cancelled_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()  # must not raise
+
+    assert session._nudge_queue.pending(channel="quiet") == [("watch_triggered", "deploy finished")]
+    assert [t for t, _ in session._nudge_queue.pending()] == ["watch_triggered"]
+
+
+def test_quiet_ride_along_still_delivers_when_wake_proceeds(tmp_db):
+    """Corner: the two-pass drain's quiet ride-along survives the wake
+    channel joining the WAKE_PENDING pass — a Stop-demoted external
+    rides a wake earned by a wake-channel idle nudge, rendered in seq
+    order (older external first)."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._title_generated = True
+    session._nudge_queue.enqueue("watch_triggered", "older external", "any")
+    session._nudge_queue.demote_channel("any", "quiet")  # a Stop demoted it
+    session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
+
+    p = _patch_llm_surface(session)
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        session.deliver_wake_nudge_from_queue()
+
+    msgs = dicts_from_turns(session.messages)
+    sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+    assert sys_sources == ["watch_triggered", "idle_children"]
+    assert len(session._nudge_queue) == 0
+
+
+def test_interjection_handoff_delivers_externals_and_drops_only_idle_nudges(tmp_db):
+    """External events are NOT idle nudges, and the interjection handoff
+    must not treat them as such (owner addendum, 2026-07-29): with a
+    user interjection waiting at the idle seam, BOTH fire — the
+    interjection as the genuine user turn AND the queued external-event
+    entries on that same turn's drain seam (``send``'s
+    ``_emit_pending_user_nudges`` drains ``{user, any, quiet}`` right
+    after the user turn).  Only the wake-channel idle nudges drop; a
+    quiet-demoted external keeps its next-legitimate-seam behaviour,
+    which this genuine send is.
+
+    Proven over the real send loop, not assumed from the drain sets."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._title_generated = True
+    # One quiet-demoted external (a Stop demoted it earlier)...
+    session._nudge_queue.enqueue("background_shell_exit", "dev server exited", "any")
+    session._nudge_queue.demote_channel("any", "quiet")
+    # ...one live "any" external (a watch fired), and both idle nudges.
+    session._nudge_queue.enqueue("watch_triggered", "deploy finished: OK", "any")
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
+    # The user interjection is waiting when the wake worker starts.
+    session.queue_message("pivot: focus on the flaky login test")
+
+    p = _patch_llm_surface(session)
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        session.deliver_wake_nudge_from_queue()
+
+    msgs = dicts_from_turns(session.messages)
+    user_msgs = [m for m in msgs if m.get("role") == "user"]
+    # Exactly one genuine user turn: the interjection, un-tagged, and no
+    # synthetic empty wake turn anywhere.
+    assert [m["content"] for m in user_msgs] == ["pivot: focus on the flaky login test"]
+    assert user_msgs[0].get("_source") is None
+    # BOTH externals delivered on that turn's drain seam, in queue order;
+    # the idle nudges are the only entries that dropped.
+    sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+    assert sys_sources == ["background_shell_exit", "watch_triggered"]
+    assert len(session._nudge_queue) == 0
+    assert session._wake_source_tag == ""
+
+
+def test_queued_interjection_owns_the_idle_seam(coord_mgr, tmp_db):
+    """The interjection handoff, end to end over production code:
+    observer enqueues both wake-channel idle nudges on IDLE → watcher
+    spawns the wake worker → ``deliver_wake_nudge_from_queue`` finds a
+    queued user interjection and yields the seam to it.
+
+    Pins the delivery-discipline ruling: the interjection lands as
+    exactly ONE genuine user turn (no synthetic empty user turn, no
+    wake ``_source`` tag), the wake-channel idle nudges are dropped
+    (no idle system turns, nothing left to re-arm the wake gate), and
+    — because the turn is genuine — the observer's cap reset fires on
+    the next leave-IDLE, so the next genuine idle bracket re-derives
+    both nudges over fresh reads."""
+    import json as _json
+
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+    from turnstone.core.workstream import WorkstreamKind as _Kind
+
+    mgr, adapter, storage = coord_mgr
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord", skill=None)
+        assert coord.session is not None
+
+        # Both nudge conditions hold: a running child and an open task.
+        storage.register_workstream(
+            "child-a",
+            user_id="u1",
+            name="research-pricing",
+            kind=_Kind.INTERACTIVE,
+            parent_ws_id=coord.id,
+            state="running",
+        )
+        storage.save_workstream_config(
+            coord.id,
+            {
+                "tasks": _json.dumps(
+                    {
+                        "version": 1,
+                        "tasks": [
+                            {"id": "tsk_a", "title": "audit auth.py", "status": "in_progress"}
+                        ],
+                    }
+                )
+            },
+        )
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "spawn"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+
+            # The user's message raced in while a worker owned the slot
+            # (the only path that fills this queue) and is still waiting
+            # when the coord goes idle.
+            coord.session.queue_message("check the deploy logs first")
+
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+            msgs = dicts_from_turns(coord.session.messages)
+            user_msgs = [m for m in msgs if m.get("role") == "user"]
+            # Exactly one user turn carries the interjection; no empty
+            # synthetic wake turn was appended anywhere.
+            assert [m["content"] for m in user_msgs] == ["spawn", "check the deploy logs first"]
+            # A genuine turn: no wake tag on it (the persistent artifact
+            # ``_wake_source_tag`` would have stamped).
+            assert user_msgs[-1].get("_source") is None
+            # The idle nudges were dropped, not delivered — the seam was
+            # the interjection's.
+            assert [m for m in msgs if m.get("role") == "system"] == []
+            assert len(coord.session._nudge_queue) == 0
+            assert coord.session._wake_source_tag == ""
+
+            # CAP RESET, through the real observer: the interjection turn
+            # was genuine, so leaving IDLE without a wake tag clears the
+            # per-bracket caps (in production the coordinator UI's state
+            # bridge emits this transition from inside the send).
+            mgr.set_state(coord.id, WorkstreamState.THINKING)
+            # The advice cooldown stamp is test-controlled, as in the
+            # stop-latch test: the claim under test is the cap/bracket
+            # machinery, not the per-class cooldown window.
+            coord.session._metacog_state.pop("idle_tasks", None)
+
+            mgr.set_state(coord.id, WorkstreamState.IDLE)
+            _wait_for_worker_done(coord)
+
+        # The next genuine idle bracket re-derived BOTH nudges over fresh
+        # reads and the wake delivered them.
+        msgs = dicts_from_turns(coord.session.messages)
+        sys_sources = [m["_source"] for m in msgs if m.get("role") == "system"]
+        assert sys_sources == ["idle_tasks", "idle_children"]
+        assert len(coord.session._nudge_queue) == 0
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
+
+
+def test_interjection_handoff_dispatches_exactly_one_real_send(tmp_db):
+    """The handoff's dispatch shape, pinned at the session boundary: a
+    queued interjection plus queued wake nudges produce ONE ``send``
+    call carrying the interjection text with ``from_wake`` unset — never
+    ``send("")`` (that shape appends an empty untagged user turn and
+    delivers the interjection one assistant turn late via the flush
+    seam)."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session.queue_message("!!!stop the deploy")
+    session.queue_message("then check the logs")
+
+    calls: list[tuple[Any, ...]] = []
+
+    def _recording_send(*a: Any, **k: Any) -> None:
+        calls.append((a, k))
+
+    session.send = _recording_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    # One combined genuine send: priority framing preserved, both queued
+    # items folded in queue order, no wake flag.
+    assert args == ("[IMPORTANT] stop the deploy\n\nthen check the logs",)
+    assert kwargs == {}
+    # The wake-channel nudge was dropped before the send, so nothing can
+    # re-arm the wake gate at this worker's exit.
+    assert len(session._nudge_queue) == 0
+    assert session._queued_messages == {}
+    assert session._wake_source_tag == ""
+
+
+def test_interjection_handoff_contains_generation_cancelled(tmp_db):
+    """A Stop landing inside the handed-off interjection send must not
+    escape the wake worker: ``GenerationCancelled`` is a BaseException
+    ``session_worker`` does not catch.  Deliberately NO restore on this
+    arm — the Stop supersedes the queued words — so the queue stays
+    empty and the wake entries stay dropped."""
+    from tests._helpers import make_chat_session
+    from turnstone.core.session import GenerationCancelled
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session._nudge_queue.enqueue("idle_children", "children active", "wake")
+    session.queue_message("urgent question")
+
+    def _cancelled_send(*a: Any, **k: Any) -> None:
+        raise GenerationCancelled()
+
+    session.send = _cancelled_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()  # must not raise
+
+    assert len(session._nudge_queue) == 0
+    assert session._queued_messages == {}
+
+
+def test_interjection_handoff_restores_the_queue_when_send_raises(tmp_db):
+    """Any escape other than a cancel happened in send's preamble,
+    before the user turn was appended — the popped items must be
+    restored (ids and priorities intact) and the failure must surface,
+    so the next send's flush seams deliver the user's words instead of
+    a log line being their gravestone."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    _c, _p, msg_id = session.queue_message("!!!do not lose this")
+
+    def _exploding_send(*a: Any, **k: Any) -> None:
+        raise RuntimeError("preamble failure")
+
+    session.send = _exploding_send  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="preamble failure"):
+        session.deliver_wake_nudge_from_queue()
+
+    # Restored verbatim: same id, same cleaned text, same priority.
+    assert msg_id in session._queued_messages
+    text, priority = session._queued_messages[msg_id]
+    assert text == "do not lose this"
+    assert priority == "important"
+
+
+def test_interjection_handoff_does_not_restore_after_a_late_raise(tmp_db):
+    """send can raise from its LATE handlers, after the user turn was
+    appended and persisted — restoring there would deliver the user's
+    words twice at the next flush seam.  The length snapshot is the
+    discriminator: an appended turn means no restore."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session.queue_message("delivered then failed")
+
+    def _append_then_raise(text: str, *a: Any, **k: Any) -> None:
+        session.messages.append({"role": "user", "content": text})
+        raise RuntimeError("late failure")
+
+    session.send = _append_then_raise  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="late failure"):
+        session.deliver_wake_nudge_from_queue()
+
+    # The turn reached history; the queue must NOT get it back.
+    assert session._queued_messages == {}
+
+
+def test_a_retraction_during_the_handoff_is_honoured_by_the_restore(tmp_db):
+    """The DELETE route can land while the dispatcher holds the popped
+    items — it finds the id gone and answers as already-sent.  A
+    failure-path restore must not resurrect the message the user just
+    cancelled."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    _c, _p, keep_id = session.queue_message("keep this one")
+    _c, _p, retract_id = session.queue_message("cancel this one")
+
+    def _retract_mid_send(text: str, *a: Any, **k: Any) -> None:
+        session.dequeue_message(retract_id)
+        raise RuntimeError("preamble failure")
+
+    session.send = _retract_mid_send  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="preamble failure"):
+        session.deliver_wake_nudge_from_queue()
+
+    assert keep_id in session._queued_messages
+    assert retract_id not in session._queued_messages
+
+
+def test_interjection_handoff_skips_the_pop_when_budget_exhausted(tmp_db):
+    """On the budget latch ``send`` refuses without appending a turn
+    unless a human approves, and a wake is unattended — the handoff
+    must not pop (the message stays queued for the user's next real
+    send) and must fall through to the wake drain so the worker's exit
+    convergence holds."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    _c, _p, msg_id = session.queue_message("held message")
+    session._budget_exhausted = True
+
+    sends: list[tuple[Any, ...]] = []
+
+    def _recording_send(*a: Any, **k: Any) -> None:
+        sends.append((a, k))
+
+    session.send = _recording_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()
+
+    # No interjection dispatch; the wake drain path ran instead (the
+    # wake-eligible entry was drained toward the synthetic wake send).
+    assert msg_id in session._queued_messages
+    assert all(args != ("held message",) for args, _k in sends)
+    assert any(a == ("",) for a, _k in sends)
+
+
+def test_interjection_handoff_falls_through_on_content_free_items(tmp_db):
+    """A bare priority marker ('!!!') renders as nothing deliverable:
+    the handoff must not spend the seam on a content-free user turn —
+    the husk is discarded and the wake proceeds normally, nudges
+    intact."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session.queue_message("!!!")
+    session.queue_message("   ")
+
+    sends: list[tuple[Any, ...]] = []
+
+    def _recording_send(*a: Any, **k: Any) -> None:
+        sends.append((a, k))
+
+    session.send = _recording_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()
+
+    # The husks were consumed, no interjection turn was dispatched, and
+    # the wake path ran: the ONLY send is the wake's synthetic "" one —
+    # a reverted husk skip would dispatch a rendered husk turn here and
+    # fail the equality, so this line is the live mutation control.
+    assert session._queued_messages == {}
+    assert [a for a, _k in sends] == [("",)]

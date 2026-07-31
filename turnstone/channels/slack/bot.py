@@ -91,6 +91,21 @@ _LINK_RATE_LIMIT: int = 5
 _LINK_RATE_CAP: int = 2048
 
 
+def _escape_mrkdwn(text: str) -> str:
+    """Escape ``&<>`` in user- or model-authored text bound for Slack mrkdwn.
+
+    Slack's contract for interpolated user-generated text: ``&``, ``<``
+    and ``>`` become HTML entities.  That one move neutralizes broadcast
+    keywords (``<!channel>``, ``<!everyone>``), raw mention syntax
+    (``<@U\u2026>``) and link markup (``<url|label>``) while a literal
+    ``@everyone`` \u2014 which Slack only resolves inside angle brackets \u2014
+    stays plain text.  Applied per field, never to an assembled message,
+    so deliberately bot-authored markup (e.g. the session-opener
+    ``<@user>`` mention) is preserved.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _sanitize_slack_preview(text: str, max_length: int = 1200) -> str:
     """Escape Slack mrkdwn-sensitive content for safe fenced display.
 
@@ -102,7 +117,7 @@ def _sanitize_slack_preview(text: str, max_length: int = 1200) -> str:
     ``&<>`` for good measure.  Single backticks are kept intact so code
     snippets in plans / tool previews remain readable.
     """
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = _escape_mrkdwn(text)
     text = text.replace("```", "``\u200b`")
     if len(text) > max_length:
         return text[: max_length - 3] + "..."
@@ -1103,7 +1118,9 @@ class TurnstoneSlackBot:
             await self._client.chat_postMessage(
                 channel=slack_channel,
                 thread_ts=thread_ts or None,
-                text=f"_Tool blocked by admin policy: {denied}_",
+                # The feedback sent to the server stays verbatim; only the
+                # Slack-rendered notice escapes the tool names.
+                text=f"_Tool blocked by admin policy: {_escape_mrkdwn(denied)}_",
             )
             policy_handled = True
         elif verdict.kind == "allow":
@@ -1150,11 +1167,13 @@ class TurnstoneSlackBot:
 
         pending_channel = entry.channel
         pending_ts = entry.message_ts
-        risk = (event.risk_level or "medium").upper()
+        # Judge output is model-authored — escape each field before it is
+        # interpolated into the bot's mrkdwn framing.
+        risk = _escape_mrkdwn((event.risk_level or "medium").upper())
         verdict_text = (
-            f"*Judge Verdict: {event.func_name or 'tool'}*\n"
+            f"*Judge Verdict: {_escape_mrkdwn(event.func_name or 'tool')}*\n"
             f"Risk: {risk} | Confidence: {event.confidence or 'N/A'}\n"
-            f"_{event.intent_summary or ''}_"
+            f"_{_escape_mrkdwn(event.intent_summary or '')}_"
         )
         # Append the verdict section in-place on the cached blocks so
         # repeat IntentVerdictEvents stack on the same approval message
@@ -1218,7 +1237,9 @@ class TurnstoneSlackBot:
         self._pop_ws_approvals(ws_id)
 
     async def _handle_error(self, route: SlackRoute, event: ErrorEvent) -> None:
-        safe_msg = event.message[:500] if event.message else "An error occurred"
+        # Error text can embed user/model-authored fragments (tool output,
+        # provider messages) — escape the field before interpolation.
+        safe_msg = _escape_mrkdwn(event.message[:500]) if event.message else "An error occurred"
         await self._client.chat_postMessage(
             channel=route.channel,
             thread_ts=route.thread_ts or None,
@@ -1239,7 +1260,7 @@ class TurnstoneSlackBot:
         truncated_items = 0
         for item in items:
             raw_name = item.get("approval_label") or item.get("func_name") or "tool"
-            name = raw_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            name = _escape_mrkdwn(raw_name)
 
             raw_preview = item.get("preview", "")
             preview = (
@@ -1347,6 +1368,12 @@ class TurnstoneSlackBot:
 
     async def send(self, channel_id: str, content: str) -> str:
         route = SlackRoute.parse(channel_id)
+
+        # Notification bodies are server/model-authored text (titles, task
+        # names) with no bot-composed mrkdwn — the whole content is one
+        # untrusted field.  Escape before chunking so broadcast keywords
+        # and raw mention syntax can't resolve on the wire.
+        content = _escape_mrkdwn(content)
 
         root_ts = route.thread_ts or ""
         first_post_ts = ""

@@ -9,11 +9,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 # discord.utils.escape_markdown passes 'count' as positional to re.sub,
-# which is deprecated in Python 3.13+.  This is a discord.py bug (fixed
-# in newer releases); suppress here to keep the test output clean.
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:.*'count' is passed as positional argument:DeprecationWarning"
-)
+# which is deprecated in Python 3.13+, and discord.Client's event
+# registration calls asyncio.iscoroutinefunction, deprecated in 3.14+.
+# Both are discord.py bugs (fixed in newer releases); suppress here to
+# keep the test output clean.
+pytestmark = [
+    pytest.mark.filterwarnings(
+        "ignore:.*'count' is passed as positional argument:DeprecationWarning"
+    ),
+    pytest.mark.filterwarnings(
+        "ignore:.*'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning"
+    ),
+]
 
 discord = pytest.importorskip("discord")
 
@@ -128,6 +135,66 @@ class TestDiscordConfig:
         assert cfg.streaming_edit_interval == 0.5
         assert cfg.model == "gpt-5"
         assert cfg.auto_approve is True
+
+
+# ---------------------------------------------------------------------------
+# Allowed mentions
+# ---------------------------------------------------------------------------
+
+
+def _make_real_bot():
+    """Construct a TurnstoneBot around a real ``commands.Bot`` (no gateway).
+
+    Storage is mocked and the module's httpx client is patched out; the
+    underlying discord client object is real so tests can assert against
+    the actual connection-state defaults every message create inherits.
+    """
+    from turnstone.channels.discord.bot import TurnstoneBot
+    from turnstone.channels.discord.config import DiscordConfig
+
+    with patch("turnstone.channels.discord.bot.httpx.AsyncClient", return_value=AsyncMock()):
+        return TurnstoneBot(
+            DiscordConfig(bot_token="token-test"), "http://localhost:8080", MagicMock()
+        )
+
+
+class TestAllowedMentions:
+    """Approval headers and previews carry user/model text verbatim, so the
+    client-level allowed_mentions default must suppress every mention
+    resolution (@everyone/@here, users, roles) on the wire."""
+
+    def test_client_default_resolves_to_none(self):
+        bot = _make_real_bot()
+
+        am = bot._bot.allowed_mentions
+        assert am is not None
+        # AllowedMentions has no value equality — compare the wire form.
+        assert am.to_dict() == {"parse": []}
+
+    def test_message_create_inherits_client_default(self):
+        """A message create with no per-send override carries the default.
+
+        ``abc.Messageable.send`` assembles its payload via
+        ``handle_message_parameters(previous_allowed_mentions=state.allowed_mentions)``;
+        drive the same assembly with the client's state value and assert
+        the wire payload pins ``allowed_mentions`` to parse-nothing while
+        the hostile text itself stays verbatim.
+        """
+        from discord.http import handle_message_parameters
+
+        bot = _make_real_bot()
+        state_default = bot._bot._connection.allowed_mentions
+        assert state_default is not None
+
+        hostile = "@everyone @here <@123456789012345678> <@&987654321098765432>"
+        with handle_message_parameters(
+            content=hostile,
+            previous_allowed_mentions=state_default,
+        ) as params:
+            payload = params.payload
+            assert payload is not None
+            assert payload["allowed_mentions"] == {"parse": []}
+            assert payload["content"] == hostile
 
 
 # ---------------------------------------------------------------------------

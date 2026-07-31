@@ -38,6 +38,13 @@ import httpx
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
 from turnstone.core.memory import LAST_ERROR_CONFIG_KEY
+from turnstone.core.metacognition import (
+    TASK_NOTE_MAX,
+    TASK_TITLE_MAX,
+    sanitize_display,
+    task_too_long_message,
+    task_unrenderable_message,
+)
 from turnstone.core.workstream import WorkstreamKind
 
 # ---------------------------------------------------------------------------
@@ -179,16 +186,104 @@ _WS_REF_ECHO_CLIP: int = 48
 # fail in one wait call.
 _WS_REF_ERROR_TEXT_CAP: int = 2000
 
-_TASK_STATUSES = frozenset({"pending", "in_progress", "done", "blocked"})
+# Single source of truth for the task-status vocabulary.  Every status
+# MUST be classified here — ``_TASK_STATUSES`` (the validation set) and
+# ``TASK_OPEN_STATUSES`` (the idle-tasks nudge trigger set) are both
+# derived, so adding a value without deciding whether it counts as
+# unfinished work is impossible by construction.  The remaining surfaces
+# that cannot derive from Python (``tools/tasks.json``'s enum, the JS
+# ``TASK_STATUS_LABELS`` map, the ``.status-*`` CSS rules) are pinned to
+# this dict by cross-surface tests, so a new status fails CI until every
+# surface knows it.
+#
+# ``blocked`` and ``needs_user`` are deliberately distinct, and the
+# split is the whole point of the second value: ``blocked`` is waiting on
+# a dependency the coordinator may be able to clear itself (a build, a
+# sibling task, a child still running) — open=False because nudging is
+# noise while the dependency stands, but the model owns it.
+# ``needs_user`` is waiting on a decision, approval, or grant that
+# ONLY the user can make — open=False because nudging there pushes
+# the model to guess on a question it correctly escalated, the exact
+# failure the idle-tasks nudge exists to prevent.  And beyond the
+# trigger set, it is a PARK SIGNAL: any
+# ``needs_user`` row suppresses the advice nudge entirely, open tasks
+# or not — there is no task graph, so an open task may be gated on
+# exactly the question a parked one escalated, and "take the next
+# step" is unsafe until the user answers.  The earlier
+# fire-on-the-pending-one reading is REVERSED; its silence concern is
+# accepted as the cost, carried by the pane's "needs you" chip, with
+# the operator's answer as the re-arm.  The park lives in the
+# observer (``_has_needs_user``), not in this classification —
+# ``needs_user`` stays out of ``TASK_OPEN_STATUSES`` for counting,
+# and additionally parks at the fire gate and the drain predicate.
+_TASK_STATUS_IS_OPEN: dict[str, bool] = {
+    "pending": True,
+    "in_progress": True,
+    "done": False,
+    "blocked": False,
+    "needs_user": False,
+}
+_TASK_STATUSES = frozenset(_TASK_STATUS_IS_OPEN)
+TASK_OPEN_STATUSES: frozenset[str] = frozenset(
+    status for status, is_open in _TASK_STATUS_IS_OPEN.items() if is_open
+)
 # Hard cap on tasks per coordinator — the full list is read and re-serialized
 # on every mutation, so unbounded growth is both a storage and a tool-output-size
 # hazard.  Hitting the cap is an explicit signal to prune done/blocked rows.
 _TASKS_MAX = 500
-# Max task title length.  Exceeded titles return an error rather than
-# silently truncating — mutating the coordinator's planning state
-# under its nose masks real planning bugs (the model may rely on the
-# title it SENT, not the stored one).
-_TASK_TITLE_MAX = 200
+# The title/note caps live in :mod:`turnstone.core.metacognition`
+# (``TASK_TITLE_MAX`` / ``TASK_NOTE_MAX``), beside the sanitiser family
+# and ``field_str``, because ``ChatSession._prepare_tasks`` enforces them
+# early too and a private copy here would let the two layers drift.  The
+# reject-don't-truncate rule they carry is stated there, and so is the
+# wording of both refusals — ``_prepare_tasks`` speaks the same two
+# sentences to the same model, so a literal on this side would be half a
+# pair with nothing holding it to the other half.  What stays here is the
+# dict shape: the write path answers in ``{"error": ...}``, the prepare
+# path in a tool-error turn.
+
+
+def _too_long_error(field: str, length: int, cap: int) -> dict[str, Any]:
+    """The shared reject-don't-truncate error for over-cap task fields.
+
+    One builder for title and note in both ``tasks_add`` and
+    ``tasks_update`` so the cap reference and the measure-after-strip
+    rule can never drift between the four sites; the sentence itself
+    comes from :func:`task_too_long_message`, which the prepare-side
+    copy reads too.  Silent truncation is the alternative being refused:
+    mutating the coordinator's planning state under its nose masks real
+    planning bugs (the model may rely on the value it SENT, not the
+    stored one).
+    """
+    return {"error": task_too_long_message(field, length, cap)}
+
+
+def _unrenderable_error(field: str, length: int) -> dict[str, Any]:
+    """The shared reject for text that sanitises to nothing.
+
+    A value made entirely of characters every operator surface strips
+    (C0/C1 controls, zero-width and bidi steering codepoints, Unicode tag
+    chars) would store verbatim, render as NOTHING on every operator
+    display, and be fed back to the model on every ``tasks(list)`` — and
+    from there into the compaction summariser's input and the
+    cross-workstream ``recall`` index: an operator-invisible,
+    model-visible payload.  Storage stays verbatim for text that renders
+    (see the ruling in ``tasks_add``); text that cannot render at all is
+    rejected with a hint instead, mirroring ``_too_long_error``'s
+    reject-don't-mutate rule.  ``_prepare_tasks`` carries an early
+    refusal so the operator is never shown an approval card for a call
+    that cannot land; this builder is the authoritative gate, covering
+    the HTTP/maintenance callers too, and both read their wording from
+    :func:`task_unrenderable_message` so "authoritative" is about which
+    layer decides, not about which sentence the model hears.
+
+    The renderability oracle is ``sanitize_display`` at every caller —
+    angle brackets do NOT count as unrenderable, because the operator
+    surfaces now show them.  A title of ``"<>"`` is therefore storable.
+    """
+    return {"error": task_unrenderable_message(field, length)}
+
+
 # Short TTL on the per-ws_id live-inspect cache.  Back-to-back inspect()
 # calls in a model's tool loop hit this hot-path; 2s is short enough
 # that cached data stays meaningful to a human watching output and long
@@ -248,7 +343,9 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
+def load_task_envelope(
+    storage: Any, ws_id: str, *, raise_on_read_failure: bool = False
+) -> tuple[dict[str, Any], bool]:
     """Decode the persisted task envelope for ``ws_id``.
 
     Shared between :class:`CoordinatorClient` (the model-tool write path)
@@ -262,11 +359,23 @@ def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
       stored value failed decode / shape check.  Callers that mutate the
       list refuse to overwrite a corrupt blob (preserve for operator
       inspection); the UI read path treats it as an empty envelope.
+
+    A STORAGE READ failure is a separate axis from corruption, and the
+    caller chooses its policy.  By default the failure is absorbed into
+    ``(empty, corrupt=False)`` — right for the UI read endpoints, where
+    an empty pane beats a crashed request.  ``raise_on_read_failure=True``
+    lets the storage exception propagate instead: the idle observer
+    requires it, because its fire decision must fail closed on a read it
+    could not make, and an absorbed failure is indistinguishable from
+    "no tasks".  Only the read is governed by the flag — corruption
+    still reports through the flag in the tuple, never by raising.
     """
     empty: dict[str, Any] = {"version": 1, "tasks": []}
     try:
         raw = storage.load_workstream_config(ws_id) or {}
     except Exception:
+        if raise_on_read_failure:
+            raise
         log.debug("load_task_envelope.storage_failed ws=%s", ws_id, exc_info=True)
         return empty, False
     payload = raw.get("tasks")
@@ -1643,24 +1752,49 @@ class CoordinatorClient:
         title: str,
         status: str = "pending",
         child_ws_id: str = "",
+        note: str = "",
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
             return {"error": f"tasks scope violation: {ws_id}"}
+        # Stored VERBATIM (bar the strip).  Sanitising here once looked
+        # attractive — storage is the chokepoint every stored reader
+        # shares — but the strict sanitiser also removes ``<`` and
+        # ``>``, which silently rewrites ordinary planning text: a title
+        # of "cut p99 latency to <200ms" would store as "...to 200ms",
+        # inverting the constraint the model wrote.  That is precisely
+        # the mutation ``TASK_TITLE_MAX``'s reject-don't-truncate rule
+        # forbids, applied to a far wider character class than the
+        # steering vectors it was aimed at.  Sanitisation therefore
+        # belongs at each render, in the flavour that render's AUDIENCE
+        # needs: the operator-facing ones (approval preview, tasks HTTP
+        # read, idle-tasks card) use ``sanitize_display`` and KEEP
+        # brackets, because they exist to show what storage holds; the
+        # model-facing nudge body keeps ``sanitize_name`` and deletes
+        # them, because it is interpolated into a system turn.  Storage
+        # and the model's own ``tasks(list)`` see what the model sent.
+        # ONE carve-out: text that sanitises to NOTHING is rejected
+        # outright (``_unrenderable_error``) rather than stored — verbatim
+        # storage is for text that renders somewhere; a value invisible on
+        # every operator surface but re-read by the model on each ``list``
+        # is a payload channel, not planning text.  That carve-out is
+        # measured with ``sanitize_display``, so it now covers only the
+        # genuinely-invisible class.
         clean_title = (title or "").strip()
         if not clean_title:
             return {"error": "title is required"}
-        # Reject overlong titles rather than silently truncating —
-        # mutating the coordinator's planning state under its nose
-        # masks real planning bugs (the model may rely on the title it
-        # SENT, not the stored one).  Callers that want a long title
-        # must shorten it themselves.
-        if len(clean_title) > _TASK_TITLE_MAX:
-            return {
-                "error": (
-                    f"title too long ({len(clean_title)} chars, max "
-                    f"{_TASK_TITLE_MAX}).  Shorten and retry."
-                )
-            }
+        clean_note = (note or "").strip()
+        if len(clean_title) > TASK_TITLE_MAX:
+            return _too_long_error("title", len(clean_title), TASK_TITLE_MAX)
+        if len(clean_note) > TASK_NOTE_MAX:
+            return _too_long_error("note", len(clean_note), TASK_NOTE_MAX)
+        # Length first (measured on what the model sent), THEN
+        # renderability — a 250-char run of zero-widths should hear "too
+        # long", not "unrenderable", so the two hints cannot mask each
+        # other.
+        if not sanitize_display(clean_title):
+            return _unrenderable_error("title", len(clean_title))
+        if clean_note and not sanitize_display(clean_note):
+            return _unrenderable_error("note", len(clean_note))
         if status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
         with self._task_lock(ws_id):
@@ -1689,6 +1823,25 @@ class CoordinatorClient:
                 "created": now,
                 "updated": now,
             }
+            # ``note`` is written only when non-empty, so the key is
+            # absent on the overwhelming majority of rows.  The full
+            # envelope is read and re-serialised on every mutation and
+            # fed back to the model by ``tasks(action='list')``, where
+            # ``tasks`` sits in ``_STRUCTURAL_FLOOR_TOOLS`` — an
+            # always-present ``"note": ""`` on 200 rows would spend
+            # budget on nothing and push the result closer to the
+            # head+tail floor, which cuts mid-JSON.  Readers must
+            # therefore treat the key as absent-by-default (there is no
+            # backfill for rows written before this field existed), and
+            # the absence goes all the way to the wire: the tasks
+            # endpoint returns this envelope as unvalidated JSON with
+            # its display sanitiser preserving the missing key (the
+            # spec-side response model is generation-only and never
+            # serves the route), and the FE tasks pane reads ``note``
+            # truthily, rendering a note row only when a non-empty one
+            # is present.
+            if clean_note:
+                task["note"] = clean_note
             envelope["tasks"].append(task)
             self._save_tasks(ws_id, envelope)
             return task
@@ -1701,11 +1854,21 @@ class CoordinatorClient:
         title: str | None = None,
         status: str | None = None,
         child_ws_id: str | None = None,
+        note: str | None = None,
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
             return {"error": f"tasks scope violation: {ws_id}"}
         if status is not None and status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
+        clean_note: str | None = None
+        if note is not None:
+            clean_note = note.strip()
+            if len(clean_note) > TASK_NOTE_MAX:
+                return _too_long_error("note", len(clean_note), TASK_NOTE_MAX)
+            # ``""`` stays a legal CLEAR; only a non-empty note that
+            # sanitises to nothing is rejected (see ``_unrenderable_error``).
+            if clean_note and not sanitize_display(clean_note):
+                return _unrenderable_error("note", len(clean_note))
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
@@ -1716,18 +1879,26 @@ class CoordinatorClient:
                         clean = title.strip()
                         if not clean:
                             return {"error": "title cannot be empty"}
-                        if len(clean) > _TASK_TITLE_MAX:
-                            return {
-                                "error": (
-                                    f"title too long ({len(clean)} chars, max "
-                                    f"{_TASK_TITLE_MAX}).  Shorten and retry."
-                                )
-                            }
+                        if len(clean) > TASK_TITLE_MAX:
+                            return _too_long_error("title", len(clean), TASK_TITLE_MAX)
+                        if not sanitize_display(clean):
+                            return _unrenderable_error("title", len(clean))
                         t["title"] = clean
                     if status is not None:
                         t["status"] = status
                     if child_ws_id is not None:
                         t["child_ws_id"] = child_ws_id
+                    if clean_note is not None:
+                        # ``note`` follows ``child_ws_id``, not ``title``:
+                        # it is optional, so an empty string is a CLEAR
+                        # rather than an error.  Deleting the key instead
+                        # of storing "" keeps the absent-by-default shape
+                        # ``tasks_add`` writes, so a cleared note costs
+                        # the same as one that never existed.
+                        if clean_note:
+                            t["note"] = clean_note
+                        else:
+                            t.pop("note", None)
                     t["updated"] = _utc_now_iso()
                     self._save_tasks(ws_id, envelope)
                     # t is a dict pulled out of a json-decoded list; mypy
@@ -1755,71 +1926,6 @@ class CoordinatorClient:
                 return {"error": f"task not found: {task_id}"}
             self._save_tasks(ws_id, envelope)
             return {"ok": True, "task_id": task_id}
-
-    def cleanup_dead_task_child_refs(self, ws_id: str) -> int:
-        """Clear ``child_ws_id`` pointers on tasks whose referenced
-        workstream no longer exists in storage.  Returns the number of
-        links blanked (0 if nothing needed doing, envelope was corrupt,
-        or the lookup failed).
-
-        Called by :meth:`SessionManager.close` after the state
-        transition — the task envelope is a per-coordinator planning
-        structure, so cross-coord scope guards don't apply the same way
-        they do for add/update/remove.  Held under the same per-ws
-        ``_task_lock`` as add/update/remove/reorder so a close racing
-        an in-flight mutation can't lose the mutation (#bug-6).
-        """
-        with self._task_lock(ws_id):
-            envelope, corrupt = load_task_envelope(self._storage, ws_id)
-            if corrupt:
-                return 0
-            tasks = envelope.get("tasks") or []
-            if not tasks:
-                return 0
-            candidate_ids = sorted(
-                {
-                    str(t.get("child_ws_id") or "")
-                    for t in tasks
-                    if isinstance(t, dict) and t.get("child_ws_id")
-                }
-            )
-            if not candidate_ids:
-                return 0
-            try:
-                existing_rows = self._storage.get_workstreams_batch(candidate_ids)
-            except Exception:
-                log.debug(
-                    "coord_client.task_ref_batch_failed ws=%s",
-                    ws_id,
-                    exc_info=True,
-                )
-                return 0
-            dead_ids = {cid for cid in candidate_ids if existing_rows.get(cid) is None}
-            if not dead_ids:
-                return 0
-            blanked = 0
-            for t in tasks:
-                if isinstance(t, dict) and str(t.get("child_ws_id") or "") in dead_ids:
-                    t["child_ws_id"] = ""
-                    blanked += 1
-            if not blanked:
-                return 0
-            try:
-                self._save_tasks(ws_id, envelope)
-            except Exception:
-                # Write-side divergence — the task envelope on disk
-                # now disagrees with what the close path intended.
-                # Bump to warning (not debug) so operators see it;
-                # read-side corruption (already silent on load) stays
-                # at debug.  #q-6.
-                log.warning(
-                    "coord_client.task_ref_save_failed ws=%s blanked=%d",
-                    ws_id,
-                    blanked,
-                    exc_info=True,
-                )
-                return 0
-            return blanked
 
     def tasks_reorder(self, ws_id: str, *, task_ids: list[str]) -> dict[str, Any]:
         """Reject unless ``task_ids`` is an exact permutation of the

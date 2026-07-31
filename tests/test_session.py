@@ -6652,19 +6652,33 @@ class TestDeliverWakeNudge:
         is passed explicitly (the wake's synthesized first turn);
         ``_flush_queued_messages``'s default-False call leaves the tag
         unset on the flushed message.
+
+        The message is queued MID-wake-send (from the first stream call),
+        not before the wake: a message already waiting when the wake
+        worker starts now owns the idle seam outright — the interjection
+        handoff, pinned in test_idle_nudge_wake_integration.py — and the
+        wake turn never runs.  The mid-turn window is where the wake's
+        chat loop and a real user message can still interleave.
         """
         session = _make_session()
         session._title_generated = True
         session._nudge_queue.enqueue("idle_children", "kids", "any")
-        # Queue a real user message that will be flushed at the IDLE seam.
-        session.queue_message("real user input", queue_msg_id="q-1")
+
+        def _queue_then_reply(*_a: Any, **_k: Any) -> dict[str, Any]:
+            # First stream call: a real user message lands mid-wake-turn.
+            # Subsequent calls: plain replies until the flush seam empties.
+            if not session._queued_messages and not any(
+                "real user input" in str(m.content) for m in session.messages
+            ):
+                session.queue_message("real user input", queue_msg_id="q-1")
+            return {"role": "assistant", "content": "ok"}
 
         with (
             patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(
                 session,
                 "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
+                side_effect=_queue_then_reply,
             ),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),

@@ -191,6 +191,60 @@ class TestLenAndClear:
         assert q.has_pending(TOOL_DRAIN)
 
 
+class TestWakeChannel:
+    """The wake-only channel: a member of ``WAKE_PENDING`` and of no
+    drain set.  The coordinator idle nudges ride it so they can never
+    deliver at a user or tool seam — their bodies speak about an IDLE
+    state that a later seam no longer describes."""
+
+    def test_wake_invisible_to_user_and_tool_drains(self):
+        from turnstone.core.nudge_queue import WAKE_PENDING
+
+        q = NudgeQueue()
+        q.enqueue("idle_tasks", "open tasks", "wake")
+        q.enqueue("idle_children", "kids", "wake")
+        assert q.drain(USER_DRAIN) == []
+        assert q.drain(TOOL_DRAIN) == []
+        assert len(q) == 2  # both survived both seam drains untouched
+        # The wake pass is the one seam that delivers them, in order.
+        assert q.drain(WAKE_PENDING) == [
+            ("idle_tasks", "open tasks", None),
+            ("idle_children", "kids", None),
+        ]
+
+    def test_wake_counts_toward_the_wake_gate(self):
+        from turnstone.core.nudge_queue import WAKE_PENDING
+
+        q = NudgeQueue()
+        q.enqueue("idle_tasks", "open tasks", "wake")
+        assert q.has_pending(WAKE_PENDING)
+
+    def test_clear_channels_drops_wake_but_not_any(self):
+        """The abandoned-generation sweep: ``wake`` entries drop while
+        ``any``-channel externals stay for the demote that follows."""
+        q = NudgeQueue()
+        q.enqueue("idle_tasks", "open tasks", "wake")
+        q.enqueue("watch_triggered", "fired", "any")
+        q.enqueue("idle_children", "kids", "wake")
+        assert q.clear_channels({"wake"}) == 2
+        assert q.pending() == [("watch_triggered", "fired")]
+
+    def test_wake_pass_merges_with_quiet_ride_along_by_seq(self):
+        """The wake path's two-pass drain shape: a quiet external older
+        than the wake entry still renders first after the seq merge."""
+        from turnstone.core.nudge_queue import QUIET_DRAIN, WAKE_PENDING
+
+        q = NudgeQueue()
+        q.enqueue("watch_triggered", "older external", "any")
+        q.demote_channel("any", "quiet")  # a Stop demoted it
+        q.enqueue("idle_children", "kids", "wake")  # the wake earner
+        entries = q.drain_entries(WAKE_PENDING)
+        assert [e.text for e in entries] == ["kids"]
+        entries += q.drain_entries(QUIET_DRAIN)
+        entries.sort(key=lambda e: e.seq)
+        assert [e.text for e in entries] == ["older external", "kids"]
+
+
 class TestDropOldestByType:
     def test_drop_oldest_by_type_removes_earliest_match(self):
         """Drop the FIRST entry of the matching type; later matches stay."""
@@ -480,7 +534,7 @@ class TestValidation:
     def test_invalid_channel_raises(self):
         q = NudgeQueue()
         with pytest.raises(ValueError, match="channel"):
-            q.enqueue("a", "1", "wake")  # type: ignore[arg-type]
+            q.enqueue("a", "1", "idle")  # type: ignore[arg-type]
         with pytest.raises(ValueError):
             q.enqueue("b", "2", "")  # type: ignore[arg-type]
         # Queue is unaffected by the failed enqueues.

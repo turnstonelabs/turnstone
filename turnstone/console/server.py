@@ -59,6 +59,7 @@ from turnstone.core.auth import (
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
 from turnstone.core.mcp_crypto import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
+from turnstone.core.metacognition import field_str, sanitize_display
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_replay import session_replay_preamble
@@ -4378,7 +4379,81 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
         return err404
 
     envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
+    envelope = _sanitize_task_envelope_for_display(envelope)
     return JSONResponse(envelope)
+
+
+def _sanitize_task_envelope_for_display(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Sanitise the operator-facing copy of a task envelope.
+
+    ``title`` and ``note`` are model-authored free text and this response
+    feeds the operator's tasks pane, so a bidi override or zero-width run
+    could make the pane display an ask in an order different from the one
+    stored — on a ``needs_user`` row, the one the operator acts on.
+
+    Sanitising happens at each operator-facing render (here, the nudge
+    card's producer, the approval preview) rather than at the write:
+    storing the sanitised form would rewrite the model's planning text
+    under it, which is the mutation the reject-don't-truncate rule
+    forbids.  Storage stays verbatim, so the model reads back what it
+    sent through ``tasks(action='list')``.
+
+    ``sanitize_display`` — not ``sanitize_name`` — is the sanitiser on
+    this path, so what it removes is exactly the invisible class:
+    control chars (including newlines, which would ragged the pane's
+    rows), bidi overrides, zero-width runs and tag chars.  Angle
+    brackets are KEPT here, because this response IS the operator's view
+    of storage and deleting them turned a stored "cut p99 latency to
+    <200ms" into "...to 200ms" — the constraint inverted on the pane
+    while ``tasks(action='list')`` showed the model the original.  The
+    model-facing nudge body keeps the bracket-deleting sanitiser; see
+    ``metacognition.sanitize_display``.
+
+    Ragged-row coercion goes through ``metacognition.field_str`` — the
+    same single coercion point the nudge card's producer uses — so the
+    two operator-facing surfaces cannot disagree on a ragged row (the
+    previous ``str(x or "")`` mapped ``0``/``False`` to ``""`` while the
+    card rendered ``"0"``).  ``status`` is coerced too, which keeps a
+    falsy-but-real value (``0``/``False``) out of the FE's
+    ``task.status || "pending"`` fallback — but ``field_str(None)`` is
+    the falsy ``""``, so a null/absent status still hits that fallback:
+    the row renders a ``pending`` chip on the pane while the idle-tasks
+    nudge (whose ``_open_tasks`` coerces the same way and drops the
+    row) is blind to it.  Accepted ragged-row residual, same
+    hand-edited-envelope class as ``created``/``updated`` below;
+    server-side normalisation is deferred.  ``id``/``child_ws_id`` are
+    coerced for contract compliance (``CoordinatorTaskInfo`` publishes
+    them as required strings while this handler returns unvalidated
+    JSON).
+    ``child_ws_id`` is additionally SANITISED where ``id`` is not: the
+    id is server-minted (``tsk_`` + hex), while ``child_ws_id`` is
+    whatever the model passed, so it carries the same steering risk as
+    ``title``/``note`` and renders on the same pane.
+    ``created``/``updated`` stay uncoerced — accepted residual under the
+    same contract caveat.
+
+    Rows that are not dicts pass through untouched — the envelope is a
+    JSON blob and ``load_task_envelope`` shape-checks only its top level.
+    """
+    rows = envelope.get("tasks")
+    if not isinstance(rows, list):
+        return envelope
+    clean: list[Any] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            clean.append(row)
+            continue
+        row = {
+            **row,
+            "id": field_str(row.get("id")),
+            "title": sanitize_display(field_str(row.get("title"))),
+            "status": field_str(row.get("status")),
+            "child_ws_id": sanitize_display(field_str(row.get("child_ws_id"))),
+        }
+        if "note" in row:
+            row["note"] = sanitize_display(field_str(row.get("note")))
+        clean.append(row)
+    return {**envelope, "tasks": clean}
 
 
 # ---------------------------------------------------------------------------
@@ -4785,8 +4860,10 @@ def _bootstrap_coord_subsystem(
     # ``app.state._idle_nudge_watchers``.
     try:
         coord_state_writer.start()
-        # Coord-side observer: when a coord goes IDLE with active
-        # children still running, enqueues an idle_children nudge.
+        # Coord-side observer: enqueues idle_children / idle_tasks
+        # nudges when a coord goes IDLE with unfinished work — children
+        # still running, open tasks still held, or both (the two fire
+        # independently and may co-deliver).
         # MUST register BEFORE the IdleNudgeWatcher so subscriber-fire
         # order on the same IDLE event has the observer enqueueing
         # first, then the watcher peeking.
