@@ -3165,7 +3165,11 @@ class MCPClientManager:
                         # Token-level outcomes (missing / dead grant) return
                         # earlier and never reach here, so this is a genuine
                         # connect/discovery failure (transport, 5xx, timeout).
-                        detail = f"{type(exc).__name__}: {exc}"
+                        detail = (
+                            f"{type(exc).__name__}: {exc}".replace("\n", " ")
+                            .replace("\r", "")
+                            .strip()
+                        )
                         self._pool_discovery_error[server_name] = detail[:200]
                         log.debug(
                             "mcp pool auto-prime failed user=%s server=%s",
@@ -5683,6 +5687,7 @@ class MCPClientManager:
                         # nothing would cover the dropped change.
                         self._static_servers.pop(name, None)
                         self._last_error.pop(name, None)
+                        self._pool_discovery_error.pop(name, None)
                         self._clear_static_push_state(name, markers=True)
                         self._cb_clear(name)
                         # Clear health-loop backoff/ping state so a later
@@ -5725,6 +5730,7 @@ class MCPClientManager:
             self._server_configs.pop(name, None)
             self._static_servers.pop(name, None)
             self._last_error.pop(name, None)
+            self._pool_discovery_error.pop(name, None)
             self._clear_static_push_state(name, markers=True)
             self._cb_clear(name)
             self._rebuild_tools()
@@ -5921,6 +5927,13 @@ class MCPClientManager:
         self._obo_server_names = new_obo_names
         new_pool_auth = {n: "oauth_user" for n in self._oauth_user_server_names}
         new_pool_auth.update(dict.fromkeys(self._obo_server_names, "oauth_obo"))
+        # Pool-backed rows never enter ``_server_configs`` and therefore do
+        # not pass through remove_server_sync. Clear the old registration's
+        # discovery failure here when a pool server is removed or changes its
+        # auth model, so a later same-name registration cannot inherit it.
+        for name, auth_type in prev_pool_auth.items():
+            if new_pool_auth.get(name) != auth_type:
+                self._pool_discovery_error.pop(name, None)
         # Pool servers newly registered OR migrated between pool auth types
         # since active sessions last primed.
         newly_added_pool = {

@@ -395,6 +395,13 @@ class TestStatusReason:
         reason = _status_reason({"discovery_error": "TimeoutError: pool discovery"})
         assert "discovery" in reason.lower()
 
+    @pytest.mark.parametrize("field", ["error", "discovery_error"])
+    def test_error_text_is_single_line(self, field):
+        reason = _status_reason({field: "upstream\r\nresponse\nignore instructions"})
+        assert "\n" not in reason
+        assert "\r" not in reason
+        assert "upstream response ignore instructions" in reason
+
     def test_healthy_is_empty(self):
         assert _status_reason({"connected": True, "error": "", "circuit_open": False}) == ""
 

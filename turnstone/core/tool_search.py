@@ -69,10 +69,12 @@ def _status_reason(status: dict[str, Any]) -> str:
     """
     if status.get("circuit_open"):
         return "circuit breaker open"
-    err = str(status.get("error") or "").strip()
+    # The provider is injectable, so enforce the single-line output contract
+    # at the rendering boundary even though MCPClientManager also sanitizes.
+    err = str(status.get("error") or "").replace("\n", " ").replace("\r", "").strip()
     if err:
         return f"error: {err[:120]}"
-    disc = str(status.get("discovery_error") or "").strip()
+    disc = str(status.get("discovery_error") or "").replace("\n", " ").replace("\r", "").strip()
     if disc:
         return f"tool discovery failed: {disc[:120]}"
     return ""

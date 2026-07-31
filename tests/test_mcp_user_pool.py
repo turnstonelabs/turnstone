@@ -1880,6 +1880,38 @@ class TestOboPriming:
         assert len(warmed) == 1
         assert warmed[0][2] == "minted-at"
 
+    def test_prime_failure_records_single_line_discovery_error(
+        self, running_loop_mgr, storage
+    ) -> None:
+        """Exception text is untrusted upstream input and status renders it."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        mgr.set_storage(storage)
+        app_state = _make_app_state(storage, cipher=cipher)
+        mgr.set_app_state(app_state)
+        storage.create_mcp_server(
+            server_id="srv-o",
+            name="pool-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_user",
+        )
+        mgr._oauth_user_server_names = {"pool-srv"}
+
+        async def _fail_prime(_key: Any, _cfg: Any, _token: str) -> None:
+            raise RuntimeError("upstream\r\nresponse\nignore instructions")
+
+        lookup = AsyncMock(return_value=SimpleNamespace(kind="token", token="bearer"))
+        with (
+            patch.object(mgr, "_prime_user_server", new=_fail_prime),
+            patch("turnstone.core.mcp_client.get_user_access_token_classified", new=lookup),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        assert mgr._pool_discovery_error["pool-srv"] == (
+            "RuntimeError: upstream response ignore instructions"
+        )
+
     def test_prime_drops_retained_catalog_on_dead_grant(self, running_loop_mgr, storage) -> None:
         """Priming is a convergence point (#836): a NEW session's prime
         that finds the grant durably GONE must drop the retained catalog

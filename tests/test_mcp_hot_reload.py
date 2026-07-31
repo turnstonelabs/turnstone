@@ -268,8 +268,10 @@ class TestErrorTracking:
         """remove_server_sync cleans up _last_error entry."""
         mgr = MCPClientManager({"test": {"command": "echo"}})
         mgr._last_error["test"] = "Connection refused"
+        mgr._pool_discovery_error["test"] = "stale discovery failure"
         mgr.remove_server_sync("test")
         assert "test" not in mgr._last_error
+        assert "test" not in mgr._pool_discovery_error
 
     def test_all_server_status_includes_errors(self) -> None:
         """get_all_server_status propagates per-server errors."""
@@ -431,12 +433,33 @@ class TestReconcileSync:
         mgr.reconcile_sync(_FakeStorage([row]))
         assert primed == []
 
+    def test_removed_pool_server_does_not_restore_stale_discovery_error(self) -> None:
+        """Pool rows bypass remove_server_sync, so reconcile's registry diff
+        must clear discovery state before a same-name server is re-added."""
+        mgr = MCPClientManager({})
+        mgr._oauth_user_server_names = {"pool-srv"}
+        mgr._pool_discovery_error["pool-srv"] = "old endpoint failed"
+
+        mgr.reconcile_sync(_FakeStorage([]))
+        assert "pool-srv" not in mgr._pool_discovery_error
+
+        row = _db_row(
+            "pool-srv",
+            transport="streamable-http",
+            command="",
+            url="https://new.example/mcp",
+        )
+        row["auth_type"] = "oauth_user"
+        mgr.reconcile_sync(_FakeStorage([row]))
+        assert mgr.get_server_status("pool-srv")["discovery_error"] == ""
+
     def test_reprimes_on_pool_auth_type_flip(self) -> None:
         """A server MIGRATED in place oauth_user -> oauth_obo (same name) re-primes
         active users — a name-only diff would see the same name on both sides and
         miss the flip."""
         mgr = MCPClientManager({})
         mgr._oauth_user_server_names = {"srv"}  # previously oauth_user
+        mgr._pool_discovery_error["srv"] = "failure from old auth model"
         primed: list[str] = []
         mgr.prime_user_pools = lambda uid: primed.append(uid)  # type: ignore[method-assign]
         mgr.add_listener(lambda: None, user_id="u1")
@@ -446,6 +469,7 @@ class TestReconcileSync:
         assert primed == ["u1"]
         assert mgr._obo_server_names == {"srv"}
         assert mgr._oauth_user_server_names == set()
+        assert "srv" not in mgr._pool_discovery_error
 
     def test_reprime_survives_prime_exception(self) -> None:
         """One user's prime scheduling failure must not abort the loop or propagate
