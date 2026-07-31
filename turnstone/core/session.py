@@ -6078,8 +6078,7 @@ class ChatSession:
             return None
         has_static_key = bool(getattr(cfg, "api_key", ""))
         configured_fail_closed = bool(
-            self._config_store is not None
-            and self._config_store.get("model.auth_fail_closed")
+            self._config_store is not None and self._config_store.get("model.auth_fail_closed")
         )
         must_fail_closed = configured_fail_closed or not has_static_key
         user_id = ""
