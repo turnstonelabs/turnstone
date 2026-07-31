@@ -99,7 +99,8 @@ def render_user_interjection(message: str, priority: str) -> str:
 # ``{"role": "system", "_source": <kind>, "content": ...}`` messages rather
 # than spliced into a neighbouring turn's ``content``.  At the wire boundary a
 # system turn is either kept inline (native mid-conversation system messages —
-# claude-opus-4-8, claude-fable-5) or folded into the preceding turn as a
+# any model whose capability row sets supports_mid_conversation_system) or
+# folded into the preceding turn as a
 # ``[start system-reminder]`` block (every other model).  ``_source`` classifies the turn for UI rendering
 # and replay; it rides the persisted ``_source`` column and is stripped before
 # the LLM wire by ``sanitize_messages``.  See ``ChatSession`` for the producers
@@ -124,6 +125,7 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
         "repeat",
         "compaction_pending",
         "idle_children",
+        "idle_tasks",
         "watch_triggered",
         # Background-shell exit notice (#817) — rides the same external-event
         # rail as ``watch_triggered``; carries ``shell_id`` / ``command`` /
@@ -155,7 +157,7 @@ def make_system_turn(source: str, content: str, **meta: Any) -> dict[str, Any]:
     structured fields never reach the model.
 
     ``content`` is stored and — on the native mid-conversation-system path
-    (claude-opus-4-8, claude-fable-5) — sent to the model verbatim, so
+    (any row with supports_mid_conversation_system) — sent verbatim, so
     fence-escaping is NOT
     done here.  It belongs to the fallback fold step, which wraps the content
     in a nonce-delimited ``[start system-reminder_{nonce}]`` fence via

@@ -1,12 +1,14 @@
 """``server.require_project`` — the opt-in, default-off gate refusing projectless
-interactive creates.
+interactive and coordinator creates.
 
-Three surfaces:
+Four surfaces:
   * the predicate matrix (``require_project_enabled`` / ``require_project_denies_create``);
   * the fork/resume project inheritance + the cross-tenant 403-vs-400 oracle in the
     interactive create validator (``_interactive_create_validate_request``);
   * the console cluster-create proxy's surface-only-require_project / mask-everything
-    -else policy (``create_workstream``).
+    -else policy (``create_workstream``);
+  * the coordinator create mount on the console (gate wired on the real
+    ``coord_endpoint_config``, operator tokens not exempt).
 
 Validator tests drive the coroutine synchronously via ``asyncio.run`` so they need no
 async-plugin marker. Storage is a MagicMock patched onto the singleton getter that both
@@ -91,6 +93,20 @@ class TestRequireProjectPredicate:
 
         cs = make_config_store(**{"server.require_project": True})
         assert require_project_denies_create(cs, _Auth(), "   ") is True
+
+    @pytest.mark.parametrize("bad", [123, True, ["p1"], {"id": "p1"}, 1.5])
+    def test_truthy_non_string_project_is_projectless(
+        self, bad: Any, make_config_store: Any
+    ) -> None:
+        # A truthy non-string project_id must NOT stringify past the gate: the
+        # create path coerces non-strings to absent (build_kwargs → None), so
+        # the gate has to deny them under require_project or a projectless
+        # session gets minted with the policy on. Regression for the
+        # str(project_id or "") stringification bypass.
+        from turnstone.core.auth import require_project_denies_create
+
+        cs = make_config_store(**{"server.require_project": True})
+        assert require_project_denies_create(cs, _Auth(), bad) is True
 
     def test_service_scope_exempt(self, make_config_store: Any) -> None:
         from turnstone.core.auth import require_project_denies_create
@@ -501,7 +517,6 @@ def _run_gate(list_kind: Any, flag_on: bool, body: dict[str, Any], make_config_s
     (kind, flag, body). A gate pass-through raises out of a build_kwargs stub that
     the handler's own try/except turns into a non-require_project response."""
     from turnstone.core.session_routes import SessionEndpointConfig, make_create_handler
-    from turnstone.core.workstream import WorkstreamKind
 
     def _build(*_a: Any, **_k: Any) -> dict[str, Any]:
         raise RuntimeError("stopped just past the require_project gate")
@@ -515,9 +530,10 @@ def _run_gate(list_kind: Any, flag_on: bool, body: dict[str, Any], make_config_s
         not_found_label="workstream",
         audit_action_prefix="ws",
         list_kind=list_kind,
-        # Derived per-kind HERE the way the real mounts wire it (interactive True,
-        # coordinator False); production keeps it a declarative field, not a kind check.
-        create_gate_require_project=(list_kind == WorkstreamKind.INTERACTIVE),
+        # Both real mounts wire the gate on (interactive on the node,
+        # coordinator on the console); production keeps it a declarative
+        # field, not a kind check.
+        create_gate_require_project=True,
         create_validate_request=None,
         create_build_kwargs=_build,
         create_supports_attachments=False,
@@ -529,7 +545,13 @@ def _run_gate(list_kind: Any, flag_on: bool, body: dict[str, Any], make_config_s
     return asyncio.run(handler(_gate_request(body, cs, auth)))
 
 
-class TestNodeGateKindScoping:
+class TestGateKindParity:
+    """The gate is kind-INDEPENDENT: both real mounts wire it on
+    (``create_gate_require_project=True``), so the (kind × flag × project)
+    matrix must apply uniformly. These synthetic-cfg cases assert that
+    parity — the exemption lives in ``require_project_denies_create``
+    (token_source / service scope), never in the mount kind."""
+
     def test_interactive_projectless_gated(self, make_config_store: Any, tmp_db: Any) -> None:
         from turnstone.core.workstream import WorkstreamKind
 
@@ -548,13 +570,130 @@ class TestNodeGateKindScoping:
         resp = _run_gate(WorkstreamKind.INTERACTIVE, False, {}, make_config_store)
         assert not _is_require_project_400(resp)
 
-    def test_coordinator_projectless_exempt(self, make_config_store: Any, tmp_db: Any) -> None:
-        # The coordinator mount leaves create_gate_require_project False, so a
-        # projectless coordinator create is NOT gated even with the flag on.
+    def test_coordinator_projectless_gated(self, make_config_store: Any, tmp_db: Any) -> None:
+        # The coordinator mount wires create_gate_require_project=True, so a
+        # projectless coordinator create is refused the same as interactive.
         from turnstone.core.workstream import WorkstreamKind
 
         resp = _run_gate(WorkstreamKind.COORDINATOR, True, {}, make_config_store)
+        assert _is_require_project_400(resp)
+
+    def test_coordinator_with_project_passes(self, make_config_store: Any, tmp_db: Any) -> None:
+        from turnstone.core.workstream import WorkstreamKind
+
+        resp = _run_gate(WorkstreamKind.COORDINATOR, True, {"project_id": "p1"}, make_config_store)
         assert not _is_require_project_400(resp)
+
+    def test_coordinator_flag_off_passes(self, make_config_store: Any, tmp_db: Any) -> None:
+        from turnstone.core.workstream import WorkstreamKind
+
+        resp = _run_gate(WorkstreamKind.COORDINATOR, False, {}, make_config_store)
+        assert not _is_require_project_400(resp)
+
+
+# ---------------------------------------------------------------------------
+# Coordinator create mount wiring — the REAL console mount wires
+# create_gate_require_project=True on coord_endpoint_config. The synthetic-cfg
+# tests above can't catch a mis-wire on the actual mount, so drive the mounted
+# console endpoint end-to-end (mirrors TestRequireProjectMountWiring in
+# test_server_authz.py for the interactive node mount).
+# ---------------------------------------------------------------------------
+
+
+def _operator_headers() -> dict[str, str]:
+    """An ``admin.coordinator`` operator WITHOUT the ``service`` scope.
+
+    Service identities are exempt from the gate; the operator's own token
+    must not be, so the gate tests would silently pass-through if this
+    reused ``_console_headers()`` (which carries ``service``).
+    """
+    from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
+
+    tok = create_jwt(
+        user_id="op",
+        scopes=frozenset({"read", "write", "approve"}),
+        source="test",
+        secret=_CONSOLE_JWT_SECRET,
+        audience=JWT_AUD_CONSOLE,
+        permissions=frozenset({"admin.coordinator"}),
+    )
+    return {"Authorization": f"Bearer {tok}"}
+
+
+@contextlib.contextmanager
+def _console_coord_client(tmp_path: Any, cs: Any) -> Any:
+    """A console TestClient with the real coord create mount live: a real
+    ``SessionManager(CoordinatorAdapter)`` over SQLite, a fake model registry
+    (passes the 503 gates), and the given config store."""
+    from starlette.testclient import TestClient
+
+    from tests._coord_test_helpers import _build_mgr, _fake_registry
+    from turnstone.console.collector import ClusterCollector
+    from turnstone.console.server import _load_static, create_app
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    _load_static()
+    storage = SQLiteBackend(str(tmp_path / "coord-gate.db"))
+    app = create_app(collector=MagicMock(spec=ClusterCollector), jwt_secret=_CONSOLE_JWT_SECRET)
+    mgr = _build_mgr(storage)
+    app.state.coord_mgr = mgr
+    app.state.coord_adapter = mgr._adapter
+    app.state.coord_registry = _fake_registry()
+    app.state.coord_registry_error = ""
+    app.state.config_store = cs
+    app.state.auth_storage = storage
+    client = TestClient(app, raise_server_exceptions=False, headers=_operator_headers())
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+class TestCoordMountWiring:
+    def test_projectless_coord_create_gated_when_on(
+        self, tmp_path: Any, make_config_store: Any
+    ) -> None:
+        cs = make_config_store(**{"server.require_project": True})
+        with _console_coord_client(tmp_path, cs) as client:
+            resp = client.post("/v1/api/workstreams/new", json={"name": "no-project"})
+        assert resp.status_code == 400, resp.text
+        assert resp.json().get("code") == "require_project"
+
+    def test_coord_create_with_project_passes_when_on(
+        self, tmp_path: Any, make_config_store: Any
+    ) -> None:
+        # A projected create must clear the gate; it 400s in the coord
+        # validator instead (unknown project_id on the fresh DB) — asserting
+        # NOT-the-coded-400 pins the gate without needing a seeded project.
+        cs = make_config_store(**{"server.require_project": True})
+        with _console_coord_client(tmp_path, cs) as client:
+            resp = client.post(
+                "/v1/api/workstreams/new", json={"name": "x", "project_id": "p-missing"}
+            )
+        assert resp.json().get("code") != "require_project", resp.text
+
+    def test_projectless_coord_create_allowed_when_off(
+        self, tmp_path: Any, make_config_store: Any
+    ) -> None:
+        with _console_coord_client(tmp_path, make_config_store()) as client:
+            resp = client.post("/v1/api/workstreams/new", json={"name": "no-project"})
+        body = resp.json()
+        assert resp.status_code == 200, body
+        assert body.get("ws_id")
+
+    def test_non_string_project_id_cannot_bypass_gate(
+        self, tmp_path: Any, make_config_store: Any
+    ) -> None:
+        # End-to-end regression: the create path coerces a non-string
+        # project_id to absent (validator skips its attach check, build_kwargs
+        # → None), so a truthy non-string must be refused by the gate rather
+        # than minting a projectless coordinator with the policy on. Pins the
+        # three wired sites (validator / gate / build_kwargs) agreeing.
+        cs = make_config_store(**{"server.require_project": True})
+        with _console_coord_client(tmp_path, cs) as client:
+            resp = client.post("/v1/api/workstreams/new", json={"name": "x", "project_id": 123})
+        assert resp.status_code == 400, resp.text
+        assert resp.json().get("code") == "require_project"
 
 
 # ---------------------------------------------------------------------------

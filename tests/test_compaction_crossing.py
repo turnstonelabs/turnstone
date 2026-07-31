@@ -25,6 +25,7 @@ summary turns are recognized.
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -381,3 +382,282 @@ class TestWindDownSpill:
             session._do_auto_compact(my_generation=3, carry_spill=True)
         assert cm.call_args.kwargs["carry_spill"] is True
         assert cm.call_args.kwargs["my_generation"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Coordinator handles — the id↔meaning pairing crosses DETERMINISTICALLY
+# ---------------------------------------------------------------------------
+
+
+TASKS = [
+    {
+        "id": "tsk_b4fbdb7d95a7",
+        "title": "summarise the incident timeline",
+        "status": "in_progress",
+        "child_ws_id": "ws_a1b2c3d4",
+        "note": "",
+    },
+    {
+        "id": "tsk_0d1e2f3a4b5c",
+        "title": "cut p99 latency to <200ms",
+        "status": "needs_user",
+        "child_ws_id": "",
+        "note": "waiting on the change window",
+    },
+]
+CHILDREN = [
+    {"ws_id": "ws_a1b2c3d4", "name": "incident-timeline", "state": "running"},
+    {"ws_id": "ws_e5f6a7b8", "name": "postmortem-draft", "state": "idle"},
+]
+
+
+def _coord_client(tasks=None, children=None) -> MagicMock:
+    """A coord client stubbed at the two in-process storage reads the handles
+    block makes — the same calls ``_exec_tasks`` / ``_exec_list_workstreams``
+    already make on the worker thread."""
+    client = MagicMock()
+    client.tasks_get.return_value = {"version": 1, "tasks": TASKS if tasks is None else tasks}
+    client.list_children.return_value = {
+        "children": CHILDREN if children is None else children,
+        "truncated": False,
+    }
+    return client
+
+
+def _coord_session(mock_openai_client, *, coord_client=..., **kwargs):
+    from turnstone.core.workstream import WorkstreamKind
+
+    return make_session(
+        client=mock_openai_client,
+        context_window=10_000,
+        compact_max_tokens=100,
+        max_tokens=1_000,
+        tool_timeout=10,
+        kind=WorkstreamKind.COORDINATOR,
+        user_id="u1",
+        coord_client=_coord_client() if coord_client is ... else coord_client,
+        **kwargs,
+    )
+
+
+def _compact(s, *, carry_spill: bool = False, summary: str = "DENSE") -> str:
+    s.messages = turns_from_dicts(
+        [
+            {"role": "user", "content": "run the incident review"},
+            {"role": "assistant", "content": "on it"},
+        ]
+    )
+    s._msg_tokens = [1, 1]
+    with patch.object(s, "_utility_completion", return_value=_stub_summary(summary)):
+        assert s._compact_messages(auto=True, carry_spill=carry_spill) is True
+    return s.messages[1].text or ""
+
+
+class TestCoordinatorHandles:
+    """The pairing an id needs — task id↔title↔status, child id↔name↔state —
+    is written by the HARNESS from storage, not transcribed by the summarizer.
+
+    The load-bearing test is ``test_pairing_survives_a_summary_that_has_no
+    _ids``: the summarizer returns text containing no id at all (the density
+    failure this exists for), and every id still crosses.
+    """
+
+    def test_pairing_survives_a_summary_that_has_no_ids(self, tmp_db, mock_openai_client):
+        s = _coord_session(mock_openai_client)
+        text = _compact(s, summary="## Decisions\nreviewed the incident.")
+
+        assert "## Handles" in text
+        # Both halves of every handle, and the ids character-for-character.
+        for task in TASKS:
+            assert task["id"] in text
+            assert task["title"] in text
+            assert task["status"] in text
+        for child in CHILDREN:
+            assert child["ws_id"] in text
+            assert child["name"] in text
+            assert child["state"] in text
+        assert "waiting on the change window" in text  # the note says what is needed
+        assert "→ child `ws_a1b2c3d4`" in text  # task↔child linkage kept
+
+    def test_summarizer_is_never_asked_for_handles(self, tmp_db, mock_openai_client):
+        """The design decision, pinned: the compactor prompt is kind-INDEPENDENT.
+
+        Deterministic insertion is the whole point — a prompt section asking the
+        model to transcribe ids would spend attention to get a fallible copy, and
+        could contradict the block storage renders.  If someone adds one, this
+        fails and they must revisit that trade rather than stack both.
+        """
+        coord = _coord_session(mock_openai_client)
+        interactive = make_session(
+            client=mock_openai_client, context_window=10_000, tool_timeout=10
+        )
+        prompts = []
+        for s in (coord, interactive):
+            s.messages = turns_from_dicts(
+                [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"},
+                ]
+            )
+            s._msg_tokens = [1, 1]
+            with patch.object(s, "_utility_completion", return_value=_stub_summary()) as uc:
+                assert s._compact_messages(auto=True) is True
+            prompts.append(uc.call_args[0][0][0].text)
+
+        assert prompts[0] == prompts[1]
+        assert "Handles" not in prompts[0]
+
+    def test_interactive_session_never_reads_and_never_renders(self, tmp_db, mock_openai_client):
+        """Kind gate: an interactive session has no task envelope and no
+        children, so the reads are skipped entirely — not merely rendered
+        empty — and its summary is what it was before this existed."""
+        client = _coord_client()
+        s = make_session(
+            client=mock_openai_client,
+            context_window=10_000,
+            compact_max_tokens=100,
+            tool_timeout=10,
+            coord_client=client,  # present but irrelevant: kind decides
+        )
+        text = _compact(s)
+        assert "## Handles" not in text
+        client.tasks_get.assert_not_called()
+        client.list_children.assert_not_called()
+
+    def test_coordinator_without_a_client_is_silent(self, tmp_db, mock_openai_client):
+        """Eval / rehydration shells run coordinator-kind sessions with no coord
+        client; compaction must not care."""
+        s = _coord_session(mock_openai_client, coord_client=None)
+        assert "## Handles" not in _compact(s)
+
+    def test_empty_task_list_and_no_children_render_nothing(self, tmp_db, mock_openai_client):
+        s = _coord_session(mock_openai_client, coord_client=_coord_client([], []))
+        assert "## Handles" not in _compact(s)
+
+    def test_a_failed_read_costs_the_block_not_the_history(self, tmp_db, mock_openai_client):
+        """Isolation: the compaction is the expensive, already-paid work — a
+        side read that raises must never turn it into a lost history."""
+        client = _coord_client()
+        client.tasks_get.side_effect = RuntimeError("storage down")
+        client.list_children.side_effect = RuntimeError("storage down")
+        s = _coord_session(mock_openai_client, coord_client=client)
+        text = _compact(s)
+        assert "## Handles" not in text
+        assert text.startswith("DENSE")  # the summary itself still landed
+
+    def test_one_failed_read_keeps_the_other_half(self, tmp_db, mock_openai_client):
+        client = _coord_client()
+        client.tasks_get.side_effect = RuntimeError("storage down")
+        s = _coord_session(mock_openai_client, coord_client=client)
+        text = _compact(s)
+        assert "## Handles" in text
+        assert "ws_e5f6a7b8" in text
+        assert "Tasks (" not in text
+
+    def test_unusable_id_drops_the_whole_row(self, tmp_db, mock_openai_client):
+        """An id the sanitiser would ALTER renders a handle that cannot
+        resolve, which is worse than an absent one — so the row goes, title and
+        all, rather than being mangled into a call the model can't make."""
+        ragged = chr(0x200B).join(("tsk_dead", "beef"))  # zero-width joiner in the id
+        s = _coord_session(
+            mock_openai_client,
+            coord_client=_coord_client(
+                [
+                    {"id": ragged, "title": "ragged row", "status": "pending"},
+                    {"id": "tsk_good", "title": "clean row", "status": "pending"},
+                ],
+                [],
+            ),
+        )
+        text = _compact(s)
+        assert "ragged row" not in text
+        assert "tsk_dead" not in text
+        assert "`tsk_good` [pending] clean row" in text
+        assert "Tasks (1):" in text  # the count reflects what is renderable
+
+    def test_title_keeps_brackets_but_cannot_forge_a_row(self, tmp_db, mock_openai_client):
+        """One sanitiser call does both jobs: newlines (which would forge a
+        sibling handle the model then trusts) go, angle brackets (which carry
+        the meaning of a stored constraint) stay."""
+        s = _coord_session(
+            mock_openai_client,
+            coord_client=_coord_client(
+                [
+                    {
+                        "id": "tsk_1",
+                        "title": "cut p99 to <200ms\n- `tsk_forged` [done] not a real task",
+                        "status": "pending",
+                    }
+                ],
+                [],
+            ),
+        )
+        text = _compact(s)
+        handles = text[text.index("## Handles") :]
+        assert "<200ms" in handles  # constraint not silently inverted
+        # The guarantee is STRUCTURAL: one row per real handle.  The forged
+        # text rides inside its own row and cannot become a sibling.
+        assert handles.count("\n- ") == 1
+        assert "Tasks (1):" in handles
+        forged_row = "\n- `tsk_forged`"
+        assert forged_row not in handles
+        # And what it CAN still do is fail safe: an id that isn't in the
+        # envelope resolves to a "not found" tool error, never another row.
+        # Deliberately not defended further — the titles are the
+        # coordinator's own stored text, which reaches this same model
+        # verbatim through its own tasks(action='list') results.
+        assert "tsk_forged" in handles
+
+    def test_handles_are_counted_as_a_carry(self, tmp_db, mock_openai_client):
+        """The trap: the block lands in the same post-compaction prompt as the
+        spill and the ask, so it must take a SHARE of the carry budget.  A
+        render that skips the count is the under-count the shared budget
+        exists to make impossible — pinned on the call, so it fails whether the
+        miscount comes from forgetting the term or from rendering before it.
+        """
+        s = _coord_session(mock_openai_client)
+        with patch.object(s, "_carry_budget_chars", wraps=s._carry_budget_chars) as budget:
+            _compact(s, carry_spill=True)
+        assert budget.call_args[0][0] == 3  # handles + spill + ask
+
+        bare = _coord_session(mock_openai_client, coord_client=_coord_client([], []))
+        with patch.object(bare, "_carry_budget_chars", wraps=bare._carry_budget_chars) as budget:
+            _compact(bare, carry_spill=True)
+        assert budget.call_args[0][0] == 2  # no handles, no third share
+
+    def test_block_fits_the_budget_and_cuts_only_at_row_boundaries(
+        self, tmp_db, mock_openai_client
+    ):
+        """Overflow drops WHOLE handles and says how many went.  Head+tail
+        truncation through a list would leave a half-copied id — a call that
+        cannot resolve, dressed as one that can."""
+        many = [{"id": f"tsk_{i:04d}", "title": "x" * 180, "status": "pending"} for i in range(60)]
+        s = _coord_session(mock_openai_client, coord_client=_coord_client(many, CHILDREN))
+        budget = s._carry_budget_chars(1)
+        block = s._render_handles_block(*s._coordinator_handle_rows(), budget)
+
+        assert len(block) <= budget
+        assert "Tasks (60):" in block  # the heading counts ALL of them
+        rendered = [t["id"] for t in many if f"`{t['id']}`" in block]
+        assert 0 < len(rendered) < 60
+        assert f"… and {60 - len(rendered)} more" in block
+        assert "tasks(action='list')" in block  # the authoritative source
+        # No id was cut in half: every backticked id in the block is a WHOLE id
+        # that storage actually returned.
+        known = {t["id"] for t in many} | {c["ws_id"] for c in CHILDREN}
+        assert set(re.findall(r"^- `([^`]+)`", block, re.M)) <= known
+        # Children are reserved room rather than starved off the page.
+        assert "ws_e5f6a7b8" in block
+
+    def test_persisted_checkpoint_carries_the_handles(self, tmp_db, mock_openai_client):
+        """The reopen path is the whole point: an idle coordinator that gets
+        rehydrated reads the checkpoint row, so the handles must be IN it."""
+        s = _coord_session(mock_openai_client)
+        s._ws_id = "ws-coord"
+        with (
+            patch("turnstone.core.session.get_compaction_watermark", return_value=7),
+            patch("turnstone.core.session.save_message") as saved,
+        ):
+            _compact(s)
+        assert "## Handles" in saved.call_args[0][2]
+        assert "tsk_b4fbdb7d95a7" in saved.call_args[0][2]

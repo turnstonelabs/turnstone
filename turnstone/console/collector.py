@@ -277,7 +277,21 @@ class ClusterCollector:
                 await task
 
     async def _node_sse_task(self, node_id: str, stop_event: asyncio.Event) -> None:
-        """Persistent SSE connection to a single server node."""
+        """Persistent SSE connection to a single server node.
+
+        DELIBERATELY cursorless (#881 audit ruling): every (re)connect is
+        fresh — no ``Last-Event-ID``, so the node answers with a full
+        ``node_snapshot`` and the collector rebuilds wholesale.  That is
+        this consumer's recovery model (idempotent state-of-world, not
+        append-only history), it side-steps cursor staleness across node
+        restarts entirely, and it means the epoch staleness check and
+        the ``replay_truncated`` envelope can never fire here — the
+        epoch-tagged ids themselves are on the wire, just never read.
+        If a cursor is ever adopted, present the SSE ``id:`` VERBATIM
+        (opaque ``"{boot_epoch}-{counter}"`` — never parse it) and handle
+        ``replay_truncated`` explicitly; today an unknown event type
+        no-ops in ``_apply_delta`` by design.
+        """
         backoff = 1.0
         while not stop_event.is_set() and self._running:
             url = self._get_node_url(node_id)

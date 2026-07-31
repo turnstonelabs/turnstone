@@ -1,17 +1,24 @@
 {
   "name": "tasks",
-  "description": "Ordered task list for the coordinator's own planning state. Persisted on the coordinator workstream so it survives restarts. Use to decompose work, mark progress, and link tasks to spawned children via `child_ws_id`. Actions: `add` (append), `update` (mutate title/status/child_ws_id by id), `remove` (by id), `reorder` (by id list), `list`. Status: `pending`, `in_progress`, `done`, `blocked`. Titles over 200 chars are rejected (error) rather than silently truncated. `child_ws_id` is a free-form label — not validated against the workstreams table, so it can point at a not-yet-spawned or already-closed id; cross-reference `list_workstreams` if you care.",
+  "description": "Ordered task list for the coordinator's own planning state. Persisted on the coordinator workstream so it survives restarts. Use to decompose work, mark progress, and link tasks to spawned children via `child_ws_id`. Actions: `add` (append), `update` (mutate title/status/child_ws_id/note by id), `remove` (by id), `reorder` (by id list), `list`. Status: `pending`, `in_progress`, `done`, `blocked`, `needs_user`. Use `blocked` when something you may be able to clear yourself is in the way (a build, a sibling task, a running child); use `needs_user` when the task cannot proceed without a decision, approval, or grant that only the user can give \u2014 that is a valid place to stop, and `note` is where you say what you need. Titles and notes over 200 chars are rejected (error) rather than silently truncated. `child_ws_id` is a free-form label \u2014 not validated against the workstreams table, so it can point at a not-yet-spawned or already-closed id; cross-reference `list_workstreams` if you care.",
   "parameters": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
         "description": "One of: add / update / remove / reorder / list.",
-        "enum": ["add", "update", "remove", "reorder", "list"]
+        "enum": [
+          "add",
+          "update",
+          "remove",
+          "reorder",
+          "list"
+        ]
       },
       "title": {
         "type": "string",
-        "description": "For 'add' and 'update': task title. Max 200 chars; longer titles are REJECTED (not truncated)."
+        "description": "For 'add' and 'update': task title. Max 200 chars; longer titles are REJECTED (not truncated).",
+        "maxLength": 200
       },
       "task_id": {
         "type": "string",
@@ -19,20 +26,35 @@
       },
       "status": {
         "type": "string",
-        "description": "For 'add' and 'update': pending / in_progress / done / blocked.",
-        "enum": ["pending", "in_progress", "done", "blocked"]
+        "description": "For 'add' and 'update': pending / in_progress / done / blocked / needs_user. `blocked` = waiting on a dependency you may be able to clear yourself. `needs_user` = waiting on a decision, approval, or grant only the user can give; pair it with `note`.",
+        "enum": [
+          "pending",
+          "in_progress",
+          "done",
+          "blocked",
+          "needs_user"
+        ]
+      },
+      "note": {
+        "type": "string",
+        "description": "For 'add' and 'update': optional one-sentence note. Use it to say what you need from the user on a `needs_user` task, so setting the status does not overwrite the title. Max 200 chars; longer notes are REJECTED (not truncated). Pass an empty string on 'update' to clear it.",
+        "maxLength": 200
       },
       "child_ws_id": {
         "type": "string",
-        "description": "For 'add' and 'update': optional free-form ws_id label. NOT validated against the workstreams table — the coordinator owns the linkage semantics (pre-spawn placeholders and post-close references are both legal)."
+        "description": "For 'add' and 'update': optional free-form ws_id label. NOT validated against the workstreams table \u2014 the coordinator owns the linkage semantics (pre-spawn placeholders and post-close references are both legal)."
       },
       "task_ids": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "description": "For 'reorder': new ordering by task_id (must be a permutation of existing task_ids)."
       }
     },
-    "required": ["action"]
+    "required": [
+      "action"
+    ]
   },
   "coordinator": true,
   "primary_key": "action"

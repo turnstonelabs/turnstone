@@ -15,6 +15,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from turnstone.core.metacognition import TASK_NOTE_MAX, TASK_TITLE_MAX
 from turnstone.core.session import ChatSession
 from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.prompts import ClientType
@@ -1213,7 +1214,7 @@ def test_tasks_exec_add_dispatches(coord_session):
     item = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "plan", "status": "pending"}))
     _, _ = sess._exec_tasks(item)
     coord.tasks_add.assert_called_once_with(
-        sess._ws_id, title="plan", status="pending", child_ws_id=""
+        sess._ws_id, title="plan", status="pending", child_ws_id="", note=""
     )
 
 
@@ -1649,14 +1650,17 @@ def test_tasks_update_without_title_evaluates_intent_cleanly(coord_session, monk
     assert item["title"] is None
     sess._evaluate_intent([item])
     # title collapses None → "" (truncatable text); status is projected so the
-    # judge can see what state is being set; child_ws_id passes through as None
-    # ("unchanged"), never sliced.
+    # judge can see what state is being set; child_ws_id and note pass through
+    # as None ("unchanged"), never sliced.  note deliberately does NOT follow
+    # title's collapse — an empty note is a legal value (it clears the field),
+    # so None → "" would show the judge a clear nobody requested.
     assert item["func_args"] == {
         "action": "update",
         "task_id": "tsk_1",
         "title": "",
         "status": "in_progress",
         "child_ws_id": None,
+        "note": None,
     }
 
 
@@ -1850,3 +1854,540 @@ def test_notify_exec_on_coord_session_sends_via_channel_gateway(coord_session, t
     assert post_kwargs["json"]["target"] == {"username": "admin"}
     assert post_kwargs["json"]["message"] == "batch failed on child-x"
     assert post_kwargs["json"]["ws_id"] == "coord-1"
+
+
+def test_tasks_prepare_add_rejects_non_string_note(coord_session):
+    """Without the type check, ``note=42`` reaches ``tasks_add`` and blows
+    up inside ``.strip()`` as a generic 'add failed'."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "t", "note": 42}))
+    assert "error" in item
+    assert "note must be a string" in item["error"]
+
+
+def test_tasks_prepare_update_rejects_non_string_note(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "update", "task_id": "tsk_1", "note": ["x"]}))
+    assert "error" in item
+    assert "note must be a string" in item["error"]
+
+
+def test_tasks_prepare_update_with_note_alone_is_accepted(coord_session):
+    """A note-only update is exactly the shape the idle-tasks nudge tells
+    the model to make, so it must count toward 'something to update'."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "note": "need a decision"})
+    )
+    assert "error" not in item
+    assert item["note"] == "need a decision"
+
+
+def test_tasks_prepare_update_with_nothing_still_rejected(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "update", "task_id": "tsk_1"}))
+    assert "error" in item
+    assert "at least one of" in item["error"]
+
+
+def test_tasks_prepare_add_preview_carries_note(coord_session):
+    """The operator approves the mutation from the preview; a hidden note
+    means approving an ask they cannot read."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "tasks",
+            {
+                "action": "add",
+                "title": "pick a backend",
+                "status": "needs_user",
+                "note": "which auth backend is canonical?",
+            },
+        )
+    )
+    assert "error" not in item
+    assert "which auth backend is canonical?" in item["preview"]
+
+
+def test_tasks_projection_carries_note_to_judge(coord_session, monkeypatch):
+    """Smart Approvals rules on ``func_args`` alone — an unprojected field
+    is invisible to it."""
+    sess, _coord, _ui = coord_session
+    _stub_judge_for_evaluate_intent(monkeypatch, sess)
+    item = sess._prepare_tool(
+        _tc(
+            "tasks",
+            {
+                "action": "update",
+                "task_id": "tsk_1",
+                "status": "needs_user",
+                "note": "need a decision on the schema",
+            },
+        )
+    )
+    sess._evaluate_intent([item])
+    assert item["func_args"]["note"] == "need a decision on the schema"
+
+
+def test_tasks_preview_marks_truncated_note(coord_session):
+    """The operator rules on the preview.  A bare slice reads as the
+    whole argument — and with notes capped at 200 the half they never saw
+    can be the half naming the destructive option."""
+    sess, _coord, _ui = coord_session
+    long_note = "point the migration at " + ("x" * 200)
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "add", "title": "t", "note": long_note[:200]})
+    )
+    assert "error" not in item
+    assert "chars omitted]" in item["preview"], (
+        "an over-budget note must carry honest_truncate's marker, not a silent slice"
+    )
+
+
+def test_tasks_preview_marks_truncated_title(coord_session):
+    """All four preview/header slices in _prepare_tasks use the same
+    honest marker — converting only the note ones would leave the
+    function internally inconsistent."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "t" * 200}))
+    assert "error" not in item
+    assert "chars omitted]" in item["header"]
+
+
+def test_tasks_update_whitespace_note_previews_as_clear(coord_session):
+    """Preview/execute divergence: a whitespace-only note is truthy
+    before the strip, so it previewed as a note being SET while
+    tasks_update stripped it to "" and took the CLEAR branch — the
+    operator approved "set a note" and the tool deleted one."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "update", "task_id": "tsk_1", "note": "   "}))
+    assert "error" not in item
+    # Stripped once at prepare, so preview, projection and execute agree.
+    assert item["note"] == ""
+    assert "note=-" in item["preview"]
+
+
+def test_tasks_update_strips_whitespace_only_string_fields(coord_session):
+    """A whitespace-only title/status/child_ws_id is ordinary spaces,
+    not steering codepoints.  The update branch strips every string
+    field once, like the note, so the ``[unrenderable: N chars]``
+    marker's trigger stays the genuinely-invisible class only — spaces
+    must never be reported to the operator as control/zero-width/bidi
+    text — and a whitespace-only ``child_ws_id`` previews as the
+    explicit clear (``-``) it now performs."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "tasks",
+            {
+                "action": "update",
+                "task_id": "tsk_1",
+                "title": "   ",
+                "status": "   ",
+                "child_ws_id": "   ",
+            },
+        )
+    )
+    assert "error" not in item
+    assert "unrenderable" not in item["preview"]
+    assert "child_ws_id=-" in item["preview"]
+    # The stripped values are what execute hands the write path — the
+    # operator ruled on the value that runs.
+    assert item["title"] == ""
+    assert item["status"] == ""
+    assert item["child_ws_id"] == ""
+
+
+def test_tasks_prepare_rejects_unrenderable_note_before_approval(coord_session):
+    """The sanitise-to-empty sibling of the whitespace divergence above,
+    in reverse: an update note made only of stripped characters previewed
+    as ``note=-`` (the explicit-CLEAR marker) while execute stored the
+    raw payload — the operator approved a clear and got a SET.  Rejected
+    at prepare now (the write path rejects authoritatively too), so the
+    approval card can never carry the lie."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "note": chr(0x200B) * 3})
+    )
+    assert "error" in item
+    assert "no renderable characters" in item["error"]
+    assert "retry" in item["error"]  # reject WITH hint
+
+
+def test_tasks_prepare_rejects_unrenderable_add_title_and_note(coord_session):
+    """The add-branch siblings: an unrenderable title creates a task no
+    operator surface can name; an unrenderable note was silently OMITTED
+    from the preview while storing verbatim.  Both fixtures are the
+    genuinely-invisible class — brackets render now, so they are not
+    part of it."""
+    sess, _coord, _ui = coord_session
+    t = sess._prepare_tool(_tc("tasks", {"action": "add", "title": chr(0x200B) * 2}))
+    assert "error" in t and "no renderable characters" in t["error"]
+    n = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "ok", "note": chr(0x202E)}))
+    assert "error" in n and "no renderable characters" in n["error"]
+
+
+def test_prepare_rejects_over_cap_fields_before_approval(coord_session):
+    """THE OPERATOR-SPARING PROPERTY.  An over-cap title or note is a tool
+    error at prepare, not an approval card: the write path refuses it, so
+    without this gate the operator spent a decision on a mutation that
+    could never land — the same class the adjacent unrenderable reject
+    exists to prevent.  ``needs_approval`` False and no ``execute`` is
+    what "no approval item" means at this layer."""
+    sess, _coord, _ui = coord_session
+    for args, field in (
+        ({"action": "add", "title": "x" * (TASK_TITLE_MAX + 1)}, "title"),
+        ({"action": "add", "title": "ok", "note": "x" * (TASK_NOTE_MAX + 1)}, "note"),
+        (
+            {"action": "update", "task_id": "tsk_1", "title": "x" * (TASK_TITLE_MAX + 1)},
+            "title",
+        ),
+        (
+            {"action": "update", "task_id": "tsk_1", "note": "x" * (TASK_NOTE_MAX + 1)},
+            "note",
+        ),
+        # Doubly over cap on an update: the write path checks the note
+        # before the row loop and the title inside it, so both layers must
+        # name the NOTE here.  Title-first at prepare would send the model
+        # to fix the wrong field.
+        (
+            {
+                "action": "update",
+                "task_id": "tsk_1",
+                "title": "x" * (TASK_TITLE_MAX + 1),
+                "note": "x" * (TASK_NOTE_MAX + 1),
+            },
+            "note",
+        ),
+    ):
+        item = sess._prepare_tool(_tc("tasks", args))
+        assert "error" in item, args
+        assert f"{field} too long" in item["error"], (args, item["error"])
+        assert "Shorten and retry" in item["error"]  # reject WITH hint
+        assert item["needs_approval"] is False
+        assert "execute" not in item, "an unlandable call must not reach the approval surface"
+
+
+def _write_path_client(tmp_path, name="oracle.db"):
+    """A real ``CoordinatorClient`` over a real SQLite backend.
+
+    The write path is the authoritative half of every prepare-versus-write
+    agreement test below, so it has to be the real one — a MagicMock would
+    accept whatever prepare passed it and agree with itself.
+    """
+    import httpx
+
+    from turnstone.console.coordinator_client import CoordinatorClient
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    storage = SQLiteBackend(str(tmp_path / name))
+    storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    return CoordinatorClient(
+        console_base_url="http://x",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+        child_event_bus=ChildEventBus(),
+    )
+
+
+def test_prepare_and_write_path_agree_on_renderability_and_length(coord_session, tmp_path):
+    """ONE ORACLE, for both admission rules.  ``_prepare_tasks`` carries
+    an early copy of the unrenderable reject AND of the length caps;
+    ``tasks_add``/``tasks_update`` carry the authoritative ones.  If the
+    two measure with different sanitisers or different caps, one refuses
+    what the other accepts: either an approval card for a call that
+    cannot land, or a refusal at prepare that the write path would have
+    allowed — a rejection no input can reach.  Both mutation branches are
+    checked, because switching ``add`` alone just relocates the
+    divergence to ``update``."""
+    sess, _coord, _ui = coord_session
+    client = _write_path_client(tmp_path)
+    seed = client.tasks_add("coord-1", title="seed")
+    assert "error" not in seed
+
+    # Brackets render, so they are storable; only the genuinely-invisible
+    # class is refused — and both copies must say so identically.
+    for value, renders in (("<>", True), ("hold p99 <200ms", True), (chr(0x200B) * 2, False)):
+        prepared_add = sess._prepare_tool(_tc("tasks", {"action": "add", "title": value}))
+        prepared_upd = sess._prepare_tool(
+            _tc("tasks", {"action": "update", "task_id": seed["id"], "title": value})
+        )
+        written_add = client.tasks_add("coord-1", title=value)
+        written_upd = client.tasks_update("coord-1", task_id=seed["id"], title=value)
+        verdicts = [
+            "error" not in prepared_add,
+            "error" not in prepared_upd,
+            "error" not in written_add,
+            "error" not in written_upd,
+        ]
+        assert verdicts == [renders] * 4
+
+    # The same property for the caps.  At cap stores, one over is
+    # refused, and leading whitespace does not count — both layers
+    # measure AFTER the strip, so a prepare copy that measured the raw
+    # argument would refuse a title the write path stores happily.
+    for field, cap in (("title", TASK_TITLE_MAX), ("note", TASK_NOTE_MAX)):
+        for value, fits in (
+            ("x" * cap, True),
+            ("x" * (cap + 1), False),
+            (" " * 8 + "x" * cap, True),
+        ):
+            title = value if field == "title" else "ok"
+            note = value if field == "note" else ""
+            prepared_add = sess._prepare_tool(
+                _tc("tasks", {"action": "add", "title": title, "note": note})
+            )
+            prepared_upd = sess._prepare_tool(
+                _tc("tasks", {"action": "update", "task_id": seed["id"], field: value})
+            )
+            written_add = client.tasks_add("coord-1", title=title, note=note)
+            written_upd = client.tasks_update("coord-1", task_id=seed["id"], **{field: value})
+            verdicts = [
+                "error" not in prepared_add,
+                "error" not in prepared_upd,
+                "error" not in written_add,
+                "error" not in written_upd,
+            ]
+            assert verdicts == [fits] * 4, (field, len(value), fits)
+
+
+def test_too_long_wins_over_unrenderable_at_both_layers(coord_session, tmp_path):
+    """MASKING ORDER.  Length is measured before renderability at every
+    gate, so a long run of zero-widths hears "too long" rather than
+    "unrenderable".  The write path documents that order; the prepare
+    copy has to keep it, or one value draws two different hints depending
+    on which layer the model happens to reach first."""
+    sess, _coord, _ui = coord_session
+    client = _write_path_client(tmp_path, name="masking.db")
+    seed = client.tasks_add("coord-1", title="seed")
+    assert "error" not in seed
+
+    # Zero-width space, built with chr() rather than a literal escape.
+    payload = chr(0x200B) * 250
+    assert len(payload) > TASK_TITLE_MAX
+
+    errors = [
+        sess._prepare_tool(_tc("tasks", {"action": "add", "title": payload}))["error"],
+        sess._prepare_tool(
+            _tc("tasks", {"action": "update", "task_id": seed["id"], "title": payload})
+        )["error"],
+        client.tasks_add("coord-1", title=payload)["error"],
+        client.tasks_update("coord-1", task_id=seed["id"], title=payload)["error"],
+    ]
+    for message in errors:
+        assert "too long" in message
+        assert "no renderable characters" not in message
+
+
+def test_unrenderable_errors_do_not_instruct_the_model_about_brackets(coord_session):
+    """D5.  Both copies of the reject once told the model that operator
+    displays strip angle brackets.  They no longer do — left in place,
+    the hint talks a model out of a legitimate "<200ms" title, which is
+    the same corruption the display fix removed, moved one layer up."""
+    from turnstone.console.coordinator_client import _unrenderable_error
+
+    sess, _coord, _ui = coord_session
+    authoritative = _unrenderable_error("title", 3)["error"]
+    early = sess._prepare_tool(_tc("tasks", {"action": "add", "title": chr(0x200B) * 3}))["error"]
+    for message in (authoritative, early):
+        assert "angle bracket" not in message
+        assert "control/zero-width/bidi" in message
+
+
+def test_prepare_and_write_path_refuse_in_the_same_words(coord_session):
+    """ONE SENTENCE, not two that happen to agree.
+
+    Both refusals are returned to the MODEL, and the prepare copy is the
+    one it always hits first — so the layer documented as authoritative
+    is the one it never sees.  The two were restated as separate literals
+    differing only by the action prefix, narrowed in lockstep by hand,
+    with nothing pinning them: an edit to one alone passed CI while the
+    model was told two different reasons for the same refusal depending
+    on which layer it reached.  The neighbouring tests cannot catch that
+    — they assert substrings ("no renderable characters", "too long"),
+    which survive any narrowing that keeps the phrase.
+
+    Both layers now read one producer, so the one-sided edit is not
+    merely detectable but unavailable.  This asserts the relation that
+    makes re-inlining a literal fail: equality modulo the action prefix,
+    for both refusals, both fields and both mutation branches — the
+    prefix being the only thing prepare is entitled to add, so a batched
+    update names the row that failed.  The comparison runs through
+    ``_coord_tool_error`` rather than restating its ``"Error: "``
+    envelope, so the envelope is not a third literal to keep in step,
+    and the whole item is compared: a refusal that grew an ``execute``
+    or an approval card would fail here too.
+    """
+    from turnstone.console.coordinator_client import _too_long_error, _unrenderable_error
+
+    sess, _coord, _ui = coord_session
+    blank = chr(0x200B) * 3  # zero-width space, built with chr()
+    over_title = "x" * (TASK_TITLE_MAX + 1)
+    over_note = "x" * (TASK_NOTE_MAX + 1)
+    upd = {"action": "update", "task_id": "tsk_1"}
+    for args, action, authoritative in (
+        ({"action": "add", "title": blank}, "add", _unrenderable_error("title", len(blank))),
+        (
+            {"action": "add", "title": "ok", "note": blank},
+            "add",
+            _unrenderable_error("note", len(blank)),
+        ),
+        (upd | {"title": blank}, "update", _unrenderable_error("title", len(blank))),
+        (upd | {"note": blank}, "update", _unrenderable_error("note", len(blank))),
+        (
+            {"action": "add", "title": over_title},
+            "add",
+            _too_long_error("title", len(over_title), TASK_TITLE_MAX),
+        ),
+        (
+            {"action": "add", "title": "ok", "note": over_note},
+            "add",
+            _too_long_error("note", len(over_note), TASK_NOTE_MAX),
+        ),
+        (
+            upd | {"title": over_title},
+            "update",
+            _too_long_error("title", len(over_title), TASK_TITLE_MAX),
+        ),
+        (
+            upd | {"note": over_note},
+            "update",
+            _too_long_error("note", len(over_note), TASK_NOTE_MAX),
+        ),
+    ):
+        item = sess._prepare_tool(_tc("tasks", args))
+        assert "error" in item, args
+        expected = sess._coord_tool_error("call-1", "tasks", f"{action}: {authoritative['error']}")
+        assert item == expected, (args, item["error"])
+
+
+def test_tasks_update_header_sanitizes_and_truncates_task_id(coord_session):
+    """Every model-controlled string on the approval surface renders via
+    ``_pf`` — a newline in ``task_id`` forges an extra header line in the
+    channel formatter (which truncates preview but NOT header) and in
+    buildConvCmd's line-classified view.  ``item["task_id"]`` stays raw:
+    it feeds ``tasks_update`` by exact match, so sanitising the stored
+    value would turn every mutation into "task not found"."""
+    sess, _coord, _ui = coord_session
+    raw_id = "tsk_a" + chr(10) + "FAKE APPROVAL LINE"
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": raw_id, "status": "done"})
+    )
+    assert "error" not in item
+    assert chr(10) not in item["header"]
+    assert item["task_id"] == raw_id
+    long_item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "t" * 200, "status": "done"})
+    )
+    assert "chars omitted]" in long_item["header"]
+
+
+def test_tasks_remove_header_sanitizes_task_id(coord_session):
+    sess, _coord, _ui = coord_session
+    raw_id = "tsk" + chr(10) + "x"
+    item = sess._prepare_tool(_tc("tasks", {"action": "remove", "task_id": raw_id}))
+    assert "error" not in item
+    assert chr(10) not in item["header"]
+    assert item["task_id"] == raw_id
+
+
+def test_tasks_preview_sanitizes_status_and_child_ws_id(coord_session):
+    """``status``/``child_ws_id`` rode the preview raw — a bidi override
+    there reorders the decision the operator reads, which is the exact
+    attack the title/note sanitisation ruling was added to stop."""
+    sess, _coord, _ui = coord_session
+    raw_status = "done" + chr(0x202E)
+    item = sess._prepare_tool(
+        _tc(
+            "tasks",
+            {
+                "action": "update",
+                "task_id": "tsk_1",
+                "status": raw_status,
+                "child_ws_id": "ws-1" + chr(10) + "x",
+            },
+        )
+    )
+    assert "error" not in item
+    assert chr(0x202E) not in item["preview"]
+    assert chr(10) not in item["preview"]
+    # Raw values still flow to execute untouched.
+    assert item["status"] == raw_status
+
+
+def test_tasks_preview_marks_unrenderable_child_ws_id(coord_session):
+    """``child_ws_id``'s ``-`` means "explicit clear".  A value that
+    sanitises to empty must render the unrenderable marker, NOT ``-`` —
+    otherwise the operator approves a clear while execute stores the
+    payload: the note divergence exported to a new field by the very
+    sanitisation that fixed it there.  The marker's trigger is now the
+    genuinely-invisible class only; ``"<>"`` renders (test below)."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "tasks",
+            {"action": "update", "task_id": "tsk_1", "child_ws_id": chr(0x200B) + chr(0x202E)},
+        )
+    )
+    assert "error" not in item
+    assert "child_ws_id=[unrenderable: 2 chars]" in item["preview"]
+    assert item["child_ws_id"] == chr(0x200B) + chr(0x202E)
+
+
+def test_tasks_preview_shows_bracket_child_ws_id_verbatim(coord_session):
+    """The approval preview is an operator surface: it must show the
+    text that will be stored.  Deleting angle brackets here asked the
+    operator to approve a string the tool would not write."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "child_ws_id": "<>"})
+    )
+    assert "error" not in item
+    assert "child_ws_id=<>" in item["preview"]
+    assert item["child_ws_id"] == "<>"
+
+
+def test_tasks_preview_shows_bracketed_title_verbatim(coord_session):
+    """The reported bug at the approval surface: a title of
+    "cut p99 latency to <200ms" previewed as "...to 200ms" — the
+    operator approved the opposite constraint."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "cut p99 latency to <200ms"}))
+    assert "error" not in item
+    assert "cut p99 latency to <200ms" in item["header"]
+
+
+def test_tasks_reorder_preview_sanitizes_ids(coord_session):
+    sess, _coord, _ui = coord_session
+    raw_ids = ["a" + chr(10) + "b", "c"]
+    item = sess._prepare_tool(_tc("tasks", {"action": "reorder", "task_ids": raw_ids}))
+    assert "error" not in item
+    assert chr(10) not in item["preview"]
+    assert item["task_ids"] == raw_ids
+
+
+def test_prepare_tasks_imports_honest_truncate_once():
+    """ONE deferred import above the action branches — a second copy per
+    branch is how the two drift (the old per-branch comment also claimed
+    a judge import cycle that does not exist at HEAD)."""
+    import inspect
+
+    from turnstone.core.session import ChatSession
+
+    src = inspect.getsource(ChatSession._prepare_tasks)
+    assert src.count("from turnstone.core.judge import honest_truncate") == 1
+
+
+def test_tasks_update_none_note_stays_unchanged(coord_session):
+    """The strip must preserve the None/"" distinction: None means
+    "unchanged", "" means "clear"."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("tasks", {"action": "update", "task_id": "tsk_1", "status": "done"})
+    )
+    assert "error" not in item
+    assert item["note"] is None
+    assert "note=" not in item["preview"]

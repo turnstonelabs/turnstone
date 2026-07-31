@@ -59,6 +59,7 @@ from turnstone.core.auth import (
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
 from turnstone.core.mcp_crypto import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
+from turnstone.core.metacognition import field_str, sanitize_display
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
@@ -155,24 +156,17 @@ def _parse_int(
 # Proxy helpers
 # ---------------------------------------------------------------------------
 
-# Inline JS injected into proxied server-UI pages.  Two responsibilities,
-# kept in one IIFE so the original window.fetch closure variable is
-# available to the picker (which has to bypass the prefix shim):
+# Inline JS injected into proxied server-UI pages.  Two responsibilities:
 #
-#   1. Prefix shim \u2014 rewrites root-relative fetch() and EventSource()
+#   1. Prefix shim — rewrites root-relative fetch() and EventSource()
 #      URLs to /node/{id}/... so the proxied page's API calls land
 #      at the console (which forwards them to the right server node).
 #
-#   2. Node picker \u2014 on DOMContentLoaded, prepends a node-id pill into
-#      the server UI's #ui-header (.appbar).  Click \u2192 dropdown with
-#      \u2190 Console + the other healthy nodes.  Replaces the earlier
-#      32px back-to-console banner that used to live above the appbar.
-#      Lazy-fetches /api/cluster/nodes the first time the menu opens
-#      (cheap when the user never clicks; fresh when they do).
+#   2. Back to console — repoints the proxied page's rail brand at "/",
+#      so the console stays reachable from inside a node view.
 _JS_PROXY_SHIM = """\
 (function(){
   var _pfx = "PREFIX_PLACEHOLDER";
-  var _nodeId = "NODE_ID_PLACEHOLDER";
   var _oF = window.fetch;
   window.fetch = function(u, o){
     if (typeof u === "string" && u.startsWith("/")) u = _pfx + u;
@@ -188,402 +182,37 @@ _JS_PROXY_SHIM = """\
   window.EventSource.OPEN = _oE.OPEN;
   window.EventSource.CLOSED = _oE.CLOSED;
 
-  function el(tag, cls, text){
-    var n = document.createElement(tag);
-    if (cls) n.className = cls;
-    if (text != null) n.textContent = text;
-    return n;
-  }
-
-  function buildPicker(){
-    var header = document.getElementById("ui-header");
-    if (!header) return;
-
-    // Trigger pill \u2014 prepended into #ui-header (the server UI's appbar).
-    var pill = document.createElement("button");
-    pill.type = "button";
-    pill.className = "console-node-pill";
-    pill.setAttribute("aria-haspopup", "menu");
-    pill.setAttribute("aria-expanded", "false");
-    pill.setAttribute("aria-label", "Switch node, currently " + _nodeId);
-    // title gives sighted users the full id when it ellipsizes
-    // \u2014 see the max-width + text-overflow rules in _CONSOLE_PROXY_STYLE.
-    pill.setAttribute("title", _nodeId);
-    pill.appendChild(el("span", "console-node-pill-dot"));
-    pill.appendChild(el("span", "console-node-pill-id", _nodeId));
-    pill.appendChild(el("span", "console-node-pill-caret", "\u25be"));
-    header.insertBefore(pill, header.firstChild);
-
-    // Menu state lives at the picker level, not on the menu DOM, so a
-    // close-then-reopen reuses the cached node list (no stale spinner).
-    var menu = null;
-    var loaded = false;
-    var loading = false;
-    var lastNodes = [];
-    var closeHandler = null;
-
-    function closeMenu(){
-      if (menu){ menu.remove(); menu = null; }
-      if (closeHandler){
-        document.removeEventListener("mousedown", closeHandler);
-        document.removeEventListener("keydown", closeHandler);
-        closeHandler = null;
-      }
-      pill.setAttribute("aria-expanded", "false");
-    }
-
-    function openMenu(){
-      if (menu) return;
-      // Reuse the workstream-tab dropdown shell for visual + behavioural
-      // consistency with the chevron menu next to it in the same toolbar.
-      menu = document.createElement("div");
-      menu.className = "ws-tab-dropdown console-node-menu";
-      menu.setAttribute("role", "menu");
-      menu.setAttribute("aria-label", "Switch node");
-      menu.addEventListener("contextmenu", function(e){ e.preventDefault(); });
-      document.body.appendChild(menu);
-      pill.setAttribute("aria-expanded", "true");
-
-      if (loaded){
-        renderMenu(lastNodes);
-      } else if (loading){
-        menu.appendChild(skeleton());
-        positionMenu();
-      } else {
-        menu.appendChild(skeleton());
-        positionMenu();
-        loadNodes();
-      }
-
-      // Keyboard handler kept in lockstep with the workstream-tab dropdown
-      // in turnstone/ui/static/app.js (search for _tabDropdownCloseHandler).
-      // If you change the keys here, change them there.  The only intentional
-      // divergence is the :not([aria-disabled='true']) filter — the picker
-      // skips disabled rows (current + unreachable) during arrow-key cycling.
-      closeHandler = function(e){
-        if (e.type === "keydown"){
-          if (e.key === "Escape"){
-            e.preventDefault();
-            closeMenu();
-            pill.focus();
-          } else if (e.key === "Tab"){
-            // Per ARIA APG menu pattern: Tab closes the menu AND moves
-            // focus to the next focusable element.  Don't preventDefault —
-            // let the browser do its native Tab traversal.
-            closeMenu();
-          } else if (e.key === "ArrowDown" || e.key === "ArrowUp"
-                  || e.key === "Home" || e.key === "End"){
-            e.preventDefault();
-            if (!menu) return;
-            var btns = Array.from(
-              menu.querySelectorAll(".ws-tab-dropdown-item:not([aria-disabled='true'])")
-            );
-            if (!btns.length) return;
-            var idx = btns.indexOf(document.activeElement);
-            if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
-            // idx <= 0 covers both "first item" (wrap to last) and "no
-            // current focus" (idx === -1, which would otherwise yield N-2
-            // via the modulo).  Same shape worth backporting to app.js.
-            else if (e.key === "ArrowUp") btns[idx <= 0 ? btns.length - 1 : idx - 1].focus();
-            else if (e.key === "Home") btns[0].focus();
-            else if (e.key === "End") btns[btns.length - 1].focus();
-          }
-        } else if (e.type === "mousedown"
-                && menu && !menu.contains(e.target)
-                && e.target !== pill && !pill.contains(e.target)){
-          closeMenu();
-        }
-      };
-
-      // Defer listener wiring + initial focus so the click that opened
-      // the menu doesn't immediately trigger the mousedown-close path.
-      var activeMenu = menu;
-      var activeHandler = closeHandler;
-      setTimeout(function(){
-        if (menu !== activeMenu || !activeHandler) return;
-        document.addEventListener("mousedown", activeHandler);
-        document.addEventListener("keydown", activeHandler);
-        var first = activeMenu.querySelector(
-          ".ws-tab-dropdown-item:not([aria-disabled='true'])"
-        );
-        if (first) first.focus();
-      }, 0);
-    }
-
-    function positionMenu(){
-      if (!menu) return;
-      var pr = pill.getBoundingClientRect();
-      var mr = menu.getBoundingClientRect();
-      var mx = pr.left;
-      var my = pr.bottom + 4;
-      if (my + mr.height > window.innerHeight) my = pr.top - mr.height - 4;
-      if (mx + mr.width > window.innerWidth) mx = window.innerWidth - mr.width - 4;
-      if (mx < 4) mx = 4;
-      menu.style.left = mx + "px";
-      menu.style.top = my + "px";
-    }
-
-    function skeleton(){
-      var box = el("div", "console-node-skeleton");
-      box.setAttribute("role", "status");
-      box.setAttribute("aria-label", "Loading nodes");
-      // Three rows: roughly the typical small-cluster size.  CSS fades
-      // opacity per :nth-child (1.0 / 0.7 / 0.5) — adding a fourth would
-      // need a fourth opacity stop to avoid visual repetition.
-      for (var i = 0; i < 3; i++) box.appendChild(el("div", "console-node-skeleton-row"));
-      return box;
-    }
-
-    function loadNodes(){
-      loading = true;
-      // Saved original fetch \u2014 the prefix shim above would otherwise
-      // rewrite this to /node/{id}/v1/api/cluster/nodes, which the node
-      // doesn't serve (it's a console-only endpoint mounted at /v1).
-      // limit=1000 requests the collector's hard maximum in one round-trip;
-      // beyond 1000 nodes the picker UI is no longer the right shape (it'd
-      // need a search box) so we don't try to paginate.
-      _oF.call(window, "/v1/api/cluster/nodes?limit=1000", { credentials: "same-origin" })
-        .then(function(r){ if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-        .then(function(data){
-          loaded = true; loading = false;
-          lastNodes = Array.isArray(data && data.nodes) ? data.nodes : [];
-          if (menu) renderMenu(lastNodes);
-        })
-        .catch(function(){
-          loading = false;
-          if (menu) renderError();
-        });
-    }
-
-    function renderError(){
-      var status = el("div", "console-node-menu-status", "Failed to load nodes");
-      var retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "ws-tab-dropdown-item console-node-menu-item";
-      retry.setAttribute("role", "menuitem");
-      retry.setAttribute("tabindex", "-1");
-      retry.appendChild(el("span", "ws-tab-dropdown-label", "Retry"));
-      retry.addEventListener("click", function(e){
-        e.stopPropagation();
-        loaded = false;
-        if (menu){ menu.replaceChildren(skeleton()); positionMenu(); }
-        loadNodes();
-      });
-      menu.replaceChildren(status, retry);
-      positionMenu();
-      setTimeout(function(){ retry.focus(); }, 0);
-    }
-
-    function buildBackItem(){
-      var back = document.createElement("a");
-      back.href = "/";
-      back.className = "ws-tab-dropdown-item console-node-menu-item console-node-menu-back";
-      back.setAttribute("role", "menuitem");
-      back.setAttribute("tabindex", "-1");
-      back.setAttribute("aria-label", "Back to console");
-      back.appendChild(el("span", "console-node-menu-arrow", "\u2190"));
-      back.appendChild(el("span", "ws-tab-dropdown-label", "Console"));
-      return back;
-    }
-
-    function buildNodeItem(n){
-      var nid = n.node_id || "";
-      if (!nid) return null;
-      var isCurrent = nid === _nodeId;
-      var reachable = n.reachable !== false;
-      var hStatus = (n.health && n.health.status) || "";
-      var status = !reachable ? "unreachable"
-                  : (hStatus && hStatus !== "ok" ? "degraded" : "healthy");
-      var dotMod = status === "healthy" ? "" : status;
-      var wsTotal = n.ws_total != null ? n.ws_total : 0;
-      // Current + unreachable rows are non-interactive: rendered as <div>
-      // with aria-disabled so the keyboard-nav filter skips them and
-      // mouse clicks land on dead text.  A clickable <a> for an
-      // unreachable node would route the user to a 502 page.
-      var nonInteractive = isCurrent || !reachable;
-
-      var item;
-      if (nonInteractive){
-        item = document.createElement("div");
-      } else {
-        item = document.createElement("a");
-        item.href = "/node/" + encodeURIComponent(nid) + "/";
-      }
-      item.className = "ws-tab-dropdown-item console-node-menu-item"
-                      + (isCurrent ? " is-current" : "")
-                      + (!reachable && !isCurrent ? " is-unreachable" : "");
-      item.setAttribute("role", "menuitem");
-      item.setAttribute("tabindex", "-1");
-      if (isCurrent) item.setAttribute("aria-current", "true");
-      if (nonInteractive) item.setAttribute("aria-disabled", "true");
-      item.setAttribute(
-        "aria-label",
-        nid + ", " + wsTotal + " workstream" + (wsTotal === 1 ? "" : "s")
-            + ", " + status + (isCurrent ? ", current node" : "")
-      );
-
-      var dot = el("span",
-        "console-node-menu-item-dot"
-        + (dotMod ? " console-node-menu-item-dot--" + dotMod : ""));
-      dot.setAttribute("aria-hidden", "true");
-      item.appendChild(dot);
-
-      item.appendChild(el("span", "ws-tab-dropdown-label console-node-menu-item-id", nid));
-
-      // Meta carries ws-count + status text \u2014 the text suffix doubles as
-      // a colorblind-safe encoding of the dot color.  aria-hidden because
-      // the menuitem aria-label already says it.
-      var metaText = wsTotal + " ws" + (status !== "healthy" ? " \u00b7 " + status : "");
-      var meta = el("span", "ws-tab-dropdown-key", metaText);
-      meta.setAttribute("aria-hidden", "true");
-      item.appendChild(meta);
-
-      if (isCurrent){
-        var check = el("span", "console-node-menu-item-check", "\u2713");
-        check.setAttribute("aria-hidden", "true");
-        item.appendChild(check);
-      }
-      return item;
-    }
-
-    function renderMenu(nodes){
-      var children = [buildBackItem()];
-
-      var nodeItems = [];
-      nodes.forEach(function(n){
-        var it = buildNodeItem(n);
-        if (it) nodeItems.push(it);
-      });
-
-      if (nodeItems.length){
-        var sep = el("div", "ws-tab-dropdown-sep");
-        sep.setAttribute("role", "separator");
-        children.push(sep);
-        children = children.concat(nodeItems);
-      }
-
-      menu.replaceChildren(...children);
-      positionMenu();
-
-      // First-open path: openMenu()'s deferred focus hook ran before the
-      // async fetch resolved, so it found only the skeleton and left
-      // focus on the pill.  If focus is still on the pill (i.e. the user
-      // didn't navigate away while the skeleton was up), grab it now.
-      if (document.activeElement === pill){
-        var first = menu.querySelector(
-          ".ws-tab-dropdown-item:not([aria-disabled='true'])"
-        );
-        if (first) first.focus();
-      }
-    }
-
-    pill.addEventListener("click", function(e){
+  // Repoint the rail brand at the console.  Only proxied pages get this shim,
+  // so a standalone server keeps shell.js's showHome().  The node's own
+  // dashboard stays reachable as the non-closable first tab.
+  function wireBrandHome(){
+    var brand = document.querySelector(".rail-brand .brand-home");
+    if (!brand) return;
+    brand.setAttribute("aria-label", "Back to console");
+    brand.setAttribute("title", "Back to console");
+    var sub = brand.querySelector(".brand-sub");
+    if (sub) sub.textContent = "← console";
+    // Capture at the document so this runs during the capture walk, before
+    // any listener on the button itself; stopPropagation() then keeps
+    // shell.js's showHome() bubble listener from ever being reached.
+    document.addEventListener("click", function(e){
+      if (!brand.contains(e.target)) return;
+      e.preventDefault();
       e.stopPropagation();
-      if (menu) closeMenu(); else openMenu();
-    });
+      window.location.href = "/";
+    }, true);
   }
 
+  // shell.js builds the rail synchronously in mountShell (before its first
+  // await), and deferred modules run before DOMContentLoaded — so
+  // .brand-home exists by the time this fires.
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", buildPicker);
+    document.addEventListener("DOMContentLoaded", wireBrandHome);
   } else {
-    buildPicker();
+    wireBrandHome();
   }
 })();
 """
-
-# Inline <style> injected into proxied server-UI pages.  The dropdown
-# panel itself reuses .ws-tab-dropdown* (defined in ui/static/style.css,
-# which the proxied page already loads) for animation, shadow, theme
-# override, and item layout.  This sheet adds:
-#   - the trigger pill (no analogue exists in the server UI),
-#   - the inline health-dot in menu items (mirrors --green / --accent /
-#     --red from the cluster-overview node table \u2014 see
-#     console/static/style.css:535-549),
-#   - the "you are here" tint + cursor:default for the current node row,
-#   - a 3-row pulse skeleton for the loading state.
-_CONSOLE_PROXY_STYLE = (
-    "<style>"
-    # --- Trigger pill \u2014 sits at the start of #ui-header (.appbar).
-    # Height 24px passes WCAG 2.5.8 (24px min target) and harmonises
-    # with .btn (28px) and .appbar-back (~20px) without looking stunted.
-    # max-width caps the pill against pathologically long node ids
-    # (validated up to 256 chars upstream); the id span ellipsizes
-    # inside.  min-width:0 lets it shrink under appbar pressure.
-    ".console-node-pill{display:inline-flex;align-items:center;gap:6px;"
-    "height:24px;padding:0 10px;max-width:240px;min-width:0;"
-    "font-family:var(--font-mono);font-size:12px;color:var(--fg-dim);"
-    "background:transparent;border:1px solid var(--border-strong);"
-    "border-radius:var(--radius-sm);cursor:pointer;line-height:1;"
-    "transition:background .12s,color .12s}"
-    ".console-node-pill:hover{background:var(--bg-highlight);color:var(--fg)}"
-    '.console-node-pill[aria-expanded="true"]{background:var(--bg-highlight);'
-    "color:var(--fg);border-color:var(--accent-dim)}"
-    ".console-node-pill:focus-visible{outline:2px solid var(--accent);"
-    "outline-offset:2px}"
-    ".console-node-pill-dot{width:6px;height:6px;border-radius:50%;"
-    "background:var(--green);box-shadow:0 0 4px var(--green-glow);"
-    "flex-shrink:0}"
-    ".console-node-pill-id{font-weight:500;overflow:hidden;"
-    "text-overflow:ellipsis;white-space:nowrap;min-width:0}"
-    ".console-node-pill-caret{font-size:10px;color:var(--fg-dim);opacity:.7;"
-    "display:inline-block;transition:transform .12s}"
-    '.console-node-pill[aria-expanded="true"] .console-node-pill-caret'
-    "{transform:rotate(180deg)}"
-    # --- Menu shell uses .ws-tab-dropdown directly; no CSS needed here.
-    # Constrain the picker's width so node ids + meta have room.
-    ".console-node-menu{min-width:240px;max-width:360px}"
-    # --- Menu items reuse .ws-tab-dropdown-item \u2014 we only override
-    # font (mono, for hostname-like ids) and add the dot column.
-    ".console-node-menu-item{font-family:var(--font-mono);font-size:12px;"
-    "padding:6px 12px;gap:8px;color:var(--fg-dim);text-decoration:none}"
-    # Current row: keep the accent-tint visible.  The shared
-    # .ws-tab-dropdown-item[aria-disabled="true"] rule applies opacity:.55
-    # which would otherwise wash out the "you are here" tint \u2014 restore
-    # full opacity here.  Same restore for the unreachable row's red dot
-    # so its color signal stays legible against the dim row background.
-    ".console-node-menu-item.is-current{background:var(--accent-dim);"
-    "color:var(--fg);cursor:default;opacity:1}"
-    ".console-node-menu-item.is-current:hover{background:var(--accent-dim);"
-    "color:var(--fg)}"
-    # Unreachable row: dim the text but leave the dot at full saturation
-    # so the red signal reads against the dim row.  cursor:not-allowed
-    # comes from the shared aria-disabled rule.
-    ".console-node-menu-item.is-unreachable{color:var(--fg-dim)}"
-    ".console-node-menu-item.is-unreachable .console-node-menu-item-dot{opacity:1}"
-    ".console-node-menu-back{color:var(--accent)}"
-    ".console-node-menu-back:hover{color:var(--accent)}"
-    ".console-node-menu-arrow{font-family:var(--font-mono);font-size:13px}"
-    # Health dots in menu items \u2014 match cluster-overview canonical colors:
-    #   reachable + ok      \u2192 --green  (style.css:539)
-    #   reachable + !ok     \u2192 --accent (style.css:548  \u2014 was --yellow)
-    #   unreachable         \u2192 --red    (style.css:544)
-    ".console-node-menu-item-dot{width:6px;height:6px;border-radius:50%;"
-    "flex-shrink:0;background:var(--green);box-shadow:0 0 4px var(--green-glow)}"
-    ".console-node-menu-item-dot--unreachable{background:var(--red);"
-    "box-shadow:0 0 4px var(--red-glow)}"
-    ".console-node-menu-item-dot--degraded{background:var(--accent);"
-    "box-shadow:0 0 4px var(--accent-glow-strong)}"
-    ".console-node-menu-item-id{flex:1}"
-    ".console-node-menu-item-check{color:var(--accent);font-size:11px}"
-    # --- Loading state: 3-row pulsing skeleton.  Reuses --border-strong
-    # for the row tint and a dedicated keyframe so we can guard it under
-    # prefers-reduced-motion in step.
-    ".console-node-skeleton{padding:6px 0}"
-    ".console-node-skeleton-row{height:14px;margin:6px 12px;"
-    "background:var(--border-strong);border-radius:var(--radius-sm);"
-    "animation:console-node-skel-pulse 1.4s ease-in-out infinite}"
-    ".console-node-skeleton-row:nth-child(2){opacity:.7;animation-delay:.15s}"
-    ".console-node-skeleton-row:nth-child(3){opacity:.5;animation-delay:.3s}"
-    "@keyframes console-node-skel-pulse{"
-    "0%,100%{opacity:.4}50%{opacity:.8}}"
-    "@media (prefers-reduced-motion:reduce){"
-    ".console-node-skeleton-row{animation:none}}"
-    # --- Status text fallback (only used by the error path now).
-    ".console-node-menu-status{padding:8px 12px;font-family:var(--font-mono);"
-    "font-size:11px;color:var(--fg-dim);text-align:center}"
-    "</style>"
-)
-
 
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
@@ -3043,16 +2672,12 @@ async def proxy_index(request: Request) -> Response:
         page = page.replace('src="/static/', f'src="{prefix}/static/')
         page = page.replace('href="/shared/', f'href="{prefix}/shared/')
         page = page.replace('src="/shared/', f'src="{prefix}/shared/')
-        # Inject the proxy shim (prefix rewriting + node-picker) after <body>.
-        # The picker self-attaches to #ui-header on DOMContentLoaded; the
-        # banner that used to live above the appbar is gone.  node_id is
-        # validated against _VALID_NODE_ID upstream, so json.dumps is the
-        # only escaping the JS literal needs.
-        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix)).replace(
-            '"NODE_ID_PLACEHOLDER"', json.dumps(node_id)
-        )
-        shim = "<script>" + shim_js + "</script>"
-        page = page.replace("<body>", "<body>" + _CONSOLE_PROXY_STYLE + shim, 1)
+        # Inject the proxy shim (prefix rewriting + back-to-console) after
+        # <body>.  prefix is built from a node_id already validated against
+        # _VALID_NODE_ID, so json.dumps is the only escaping the JS literal
+        # needs.
+        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
+        page = page.replace("<body>", "<body><script>" + shim_js + "</script>", 1)
         html_resp = HTMLResponse(page)
         html_resp.headers["Cache-Control"] = "no-cache"
         return html_resp
@@ -4753,7 +4378,81 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
         return err404
 
     envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
+    envelope = _sanitize_task_envelope_for_display(envelope)
     return JSONResponse(envelope)
+
+
+def _sanitize_task_envelope_for_display(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Sanitise the operator-facing copy of a task envelope.
+
+    ``title`` and ``note`` are model-authored free text and this response
+    feeds the operator's tasks pane, so a bidi override or zero-width run
+    could make the pane display an ask in an order different from the one
+    stored — on a ``needs_user`` row, the one the operator acts on.
+
+    Sanitising happens at each operator-facing render (here, the nudge
+    card's producer, the approval preview) rather than at the write:
+    storing the sanitised form would rewrite the model's planning text
+    under it, which is the mutation the reject-don't-truncate rule
+    forbids.  Storage stays verbatim, so the model reads back what it
+    sent through ``tasks(action='list')``.
+
+    ``sanitize_display`` — not ``sanitize_name`` — is the sanitiser on
+    this path, so what it removes is exactly the invisible class:
+    control chars (including newlines, which would ragged the pane's
+    rows), bidi overrides, zero-width runs and tag chars.  Angle
+    brackets are KEPT here, because this response IS the operator's view
+    of storage and deleting them turned a stored "cut p99 latency to
+    <200ms" into "...to 200ms" — the constraint inverted on the pane
+    while ``tasks(action='list')`` showed the model the original.  The
+    model-facing nudge body keeps the bracket-deleting sanitiser; see
+    ``metacognition.sanitize_display``.
+
+    Ragged-row coercion goes through ``metacognition.field_str`` — the
+    same single coercion point the nudge card's producer uses — so the
+    two operator-facing surfaces cannot disagree on a ragged row (the
+    previous ``str(x or "")`` mapped ``0``/``False`` to ``""`` while the
+    card rendered ``"0"``).  ``status`` is coerced too, which keeps a
+    falsy-but-real value (``0``/``False``) out of the FE's
+    ``task.status || "pending"`` fallback — but ``field_str(None)`` is
+    the falsy ``""``, so a null/absent status still hits that fallback:
+    the row renders a ``pending`` chip on the pane while the idle-tasks
+    nudge (whose ``_open_tasks`` coerces the same way and drops the
+    row) is blind to it.  Accepted ragged-row residual, same
+    hand-edited-envelope class as ``created``/``updated`` below;
+    server-side normalisation is deferred.  ``id``/``child_ws_id`` are
+    coerced for contract compliance (``CoordinatorTaskInfo`` publishes
+    them as required strings while this handler returns unvalidated
+    JSON).
+    ``child_ws_id`` is additionally SANITISED where ``id`` is not: the
+    id is server-minted (``tsk_`` + hex), while ``child_ws_id`` is
+    whatever the model passed, so it carries the same steering risk as
+    ``title``/``note`` and renders on the same pane.
+    ``created``/``updated`` stay uncoerced — accepted residual under the
+    same contract caveat.
+
+    Rows that are not dicts pass through untouched — the envelope is a
+    JSON blob and ``load_task_envelope`` shape-checks only its top level.
+    """
+    rows = envelope.get("tasks")
+    if not isinstance(rows, list):
+        return envelope
+    clean: list[Any] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            clean.append(row)
+            continue
+        row = {
+            **row,
+            "id": field_str(row.get("id")),
+            "title": sanitize_display(field_str(row.get("title"))),
+            "status": field_str(row.get("status")),
+            "child_ws_id": sanitize_display(field_str(row.get("child_ws_id"))),
+        }
+        if "note" in row:
+            row["note"] = sanitize_display(field_str(row.get("note")))
+        clean.append(row)
+    return {**envelope, "tasks": clean}
 
 
 # ---------------------------------------------------------------------------
@@ -5160,8 +4859,10 @@ def _bootstrap_coord_subsystem(
     # ``app.state._idle_nudge_watchers``.
     try:
         coord_state_writer.start()
-        # Coord-side observer: when a coord goes IDLE with active
-        # children still running, enqueues an idle_children nudge.
+        # Coord-side observer: enqueues idle_children / idle_tasks
+        # nudges when a coord goes IDLE with unfinished work — children
+        # still running, open tasks still held, or both (the two fire
+        # independently and may co-deliver).
         # MUST register BEFORE the IdleNudgeWatcher so subscriber-fire
         # order on the same IDLE event has the observer enqueueing
         # first, then the watcher peeking.
@@ -14573,6 +14274,13 @@ def create_app(
         events_replay=_coord_events_replay,
         create_supports_attachments=True,
         create_supports_user_id_override=False,
+        # Coordinator creates honour ``server.require_project`` exactly like
+        # interactive creates — the operator's own token gets no exemption.
+        # Distinct seam: the sessions a coordinator SPAWNS stay exempt via
+        # the ``token_source == "coordinator"`` branch inside
+        # ``require_project_denies_create``; that covers child spawns on
+        # nodes, not creating the coordinator itself.
+        create_gate_require_project=True,
         create_validate_request=_coord_create_validate_request,
         create_build_kwargs=_coord_create_build_kwargs,
         create_post_install=_coord_create_post_install,

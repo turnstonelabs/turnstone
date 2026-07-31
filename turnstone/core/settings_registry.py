@@ -362,18 +362,18 @@ def _build_registry() -> dict[str, SettingDef]:
             "server.require_project",
             "bool",
             False,
-            "Require new interactive chats to be filed under a project",
+            "Require new chats and coordinators to be filed under a project",
             "server",
-            help="When on, starting a new interactive chat is refused unless it is filed "
-            "under a project. This is off by default and changes nothing until you turn it "
-            "on. A person can start a chat only once they belong to at least one project: "
-            "there is no automatic or personal project, so before turning this on in a "
-            "strict deployment, give each user membership in a project or mark a project "
-            "public, or they will not be able to start chats at all. Forking or resuming a "
-            "chat keeps the source chat's project; forking a chat that has no project is "
-            "refused just like starting a fresh chat without one. Automation such as "
-            "channel and scheduler activity, and coordinator-spawned sessions, are not "
-            "affected.",
+            help="When on, starting a new chat or a new coordinator is refused unless it "
+            "is filed under a project. This is off by default and changes nothing until "
+            "you turn it on. A person can start a chat only once they belong to at least "
+            "one project: there is no automatic or personal project, so before turning "
+            "this on in a strict deployment, give each user membership in a project or "
+            "mark a project public, or they will not be able to start chats at all. "
+            "Forking or resuming a chat keeps the source chat's project; forking a chat "
+            "that has no project is refused just like starting a fresh chat without one. "
+            "Automation such as channel and scheduler activity, and the sessions a "
+            "coordinator spawns to do its work, are not affected.",
         ),
         # -- cluster --------------------------------------------------------
         SettingDef(
@@ -782,9 +782,12 @@ def _build_registry() -> dict[str, SettingDef]:
             "Seconds between metacognitive nudges",
             "memory",
             min_value=0,
-            help="Metacognitive nudges are gentle reminders to the AI to save useful information "
-            "from the conversation (e.g. user preferences, project decisions). This controls "
-            "the minimum time between nudges to avoid being repetitive.",
+            help="Minimum seconds between nudges of the same type. Applies to the "
+            "memory-save reminders (gentle prompts to record useful information such as "
+            "user preferences or project decisions) and to the coordinator's open-task "
+            "reminder. Does not apply to the coordinator's 'children still running' "
+            "liveness wake, which has no cooldown so an idle coordinator is never "
+            "silently stranded. Set to 0 to disable the spacing entirely.",
         ),
         SettingDef(
             "memory.nudges",
@@ -794,7 +797,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "memory",
             help="When enabled, the system periodically reminds the AI to save important "
             "information from conversations into long-term memory. This helps the AI "
-            "remember context across separate conversations.",
+            "remember context across separate conversations. Also gates the coordinator's "
+            "open-task reminder. Does not affect coordinator liveness wakes (the 'children "
+            "still running' nudge), which fire regardless so an idle coordinator is never "
+            "silently stranded.",
         ),
         # -- tls ----------------------------------------------------------------
         SettingDef(

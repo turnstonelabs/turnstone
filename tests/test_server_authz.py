@@ -1807,6 +1807,41 @@ class TestCompactCommandDispatch:
         assert not zombie.is_alive()
         wait_until(lambda: self._drain_idle(ws), timeout=8.0)
 
+    def test_force_cancel_runs_abandon_machinery_before_idle_emission(self, app_client):
+        """The force branch runs the session's abandon machinery BEFORE
+        clearing ownership and emitting idle.  Subscribers on the IDLE
+        fan-out (the coordinator idle observer's operator-Stop gate,
+        the wake watcher's queue read) use the latch and the demote to
+        tell an operator-forced IDLE from a turn reaching idle under
+        its own power — and the thread force-cancel abandons is stuck
+        by definition, so its own exception handler cannot be relied
+        on to have run first."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        zombie = ws.worker_thread
+        calls: list[str] = []
+        ws.session._drain_pending_advisories = lambda: calls.append("abandon")
+        ws.ui.on_state_change = lambda s: calls.append(f"state:{s}")
+        resp = client.post(
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={"force": True},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        assert calls == ["abandon", "state:idle"]
+        gate.set()
+        zombie.join(timeout=5)
+        assert not zombie.is_alive()
+
     def test_ws_close_mid_window_drops_pending_and_drain_exits(self, app_client):
         """A workstream closed with deferred sends outstanding drops them
         (documented at-most-once contract) and the drain task retires
@@ -1987,6 +2022,20 @@ class TestCompactCommandDispatch:
         # re-attempted) and nothing was dispatched behind the user's back.
         wait_until(lambda: calls["n"] >= 2, timeout=8.0)
         assert ws.session.sends == []
+        # ``calls["n"]`` increments as the FIRST statement of the attempt, so
+        # the counter crosses 2 while the drain still holds the entry CLAIMED
+        # (popped, dispatch in flight).  Retract only scans ``_pending_sends``
+        # and correctly answers not_found for a claimed entry, so firing the
+        # DELETE off the counter alone races the crash path's re-insert and
+        # loses whenever the re-insert is slower than the request -- which it
+        # is under pytest, where the log handlers make the intervening
+        # ``log.exception`` roughly as expensive as wait_until's poll interval.
+        # Wait for the state this test is actually about: the entry BACK on
+        # the list, mid-crash-loop, retractable.
+        wait_until(
+            lambda: any(e.msg_id == msg_id for e in list(ws._pending_sends)),
+            timeout=8.0,
+        )
         d = client.request(
             "DELETE",
             f"/v1/api/workstreams/{ws_id}/send",

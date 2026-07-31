@@ -436,13 +436,34 @@
     font-size: 13px;
   }
 }
+/* Same wrap rule as `.task-row .meta` below: a title is model-authored
+   free text up to _TASK_TITLE_MAX, and `.task-row` is a column flexbox
+   whose items default to `min-width: auto`, so an unbroken 200-char
+   token forces the fixed-width sidebar without this. */
 .task-row .title {
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-weight: 500;
   color: var(--ink);
 }
+/* Shared by the `→ child` link row and the note row.  `word-break` is
+   load-bearing for the note: it carries model-authored free text up to
+   _TASK_NOTE_MAX, and a `needs_user` ask is exactly where an
+   unbroken token lands (a URL, a path, a credential endpoint).  Without
+   it the token forces the row past the fixed sidebar width, because
+   flex items default to `min-width: auto`.  The same string already
+   wraps in the idle-tasks chat card (chat.css `.msg-idle-note`); the
+   two rules must agree on the WRAP — `word-break: break-word` on
+   both, pinned by test_task_note_wraps_in_both_surfaces — or the same
+   note overflows one surface and not the other.  They are not
+   otherwise identical: the card also sets `white-space: pre-wrap` (a
+   transcript record keeps the note's internal spacing), which this
+   compact row does not. */
 .task-row .meta {
   font-size: 11px;
   color: var(--ink-3);
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 /* Task-status text — the .pill primitive handles the chip; this only
    covers the mono status text inside the row header before the title. */
@@ -472,6 +493,32 @@
   color: var(--err);
   border-color: color-mix(in srgb, var(--err) 45%, var(--hair));
   background: var(--err-soft);
+}
+/* needs_user uses the --warn (gold / "attention") family rather than
+   --err: a task waiting on the operator is not a failure, it is a queue
+   the operator owns.  Distinct from --err-soft blocked, which is the
+   coordinator's own dependency wall.
+
+   The text is DARKENED with the same color-mix the approval
+   disclosure's `.rec-*` chips use (`code.rec-review`, the 12/38/70%
+   scheme above) rather than raw var(--warn).  --warn is the only accent
+   whose light-theme lightness is 0.58 rather than 0.5, so raw-on-soft
+   measures ~3.6:1 there — under the 4.5:1 AA floor that applies at this
+   chip's 10px/600/uppercase, and the worst of the four status chips on
+   the one status whose entire purpose is to be noticed.  The mix puts it
+   at ~5.0:1 light / ~6.3:1 dark, in family with its siblings.
+   (Ratios computed from the oklch tokens through oklab→sRGB, not a
+   browser measurement — the repo has no automated contrast check.)
+
+   KNOWN SIBLING, deliberately not swept: ui-base.css `.risk.med` pairs
+   the same raw --warn on --warn-soft at the same 10px/600/uppercase and
+   has the identical AA failure.  Out of scope here (it predates this
+   chip and belongs to the risk-badge surface); tracked separately rather
+   than widened into this change. */
+.task-row .status-needs_user {
+  color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--hair));
+  background: var(--warn-soft);
 }
 .sidebar-empty {
   padding: 8px 10px;

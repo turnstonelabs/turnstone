@@ -1506,3 +1506,39 @@ class TestPersonaDiscovery:
         item = session._prepare_spawn_workstream("c1", {"persona": "nope"})
         assert item.get("error")
         assert "Available for interactive: engineer (default), writer" in item["error"]
+
+
+class TestNudgeToolVisibility:
+    """``_nudges_enabled`` generalises from "the memory tool" to
+    ``NUDGE_REQUIRED_TOOL``, so the class split is pinned at the
+    ChatSession level and not only inside the observer."""
+
+    def test_idle_tasks_gated_on_the_tasks_tool(self, tmp_db, mock_openai_client) -> None:
+        # Every branch of the idle_tasks body is a tasks(...) call, so a
+        # persona hiding that tool must suppress it — the same rule the
+        # memory nudges follow, via one map instead of a hardcoded name.
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"read_file"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert not session._nudges_enabled("idle_tasks")
+
+    def test_idle_tasks_allowed_when_tasks_visible(self, tmp_db, mock_openai_client) -> None:
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"tasks"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert session._nudges_enabled("idle_tasks")
+
+    def test_idle_children_is_not_tool_gated(self, tmp_db, mock_openai_client) -> None:
+        # LIVENESS: the body names wait_for_workstream, but the wake
+        # itself is the point and the body has a non-tool branch beside
+        # it.  A persona hiding the tool must not strand the coordinator.
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"read_file"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert session._nudges_enabled("idle_children")

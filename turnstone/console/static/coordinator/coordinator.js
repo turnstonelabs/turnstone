@@ -56,6 +56,9 @@ import {
   DEGRADED_COOLDOWN_BASE_MS,
   DEGRADED_COOLDOWN_MAX_MS,
   DEGRADED_COOLDOWN_RESET_MS,
+  TRUNCATED_RESYNC_JITTER_MS,
+  STALE_RETRY_JITTER_MS,
+  STALE_RETRY_BASE_MS,
   overflowWindowTripped,
   degradedCooldownStep,
 } from "/shared/sse_overflow.js";
@@ -641,6 +644,100 @@ function createCoordinatorPane(root, wsId, opts) {
   // also catches a turn stranded by close-on-hide (finished while hidden, its
   // stream_end evicted before the show-edge reconnect).
   let pendingTruncatedResync = false;
+  // Transcript-staleness latch (#894, the port of interactive.js's #890
+  // _historyStale).  Set at clear_ui arrival — from that moment the visible
+  // transcript is the PRE-rewind one and no longer matches the server's
+  // restructured conversation — and cleared in EXACTLY ONE place:
+  // refetchHistory's success-path render.  It gates the DOM-counting
+  // affordances (_rewindToMessage / _editAndResend / _startEdit, via
+  // ``busy || historyStale``) so a turn count computed off the stale DOM
+  // can't reach POST /rewind during the refetch window OR after a failed
+  // refetch.  LATCH, not a refetch-in-flight flag: a flag reopens on the
+  // failed exit, which is exactly the over-rewind window (the bug
+  // interactive.js hit in its round-3 review).  Heals: one bounded
+  // turn-free retry armed by the clear_ui handler, then the idle-edge
+  // backstop in the state_change consumer — both plain REST refetches
+  // (TRANSPORT-FREE; the ruling lives at the backstop).
+  let historyStale = false;
+  // Count of refetchHistory calls currently awaiting /history.  The
+  // staleness heals (retry + backstop) read it to YIELD to any in-flight
+  // fetch — clear_ui's own, a sibling heal's, or a resync's — instead of
+  // stomping it with a same-snapshot double render.  Coord's quiesce-free
+  // substitute for interactive.js's !_replayQueue yield guard.  A COUNT,
+  // not a boolean: overlapping fetches are reachable (another actor's
+  // rewind can emit clear_ui while a heal fetch is in flight), and a
+  // boolean would clear on the first finisher's exit with a fetch still
+  // live.  Only the await window needs bracketing — the render after
+  // ``if (!hist)`` is synchronous, so no timer or SSE handler can observe
+  // the counter mid-render.
+  let refetchesInFlight = 0;
+  // Monotonic refetchHistory dispatch stamp.  Each call captures
+  // ``++refetchSeq`` before its await; the render-time gate discards any
+  // payload whose stamp is no longer current, so overlapping fetches
+  // (reachable via another actor's clear_ui racing a heal) resolve
+  // last-DISPATCH-wins deterministically instead of last-RESPONSE-wins —
+  // an older snapshot landing late can neither double-render nor clear
+  // the staleness latch over a newer truth.
+  let refetchSeq = 0;
+  // EVERY in-flight /history AbortController — destroy() aborts them all
+  // so a slow fetch cannot pin the destroyed pane's closure for the
+  // bound's full 15s (the same dead-not-inert ruling destroy() applies
+  // to staleRetryTimer).  A Set, not a single slot (r9): overlapping
+  // dispatches settle in any order, and a newest-wins slot nulled by
+  // the newer dispatch's finally left the OLDER fetch unabortable.
+  const histCtrls = new Set();
+  // call_ids of tool calls whose results are still ARRIVING ON THE LIVE
+  // STREAM — the render-time gate's tool-phase liveness signal.  Fed
+  // ONLY by live SSE events (tool_pending / tool_info add, tool_result
+  // deletes) and drained at the settle edge ONLY (state_change
+  // idle/error — a leftover id there is a dead call whose result will
+  // never come).  Retirement policy (r7): an id leaves on its RESULT,
+  // at the SETTLE edge, or with pane death — transport death is NOT a
+  // retirement event, because the reconnect replay does not re-announce
+  // a live batch (verified: replay_ok yields only events past the
+  // cursor; the fresh/truncated replay yields no tool_pending/tool_info)
+  // — a stale id fails CLOSED (skip, latch survives, settle heals),
+  // while an empty set fails OPEN into the wipe.  NEVER
+  // touched by any render: that is the r6 lesson — refetchHistory's own
+  // replay path paints orphan batches (committed tool_calls with no
+  // persisted result) with the same .conv-batch--running class the live
+  // path uses, and nothing ever strips a dead orphan's class, so a
+  // DOM-derived liveness probe would let one orphan paint poison every
+  // seedless heal for the life of the page (rewind/edit permanently
+  // dead).  Reachability ruling (r7, superseding r6's): the persisted
+  // orphan is REAL — a hard crash (SIGKILL/OOM) leaves the committed
+  // tool_calls turn genuinely unresulted; only a GRACEFUL close
+  // synthesizes the "Cancelled by user" result (session.cancel()), and
+  // boot rehydration synthesizes nothing (both verified empirically).
+  // The G6 harness scenario hard-kills a node and proves the seedless
+  // rewind renders THROUGH the painted residue.  Liveness is read from
+  // the channel that creates the hazard — the stream — never from DOM
+  // the render path can forge.
+  const liveToolCalls = new Set();
+  // The cursor position a replay_truncated envelope was received AT — i.e.
+  // "a gap of lost events exists BELOW this cursor".  Keep-oldest: set only
+  // when null (repeated envelopes for the same unrepaired gap must not
+  // advance it), cleared by any successful full-history render
+  // (refetchHistory — the truncated resync and a clear_ui rebuild both
+  // repair the gap).  NOT cleared by teardown or turn boundaries, and —
+  // unlike interactive.js — never dropped for a ws switch: this pane is
+  // single-wsId for life (a ws-switch feature would have to reset it
+  // alongside lastEventId).  The connectSSE chokepoint is its
+  // cursor-presenting consumer: while set, every manual (re)connect
+  // presents THIS cursor (not the since-advanced live lastEventId), so the
+  // server re-answers replay_truncated and the resync re-arms no matter
+  // which teardown cancelled the pending jittered timer — the gap-repair
+  // guarantee survives any interleaving of hide/show, degraded cooldowns,
+  // CLOSED-state retries, and failed /history fetches.  Three more sites
+  // read it purely as a null-sentinel for "is an unrepaired gap on
+  // record": the replay_truncated case (dedup the sidebar refresh per
+  // gap), loadHistoryThenReconnect's heal-time sidebar refresh, and
+  // onopen's post-gap sidebar-refresh gate (stands down while a gap is on
+  // record — the gap machinery owns recovery).  Cleared — together with
+  // the deferred latch and any pending resync timer — only by
+  // refetchHistory's success-path supersession.  Mirrors interactive.js's
+  // _truncatedFromCursor.
+  let truncatedFromCursor = null;
   // Saved high-water mark for the manual-reconnect path.  The
   // EventSource constructor can't set custom headers, so when we
   // construct a fresh source we thread ``?last_event_id=N`` instead
@@ -657,13 +754,42 @@ function createCoordinatorPane(root, wsId, opts) {
   // class) vs client dispatch/render throws (wedge class).  The console line
   // at each increment carries the running count, so a field report shows which
   // class fired without a debugger attached.
-  const streamHealth = { overflows: 0, renderThrows: 0, malformedFrames: 0 };
-  // Rolling timestamps of stream_overflow closes feeding the degraded-catchup
-  // limiter (overflowWindowTripped); plus the cooldown-ladder state, keyed off
-  // the last-trip timestamp via degradedCooldownStep — never off overflowTimes
-  // (enterDegradedCatchup clears it each trip).  See enterDegradedCatchup.
+  // ``truncatedGaps`` counts replay-window misses (truncated envelopes acted
+  // on), NOT resyncs performed — a degraded-catchup trip records the gap but
+  // skips its resync.  Pairs with the node-side ws.events.replay_truncated
+  // log line for field forensics.
+  const streamHealth = {
+    overflows: 0,
+    renderThrows: 0,
+    malformedFrames: 0,
+    truncatedGaps: 0,
+  };
+  // Rolling timestamps of heavyweight-recovery churn — stream_overflow closes
+  // AND truncated resyncs (both via recordChurnAndMaybeTrip) — feeding the
+  // degraded-catchup limiter (overflowWindowTripped); plus the cooldown-ladder
+  // state, keyed off the last-trip timestamp via degradedCooldownStep — never
+  // off overflowTimes (enterDegradedCatchup clears it each trip).  See
+  // enterDegradedCatchup.
   const overflowTimes = [];
   let degradedTimer = null;
+  // Pending jittered truncated-resync (see scheduleTruncatedResync).
+  // Cancelled by closeStreamTransport alongside degradedTimer, so any path
+  // that tears the transport down (redial, close-on-hide, degraded entry,
+  // close-session, destroy) also discards a resync scheduled for the OLD
+  // stream — the next connect's own truncated envelope reschedules if the
+  // gap still exists (truncatedFromCursor re-presents it).
+  let truncatedResyncTimer = null;
+  // The ONE bounded clear_ui-failure retry (#894; mirrors interactive.js's
+  // _staleRetryTimer).  Armed only from the clear_ui handler's .then when
+  // the latch survived the refetch; never re-armed from its own firing
+  // (bounded by construction).  Cancelled by refetchHistory's success path
+  // and destroy() ONLY — deliberately NOT by closeStreamTransport beside
+  // the transport timers above: this is a REST-refetch timer, not a
+  // transport timer, and a transport-only redial (hide/show, degraded
+  // cooldown, reconnect backoff) must keep the pending heal intent alive.
+  // A firing after coordCloseSession no-ops via the visHandler fire-time
+  // guard.
+  let staleRetryTimer = null;
   let degradedCooldownMs = DEGRADED_COOLDOWN_BASE_MS;
   let lastDegradedAt = 0;
   // Close-on-hide / replay-on-show bookkeeping.  A hidden tab's throttled event
@@ -847,7 +973,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // generic history-replay branch already renders unknown roles via
     // appendText("system", …); this variant gives it the operator styling.
     // The `operator-context` marker is shared by every operator row (this
-    // bubble + the watch-result / guard-finding / idle-children cards) so the
+    // bubble + the watch-result / guard-finding / idle-children / idle-tasks cards) so the
     // retry-skip walk in _refreshRetryButton can skip them all uniformly.
     system: "system-context operator-context",
   };
@@ -927,49 +1053,251 @@ function createCoordinatorPane(root, wsId, opts) {
     return el;
   }
 
-  // Structured ``.msg.idle-children`` card for the coordinator-only
-  // ``idle_children`` operator-context system turn — lists the child
-  // workstreams still running while the coordinator went idle.  ``meta.children``
-  // is ``[{ws_id, name, state}]`` (names already ``sanitize_name``-cleaned at the
-  // producer); rendered via textContent so a hostile workstream name is inert.
-  function appendIdleChildren(meta) {
+  // Task statuses the pane knows how to render, mapped to the operator-facing
+  // chip text.  Mirrors ``_TASK_STATUS_IS_OPEN`` in coordinator_client.py —
+  // a cross-surface test pins the two key sets together, so a new status
+  // fails CI until this map knows it.  Doubles as the allowlist for the
+  // CSS class: the status string arrives from storage, and a hand-edited
+  // row (`status: "x y"`) would otherwise inject arbitrary classes via
+  // `className`.
+  const TASK_STATUS_LABELS = {
+    pending: "pending",
+    in_progress: "in progress",
+    done: "done",
+    blocked: "blocked",
+    needs_user: "needs you",
+  };
+
+  function taskStatusKnown(status) {
+    return Object.prototype.hasOwnProperty.call(TASK_STATUS_LABELS, status);
+  }
+
+  // Operator-facing text for a task status.  Both surfaces that show a
+  // status — the tasks sidebar chip and the idle-tasks conversation card
+  // — go through here, so one task can never read `in_progress` in one
+  // place and `in progress` in the other.  Unknown values pass through
+  // verbatim rather than being hidden.
+  function taskStatusLabel(status) {
+    return taskStatusKnown(status) ? TASK_STATUS_LABELS[status] : status;
+  }
+
+  // Shared DOM builder for the two idle cards.  The cards are the same
+  // class of notice ("you went idle with N outstanding") and share their
+  // grouped CSS rules; sharing the builder keeps the DOM shape in
+  // lockstep the same way — an accessibility attribute or scroll change
+  // lands on both or neither.  ``rows`` is
+  // ``[{name?, state?, note?, ident?}]``,
+  // all fields pre-sanitized at the producer and rendered via
+  // textContent so hostile values are inert.  Every field cell is
+  // conditional — a fresh idle-children row carries no name at all
+  // (card honesty: the model was told ids and states only), so an
+  // empty-name row must not leave a stray empty span between ident and
+  // state.  Both card kinds carry ``ident`` (the task id / the child's
+  // ws_id prefix), rendered as a leading column so a row with no name
+  // is still identifiable.  ``moreCount`` > 0 appends the overflow
+  // line so a capped list never reads as "that's all".
+  // The wrappers below keep their full className/data-ts-role literals
+  // — the test_coordinator_page pins grep for them.
+  function buildIdleCard(
+    className,
+    tsRole,
+    ariaLabel,
+    headerText,
+    rows,
+    moreCount,
+  ) {
     const el = document.createElement("div");
-    el.className = "msg idle-children operator-context";
+    el.className = className;
     el.setAttribute("role", "article");
-    el.setAttribute("data-ts-role", "idle_children");
-    el.setAttribute("aria-label", "idle children");
-    const children = Array.isArray(meta.children) ? meta.children : [];
+    el.setAttribute("data-ts-role", tsRole);
+    el.setAttribute("aria-label", ariaLabel);
     const header = document.createElement("div");
     header.className = "msg-idle-header";
-    header.textContent =
+    header.textContent = headerText;
+    el.appendChild(header);
+    const list = document.createElement("ul");
+    list.className = "msg-idle-list";
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || {};
+      const li = document.createElement("li");
+      li.className = "msg-idle-child";
+      if (r.ident) {
+        // Identifier column, carried by both cards for one reason: a name
+        // is not an identity. A task's title may legitimately be empty or
+        // unidentifiable (a bracket-only title survives the producer's
+        // display projection intact), and a fresh idle-children row
+        // carries no name at all, so without this column such rows would
+        // leave the operator nothing to match against.
+        const ident = document.createElement("span");
+        ident.className = "msg-idle-child-ident";
+        ident.textContent = String(r.ident);
+        li.appendChild(ident);
+      }
+      if (r.name) {
+        const name = document.createElement("span");
+        name.className = "msg-idle-child-name";
+        name.textContent = String(r.name);
+        li.appendChild(name);
+      }
+      if (r.state) {
+        const state = document.createElement("span");
+        state.className = "msg-idle-child-state";
+        state.textContent = String(r.state);
+        li.appendChild(state);
+      }
+      if (r.note) {
+        const note = document.createElement("div");
+        note.className = "msg-idle-note";
+        note.textContent = String(r.note);
+        li.appendChild(note);
+      }
+      list.appendChild(li);
+    }
+    el.appendChild(list);
+    if (moreCount > 0) {
+      const more = document.createElement("div");
+      more.className = "msg-idle-more";
+      more.textContent = "…and " + moreCount + " more";
+      el.appendChild(more);
+    }
+    messagesEl.appendChild(el);
+    _scheduleScroll();
+    return el;
+  }
+
+  // Structured ``.msg.idle-children`` card for the coordinator-only
+  // ``idle_children`` operator-context system turn — lists the child
+  // workstreams still running while the coordinator went idle.
+  //
+  // CARD HONESTY: this card is the transcript's record of the nudge — it
+  // renders what the model was TOLD, formatted for operator readability,
+  // never content the model did not receive.  Fresh ``meta.children`` is
+  // ``[{ws_id, state}]`` — the body delivered to the model is ids and
+  // states only (child names are model-authored and are no longer lowered
+  // into the system turn), so the card renders ident + state and NO name
+  // column for those rows.  Child names live on the children sidebar, the
+  // browsing surface.
+  //
+  // OLD persisted rows (pre-roster-change transcripts replayed from
+  // /history) still carry a ``name`` key, and rendering it is legitimate
+  // by the same rule: those nudges DID deliver the name to the model at
+  // the time, so showing it records what the model received.  The map
+  // below therefore renders ``name`` exactly when the row carries one and
+  // never invents one — no ``|| c.ws_id`` fallback, which would render a
+  // "name" cell fresh rows must not have.  Workstream states render RAW,
+  // unlike the tasks card's status labels: running/thinking/attention are
+  // already plain lowercase words, while task statuses carry machine
+  // underscores (``in_progress``) that need the label map.  One
+  // vocabulary per surface-kind, not one rule for both cards.
+  function appendIdleChildren(meta) {
+    const children = Array.isArray(meta.children) ? meta.children : [];
+    // The ws_id's first 8 chars ride as `ident` — display formatting
+    // over the same full id the model-facing body's bullet carries
+    // whole (the bullet is a handle for the resolver, which refuses
+    // prefixes; this column is a label for the operator's eye) — and
+    // `ident` is the row's identity column; a fresh row renders
+    // ident + state and nothing else.
+    const rows = children.map((c) => ({
+      ident: c && c.ws_id ? String(c.ws_id).slice(0, 8) : "",
+      name: c && c.name ? String(c.name) : "",
+      state: c && c.state ? String(c.state) : "",
+    }));
+    const headerText =
       "idle · " +
       children.length +
       (children.length === 1
         ? " child still running"
         : " children still running");
-    el.appendChild(header);
-    const list = document.createElement("ul");
-    list.className = "msg-idle-list";
-    for (let i = 0; i < children.length; i++) {
-      const c = children[i] || {};
-      const li = document.createElement("li");
-      li.className = "msg-idle-child";
-      const name = document.createElement("span");
-      name.className = "msg-idle-child-name";
-      name.textContent = String(c.name || c.ws_id || "child");
-      li.appendChild(name);
-      if (c.state) {
-        const state = document.createElement("span");
-        state.className = "msg-idle-child-state";
-        state.textContent = String(c.state);
-        li.appendChild(state);
-      }
-      list.appendChild(li);
+    return buildIdleCard(
+      "msg idle-children operator-context",
+      "idle_children",
+      "idle children",
+      headerText,
+      rows,
+      0,
+    );
+  }
+
+  // Structured ``.msg.idle-tasks`` card for the coordinator-only
+  // ``idle_tasks`` operator-context system turn.  It fires independently
+  // of the children state, so it may arrive alone or co-deliver in the
+  // same drain beside the ``idle-children`` card, tasks first.
+  //
+  // CARD HONESTY: this card is the transcript's record of the nudge — it
+  // renders what the model was TOLD, formatted for operator readability,
+  // never content the model did not receive.  Fresh ``meta.counts`` is
+  // ``{open, in_progress, pending, ...}`` — the delivered body is one
+  // counts line plus the typed branches, with NO task text at all — so
+  // the card renders those counts and nothing else: one row per open
+  // status, in the sorted order the body's own split uses.  Statuses map
+  // through ``taskStatusLabel`` (formatting freedom; the label never adds
+  // content beyond the body's split), and zero counts render because the
+  // model was told the zero too.  A card that showed titles here would
+  // falsify the operator's mental model of what the coordinator knows;
+  // the tasks pane remains the browsing surface for rows.
+  //
+  // OLD persisted rows (pre-counts transcripts replayed from /history)
+  // still carry the row-shaped ``meta.tasks`` + ``meta.total``, and
+  // rendering those rows is legitimate by the same rule as the children
+  // card's ``name`` column: those nudges DID deliver the roster to the
+  // model at the time, so showing it records what the model received.
+  // That legacy path keeps the display-projection contract it shipped
+  // with — angle brackets survive (``sanitize_display`` at the then-
+  // producer), inert only because every field is written via
+  // ``textContent``; do not switch any of them to ``innerHTML``.
+  function appendIdleTasks(meta) {
+    const counts =
+      meta && meta.counts && typeof meta.counts === "object"
+        ? meta.counts
+        : null;
+    if (counts) {
+      const total = typeof counts.open === "number" ? counts.open : 0;
+      const rows = Object.keys(counts)
+        .filter((k) => k !== "open")
+        .sort()
+        .map((k) => ({
+          // Count in the name column, status label in the state chip:
+          // "1 · in progress".  Number coercion keeps a ragged
+          // non-numeric value visible rather than NaN-blank.
+          name: String(counts[k]),
+          state: taskStatusLabel(String(k)),
+        }));
+      const headerText =
+        "idle · " + total + (total === 1 ? " open task" : " open tasks");
+      return buildIdleCard(
+        "msg idle-tasks operator-context",
+        "idle_tasks",
+        "open tasks",
+        headerText,
+        rows,
+        0,
+      );
     }
-    el.appendChild(list);
-    messagesEl.appendChild(el);
-    _scheduleScroll();
-    return el;
+    const tasks = Array.isArray(meta.tasks) ? meta.tasks : [];
+    const total = typeof meta.total === "number" ? meta.total : tasks.length;
+    // Legacy rows: the producer emitted the DISPLAY projection of the
+    // title, which may be empty; this card's "(untitled)" fallback is
+    // keyed on THAT, and diverged from the then-body's strict-projection
+    // fallback by design. The id rides alongside as `ident` so an
+    // untitled row is still identifiable. Do NOT reintroduce a `|| t.id`
+    // fallback on `name`: `ident` is the id column, and folding the id
+    // into the name is what made the two surfaces disagree.
+    const rows = tasks.map((t) => ({
+      ident: t && t.id ? String(t.id) : "",
+      name: (t && t.title) || "(untitled)",
+      state: t && t.status ? taskStatusLabel(String(t.status)) : "",
+      note: t && t.note ? String(t.note) : "",
+    }));
+    const headerText =
+      "idle · " + total + (total === 1 ? " open task" : " open tasks");
+    return buildIdleCard(
+      "msg idle-tasks operator-context",
+      "idle_tasks",
+      "open tasks",
+      headerText,
+      rows,
+      Math.max(0, total - tasks.length),
+    );
   }
 
   // "queued message" bubble for a ``user_interjection`` system turn — shows the
@@ -990,9 +1318,9 @@ function createCoordinatorPane(root, wsId, opts) {
   // Dispatch a first-class operator-context system turn to the right renderer.
   // Shared by the live ``system_turn`` SSE handler and history replay so the
   // two can't drift on which kinds get structured cards.  ``watch_triggered`` /
-  // ``output_guard`` / ``idle_children`` carry structured ``meta`` → cards;
-  // ``user_interjection`` → a "queued message" bubble; everything else → the
-  // labeled operator bubble.
+  // ``output_guard`` / ``idle_children`` / ``idle_tasks`` carry structured
+  // ``meta`` → cards; ``user_interjection`` → a "queued message" bubble;
+  // everything else → the labeled operator bubble.
   function renderSystemTurn(source, content, meta) {
     const m = meta && typeof meta === "object" ? meta : null;
     // /history projection of a persisted compaction marker — same result
@@ -1007,6 +1335,7 @@ function createCoordinatorPane(root, wsId, opts) {
       return appendWatchResult(m, content || "");
     if (source === "output_guard" && m) return appendGuardFinding(m);
     if (source === "idle_children" && m) return appendIdleChildren(m);
+    if (source === "idle_tasks" && m) return appendIdleTasks(m);
     if (source === "user_interjection")
       return appendInterjection(m, content || "");
     return appendText("system", content || "", {
@@ -1131,8 +1460,10 @@ function createCoordinatorPane(root, wsId, opts) {
       if (preview.length > 600) preview = preview.slice(0, 600) + "…";
     } else if (argsRaw) {
       // Malformed JSON or non-object args — show the raw payload
-      // truncated.  Matches the interactive replay's substring(0, 100)
-      // fallback at ui/static/app.js Pane.replayHistory.
+      // truncated.  Matches the interactive replay's fallback in
+      // shared_static/interactive.js replayHistory (the live parity
+      // source; the old ui/static/app.js Pane.replayHistory moved
+      // there in the L-shell step-5a lift).
       header = name;
       preview = argsRaw.length > 200 ? argsRaw.slice(0, 200) + "…" : argsRaw;
     }
@@ -2393,12 +2724,14 @@ function createCoordinatorPane(root, wsId, opts) {
     });
   }
 
-  function getJSON(url) {
+  function getJSON(url, init) {
     const fn = typeof authFetch === "function" ? authFetch : fetch;
-    return fn(url, { credentials: "include" }).then((r) => {
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    });
+    return fn(url, Object.assign({ credentials: "include" }, init || {})).then(
+      (r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      },
+    );
   }
 
   // ------------------------------------------------------------------
@@ -2426,15 +2759,21 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   // The transport-teardown chokepoint: close + null the EventSource and
-  // cancel BOTH pending retry timers (reconnect backoff + degraded catch-up).
-  // Every teardown path routes through here — connectSSE's redial prologue,
-  // suspendStream (overflow / hide / close-session), destroy — so a new
-  // transport timer gets cancelled in one place instead of by hand at each
-  // call site.  Cancelling the degraded timer on redial also keeps a pending
-  // catch-up retry from firing mid-stream and double-opening;
-  // enterDegradedCatchup re-arms AFTER its own suspend, so this never cancels
-  // the timer it is about to set.  Gap accounting stays OUT of this helper —
-  // a redial is not itself a gap (suspendStream layers markStreamGap on top).
+  // cancel the pending retry timers (reconnect backoff, degraded catch-up,
+  // truncated resync).  Every teardown path routes through here —
+  // connectSSE's redial prologue, suspendStream (overflow / hide /
+  // close-session / truncated resync), destroy — so a new transport timer
+  // gets cancelled in one place instead of by hand at each call site.
+  // Cancelling the degraded timer on redial also keeps a pending catch-up
+  // retry from firing mid-stream and double-opening; enterDegradedCatchup
+  // re-arms AFTER its own suspend, so this never cancels the timer it is
+  // about to set.  Likewise the truncated-resync fire path nulls its own
+  // handle BEFORE calling loadHistoryThenReconnect, so the teardown inside
+  // that flow never cancels the work it is part of; cancelling a merely
+  // PENDING resync here is always safe because truncatedFromCursor (not the
+  // timer) is the durable repair state — the next connect re-presents it.
+  // Gap accounting stays OUT of this helper — a redial is not itself a gap
+  // (suspendStream layers markStreamGap on top).
   function closeStreamTransport() {
     if (evtSource) {
       try {
@@ -2452,6 +2791,28 @@ function createCoordinatorPane(root, wsId, opts) {
       clearTimeout(degradedTimer);
       degradedTimer = null;
     }
+    if (truncatedResyncTimer) {
+      clearTimeout(truncatedResyncTimer);
+      truncatedResyncTimer = null;
+    }
+    // liveToolCalls is deliberately NOT drained here (r7 ruling): the
+    // reconnect replay does NOT re-announce a live batch — replay_ok
+    // yields only events past lastEventId (the announce sits below it)
+    // and the coord fresh/truncated replay yields connected/status/
+    // pending-cards/verdicts, never tool_pending or tool_info — so a
+    // drain here left the render gate's tool-phase term EMPTY across
+    // every mid-batch redial and a slow seedless refetch resolving
+    // after the reopen wiped the live batch (fails OPEN).  A stale id
+    // instead fails CLOSED — a skipped render leaves the staleness
+    // latch set and heals at the next organic settle — and retirement
+    // is fully covered without this site: results still arrive through
+    // replay_ok (tool_result deletes), every fresh/truncated reconnect
+    // carries a synthetic state_change whose settle edge clears, and
+    // destroy() ends the closure.
+    // staleRetryTimer is deliberately NOT cancelled here — it is a
+    // REST-refetch heal, not transport state, and a transport-only redial
+    // must keep the pending heal intent (terminal-only cancel; see its
+    // decl and destroy()).
   }
 
   function connectSSE() {
@@ -2467,12 +2828,31 @@ function createCoordinatorPane(root, wsId, opts) {
     // manual case (scheduleReconnect-driven reconnect after CLOSED state).
     const wasReconnecting = disconnectedAt !== 0 || reconnectAttempts > 0;
     let url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
+    // A recorded truncation gap OVERRIDES the live cursor: while
+    // truncatedFromCursor is set (gap detected, no full render yet), every
+    // manual (re)connect presents the truncation-time cursor, so the server
+    // re-answers replay_truncated and the resync re-arms — whatever teardown
+    // cancelled the pending jittered resync in the meantime (close-on-hide,
+    // degraded entry, CLOSED-state retry, close-session resume).  This
+    // connect chokepoint is what makes the gap-repair guarantee
+    // interleaving-proof; a cancellable timer alone silently loses the
+    // repair when a hide/show cycle lands inside the jitter window after
+    // the live cursor has advanced past the truncation point.  Safe against
+    // double-render: ring eviction is forward-only, so a once-truncated
+    // cursor can never re-enter replay range — this connect always draws
+    // the envelope, never a bulk replay.  (Native EventSource
+    // auto-reconnects bypass this — the browser's header carries the
+    // advanced id — but they never run closeStreamTransport, so the pending
+    // resync timer survives them.)
+    //
     // ``!= null`` (not truthiness): a resume cursor of 0 is valid (the
     // ring buffer's first emitted event is id 1), and a brand-new ws's
     // first-turn /history cursor can be 0 — a truthiness gate would drop
     // it to the lossy fresh-snapshot path.  Mirrors ui/static/app.js.
-    if (lastEventId != null) {
-      url += "?last_event_id=" + encodeURIComponent(lastEventId);
+    const connectCursor =
+      truncatedFromCursor != null ? truncatedFromCursor : lastEventId;
+    if (connectCursor != null) {
+      url += "?last_event_id=" + encodeURIComponent(connectCursor);
     }
     // Close-on-hide / replay-on-show: install once per pane, removed by
     // destroy().  A hidden tab's throttled drain is the likeliest slow consumer
@@ -2537,8 +2917,21 @@ function createCoordinatorPane(root, wsId, opts) {
       // lying (see GAP_REFRESH_THRESHOLD_MS).  The ring-evicted case
       // announces itself — the replay_truncated handler runs the same
       // refresh on arrival (gapRefreshedAtOpen keeps the two from stacking).
+      //
+      // While a truncation gap is ON RECORD, the gap machinery owns sidebar
+      // recovery outright — the envelope refreshed at gap start and the
+      // heal-time refresh covers everything since — so this arm stands
+      // down.  Without that gate, the failed-resync retry loop re-fires
+      // this refresh once per reconnect: loadHistoryThenReconnect nulls
+      // lastEventId, a failed /history never re-seeds it, and every retry
+      // reconnect then reads as "no cursor to resume from" — the onopen
+      // half of the same un-jittered /children + /tasks stampede the
+      // envelope's per-gap dedup stops.  (On the clean cursorless heal the
+      // record is already cleared before the reconnect, so the one
+      // intended heal refresh still lands here.)
       if (
         wasReconnecting &&
+        truncatedFromCursor == null &&
         (lastEventId == null || gapMs > GAP_REFRESH_THRESHOLD_MS)
       ) {
         refreshSidebarAfterGap();
@@ -2648,7 +3041,15 @@ function createCoordinatorPane(root, wsId, opts) {
       // Capture lastEventId BEFORE JSON.parse so a malformed event
       // doesn't desync the manual-reconnect fallback from native
       // auto-reconnect.
-      if (evtSource && evtSource.lastEventId) {
+      // ``lastEventId`` lives on the MESSAGE EVENT — EventSource exposes
+      // no such property, so the pre-2026-07 read off the source OBJECT
+      // was a dead conditional: the cursor never tracked live traffic
+      // and the counter-reset detector below never fired in a real
+      // browser.  ``!== ""``: no-id frames carry "" per spec.  (A
+      // DOMString — the valid id "0" is truthy, so truthiness would
+      // behave identically; the explicit form matches interactive.js's
+      // canonical capture.)
+      if (event.lastEventId != null && event.lastEventId !== "") {
         // A live event id BELOW our saved cursor means the server's per-ws
         // event counter reset — a coordinator process restart with a fresh,
         // empty ring.  The replay path can't flag that (a cursor at/above the
@@ -2661,12 +3062,12 @@ function createCoordinatorPane(root, wsId, opts) {
         if (
           lastEventId != null &&
           !gapRefreshedAtOpen &&
-          Number(evtSource.lastEventId) < Number(lastEventId)
+          Number(event.lastEventId) < Number(lastEventId)
         ) {
           refreshSidebarAfterGap();
           gapRefreshedAtOpen = true;
         }
-        lastEventId = evtSource.lastEventId;
+        lastEventId = event.lastEventId;
       }
       let data = null;
       try {
@@ -2719,15 +3120,16 @@ function createCoordinatorPane(root, wsId, opts) {
   // ------------------------------------------------------------------
 
   // Transport-only stream suspension for the overflow / visibility /
-  // close-session paths: the closeStreamTransport teardown WITHOUT the full
-  // destroy() cleanup (observers, task timers), plus gap accounting.
-  // connectSSE re-opens from the saved lastEventId, so this is lossless for
-  // committed turns.
+  // close-session / truncated-resync paths: the closeStreamTransport
+  // teardown WITHOUT the full destroy() cleanup (observers, task timers),
+  // plus gap accounting.  connectSSE re-opens from the saved lastEventId
+  // (or the recorded truncation cursor), so this is lossless for committed
+  // turns.
   function suspendStream() {
     closeStreamTransport();
     // A deliberate suspend is still a gap.  The transient-error path marks
-    // it via onerror; the overflow/hide/close-session paths self-close (no
-    // onerror fires after .close()), so mark it here instead.
+    // it via onerror; the overflow/hide/close-session/resync paths
+    // self-close (no onerror fires after .close()), so mark it here instead.
     markStreamGap();
   }
 
@@ -2742,10 +3144,14 @@ function createCoordinatorPane(root, wsId, opts) {
 
   // Replace-mode sidebar re-sync after a gap the reconnect replay could not
   // (or might not) have covered — the server is authoritative; any SSE-only
-  // child/task rows accumulated before the disconnect are stale.  Two
-  // callers: onopen (no-cursor / over-threshold gaps) and the
-  // replay_truncated handler (ring-evicted gaps).  Ordinary short gaps need
-  // neither — the ring replay redelivers child_ws_* / task events itself.
+  // child/task rows accumulated before the disconnect are stale.  Four
+  // callers: onopen (no-cursor / over-threshold gaps, standing down while a
+  // truncation gap is on record), the onmessage counter-reset detector
+  // (live id below the saved cursor = process restart), the
+  // replay_truncated handler (NEW ring-evicted gaps — deduped per gap), and
+  // loadHistoryThenReconnect's heal-time refresh (retry-window staleness on
+  // a cursor-seeded heal).  Ordinary short gaps need none of them — the
+  // ring replay redelivers child_ws_* / task events itself.
   function refreshSidebarAfterGap() {
     loadChildren({ replace: true });
     loadTasks();
@@ -2783,19 +3189,16 @@ function createCoordinatorPane(root, wsId, opts) {
     );
   }
 
-  function noteStreamOverflow() {
-    streamHealth.overflows += 1;
+  // The ONE rolling-window churn accounting step for the degraded ladder —
+  // stream_overflow closes (noteStreamOverflow) AND truncated resyncs
+  // (noteTruncatedResync) land here, so the trip parameters and the
+  // degraded-entry call have a single implementation that cannot silently
+  // diverge.  The cooldown-ladder reset lives in enterDegradedCatchup
+  // (keyed off lastDegradedAt), NOT here — this only counts and trips.
+  // Returns true when this entry ENTERED degraded catch-up.
+  function recordChurnAndMaybeTrip() {
     const now = Date.now();
     overflowTimes.push(now);
-    console.warn(
-      "coordinator: server closed the stream after a send-queue overflow " +
-        "(total " +
-        streamHealth.overflows +
-        "); reconnect will replay the gap",
-    );
-    // Trip when OVERFLOW_TRIP_COUNT closes land inside the rolling window.  The
-    // cooldown-ladder reset lives in enterDegradedCatchup (keyed off
-    // lastDegradedAt), NOT here — this only counts and trips.
     if (
       overflowWindowTripped(
         overflowTimes,
@@ -2805,7 +3208,191 @@ function createCoordinatorPane(root, wsId, opts) {
       )
     ) {
       enterDegradedCatchup();
+      return true;
     }
+    return false;
+  }
+
+  function noteStreamOverflow() {
+    streamHealth.overflows += 1;
+    console.warn(
+      "coordinator: server closed the stream after a send-queue overflow " +
+        "(total " +
+        streamHealth.overflows +
+        "); reconnect will replay the gap",
+    );
+    recordChurnAndMaybeTrip();
+  }
+
+  // The one increment+log step for the replay-window class — EVERY
+  // truncatedGaps bump goes through here so the console invariant documented
+  // at the streamHealth initializer holds (each increment carries the running
+  // count).  Class-of-event wording only: the recovery that follows differs
+  // by caller (jittered fresh-connect, idle-edge fresh-connect, or a
+  // degraded-catchup skip), so the line must not assert an action a trip may
+  // skip.  Churn accounting is deliberately NOT here — the idle-edge caller
+  // records the gap without feeding the degraded ladder.
+  function recordTruncatedGap() {
+    streamHealth.truncatedGaps += 1;
+    console.warn(
+      "coordinator: replay window could not cover the reconnect gap " +
+        "(total " +
+        streamHealth.truncatedGaps +
+        ")",
+    );
+  }
+
+  // Count a truncated-triggered full resync into the SAME rolling churn
+  // window as overflow closes (overflowTimes): both are "this consumer
+  // needed heavyweight recovery", and the degraded ladder is the bound for
+  // either loop.  Returns true when this trip ENTERED degraded catch-up —
+  // the caller must then SKIP starting its resync: the cooldown ladder just
+  // disconnected the stream, and a loadHistoryThenReconnect started now
+  // would reconnect from its .finally and defeat the cooldown it triggered.
+  // The wake-up reconnect re-arrives here via a fresh replay_truncated (the
+  // chokepoint re-presents the still-stale truncatedFromCursor), so the
+  // resync is deferred, not lost.
+  function noteTruncatedResync() {
+    recordTruncatedGap();
+    return recordChurnAndMaybeTrip();
+  }
+
+  // Start the truncated-triggered fresh connect after a random
+  // 0..TRUNCATED_RESYNC_JITTER_MS spread.  The truncated envelope is
+  // herd-shaped — a node restart makes every stale-cursor tab reconnect
+  // inside the EventSource retry jitter and each answers with a /history
+  // fetch — and the per-tab churn limiter cannot see a cross-tab herd (one
+  // resync per tab never trips it), so the spread is applied here, before
+  // the fetch.  During the wait the pane keeps painting live events from
+  // the still-open stream; the gap predates the resync either way, so the
+  // only cost is a delayed backfill.  closeStreamTransport owns
+  // cancellation (redial, hide, degraded entry, close-session, destroy —
+  // see the field comment on truncatedResyncTimer).
+  function scheduleTruncatedResync() {
+    if (truncatedResyncTimer != null) return; // one pending resync at a time
+    truncatedResyncTimer = setTimeout(() => {
+      // Null the handle BEFORE loading — loadHistoryThenReconnect tears the
+      // transport down (closeStreamTransport cancels this timer), and a
+      // still-set handle would cancel the work it is part of.
+      truncatedResyncTimer = null;
+      loadHistoryThenReconnect();
+    }, Math.random() * TRUNCATED_RESYNC_JITTER_MS);
+  }
+
+  // The dead-stream truncated resync (#882): mirror of interactive.js's
+  // _loadHistoryThenConnect, minus the ws-switch machinery — this pane is
+  // single-wsId for life, so there is no load token and no cross-ws
+  // truncated-cursor drop (see the clear_ui handler's ruling on the
+  // same-ws render race).  The reference's lastEventId reset is KEPT —
+  // not as ws-switch machinery but for reborn-ring convergence (see the
+  // note in the body; deleting it reintroduces the envelope→resync loop
+  // the coord-restart e2e scenario exists to catch).  Order matters:
+  //   1. suspendStream — tear the transport down FIRST so no live events
+  //      paint into the pane mid-rebuild, and mark the gap so a slow
+  //      /history fetch (>60s) re-enters onopen's cursor-trust-window
+  //      refresh on reconnect.
+  //   2. Null the streaming refs + buffers: refetchHistory replaceChildren()s
+  //      the DOM but does NOT null them, and the envelope's own synthetic
+  //      in_progress_snapshot may have re-created a live bubble between
+  //      scheduling and this fire — a stale ref would strand the rebuilt
+  //      turn's tokens into a detached node, and stale buffers would make
+  //      the reconnect's snapshot length-guards skip the repaint.  Safe
+  //      here because the transport is already down (no delta can race the
+  //      null).
+  //   3. refetchHistory(true): full render + adopt hist.cursor (/history
+  //      trims the trailing in-flight turn whenever it returns a cursor,
+  //      expecting the caller to replay from it — adoption is the #882 fix
+  //      core).  A successful render also clears truncatedFromCursor.
+  //   4. Reconnect in .finally — runs on success, failure, AND a render
+  //      throw.  The failed-fetch retry rides the connect chokepoint, not a
+  //      callback: a failure leaves truncatedFromCursor set (only a
+  //      successful render clears it), so this reconnect presents the
+  //      truncation-time cursor, draws replay_truncated again, and the
+  //      resync retries — bounded by the churn limiter + degraded ladder.
+  //      The old transcript survives a failed fetch (the wipe sits below
+  //      refetchHistory's !hist guard), so the retry window shows
+  //      stale-but-real content, not an empty pane.
+  //      ``if (visHandler)``: destroy() and coordCloseSession release the
+  //      stream lifecycle by removing the visibility handler — the same
+  //      sentinel that keeps a show edge from resurrecting a deliberately
+  //      closed stream keeps this async tail from reopening one on a
+  //      destroyed pane (close-session's own resumeSse re-arms on its
+  //      failure paths).
+  function loadHistoryThenReconnect() {
+    suspendStream();
+    currentAssistantEl = null;
+    currentAssistantBuf = "";
+    currentReasoningEl = null;
+    currentReasoningBuf = "";
+    // Drop the live cursor for the reconnect: the full render below
+    // supersedes it (refetchHistory re-seeds from hist.cursor when the
+    // server hands one back).  This is NOT just interactive parity — it is
+    // what makes the resync CONVERGE against a reborn ring: after a node
+    // restart, a successful /history on an idle ws returns NO cursor, and
+    // without this null the reconnect re-presents the frozen pre-restart
+    // cursor against the empty reseeded ring, which honestly answers
+    // replay_truncated — again and again, an envelope→resync→envelope loop
+    // that trips the churn ladder and parks the pane in degraded cooldown
+    // cycles forever (an idle ws emits no frames to ever advance the
+    // cursor).  Caught by scripts/recovery_e2e.py --scenario coord-restart;
+    // invisible to source-pattern tests.  On the FAILED-fetch leg the
+    // reconnect still retries correctly: truncatedFromCursor (not
+    // lastEventId) is the durable repair state the chokepoint presents.
+    lastEventId = null;
+    // A pending deferred resync is superseded by this full refetch — without
+    // this clear, the next idle edge would run a second, pointless full
+    // resync.
+    pendingTruncatedResync = false;
+    refetchHistory(true)
+      .then(() => {
+        // Successful heal only (a failed fetch resolves too, but leaves the
+        // record set; a render throw skips .then entirely): refresh the
+        // sidebar once.  The envelope refreshed it at gap START; this
+        // covers child_ws_* / task events that landed in the retry loop's
+        // suspend→fetch→reconnect windows, which no SSE replay can
+        // redeliver (each retry reconnect presents the stale record
+        // cursor) — the sidebar heals here exactly the way the transcript
+        // heals via /history.  Gated to the cursor-SEEDED heal
+        // (lastEventId != null): the cursorless heal reconnects fresh and
+        // onopen's own no-cursor arm runs this same refresh — skipping
+        // here keeps it to one refresh per heal on both shapes.
+        // Slow-heal exclusivity: when the fetch itself outlived the
+        // cursor-trust window, onopen's over-threshold arm WILL refresh —
+        // measured off the same disconnectedAt read here — so stand down.
+        // The implication holds up to the connect handshake: a fetch
+        // landing within one handshake of the threshold measures under it
+        // here and over it at onopen and double-fires (accepted:
+        // replace-mode loads are last-writer-wins, and closing the
+        // handshake-wide window at a 60s boundary would take a heal-scoped
+        // flag that survives onopen's per-connection reset — more state
+        // than the dedup is worth).  A heal followed by a long hidden
+        // deferral before the reconnect legitimately gets both: the hide
+        // opened a NEW coverage gap after this one healed.
+        //
+        // RULED (2026-07-21, #882 review): on a ZERO-retry seeded heal
+        // this refresh duplicates what the seeded replay_ok reconnect
+        // redelivers from the ring anyway.  Accepted: telling K=0 from
+        // K>=1 needs a per-episode attempt counter whose reset lifecycle
+        // spans schedule/trip/latch/failure paths, and ~3 jitter-spread
+        // REST per healed gap is cheaper than that state; the deeper fix
+        // for restart-herd sidebar load is server-side coalescing (#884).
+        // visHandler: same destroyed/close-session sentinel as the
+        // reconnect below.
+        const onopenWillRefresh =
+          disconnectedAt !== 0 &&
+          Date.now() - disconnectedAt > GAP_REFRESH_THRESHOLD_MS;
+        if (
+          visHandler &&
+          truncatedFromCursor == null &&
+          lastEventId != null &&
+          !onopenWillRefresh
+        ) {
+          refreshSidebarAfterGap();
+        }
+      })
+      .finally(() => {
+        if (visHandler) connectSSE();
+      });
   }
 
   function enterDegradedCatchup() {
@@ -2945,6 +3532,7 @@ function createCoordinatorPane(root, wsId, opts) {
         noteStreamOverflow();
         break;
       case "tool_result":
+        liveToolCalls.delete(ev.call_id || "");
         appendToolResult(
           ev.name || "tool",
           ev.call_id || "",
@@ -3098,7 +3686,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // user interjection, metacognitive nudge, watch result — see
         // make_system_turn).  Rendered in trajectory sequence (it FOLLOWS the
         // turn it advises).  ``renderSystemTurn`` routes by ``ev.source`` to the
-        // structured card (watch / guard / idle-children) or the operator bubble
+        // structured card (watch / guard / idle-children / idle-tasks) or the operator bubble
         // (carrying ``ev.meta`` so cards rebuild identically live and on replay).
         // Dedup: skip a turn already painted from /history (matched by id) and
         // redelivered by an SSE replay past the resume cursor.  With the
@@ -3164,16 +3752,96 @@ function createCoordinatorPane(root, wsId, opts) {
           // settled and /history is complete.  Also repairs a turn stranded by
           // close-on-hide — hidden mid-turn, its stream_end evicted, so the
           // show-edge replay_truncated latched the flag and the live bubble
-          // never finalized.  Reset the streaming refs first: refetchHistory
-          // replaceChildren()s the DOM but does NOT null them, and a dangling
-          // ref would strand the NEXT turn's tokens into a detached node.
-          // Mirrors interactive.js.
+          // never finalized.  Same dead-stream flow as the immediate branch
+          // (full fresh connect, cursor adoption; the streaming-ref reset
+          // lives inside loadHistoryThenReconnect) — but NOT counted into
+          // the degraded-churn window, and NOT herd-jittered: this branch
+          // fires once per latch, and the latch only re-arms via a NEW
+          // truncated envelope followed by a full turn-settle — inherently
+          // rate-limited AND per-pane staggered by turn timing, unlike the
+          // immediate branch's reconnect loop (which the limiter bounds and
+          // scheduleTruncatedResync spreads).  Usually /history returns no
+          // cursor here (no orphan at idle) and the reconnect is a plain
+          // fresh connect.  Mirrors interactive.js.
+          //
+          // RULED (2026-07-21, #882 review): the turn-timing stagger does
+          // NOT cover the restart herd — N mid-turn tabs all latch, then
+          // all consume when the reconnect's synthetic idle replay lands
+          // inside the same retry window — but this branch stays
+          // un-jittered anyway: it is byte-for-byte the converged
+          // interactive.js shape, a coordinator-only spread would fork the
+          // shared design for a one-shot-per-latch peak (identical total
+          // volume), and the tracked fix for restart-herd /history load is
+          // server-side coalescing (#884).  If that herd ever measures
+          // hot, sweep BOTH clients' idle-edge consumers together — do not
+          // patch just this one.
+          // Settle edge: the turn is over, so any id still in the live
+          // set is a dead call whose result will never arrive — drain it
+          // or the residue would hold the render gate's tool-phase term
+          // closed forever (see liveToolCalls' decl).
+          liveToolCalls.clear();
           if (pendingTruncatedResync) {
             pendingTruncatedResync = false;
-            currentAssistantEl = null;
-            currentAssistantBuf = "";
-            currentReasoningEl = null;
-            currentReasoningBuf = "";
+            recordTruncatedGap();
+            loadHistoryThenReconnect();
+          } else if (
+            historyStale &&
+            !refetchesInFlight &&
+            !currentAssistantEl &&
+            !currentReasoningEl
+          ) {
+            // Staleness-latch backstop (#894): the clear_ui refetch and its
+            // one bounded retry both failed, so the transcript still doesn't
+            // match the server and rewind/edit stay latch-closed.  The turn
+            // just settled — refetch now.
+            //
+            // TRANSPORT-FREE BY DESIGN (ruled, do not "upgrade" this to
+            // loadHistoryThenReconnect): the heal must never touch the
+            // stream.  A reload's fresh reconnect draws the server's
+            // synthetic state_change:idle, which lands back in THIS branch —
+            // with /history down that is a zero-backoff disconnect/refetch/
+            // reconnect storm against a recovering node (interactive.js's
+            // round-5 critical), self-sustaining until /history recovers.
+            // A plain REST refetch emits zero SSE events, so this heal
+            // never CAUSES its own trigger and the self-loop is
+            // structurally impossible.  Precision on the trigger edges
+            // (r5): turn settles are the main one, but fresh/truncated
+            // SSE replays also carry a synthetic state_change (replay_ok
+            // does not) — so a latched pane pays one refetch per
+            // reconnect too.  That edge is bounded by the reconnect
+            // machinery's own jitter/backoff, is user/transport-driven
+            // rather than heal-driven, and the restart-herd /history load
+            // is bounded server-side by #884's single-flight — ruled
+            // acceptable; do NOT bolt a client-side limiter onto this arm
+            // (and never a transport-touching one).  Stream death has its
+            // own owners (EventSource native auto-reconnect, the
+            // truncated resync in the branch above — whose heal
+            // legitimately IS a reconnect: its stream is dead, this arm's
+            // is alive) and the else-if keeps the truncated branch's
+            // reload from doubling up (its render clears this latch too).
+            //
+            // The ref guards are a DELIBERATE divergence from the
+            // interactive template (which omits them on its backstop):
+            // interactive's replayHistory resets the streaming refs on
+            // every render, coord's refetchHistory does not — and this arm
+            // also serves state_change:error edges, where no stream_end
+            // ran finishAssistantStream and a live-bubble ref can
+            // survive.  Post-r5 the render-time gate in refetchHistory
+            // carries the wipe-safety correctness; these fire-time guards
+            // are the efficiency layer — they skip a fetch whose payload
+            // the gate would discard (a latched pane draining a K-deep
+            // send queue still pays one discarded fetch per settle edge
+            // it loses the race on; ruled acceptable — per-pane cost
+            // rides organic edges only and #884 coalesces the herd).
+            // Accepted liveness lag (ruled): if /history recovers while
+            // the pane sits idle untouched, rewind/edit stay closed until
+            // the next organic settle — strictly safer than the storm.
+            // Do not add ANY transport-touching timer to shorten it.
+            //
+            // Fire-and-forget, seedless: the stream is alive so lastEventId
+            // must not rewind; no composer state rides this heal (that is
+            // the clear_ui caller's .catch), so a render throw stays loud;
+            // and nothing here re-arms the retry, keeping it bounded.
             refetchHistory();
           }
         } else if (
@@ -3250,9 +3918,101 @@ function createCoordinatorPane(root, wsId, opts) {
         // Conversation was structurally reset (rewind / retry). Re-render
         // from REST, then dispatch any queued edit-and-resend once the (now
         // truncated) history lands. Coord is single-wsId per page, so no
-        // load-token guard is needed (unlike the interactive pane).
+        // load-token guard is needed (unlike the interactive pane): a
+        // cross-ws misroute cannot happen, and the resend below always
+        // belongs to this pane.  The remaining same-ws exposure — this
+        // seedless live re-render racing a truncated resync's seeded one —
+        // is RULED accepted without a token: both renders are
+        // server-authoritative snapshots milliseconds apart, last-writer
+        // wins, and refetchHistory's success-path supersession (record +
+        // deferred latch + pending timer) eliminates the dominant vector (a
+        // resync still armed when this rebuild lands); the residual
+        // fetch-overlap window is transient-cosmetic and heals on the next
+        // full render or chokepoint retry.
+        //
+        // Latch transcript staleness FIRST (#894): from this moment until a
+        // successful render the visible DOM is the PRE-rewind transcript
+        // and must not feed a rewind/edit turn count (see historyStale's
+        // decl).  The cosmetic [data-busy] grey-out for this window stays a
+        // deferred parity item (#890 PR ruling) — the handler-side
+        // ``busy || historyStale`` gate carries the correctness.
+        historyStale = true;
         refetchHistory()
           .then(() => {
+            // Repair-intent supersession (pending resync timer + deferred
+            // latch + gap record) lives inside refetchHistory's success
+            // path — a successful rebuild here clears all three, a FAILED
+            // fetch (which also resolves) clears none, and a mid-render
+            // throw skips this .then entirely — so the pending resync
+            // stays the repair owner exactly when the pane still needs it.
+            //
+            // Failed fetch (the latch survived — only the success render
+            // clears it): arm the ONE bounded turn-free retry (#894).
+            // Armed here rather than in a failure branch so the retry's own
+            // failure cannot re-arm (bounded by construction); a NEWER
+            // clear_ui replaces the pending timer via the clearTimeout
+            // below, so at most one retry is ever pending.  Fire-time
+            // guards make a stale firing a no-op: healed or superseded
+            // (historyStale — coord has no load token; single-wsId, so the
+            // latch itself is the still-current signal), a fetch already
+            // in flight (!refetchesInFlight — yield instead of stomping it
+            // with a same-snapshot double render), mid-turn (!busy — the
+            // idle-edge backstop owns the busy case, e.g. the edit-resend
+            // dispatched below), a live bubble (the ref guards skip a
+            // fetch whose payload refetchHistory's render-time gate would
+            // discard — the gate carries the wipe-safety correctness,
+            // these are the efficiency layer), or torn down (visHandler —
+            // destroy() also cancels this timer outright, but
+            // coordCloseSession only nulls visHandler).
+            //
+            // The ARM is visHandler-gated too: this .then can settle AFTER
+            // a teardown (destroy/close-session during the in-flight
+            // refetch), and destroy's clearTimeout already ran — an arm
+            // here would recreate the orphan timer destroy exists to kill
+            // (a no-op fire, but it pins the dead closure for 2s).  The
+            // edit-resend below stays UNgated on teardown by design: the
+            // rewind committed server-side and the workstream outlives the
+            // pane UI, so the user's committed edit still delivers.
+            if (historyStale && visHandler) {
+              if (staleRetryTimer) clearTimeout(staleRetryTimer);
+              staleRetryTimer = setTimeout(
+                () => {
+                  staleRetryTimer = null;
+                  if (
+                    historyStale &&
+                    !refetchesInFlight &&
+                    !busy &&
+                    !currentAssistantEl &&
+                    !currentReasoningEl &&
+                    visHandler &&
+                    evtSource &&
+                    evtSource.readyState === EventSource.OPEN
+                  ) {
+                    // Stream must be OPEN, not merely present: close-on-hide
+                    // keeps this timer armed by design (the fire can land
+                    // with the transport down), and a CONNECTING source has
+                    // a frozen cursor with a pending replay — a seedless
+                    // fetch then would render past it (double-render when
+                    // the replay lands).  Skip instead; the latch survives
+                    // and the next organic settle re-fires the backstop.
+                    // The backstop itself needs no such term: it runs
+                    // inside SSE dispatch, so its stream is live by
+                    // construction.  refetchHistory's render-time gate
+                    // re-checks every invariant across the await window.
+                    // Fire-and-forget, seedless (live stream — lastEventId
+                    // must not rewind); a render throw stays loud, as on the
+                    // backstop.
+                    refetchHistory();
+                  }
+                  // ADDITIVE spread over the 2000 floor: one clear_ui reaches
+                  // every listener on the ws, so an un-spread retry re-fetches
+                  // in lockstep across tabs.  The floor is load-bearing (the
+                  // e2e non-occurrence windows size on it) — jitter up, never
+                  // down.  Mirrored in interactive.js; the constant is shared.
+                },
+                STALE_RETRY_BASE_MS + Math.random() * STALE_RETRY_JITTER_MS,
+              );
+            }
             if (!_pendingEditSend) return;
             const editText = _pendingEditSend;
             _pendingEditSend = null;
@@ -3280,27 +4040,75 @@ function createCoordinatorPane(root, wsId, opts) {
           });
         break;
       }
-      case "replay_truncated":
-        // Reconnect buffer evicted past our last-seen id — re-sync from REST.
+      case "replay_truncated": {
+        // The stream just admitted losing events past recovery — treat the
+        // connection as DEAD and run the full fresh-connect flow
+        // (loadHistoryThenReconnect: disconnect first, REST /history,
+        // rebuild, adopt the returned resume cursor, reconnect).  The cursor
+        // adoption is the point (#882 — ruled with interactive.js, do not
+        // revert to an in-place refetch): /history TRIMS the trailing
+        // in-flight turn whenever it hands back a cursor
+        // (_resume_cursor_and_trim), on the assumption the caller replays
+        // from that cursor.  The old in-place refetch here discarded the
+        // cursor, so a mid-run truncation wiped the executing turn's rows
+        // with no redelivery — later tool results then orphaned into
+        // standalone top-level bubbles.  Disconnect-first also removes the
+        // flush-vs-reconnect ambiguity: no live events arrive during the
+        // rebuild, so nothing double-renders.  The rehydrate-triggered
+        // truncation (empty reborn ring) rides the same flow — a rehydrated
+        // ws has no in-flight orphan to trim, so /history returns no cursor
+        // and the reconnect is a plain fresh connect (the load drops the
+        // stale cursor — see loadHistoryThenReconnect's reborn-ring note).
+        //
         // Skip while a turn is mid-stream (BOTH a content bubble and a
-        // reasoning-only one are detachable): the recovery floor's
-        // in_progress_snapshot repaints it, and an async refetch's
+        // reasoning-only one are detachable): an async refetch's
         // replaceChildren() would detach the live bubble so deltas render
-        // nowhere.  Mid-stream the resync is DEFERRED, not dropped — skipping
-        // outright left the ring-evicted gap unrepaired for the rest of the
-        // session (no clean reconnect may come for hours); the idle edge
-        // consumes the flag.  Mirrors interactive.js's _pendingTruncatedResync.
+        // nowhere.  Mid-stream the resync is DEFERRED, not dropped —
+        // skipping outright left the ring-evicted gap unrepaired for the
+        // rest of the session; the idle edge consumes the flag.
+        //
+        // Record WHERE the gap sits before either branch: the envelope
+        // arrived at the connect cursor, but by the time the resync's
+        // /history fetch runs (after the jitter, or at the idle edge) the
+        // live stream has advanced lastEventId well past it — the
+        // failed-fetch retry needs this truncation-time value, not the
+        // advanced one (see truncatedFromCursor's field comment).
+        // Keep-oldest: a retry reconnect re-delivers an envelope for the
+        // SAME unrepaired gap and must not advance the record.  Whether
+        // this envelope OPENED the gap (vs. re-announcing one already on
+        // record) also drives the sidebar-refresh dedup below.
+        const isNewTruncationGap = truncatedFromCursor == null;
+        if (isNewTruncationGap) {
+          truncatedFromCursor = lastEventId;
+        }
         if (!currentAssistantEl && !currentReasoningEl) {
-          refetchHistory();
+          // Limiter check BEFORE scheduling the resync — a trip has just
+          // disconnected the stream for a cooldown, and a resync started
+          // now would reconnect from its .finally and defeat the cooldown
+          // (see noteTruncatedResync).  No trip → the fresh connect starts
+          // after a herd-spreading jitter (scheduleTruncatedResync).
+          if (!noteTruncatedResync()) {
+            scheduleTruncatedResync();
+          }
         } else {
           pendingTruncatedResync = true;
         }
         // The evicted slice may have carried child_ws_* / task events the
         // sidebar will never see replayed — this is the server saying the
-        // gap was NOT covered, so pull authoritative state (unless onopen
-        // already did, milliseconds ago, for this same reconnect).
-        if (!gapRefreshedAtOpen) refreshSidebarAfterGap();
+        // gap was NOT covered, so pull authoritative state.  Deduped two
+        // ways: per open against onopen's refresh (gapRefreshedAtOpen —
+        // milliseconds apart on the same reconnect), and per GAP against
+        // the failed-resync retry loop — each retry reconnect re-draws the
+        // envelope for the SAME unrepaired gap (keep-oldest record still
+        // set), and re-refreshing then would hit /children + /tasks + the
+        // live-badge bulk fetch un-jittered once per retry, across every
+        // open tab of a console that is already struggling (only /history
+        // rides the herd spread).  Sidebar staleness accrued DURING the
+        // retry loop's teardown windows is covered by the heal-time
+        // refresh in loadHistoryThenReconnect.
+        if (isNewTruncationGap && !gapRefreshedAtOpen) refreshSidebarAfterGap();
         break;
+      }
       case "tool_pending":
         // Early paint — render the batch the instant the model commits to
         // a tool call, BEFORE the intent judge / Smart Approvals verdict and
@@ -3311,6 +4119,9 @@ function createCoordinatorPane(root, wsId, opts) {
         // Reuses the --running placeholder (subtle accent rail, no actions)
         // the replay path already knows how to upgrade; the ``announce`` flag
         // only swaps the kicker to "Evaluating" while the judge runs.
+        (ev.items || []).forEach((it) => {
+          if (it.call_id) liveToolCalls.add(it.call_id);
+        });
         appendToolBatch(ev.items || [], {
           announce: true,
           running: true,
@@ -3332,6 +4143,9 @@ function createCoordinatorPane(root, wsId, opts) {
         // — the tool starts executing the moment auto-approval lands,
         // and the batch should show the same RUNNING indicator the
         // replay path renders for an unresolved committed turn.
+        (ev.items || []).forEach((it) => {
+          if (it.call_id) liveToolCalls.add(it.call_id);
+        });
         appendToolBatch(ev.items || [], { auto: true, running: true });
         break;
       // Child-workstream fan-out routed through the coordinator's own
@@ -4297,9 +5111,14 @@ function createCoordinatorPane(root, wsId, opts) {
     row.className = "task-row";
     row.setAttribute("role", "listitem");
     const status = task.status || "pending";
+    // Unknown values keep the neutral base chip rather than styling
+    // themselves — the allowlist is what stops a hand-edited status
+    // from injecting classes through `className`.
     const statusSpan = document.createElement("span");
-    statusSpan.className = "status status-" + status;
-    statusSpan.textContent = status;
+    statusSpan.className = taskStatusKnown(status)
+      ? "status status-" + status
+      : "status";
+    statusSpan.textContent = taskStatusLabel(status);
     const title = document.createElement("span");
     title.className = "title";
     title.textContent = task.title || "";
@@ -4307,6 +5126,12 @@ function createCoordinatorPane(root, wsId, opts) {
     head.appendChild(statusSpan);
     head.appendChild(title);
     row.appendChild(head);
+    if (task.note) {
+      const noteEl = document.createElement("div");
+      noteEl.className = "meta note";
+      noteEl.textContent = task.note;
+      row.appendChild(noteEl);
+    }
     if (task.child_ws_id && WS_ID_RE.test(task.child_ws_id)) {
       const link = document.createElement("div");
       link.className = "meta";
@@ -4919,6 +5744,10 @@ function createCoordinatorPane(root, wsId, opts) {
   // ------------------------------------------------------------------
 
   function _rewindToTurns(turns) {
+    // Deliberately busy-only, NOT latch-gated (#894 ruling): the caller
+    // passes an explicit turn count, so transcript staleness cannot
+    // corrupt it, and programmatic rewinds must keep working while a heal
+    // is pending.  The DOM-counting wrappers below carry the latch.
     if (busy) return;
     if (!Number.isInteger(turns) || turns < 1) return;
     authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/rewind", {
@@ -4932,7 +5761,14 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _rewindToMessage(msgEl) {
-    if (busy) return;
+    // busy || historyStale (#894, the #890 port): from clear_ui arrival
+    // until the next SUCCESSFUL refetchHistory render — the fetch window
+    // AND the failed-fetch aftermath — the visible transcript is the
+    // stale PRE-rewind DOM with busy false, so the .msg.user count below
+    // would over-rewind the already-restructured server conversation.
+    // The latch closes exactly that window; see historyStale's decl for
+    // the heal paths that reopen the affordances.
+    if (busy || historyStale) return;
     const userMsgs = messagesEl.querySelectorAll(".msg.user");
     const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
@@ -4941,6 +5777,10 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _retryLast() {
+    // Deliberately busy-only, NOT latch-gated (#894 ruling): no DOM count
+    // feeds this POST — /retry re-runs the server's own last turn, which
+    // is authoritative regardless of what the pane shows.  Mirrors
+    // interactive.js, whose retry is equally ungated.
     if (busy) return;
     authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/retry", {
       method: "POST",
@@ -4951,7 +5791,10 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _editAndResend(msgEl, newText) {
-    if (busy) return;
+    // busy || historyStale (#894): same stale-DOM hazard as
+    // _rewindToMessage — the turn count AND the _pendingEditSend latch
+    // would both bind to a transcript the server no longer has.
+    if (busy || historyStale) return;
     const userMsgs = messagesEl.querySelectorAll(".msg.user");
     const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
@@ -5003,7 +5846,11 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _startEdit(msgEl, originalText) {
-    if (busy) return;
+    // busy || historyStale (#894): entering edit mode on a stale row would
+    // let the user type into a message the pending re-render is about to
+    // replaceChildren away — and _editAndResend would refuse the submit
+    // anyway.  Gate at entry so the affordance and the action agree.
+    if (busy || historyStale) return;
     // Save current child nodes so Cancel can restore them.
     const savedNodes = [];
     while (msgEl.firstChild) {
@@ -5129,7 +5976,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // Skip retry when the most recent semantic turn is tool-only (last DOM
     // child is a .conv-batch construct); walk back past operator-context
     // rows first — the plain system bubble AND the structured watch-result /
-    // guard-finding / idle-children cards all carry .operator-context — so the
+    // guard-finding / idle-children / idle-tasks cards all carry .operator-context — so the
     // guard still fires when the tool turn carried a nudge / guard finding.
     // Keying on the shared marker (not any single card class) keeps the skip
     // correct as new card kinds are added. (Both personas now render the
@@ -5197,38 +6044,200 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   // Fetch /history and (re)render the message column from scratch.  Used for
-  // first paint AND for the clear_ui / replay_truncated re-render after a
-  // rewind/retry truncates the conversation.  The fetch is wrapped; the
+  // first paint, the clear_ui re-render after a rewind/retry truncates the
+  // conversation, and the truncated resync (via loadHistoryThenReconnect,
+  // which seeds the cursor and reconnects).  The fetch is wrapped; the
   // render runs after the clear so a render bug surfaces loudly instead of
   // masking as an empty pane.  The message column + tool-tracking state
-  // (toolRows / activeBatch, which the render rebuilds) reset up front so a
-  // mid-session re-render leaves no stale call_id→row mappings pointing at
-  // detached DOM.  On first paint they're already empty — harmless no-ops.
+  // (toolRows / activeBatch, which the render rebuilds) reset alongside the
+  // wipe — after the fetch guard — so a mid-session re-render leaves no stale
+  // call_id→row mappings pointing at detached DOM, while a FAILED fetch
+  // leaves both DOM and maps untouched.  On first paint they're already
+  // empty — harmless no-ops.
   async function refetchHistory(seedCursor = false) {
     let hist = null;
+    // Count the await window so the staleness heals can yield to an
+    // in-flight fetch (see refetchesInFlight's decl).  Only the fetch
+    // needs bracketing: the render below runs synchronously after the
+    // await, so no timer or SSE handler can observe the counter
+    // mid-render.  The seq stamp makes overlapping dispatches resolve
+    // last-dispatch-wins at the render-time gate.
+    const seq = ++refetchSeq;
+    refetchesInFlight++;
+    // Bound the await (r7): the counter and both heals gate on this
+    // fetch settling.  A /history that is accepted and never answered
+    // (wedged node, stalled response body) would otherwise pin
+    // refetchesInFlight above zero for the life of the page and every
+    // heal would yield forever — beyond the ruled settle-lag.  Same
+    // AbortController + flat-timeout shape as coordSend's /send bound;
+    // an abort lands in the catch, the latch survives, and the heals
+    // retry on later organic edges against a fresh attempt.
+    const histCtrl =
+      typeof AbortController === "function" ? new AbortController() : null;
+    if (histCtrl) histCtrls.add(histCtrl);
+    const histTimer = histCtrl
+      ? setTimeout(() => histCtrl.abort(), 15000)
+      : null;
     try {
       hist = await getJSON(
         "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
+        histCtrl ? { signal: histCtrl.signal } : undefined,
       );
     } catch (e) {
       console.warn("coord history fetch failed", e);
       hist = null;
+    } finally {
+      if (histTimer) clearTimeout(histTimer);
+      if (histCtrl) histCtrls.delete(histCtrl);
+      refetchesInFlight--;
     }
+    // A FAILED fetch keeps the pane intact: the wipe + tracking resets
+    // run only once a payload actually arrived.  (Pre-#882 the wipe ran
+    // before this guard, so a failed /history — likeliest during the
+    // restart windows that trigger truncated resyncs — left an EMPTY
+    // pane on a live stream with no retry record.  Stale-but-real
+    // content beats blank, and the tool-row/batch maps stay valid
+    // against the untouched DOM.  On the clear_ui caller a failure now
+    // shows the pre-rewind transcript instead of an empty pane — also
+    // stale-but-real; the rewound truth lands on the next successful
+    // refetch.)  Success ordering is unchanged: the wipe always ran
+    // after the await, never as immediate feedback.
+    if (!hist) return;
+    // RENDER-TIME gate (#894 r4, re-derived r5): the await above is a
+    // real window — pane state can change between a caller's fire-time
+    // checks and this render, and only THIS site can see across it
+    // (chokepoint, not per-caller guards).  The gate reads DOM-LIVE-STATE
+    // signals, never plain ``busy`` — that distinction is the r5 lesson:
+    // ``busy`` means "a turn is executing", not "this DOM holds live turn
+    // state", and the two diverge exactly where it hurt.  _editAndResend
+    // flips busy BEFORE its POST and /rewind emits only clear_ui (no
+    // state_change), so a busy term skipped the truncation render the
+    // rewind exists to produce and appended the resent bubble onto the
+    // PRE-rewind transcript; /retry's regenerated turn likewise raced its
+    // own clear_ui refetch.  A skipped render must only ever mean "the
+    // wipe would destroy live DOM" or "the paint would outrun the
+    // cursor":
+    //
+    // - seq (universal): a newer dispatch supersedes this payload
+    //   (last-DISPATCH-wins; see refetchSeq's decl).
+    // - content refs (universal): a live bubble ref means the stream is
+    //   mid-CONTENT — wiping detaches the node every remaining token
+    //   renders into.  Universal because skipping always beats
+    //   stranding a ref, and the seeded callers null their refs before
+    //   fetching anyway (loadHistoryThenReconnect explicitly; init
+    //   pre-connect), so this never blocks them.
+    // - SEEDLESS-only, because the seeded flows deliberately render
+    //   over/instead-of these states (keying on the seedCursor ARG, not
+    //   caller identity):
+    //   . liveToolCalls.size — a tool batch whose results are still
+    //     arriving on the live stream; wiping would orphan the rows the
+    //     stream keeps writing into.  EVENT-DRIVEN by construction (see
+    //     the decl): the r5 shape probed the DOM for
+    //     .conv-batch--running, but this render's own replay path
+    //     paints orphan batches (committed tool_calls, no persisted
+    //     result) with that same class and nothing ever strips a dead
+    //     orphan's — one orphan paint would poison every seedless heal
+    //     for the life of the page (the r6 find, REACHABLE per r7: a
+    //     hard crash leaves the orphan persisted — only graceful close
+    //     synthesizes a cancel result — and G6 proves the rewind
+    //     renders through the residue).  NOT activeBatch either — that is
+    //     the pending-APPROVAL tracker (the r5 re-derivation's first
+    //     mistake).  Liveness comes from the stream, never from DOM a
+    //     render can forge.  The SEEDED resync bypasses the term: after
+    //     a node dies mid-batch the render IS the recovery — the replay
+    //     adopts hist.cursor and rebuilds any genuinely live turn
+    //     (blocking that render wedged coord-restart outright, the r5
+    //     family-run find).
+    //   . busySource === "optimistic" — coordSend's pre-POST flip, the
+    //     one busy flavor that marks un-committed DOM (an optimistic
+    //     row the snapshot may not carry; see setBusy's contract).  The
+    //     seeded resync renders through it: dead-stream recovery
+    //     outranks a transient row, matching pre-#894 behavior.  The
+    //     clear_ui .then's edit-resend paints under plain "server" busy
+    //     instead; its narrower wipe window (a second actor's clear_ui
+    //     inside the resend's commit gap) is accepted — the resent
+    //     message re-appears at its turn's settle heal, and pre-#894
+    //     behavior there was an over-rewind.
+    //   . stream-OPENness — CONNECTING is NOT live (native
+    //     auto-reconnect keeps the handle with a frozen lastEventId and
+    //     a pending replay; painting past the cursor double-renders
+    //     when that replay lands; hide/suspend null the handle
+    //     outright).  The seeded flows own their reconnect and adopt
+    //     hist.cursor below.
+    //
+    // On every skip the staleness latch survives (clear is below), the
+    // affordance gate stays closed, and the next organic settle re-fires
+    // the backstop.  The callers' fire-time guards remain as the
+    // efficiency layer (skip the pointless fetch); THIS gate is the
+    // correctness carrier.
+    if (seq !== refetchSeq) return;
+    if (currentAssistantEl || currentReasoningEl) return;
+    if (
+      !seedCursor &&
+      (busySource === "optimistic" ||
+        liveToolCalls.size > 0 ||
+        !evtSource ||
+        evtSource.readyState !== EventSource.OPEN)
+    )
+      return;
     messagesEl.replaceChildren();
+    // A full committed-history render repairs any recorded truncation gap —
+    // whether this render came from the truncated resync itself or from an
+    // unrelated clear_ui rebuild — so it supersedes ALL pending repair
+    // intent in one place: the retry cursor (a LATER failed reload must not
+    // rewind onto a gap that no longer exists), the deferred mid-turn
+    // latch, and any still-pending jittered timer.  Leaving the latch or
+    // timer armed past a heal fired a phantom resync against the repaired
+    // gap — a false truncatedGaps bump plus a needless teardown, and on
+    // that redundant load's FAILED-fetch leg the cursor had been dropped
+    // with no record set, so the reconnect came back cursorless with
+    // nothing armed to re-cover the suspend window.  (Only a render clears
+    // any of these — a failed fetch returned above with the record intact,
+    // which is what arms the connect chokepoint's retry; and cancelling
+    // the timer here is safe precisely because the gap it was scheduled
+    // for was just rendered away.)
+    truncatedFromCursor = null;
+    pendingTruncatedResync = false;
+    if (truncatedResyncTimer) {
+      clearTimeout(truncatedResyncTimer);
+      truncatedResyncTimer = null;
+    }
+    // A successful full render also restores transcript truth: clear the
+    // staleness latch and cancel the pending heal retry (#894).  These sit
+    // HERE — below the ``if (!hist) return`` and beside the other repair
+    // clears, BEFORE the long render loop — so a FAILED fetch leaves the
+    // latch set (which is what arms the retry/backstop), while a mid-render
+    // throw doesn't re-close a pane whose replaceChildren already
+    // committed (a partially painted FRESH transcript at worst
+    // UNDER-counts, the safe direction).  The ONLY latch-clear site.
+    // Freshness layers (r9 accounting): a dispatch that PREDATES the
+    // latest clear_ui never reaches here at all — clear_ui always
+    // dispatches immediately after arriving, so a stale-epoch dispatch
+    // is also a stale-SEQ dispatch and the currency gate above discards
+    // it (an r8 epoch guard here was unreachable and was removed).  The
+    // remaining freshness hazard — a CURRENT dispatch joining a
+    // pre-rewind server flight — is closed server-side: the #884 flight
+    // key folds in the ws's truncation generation.
+    historyStale = false;
+    if (staleRetryTimer) {
+      clearTimeout(staleRetryTimer);
+      staleRetryTimer = null;
+    }
     toolRows.clear();
     activeBatch = null;
     renderedSystemEventIds.clear();
     resetCompactionHolder(compactionHolder);
-    if (!hist) return;
     // Fresh-connect fast-forward: when the trailing turn is an executing
     // in-flight tool batch the server can replay, /history returns a
     // non-null ``cursor`` and OMITS that turn. Seed ``lastEventId`` so the
-    // connectSSE on the initial-connect path (seedCursor=true) opens with
+    // connectSSE on the reconnecting paths (seedCursor=true: init first
+    // paint AND the truncated resync's loadHistoryThenReconnect) opens with
     // ?last_event_id= and the replay_ok delta rebuilds the in-flight turn
     // — otherwise the trimmed turn would be neither in /history nor
-    // replayed. The clear_ui / replay_truncated re-render callers leave
-    // seedCursor false: they run on a live stream and must NOT rewind
-    // lastEventId off the live position. Mirrors ui/static/app.js.
+    // replayed. The clear_ui re-render caller (the one remaining seedless
+    // live-stream caller) leaves seedCursor false: it runs on a live stream
+    // with no reconnect and must NOT rewind lastEventId off the live
+    // position. Mirrors ui/static/app.js.
     if (seedCursor && hist.cursor != null) lastEventId = hist.cursor;
     // Map call_id → tool name resolved from the most recent
     // assistant tool_calls.  Storage's `tool` rows carry only
@@ -5493,7 +6502,7 @@ function createCoordinatorPane(root, wsId, opts) {
         } else if (role === "system") {
           // First-class operator-context system turn — ``renderSystemTurn``
           // routes by ``m.source`` to the structured card (watch / guard /
-          // idle-children) or the operator bubble, reading ``m.meta`` from the
+          // idle-children / idle-tasks) or the operator bubble, reading ``m.meta`` from the
           // ``/history`` projection so replay matches the live render exactly.
           if (!content) return;
           renderSystemTurn(m.source || "", content, m.meta);
@@ -5506,7 +6515,8 @@ function createCoordinatorPane(root, wsId, opts) {
       }
     });
     // Attach the retry affordance to the last assistant turn on every render
-    // (first paint + clear_ui / replay_truncated re-render), matching the
+    // (first paint, the clear_ui re-render, and the truncated resync's
+    // rebuild via loadHistoryThenReconnect), matching the
     // interactive replayHistory() path. finishAssistantStream only covers the
     // live-turn-ends case — without this a reloaded or rewound coordinator
     // showed assistant turns with no retry button.
@@ -5519,7 +6529,8 @@ function createCoordinatorPane(root, wsId, opts) {
   function onLogin() {
     reconnectAttempts = 0;
     // connectSSE's closeStreamTransport prologue cancels any pending
-    // reconnect / degraded timers before dialling.
+    // transport retry timers (reconnect / degraded / truncated resync)
+    // before dialling.
     connectSSE();
   }
 
@@ -5527,8 +6538,30 @@ function createCoordinatorPane(root, wsId, opts) {
   // per-instance pane must release the stream + every timer/observer or a
   // backgrounded pane keeps an SSE open and fires renders into detached DOM.
   function destroy() {
-    // Stream + both retry timers (reconnect backoff, degraded catch-up).
+    // Stream + the retry timers (reconnect backoff, degraded catch-up,
+    // truncated resync).
     closeStreamTransport();
+    // The clear_ui-failure retry deliberately survives closeStreamTransport
+    // (transport-only redials keep the heal intent — see its decl), so it
+    // must die HERE, the terminal path: destroy() bumps no generation, and
+    // while the visHandler fire-time guard would render a post-destroy
+    // firing inert, a timer into a destroyed pane must be dead, not merely
+    // inert — it pins the closure for its remaining delay.
+    if (staleRetryTimer) {
+      clearTimeout(staleRetryTimer);
+      staleRetryTimer = null;
+    }
+    // Abort every in-flight /history for the same reason: the 15s bound
+    // alone would keep the detached pane's closure alive until it fired
+    // (the settled fetches' renders then discard via the !hist path).
+    histCtrls.forEach((c) => {
+      try {
+        c.abort();
+      } catch (_) {
+        /* noop */
+      }
+    });
+    histCtrls.clear();
     [
       cancelTimeoutId,
       forceTimeoutId,

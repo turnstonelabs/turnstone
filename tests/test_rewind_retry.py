@@ -77,7 +77,7 @@ class NullUI:
         pass
 
 
-def _make_session(tmp_db) -> ChatSession:
+def _make_session(tmp_db, ws_id: str | None = None) -> ChatSession:
     return ChatSession(
         client=MagicMock(),
         model="test-model",
@@ -86,6 +86,7 @@ def _make_session(tmp_db) -> ChatSession:
         temperature=0.5,
         max_tokens=4096,
         tool_timeout=30,
+        ws_id=ws_id,
     )
 
 
@@ -422,3 +423,57 @@ class TestRewindDBSync:
         assert len(db_msgs) == 2
         assert db_msgs[0]["content"] == "Hello"
         assert db_msgs[1]["content"] == "Hi!"
+
+
+def test_truncation_bumps_history_generation(tmp_db) -> None:
+    """#894: the /history single-flight keys on _history_generation, so a
+    truncation that DELETED storage rows must bump it — and a truncation
+    that could not delete (storage count unavailable/empty — the
+    error-path early returns) must NOT, because flights rebuild from
+    storage and an unbumped generation on error is the safe direction (a
+    stale-keyed flight reading post-delete rows is spuriously fresh; a
+    new-keyed flight reading pre-delete rows would be wrongly joinable).
+    The endpoint-level flight test mocks the counter, so this is the
+    PRODUCER pin: delete the bump in _persist_truncation and the first
+    arm fails while everything else stays green."""
+    from turnstone.core.storage import get_storage
+
+    storage = get_storage()
+    storage.register_workstream("ws-gen-pin", kind="interactive", user_id="test-user")
+    session = _make_session(tmp_db, ws_id="ws-gen-pin")
+    _populate_simple(session)
+    for role, content in (
+        ("user", "Hello"),
+        ("assistant", "Hi there!"),
+        ("user", "How are you?"),
+        ("assistant", "I'm fine."),
+    ):
+        storage.save_message("ws-gen-pin", role, content)
+
+    g0 = session._history_generation
+    assert session.rewind(1) > 0
+    assert session._history_generation == g0 + 1, (
+        "a storage-deleting rewind must bump the history generation"
+    )
+
+    # retry: re-persist the tail the rewind removed, then drop the last
+    # assistant turn.
+    storage.save_message("ws-gen-pin", "user", "How are you?")
+    storage.save_message("ws-gen-pin", "assistant", "I'm fine.")
+    _populate_simple(session)
+    g1 = session._history_generation
+    assert session.retry() is not None
+    assert session._history_generation == g1 + 1, (
+        "a storage-deleting retry must bump the history generation"
+    )
+
+    # Error-path arm: an in-memory-only session (no persisted rows — the
+    # count<=0 early return skips the delete) must NOT bump.
+    bare = _make_session(tmp_db)
+    _populate_simple(bare)
+    g2 = bare._history_generation
+    assert bare.rewind(1) > 0
+    assert bare._history_generation == g2, (
+        "a truncation that could not delete storage rows must leave the "
+        "generation unbumped (fail-safe direction)"
+    )

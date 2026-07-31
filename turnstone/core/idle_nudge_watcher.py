@@ -84,6 +84,8 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
     * nothing gate-eligible under ``WAKE_PENDING`` — tool-only/quiet entries
       belong to the next tool-result seam, not a synthetic empty user
       turn (``deliver_wake_nudge_from_queue`` would no-op on them).
+      ``"wake"``-channel entries (the coordinator idle nudges) ARE
+      gate-eligible: the wake is the only seam that can deliver them.
 
     Past the gates, exactly one info line is emitted per call:
 
@@ -161,9 +163,9 @@ class IdleNudgeWatcher:
     :func:`wake_workstream_if_pending` (the shared gate — see its
     docstring for the full gate order).  If the workstream's
     :class:`NudgeQueue` has any drainable entry for the wake's drain
-    gate (``WAKE_PENDING`` — channels ``"user"`` or ``"any"``), the
-    gate dispatches via ``session_worker.send`` with a no-op
-    ``enqueue`` callback.  Tool-only entries don't fire the wake —
+    gate (``WAKE_PENDING`` — channels ``"user"``, ``"any"`` or
+    ``"wake"``), the gate dispatches via ``session_worker.send`` with a
+    no-op ``enqueue`` callback.  Tool-only entries don't fire the wake —
     they belong to the next tool-result seam, not a synthetic empty
     user turn — otherwise every IDLE event with a queued tool advisory
     would spawn a wake daemon that immediately no-ops at

@@ -967,6 +967,33 @@ The default limit is 50% of the context window in characters (computed as
 
 This truncation message is visible to the model, so it knows output was cut.
 
+During the send loop the limit is additionally capped by the remaining
+context budget, and three guarantees apply when that budget reaches zero
+(#883):
+
+- **Structural floor** — orchestration handles (`spawn_workstream`,
+  `spawn_batch`, `wait_for_workstream`, `tasks`) and error results are
+  always admitted up to a guaranteed floor (2048 chars, head+tail beyond
+  it), because a lost `ws_id` or a masked failure wedges the session.
+- **Small-result pass** — results at or under the floor pass verbatim,
+  funded from a bounded per-batch grace pool (2× the floor) so a wide
+  batch of small results cannot collectively bypass budget accounting;
+  past the pool they get the drop notice instead.
+- **Honest drop notice** — a bulky non-structural result is replaced by an
+  explicit `Error: tool result dropped — context budget exhausted…` notice
+  stating the call ran but its output could not be admitted (never a
+  successful-looking trim).
+
+A zero budget also triggers one mid-turn auto-compaction before results are
+sized. With `max_tokens ≥ context_window/4` the response reserve zeroes the
+budget near 70% fullness — below the default 80% auto-compact threshold —
+and without this trigger a session could idle in that band indefinitely
+with every tool result floored or dropped. The trigger keys on the
+exhausted budget itself, not on any threshold, so it composes with any
+operator-set `auto_compact_pct`: with thresholds below the zero point the
+ordinary owed-compaction paths fire first and this trigger degrades to a
+backstop for the cases where they bailed or freed too little.
+
 ---
 
 ## Persistence

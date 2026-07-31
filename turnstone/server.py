@@ -22,6 +22,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import sys
 import textwrap
 import threading
@@ -1008,7 +1009,31 @@ async def global_events_sse(request: Request) -> Response:
 
     On connect, emits a ``node_snapshot`` event with the full node state
     (workstreams, health, aggregate) followed by real-time delta events.
-    The snapshot and listener registration are atomic — no events are lost.
+    Listener registration happens under the fan-out lock BEFORE the
+    snapshot is built (the O(workstreams) build must not stall the
+    fan-out thread), so no event is lost: a delta stamped while the
+    snapshot builds is both reflected in the (newer) snapshot and queued
+    behind it, and consumers absorb the double-representation because
+    the stream is state-of-world — app.js re-applies deltas over the
+    snapshot idempotently, the console collector rebuilds wholesale.
+    The visible cost is at most a transient stale tick during the build
+    window, healed by the next delta.
+
+    Resume contract (#881): every event's SSE ``id:`` is
+    ``"{boot_epoch}-{counter}"``, where ``boot_epoch`` is a per-process
+    nonce and ``counter`` is the process-local monotonic event id.  A
+    reconnect presenting a cursor (``Last-Event-ID`` header or
+    ``?last_event_id=``) whose epoch matches gets the ring replay
+    (``replay_ok`` past the counter, or a ``replay_truncated`` envelope
+    with ``reason="ring_evicted"`` when the ring has moved on); a cursor
+    from any other epoch — a prior boot, another node, a pre-#881
+    bare-int client — gets ``replay_truncated`` with
+    ``reason="boot_epoch"`` followed by a fresh ``node_snapshot``, since
+    the events it missed died with the process that minted it.
+    ``boot_epoch`` is not exclusively a foreign-epoch signal: a
+    same-epoch cursor over an EMPTY ring (impossible from our own ids —
+    forged or a bug) also draws it via the fail-safe branch below.  Clients
+    treat the cursor as an opaque string; only this handler parses it.
     """
     # -- Service-scope gate ---------------------------------------------------
     # The global stream carries cluster-wide workstream inventory across
@@ -1036,14 +1061,44 @@ async def global_events_sse(request: Request) -> Response:
     # Native EventSource sets the header on auto-reconnect; the
     # manual-reconnect path (which can't set custom headers on
     # ``new EventSource(url)``) uses the query-param fallback.
+    #
+    # Global ids are ``"{boot_epoch}-{counter}"`` (#881): the epoch half
+    # proves the cursor was minted by THIS process.  The counter reboots
+    # at 0 with the process, so without the epoch a pre-restart cursor is
+    # first invisibly "ahead" of the reborn ring (empty replay slice) and
+    # then, as the counter re-grows past it, aliases into the new id
+    # space — both draw ``replay_ok`` and silently skip the restart
+    # boundary.  Parse outcomes:
+    #   - no cursor            → ``last_event_id = None`` (fresh);
+    #   - epoch matches        → ``last_event_id = counter`` (ring logic);
+    #   - anything else        → ``cursor_stale = True`` (a cursor was
+    #     presented but is unusable: prior-boot epoch, another node's
+    #     epoch, a bare-int cursor from a pre-#881 client, or garbage)
+    #     → the ``replay_truncated`` + node_snapshot floor below.  A
+    #     present-but-unusable cursor must NOT fall back to ``fresh``:
+    #     fresh is the no-loss shape, and this caller has provably
+    #     lost the events between its cursor and this boot.
+    boot_epoch: str = request.app.state.global_boot_epoch
     last_event_id_raw = request.headers.get("Last-Event-ID") or request.query_params.get(
         "last_event_id"
     )
-    last_event_id: int | None
-    try:
-        last_event_id = int(last_event_id_raw) if last_event_id_raw else None
-    except (TypeError, ValueError):
-        last_event_id = None
+    last_event_id: int | None = None
+    cursor_stale = False
+    if last_event_id_raw:
+        cursor_epoch, sep, counter_raw = last_event_id_raw.partition("-")
+        if sep and cursor_epoch == boot_epoch:
+            try:
+                last_event_id = int(counter_raw)
+            except ValueError:
+                cursor_stale = True
+            else:
+                if last_event_id < 0:
+                    # Our counters start at 1; a negative counter can
+                    # only be forged.  Same floor as garbage.
+                    last_event_id = None
+                    cursor_stale = True
+        else:
+            cursor_stale = True
 
     # -- Atomic snapshot / replay-slice + listener registration ---------------
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
@@ -1053,50 +1108,93 @@ async def global_events_sse(request: Request) -> Response:
         request.app.state.global_event_buffer
     )
 
-    # Three replay shapes, matching :func:`make_events_handler`:
+    # Four replay shapes (the first three matching :func:`make_events_handler`):
     #   - ``last_event_id is None`` → ``"fresh"``: emit node_snapshot
     #     then live.
     #   - ``last_event_id`` + buffer covers gap → ``"replay_ok"``:
     #     emit buffered events past the id, SKIP node_snapshot, then
     #     live.
-    #   - ``last_event_id`` + buffer too short → ``"truncated"``: emit
-    #     a ``replay_truncated`` envelope then fall through to
-    #     ``"fresh"`` (node_snapshot is the recovery floor).
+    #   - ``last_event_id`` + buffer too short → ``"truncated"``
+    #     (``reason="ring_evicted"``, honest ``lost_count``): emit a
+    #     ``replay_truncated`` envelope then fall through to ``"fresh"``
+    #     (node_snapshot is the recovery floor).
+    #   - ``cursor_stale`` (#881) → ``"truncated"``
+    #     (``reason="boot_epoch"``): the cursor is from another boot —
+    #     the prior ring died with its process, so what was lost is
+    #     unknowable; the envelope omits ``lost_count`` /
+    #     ``earliest_available_id`` rather than guess.  The per-ws
+    #     stream never needs this arm: its counter is storage-seeded
+    #     across restarts, so plain counter comparison detects staleness
+    #     there (see ``register_listener_with_replay``); the global
+    #     counter is process-local and reboots at 0, hence the epoch.
     replay_status: str
+    truncated_reason = "ring_evicted"
     replay_events: list[dict[str, Any]] = []
     lost_count = 0
     earliest_available_id = 0
     snapshot: dict[str, Any] | None = None
 
     with listeners_lock:
-        if last_event_id is None:
+        if cursor_stale:
+            replay_status = "truncated"
+            truncated_reason = "boot_epoch"
+        elif last_event_id is None:
             replay_status = "fresh"
-            snapshot = _build_node_snapshot(request.app.state)
         else:
             buffered = list(event_buffer)
             if not buffered:
-                replay_status = "replay_ok"
+                # Same-epoch cursor against an empty ring is impossible
+                # by construction (ids are only minted by the fanout
+                # thread's single append site, first id 1, and the ring
+                # is never cleared — an id implies a non-empty ring), so
+                # a cursor landing here is forged or a bug.  Fail SAFE
+                # to the truncated floor: the snapshot rebuild is
+                # idempotent, whereas trusting the cursor would replay
+                # nothing and ghost the roster (#881's original lie).
+                replay_status = "truncated"
+                truncated_reason = "boot_epoch"
             else:
                 earliest_available_id = buffered[0][0]
                 if last_event_id < earliest_available_id - 1:
                     replay_status = "truncated"
                     lost_count = (earliest_available_id - 1) - last_event_id
-                    snapshot = _build_node_snapshot(request.app.state)
                 else:
                     replay_status = "replay_ok"
                     replay_events = [ev for eid, ev in buffered if eid > last_event_id]
         listeners.append(client_queue)
 
+    def _deregister() -> None:
+        """Remove this connection's queue from the fan-out list.
+
+        Idempotent (``in`` check under the lock).  Two owners share it:
+        the generator's ``finally`` on every stream exit, and the
+        registration-window guard below for exits that fire before the
+        generator exists.
+        """
+        with listeners_lock:
+            if client_queue in listeners:
+                listeners.remove(client_queue)
+
     async def event_generator() -> AsyncGenerator[dict[str, Any], None]:
         _metrics.record_sse_connect()
 
         def _format_event(event: dict[str, Any]) -> dict[str, str]:
-            """Strip ``_event_id`` from the wire dict, attach SSE ``id:``."""
+            """Strip ``_event_id`` from the wire dict, attach SSE ``id:``.
+
+            The id is ``"{boot_epoch}-{counter}"`` — GLOBAL-LANE ONLY
+            (#881).  Do not propagate the epoch tag to the per-ws
+            formatter in ``make_events_handler``: per-ws ids must stay
+            bare ints — their counter is storage-seeded across restarts
+            (epoch unnecessary), clients seed cursors from ``/history``'s
+            integer ``cursor``, and coordinator.js's counter-reset
+            detector does ``Number(event.lastEventId)`` comparisons that
+            an epoch prefix would turn into ``NaN`` and silently kill.
+            """
             ev_copy = dict(event)
             eid = ev_copy.pop("_event_id", None)
             out: dict[str, str] = {"data": json.dumps(ev_copy)}
             if eid is not None:
-                out["id"] = str(eid)
+                out["id"] = f"{boot_epoch}-{eid}"
             return out
 
         try:
@@ -1106,15 +1204,23 @@ async def global_events_sse(request: Request) -> Response:
             yield {"retry": random.randint(2500, 4500)}
 
             if replay_status == "truncated":
-                yield {
-                    "data": json.dumps(
-                        {
-                            "type": "replay_truncated",
-                            "lost_count": lost_count,
-                            "earliest_available_id": earliest_available_id,
-                        }
-                    )
+                # ``reason`` distinguishes an in-epoch ring overrun
+                # (``ring_evicted`` — ``lost_count`` /
+                # ``earliest_available_id`` are honest) from a
+                # cross-boot cursor (``boot_epoch`` — the prior ring
+                # died with its process, so the loss is unknowable and
+                # the numeric fields are OMITTED rather than invented).
+                # No first-party consumer reads the numeric fields
+                # (app.js reads only ``type`` and resyncs), so the
+                # conditional shape is wire-safe.
+                envelope: dict[str, Any] = {
+                    "type": "replay_truncated",
+                    "reason": truncated_reason,
                 }
+                if truncated_reason == "ring_evicted":
+                    envelope["lost_count"] = lost_count
+                    envelope["earliest_available_id"] = earliest_available_id
+                yield {"data": json.dumps(envelope)}
             if replay_status == "replay_ok":
                 for ev in replay_events:
                     yield _format_event(ev)
@@ -1139,11 +1245,62 @@ async def global_events_sse(request: Request) -> Response:
                     pass  # poll timeout, retry
         finally:
             _metrics.record_sse_disconnect()
-            with listeners_lock:
-                if client_queue in listeners:
-                    listeners.remove(client_queue)
+            _deregister()
 
-    return EventSourceResponse(event_generator(), ping=5)
+    # Registration-window guard (#881 round-2 review): from the append
+    # above until the return below, THIS frame owns the listener — the
+    # generator's ``finally`` (the normal owner) cannot run before the
+    # generator exists, so any exit in this window must de-register or
+    # the queue leaks into the fan-out loop forever (the fan-out thread
+    # never removes dead listeners; pre-#881 the append was the LAST
+    # statement of the locked block precisely so a raising snapshot
+    # build could not strand it).  Everything that can raise lives
+    # inside the try — the snapshot build (storage reads + per-ws
+    # locks), the log call, and response construction; the two ``def``s
+    # above are pure bindings and cannot.  ``BaseException``: the
+    # window is await-free today, so a cancellation cannot land inside
+    # it, but the guard must not silently narrow if a future edit
+    # introduces an await.  Ownership passes to the generator's
+    # ``finally`` once the return succeeds.
+    try:
+        if replay_status != "replay_ok":
+            # Snapshot built AFTER the lock: ``_build_node_snapshot``
+            # is an O(workstreams) walk taking each ws's ``_ws_lock``,
+            # and under ``global_listeners_lock`` it would stall the
+            # fanout thread's per-event stamping for EVERY listener —
+            # N-fold during a restart herd of stale-cursor reconnects,
+            # exactly when the reborn node is emitting its re-open
+            # events.  Registration already happened under the lock
+            # above, so every event from that instant on is queued to
+            # this listener: nothing is lost, and deltas stamped while
+            # the snapshot builds re-apply idempotently over the
+            # (newer) snapshot at the consumer (state-of-world
+            # contract — see the endpoint docstring).  ``replay_ok``
+            # is by design exactly the no-snapshot shape (truncated
+            # always carries the snapshot floor, fresh always
+            # snapshots), so this predicate and the generator's
+            # emission branch stay one rule.
+            snapshot = _build_node_snapshot(request.app.state)
+
+        if replay_status == "truncated":
+            # Envelope chokepoint log, analog of
+            # ``ws.events.replay_truncated`` on the per-ws lane — one
+            # line per gap detection, the operator signal that clients
+            # are being told to resync (a burst of ``reason=boot_epoch``
+            # right after startup is the restart herd healing; sustained
+            # ``reason=ring_evicted`` means the ring cap is being
+            # outrun).
+            log.info(
+                "global.events.replay_truncated",
+                reason=truncated_reason,
+                lost_count=lost_count if truncated_reason == "ring_evicted" else None,
+                cursor=(last_event_id_raw or "")[:64],
+            )
+
+        return EventSourceResponse(event_generator(), ping=5)
+    except BaseException:
+        _deregister()
+        raise
 
 
 async def dashboard(request: Request) -> JSONResponse:
@@ -4211,14 +4368,19 @@ def _aggregate_emitter_thread(
     mgr: SessionManager,
     global_queue: queue.Queue[dict[str, Any]],
     interval: float = 10.0,
+    stop: threading.Event | None = None,
 ) -> None:
     """Periodically emit aggregate token/tool_call totals on the global SSE queue.
 
     Runs as a daemon thread so the console receives periodic updates without
-    having to poll ``/v1/api/dashboard``.
+    having to poll ``/v1/api/dashboard``.  ``stop`` (#885) is the lifespan
+    shutdown signal — ``wait(interval)`` doubles as the tick sleep, so a
+    set wakes the thread immediately instead of stranding shutdown behind
+    a sleep.
     """
-    while True:
-        time.sleep(interval)
+    if stop is None:
+        stop = threading.Event()
+    while not stop.wait(interval):
         total_tokens = 0
         total_tool_calls = 0
         active_count = 0
@@ -4255,6 +4417,7 @@ def _idle_cleanup_thread(
     timeout_sec: float,
     global_queue: queue.Queue[dict[str, Any]],
     rate_limiter: Any = None,
+    stop: threading.Event | None = None,
 ) -> None:
     """Periodically close IDLE workstreams and clean up rate limiter buckets.
 
@@ -4263,14 +4426,27 @@ def _idle_cleanup_thread(
     ``reason="closed"``. The old manual emission here (``reason="idle"``)
     is gone — the frontend didn't differentiate "idle" from "closed"
     anyway and the duplicate event caused spurious UI flicker.
+
+    ``stop`` (#885): lifespan shutdown signal, same ``wait``-as-sleep
+    pattern as :func:`_aggregate_emitter_thread`.
     """
     del global_queue  # adapter handles the emission
+    if stop is None:
+        stop = threading.Event()
     check_every = min(300.0, timeout_sec / 4)  # check at 1/4 of timeout, max 5 min
-    while True:
-        time.sleep(check_every)
+    while not stop.wait(check_every):
         mgr.close_idle(timeout_sec)
         if rate_limiter is not None:
             rate_limiter.cleanup()
+
+
+# Shutdown sentinel for ``_global_fanout_thread`` (#885): the lifespan
+# puts THIS object on the global queue and the thread exits when it draws
+# it.  Identity-checked (``is``), so an event that merely equals it can't
+# spoof a shutdown; dict-typed so the queue's type stays honest.  FIFO
+# gives clean drain semantics — everything enqueued before the sentinel
+# still stamps + fans out.
+_FANOUT_SHUTDOWN: dict[str, Any] = {"type": "_fanout_shutdown"}
 
 
 def _global_fanout_thread(
@@ -4291,10 +4467,14 @@ def _global_fanout_thread(
     event lands in ONLY the buffer or ONLY the listener queue across
     the registration boundary.  Mirrors :meth:`SessionUIBase._enqueue`'s
     contract for the global lane.
+
+    Exits when it draws :data:`_FANOUT_SHUTDOWN` from the queue (#885).
     """
     while True:
         try:
             event = source_queue.get()
+            if event is _FANOUT_SHUTDOWN:
+                return
             with lock:
                 counter_holder[0] += 1
                 event_id = counter_holder[0]
@@ -4319,6 +4499,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Dedicated executor for SSE queue polling so it doesn't compete
     # with the default asyncio executor (which caps at ~32 workers).
     app.state.sse_executor = ThreadPoolExecutor(max_workers=200, thread_name_prefix="sse")
+    # Lifespan daemon-thread shutdown (#885): one shared Event for the
+    # sleep-loop threads plus the queue sentinel for the fanout; refs
+    # kept so the shutdown tail below can join them.  ``daemon=True``
+    # stays — it is the backstop if a join times out, not the shutdown
+    # mechanism.
+    daemon_stop = threading.Event()
     # Start global event fan-out thread
     fanout = threading.Thread(
         target=_global_fanout_thread,
@@ -4336,10 +4522,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     agg_emitter = threading.Thread(
         target=_aggregate_emitter_thread,
         args=(app.state.workstreams, app.state.global_queue),
+        kwargs={"stop": daemon_stop},
         daemon=True,
     )
     agg_emitter.start()
     # Start idle cleanup thread if configured
+    cleanup: threading.Thread | None = None
     if app.state.idle_timeout > 0:
         cleanup = threading.Thread(
             target=_idle_cleanup_thread,
@@ -4349,6 +4537,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 app.state.global_queue,
                 app.state.rate_limiter,
             ),
+            kwargs={"stop": daemon_stop},
             daemon=True,
         )
         cleanup.start()
@@ -4567,6 +4756,26 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.oidc import close_oidc_state
 
     await close_oidc_state(app.state)
+    # Stop the lifespan daemon threads (#885).  Sessions are already
+    # closed above, so their final ws_closed events sit ahead of the
+    # sentinel in the queue and still fan out (FIFO drain); the Event
+    # wakes the sleep-loop threads immediately.  Joins are bounded and
+    # off-loop; a thread that outlives its budget is logged and left to
+    # the daemon flag rather than wedging shutdown.
+    daemon_stop.set()
+    # The sentinel put stays inline (unlike the off-loop joins below): the
+    # fanout consumer is still alive here — it exits only on drawing this
+    # sentinel — and fans out with non-blocking put_nowait, so the bounded
+    # queue drains fast and put() returns at once; timeout=1 is a ceiling
+    # that never binds. Off-loop is reserved for the multi-second joins.
+    with contextlib.suppress(queue.Full):
+        app.state.global_queue.put(_FANOUT_SHUTDOWN, timeout=1)
+    for _t in (fanout, agg_emitter, cleanup):
+        if _t is None:
+            continue
+        await asyncio.to_thread(_t.join, 5)
+        if _t.is_alive():
+            log.warning("server.daemon_thread_join_timeout", thread=_t.name)
     app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
 
 
@@ -4961,6 +5170,23 @@ def create_app(
     # Single-element list as a mutable int holder so the fanout
     # thread can ``counter_holder[0] += 1`` under the lock.
     app.state.global_event_id_holder = [0]
+    # Per-process boot epoch for the global SSE lane (#881).  The
+    # counter above reboots at 0 with the process (unlike the per-ws
+    # counters, which ``_seed_event_id_from_storage`` seeds from
+    # ``MAX(conversations.event_id)``), so a bare integer cursor from a
+    # prior boot is indistinguishable from — and eventually aliases
+    # into — the new id space.  Every global SSE ``id:`` is therefore
+    # stamped ``"{epoch}-{counter}"``; a reconnect cursor whose epoch
+    # differs from the live process is stale by construction and draws
+    # the ``replay_truncated`` + node_snapshot recovery floor in
+    # :func:`global_events_sse`.  Hex nonce (never contains ``-``), so
+    # ``partition("-")`` splits the id unambiguously.  64 bits: the
+    # equality check is the ONLY thing standing between a prior-boot
+    # cursor and a silent ``replay_ok``-empty alias, and the collision
+    # event is per same-node restart-pair — 2^-64 keeps a
+    # fleet-lifetime of restarts engineered far below threshold where
+    # 32 bits left it merely unlikely (review round 4).
+    app.state.global_boot_epoch = secrets.token_hex(8)
     app.state.skip_permissions = skip_permissions
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage

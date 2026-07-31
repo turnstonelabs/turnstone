@@ -30,6 +30,42 @@ export const DEGRADED_COOLDOWN_MAX_MS = 120000;
 // top-of-ladder trips exceed the window and oscillate the cooldown back to
 // base — the escalation must survive its own backoff.
 export const DEGRADED_COOLDOWN_RESET_MS = 300000;
+// Random 0..this spread before a truncated-triggered /history resync starts.
+// The truncated envelope is herd-shaped: a node restart makes EVERY open tab
+// with a stale cursor reconnect inside the EventSource retry jitter
+// (2.5-4.5 s) and — since empty-ring reconnects now report truncated instead
+// of a silent replay_ok — each one answers with a full /history fetch.  The
+// per-tab churn limiter can't see the cross-tab herd (one resync per tab
+// never trips it), so the spread happens client-side, before the fetch.
+// During the wait the pane keeps painting live events (the gap predates the
+// resync either way), so the only cost is a delayed backfill.  If restart
+// herds ever measure hot despite the spread, the deeper complement is
+// server-side /history coalescing/rate-limiting (#884) — a node-side
+// change, not a bigger jitter: the spread lowers the peak but not the
+// total per-restart fetch count.
+export const TRUNCATED_RESYNC_JITTER_MS = 10000;
+
+// Spread for the clear_ui staleness retry, ADDITIVE over STALE_RETRY_BASE_MS
+// (`STALE_RETRY_BASE_MS + Math.random() * this`).  One clear_ui fans out to every listener
+// on the workstream, so an un-spread retry makes N tabs re-fetch /history in
+// near-lockstep — and #900 widened that arm: a render the cursor-safety gate
+// declines now leaves the latch set, so a SUCCESSFUL fetch can arm the retry
+// too, and the decline trigger (transport down) is itself herd-shaped.
+//
+// Deliberately small, and deliberately NOT TRUNCATED_RESYNC_JITTER_MS: this
+// spread works AGAINST #884's `(ws_id, limit, generation)` single-flight,
+// which coalesces a lockstep herd into one reconstruction.  Spreading past a
+// typical flight duration de-coalesces it — lower peak, higher total. 500 ms
+// keeps the window comparable to a flight while still breaking lockstep.
+// The floor is load-bearing for the e2e non-occurrence detectors (they size
+// their windows on floor + this); raising either requires widening those.
+export const STALE_RETRY_JITTER_MS = 500;
+
+// The floor the jitter is additive OVER.  Exported rather than left as a
+// literal in each client because FOUR sites must move together: both panes'
+// retry arms and both e2e non-occurrence windows, which size themselves on
+// floor + jitter and go vacuous if the retry can fire before they open.
+export const STALE_RETRY_BASE_MS = 2000;
 
 // Rolling-window trip check.  Prunes `times` in place (entries older than
 // windowMs against nowMs) and reports whether count-or-more remain.  A

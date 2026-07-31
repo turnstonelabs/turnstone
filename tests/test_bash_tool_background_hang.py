@@ -128,6 +128,72 @@ def test_stdout_streams_to_ui_from_drain_thread():
     assert any("streamed-line" in c for c in chunks)
 
 
+def test_leaked_drain_stops_emitting_chunks_after_return(tmp_path):
+    """A double-``setsid`` grandchild escapes the session-group kill and
+    holds the stdout pipe open past the drain join (``bash.drain_leaked``)
+    — the leaked drain thread must STOP forwarding chunks to the UI once
+    ``_exec_bash`` returns (the ``emit_done`` gate).  Without the gate,
+    its lines land in later turns' panes: the UI batches per call_id,
+    some providers reuse call_ids across turns, and the client grafts
+    stray chunks under the completed row.
+
+    The grandchild's writer loop is time-bounded (~8s) so even a failed
+    cleanup cannot outlive the test session, and the finally kills it so
+    the drain thread hits EOF before the leaked-thread guard sweeps.
+    """
+    pidfile = str(tmp_path / "leak.pid")
+    chunks: list[str] = []
+
+    class RecordingUI(NullUI):
+        def on_tool_output_chunk(self, call_id, chunk):
+            chunks.append(chunk)
+
+    session = make_session(tool_timeout=30, ui=RecordingUI())
+    # setsid detaches the grandchild from the session group (killpg
+    # misses it); it inherits our stdout pipe and keeps writing.
+    command = (
+        f"setsid bash -c 'echo $$ > {pidfile}; "
+        "for i in $(seq 1 80); do echo leak-$i; sleep 0.1; done' & echo fg-done"
+    )
+    leak_pid = None
+    try:
+        finished, result = _run_in_thread(
+            lambda: session._exec_bash({"call_id": "c1", "command": command}),
+            timeout=20,
+        )
+        assert finished, "_exec_bash hung on the escaped grandchild"
+        assert result is not None
+        _call_id, output = result
+        assert "fg-done" in output
+        # The call has RETURNED (gate set).  The grandchild is still
+        # writing; give its lines time to traverse the leaked drain.
+        seen_at_return = len(chunks)
+        time.sleep(1.0)
+        # ``<= +1``: the gate documents a one-line residual race (a line
+        # already past the is_set() check when the event sets).  A broken
+        # gate keeps forwarding ~10 lines/sec and still fails loudly.
+        assert len(chunks) <= seen_at_return + 1, (
+            "leaked drain thread kept forwarding chunks to the UI after "
+            "the tool returned — the emit_done gate is not holding"
+        )
+    finally:
+        deadline = time.monotonic() + 5
+        while leak_pid is None and time.monotonic() < deadline:
+            try:
+                with open(pidfile) as f:
+                    leak_pid = int(f.read().strip())
+            except (FileNotFoundError, ValueError):
+                time.sleep(0.05)
+        if leak_pid is not None:
+            _kill_pid(leak_pid)
+            # Let the drain thread hit EOF before the leaked-thread
+            # guard sweeps the test's thread table.
+            deadline = time.monotonic() + 5
+            while _pid_alive(leak_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            time.sleep(0.2)
+
+
 def test_cancel_midbash_reports_unknown():
     """An external ``cancel()`` during a running bash unblocks the process-bounded
     wait and reports UNKNOWN (unknown-never-none), not a clean result."""
