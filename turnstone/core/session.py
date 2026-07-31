@@ -1880,6 +1880,7 @@ class ChatSession:
                 always_on_names=builtin_in_session,
                 max_results=tool_search_max_results,
                 reranker=self._bm25_reranker(),
+                status_provider=self._mcp_status_snapshot,
             )
         # Converge with any MCP catalog change that fired during
         # construction: a listener callback landing between the
@@ -2931,12 +2932,28 @@ class ChatSession:
                 always_on_names=set(BUILTIN_TOOL_NAMES),
                 max_results=self._tool_search_max_results,
                 reranker=self._bm25_reranker(),
+                status_provider=self._mcp_status_snapshot,
             )
             # Restore previously expanded tools that still exist
             if old_expanded:
                 self._tool_search.expand_visible(old_expanded)
         else:
             self._tool_search = None
+
+    def _mcp_status_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Per-server MCP status for this session's user, consumed by
+        ``ToolSearchManager`` to flag unavailable servers in search results.
+
+        Returns ``{}`` when no MCP client is bound or the lookup fails — the
+        advisory then simply stays silent rather than breaking tool search.
+        """
+        client = self._mcp_client
+        if client is None:
+            return {}
+        try:
+            return client.get_all_server_status(self._mcp_user_id)
+        except Exception:
+            return {}
 
     def set_watch_runner(self, runner: Any, wake_fn: Callable[[], object] | None = None) -> None:
         """Inject the server-level WatchRunner and register a dispatch fn

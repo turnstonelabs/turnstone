@@ -8,6 +8,7 @@ from turnstone.core.tool_search import (
     BM25Index,
     ToolSearchManager,
     _mcp_server_summary,
+    _status_reason,
     _tokenize,
     _tool_name,
 )
@@ -254,6 +255,156 @@ class TestToolSearchManagerReranking:
 # ---------------------------------------------------------------------------
 # Helper function tests
 # ---------------------------------------------------------------------------
+
+
+class TestToolSearchTruncation:
+    """search() records the full match count so format_search_results can
+    report honest truncation instead of silently dropping matches."""
+
+    @pytest.fixture()
+    def manager(self):
+        # Every name shares the ``mcp`` token, so a search for "mcp" matches
+        # all six deferred tools — more than max_results=3.
+        mcp_tools = [
+            _make_tool("mcp__github__create_issue", "Create a new GitHub issue"),
+            _make_tool("mcp__github__list_issues", "List GitHub issues"),
+            _make_tool("mcp__github__get_repo", "Get repository details"),
+            _make_tool("mcp__slack__send_message", "Send a Slack message"),
+            _make_tool("mcp__slack__list_channels", "List Slack channels"),
+            _make_tool("mcp__jira__create_ticket", "Create a Jira ticket"),
+        ]
+        return ToolSearchManager(mcp_tools, always_on_names=set(), max_results=3)
+
+    def test_search_records_total_matched(self, manager):
+        results = manager.search("mcp")
+        assert len(results) == 3
+        assert manager._last_total_matched == 6
+
+    def test_format_reports_truncation(self, manager):
+        results = manager.search("mcp")
+        text = manager.format_search_results(results)
+        assert "Showing the top 3 of 6" in text
+
+    def test_no_truncation_note_when_all_returned(self, manager):
+        results = manager.search("jira")  # matches only the jira tool
+        text = manager.format_search_results(results)
+        assert "Showing the top" not in text
+        assert "Found 1" in text
+
+    def test_truncation_excludes_already_expanded_from_total(self, manager):
+        # Expanding one match shrinks the reported total (only genuinely-new
+        # matches count), so "of N" never over-promises tools already loaded.
+        manager.expand_visible(["mcp__github__create_issue"])
+        manager.search("mcp")
+        assert manager._last_total_matched == 5
+
+
+class TestToolSearchUnavailableAdvisory:
+    """A down/unauthorized server is surfaced, never silently treated as
+    'no such tool'. Driven by the injected status_provider."""
+
+    def _mgr(self, tools, status):
+        return ToolSearchManager(
+            tools, always_on_names=set(), status_provider=lambda: status
+        )
+
+    def test_empty_results_with_outage_explains_outage(self):
+        mgr = self._mgr(
+            [_make_tool("mcp__dhcp__GetLease", "Get a dhcp lease")],
+            {"DHCP-MCP": {"error": "500 app failed to start"}},
+        )
+        text = mgr.format_search_results(mgr.search("nonexistent_capability_xyz"))
+        assert "unavailable" in text.lower() or "outage" in text.lower()
+        assert "DHCP-MCP" in text
+        assert "500 app failed to start" in text
+        # Must NOT give the misleading "try a different query" line alone.
+        assert text != "No matching tools found. Try a different search query."
+
+    def test_advisory_appended_when_results_present(self):
+        mgr = self._mgr(
+            [
+                _make_tool("mcp__github__create_issue", "Create a github issue"),
+                _make_tool("mcp__dhcp__GetLease", "Get a dhcp lease"),
+            ],
+            {"DHCP-MCP": {"discovery_error": "500 app failed"}},
+        )
+        text = mgr.format_search_results(mgr.search("github"))
+        assert "Found 1" in text
+        assert "currently unavailable" in text
+        assert "DHCP-MCP" in text
+        assert "tool discovery failed" in text
+
+    def test_circuit_open_flagged(self):
+        mgr = self._mgr(
+            [_make_tool("mcp__x__t", "thing")],
+            {"X": {"circuit_open": True}},
+        )
+        text = mgr.format_search_results([])
+        assert "circuit breaker open" in text
+
+    def test_healthy_server_not_flagged(self):
+        mgr = self._mgr(
+            [_make_tool("mcp__github__create_issue", "Create a github issue")],
+            {"github": {"connected": True, "error": "", "circuit_open": False}},
+        )
+        text = mgr.format_search_results(mgr.search("github"))
+        assert "unavailable" not in text.lower()
+
+    def test_unprimed_server_not_flagged(self):
+        # connected=False with no error is "not reached yet", not an outage —
+        # flagging it would cry wolf on every server the user hasn't touched.
+        mgr = self._mgr(
+            [_make_tool("mcp__github__create_issue", "Create a github issue")],
+            {"github": {"connected": False, "error": "", "circuit_open": False}},
+        )
+        text = mgr.format_search_results(mgr.search("github"))
+        assert "unavailable" not in text.lower()
+
+    def test_no_status_provider_is_legacy_behaviour(self):
+        mgr = ToolSearchManager(
+            [_make_tool("mcp__github__create_issue", "Create a github issue")],
+            always_on_names=set(),
+        )
+        assert (
+            mgr.format_search_results([])
+            == "No matching tools found. Try a different search query."
+        )
+        text = mgr.format_search_results(mgr.search("github"))
+        assert "unavailable" not in text.lower()
+
+    def test_status_provider_error_is_swallowed(self):
+        def boom():
+            raise RuntimeError("status backend down")
+
+        mgr = ToolSearchManager(
+            [_make_tool("mcp__github__create_issue", "Create a github issue")],
+            always_on_names=set(),
+            status_provider=boom,
+        )
+        # A broken provider must never break tool search itself.
+        text = mgr.format_search_results(mgr.search("github"))
+        assert "Found 1" in text
+
+
+class TestStatusReason:
+    def test_circuit_open(self):
+        assert _status_reason({"circuit_open": True}) == "circuit breaker open"
+
+    def test_error_text(self):
+        assert "500 boom" in _status_reason({"error": "500 boom"})
+
+    def test_discovery_error(self):
+        reason = _status_reason({"discovery_error": "TimeoutError: pool discovery"})
+        assert "discovery" in reason.lower()
+
+    def test_healthy_is_empty(self):
+        assert _status_reason({"connected": True, "error": "", "circuit_open": False}) == ""
+
+    def test_circuit_takes_precedence_over_error(self):
+        assert (
+            _status_reason({"circuit_open": True, "error": "boom"})
+            == "circuit breaker open"
+        )
 
 
 class TestMCPServerSummary:

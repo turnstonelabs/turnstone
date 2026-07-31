@@ -677,6 +677,13 @@ class MCPClientManager:
         self._db_managed: set[str] = set()
         # Per-server last-error tracking (set on failure, cleared on success)
         self._last_error: dict[str, str] = {}
+        # Per-server last tool-DISCOVERY error for pool (oauth_user / oauth_obo)
+        # servers: set when a prime/connect raises during discovery (transport,
+        # 5xx, timeout), cleared on the next successful pool connect. Surfaced
+        # via get_server_status(...)["discovery_error"] so a swallowed discovery
+        # failure (e.g. a 500 from the MCP endpoint) is visible instead of the
+        # server silently contributing zero tools to the catalog.
+        self._pool_discovery_error: dict[str, str] = {}
         self._MAX_ERROR_LEN = 256
 
         # Listener infrastructure (tool-change callbacks for ChatSession).
@@ -2916,6 +2923,9 @@ class MCPClientManager:
         # ``_user_resources`` / ``_user_prompts``. Per-user fan-out
         # ensures another user's session never observes this change.
         self._rebuild_and_notify_user_catalogs(user_id)
+        # Discovery just succeeded for this server — clear any prior recorded
+        # pool discovery failure so a healed outage doesn't linger on status.
+        self._pool_discovery_error.pop(server_name, None)
         return entry
 
     # -- pool priming ---------------------------------------------------------
@@ -3147,7 +3157,16 @@ class MCPClientManager:
                             user_id,
                             server_name,
                         )
-                    except Exception:
+                    except Exception as exc:
+                        # Record the discovery failure so it is visible via
+                        # server status (and tool_search's unavailable-server
+                        # advisory) instead of being swallowed to a debug log
+                        # with the server silently contributing zero tools.
+                        # Token-level outcomes (missing / dead grant) return
+                        # earlier and never reach here, so this is a genuine
+                        # connect/discovery failure (transport, 5xx, timeout).
+                        detail = f"{type(exc).__name__}: {exc}"
+                        self._pool_discovery_error[server_name] = detail[:200]
                         log.debug(
                             "mcp pool auto-prime failed user=%s server=%s",
                             user_id,
@@ -5761,6 +5780,7 @@ class MCPClientManager:
             ),
             "prompts": len(state.prompts) if state is not None and state.session is not None else 0,
             "error": self._last_error.get(name, ""),
+            "discovery_error": self._pool_discovery_error.get(name, ""),
             "transport": transport,
             "command": cfg.get("command", "") if transport == "stdio" else "",
             "url": cfg.get("url", "") if transport != "stdio" else "",
@@ -5826,6 +5846,7 @@ class MCPClientManager:
             "resources": len(rep.resources) if rep is not None and rep.resources else 0,
             "prompts": len(rep.prompts) if rep is not None and rep.prompts else 0,
             "error": self._last_error.get(name, ""),
+            "discovery_error": self._pool_discovery_error.get(name, ""),
             "transport": "streamable-http",
             "command": "",
             "url": "",
