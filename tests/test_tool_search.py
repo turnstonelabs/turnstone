@@ -304,9 +304,7 @@ class TestToolSearchUnavailableAdvisory:
     'no such tool'. Driven by the injected status_provider."""
 
     def _mgr(self, tools, status):
-        return ToolSearchManager(
-            tools, always_on_names=set(), status_provider=lambda: status
-        )
+        return ToolSearchManager(tools, always_on_names=set(), status_provider=lambda: status)
 
     def test_empty_results_with_outage_explains_outage(self):
         mgr = self._mgr(
@@ -401,10 +399,7 @@ class TestStatusReason:
         assert _status_reason({"connected": True, "error": "", "circuit_open": False}) == ""
 
     def test_circuit_takes_precedence_over_error(self):
-        assert (
-            _status_reason({"circuit_open": True, "error": "boom"})
-            == "circuit breaker open"
-        )
+        assert _status_reason({"circuit_open": True, "error": "boom"}) == "circuit breaker open"
 
 
 class TestMCPServerSummary:
