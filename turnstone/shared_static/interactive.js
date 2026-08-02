@@ -55,7 +55,13 @@ import {
 } from "./composer_queue.js";
 import { StatusBar } from "./status_bar.js";
 import { streamingRender, streamingRenderFinalize } from "./renderer.js";
-import { setMarkdown, operatorSourceLabel } from "./utils.js";
+import {
+  buildMsgCopyButton,
+  buildMsgRetryButton,
+  ensureMsgActionsBar,
+  findMsgActionsBar,
+} from "./copy_actions.js";
+import { makeAnnouncer, operatorSourceLabel } from "./utils.js";
 import {
   OVERFLOW_TRIP_COUNT,
   OVERFLOW_TRIP_WINDOW_MS,
@@ -107,45 +113,22 @@ function getVoiceRoles(base) {
 
 // Visually-hidden polite live region for voice status (recording / playback)
 // so screen-reader users perceive state changes otherwise conveyed only by
-// color/icon. Errors go through showToast (already a live region). Single
-// shared node; clear-then-set so repeated identical messages re-announce.
-let _voiceStatusEl = null;
-function voiceAnnounce(msg) {
-  if (!_voiceStatusEl) {
-    _voiceStatusEl = document.createElement("div");
-    _voiceStatusEl.className = "sr-only";
-    _voiceStatusEl.setAttribute("role", "status");
-    _voiceStatusEl.setAttribute("aria-live", "polite");
-    document.body.appendChild(_voiceStatusEl);
-  }
-  _voiceStatusEl.textContent = "";
-  window.setTimeout(() => {
-    if (_voiceStatusEl) _voiceStatusEl.textContent = msg;
-  }, 30);
-}
+// color/icon. Errors go through showToast (already a live region).
+const voiceAnnounce = makeAnnouncer();
 
 // Visually-hidden POLITE live region for the tool-call early paint
 // (tool_pending) so screen-reader users hear a committed call land — and that
 // they can Stop it — even though messagesEl is flipped to aria-live="off"
 // during the token streaming that immediately precedes the call.  Polite (not
 // assertive): a committed call is worth surfacing but isn't the action-required
-// human gate, which keeps its own assertive announcement.  Separate node from
-// the voice region so the two never clobber each other.  Single shared node;
-// clear-then-set so repeated identical messages re-announce.
-let _toolStatusEl = null;
+// human gate, which keeps its own assertive announcement.  Separate region
+// from the voice one so the two never clobber each other.
+const _toolStatus = makeAnnouncer();
+// The wrapper earns its keep with the empty-message guard —
+// _toolAnnounceText returns "" for a batch with no named tools.
 function toolAnnounce(msg) {
   if (!msg) return;
-  if (!_toolStatusEl) {
-    _toolStatusEl = document.createElement("div");
-    _toolStatusEl.className = "sr-only";
-    _toolStatusEl.setAttribute("role", "status");
-    _toolStatusEl.setAttribute("aria-live", "polite");
-    document.body.appendChild(_toolStatusEl);
-  }
-  _toolStatusEl.textContent = "";
-  window.setTimeout(() => {
-    if (_toolStatusEl) _toolStatusEl.textContent = msg;
-  }, 30);
+  _toolStatus(msg);
 }
 
 // Terse SR summary for a committed tool batch: tool name(s) (capped at 3) +
@@ -2082,12 +2065,7 @@ class Pane {
           this.currentReasoningEl = null;
         }
         if (!this.currentAssistantEl) {
-          this.currentAssistantEl = document.createElement("div");
-          this.currentAssistantEl.className = "msg assistant";
-          this.currentAssistantBodyEl = document.createElement("div");
-          this.currentAssistantBodyEl.className = "msg-body";
-          this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
-          this.messagesEl.appendChild(this.currentAssistantEl);
+          this._newAssistantBubble();
         }
         this.contentBuffer += evt.text;
         streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
@@ -2171,12 +2149,7 @@ class Pane {
             this.currentReasoningEl = null;
           }
           if (!this.currentAssistantEl) {
-            this.currentAssistantEl = document.createElement("div");
-            this.currentAssistantEl.className = "msg assistant";
-            this.currentAssistantBodyEl = document.createElement("div");
-            this.currentAssistantBodyEl.className = "msg-body";
-            this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
-            this.messagesEl.appendChild(this.currentAssistantEl);
+            this._newAssistantBubble();
           }
           if (this.contentBuffer.length < evt.content.length) {
             this.contentBuffer = evt.content;
@@ -2733,28 +2706,38 @@ class Pane {
     el.appendChild(bar);
   }
 
+  // The one creation path for live-streamed assistant bubbles (the
+  // content and in_progress_snapshot branches): bubble + body + the
+  // persistent copy action, with the streaming refs assigned as a unit
+  // so the two branches cannot drift.
+  _newAssistantBubble() {
+    this.currentAssistantEl = document.createElement("div");
+    this.currentAssistantEl.className = "msg assistant";
+    this.currentAssistantBodyEl = document.createElement("div");
+    this.currentAssistantBodyEl.className = "msg-body";
+    this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
+    this._addCopyAction(this.currentAssistantEl);
+    this.messagesEl.appendChild(this.currentAssistantEl);
+  }
+
+  // Every assistant bubble gets a persistent copy button at creation —
+  // O(1) per message, unlike the removed whole-transcript sweep this
+  // file's retry attach deliberately avoids (see
+  // _attachRetryToLastAssistant).  The bar is shared with the transient
+  // retry / TTS buttons the holder mechanism adds and removes.  Callers
+  // pass a JUST-CREATED bubble (both stream branches via
+  // _newAssistantBubble, and replay) — no dedup needed against an empty
+  // bar.
+  _addCopyAction(el) {
+    ensureMsgActionsBar(el).appendChild(buildMsgCopyButton(el));
+  }
+
   _addRetryAction(el) {
-    let bar = el.querySelector(".msg-actions");
-    if (!bar) {
-      bar = document.createElement("div");
-      bar.className = "msg-actions";
-      bar.setAttribute("role", "toolbar");
-      bar.setAttribute("aria-label", "Message actions");
-      el.appendChild(bar);
-    }
-    const btn = document.createElement("button");
-    btn.className = "msg-action-btn";
-    btn.title = "Retry (regenerate response)";
-    btn.setAttribute("aria-label", "Retry last response");
-    const icon = document.createElement("span");
-    icon.className = "icon-retry";
-    icon.setAttribute("aria-hidden", "true");
-    btn.appendChild(icon);
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this._retryLast();
-    });
-    bar.insertBefore(btn, bar.firstChild);
+    const bar = ensureMsgActionsBar(el);
+    bar.insertBefore(
+      buildMsgRetryButton(() => this._retryLast()),
+      bar.firstChild,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -3029,15 +3012,11 @@ class Pane {
   }
 
   _addTtsAction(el) {
-    let bar = el.querySelector(".msg-actions");
-    if (!bar) {
-      bar = document.createElement("div");
-      bar.className = "msg-actions";
-      bar.setAttribute("role", "toolbar");
-      bar.setAttribute("aria-label", "Message actions");
-      el.appendChild(bar);
-    }
+    const bar = ensureMsgActionsBar(el);
     if (bar.querySelector(".msg-tts-btn")) return; // already added
+    // Inserted BEFORE the persistent copy button (below) so DOM order,
+    // tab order and visual order agree: [retry, tts, copy], with copy
+    // anchoring the corner on every bubble.
     const btn = document.createElement("button");
     btn.className = "msg-action-btn msg-tts-btn";
     btn.title = "Play response aloud";
@@ -3051,7 +3030,7 @@ class Pane {
       e.stopPropagation();
       this._playMessageTTS(el, btn);
     });
-    bar.appendChild(btn);
+    bar.insertBefore(btn, bar.querySelector(".msg-copy-btn"));
   }
 
   // Strip code blocks / inline code / rendered math so TTS doesn't read source
@@ -3456,7 +3435,14 @@ class Pane {
           const bodyEl = document.createElement("div");
           bodyEl.className = "msg-body";
           el.appendChild(bodyEl);
-          setMarkdown(bodyEl, msg.content);
+          // Same render mechanism as the coordinator's history path: the
+          // finalize helper renders + post-renders AND stashes the raw
+          // markdown on the body for the copy affordance — replayed
+          // bubbles must copy identically to live-streamed ones.  The
+          // copy action attaches BEFORE the render, matching the
+          // streaming path's attach-then-fill order.
+          this._addCopyAction(el);
+          streamingRenderFinalize(bodyEl, msg.content);
           this.messagesEl.appendChild(el);
           lastToolBlock = null;
         }
@@ -3661,13 +3647,20 @@ class Pane {
   }
 
   _attachRetryToLastAssistant() {
-    // Remove the previous holder's action bar via the tracked ref — the old
-    // whole-transcript ".msg.assistant .msg-actions" sweep was O(N) per
-    // busy→idle edge.  At most one assistant bar exists (this method is its
-    // only writer); a holder detached by a rebuild no-ops harmlessly.
+    // Remove the previous holder's retry / TTS buttons via the tracked ref —
+    // the old whole-transcript ".msg.assistant .msg-actions" sweep was O(N)
+    // per busy→idle edge.  The bar itself stays: every assistant bubble owns
+    // one for its persistent copy button (_addCopyAction, at creation), and
+    // only the transient retry / TTS buttons move with the holder.  At most
+    // one bubble carries them (this method is their only writer); a holder
+    // detached by a rebuild no-ops harmlessly.
     if (this._retryHolderEl) {
-      const oldBar = this._retryHolderEl.querySelector(".msg-actions");
-      if (oldBar) oldBar.remove();
+      const oldBar = findMsgActionsBar(this._retryHolderEl);
+      if (oldBar) {
+        oldBar
+          .querySelectorAll(".msg-retry-btn, .msg-tts-btn")
+          .forEach((b) => b.remove());
+      }
       this._retryHolderEl = null;
     }
     // Find the last assistant message with content and add retry.

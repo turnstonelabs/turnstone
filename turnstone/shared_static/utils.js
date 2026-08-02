@@ -2,9 +2,9 @@
 
    ES module at the BOTTOM of the shared module graph: imports nothing, so
    renderer.js / auth.js / kb.js / cards.js can import from here without
-   cycles.  The two helpers that call upward (setMarkdown → renderer,
-   exportWorkstreamDownload → toast/auth) late-bind through window at CALL
-   time instead — importing them here would close an import cycle.
+   cycles.  The one helper that calls upward (exportWorkstreamDownload →
+   toast/auth) late-binds through window at CALL time instead — importing
+   here would close an import cycle.
 
    The window bridge at the bottom keeps the still-classic consumers
    (console app.js / admin.js / governance.js, ui app.js, inline onclick=)
@@ -149,6 +149,95 @@ export function makeEmptyState(text) {
   return div;
 }
 
+// Build a screen-reader live-region announcer and return its announce
+// function.  The sr-only region is appended to document.body EAGERLY, at
+// factory time: assistive tech only announces changes to a region that
+// was ALREADY in the accessibility tree, so a region born lazily with
+// its first message is silent exactly once.  Announcing is clear-then-
+// set on a short timer so repeated identical messages re-announce.
+// Callers keep one announcer per concern (voice status, tool early
+// paint, copy outcomes) so two announcements never clobber each other
+// inside one region.
+export function makeAnnouncer() {
+  const region = document.createElement("span");
+  region.className = "sr-only";
+  region.setAttribute("role", "status");
+  region.setAttribute("aria-live", "polite");
+  document.body.appendChild(region);
+  return function announce(text) {
+    region.textContent = "";
+    window.setTimeout(function () {
+      region.textContent = text;
+    }, 30);
+  };
+}
+
+// Copy text to the system clipboard; resolves true on success.  The
+// async Clipboard API exists only in secure contexts (HTTPS or
+// localhost), and cluster nodes reached over plain HTTP on a LAN have
+// no `navigator.clipboard` at all — those fall back to the legacy
+// hidden-textarea + execCommand("copy") path.  execCommand copies the
+// textarea's selection, so the user's own selection and focus are
+// captured first and restored after.
+export async function copyTextToClipboard(text) {
+  const value = String(text == null ? "" : text);
+  if (window.isSecureContext && navigator.clipboard) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch (e) {
+      /* permission denied — the legacy path below still has a shot */
+    }
+  }
+  const prevFocus = document.activeElement;
+  const sel = document.getSelection();
+  const prevRanges = [];
+  if (sel) {
+    // cloneRange: getRangeAt returns LIVE ranges, and moving the
+    // selection into the shim textarea below can collapse them in
+    // place — a live ref would "restore" the collapsed range.
+    for (let i = 0; i < sel.rangeCount; i++) {
+      prevRanges.push(sel.getRangeAt(i).cloneRange());
+    }
+  }
+  const ta = document.createElement("textarea");
+  ta.value = value;
+  ta.setAttribute("readonly", "");
+  ta.setAttribute("aria-hidden", "true");
+  // This off-screen node briefly becomes the focused / hit-tested
+  // element mid-copy; delegated UI listeners (the copy affordance's
+  // pointer-dismissal rule) must be able to recognize and ignore the
+  // shim, or the copy gesture dismisses its own button mid-copy.
+  ta.setAttribute("data-clipboard-shim", "");
+  ta.style.position = "fixed";
+  ta.style.top = "0";
+  ta.style.left = "0";
+  ta.style.width = "1px";
+  ta.style.height = "1px";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (e) {
+    ok = false;
+  }
+  ta.remove();
+  if (sel) {
+    sel.removeAllRanges();
+    for (let i = 0; i < prevRanges.length; i++) sel.addRange(prevRanges[i]);
+  }
+  if (prevFocus && typeof prevFocus.focus === "function") {
+    try {
+      prevFocus.focus({ preventScroll: true });
+    } catch (e) {
+      /* focus restoration is best-effort */
+    }
+  }
+  return ok;
+}
+
 // Parse a *trusted* HTML string into DOM nodes and install them as
 // the new children of ``el``.  Callers must guarantee the HTML was
 // produced by an escaping / sanitising pipeline (escapeHtml,
@@ -159,18 +248,6 @@ export function makeEmptyState(text) {
 export function setSafeHtml(el, html) {
   const parsed = new DOMParser().parseFromString(html, "text/html");
   el.replaceChildren(...Array.from(parsed.body.childNodes));
-}
-
-// Render markdown content into an element.  renderMarkdown produces
-// fully-escaped HTML (see renderer.js — every input runs through
-// escapeHtml before any markdown ops; URLs are gated by an allow-list
-// regex), so routing the result through setSafeHtml is safe as long
-// as renderer.js is trusted.  postRenderMarkdown finishes the job —
-// hljs highlighting + mermaid SVG rendering for any code blocks the
-// markdown emitted.
-export function setMarkdown(el, content) {
-  setSafeHtml(el, window.renderMarkdown(content));
-  window.postRenderMarkdown(el);
 }
 
 // Download a workstream's conversation as OpenAI-shaped JSON.  Hits
@@ -259,7 +336,7 @@ Object.assign(window, {
   cssEscape,
   makeKeyLabel,
   makeEmptyState,
+  copyTextToClipboard,
   setSafeHtml,
-  setMarkdown,
   exportWorkstreamDownload,
 });

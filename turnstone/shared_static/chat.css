@@ -857,18 +857,9 @@
   }
 }
 
-/* ==========================================================================
-   Reduced motion — disable chat.css transitions.
-   ========================================================================== */
-@media (prefers-reduced-motion: reduce) {
-  .msg-actions,
-  .msg-action-btn,
-  .composer-attach,
-  .composer-input,
-  .composer-send {
-    transition: none;
-  }
-}
+/* Reduced-motion overrides live in ONE block at the end of this file — a
+   transition: none here would lose to the equal-specificity component rules
+   declared below it. */
 
 /* ==========================================================================
    Message primitive — chat-style single-column message block.  Semantic
@@ -1622,6 +1613,11 @@
   outline-offset: 1px;
 }
 
+/* Slot order is DOM order — retry prepends, TTS inserts before the
+   persistent copy button, copy anchors the corner on every bubble — so
+   visual order and tab order always agree (no flex `order`, which would
+   split the two). */
+
 /* Touch-only: keep actions visible; hover-reveal isn't reachable.
    `(pointer: coarse)` narrows the match to true touch devices —
    `(hover: none)` alone fires on stylus and some laptops too. Matches
@@ -1644,7 +1640,7 @@
 }
 
 /* ==========================================================================
-   Per-message rewind / edit / retry affordance (#549)
+   Per-message rewind / edit / retry (#549) + copy affordances
    Icon glyphs rendered inside the .msg-action-btn toolbar above, plus the
    inline edit-in-place form. Shared by the interactive pane (ui/static) and
    the coordinator dashboard (console/static/coordinator); both load this file
@@ -1728,6 +1724,148 @@
   left: 6px;
 }
 
+/* Icon: copy (two offset sheets).  The back sheet draws only its top and
+   right edges so the front sheet needs no occluding background — the
+   button renders over arbitrary surfaces (bubble, code, floating). */
+.icon-copy {
+  width: 12px;
+  height: 12px;
+  position: relative;
+}
+.icon-copy::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 8px;
+  height: 8px;
+  border-top: 1.5px solid currentColor;
+  border-right: 1.5px solid currentColor;
+  border-radius: 0 2px 0 0;
+  box-sizing: border-box;
+}
+.icon-copy::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+  box-sizing: border-box;
+}
+
+/* Copy outcome flash — the icon swaps to a check / cross alongside the
+   title text set by copy_actions.js (shape + prose, never colour alone).
+   The outcome classes are written only onto the two copy buttons, and the
+   .icon-copy descendant scopes the rules — one selector serves both. */
+.is-copied .icon-copy::before {
+  display: none;
+}
+.is-copied .icon-copy::after {
+  border: none;
+  border-left: 2px solid var(--ok);
+  border-bottom: 2px solid var(--ok);
+  border-radius: 0;
+  width: 9px;
+  height: 5px;
+  left: 1px;
+  bottom: 3px;
+  transform: rotate(-45deg);
+}
+.is-copy-failed .icon-copy::before,
+.is-copy-failed .icon-copy::after {
+  display: block;
+  border: none;
+  border-top: 2px solid var(--err);
+  border-radius: 1px;
+  width: 11px;
+  height: 0;
+  top: 5px;
+  left: 0;
+  right: auto;
+  bottom: auto;
+}
+.is-copy-failed .icon-copy::before {
+  transform: rotate(45deg);
+}
+.is-copy-failed .icon-copy::after {
+  transform: rotate(-45deg);
+}
+
+/* Floating block-copy button — positioned (fixed) by copy_actions.js over
+   the hovered code fence / mermaid diagram / table.  Deliberately never
+   inside rendered block DOM: streaming innerHTML replacement and the
+   source-keyed hljs cache would eat an embedded button.  Sits above pane
+   chrome (z 10) and below overlays (z 999). */
+.block-copy-btn {
+  /* Hidden via visibility (not display): the button stays out of the tab
+     order and hit-testing while hidden, and the show toggle repaints
+     reliably in headless captures (display:none -> flex on a late-inserted
+     fixed element skipped the compositor frame in the livepass shots). */
+  visibility: hidden;
+  opacity: 0;
+  display: inline-flex;
+  position: fixed;
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  color: var(--ink-3);
+  /* The button floats over arbitrary content whose backgrounds sit within
+     a token step of every elevated fill (in light theme --bg-elevated IS
+     the bubble colour), so the BORDER is the component boundary: mixed
+     from --ink-3 it holds ~3:1 against the panel tones in both themes
+     (WCAG 1.4.11), with the shadow as depth, not as the only separator. */
+  background: var(--bg-elevated);
+  border: 1px solid color-mix(in srgb, var(--ink-3) 45%, transparent);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+  transition:
+    color 120ms ease,
+    border-color 120ms ease;
+}
+.block-copy-btn.is-visible {
+  visibility: visible;
+  opacity: 1;
+}
+.block-copy-btn:hover {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+/* The focusable blocks (fences and diagram containers carry tabindex=0
+   for scrollable-region access and the Enter-to-copy keyboard path;
+   tables already did) get the house focus ring instead of the UA
+   default. */
+.msg-body pre:focus-visible,
+.table-wrap:focus-visible,
+.mermaid-container:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Keyboard block copy (Enter on the focused block) flashes its outcome
+   on the block itself: solid ok ring for copied, dashed err ring for
+   failed — shape + colour, with the prose carried by the live-region
+   announcement.  The classes are transient (copy_actions.js reverts
+   them after the flash). */
+.msg-body pre.is-copied,
+.table-wrap.is-copied,
+.mermaid-container.is-copied {
+  outline: 2px solid var(--ok);
+  outline-offset: 1px;
+}
+.msg-body pre.is-copy-failed,
+.table-wrap.is-copy-failed,
+.mermaid-container.is-copy-failed {
+  outline: 2px dashed var(--err);
+  outline-offset: 1px;
+}
+
 /* Edit-in-place form */
 .msg-edit-form {
   display: flex;
@@ -1797,7 +1935,11 @@
   display: none;
 }
 
-/* Busy-state disables action buttons */
+/* Busy-state disables action buttons — copy included: every copy
+   affordance is idle-only (the pane-level data-busy stamp is the one
+   gate).  Visual + pointer here; the click paths in copy_actions.js
+   refuse independently, since pointer-events cannot stop a keyboard
+   activation. */
 [data-busy="true"] .msg-action-btn {
   opacity: 0.3;
   pointer-events: none;
@@ -1874,8 +2016,20 @@
 .ws-status-bar.ws-sb-disconnected .ws-sb-turns {
   opacity: 0.4;
 }
+/* ==========================================================================
+   Reduced motion — the ONE consolidated block, kept at the END of the file:
+   these are equal-specificity overrides, so any component rule declared
+   after them would silently win (that is exactly how the previous copy of
+   this block near the top of the file was dead on arrival).
+   ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
-  .ws-status-bar {
+  .ws-status-bar,
+  .msg-actions,
+  .msg-action-btn,
+  .block-copy-btn,
+  .composer-attach,
+  .composer-input,
+  .composer-send {
     transition: none;
   }
 }

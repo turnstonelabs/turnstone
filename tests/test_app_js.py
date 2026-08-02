@@ -626,8 +626,8 @@ def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
     1. **Strict DOM-construction** (``ui/static/app.js``,
        ``shared_static/utils.js``, ``shared_static/auth.js``,
        ``shared_static/kb.js``, ``coordinator.js`` chat entry,
-       ``console/static/app.js``): renderer output routes through
-       ``setMarkdown`` (or ``setSafeHtml`` for pre-baked HTML strings);
+       ``console/static/app.js``): renderer output routes through the
+       streaming helpers or ``setSafeHtml`` (for pre-baked HTML strings);
        every other site uses ``createElement`` + ``textContent`` +
        ``append`` / ``replaceChildren``.  Missing escapes are
        structurally impossible — no HTML string is ever interpolated.
@@ -666,8 +666,8 @@ def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
         f"{label}:\n"
         + "\n".join(f"  line {n}: {line}" for n, line in offenders[:10])
         + "\nUse DOM construction (createElement + textContent + "
-        "append/replaceChildren) or route renderer output through "
-        "setMarkdown() / setSafeHtml() in shared/utils.js."
+        "append/replaceChildren) or route trusted HTML through "
+        "setSafeHtml() in shared/utils.js."
     )
 
 
@@ -784,18 +784,20 @@ def test_model_response_controls_are_capability_driven_and_sparse() -> None:
     assert 'apiSurfEl.addEventListener("change", _onModelFieldChange)' in admin
 
 
-def test_shared_utils_defines_set_markdown_helper() -> None:
-    """The ``setMarkdown`` helper in ``shared/utils.js`` is the single
-    audited entry point for rendering markdown content into a DOM
-    element from ``app.js``.  It parses ``renderMarkdown``'s output via
-    ``DOMParser`` (avoiding the unsafe sink entirely) and runs
-    ``postRenderMarkdown`` on the result.  A refactor that drops or
-    renames it would break the two interactive call sites silently at
+def test_shared_utils_defines_set_safe_html_helper() -> None:
+    """``setSafeHtml`` in ``shared/utils.js`` is the single audited entry
+    point for installing trusted HTML strings into a DOM element outside
+    renderer.js.  It parses via ``DOMParser`` (avoiding the unsafe sink
+    entirely); its markdown callers use it directly (coordinator
+    ``appendMsg``, preview.js), while renderer.js's streaming helpers
+    write their own sanctioned in-file ``innerHTML`` — which is exactly
+    why renderer.js is excluded from the sink scan.  A refactor that
+    drops or renames the helper would break its call sites silently at
     runtime."""
     body = _UTILS_JS.read_text(encoding="utf-8")
-    assert "function setMarkdown(el, content)" in body, (
-        "shared/utils.js must define setMarkdown(el, content) — "
-        "app.js routes both renderer-output sites through this helper."
+    assert "function setSafeHtml(el, html)" in body, (
+        "shared/utils.js must define setSafeHtml(el, html) — the "
+        "sanctioned trusted-HTML installation chokepoint."
     )
     # The DOMParser path is what avoids the unsafe sink.  The absence
     # of the unsafe assignment inside the helper is pinned by the
@@ -804,7 +806,7 @@ def test_shared_utils_defines_set_markdown_helper() -> None:
     # to e.g. ``Range.createContextualFragment`` forces an explicit
     # reviewer decision.
     assert "DOMParser()" in body, (
-        "setMarkdown must parse via DOMParser, not the unsafe DOM-write "
+        "setSafeHtml must parse via DOMParser, not the unsafe DOM-write "
         "sink — that is what keeps the audit surface at one location."
     )
 
@@ -3422,3 +3424,241 @@ def test_every_system_turn_source_has_a_fallback_label() -> None:
     labelled = {ln.split(":", 1)[0].strip() for ln in block.splitlines() if ":" in ln}
     missing = set(SYSTEM_TURN_SOURCES) - labelled - {"compaction"}
     assert not missing, f"system turn sources with no operator label: {sorted(missing)}"
+
+
+def test_copy_button_survives_retry_teardown_in_both_clients() -> None:
+    """Every assistant bubble carries a persistent copy button in its
+    ``.msg-actions`` bar; the retry-holder teardown in BOTH clients must
+    remove only the transient buttons (``.msg-retry-btn`` /
+    ``.msg-tts-btn``), never the bar — removing the bar (the pre-copy
+    behavior) silently strips copy from the previous holder bubble on
+    every busy→idle edge, and only manual testing would notice.
+
+    Interactive: the tracked-holder teardown targets the button classes.
+    Coordinator: ``_refreshRetryButton``'s sweep collects
+    ``.msg-retry-btn`` nodes, not whole ``.msg-actions`` bars."""
+    interactive = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = _pane_method_offset(interactive, "_attachRetryToLastAssistant")
+    end = _pane_method_offset(interactive, "announceToolBlock")
+    teardown = interactive[start:end]
+    assert '".msg-retry-btn, .msg-tts-btn"' in teardown, (
+        "interactive teardown must remove the transient retry/TTS buttons by class"
+    )
+    assert "oldBar.remove()" not in teardown, (
+        "interactive teardown removes the whole .msg-actions bar — that "
+        "strips the persistent copy button from the previous holder bubble"
+    )
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    refresh_start = coord.index("function _refreshRetryButton()")
+    refresh_end = coord.index("async function init()", refresh_start)
+    refresh = coord[refresh_start:refresh_end]
+    assert '".msg.assistant .msg-retry-btn"' in refresh, (
+        "coordinator _refreshRetryButton must sweep retry BUTTONS"
+    )
+    assert '".msg.assistant .msg-actions"' not in refresh, (
+        "coordinator _refreshRetryButton sweeps whole .msg-actions bars — "
+        "that strips every bubble's persistent copy button"
+    )
+
+
+def test_every_assistant_bubble_creation_path_attaches_copy() -> None:
+    """The copy button attaches at bubble CREATION on every assistant
+    render path — both live-stream branches and the history replay in the
+    interactive pane, and the single ``appendMsg`` chokepoint in the
+    coordinator (guarded on the literal role, so the unknown-role
+    fallback variant doesn't grow one).  A path that skips the attach
+    ships bubbles that silently cannot be copied."""
+    interactive = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    # Structural call statements only (line-anchored), so a comment or
+    # string mentioning the method cannot satisfy or break the count.
+    # The two live-stream branches share one creation helper; the replay
+    # branch attaches on its own bubble.
+    stream_calls = len(re.findall(r"^\s+this\._newAssistantBubble\(", interactive, re.M))
+    assert stream_calls == 2, (
+        "expected the content + in_progress_snapshot branches to create "
+        f"bubbles via this._newAssistantBubble(); found {stream_calls} call sites"
+    )
+    calls = len(re.findall(r"^\s+this\._addCopyAction\(", interactive, re.M))
+    assert calls == 2, (
+        "expected the shared creation helper + the replay branch to call "
+        f"this._addCopyAction(…); found {calls} call sites"
+    )
+    replay_start = _pane_method_offset(interactive, "replayHistory")
+    replay_end = _pane_method_offset(interactive, "_attachRetryToLastAssistant")
+    replay = interactive[replay_start:replay_end]
+    assert "streamingRenderFinalize(bodyEl, msg.content)" in replay, (
+        "replayed assistant bubbles must render through "
+        "streamingRenderFinalize — the finalize helper is what stashes "
+        "the raw markdown the copy affordance reads"
+    )
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    append_start = coord.index("function appendMsg(role, html, opts)")
+    append_end = coord.index("function appendText(", append_start)
+    append = coord[append_start:append_end]
+    assert 'role === "assistant"' in append and "buildMsgCopyButton(el)" in append, (
+        "coordinator appendMsg must attach the copy bar for assistant bubbles at creation"
+    )
+
+
+def test_block_copy_btn_css_box_matches_js_constants() -> None:
+    """The floating copy button's placement clamps (copy_actions.js FAB_W /
+    FAB_H) mirror the CSS box (.block-copy-btn width/height in shared
+    chat.css).  The CSS is the source of truth; this pin is what makes a
+    CSS resize fail loudly instead of silently desyncing every clamp —
+    placement itself has no unit assertions (the livepass harness owns
+    rendered placement)."""
+    ca = (_REPO_ROOT / "turnstone/shared_static/copy_actions.js").read_text(encoding="utf-8")
+    css = (_REPO_ROOT / "turnstone/shared_static/chat.css").read_text(encoding="utf-8")
+    w = re.search(r"const FAB_W = (\d+);", ca)
+    h = re.search(r"const FAB_H = (\d+);", ca)
+    assert w and h, "FAB_W / FAB_H constants not found in copy_actions.js"
+    # The box must be declared in exactly ONE .block-copy-btn rule: a
+    # second declaration (a media query, a state variant) would override
+    # the box while this pin kept watching the base rule — silent desync.
+    rules = re.findall(r"\.block-copy-btn[^{}]*\{[^}]*\}", css)
+    assert rules, ".block-copy-btn rules not found in chat.css"
+    declaring = [r for r in rules if re.search(r"\b(width|height)\s*:", r)]
+    assert len(declaring) == 1, (
+        ".block-copy-btn width/height must live in exactly one rule so the "
+        "JS mirror has one source of truth; found: " + repr(declaring)
+    )
+    block = declaring[0]
+    assert f"width: {w.group(1)}px" in block, (
+        ".block-copy-btn width in chat.css no longer matches FAB_W — "
+        "update the JS mirror (and its clamps) with the CSS box"
+    )
+    assert f"height: {h.group(1)}px" in block, (
+        ".block-copy-btn height in chat.css no longer matches FAB_H — "
+        "update the JS mirror (and its clamps) with the CSS box"
+    )
+
+
+def test_retry_and_token_copy_degrade_without_the_module_lane() -> None:
+    """Two classic-script affordances predate the shared ES-module lane and
+    must keep working when it fails to load (script fetch error on a
+    degraded LAN): the coordinator's retry button and the admin one-time
+    token dialog's copy.  Both prefer the bridged helpers and must carry a
+    zero-dependency fallback — a silent early-return (retry never renders)
+    or an unguarded bridge call (uncaught TypeError in the token modal)
+    regresses main's contract."""
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    retry_start = coord.index("function _addRetryAction(el)")
+    retry_end = coord.index("function _refreshRetryButton()", retry_start)
+    retry = coord[retry_start:retry_end]
+    assert 'typeof ensureMsgActionsBar === "function"' in retry, (
+        "coordinator retry must feature-detect the bridged helpers"
+    )
+    assert 'document.createElement("button")' in retry and "msg-retry-btn" in retry, (
+        "coordinator retry lost its zero-dependency fallback — with the "
+        "module lane down the retry button must still be built in place"
+    )
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    copy_start = admin.index("function copyCreatedToken()")
+    copy_fn = admin[copy_start : admin.index("\nfunction ", copy_start + 1)]
+    assert 'typeof window.copyTextToClipboard !== "function"' in copy_fn, (
+        "admin token copy must feature-detect the bridged helper — an "
+        "unguarded bridge call throws with the module lane down"
+    )
+    # The no-bridge branch is not selection-only: it attempts the native
+    # async API directly (the degraded page is usually an HTTPS console
+    # where it works) before degrading to select-the-text.
+    no_bridge = copy_fn[
+        copy_fn.index('typeof window.copyTextToClipboard !== "function"') : copy_fn.index(
+            "window.copyTextToClipboard(_lastCreatedToken)"
+        )
+    ]
+    assert "navigator.clipboard" in no_bridge and ".writeText(_lastCreatedToken)" in no_bridge, (
+        "the no-bridge branch must attempt navigator.clipboard.writeText "
+        "directly before falling back to manual selection"
+    )
+    assert copy_fn.count("selectTokenFallback") >= 3, (
+        "admin token copy lost its select-the-text fallback (needed for "
+        "the clipboard-less, the copy-rejected and the bridge-failed paths)"
+    )
+
+
+def test_copy_affordances_are_idle_only() -> None:
+    """Every copy affordance is unavailable while the pane is busy, gated on
+    the ONE pane-level fact both clients already maintain (data-busy on
+    the messages container) — there is no per-bubble streaming stamp.
+    Three pins keep the contract honest:
+
+    * no ``.is-streaming`` mechanism anywhere in either client or the
+      shared stylesheet (its per-bubble gate was replaced wholesale);
+    * the chat.css busy rule covers ALL action buttons — no copy
+      exemption;
+    * the module enforces the gate in JS at each activation path (bubble
+      click, floating-button click, Enter keydown, hover reveal, and the
+      within-block fast path's dismissal) — CSS pointer-events alone is
+      keyboard-bypassable."""
+    interactive = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    css = (_REPO_ROOT / "turnstone/shared_static/chat.css").read_text(encoding="utf-8")
+    for label, body in (
+        ("interactive.js", interactive),
+        ("coordinator.js", coord),
+        ("chat.css", css),
+    ):
+        assert "is-streaming" not in body, (
+            f"{label} resurrects the per-bubble is-streaming gate — the busy "
+            "gate is pane-level data-busy only"
+        )
+    assert '[data-busy="true"] .msg-action-btn {' in css, (
+        "chat.css must disable every .msg-action-btn while busy"
+    )
+    assert ":not(.msg-copy-btn)" not in css, (
+        "the busy rule must not exempt the copy button — copy is idle-only"
+    )
+    ca = (_REPO_ROOT / "turnstone/shared_static/copy_actions.js").read_text(encoding="utf-8")
+    assert "'[data-busy=\"true\"]'" in ca, (
+        "copy_actions.js lost its JS-side busy gate (_isBusy) — the CSS "
+        "pointer-events rule alone is keyboard-bypassable"
+    )
+    for path_marker in (
+        # bubble copy click
+        "if (_isBusy(msgEl)) {",
+        # floating-button click guard
+        "if (_isBusy(target)) {",
+        # Enter-on-block keydown
+        "if (_isBusy(block)) {",
+        # hover reveal
+        "&& !_isBusy(block)",
+        # within-block fast path — a turn starting under a shown button
+        # must dismiss on the next move, not once the pointer leaves
+        "if (_isBusy(_fabTarget)) _hideFab();",
+    ):
+        assert path_marker in ca, (
+            f"copy_actions.js busy gate missing at an activation path: {path_marker!r}"
+        )
+
+
+def test_coordinator_tool_output_pres_are_focusable() -> None:
+    """Any pre inside a .msg-body hosts the pointer copy affordance, and
+    the keyboard copy path acts on the FOCUSED block — so every <pre> the
+    coordinator's tool-output formatter emits must carry tabindex, or the
+    same content a pointer user copies in one click is unreachable by
+    keyboard.  Pinned on every <pre> exit of renderToolOutput so a new
+    exit cannot ship pointer-only."""
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    start = coord.index("function renderToolOutput(")
+    fn = coord[start : coord.index("\n  }", start)]
+    pres = re.findall(r"<pre[^>]*>", fn)
+    assert pres, "renderToolOutput no longer emits <pre> blocks"
+    assert all('tabindex="0"' in p for p in pres), (
+        "a renderToolOutput <pre> exit lost its tabindex — pointer-copyable "
+        "but keyboard-unreachable:\n" + "\n".join(pres)
+    )
+    # The MCP-error card's raw-payload pre reaches .msg-body through the
+    # coordinator's orphan-result path — same invariant, shared module.
+    mcp = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    assert 'pre.setAttribute("tabindex", "0")' in mcp, (
+        "the MCP-error card's raw-payload pre must stay focusable — it is "
+        "pointer-copyable wherever the card mounts inside a .msg-body"
+    )
+    # And an emptied action bar may not linger as a zero-control toolbar
+    # landmark on the coordinator's degraded (no-bridge) lane, where the
+    # fallback bar holds ONLY the transient retry button.
+    assert "if (!bar.children.length) bar.remove();" in coord, (
+        "the coordinator retry sweep must remove a bar emptied of its last "
+        "control — screen readers announce empty 'Message actions' toolbars"
+    )
