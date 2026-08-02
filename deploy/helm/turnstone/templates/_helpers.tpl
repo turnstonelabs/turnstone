@@ -113,8 +113,9 @@ Determine the PostgreSQL username.
 {{/*
 The PostgreSQL password when the chart stores it itself, empty when it
 does not. Doubles as the predicate for "does <fullname>-secrets need to
-carry POSTGRES_PASSWORD", so templates/secret.yaml and
-turnstone.db.secretName cannot disagree about where the password lives.
+carry POSTGRES_PASSWORD", so an inline password is never written
+anywhere but <fullname>-secrets, and an operator-supplied Secret is
+never duplicated into it.
 
 An operator-supplied existingSecret wins outright: writing the value
 into a second Secret nothing reads would only duplicate a credential.
