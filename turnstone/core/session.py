@@ -3021,6 +3021,12 @@ class ChatSession:
         """Per-server MCP status for this session's user, consumed by
         ``ToolSearchManager`` to flag unavailable servers in search results.
 
+        Scoped to the EFFECTIVE user — the acting participant on a shared
+        workstream — matching the ``get_tools`` call that builds the search
+        corpus. Owner-scoping here would render the owner's per-user pool
+        state (including their recorded discovery-failure text) into a
+        non-owner participant's search results.
+
         Returns ``{}`` when no MCP client is bound or the lookup fails — the
         advisory then simply stays silent rather than breaking tool search.
         """
@@ -3028,7 +3034,7 @@ class ChatSession:
         if client is None:
             return {}
         try:
-            return client.get_all_server_status(self._mcp_user_id)
+            return client.get_all_server_status(self._mcp_effective_user_id)
         except Exception:
             return {}
 

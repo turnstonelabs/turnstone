@@ -66,6 +66,16 @@ def _status_reason(status: dict[str, Any]) -> str:
     on every server the user simply hasn't reached yet. Only hard signals
     (open circuit breaker, a recorded error, or a recorded discovery failure)
     mark a server unavailable.
+
+    A recorded discovery failure is per-user state: the client records it
+    under the (user, server) pool key and the status snapshot is scoped to
+    the requesting user (the session wires ``get_all_server_status(user_id)``),
+    so a non-empty ``discovery_error`` here means THIS user's own discovery
+    failed — never another account's. ``connected`` still gates the branch as
+    belt-and-braces: a successful connect clears the user's record, so a warm
+    transport alongside a record is a stale signal, and flagging a server the
+    user's pool is actively serving would be false. A recorded ``error``
+    stays ungated — it is a hard signal even while connected.
     """
     if status.get("circuit_open"):
         return "circuit breaker open"
@@ -75,7 +85,7 @@ def _status_reason(status: dict[str, Any]) -> str:
     if err:
         return f"error: {err[:120]}"
     disc = str(status.get("discovery_error") or "").replace("\n", " ").replace("\r", "").strip()
-    if disc:
+    if disc and not status.get("connected"):
         return f"tool discovery failed: {disc[:120]}"
     return ""
 

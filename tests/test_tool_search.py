@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from turnstone.core.bm25 import _RERANK_POOL
 from turnstone.core.tool_search import (
     BM25Index,
     ToolSearchManager,
@@ -298,6 +299,23 @@ class TestToolSearchTruncation:
         manager.search("mcp")
         assert manager._last_total_matched == 5
 
+    def test_total_matched_not_floored_by_rerank_pool(self):
+        # More matches than the rerank recall pool: the pool caps what the
+        # reranker reorders, not the recorded match count — "top N of M" must
+        # report the true M, not the pool size. [#941]
+        n = _RERANK_POOL + 10
+        tools = [_make_tool(f"mcp__srv__tool{i}", f"alpha capability {i}") for i in range(n)]
+        mgr = ToolSearchManager(
+            tools,
+            always_on_names=set(),
+            max_results=3,
+            reranker=lambda q, d: list(range(len(d)))[::-1],
+        )
+        results = mgr.search("alpha")
+        assert len(results) == 3
+        assert mgr._last_total_matched == n
+        assert f"Showing the top 3 of {n}" in mgr.format_search_results(results)
+
 
 class TestToolSearchUnavailableAdvisory:
     """A down/unauthorized server is surfaced, never silently treated as
@@ -358,6 +376,17 @@ class TestToolSearchUnavailableAdvisory:
         text = mgr.format_search_results(mgr.search("github"))
         assert "unavailable" not in text.lower()
 
+    def test_discovery_error_not_flagged_for_user_with_warm_pool(self):
+        # A discovery record alongside connected=True in the per-user status
+        # snapshot is stale (the user's own successful connect clears their
+        # record), so the outage advisory must stay silent. [#941]
+        mgr = self._mgr(
+            [_make_tool("mcp__github__create_issue", "Create a github issue")],
+            {"github": {"connected": True, "discovery_error": "500 app failed"}},
+        )
+        text = mgr.format_search_results(mgr.search("github"))
+        assert "unavailable" not in text.lower()
+
     def test_no_status_provider_is_legacy_behaviour(self):
         mgr = ToolSearchManager(
             [_make_tool("mcp__github__create_issue", "Create a github issue")],
@@ -394,6 +423,30 @@ class TestStatusReason:
     def test_discovery_error(self):
         reason = _status_reason({"discovery_error": "TimeoutError: pool discovery"})
         assert "discovery" in reason.lower()
+
+    def test_discovery_error_suppressed_when_connected(self):
+        # Belt-and-braces (#941): a successful connect clears the user's
+        # per-(user, server) record, so a record alongside a warm transport is
+        # stale — flagging a server the user's pool is serving would be false.
+        assert _status_reason({"connected": True, "discovery_error": "500 boom"}) == ""
+
+    def test_discovery_error_fires_despite_retained_catalog(self):
+        # The record is per-(user, server), so a failure in this user's status
+        # IS their own — a retained idle catalog (#836, connected=False with a
+        # non-zero tools count) must not mask it: the transport behind those
+        # tools is failing and calls will too.
+        reason = _status_reason({"connected": False, "tools": 3, "discovery_error": "500 boom"})
+        assert reason == "tool discovery failed: 500 boom"
+
+    def test_discovery_error_fires_for_cold_pool(self):
+        reason = _status_reason({"connected": False, "tools": 0, "discovery_error": "500 boom"})
+        assert reason == "tool discovery failed: 500 boom"
+
+    def test_recorded_error_not_gated_by_connected(self):
+        # Deliberate asymmetry: only the discovery branch is per-user gated. A
+        # recorded error stays a hard signal even alongside connected=True
+        # (e.g. a flapping static server).
+        assert "boom" in _status_reason({"connected": True, "error": "boom"})
 
     @pytest.mark.parametrize("field", ["error", "discovery_error"])
     def test_error_text_is_single_line(self, field):

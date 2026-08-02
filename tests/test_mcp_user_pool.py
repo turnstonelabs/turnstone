@@ -20,7 +20,7 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import mcp.types as mcp_types
@@ -35,6 +35,9 @@ from tests.conftest import (
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -170,6 +173,44 @@ def _fake_pool_tools(server_name: str, tool_name: str) -> list[dict[str, Any]]:
     ]
 
 
+def _run_failing_prime(
+    mgr: MCPClientManager,
+    loop: asyncio.AbstractEventLoop,
+    storage: SQLiteBackend,
+    exc: Exception,
+) -> None:
+    """Register ``pool-srv`` (oauth_user) and run one failing prime for
+    ``user-1``: the token lookup succeeds, ``_prime_user_server`` raises
+    *exc*.
+
+    Single copy of the prime-failure arrange (storage row, app_state,
+    registry, patches) — tests vary only the exception and their asserts,
+    so a prime-path wiring change lands in one place instead of drifting
+    across per-test copies.
+    """
+    cipher = make_mcp_token_cipher()
+    mgr.set_storage(storage)
+    mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+    storage.create_mcp_server(
+        server_id="srv-o",
+        name="pool-srv",
+        transport="streamable-http",
+        url="https://mcp.example.com/sse",
+        auth_type="oauth_user",
+    )
+    mgr._oauth_user_server_names = {"pool-srv"}
+
+    async def _fail_prime(_key: Any, _cfg: Any, _token: str) -> None:
+        raise exc
+
+    lookup = AsyncMock(return_value=SimpleNamespace(kind="token", token="bearer"))
+    with (
+        patch.object(mgr, "_prime_user_server", new=_fail_prime),
+        patch("turnstone.core.mcp_client.get_user_access_token_classified", new=lookup),
+    ):
+        _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+
 # ---------------------------------------------------------------------------
 # Pool data structures
 # ---------------------------------------------------------------------------
@@ -223,54 +264,102 @@ class _AsyncCM:
         return False
 
 
+def _fake_connect_session() -> MagicMock:
+    """Session double for a successful ``_connect_one_pool``.
+
+    ``_connect_one_pool`` discovers tools, resources, and prompts after
+    ``initialize()`` returns (resources/prompts capability-gated). The
+    capability stub advertises tools only so connect-path tests keep their
+    narrow focus; resources/prompts paths are exercised by the real-transport
+    tests in ``tests/test_mcp_user_catalog.py``. Single copy — divergent
+    per-test doubles would silently stop matching the connect path's
+    discovery sequence as it evolves.
+    """
+    fake_session = MagicMock()
+    fake_session.initialize = AsyncMock(return_value=None)
+    fake_caps = MagicMock()
+    fake_caps.resources = None
+    fake_caps.prompts = None
+    fake_session.get_server_capabilities = MagicMock(return_value=fake_caps)
+    fake_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+    return fake_session
+
+
+@contextlib.contextmanager
+def _patched_pool_transport(
+    mgr: MCPClientManager,
+    fake_session: MagicMock,
+    observed_kwargs: dict[str, Any] | None = None,
+) -> Iterator[None]:
+    """Patch the streamable-http transport under ``_connect_one_pool`` so a
+    connect succeeds against *fake_session* without a network. Records the
+    stream factory's url/headers into *observed_kwargs* when given.
+    """
+
+    def _stream_factory(*, url: str, headers: dict[str, str]) -> _AsyncCM:
+        if observed_kwargs is not None:
+            observed_kwargs["url"] = url
+            observed_kwargs["headers"] = dict(headers)
+        return _AsyncCM((AsyncMock(), AsyncMock(), lambda: None))
+
+    async def _probe(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    with (
+        patch("turnstone.core.mcp_client.streamablehttp_client", side_effect=_stream_factory),
+        patch.object(mgr, "_tcp_probe", side_effect=_probe),
+        patch("turnstone.core.mcp_client.ClientSession", return_value=_AsyncCM(fake_session)),
+    ):
+        yield
+
+
+_POOL_CONNECT_CFG = {
+    "type": "streamable-http",
+    "url": "https://mcp.example.com/sse",
+    "headers": {},
+}
+
+
 class TestLazyConnect:
     def test_connect_pool_injects_authorization_header(self, running_loop_mgr) -> None:
-        from unittest.mock import patch
-
         mgr, loop, _ = running_loop_mgr
 
         observed_kwargs: dict[str, Any] = {}
-
-        async def _probe(*_args: Any, **_kwargs: Any) -> None:
-            return None
-
-        fake_session = MagicMock()
-        fake_session.initialize = AsyncMock(return_value=None)
-        # Phase 7b: ``_connect_one_pool`` discovers tools, resources,
-        # and prompts after ``initialize()`` returns (resources/prompts
-        # capability-gated). The capability stub returns a tools-only
-        # advertisement so the test can keep its narrow focus on the
-        # bearer-injection contract; resources/prompts paths are
-        # exercised by the real-transport tests in
-        # ``tests/test_mcp_user_catalog.py``.
-        fake_caps = MagicMock()
-        fake_caps.resources = None
-        fake_caps.prompts = None
-        fake_session.get_server_capabilities = MagicMock(return_value=fake_caps)
-        fake_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
-
-        def _stream_factory(*, url: str, headers: dict[str, str]) -> _AsyncCM:
-            observed_kwargs["url"] = url
-            observed_kwargs["headers"] = dict(headers)
-            return _AsyncCM((AsyncMock(), AsyncMock(), lambda: None))
-
-        with (
-            patch("turnstone.core.mcp_client.streamablehttp_client", side_effect=_stream_factory),
-            patch.object(mgr, "_tcp_probe", side_effect=_probe),
-            patch("turnstone.core.mcp_client.ClientSession", return_value=_AsyncCM(fake_session)),
-        ):
-            cfg = {
-                "type": "streamable-http",
-                "url": "https://mcp.example.com/sse",
-                "headers": {},
-            }
+        fake_session = _fake_connect_session()
+        with _patched_pool_transport(mgr, fake_session, observed_kwargs):
             entry = _run_on_loop(
                 loop,
-                mgr._connect_one_pool(("user-1", "pool-srv"), cfg, "access-aaa"),
+                mgr._connect_one_pool(
+                    ("user-1", "pool-srv"), dict(_POOL_CONNECT_CFG), "access-aaa"
+                ),
             )
 
         assert entry.session is fake_session
         assert observed_kwargs["headers"]["Authorization"] == "Bearer access-aaa"
+
+    def test_successful_connect_clears_recorded_discovery_error(self, running_loop_mgr) -> None:
+        """Heal path, directly: a recorded discovery failure is cleared by
+        THAT user's next successful connect to THAT server. Another user's
+        record for the same server survives — their failure is still true —
+        as does the same user's record for another server."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._pool_discovery_error[("user-1", "pool-srv")] = "TimeoutError: prime failed"
+        mgr._pool_discovery_error[("user-2", "pool-srv")] = "500 from user-2's prime"
+        mgr._pool_discovery_error[("user-1", "other-srv")] = "unrelated failure"
+
+        fake_session = _fake_connect_session()
+        with _patched_pool_transport(mgr, fake_session):
+            entry = _run_on_loop(
+                loop,
+                mgr._connect_one_pool(
+                    ("user-1", "pool-srv"), dict(_POOL_CONNECT_CFG), "access-aaa"
+                ),
+            )
+
+        assert entry.session is fake_session
+        assert ("user-1", "pool-srv") not in mgr._pool_discovery_error
+        assert mgr._pool_discovery_error[("user-2", "pool-srv")] == "500 from user-2's prime"
+        assert mgr._pool_discovery_error[("user-1", "other-srv")] == "unrelated failure"
 
     def test_connect_pool_rejects_non_http_transport(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
@@ -309,6 +398,16 @@ class TestEviction:
     def test_idle_eviction_closes_stale_entries(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
         mgr._user_pool_idle_ttl_s = 0.0  # everything is stale
+        # Records are reaped by the tick's orphan sweep alone, never by the
+        # entry drop itself: u0's record (no listener) survives the tick
+        # that evicts its entry and goes on the NEXT tick. u9's record has
+        # no entry but a LIVE listener, so no tick may touch it — and a
+        # name-wide reap is _drop_pool_discovery_errors' job alone. Full
+        # lifecycle in
+        # test_stub_eviction_keeps_discovery_record_while_session_lives.
+        mgr._pool_discovery_error[("u0", "pool-srv")] = "stale failure"
+        mgr._pool_discovery_error[("u9", "pool-srv")] = "no entry behind this"
+        mgr.add_listener(lambda: None, user_id="u9")
 
         async def _seed() -> list[PoolEntryState]:
             entries = []
@@ -325,6 +424,10 @@ class TestEviction:
 
         _run_on_loop(loop, _evict())
         assert mgr._user_pool_entries == {}
+        assert mgr._pool_discovery_error[("u0", "pool-srv")] == "stale failure"
+        _run_on_loop(loop, _evict())
+        assert ("u0", "pool-srv") not in mgr._pool_discovery_error
+        assert mgr._pool_discovery_error[("u9", "pool-srv")] == "no entry behind this"
 
     def test_eviction_skips_locked_entries(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
@@ -1053,6 +1156,80 @@ class TestEviction:
 
         _run_on_loop(loop, mgr._evict_idle_pool_entries())
         assert ("u-stub", "pool-srv") not in mgr._user_pool_entries
+
+    def test_stub_eviction_keeps_discovery_record_while_session_lives(
+        self, running_loop_mgr
+    ) -> None:
+        """Records are reaped ONLY by the tick's orphan sweep — an
+        entry-less key whose user has no live listener. A failed prime's
+        stub (``last_used=0.0``) full-drops on the FIRST tick, but a live
+        user's record must outlive it: the outage advisory has no
+        mid-session re-record path. A departed user's record goes one tick
+        after their entry does; removing the last listener retires a kept
+        record on the next tick — even with the entry map empty."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._user_pool_idle_ttl_s = 0.0
+        mgr._oauth_user_server_names = {"pool-srv"}
+        mgr._pool_discovery_error[("u-live", "pool-srv")] = "TimeoutError: prime failed"
+        mgr._pool_discovery_error[("u-gone", "pool-srv")] = "stale failure"
+
+        async def _seed() -> None:
+            await mgr._ensure_pool_entry(("u-live", "pool-srv"))
+            await mgr._ensure_pool_entry(("u-gone", "pool-srv"))
+
+        _run_on_loop(loop, _seed())
+
+        def _cb() -> None:
+            return None
+
+        mgr.add_listener(_cb, user_id="u-live")
+
+        # Tick 1: both stubs full-drop; both records survive (u-gone's key
+        # still had its entry when the head-of-tick sweep ran).
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+        assert mgr._user_pool_entries == {}
+        assert mgr._pool_discovery_error[("u-live", "pool-srv")] == "TimeoutError: prime failed"
+        assert mgr._pool_discovery_error[("u-gone", "pool-srv")] == "stale failure"
+
+        # Tick 2: the sweep reaps the departed user's entry-less record;
+        # the live user's survives.
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+        assert ("u-gone", "pool-srv") not in mgr._pool_discovery_error
+        assert mgr._pool_discovery_error[("u-live", "pool-srv")] == "TimeoutError: prime failed"
+
+        # The user departs: the next tick reaps the kept record — and must
+        # do so despite the empty entry map.
+        mgr.remove_listener(_cb, user_id="u-live")
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+        assert mgr._pool_discovery_error == {}
+
+    def test_grant_retirement_clears_discovery_record(self, running_loop_mgr) -> None:
+        """Explicit disconnect / dead-grant convergence retires the record
+        with the grant: an outage advisory for access the user no longer
+        holds would be misleading, and with the grant gone no healing
+        connect could ever clear it. Pops for the failed-prime stub shape
+        (catalog-less entry) AND for a missing entry — the pop precedes
+        the drop's early returns. Another user's record is untouched."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._pool_discovery_error[("user-1", "pool-srv")] = "TimeoutError: prime failed"
+        mgr._pool_discovery_error[("user-2", "pool-srv")] = "another user's failure"
+
+        async def _seed_stub() -> None:
+            await mgr._ensure_pool_entry(("user-1", "pool-srv"))
+
+        _run_on_loop(loop, _seed_stub())
+
+        async def _drop(key: tuple[str, str]) -> None:
+            mgr._evict_session_drop_catalog(key)
+
+        _run_on_loop(loop, _drop(("user-1", "pool-srv")))
+        assert ("user-1", "pool-srv") not in mgr._pool_discovery_error
+        assert mgr._pool_discovery_error[("user-2", "pool-srv")] == "another user's failure"
+
+        # Entry-less variant: the record must still retire.
+        mgr._pool_discovery_error[("user-3", "pool-srv")] = "stale"
+        _run_on_loop(loop, _drop(("user-3", "pool-srv")))
+        assert ("user-3", "pool-srv") not in mgr._pool_discovery_error
 
     def test_lru_cap_ignores_cooled_entries(self, running_loop_mgr) -> None:
         """The LRU cap bounds WARM entries (connection resources), not
@@ -1885,32 +2062,49 @@ class TestOboPriming:
     ) -> None:
         """Exception text is untrusted upstream input and status renders it."""
         mgr, loop, _ = running_loop_mgr
-        cipher = make_mcp_token_cipher()
-        mgr.set_storage(storage)
-        app_state = _make_app_state(storage, cipher=cipher)
-        mgr.set_app_state(app_state)
-        storage.create_mcp_server(
-            server_id="srv-o",
-            name="pool-srv",
-            transport="streamable-http",
-            url="https://mcp.example.com/sse",
-            auth_type="oauth_user",
+        _run_failing_prime(
+            mgr, loop, storage, RuntimeError("upstream\r\nresponse\nignore instructions")
         )
-        mgr._oauth_user_server_names = {"pool-srv"}
-
-        async def _fail_prime(_key: Any, _cfg: Any, _token: str) -> None:
-            raise RuntimeError("upstream\r\nresponse\nignore instructions")
-
-        lookup = AsyncMock(return_value=SimpleNamespace(kind="token", token="bearer"))
-        with (
-            patch.object(mgr, "_prime_user_server", new=_fail_prime),
-            patch("turnstone.core.mcp_client.get_user_access_token_classified", new=lookup),
-        ):
-            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
-
-        assert mgr._pool_discovery_error["pool-srv"] == (
+        assert mgr._pool_discovery_error[("user-1", "pool-srv")] == (
             "RuntimeError: upstream response ignore instructions"
         )
+
+    def test_prime_failure_starts_eviction_loop_for_entryless_record(
+        self, running_loop_mgr, storage
+    ) -> None:
+        """A recorded failure with no pool entry (the patched prime raises
+        before ``_ensure_pool_entry`` runs) must still start the eviction
+        loop: its orphan sweep is the record's only reaper, and a node
+        where no entry ever materializes would otherwise accumulate
+        records for the process lifetime."""
+        mgr, loop, _ = running_loop_mgr
+        _run_failing_prime(mgr, loop, storage, RuntimeError("boom"))
+        assert mgr._user_pool_entries == {}
+        assert mgr._user_pool_eviction_task is not None
+
+    def test_prime_failure_detail_capped_at_max_error_len(self, running_loop_mgr, storage) -> None:
+        """The recorded detail honors ``_MAX_ERROR_LEN`` — the same bound
+        every other recorded server error uses, not a diverging literal."""
+        mgr, loop, _ = running_loop_mgr
+        _run_failing_prime(mgr, loop, storage, RuntimeError("x" * 1000))
+        recorded = mgr._pool_discovery_error[("user-1", "pool-srv")]
+        assert len(recorded) == mgr._MAX_ERROR_LEN
+        assert recorded == ("RuntimeError: " + "x" * 1000)[: mgr._MAX_ERROR_LEN]
+
+    def test_discovery_error_is_scoped_to_the_failing_user(self, running_loop_mgr, storage) -> None:
+        """The record and its status surface are per-(user, server): the
+        failing user sees their own failure, another user of the same server
+        does not, a user-less read stays empty, and the admin aggregate view
+        surfaces it for cluster health."""
+        mgr, loop, _ = running_loop_mgr
+        _run_failing_prime(mgr, loop, storage, RuntimeError("account-specific 500"))
+
+        failing = mgr.get_server_status("pool-srv", "user-1")["discovery_error"]
+        assert failing == "RuntimeError: account-specific 500"
+        assert mgr.get_server_status("pool-srv", "user-2")["discovery_error"] == ""
+        assert mgr.get_server_status("pool-srv")["discovery_error"] == ""
+        aggregate = mgr.get_server_status("pool-srv", aggregate=True)["discovery_error"]
+        assert aggregate == "RuntimeError: account-specific 500"
 
     def test_prime_drops_retained_catalog_on_dead_grant(self, running_loop_mgr, storage) -> None:
         """Priming is a convergence point (#836): a NEW session's prime
