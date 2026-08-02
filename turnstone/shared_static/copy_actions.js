@@ -476,8 +476,11 @@ document.addEventListener(
 );
 
 // Pointer leaving the window would otherwise strand the button painted
-// over the page with nothing left to dismiss it.
-document.addEventListener("mouseleave", function () {
+// over the page with nothing left to dismiss it.  The listener sits on
+// documentElement rather than document: engines deliver the leave event
+// to the <html> element reliably, while document-level delivery on
+// window exit is historically flaky.
+document.documentElement.addEventListener("mouseleave", function () {
   _hideFab();
 });
 

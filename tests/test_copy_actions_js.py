@@ -189,6 +189,10 @@ global.document = {
     return el;
   },
   body: makeEl('body'),
+  // The window-exit dismissal listens on the <html> element (document-
+  // level mouseleave delivery is flaky on window exit), so the stub
+  // carries a documentElement with its own listener map.
+  documentElement: makeEl('html'),
   addEventListener: (t, fn) => {
     (docListeners[t] = docListeners[t] || []).push(fn);
   },
@@ -708,7 +712,8 @@ def test_pointer_dismissal_is_unconditional() -> None:
       const hiddenByMouseover = !fab.classList.contains('is-visible');
       fireDoc('mouseover', a.table);
       const reshown = fab.classList.contains('is-visible');
-      fireDoc('mouseleave', outsider);
+      (document.documentElement.listeners.mouseleave || []).forEach((fn) =>
+        fn({ target: outsider }));
       const hiddenByMouseleave = !fab.classList.contains('is-visible');
       fireDoc('mouseover', a.table);
       fireDoc('scroll', document);
