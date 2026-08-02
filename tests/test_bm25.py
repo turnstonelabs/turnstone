@@ -151,8 +151,8 @@ class TestBM25Reranking:
         # REORDER MODE (default rerank_filters=False, reactive tool/skill
         # search): an empty reranker result means the endpoint failed, so fall
         # back to BM25 order -- results are NEVER silently dropped. [bug-1]
-        # Guards the reorder-branch ``if not out: return pool[:k]`` -- removing
-        # it makes this return [] and fail.
+        # Guards the reorder-branch ``if not out: return ranked[:k]`` --
+        # removing it makes this return [] and fail.
         index = BM25Index(self._DOCS, reranker=lambda q, d: [])
         assert index.search("alpha", k=5) == BM25Index(self._DOCS)._bm25_rank("alpha")[:5]
 
@@ -217,7 +217,9 @@ class TestBM25Reranking:
 
     def test_recall_pool_capped_at_rerank_pool(self):
         # More matching docs than the recall cap: the reranker must receive
-        # exactly _RERANK_POOL docs, and outputs may only reference that set.
+        # exactly _RERANK_POOL docs. The cap bounds what the reranker SEES,
+        # not what the caller gets — matches past the pool trail in BM25
+        # order, so a full-corpus k still returns every match.
         n = _RERANK_POOL + 10
         docs = [f"alpha doc{i}" for i in range(n)]
         seen_len = {"n": -1}
@@ -229,10 +231,58 @@ class TestBM25Reranking:
         index = BM25Index(docs, reranker=rec)
         result = index.search("alpha", k=n)
         assert seen_len["n"] == _RERANK_POOL  # only the first 50 reached rerank
-        assert len(result) == _RERANK_POOL
-        # Every returned index is from the BM25 top-50 recall set.
-        recall = set(BM25Index(docs)._bm25_rank("alpha")[:_RERANK_POOL])
-        assert set(result) == recall
+        # Identity rerank over the pool + BM25-ordered tail == full BM25 order.
+        assert result == BM25Index(docs)._bm25_rank("alpha")
+
+    def test_matches_past_the_pool_trail_in_bm25_order(self):
+        # REORDER MODE with k > _RERANK_POOL: the reranked head comes first,
+        # then every match past the pool in BM25 order. Guards the tail loop —
+        # without it the result caps at the pool and tool_search's "top N of M"
+        # count floors at the pool size. [#941]
+        n = _RERANK_POOL + 10
+        docs = [f"alpha doc{i}" for i in range(n)]
+        bm25_all = BM25Index(docs)._bm25_rank("alpha")
+        index = BM25Index(docs, reranker=lambda q, d: list(range(len(d)))[::-1])
+        result = index.search("alpha", k=n)
+        assert result == bm25_all[:_RERANK_POOL][::-1] + bm25_all[_RERANK_POOL:]
+
+    def test_reorder_fallbacks_not_capped_at_pool(self):
+        # Both reorder-mode fallbacks (reranker exception, empty result) must
+        # return the FULL BM25 ranking for k > _RERANK_POOL, not the pool
+        # slice — the fallback path must be as honest as the happy path. [#941]
+        def boom(q, d):
+            raise RuntimeError("rerank endpoint down")
+
+        n = _RERANK_POOL + 10
+        docs = [f"alpha doc{i}" for i in range(n)]
+        bm25_all = BM25Index(docs)._bm25_rank("alpha")
+        assert BM25Index(docs, reranker=boom).search("alpha", k=n) == bm25_all
+        assert BM25Index(docs, reranker=lambda q, d: []).search("alpha", k=n) == bm25_all
+
+    def test_past_pool_tail_respects_k(self):
+        # k between the pool size and the match count: the tail must stop at
+        # k, not run to the end of the ranking — callers slice rows by the
+        # returned indices, so over-returning corrupts their result sets.
+        n = _RERANK_POOL + 10
+        k = _RERANK_POOL + 5
+        docs = [f"alpha doc{i}" for i in range(n)]
+        bm25_all = BM25Index(docs)._bm25_rank("alpha")
+        index = BM25Index(docs, reranker=lambda q, d: list(range(len(d)))[::-1])
+        result = index.search("alpha", k=k)
+        assert len(result) == k
+        assert result == bm25_all[:_RERANK_POOL][::-1] + bm25_all[_RERANK_POOL:k]
+
+    def test_filter_mode_error_fallback_keeps_pool_bound(self):
+        # FILTER MODE's error fallback stays pool-bounded: its happy path can
+        # never exceed the pool, and an endpoint failure must not return a
+        # longer list than a working endpoint ever could.
+        def boom(q, d):
+            raise RuntimeError("rerank endpoint down")
+
+        n = _RERANK_POOL + 10
+        docs = [f"alpha doc{i}" for i in range(n)]
+        index = BM25Index(docs, reranker=boom, rerank_filters=True)
+        assert index.search("alpha", k=n) == BM25Index(docs)._bm25_rank("alpha")[:_RERANK_POOL]
 
     def test_empty_query_skips_reranker(self):
         calls = {"n": 0}

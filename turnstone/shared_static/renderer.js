@@ -4,6 +4,10 @@
 // globals).  Window bridge at the bottom for the still-classic consumers.
 
 import { escapeHtml } from "./utils.js";
+// Side-effect import: the copy-to-clipboard affordances (floating block
+// button + delegated listeners) ride the renderer so they land on every
+// surface that renders markdown — no per-page wiring to drift.
+import "./copy_actions.js";
 
 // ---------------------------------------------------------------------------
 //  Inline formatting
@@ -377,8 +381,11 @@ function _renderMarkdownBody(text) {
     /^([ \t]*)((?:[-*+]|\d+[.)])[ \t]+)?(```+)([^\s`]*)\n((?:(?!\3)[\s\S])*?)\3[ \t]*(?=\n|$)/gm,
     function (m, indent, marker, _open, lang, code) {
       var cssLang = _langToCssClass(lang);
+      // tabindex=0: a fence is a horizontal scroll region (keyboard users
+      // must be able to reach and scroll it), and a focused block is what
+      // the keyboard copy path acts on (copy_actions.js, Enter).
       codeBlocks.push(
-        "<pre><code" +
+        '<pre tabindex="0"><code' +
           (cssLang ? ' class="language-' + escapeHtml(cssLang) + '"' : "") +
           ">" +
           // Strip the trailing newline plus any whitespace an indented close
@@ -525,9 +532,22 @@ function _renderMarkdownBody(text) {
   // The reverse edge case (math containing backticks, e.g.
   // ``$$ \verb|`x`| $$``) is much rarer and KaTeX would reject
   // the verbatim syntax anyway.
+  // Raw-source twins for the inline-code / math sentinels, mirroring
+  // Raw twins: the table pass slices its data-md-source region from
+  // POST-masking text, so a cell's sentinels must be restored to the raw
+  // source the user wrote before the slice lands in an attribute — the
+  // rendered substitutes carry quotes/markup and are restored AFTER the
+  // table splice, i.e. inside the attribute value (the B-class breakout).
+  // Every mask pushes to its raw twin unconditionally, so the twins are
+  // index-aligned with the rendered arrays by construction — the cost is
+  // one string reference per span.
+  var inlineCodesRaw = [];
+  var mathBlocksRaw = [];
+  var inlineMathsRaw = [];
   var inlineCodes = [];
   text = text.replace(/`([^`\n]+)`/g, function (m, code) {
     inlineCodes.push("<code>" + escapeHtml(code) + "</code>");
+    inlineCodesRaw.push(m);
     return "\x00IC" + (inlineCodes.length - 1) + "\x00";
   });
 
@@ -540,10 +560,12 @@ function _renderMarkdownBody(text) {
   var mathBlocks = [];
   text = text.replace(/\$\$([\s\S]+?)\$\$/g, function (m, tex) {
     mathBlocks.push(renderLatex(tex.trim(), true));
+    mathBlocksRaw.push(m);
     return "\x00MB" + (mathBlocks.length - 1) + "\x00";
   });
   text = text.replace(/\\\[([\s\S]+?)\\\]/g, function (m, tex) {
     mathBlocks.push(renderLatex(tex.trim(), true));
+    mathBlocksRaw.push(m);
     return "\x00MB" + (mathBlocks.length - 1) + "\x00";
   });
 
@@ -564,8 +586,32 @@ function _renderMarkdownBody(text) {
   var inlineMaths = [];
   text = text.replace(/\\\(([^\n]+?)\\\)/g, function (m, tex) {
     inlineMaths.push(renderLatex(tex.trim(), false));
+    inlineMathsRaw.push(m);
     return "\x00IM" + (inlineMaths.length - 1) + "\x00";
   });
+
+  // One ordered spec drives every raw-span restore: REVERSE mask order
+  // (IM, MB, then IC), because a later mask's span can swallow an
+  // earlier mask's sentinel into its raw twin (math wrapping inline
+  // code) — each pass re-exposes the sentinels the passes after it
+  // resolve.  A new span mask gets a row here alongside its raw twin.
+  // Two restore sites: a table's data-md-source stash, and
+  // footnote-definition bodies before their recursive render.
+  var rawSpanPasses = [
+    [/\x00IM(\d+)\x00/g, inlineMathsRaw],
+    [/\x00MB(\d+)\x00/g, mathBlocksRaw],
+    [/\x00IC(\d+)\x00/g, inlineCodesRaw],
+  ];
+  function restoreRawSpans(slice) {
+    if (slice.indexOf("\x00") === -1) return slice;
+    for (var rs = 0; rs < rawSpanPasses.length; rs++) {
+      slice = slice.replace(
+        rawSpanPasses[rs][0],
+        _restorer(rawSpanPasses[rs][1]),
+      );
+    }
+    return slice;
+  }
 
   // Protect markdown tables (extract before line-by-line processing)
   var tableBlocks = [];
@@ -616,8 +662,39 @@ function _renderMarkdownBody(text) {
           dataRows.push(row);
           j++;
         }
+        // The original pipe/alignment lines are unrecoverable from the
+        // rendered cells (trimmed, inline-rendered), so the copy affordance
+        // (copy_actions.js) needs them stashed here — the block's WHOLE
+        // raw source, by the same contract as message copy: the clipboard
+        // carries what was written, including source the render does not
+        // display (a row wider than the header renders truncated but
+        // copies whole).  What is SHOWN is the render's decision; what is
+        // COPIED is the source.
+        //
+        //   * The slice comes from POST-masking text: inline-code/math in
+        //     cells are NUL sentinels whose global restores run AFTER the
+        //     table restore — i.e. INSIDE this attribute — so they are
+        //     resolved to their RAW sources first via restoreRawSpans
+        //     (never into tlines: the rendered cells above keep theirs
+        //     for the global passes).  Every frame resolves its OWN span
+        //     sentinels — footnote bodies are restored to raw before
+        //     their recursive render — so the trailing strip is a pure
+        //     backstop for a future recursion site that forgets that
+        //     restore: an attribute must never carry a NUL sentinel,
+        //     because the outer restores would splice rendered HTML into
+        //     it after the fact.
+        //
+        //   * The attribute escape is escapeHtml — the pipeline's one
+        //     escaping helper — bound to safeMdSource for the
+        //     double-quoted attribute value below.
+        var rawMdSource = restoreRawSpans(
+          tlines.slice(i, j).join("\n"),
+        ).replace(/\x00[A-Z]{2}\d+\x00/g, "");
+        var safeMdSource = escapeHtml(rawMdSource);
         var html =
-          '<div class="table-wrap" tabindex="0" role="region" aria-label="Data table"><table>';
+          '<div class="table-wrap" tabindex="0" role="region" aria-label="Data table" data-md-source="' +
+          safeMdSource +
+          '"><table>';
         html += "<thead><tr>";
         for (var k = 0; k < hdrCells.length; k++) {
           var align = aligns[k] || "left";
@@ -793,17 +870,19 @@ function _renderMarkdownBody(text) {
   // Append footnote section if any definitions were collected.
   //
   // Each definition body is rendered by a recursive renderMarkdown call.  The
-  // body was collected AFTER the inline-code/math passes, so it may carry
-  // outer-scope sentinels (e.g. `code` in a footnote -> a \x00IC\x00 sentinel).
-  // The recursion can't resolve those against its own fresh, empty arrays, but
-  // the restore guard (Fix 2) leaves the sentinel intact instead of emitting
-  // "undefined"; because this section is appended to `result` BEFORE the
-  // restore passes below — whose inlineCodes/mathBlocks are still populated —
-  // the OUTER restore resolves it, so inline code / math in a footnote renders
-  // correctly.  A FENCED block continuing a footnote definition works the same
-  // way: the fence pass re-emits its 2-space indent before the sentinel, so
-  // the continuation scan still collects it and the round-trip restores the
-  // code inside the footnote item.
+  // body was collected AFTER the inline-span masks, so it carries outer-scope
+  // span sentinels — restored to RAW source first (restoreRawSpans, the same
+  // recipe the <details> pass uses for fenced bodies) so the recursion
+  // re-masks the spans itself and its own table stashes resolve against its
+  // own raw twins (an outer sentinel reaching a recursive stash would be
+  // stripped as residue: silent loss in the copied source).  BLOCK sentinels
+  // keep the original path: the recursion leaves a fence's \x00CB\x00 inert
+  // (the restore guard emits the matched sentinel, never "undefined"), and
+  // because this section is appended to `result` BEFORE the restore passes
+  // below — whose codeBlocks array is still populated — the OUTER restore
+  // resolves it, so a FENCED block continuing a footnote definition renders
+  // correctly (the fence pass re-emits its 2-space indent before the
+  // sentinel, so the continuation scan still collects it).
   var fnKeys = Object.keys(footnoteDefs);
   if (fnKeys.length > 0) {
     var fnHtml =
@@ -818,7 +897,7 @@ function _renderMarkdownBody(text) {
         "-def-" +
         safeFid +
         '">' +
-        renderMarkdown(footnoteDefs[fid]) +
+        renderMarkdown(restoreRawSpans(footnoteDefs[fid])) +
         ' <a href="#fn-' +
         _fnScopeId +
         "-ref-" +
@@ -849,10 +928,17 @@ function _renderMarkdownBody(text) {
   result = result.replace(/\x00DT(\d+)\x00/g, _restorer(detailsBlocks));
   result = result.replace(/<p>\x00BQ(\d+)\x00<\/p>/g, _restorer(bqBlocks));
   result = result.replace(/\x00BQ(\d+)\x00/g, _restorer(bqBlocks));
-  result = result.replace(/<p>\x00MB(\d+)\x00<\/p>/g, _restorer(mathBlocks));
-  result = result.replace(/\x00MB(\d+)\x00/g, _restorer(mathBlocks));
+  // Tables restore BEFORE the inline-span passes (MB/IC/IM): a table
+  // CELL's rendered content still holds its inline sentinels, which only
+  // resolve if the table's HTML is already spliced into `result` when
+  // those passes run.  (MB used to run first, so display math in a cell
+  // rendered as literal sentinel garbage.)  The data-md-source attribute
+  // is immune to this ordering either way — it is built sentinel-free
+  // from the raw twins at emission time.
   result = result.replace(/<p>\x00TB(\d+)\x00<\/p>/g, _restorer(tableBlocks));
   result = result.replace(/\x00TB(\d+)\x00/g, _restorer(tableBlocks));
+  result = result.replace(/<p>\x00MB(\d+)\x00<\/p>/g, _restorer(mathBlocks));
+  result = result.replace(/\x00MB(\d+)\x00/g, _restorer(mathBlocks));
   result = result.replace(/\x00IC(\d+)\x00/g, _restorer(inlineCodes));
   result = result.replace(/\x00IM(\d+)\x00/g, _restorer(inlineMaths));
 
@@ -1332,6 +1418,17 @@ function postRenderMermaid(containerEl) {
     }
     var div = document.createElement("div");
     div.setAttribute("data-mermaid-source", source);
+    // Focusable like the other copyable blocks (pre / .table-wrap carry
+    // tabindex=0): a focused block is what the keyboard copy path acts on
+    // (copy_actions.js, Enter), and the container is a scrollable region
+    // (overflow-x) that keyboard users must be able to reach.  Set at
+    // creation so the loading and error states are reachable too — the
+    // rendered-SVG apply replaces innerHTML, which leaves host attributes
+    // intact.  role=region (not img: the error state carries readable
+    // message + source that AT must not flatten away).
+    div.setAttribute("tabindex", "0");
+    div.setAttribute("role", "region");
+    div.setAttribute("aria-label", "Diagram");
     // Use cache.has (not truthiness) so a future cached value of
     // empty string / falsy SVG doesn't masquerade as a miss.
     if (_mermaidSvgCache.has(source)) {
@@ -1401,6 +1498,13 @@ export function reRenderAllMermaid() {
 // ---------------------------------------------------------------------------
 function _streamingRenderApply(el, buffer) {
   if (el._lastRenderedBuffer === buffer) return;
+  // Unconditional copy-source stash (read by copy_actions.msgCopySource):
+  // BOTH exits below display content for this buffer — the catch paints it
+  // as plain text — so the stash must not ride _lastRenderedBuffer, whose
+  // stays-unset-on-throw semantics exist to make the next frame re-attempt
+  // the render (a copy reading it would get the last SUCCESSFUL frame's
+  // prefix while the bubble displays the full reply).
+  el._copySource = buffer;
   try {
     el.innerHTML = renderMarkdown(buffer);
   } catch (e) {

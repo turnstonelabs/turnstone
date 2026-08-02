@@ -3670,12 +3670,9 @@ function hideTokenCreatedModal() {
 
 function copyCreatedToken() {
   if (!_lastCreatedToken) return;
-  if (navigator.clipboard) {
-    navigator.clipboard.writeText(_lastCreatedToken).then(function () {
-      showToast("Token copied to clipboard");
-    });
-  } else {
-    // Fallback: select the text
+  // Select the token text so a manual copy is one keystroke away — the
+  // landing spot whenever no automatic path succeeded.
+  function selectTokenFallback() {
     const el = document.getElementById("token-created-value");
     const range = document.createRange();
     range.selectNodeContents(el);
@@ -3684,6 +3681,33 @@ function copyCreatedToken() {
     sel.addRange(range);
     showToast("Select and copy the token");
   }
+  // copyTextToClipboard (utils.js) covers the plain-HTTP LAN case via its
+  // legacy execCommand path.  The one-time token dialog must keep working
+  // with ZERO module dependencies (this is a classic script; the bridge
+  // is absent whenever the module lane failed), so with no bridge the
+  // native async API is still attempted directly — most degraded pages
+  // are HTTPS consoles where it works — before degrading to the manual
+  // selection, never to a throw.
+  if (typeof window.copyTextToClipboard !== "function") {
+    if (navigator.clipboard) {
+      navigator.clipboard
+        .writeText(_lastCreatedToken)
+        .then(function () {
+          showToast("Token copied to clipboard");
+        })
+        .catch(selectTokenFallback);
+    } else {
+      selectTokenFallback();
+    }
+    return;
+  }
+  window.copyTextToClipboard(_lastCreatedToken).then(function (ok) {
+    if (ok) {
+      showToast("Token copied to clipboard");
+      return;
+    }
+    selectTokenFallback();
+  });
 }
 
 // Escape closes any open settings help popover (the settings panels and the

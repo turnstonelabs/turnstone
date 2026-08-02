@@ -881,6 +881,12 @@ function createCoordinatorPane(root, wsId, opts) {
     return UNKNOWN_AUTO_APPROVE_REASON;
   }
 
+  // The <pre> exits carry tabindex=0: any pre inside a .msg-body hosts
+  // the pointer copy affordance (copy_actions.js), and the keyboard copy
+  // path acts on the FOCUSED block — an unfocusable pre would be
+  // copyable in one click by pointer and unreachable by keyboard.  They
+  // are horizontal scroll regions too, which keyboard users must be
+  // able to reach regardless.
   function renderToolOutput(rawText) {
     // Try parse JSON first — coordinator tool output is JSON-shaped.
     let parsed = null;
@@ -901,7 +907,7 @@ function createCoordinatorPane(root, wsId, opts) {
     }
     if (rows.length === 0) {
       return (
-        "<pre>" +
+        '<pre tabindex="0">' +
         esc(redactCredentials(JSON.stringify(parsed, null, 2))) +
         "</pre>"
       );
@@ -934,7 +940,7 @@ function createCoordinatorPane(root, wsId, opts) {
         "  " + (link || esc("?")) + (meta.length ? "  " + meta.join(" ") : "")
       );
     });
-    return "<pre>" + lines.join("\n") + "</pre>";
+    return '<pre tabindex="0">' + lines.join("\n") + "</pre>";
   }
 
   // ------------------------------------------------------------------
@@ -1001,6 +1007,14 @@ function createCoordinatorPane(root, wsId, opts) {
     body.className = "msg-body";
     setSafeHtml(body, html);
     el.appendChild(body);
+    // Every assistant bubble gets a persistent copy button at creation
+    // (O(1) per message — appendMsg is the single chokepoint for assistant
+    // bubbles).  Keyed on the literal role, not the variant fallback, so
+    // unknown roles don't grow one.  The transient retry button joins this
+    // bar on the last bubble via _addRetryAction / _refreshRetryButton.
+    if (role === "assistant" && typeof buildMsgCopyButton === "function") {
+      ensureMsgActionsBar(el).appendChild(buildMsgCopyButton(el));
+    }
     messagesEl.appendChild(el);
     _scheduleScroll();
     return el;
@@ -5947,32 +5961,63 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _addRetryAction(el) {
-    let bar = el.querySelector(".msg-actions");
-    if (!bar) {
-      bar = document.createElement("div");
-      bar.className = "msg-actions";
-      bar.setAttribute("role", "toolbar");
-      bar.setAttribute("aria-label", "Message actions");
-      el.appendChild(bar);
+    // Retry must render with ZERO module dependencies — it predates the
+    // shared module lane and an operator on a degraded page (module fetch
+    // failure) still needs regenerate.  The shared builders are preferred
+    // when bridged; the fallback twins ensureMsgActionsBar /
+    // buildMsgRetryButton exactly (same classes — the .msg-retry-btn
+    // selector is load-bearing for the teardown sweep — same
+    // role/labels), so the two paths render identically.
+    let bar = null;
+    let btn = null;
+    if (
+      typeof ensureMsgActionsBar === "function" &&
+      typeof buildMsgRetryButton === "function"
+    ) {
+      bar = ensureMsgActionsBar(el);
+      btn = buildMsgRetryButton(_retryLast);
+    } else {
+      for (let i = 0; i < el.children.length; i++) {
+        if (el.children[i].classList.contains("msg-actions")) {
+          bar = el.children[i];
+          break;
+        }
+      }
+      if (!bar) {
+        bar = document.createElement("div");
+        bar.className = "msg-actions";
+        bar.setAttribute("role", "toolbar");
+        bar.setAttribute("aria-label", "Message actions");
+        el.appendChild(bar);
+      }
+      btn = document.createElement("button");
+      btn.className = "msg-action-btn msg-retry-btn";
+      btn.title = "Retry (regenerate response)";
+      btn.setAttribute("aria-label", "Retry last response");
+      const icon = document.createElement("span");
+      icon.className = "icon-retry";
+      icon.setAttribute("aria-hidden", "true");
+      btn.appendChild(icon);
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        _retryLast();
+      });
     }
-    const btn = document.createElement("button");
-    btn.className = "msg-action-btn";
-    btn.title = "Retry (regenerate response)";
-    btn.setAttribute("aria-label", "Retry last response");
-    const icon = document.createElement("span");
-    icon.className = "icon-retry";
-    icon.setAttribute("aria-hidden", "true");
-    btn.appendChild(icon);
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      _retryLast();
-    });
     bar.insertBefore(btn, bar.firstChild);
   }
 
   function _refreshRetryButton() {
-    const old = messagesEl.querySelectorAll(".msg.assistant .msg-actions");
-    for (let i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
+    // Remove only the transient retry buttons — a bar that still holds
+    // other controls (the copy button appendMsg attaches) persists.  On
+    // the degraded no-bridge path the fallback bar held ONLY retry, and
+    // an empty toolbar is a screen-reader landmark with zero controls,
+    // so an emptied bar goes with its last button.
+    const old = messagesEl.querySelectorAll(".msg.assistant .msg-retry-btn");
+    for (let i = 0; i < old.length; i++) {
+      const bar = old[i].parentNode;
+      bar.removeChild(old[i]);
+      if (!bar.children.length) bar.remove();
+    }
     // Skip retry when the most recent semantic turn is tool-only (last DOM
     // child is a .conv-batch construct); walk back past operator-context
     // rows first — the plain system bubble AND the structured watch-result /

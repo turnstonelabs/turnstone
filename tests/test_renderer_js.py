@@ -12,7 +12,7 @@ the rendered HTML for a sample input. The assertions check the
 resulting markup contains the expected ``<span class="katex">…</span>``
 placeholder and not the raw delimiter.
 
-Both files are ES modules now; ``_demodulize`` strips the module syntax
+Both files are ES modules now; ``demodulize`` strips the module syntax
 so the script-semantics harness keeps working.  That is DELIBERATE, not
 a shortcut: the mermaid harness pokes renderer-internal state
 (``_mermaidState``) that script evaluation exposes as a context global
@@ -25,39 +25,20 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from tests._js_harness_helpers import demodulize, node_skip
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _UTILS_JS = _REPO_ROOT / "turnstone/shared_static/utils.js"
 _RENDERER_JS = _REPO_ROOT / "turnstone/shared_static/renderer.js"
 
 
-def _has_node() -> bool:
-    return shutil.which("node") is not None
-
-
-pytestmark = pytest.mark.skipif(not _has_node(), reason="node not available")
-
-
-def _demodulize(path: Path) -> str:
-    """Strip ES-module syntax so ``vm.runInThisContext`` (script semantics)
-    can evaluate the file: imports drop (the harness loads the whole
-    dependency set into one shared context, so cross-file bindings resolve
-    as context globals, exactly like the pre-module classic scripts), and
-    ``export`` keywords peel off their declarations."""
-    src = path.read_text(encoding="utf-8")
-    src = re.sub(r"^import\s+\{[\s\S]*?\}\s+from\s+\"[^\"]+\";\s*$", "", src, flags=re.M)
-    src = re.sub(r"^import\s+[^;\n]+;\s*$", "", src, flags=re.M)
-    src = re.sub(
-        r"^export\s+(?=(?:async\s+)?(?:function|const|let|var|class)\b)", "", src, flags=re.M
-    )
-    src = re.sub(r"^export\s*\{[^}]*\};\s*$", "", src, flags=re.M)
-    return src
+pytestmark = node_skip
 
 
 _HARNESS_TEMPLATE = """
@@ -93,8 +74,8 @@ process.stdout.write(renderMarkdown(input));
 def _render(markdown: str) -> str:
     """Render ``markdown`` through renderer.js + return the HTML."""
     harness = _HARNESS_TEMPLATE % {
-        "utils_src": json.dumps(_demodulize(_UTILS_JS)),
-        "renderer_src": json.dumps(_demodulize(_RENDERER_JS)),
+        "utils_src": json.dumps(demodulize(_UTILS_JS)),
+        "renderer_src": json.dumps(demodulize(_RENDERER_JS)),
         "input": json.dumps(markdown),
     }
     result = subprocess.run(
@@ -206,7 +187,7 @@ def test_latex_math_inside_inline_code_preserved() -> None:
 def test_latex_math_inside_fenced_code_preserved() -> None:
     r"""\(...\) inside a fenced block must stay literal."""
     out = _render("```\nA \\(x\\) sample\n```")
-    assert "<pre><code>" in out
+    assert '<pre tabindex="0"><code>' in out
     assert '<span class="katex">' not in out
 
 
@@ -470,8 +451,8 @@ _mermaidState = 'ready';
 def _run_mermaid_scenario(scenario_js: str) -> dict[str, Any]:
     """Run a JS snippet against the mermaid-aware harness, return JSON output."""
     harness = _MERMAID_HARNESS_TEMPLATE % {
-        "utils_src": json.dumps(_demodulize(_UTILS_JS)),
-        "renderer_src": json.dumps(_demodulize(_RENDERER_JS)),
+        "utils_src": json.dumps(demodulize(_UTILS_JS)),
+        "renderer_src": json.dumps(demodulize(_RENDERER_JS)),
         "scenario": scenario_js,
     }
     result = subprocess.run(
@@ -1577,7 +1558,7 @@ def test_forged_code_block_sentinel_does_not_duplicate_block() -> None:
     forgery: exactly one code block, no leaked sentinel."""
     md = "```python\nprint('hi')\n```\n\nprose " + _NUL + "CB0" + _NUL + " end"
     out = _render(md)
-    assert out.count("<pre>") == 1, "forged CB sentinel duplicated the block:\n" + out
+    assert out.count("<pre") == 1, "forged CB sentinel duplicated the block:\n" + out
     assert out.count("print(") == 1
     assert _NUL not in out, "raw NUL / forged sentinel leaked into output"
 
@@ -1597,7 +1578,7 @@ def test_control_strip_preserves_legit_fence_and_inline() -> None:
     only removes caller-supplied control chars, which are never valid data)."""
     out = _render("Here is `inline` and a block:\n\n```py\nx = 1\n```")
     assert "<code>inline</code>" in out
-    assert "<pre><code" in out
+    assert '<pre tabindex="0"><code' in out
     assert "x = 1" in out
     assert _NUL not in out
 
@@ -1671,9 +1652,9 @@ def test_standalone_code_block_not_wrapped_in_paragraph() -> None:
     ``<p><pre>…</pre></p>``, which a real browser splits into a stray empty
     ``<p>`` before the ``<pre>``.  The unwrap removes the wrapping paragraph."""
     out = _render("```py\nx = 1\n```")
-    assert "<pre><code" in out
+    assert '<pre tabindex="0"><code' in out
     assert "<p><pre>" not in out, "code block still wrapped in a paragraph:\n" + out
-    assert out.strip().startswith("<pre>"), "code block should not be paragraph-wrapped:\n" + out
+    assert out.strip().startswith("<pre"), "code block should not be paragraph-wrapped:\n" + out
 
 
 # ---------------------------------------------------------------------------
@@ -1691,7 +1672,7 @@ def test_blockquote_inside_fence_not_extracted() -> None:
     fence pass now runs first and masks the region."""
     out = _render("```text\nplain\n> quoted\nafter\n```")
     assert "<blockquote>" not in out, "blockquote extracted from inside a fence:\n" + out
-    assert "<pre><code" in out
+    assert '<pre tabindex="0"><code' in out
     assert "&gt; quoted" in out, "the quoted line must stay literal (escaped) code:\n" + out
 
 
@@ -1704,7 +1685,9 @@ def test_blockquoted_fence_renders_as_code() -> None:
     would have swallowed the blockquoted fence as ``undefined``.)"""
     out = _render("> ```\n> code\n> ```")
     assert "<blockquote>" in out
-    assert "<pre><code>code</code></pre>" in out, "blockquoted fence lost its code:\n" + out
+    assert '<pre tabindex="0"><code>code</code></pre>' in out, (
+        "blockquoted fence lost its code:\n" + out
+    )
     assert "undefined" not in out
     assert _NUL not in out
 
@@ -1715,7 +1698,9 @@ def test_indented_fence_still_renders_as_code() -> None:
     paragraph of literal backticks.  (A bare ``^`` anchor would drop it; the
     deeper 4-space-indent case is pinned separately.)"""
     out = _render("  ```py\n  x = 1\n  ```")
-    assert "<pre><code" in out, "indented fence dropped (not rendered as code):\n" + out
+    assert '<pre tabindex="0"><code' in out, (
+        "indented fence dropped (not rendered as code):\n" + out
+    )
     assert "x = 1" in out
 
 
@@ -1772,7 +1757,7 @@ def test_details_inside_fence_stays_literal() -> None:
     fence is masked by the (earlier) fence pass and must stay literal escaped
     code, never extracted into a real element."""
     out = _render("```html\n<details><summary>s</summary>x</details>\n```")
-    assert "<pre><code" in out
+    assert '<pre tabindex="0"><code' in out
     assert "&lt;details&gt;" in out, "details-in-fence should be literal code:\n" + out
     assert "<details>" not in out, "details inside a fence was wrongly extracted:\n" + out
 
@@ -1795,7 +1780,7 @@ def test_code_block_in_details_renders_code() -> None:
     render the CODE, not `undefined` and not an inert `CB0` sentinel."""
     out = _render("<details>\n<summary>x</summary>\n\n```py\nsecret_code()\n```\n\n</details>")
     assert "secret_code()" in out, "code inside <details> was lost:\n" + out
-    assert "<pre><code" in out and 'class="language-py"' in out
+    assert '<pre tabindex="0"><code' in out and 'class="language-py"' in out
     assert "undefined" not in out
     assert _NUL not in out, "a raw sentinel leaked (recursion did not see raw markdown):\n" + out
 
@@ -1841,7 +1826,9 @@ def test_details_close_tag_shown_in_fenced_example_does_not_close_block() -> Non
     tag; the fenced example renders as literal code inside the block."""
     md = "<details>\n<summary>s</summary>\n\n```html\n</details>\n```\n\n</details>"
     out = _render(md)
-    assert '<pre><code class="language-html">' in out, "fenced example was swallowed:\n" + out
+    assert '<pre tabindex="0"><code class="language-html">' in out, (
+        "fenced example was swallowed:\n" + out
+    )
     assert "&lt;/details&gt;" in out, "example </details> should be literal code:\n" + out
     assert out.strip().startswith("<details><summary>s</summary>"), out
     assert out.rstrip().endswith("</details>"), "real block closed early / stray text:\n" + out
@@ -1853,7 +1840,7 @@ def test_deeply_indented_fence_renders_as_code() -> None:
     tokenises as a code block — the open anchor allows arbitrary indent, so we
     don't regress deeply-nested code samples to literal backticks."""
     out = _render("    ```py\n    x = 1\n    ```")
-    assert "<pre><code" in out, "deeply-indented fence dropped:\n" + out
+    assert '<pre tabindex="0"><code' in out, "deeply-indented fence dropped:\n" + out
     assert "x = 1" in out
 
 
@@ -1866,7 +1853,9 @@ def test_fence_on_list_marker_line_renders_as_code() -> None:
     backticks + language tag as text."""
     for src in ["- ```py\n  print(1)\n  ```", "1. ```py\n   print(1)\n   ```"]:
         out = _render(src)
-        assert "<pre><code" in out, "list-marker-line fence dropped:\n" + repr(src) + "\n" + out
+        assert '<pre tabindex="0"><code' in out, (
+            "list-marker-line fence dropped:\n" + repr(src) + "\n" + out
+        )
         assert "print(1)" in out
         assert "```py" not in out, "raw fence backticks leaked as text:\n" + out
         assert "<li>" in out, "list structure lost:\n" + out
@@ -1879,7 +1868,7 @@ def test_nested_list_fence_stays_nested() -> None:
     the indent flattened the code block to a top-level sibling of the parent."""
     out = _render("- parent\n  - ```py\n    code\n    ```")
     assert "parent" in out
-    assert "<pre><code" in out and "```py" not in out
+    assert '<pre tabindex="0"><code' in out and "```py" not in out
     assert out.count("<ul>") == 2, "nested list fence flattened to a sibling:\n" + out
 
 
@@ -1888,7 +1877,7 @@ def test_big_ordered_marker_fence_is_protected() -> None:
     protected — the marker alternation uses ``\d+``, matching the list pass,
     not a capped ``\d{1,9}`` that would leave the fence unprotected."""
     out = _render("1234567890. ```py\ncode\n```")
-    assert "<pre><code" in out, "big ordered-marker fence leaked as text:\n" + out
+    assert '<pre tabindex="0"><code' in out, "big ordered-marker fence leaked as text:\n" + out
     assert "```py" not in out
 
 
@@ -1911,3 +1900,131 @@ def test_indented_details_is_extracted() -> None:
     out = _render("  <details><summary>x</summary>y</details>")
     assert "<details><summary>x</summary>" in out, "indented <details> not extracted:\n" + out
     assert "y" in out
+
+
+# ---------------------------------------------------------------------------
+# Table source stash — data-md-source for the copy affordance
+# ---------------------------------------------------------------------------
+
+
+def test_table_wrap_carries_exact_md_source() -> None:
+    """The table pass trims cells and inline-renders them, so the original
+    pipe / alignment lines are unrecoverable from the DOM.  The copy
+    affordance (copy_actions.js blockCopySource) reads the exact source
+    region from ``data-md-source``, stashed on ``.table-wrap`` at render
+    time — this pins both the attribute's presence and its exactness
+    (all rows, alignment line included, no surrounding prose)."""
+    table = "| a | b |\n|---|:--:|\n| 1 | 2 |\n| 3 | 4 |"
+    out = _render("Intro line\n\n" + table + "\n\nOutro line")
+    assert 'data-md-source="' + table + '"' in out, (
+        "table-wrap missing or carrying an inexact data-md-source:\n" + out
+    )
+
+
+def test_table_md_source_restores_inline_spans_to_raw_source() -> None:
+    """Table cells holding inline code / math are NUL-sentinel-masked by the
+    time the table pass slices its source region, and the global restore
+    passes run AFTER the table restore — i.e. INSIDE the emitted attribute.
+    Unfixed, a backtick cell put ``<code>`` markup on the clipboard and a
+    math cell spliced KaTeX HTML whose quotes TERMINATED the attribute
+    (spurious ``katex"`` attribute + source text leaking as page content).
+    The stash must round-trip the RAW author text for all three span kinds,
+    and no sentinel may survive anywhere in the output."""
+    for src in (
+        "| `x=1` | b |\n|---|---|\n| 1 | 2 |",
+        "| \\(x^2\\) | square |\n|---|---|\n| 1 | 2 |",
+        "| $$x$$ | b |\n|---|---|\n| 1 | 2 |",
+    ):
+        out = _render(src)
+        m = re.search(r'data-md-source="([^"]*)"', out)
+        assert m is not None, "no intact data-md-source attribute:\n" + out
+        # Equality (not substring): the value is the exact raw source — no
+        # rendered substitutes, no stranded sentinels, and by construction
+        # no premature quote terminating the attribute early.
+        assert m.group(1) == src, (
+            "data-md-source did not round-trip raw for " + repr(src) + ":\n" + out
+        )
+        assert "<" not in m.group(1), "markup inside the source stash:\n" + out
+        assert "\x00" not in out, "a masking sentinel survived into the output"
+    # The rendered CELLS resolve too — tables restore before the inline-span
+    # passes, so display math in a cell renders as KaTeX instead of literal
+    # sentinel garbage (a pre-existing ordering bug this stash work exposed).
+    out = _render("| $$x$$ | b |\n|---|---|\n| 1 | 2 |")
+    assert '<span class="katex">' in out, "display math in a table cell did not render:\n" + out
+
+
+def test_table_md_source_restores_nested_masks() -> None:
+    """A math span in a cell can SWALLOW an inline-code sentinel: code is
+    masked FIRST, so the math raw twin carries the code's sentinel rather
+    than its text.  The attribute restore must run in reverse mask order
+    (math before inline code) — restored in mask order, the swallowed
+    sentinel surfaces after its own pass already ran, falls to the
+    foreign-residue strip, and the copied source silently loses the code
+    span under a success flash."""
+    md = "| $$x `y` z$$ | \\(p `q` r\\) |\n|---|---|\n| 1 | 2 |"
+    out = _render(md)
+    m = re.search(r'data-md-source="([^"]*)"', out)
+    assert m is not None, "no intact data-md-source attribute:\n" + out
+    assert m.group(1) == md, "nested code-in-math did not round-trip raw:\n" + out
+
+
+def test_table_md_source_escapes_attribute_breakout_chars() -> None:
+    """A cell containing quotes or angle brackets must stay entity-escaped
+    inside the attribute value — a raw ``"`` would end the attribute and
+    let cell text inject markup."""
+    out = _render('| say "hi" & <b> | b |\n|---|---|\n| 1 | 2 |')
+    assert 'data-md-source="| say &quot;hi&quot; &amp; &lt;b&gt; | b |' in out, (
+        "quote / angle-bracket escaping missing in data-md-source:\n" + out
+    )
+    assert 'data-md-source="| say "hi"' not in out
+
+
+def test_table_md_source_aligns_raw_twins_at_nonzero_index() -> None:
+    """The raw-twin restore is index-aligned with the mask arrays; spans in
+    PROSE before the table push the table's own spans to non-zero raw
+    indices, so a push-to-one-array-only regression would splice a
+    DIFFERENT span's source into the stash.  Index 0 alone cannot catch
+    that."""
+    table = "| `x=1` | \\(y^2\\) |\n|---|---|\n| 1 | 2 |"
+    out = _render("Use `a` and \\(z\\) first.\n\n" + table)
+    m = re.search(r'data-md-source="([^"]*)"', out)
+    assert m is not None, "no intact data-md-source attribute:\n" + out
+    assert m.group(1) == table, (
+        "non-zero-index raw twins did not round-trip the table's own spans:\n" + out
+    )
+
+
+def test_footnote_frame_table_stash_round_trips_spans() -> None:
+    """A table inside a FOOTNOTE DEFINITION renders in a recursive frame.
+    The body is collected AFTER the outer inline-span masks, so its cells
+    carry OUTER-frame sentinels — restored to raw source before the
+    recursive render (restoreRawSpans), which re-masks them itself so its
+    own stash resolves them against its own raw twins.  Left unrestored,
+    the stash's residue strip silently DELETED the cell content from the
+    copied source under a success flash (and without the strip, the
+    outer restores would splice rendered HTML — attribute-terminating
+    quotes included — into the attribute after the fact)."""
+    out = _render("Ref[^a].\n\n[^a]: note\n  | h | v |\n  |---|---|\n  | $$y$$ | `c` |")
+    m = re.search(r'data-md-source="([^"]*)"', out)
+    assert m is not None, "no intact data-md-source attribute:\n" + out
+    assert m.group(1) == "| h | v |\n|---|---|\n| $$y$$ | `c` |", (
+        "footnote-frame table stash did not round-trip its cells' raw source:\n" + out
+    )
+    assert "\x00" not in out, "a masking sentinel survived into the output"
+    assert '<span class="katex">' in out, (
+        "the footnote table's math cell should render in the recursive frame:\n" + out
+    )
+
+
+def test_table_md_source_carries_ragged_rows_whole() -> None:
+    """Copy is SOURCE copy, uniformly: a row wider than the header renders
+    truncated (the loop emits hdrCells.length cells) but the stash carries
+    the block's whole raw source — the same contract as message copy.
+    What is shown is the render's decision; what is copied is what was
+    written."""
+    src = "| a | b |\n|---|---|\n| 1 | 2 | extra |"
+    out = _render(src)
+    m = re.search(r'data-md-source="([^"]*)"', out)
+    assert m is not None, "no intact data-md-source attribute:\n" + out
+    assert m.group(1) == src, "ragged table did not round-trip its whole source:\n" + out
+    assert ">extra<" not in out, "overflow cell leaked into the RENDERED table"

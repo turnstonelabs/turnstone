@@ -71,7 +71,9 @@ class BM25Index:
         """Return indices of top-k documents by relevance.
 
         Stage 1 is BM25. When a reranker is attached, a recall pool of the top
-        ``_RERANK_POOL`` BM25 hits is reranked and the top-k spliced back.
+        ``_RERANK_POOL`` BM25 hits is reranked and the top-k spliced back. In
+        reorder mode, matches ranked past the pool trail in BM25 order rather
+        than being dropped, so a ``k`` larger than the pool sees every match.
         """
         ranked = self._bm25_rank(query)
         if self._reranker is None:
@@ -83,7 +85,12 @@ class BM25Index:
         try:
             order = list(self._reranker(query, docs))
         except Exception:
-            return pool[:k]  # reranker ERROR -> BM25 order (both modes)
+            # Reranker ERROR -> BM25 order (both modes). Filter mode keeps its
+            # pool bound — its happy path can never exceed the pool, and an
+            # endpoint failure must not return a longer list than a working
+            # endpoint ever could; reorder mode gets the full ranking, like
+            # its past-pool tail below.
+            return pool[:k] if self._rerank_filters else ranked[:k]
         seen: set[int] = set()
         out: list[int] = []
         for pos in order:
@@ -110,12 +117,21 @@ class BM25Index:
         # any pool items the reranker omitted (e.g. a top_n subset) are backfilled
         # in BM25 order so results are never silently lost.
         if not out:
-            return pool[:k]
+            return ranked[:k]
         for pos in range(len(pool)):
             if len(out) >= k:
                 break
             if pos not in seen:
                 out.append(pool[pos])
+        # Matches ranked past the recall pool. A no-op when k <= _RERANK_POOL
+        # (the skills-find path passes k = min(len(rows), 50)); tool_search
+        # passes k = corpus size and DEPENDS on this tail — it counts
+        # matches from the result, and a pool-capped result would floor
+        # that count at the pool size.
+        for idx in ranked[len(pool) :]:
+            if len(out) >= k:
+                break
+            out.append(idx)
         return out
 
     def _score(self, q_tokens: list[str], doc_tokens: list[str], dl: int) -> float:

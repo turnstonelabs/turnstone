@@ -1287,6 +1287,19 @@ class TestMCPActingUserBinding:
         # Merged tool list rebuilt under the new identity.
         mcp_client.get_tools.assert_any_call(user_id="bob")
 
+    def test_status_snapshot_follows_acting_user(self, tmp_db, mock_openai_client):
+        """The tool_search status snapshot scopes to the acting user, like
+        the get_tools call that builds the search corpus — owner-scoping
+        would render the owner's per-user pool state (including their
+        recorded discovery-failure text) into a non-owner participant's
+        search results."""
+        session, mcp_client = self._make(mock_openai_client)
+        mcp_client.get_all_server_status.return_value = {}
+
+        session.bind_acting_user("bob")
+        session._mcp_status_snapshot()
+        assert mcp_client.get_all_server_status.call_args.args == ("bob",)
+
     def test_prepared_item_pins_identity_across_rebind(self, tmp_db, mock_openai_client):
         session, mcp_client = self._make(mock_openai_client)
         session.bind_acting_user("bob")

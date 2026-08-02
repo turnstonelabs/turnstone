@@ -176,6 +176,11 @@ export function buildMcpErrorEmbed(err, rawJson, onConsent) {
   details.appendChild(summary);
   const pre = document.createElement("pre");
   pre.className = "tool-output";
+  // Focusable like every copyable block: where this card mounts inside a
+  // chat .msg-body the pre hosts the pointer copy affordance, and the
+  // keyboard copy path (copy_actions.js, Enter) acts on the FOCUSED
+  // block — and it is a horizontal scroll region regardless.
+  pre.setAttribute("tabindex", "0");
   pre.textContent = tryPrettyJson(rawJson) || redactCredentials(rawJson);
   details.appendChild(pre);
   wrapper.appendChild(details);
