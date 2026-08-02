@@ -118,12 +118,19 @@ turnstone.db.secretName cannot disagree about where the password lives.
 
 An operator-supplied existingSecret wins outright: writing the value
 into a second Secret nothing reads would only duplicate a credential.
+
+Both branches need "default" because this is reached through include,
+which captures rendered text rather than a value: a key that is unset
+rather than empty — "password:" with nothing after it — renders as the
+literal "<no value>", and a ten-character string is truthy. Without the
+default that lands base64-encoded in POSTGRES_PASSWORD and the workloads
+authenticate with it.
 */}}
 {{- define "turnstone.db.inlinePassword" -}}
 {{- if .Values.postgresql.enabled }}
-{{- .Values.postgresql.auth.password }}
+{{- .Values.postgresql.auth.password | default "" }}
 {{- else if not .Values.database.external.existingSecret }}
-{{- .Values.database.external.password }}
+{{- .Values.database.external.password | default "" }}
 {{- end }}
 {{- end }}
 
