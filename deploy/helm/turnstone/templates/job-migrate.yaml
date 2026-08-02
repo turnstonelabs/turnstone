@@ -6,23 +6,30 @@ metadata:
     {{- include "turnstone.labels" . | nindent 4 }}
     app.kubernetes.io/component: migrate
   annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
+    # post-install, not pre-install: on a first install nothing the
+    # migration needs exists yet — not the ConfigMap, not the Secret, and
+    # with the bundled subchart not the database either, since Helm
+    # creates ordinary resources only once hooks have finished. On an
+    # upgrade all of it is already running, so pre-upgrade is both safe
+    # and preferable: migrations land before the new code rolls out
+    # rather than after.
+    "helm.sh/hook": post-install,pre-upgrade
     "helm.sh/hook-weight": "-1"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
-  backoffLimit: 3
+  # Helm does not wait for the database to be ready before running
+  # post-install hooks, so on a first install this Job is what waits: it
+  # exits non-zero until PostgreSQL accepts connections, and the retry
+  # budget has to cover a cold StatefulSet pulling its image and
+  # initialising.
+  backoffLimit: 10
   template:
     metadata:
       labels:
         {{- include "turnstone.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: migrate
     spec:
-      # Deliberately not turnstone.serviceAccountName: this Job is a
-      # pre-install hook, and Helm creates the chart's ServiceAccount only
-      # after hooks complete, so referencing it deadlocks the install with
-      # "error looking up service account". The migration talks to
-      # PostgreSQL and never to the Kubernetes API, so the namespace
-      # default ServiceAccount is sufficient.
+      serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
       restartPolicy: OnFailure
       containers:
         - name: migrate
@@ -32,9 +39,5 @@ spec:
             - python
             - -m
             - turnstone.core.storage._migrate
-          # No envFrom: see turnstone.db.env. As a pre-install hook this
-          # Job runs before the ConfigMap exists. The chart's Secret is
-          # reachable — it carries matching hook annotations at a lower
-          # weight — but only for the password, by secretKeyRef.
           env:
             {{- include "turnstone.db.env" . | nindent 12 }}

@@ -136,33 +136,100 @@ authenticate with it.
 {{- end }}
 
 {{/*
-Determine the secret holding the PostgreSQL password.
+The name of the bundled subchart's own Secret.
 
-An external database may point at a secret the chart does not own (a
-CloudNativePG-generated secret, an External Secrets target, ...), in
-which case the key name is rarely "POSTGRES_PASSWORD" — hence the
-companion existingSecretPasswordKey.
+Mirrors the subchart's naming rather than calling its helpers, which
+expect a context scoped to the subchart that this chart cannot hand
+them. Release-derived, so deliberately not turnstone.fullname: a
+fullnameOverride here renames this chart's resources and leaves the
+subchart's alone, and pointing at "<fullname>-postgresql" would then
+name a Secret that does not exist.
 
-Otherwise the password is inline in values, and the chart writes it to
-its own <fullname>-secrets. Note this is deliberately not
-turnstone.llm.secretName: that resolves to llm.existingSecret when the
-operator supplies one, which holds LLM API keys and has no reason to
-carry a database password. templates/secret.yaml renders on exactly the
-condition above, so the two stay in agreement.
+The subchart also normalises the release name through a regex before
+using it, which is a no-op for the DNS-1123 names Helm accepts, so it is
+not reproduced.
+*/}}
+{{- define "turnstone.postgresql.fullname" -}}
+{{- $global := ((.Values.global).postgresql).fullnameOverride }}
+{{- if $global }}
+{{- $global | trunc 63 | trimSuffix "-" }}
+{{- else if .Values.postgresql.fullnameOverride }}
+{{- .Values.postgresql.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := .Values.postgresql.nameOverride | default "postgresql" }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- define "turnstone.postgresql.secretName" -}}
+{{- $existing := coalesce (((.Values.global).postgresql).auth).existingSecret .Values.postgresql.auth.existingSecret }}
+{{- if $existing }}
+{{- tpl $existing . }}
+{{- else }}
+{{- include "turnstone.postgresql.fullname" . }}
+{{- end }}
+{{- end }}
+
+{{/*
+The subchart stores the named user's password under "password" and the
+superuser's under "postgres-password", and lets an operator rename
+either through auth.secretKeys.
+*/}}
+{{- define "turnstone.postgresql.passwordKey" -}}
+{{- $user := .Values.postgresql.auth.username | default "" }}
+{{- $keys := .Values.postgresql.auth.secretKeys | default dict }}
+{{- if or (empty $user) (eq $user "postgres") }}
+{{- $keys.adminPasswordKey | default "postgres-password" }}
+{{- else }}
+{{- $keys.userPasswordKey | default "password" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Determine the secret holding the PostgreSQL password, and the key within
+it. Three sources, and the two helpers agree by construction because
+they branch identically:
+
+  - an external database pointed at a Secret the chart does not own (a
+    CloudNativePG-generated secret, an External Secrets target, ...), in
+    which case the key is rarely "POSTGRES_PASSWORD" — hence the
+    companion existingSecretPasswordKey
+  - the bundled subchart's own Secret, when it generates the password
+  - <fullname>-secrets, when the password is supplied inline in values
+
+Note the last is deliberately not turnstone.llm.secretName: that
+resolves to llm.existingSecret when the operator supplies one, which
+holds LLM API keys and has no reason to carry a database password.
 */}}
 {{- define "turnstone.db.secretName" -}}
-{{- if and (not .Values.postgresql.enabled) .Values.database.external.existingSecret }}
+{{- if not .Values.postgresql.enabled }}
+{{- if .Values.database.external.existingSecret }}
 {{- .Values.database.external.existingSecret }}
 {{- else }}
 {{- printf "%s-secrets" (include "turnstone.fullname" .) }}
 {{- end }}
+{{- else if include "turnstone.db.inlinePassword" . }}
+{{- printf "%s-secrets" (include "turnstone.fullname" .) }}
+{{- else }}
+{{- include "turnstone.postgresql.secretName" . }}
+{{- end }}
 {{- end }}
 
 {{- define "turnstone.db.passwordKey" -}}
-{{- if and (not .Values.postgresql.enabled) .Values.database.external.existingSecret }}
+{{- if not .Values.postgresql.enabled }}
+{{- if .Values.database.external.existingSecret }}
 {{- .Values.database.external.existingSecretPasswordKey | default "password" }}
 {{- else }}
 {{- printf "POSTGRES_PASSWORD" }}
+{{- end }}
+{{- else if include "turnstone.db.inlinePassword" . }}
+{{- printf "POSTGRES_PASSWORD" }}
+{{- else }}
+{{- include "turnstone.postgresql.passwordKey" . }}
 {{- end }}
 {{- end }}
 
@@ -170,10 +237,8 @@ condition above, so the two stay in agreement.
 Database environment shared by the server, console and migrate Job.
 
 Every value except the password is rendered inline rather than pulled
-from the ConfigMap via envFrom. The migrate Job is a pre-install hook,
-and Helm creates ordinary resources only after hooks finish, so any
-envFrom dependency would leave the hook stuck in
-CreateContainerConfigError on a ConfigMap that does not exist yet.
+from the ConfigMap via envFrom, so that one definition serves all three
+workloads and the URL is assembled in exactly one place.
 
 POSTGRES_PASSWORD must still precede TURNSTONE_DB_URL: the kubelet
 expands $(VAR) only against env entries declared earlier in the list, so
