@@ -231,6 +231,11 @@ class TestMidStreamRetry:
         assert persisted and "Backend stream died mid-response" in persisted
         fatal = [r for r in caplog.records if "session.fatal.recorded" in r.message]
         assert fatal and any(r.levelno == logging.ERROR for r in fatal)
+        # Every dead attempt is finalized — two retry-path pairs plus the
+        # terminal arm's pair (the CLI markdown fence reset rides on
+        # stream_end; server workers add their own only after the fatal).
+        assert ui.kinds().count("stream_end") == 3
+        assert ui.kinds().count("turn_committed") == 3
 
     def test_cancel_during_backoff_stops_without_recreate(self, tmp_db):
         ui = RecordingUI()
@@ -259,6 +264,68 @@ class TestMidStreamRetry:
         assert ("state", "idle") in ui.events
         assert ("state", "error") not in ui.events
         assert any("cancelled" in d.lower() for d in ui.of("info"))
+        # The dead attempt's partial survives the Stop with the cancel
+        # marker — same disposition a cancel DURING the attempt gets.  "Hel"
+        # is shorter than the splitter's carry window, so this also pins the
+        # carry-tail inclusion in the stash.
+        assistant = _assistant_msgs(session)
+        assert len(assistant) == 1
+        assert assistant[0]["content"] == "Hel\n\n[generation cancelled before completion]"
+
+    def test_rebind_reprepares_wire_messages(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+        streams = [
+            _dying_stream("x", exc=httpx.ReadError("wire died")),
+            _good_stream("ok"),
+        ]
+
+        def swap_binding():
+            # A registry reload that rebinds mid-retry replaces the client
+            # object (the identity signal the wrapper keys on).
+            session.client = MagicMock()
+
+        with (
+            patch.object(session, "_create_stream_with_retry", side_effect=streams) as create,
+            patch.object(session, "_refresh_model_from_registry", side_effect=swap_binding),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(
+                session, "_prepare_wire_messages", wraps=session._prepare_wire_messages
+            ) as prep,
+        ):
+            session.send("test")
+
+        # send() prepares once; the rebind forces exactly one re-prepare
+        # (capability-sensitive wire fold) before the re-issue.
+        assert prep.call_count == 2
+        assert create.call_count == 2
+        assert _assistant_msgs(session)[-1]["content"] == "ok"
+
+    def test_refresh_fires_per_reissue(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+        streams = [
+            _dying_stream("x", exc=httpx.ReadError("wire died")),
+            _dying_stream("y", exc=httpx.ReadError("wire died again")),
+            _good_stream("ok"),
+        ]
+        with (
+            patch.object(session, "_create_stream_with_retry", side_effect=streams) as create,
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(
+                session,
+                "_refresh_model_from_registry",
+                wraps=session._refresh_model_from_registry,
+            ) as refresh,
+        ):
+            session.send("test")
+
+        assert create.call_count == 3
+        # Once at the top of send() (the per-send driver) plus once per
+        # re-issue — a regression that drops the mid-retry refresh would
+        # show 1 here and stream a reload-closed client (#937 recreate
+        # hardening).
+        assert refresh.call_count == 3
 
     def test_non_retryable_error_is_immediately_fatal(self, tmp_db):
         ui = RecordingUI()
@@ -277,6 +344,9 @@ class TestMidStreamRetry:
         assert create.call_count == 1  # zero retries
         assert ("state", "error") in ui.events
         assert not any("stream died mid-response" in d for d in ui.of("info"))
+        # The terminal arm finalizes even a zero-retry death.
+        assert ui.kinds().count("stream_end") == 1
+        assert ui.kinds().count("turn_committed") == 1
 
     def test_recreate_failure_surfaces_original_stream_death(self, tmp_db, caplog):
         """A failing re-create (closed client, registry chaos) must not

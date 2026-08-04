@@ -188,7 +188,13 @@ def test_cross_thread_client_close_surfaces_transport_error_to_blocked_read():
         reader_blocked.set()
         with pytest.raises(httpx.TransportError) as excinfo:
             next(it)  # blocked read, killed by the cross-thread close()
-        assert type(excinfo.value).__name__ == "ReadError"
+        # Platform/timing-dependent: the killed read surfaces as ReadError
+        # (EBADF from the blocked recv) or, where the reader observes EOF
+        # first, RemoteProtocolError (chunked body never terminated).  Both
+        # are TransportError members of _BACKEND_STREAM_EXC_NAMES, so
+        # transport_guarded converts either and the retry gate passes — the
+        # property this pin exists for.
+        assert type(excinfo.value).__name__ in {"ReadError", "RemoteProtocolError"}
     finally:
         # Unblock and join both threads on every exit path so nothing
         # outlives the test (leaked-thread guard).

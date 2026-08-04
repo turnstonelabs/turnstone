@@ -30,6 +30,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import traceback
 import uuid
 from datetime import UTC, datetime
 from html import escape as _html_escape
@@ -1893,6 +1894,11 @@ class ChatSession:
         # the model detached on purpose.  close() reaps everything.
         self._background_shells = BackgroundShellRegistry(on_exit=self._on_background_shell_exit)
         self._cancelled_partial_msg: dict[str, Any] | None = None
+        # The most recent dead attempt's flushed content, stashed by
+        # _stream_attempt's non-cancel death arm so the resilient wrapper
+        # can preserve it when a cancel lands in the retry window (a Stop
+        # during backoff must not vaporize text the user already saw).
+        self._midstream_dead_partial: str = ""
         self._pending_retry: str | None = None
         # True when a fatal exception's text has been persisted to
         # workstream_config["last_error"] for the coord's inspect/wait
@@ -5277,7 +5283,15 @@ class ChatSession:
             error_type=type(exc).__name__,
             error=safe,
         )
-        log.debug("session.fatal.recorded", exc_info=True)
+        # Frames only — ``exc_info=True`` would render the raw exception
+        # message, which can carry credentials verbatim (the sanitize floor
+        # the lines above exist to hold); format_tb renders the stack
+        # without the message.
+        if exc.__traceback__ is not None:
+            log.debug(
+                "session.fatal.recorded.trace",
+                trace="".join(traceback.format_tb(exc.__traceback__)),
+            )
         try:
             self.ui.on_error(safe)
         except Exception:
@@ -7700,10 +7714,26 @@ class ChatSession:
                 # mid-consumption (error-frame lanes), and it must fall
                 # through to send()'s compact-and-retry arm rather than
                 # burn re-issues on a deterministic failure.
-                if self._generation != my_generation or self._stop_retrying(
+                if self._generation != my_generation:
+                    # Superseded (force-cancel started a newer generation):
+                    # an orphaned thread must not touch the UI — a finalize
+                    # emitted here would clobber the NEW generation's
+                    # in-flight stream state.
+                    raise
+                if self._stop_retrying(
                     e, attempt, self._provider, max_retries=self._MID_STREAM_RETRIES
                 ):
-                    raise  # fatal path unchanged
+                    # Terminal: finalize the dead attempt exactly as the
+                    # retry path below does, or the last attempt's partial
+                    # stays un-flushed in every consumer — the CLI is the
+                    # sharp case (its markdown fence state resets only in
+                    # on_stream_end; the server /send workers emit their own
+                    # stream_end after a fatal, the CLI's direct send() does
+                    # not).  An attempt that died before its first token
+                    # finalizes empty buffers, which no-ops everywhere.
+                    self.ui.on_stream_end()
+                    self.ui.on_turn_committed()
+                    raise  # fatal path otherwise unchanged
                 attempt += 1
                 cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
                 delay = self._RETRY_BASE_DELAY * (2 ** (attempt - 1))
@@ -7729,25 +7759,55 @@ class ChatSession:
                     f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
                 )
                 self.ui.on_thinking_start()
-                self._backoff_or_cancelled(delay, my_generation)
-                self._cancel_stream = None  # drop the dead SDK handle
-                # A concurrent ModelRegistry.reload() closes cached clients
-                # whose connection config changed — the in-flight read then
-                # dies with a ReadError and self.client is CLOSED.  The
-                # refresh is generation-gated (two compares when nothing
-                # changed), so this is free in the common case and re-binds
-                # exactly when reload made the old client unusable.
-                self._refresh_model_from_registry()
                 try:
-                    stream = self._create_stream_with_retry(msgs)
-                except Exception:
-                    # The re-create's failure must not mask the true
-                    # stream-death error: a closed-client recreate surfaces
-                    # as a retryable APIConnectionError and would otherwise
-                    # replace the operator-actionable wording after burning
-                    # its own ladder.
-                    log.warning("stream.retry.recreate_failed", exc_info=True)
-                    raise e from None
+                    self._backoff_or_cancelled(delay, my_generation)
+                    self._cancel_stream = None  # drop the dead SDK handle
+                    # A concurrent ModelRegistry.reload() closes cached
+                    # clients whose connection config changed — the
+                    # in-flight read then dies with a ReadError and
+                    # self.client is CLOSED.  The refresh is
+                    # generation-gated (two compares when nothing changed),
+                    # so this is free in the common case and re-binds
+                    # exactly when reload made the old client unusable.
+                    client_before = self.client
+                    self._refresh_model_from_registry()
+                    if self.client is not client_before:
+                        # The rebind may have changed the model family, and
+                        # the wire fold is capability-sensitive
+                        # (fold_system_turns) — re-prepare against the new
+                        # binding, the same pass the overflow arm runs
+                        # mid-send.  Identity compare: _bind_model_from_
+                        # registry replaces the client object on any
+                        # connection-relevant change.
+                        msgs = self._prepare_wire_messages(self._full_messages())
+                    try:
+                        stream = self._create_stream_with_retry(msgs)
+                    except Exception as recreate_exc:
+                        # The re-create's failure must not mask the true
+                        # stream-death error: a closed-client recreate
+                        # surfaces as a retryable APIConnectionError and
+                        # would otherwise replace the operator-actionable
+                        # wording after burning its own ladder.  Class name
+                        # only — a ConnectError's text can carry a
+                        # credential-bearing base_url verbatim.
+                        log.warning(
+                            "stream.retry.recreate_failed",
+                            error_type=type(recreate_exc).__name__,
+                        )
+                        raise e from None
+                except GenerationCancelled:
+                    # A Stop landing in the backoff/re-create window aborts
+                    # the turn with the dead attempt's partial preserved —
+                    # the same disposition a cancel DURING the attempt gets
+                    # (send()'s cancel handler persists it with the
+                    # cancellation marker).  Without this, cancel-in-backoff
+                    # silently drops text the user already saw.
+                    if self._midstream_dead_partial:
+                        self._cancelled_partial_msg = {
+                            "role": "assistant",
+                            "content": self._midstream_dead_partial,
+                        }
+                    raise
 
     def _stream_attempt(
         self, stream: Iterator[StreamChunk], my_generation: int = 0
@@ -7777,6 +7837,7 @@ class ChatSession:
         # `_assistant_pending_tokens or ...` fallback.
         self._last_usage = None
         self._assistant_pending_tokens = 0
+        self._midstream_dead_partial = ""
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -7927,6 +7988,16 @@ class ChatSession:
             if self._cancel_event.is_set():
                 _record_cancelled_partial()
                 raise GenerationCancelled() from None
+            # A non-cancel death: stash the flushed partial so the resilient
+            # wrapper can preserve it if a cancel lands in the retry window
+            # (its backoff arm promotes the stash to _cancelled_partial_msg).
+            # The splitter's carry tail rides along when it is content-state
+            # — matching _record_cancelled_partial, which flushes it into
+            # content_parts — but without emitting mid-exception UI tokens;
+            # an in-think tail is reasoning and stays out, as there too.
+            self._midstream_dead_partial = "".join(content_parts) + (
+                splitter.pending if not splitter.in_think else ""
+            )
             raise
 
         # Flush any remaining buffered text
