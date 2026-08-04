@@ -597,6 +597,30 @@ class TestMidStreamRetry:
         assistant = _assistant_msgs(session)
         assert assistant and assistant[-1]["content"].startswith("a dead attempt")
 
+    def test_pre937_ui_without_discard_hook_survives_retry(self, tmp_db):
+        # A duck-typed UI predating on_stream_discarded must degrade to
+        # "no server-buffer truncate", not crash the retry arm with an
+        # AttributeError that replaces the stream death being handled.
+        class _Pre937UI(RecordingUI):
+            # property() with no getter raises AttributeError on access —
+            # simulating the hook's absence on an inheriting fake.
+            on_stream_discarded = property()
+
+        ui = _Pre937UI()
+        session = _make_session(ui)
+        streams = [
+            _dying_stream("x", exc=httpx.ReadError("wire died")),
+            _good_stream("ok"),
+        ]
+        with (
+            patch.object(session, "_create_stream_with_retry", side_effect=streams),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("test")
+
+        assert _assistant_msgs(session)[-1]["content"] == "ok"
+        assert ("state", "idle") in ui.events
+
     def test_overflow_recovery_discards_dead_text_from_turn_buffer(self, tmp_db):
         # A mid-consumption overflow is TERMINAL for the retry ladder but
         # RECOVERED by send()'s compact-and-retry — the dead attempt's text

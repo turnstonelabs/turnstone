@@ -348,6 +348,7 @@ def as_stream(result: Any) -> list[StreamChunk]:
         )
     ]
 
+
 class RecordingUI:
     """UI adapter recording the ordered event stream ``send()`` emits."""
 

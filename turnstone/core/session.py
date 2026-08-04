@@ -1256,7 +1256,19 @@ class SessionUI(Protocol):
     def on_turn_start(self) -> None: ...
     def on_turn_committed(self) -> None: ...
 
-    def on_stream_discarded(self) -> None: ...
+    def on_stream_discarded(self) -> None:
+        """Drop a dead stream attempt's text from any server-side buffers.
+
+        A REAL no-op default, not a bare ``...`` stub, for the same reason
+        ``on_compaction`` below carries one: an explicit pre-#937
+        ``SessionUI`` subclass inherits this as its implementation, and
+        for a discard the no-op IS correct — a UI without server-side
+        turn buffers has nothing to truncate.  ``SessionUIBase`` overrides
+        with the real truncation; duck-typed UIs that never subclass are
+        covered by the getattr probe in ``_ui_stream_discarded``.
+        """
+        return
+
     def on_thinking_start(self) -> None: ...
     def on_thinking_stop(self) -> None: ...
     def on_reasoning_token(self, text: str) -> None: ...
@@ -7730,6 +7742,21 @@ class ChatSession:
                 text = text[:start] + text[end + len(close_t) :] if end != -1 else text[:start]
         return text.strip()
 
+    def _ui_stream_discarded(self) -> None:
+        """Best-effort dead-segment discard across UI generations.
+
+        Probed, never called directly: a pre-#937 duck-typed UI may lack
+        the hook, and an AttributeError raised from the retry/terminal
+        arms would REPLACE the stream death being handled — the retry
+        gate would then judge the attribute error instead of the wire
+        failure.  Missing hook degrades to no server-buffer truncate,
+        which is correct for UIs without server-side buffers (the same
+        compat posture as ``_compaction_event``'s probe).
+        """
+        discard = getattr(self.ui, "on_stream_discarded", None)
+        if discard is not None:
+            discard()
+
     def _stream_response(
         self, msgs: list[dict[str, Any]], my_generation: int = 0
     ) -> dict[str, Any]:
@@ -7854,7 +7881,7 @@ class ChatSession:
                     # hold the dead attempt's text, concatenating the two
                     # in the idle payload.
                     self.ui.on_stream_end()
-                    self.ui.on_stream_discarded()
+                    self._ui_stream_discarded()
                     raise  # fatal path otherwise unchanged
                 # Delay from the PRE-increment attempt index — the same
                 # convention as the three sibling ladders' range loops.
@@ -7901,7 +7928,7 @@ class ChatSession:
                     # source) and reset the inflight snapshot BEFORE any
                     # retried token lands, or every consumer appends the
                     # retried text onto the dead attempt's.
-                    self.ui.on_stream_discarded()
+                    self._ui_stream_discarded()
                     # Spinner for the recreate+TTFT window, and the fresh
                     # segment watermark — AFTER the truncate, so a later
                     # discard cannot resurrect this dead segment.  A
