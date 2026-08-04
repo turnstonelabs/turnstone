@@ -141,6 +141,15 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Changed
 
+- **Log event rename: `drain_stream.post_finish_blip` is now
+  `stream.post_finish_blip`, without the `usage_captured` field.** The
+  single-shot drain normalizes mid-body transport deaths through the same
+  `transport_guarded` wrapper the interactive loop uses, so its
+  post-finish-blip tolerance logs under the wrapper's event name. Update
+  any external log filters pinned to the old name; the drained result's
+  possible `usage=None` on a post-finish blip is unchanged and documented
+  on `drain_stream`.
+
 - **Breaking (1.8): compaction feedback moved from `info` events to the
   typed `compaction` SSE event.** Pre-1.8 SSE/SDK clients that ignore
   unknown event types no longer see compaction lines (they are

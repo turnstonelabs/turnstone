@@ -92,9 +92,11 @@ def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
     recomputed from the merged parts.  Returns a fresh ``UsageInfo`` and
     never mutates ``new`` (the provider's object).
 
-    ``ChatSession``'s inline chunk consumer implements the same rule over
-    its dict-shaped accumulator; it adopts this helper when the main loop
-    moves onto ``model_turn`` (#832).
+    Serves :func:`drain_stream` and ``ChatSession``'s inline chunk
+    consumer alike — the interactive loop re-projects the merged
+    accumulator into its ``_last_usage`` dict on every usage chunk (that
+    dict has mid-stream readers), so the two lanes cannot drift on the
+    merge rule.
     """
     if acc is None:
         return replace(new)
@@ -221,7 +223,9 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
       never be handed to a caller that stores it as a complete result (a
       compaction summary, a title).  A transport blip AFTER the finish
       reason keeps the completed result and forfeits only trailing
-      metadata.
+      metadata — on the chat lane the usage chunk trails the finish
+      reason, so that result may report usage=None and the call's spend
+      goes missing from usage accounting.
     - ``usage`` merges via :func:`merge_usage` — Anthropic splits prompt
       and completion tokens across separate events.
     - Tool calls accumulate by ``ToolCallDelta.index`` via
@@ -241,15 +245,14 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
 
     Raises whatever the underlying stream raises — retry/deadline/fallback
     policy stays with the caller, exactly as with the old non-streaming
-    transport — EXCEPT httpx transport failures: streaming moves the body
-    read out of the SDK's ``APIConnectionError``-wrapped request into raw
-    iteration, so a mid-body connection drop or read timeout surfaces as a
-    bare ``httpx.TransportError`` no retry predicate recognizes.  Those
-    are re-raised (chained) as :class:`IncompleteStreamError`, restoring
-    the wire-blip retryability the non-streaming transport had.
+    transport — EXCEPT httpx transport failures, normalized by
+    :func:`transport_guarded` (the one conversion rule, shared with the
+    interactive loop): a mid-body death before the finish reason is
+    re-raised (chained) as :class:`IncompleteStreamError`, restoring the
+    wire-blip retryability the non-streaming transport had, and a
+    post-finish blip ends the stream cleanly so the completed result is
+    kept.
     """
-    import httpx  # noqa: PLC0415 — heavyweight; deferred off the type-module import path
-
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     trailing_info_parts: list[str] = []
@@ -258,32 +261,7 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     finish_reason: str | None = None
     provider_blocks: list[dict[str, Any]] = []
 
-    iterator = iter(chunks)
-    while True:
-        try:
-            sc = next(iterator)
-        except StopIteration:
-            break
-        except httpx.TransportError as exc:
-            if finish_reason is not None:
-                # The generation already completed (finish reason in hand);
-                # the blip only cost trailing metadata — a usage-only chunk
-                # or the citation footer.  Keep the complete result rather
-                # than discarding it for a retry that re-pays the tokens —
-                # but say so: on the chat lane the usage chunk trails the
-                # finish reason, so this result may report usage=None and
-                # the call's spend goes missing from usage accounting.
-                import structlog  # noqa: PLC0415 — deferred with httpx off the type-module path
-
-                structlog.get_logger(__name__).warning(
-                    "drain_stream.post_finish_blip",
-                    error_type=type(exc).__name__,
-                    usage_captured=usage is not None,
-                )
-                break
-            raise IncompleteStreamError(
-                f"stream transport failed mid-response ({type(exc).__name__}: {exc})"
-            ) from exc
+    for sc in transport_guarded(chunks):
         if sc.content_delta:
             content_parts.append(sc.content_delta)
         if sc.reasoning_delta:

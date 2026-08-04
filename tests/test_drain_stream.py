@@ -351,6 +351,22 @@ class TestTransportGuarded:
 
 
 class TestErrorPropagation:
+    def test_post_finish_blip_keeps_completed_result(self):
+        # The generation completed (finish reason in hand) — a trailing
+        # transport blip forfeits only trailing metadata (here: the usage
+        # chunk), never the completed result.
+        import httpx
+
+        def chunks():
+            yield StreamChunk(content_delta="whole answer")
+            yield StreamChunk(finish_reason="stop")
+            raise httpx.ReadError("late blip")
+
+        result = drain_stream(chunks())
+        assert result.content == "whole answer"
+        assert result.finish_reason == "stop"
+        assert result.usage is None
+
     def test_httpx_transport_error_becomes_retryable_incomplete(self):
         # Streaming moves the body read out of the SDK's wrapped request:
         # a mid-body wire failure surfaces as a raw httpx.TransportError

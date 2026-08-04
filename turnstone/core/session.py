@@ -175,6 +175,7 @@ from turnstone.core.preview import (
 from turnstone.core.providers import (
     accumulate_tool_call_delta,
     create_provider,
+    merge_usage,
     transport_guarded,
 )
 from turnstone.core.ratelimit import TokenBucket
@@ -7786,6 +7787,7 @@ class ChatSession:
         reasoning_parts: list[str] = []
         tool_calls_acc: dict[int, dict[str, Any]] = {}
         provider_blocks: list[dict[str, Any]] = []
+        usage_acc: UsageInfo | None = None
         first_token = True
         in_think = False  # inside a <think>...</think> block
         path1_reasoning = False  # last reasoning came via reasoning_delta field
@@ -7858,6 +7860,31 @@ class ChatSession:
                 self.ui.on_thinking_stop()
                 first_token = False
 
+        def _record_cancelled_partial() -> None:
+            """Flush buffered text, finalize the stream in the UI, and stash
+            the partial for send()'s cancel handler — the one sequence both
+            cancel arms (cooperative and stream-close-converted) must run.
+            ``tool_calls`` and ``_provider_content`` are DELIBERATELY
+            OMITTED from the partial:
+
+            * ``tool_calls`` — incomplete, no matching tool_result;
+              re-emitting on the next turn would orphan them.
+            * ``_provider_content`` — the Anthropic provider reads this
+              lane verbatim ahead of plain ``content`` (see
+              ``providers/_anthropic.py``), and a cancellation can leave
+              partial tool_use blocks here too.  Keeping it would also
+              cause the next-turn replay to bypass the ``[generation
+              cancelled before completion]`` marker the cancel handler
+              appends to ``content``, hiding the partial-output signal
+              from the model.
+            """
+            if pending:
+                _flush_text(pending, in_think)
+            self.ui.on_stream_end()
+            partial: dict[str, Any] = {"role": "assistant"}
+            partial["content"] = "".join(content_parts) or ""
+            self._cancelled_partial_msg = partial
+
         finish_reason = None
         try:
             for chunk in stream:
@@ -7873,35 +7900,20 @@ class ChatSession:
                     finish_reason = chunk.finish_reason
 
                 # Accumulate usage (Anthropic sends prompt tokens in message_start
-                # and completion tokens in message_delta as separate events)
+                # and completion tokens in message_delta as separate events) via
+                # THE shared max-merge rule (merge_usage, drain_stream's twin).
+                # self._last_usage is re-written on EVERY usage chunk: it is
+                # read mid-stream (_estimated_prompt_tokens, the status line),
+                # so the dict write cannot defer to stream end.
                 if chunk.usage:
-                    if self._last_usage is None:
-                        self._last_usage = {
-                            "prompt_tokens": chunk.usage.prompt_tokens,
-                            "completion_tokens": chunk.usage.completion_tokens,
-                            "total_tokens": chunk.usage.total_tokens,
-                            "cache_creation_tokens": chunk.usage.cache_creation_tokens,
-                            "cache_read_tokens": chunk.usage.cache_read_tokens,
-                        }
-                    else:
-                        self._last_usage["prompt_tokens"] = max(
-                            self._last_usage["prompt_tokens"], chunk.usage.prompt_tokens
-                        )
-                        self._last_usage["completion_tokens"] = max(
-                            self._last_usage["completion_tokens"], chunk.usage.completion_tokens
-                        )
-                        self._last_usage["total_tokens"] = (
-                            self._last_usage["prompt_tokens"]
-                            + self._last_usage["completion_tokens"]
-                        )
-                        self._last_usage["cache_creation_tokens"] = max(
-                            self._last_usage.get("cache_creation_tokens", 0),
-                            chunk.usage.cache_creation_tokens,
-                        )
-                        self._last_usage["cache_read_tokens"] = max(
-                            self._last_usage.get("cache_read_tokens", 0),
-                            chunk.usage.cache_read_tokens,
-                        )
+                    usage_acc = merge_usage(usage_acc, chunk.usage)
+                    self._last_usage = {
+                        "prompt_tokens": usage_acc.prompt_tokens,
+                        "completion_tokens": usage_acc.completion_tokens,
+                        "total_tokens": usage_acc.total_tokens,
+                        "cache_creation_tokens": usage_acc.cache_creation_tokens,
+                        "cache_read_tokens": usage_acc.cache_read_tokens,
+                    }
 
                 if self.debug:
                     parts = []
@@ -7960,26 +7972,7 @@ class ChatSession:
                 if chunk.provider_blocks:
                     provider_blocks = chunk.provider_blocks
         except GenerationCancelled:
-            # Flush whatever was buffered and build a partial message.
-            # Both ``tool_calls`` and ``_provider_content`` are
-            # DELIBERATELY OMITTED:
-            #   * ``tool_calls`` — incomplete, no matching tool_result;
-            #     re-emitting on the next turn would orphan them.
-            #   * ``_provider_content`` — the Anthropic provider reads
-            #     this lane verbatim ahead of plain ``content`` (see
-            #     ``providers/_anthropic.py``), and a cancellation can
-            #     leave partial tool_use blocks here too.  Keeping it
-            #     would also cause the next-turn replay to bypass the
-            #     ``[generation cancelled before completion]`` marker
-            #     the cancel handler appends to ``content``, hiding
-            #     the partial-output signal from the model.
-            if pending:
-                _flush_text(pending, in_think)
-            self.ui.on_stream_end()
-            partial: dict[str, Any] = {"role": "assistant"}
-            partial_content = "".join(content_parts)
-            partial["content"] = partial_content or ""
-            self._cancelled_partial_msg = partial
+            _record_cancelled_partial()
             raise
         except Exception:
             # cancel() closed the underlying SDK stream, aborting the HTTP
@@ -7987,17 +7980,7 @@ class ChatSession:
             # transport-level error (httpx, httpcore, etc.).  Convert to
             # GenerationCancelled if a cancel was requested.
             if self._cancel_event.is_set():
-                if pending:
-                    _flush_text(pending, in_think)
-                self.ui.on_stream_end()
-                partial = {"role": "assistant"}
-                partial["content"] = "".join(content_parts) or ""
-                # Same reasoning as the cooperative-cancel branch
-                # above: ``_provider_content`` is omitted so the
-                # next-turn replay reads from the marker-bearing
-                # plain content and any partial tool_use blocks
-                # inside provider_blocks don't leak through.
-                self._cancelled_partial_msg = partial
+                _record_cancelled_partial()
                 raise GenerationCancelled() from None
             raise
 
