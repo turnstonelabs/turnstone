@@ -178,7 +178,12 @@ def describe_cached(
     load-bearing for delegated backend authentication: a description produced
     under one user's OBO grant must never be served to another user without a
     call authorized as that user. Returns ``""`` on a backend failure (a
-    placeholder is rendered upstream) and does *not* cache failures.
+    placeholder is rendered upstream) and does *not* cache failures.  A
+    completed-but-EMPTY description memoizes like any other result — one
+    perceive per key, ever (an all-reasoning pass pins the placeholder;
+    the remediation is server-side: a reasoning parser or the template
+    thinking toggle on the perception alias) — under one guard: an empty
+    result NEVER overwrites a concurrently memoized real description.
     """
     key = _cache_key(principal_id=principal_id, alias=alias, content_hash=content_hash)
     with _cache_lock:
@@ -201,6 +206,14 @@ def describe_cached(
         log.warning("perception fallback failed (alias=%s): %s", alias, exc)
         return ""
     with _cache_lock:
+        # Re-check under the lock: the describe call ran unlocked, and a
+        # concurrent racer may have memoized a REAL description — an empty
+        # result must never clobber it (the memo has no invalidation
+        # path, so a clobber would pin the placeholder despite a billed,
+        # successful perceive).
+        existing = _cache.get(key)
+        if existing:
+            return existing
         if key not in _cache and len(_cache) >= _CACHE_MAX:
             _cache.pop(next(iter(_cache)), None)
         _cache[key] = text

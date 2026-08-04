@@ -22,11 +22,14 @@ Pinned rules:
   text can no longer be a partial tag).
 """
 
+import random
+
 import pytest
 
+from tests._reasoning_dialect import CASES as DIALECT_CASES
 from tests._session_helpers import make_session
 from turnstone.core.providers import StreamChunk, ToolCallDelta
-from turnstone.core.streaming_text import ThinkTagSplitter
+from turnstone.core.streaming_text import ThinkTagSplitter, split_inline_reasoning
 
 
 class _TokenRecorderUI:
@@ -175,6 +178,45 @@ def test_splitter_standalone_contract():
     splitter.feed("tail")
     splitter.flush_pending()
     assert events[-1] == ("tail", True)
+
+
+@pytest.mark.parametrize("case", DIALECT_CASES, ids=[c.id for c in DIALECT_CASES])
+def test_one_shot_dialect_conformance(case):
+    """Every dialect-catalog case through the one-shot form, exact lanes."""
+    content, reasoning = split_inline_reasoning(case.utterance)
+    assert content == case.content
+    assert reasoning == case.reasoning
+
+
+_PASSTHROUGH_CASES = [c for c in DIALECT_CASES if c.passthrough]
+
+
+@pytest.mark.parametrize("case", _PASSTHROUGH_CASES, ids=[c.id for c in _PASSTHROUGH_CASES])
+def test_one_shot_passthrough_byte_identity(case):
+    """Unconsumed input (tag-free or orphan-close-only) returns
+    byte-identical — every generated row asserts."""
+    content, _ = split_inline_reasoning(case.utterance)
+    assert content == case.utterance
+
+
+@pytest.mark.parametrize("case", DIALECT_CASES, ids=[c.id for c in DIALECT_CASES])
+def test_one_shot_equivalent_to_streaming_over_random_chunkings(case):
+    """One-shot ≡ the streaming class fed the same utterance in arbitrary
+    chunkings, EXACTLY — the one-shot is a pure raw split with no rules of
+    its own — for EVERY catalog case."""
+    rng = random.Random(case.id)  # deterministic per case
+    one_content, one_reasoning = split_inline_reasoning(case.utterance)
+    for _ in range(25):
+        spans = []
+        splitter = ThinkTagSplitter(lambda text, is_r, _s=spans: _s.append((text, is_r)))
+        i = 0
+        while i < len(case.utterance):
+            j = rng.randint(i + 1, len(case.utterance))
+            splitter.feed(case.utterance[i:j])
+            i = j
+        splitter.flush_pending()
+        assert "".join(t for t, is_r in spans if not is_r) == one_content
+        assert "".join(t for t, is_r in spans if is_r) == one_reasoning
 
 
 def test_tool_calls_flush_pending_raw_at_current_state():

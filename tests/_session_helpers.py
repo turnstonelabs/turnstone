@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-from turnstone.core.providers import StreamChunk, ToolCallDelta
+from turnstone.core.providers import ModelCapabilities, StreamChunk, ToolCallDelta
 from turnstone.core.session import ChatSession
 from turnstone.core.session_ui_base import SessionUIBase
 
@@ -347,6 +347,43 @@ def as_stream(result: Any) -> list[StreamChunk]:
             provider_blocks=list(result.provider_blocks or []),
         )
     ]
+
+
+def think_tag_stream(utterance: str) -> list[StreamChunk]:
+    """``create_streaming`` return value simulating a passthrough server
+    that emits *utterance* — typically think-tag-bearing — as plain
+    streamed content.
+
+    The per-lane fixture for inline-reasoning dialect pins: lane tests
+    supply their own utterances (the dialect's SEMANTICS are specified
+    once, in ``tests._reasoning_dialect.CASES``, and pinned by the
+    one-shot suites — lane pins assert lane behavior, not tag grammar).
+    Routes through the real ``drain_stream`` seam exactly like
+    ``as_stream``.
+    """
+    return as_stream(mock_completion_result(content=utterance))
+
+
+def seam_provider(utterance: str, *, provider_name: str = "openai-compatible") -> MagicMock:
+    """Provider fake whose ``create_streaming`` replays *utterance* through
+    the REAL drain seam (``think_tag_stream``) — THE lane-suite seam fake.
+
+    One definition so the lane suites cannot drift when the provider
+    surface ``model_turn`` probes grows: real ``ModelCapabilities`` for
+    the clamp math, ``provider_name`` overridable per suite.
+
+    Assign the RETURNED fake to ``session._provider`` — never mutate the
+    provider a session resolved on its own: with a MagicMock client the
+    session resolves the process-wide ``create_provider(...)`` singleton,
+    and writing that shared instance's ``create_streaming`` poisons every
+    later session in the test run (the SSE-recovery e2e servers resolve
+    the same instance).
+    """
+    provider = MagicMock()
+    provider.provider_name = provider_name
+    provider.get_capabilities.return_value = ModelCapabilities()
+    provider.create_streaming = MagicMock(return_value=think_tag_stream(utterance))
+    return provider
 
 
 class RecordingUI:

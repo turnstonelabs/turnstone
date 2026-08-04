@@ -54,7 +54,10 @@ from turnstone.core.lowering import (
     restore_provider_tool_ids,
     sanitize_tool_call_arguments,
 )
-from turnstone.core.providers._protocol import drain_stream
+from turnstone.core.providers._protocol import (
+    drain_stream,
+    has_reasoning_bearing_block,
+)
 from turnstone.core.storage._utils import (
     _CLIENT_TOOL_CALL_BLOCK_TYPES,
     strip_orphan_client_tool_blocks,
@@ -75,13 +78,10 @@ _DRAIN_RETRIES = 2
 # through.  Module-level so tests can zero it.
 _DRAIN_RETRY_BASE_DELAY = 0.5
 
-# Block types that carry model reasoning natively.  Anthropic emits
-# ``thinking``/``redacted_thinking`` blocks, OpenAI Responses emits
-# ``reasoning`` items, and ``reasoning_text`` is our own synthetic
-# path-3 block (see :func:`synth_reasoning_block`).
-REASONING_BEARING_BLOCK_TYPES: frozenset[str] = frozenset(
-    {"thinking", "redacted_thinking", "reasoning", "reasoning_text"}
-)
+# Native-reasoning block membership lives in providers._protocol
+# (REASONING_BEARING_BLOCK_TYPES + has_reasoning_bearing_block, beside the
+# drain's double-reasoning check); this layer consumes the shared
+# predicate in :func:`synth_reasoning_block`.
 
 
 # --------------------------------------------------------------------------- #
@@ -520,9 +520,13 @@ def synth_reasoning_block(
     text = "".join(reasoning_parts)
     if not text.strip():
         return provider_blocks
-    for b in provider_blocks:
-        if isinstance(b, dict) and b.get("type") in REASONING_BEARING_BLOCK_TYPES:
-            return provider_blocks
+    if has_reasoning_bearing_block(provider_blocks):
+        # Routine on native-reasoning lanes: reasoning_delta text is the
+        # MIRROR of the native block there, so bailing is the correct
+        # no-op, not an anomaly.  The genuinely anomalous shape —
+        # inline-EXTRACTED text alongside a native block — is logged at
+        # the drain, where extraction is distinguishable.
+        return provider_blocks
     block: dict[str, Any] = {"type": "reasoning_text", "text": text}
     if cfg is ...:
         cfg = _get_config_or_none(registry, alias)

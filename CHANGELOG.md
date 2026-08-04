@@ -206,6 +206,20 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Fixed
 
+- **Inline `<think>`/`<reasoning>` blocks no longer leak into drained
+  results (#965, #940).** On servers without a reasoning parser
+  (parserless vLLM/llama.cpp, LM Studio, bare gateways), reasoning
+  arrives as literal tags inside content; segregation now happens once
+  at the drain seam, so web-fetch tool results, sub-agent syntheses,
+  judge verdicts, titles, summaries, and optimizer prompts receive
+  tag-free content and the extracted reasoning rides the native lane.
+  Two behavior notes: a web-fetch extraction whose whole response was
+  reasoning now returns an explicit `Error: extraction returned no
+  answer` tool result (previously the raw reasoning text persisted as a
+  successful result and was replayed every following turn), and a
+  mismatched-vocabulary close tag (`<think>…</reasoning>`) now closes
+  the block — matching the interactive lane's long-standing rule —
+  where the old per-lane strips treated it as unterminated.
 - **A transport failure mid-generation no longer kills the interactive
   turn (#937).** A wire death during body streaming (TLS record failure,
   connection reset — `httpx.ReadError` and kin) surfaces after the

@@ -727,3 +727,39 @@ def test_resolve_capabilities_survives_get_config_raise() -> None:
     registry.get_config.side_effect = KeyError("gone")
     caps = resolve_capabilities(provider, "m", "gone", registry)
     assert caps == ModelCapabilities()
+
+
+def test_inline_tags_segregate_to_native_reasoning_text_and_clean_content() -> None:
+    # A passthrough server's tagged content, drained through the real seam:
+    # the turn's text is IR-clean and the extracted reasoning lands in the
+    # native lane as the path-3 synth block (so it survives reload and the
+    # operator-gated replay), never in any consumer-visible content.
+    provider = _FakeProvider([CompletionResult(content="<think>plan</think>answer")])
+    result = model_turn(_lane(provider), [Turn.user("q")])
+    assert result.content == "answer"
+    assert result.turn.text == "answer"
+    assert result.turn.native is not None
+    synth = [b for b in result.turn.native.blocks if b.get("type") == "reasoning_text"]
+    assert len(synth) == 1
+    assert synth[0]["text"] == "plan"
+
+
+def test_synth_bail_is_silent_and_leaks_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Bailing on an existing native reasoning block is the ROUTINE no-op on
+    # Anthropic/Responses lanes (reasoning_delta mirrors the block): no log
+    # event here, and reasoning text never reaches a log payload.  The
+    # genuinely anomalous shape (inline-EXTRACTED text beside a native
+    # block) is logged at the drain, where it is distinguishable.
+    import logging
+
+    from turnstone.core.model_turn import synth_reasoning_block
+
+    secret_reasoning = "the plan nobody logs"
+    with caplog.at_level(logging.DEBUG):
+        blocks = synth_reasoning_block(
+            [{"type": "thinking", "thinking": "native"}], [secret_reasoning]
+        )
+    assert blocks == [{"type": "thinking", "thinking": "native"}]
+    assert secret_reasoning not in caplog.text
