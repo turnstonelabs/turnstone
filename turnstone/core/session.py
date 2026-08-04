@@ -190,6 +190,7 @@ from turnstone.core.storage._utils import (
     attachment_to_content_part,
     normalize_search_terms,
 )
+from turnstone.core.streaming_text import ThinkTagSplitter
 from turnstone.core.tool_advisory import (
     make_system_turn,
     render_output_guard_text,
@@ -7748,12 +7749,6 @@ class ChatSession:
                     log.warning("stream.retry.recreate_failed", exc_info=True)
                     raise e from None
 
-    # Tags that delimit reasoning blocks in content stream.
-    # Checked in order; first match wins.
-    _THINK_OPEN_TAGS = ("<think>", "<reasoning>")
-    _THINK_CLOSE_TAGS = ("</think>", "</reasoning>")
-    _MAX_TAG_LEN = max(len(t) for t in _THINK_OPEN_TAGS + _THINK_CLOSE_TAGS)
-
     def _stream_attempt(
         self, stream: Iterator[StreamChunk], my_generation: int = 0
     ) -> dict[str, Any]:
@@ -7789,9 +7784,7 @@ class ChatSession:
         provider_blocks: list[dict[str, Any]] = []
         usage_acc: UsageInfo | None = None
         first_token = True
-        in_think = False  # inside a <think>...</think> block
         path1_reasoning = False  # last reasoning came via reasoning_delta field
-        pending = ""  # buffer for partial tag detection
 
         def _flush_text(text: str, is_reasoning: bool) -> None:
             """Dispatch text to the appropriate UI callback."""
@@ -7805,53 +7798,9 @@ class ChatSession:
                 content_parts.append(text)
                 self.ui.on_content_token(text)
 
-        def _drain_pending() -> None:
-            """Process the pending buffer, flushing content and detecting tags."""
-            nonlocal pending, in_think
-
-            while pending:
-                if in_think:
-                    # Look for any close tag
-                    best_idx, best_tag = None, None
-                    for tag in self._THINK_CLOSE_TAGS:
-                        idx = pending.find(tag)
-                        if idx != -1 and (best_idx is None or idx < best_idx):
-                            best_idx, best_tag = idx, tag
-
-                    if best_idx is not None:
-                        assert best_tag is not None
-                        _flush_text(pending[:best_idx], True)
-                        pending = pending[best_idx + len(best_tag) :]
-                        in_think = False
-                        continue
-
-                    # No close tag found — check if tail could be a partial tag
-                    safe = len(pending) - self._MAX_TAG_LEN
-                    if safe > 0:
-                        _flush_text(pending[:safe], True)
-                        pending = pending[safe:]
-                    break
-                else:
-                    # Look for any open tag
-                    best_idx, best_tag = None, None
-                    for tag in self._THINK_OPEN_TAGS:
-                        idx = pending.find(tag)
-                        if idx != -1 and (best_idx is None or idx < best_idx):
-                            best_idx, best_tag = idx, tag
-
-                    if best_idx is not None:
-                        assert best_tag is not None
-                        _flush_text(pending[:best_idx], False)
-                        pending = pending[best_idx + len(best_tag) :]
-                        in_think = True
-                        continue
-
-                    # No open tag found — flush all but potential partial tag
-                    safe = len(pending) - self._MAX_TAG_LEN
-                    if safe > 0:
-                        _flush_text(pending[:safe], False)
-                        pending = pending[safe:]
-                    break
+        # Owns the partial-tag carry buffer and the in-think state;
+        # dispatch stays here in _flush_text.
+        splitter = ThinkTagSplitter(_flush_text)
 
         def _stop_spinner_once() -> None:
             """Stop the spinner on first real content. Call is idempotent."""
@@ -7878,8 +7827,7 @@ class ChatSession:
               appends to ``content``, hiding the partial-output signal
               from the model.
             """
-            if pending:
-                _flush_text(pending, in_think)
+            splitter.flush_pending()
             self.ui.on_stream_end()
             partial: dict[str, Any] = {"role": "assistant"}
             partial["content"] = "".join(content_parts) or ""
@@ -7930,7 +7878,7 @@ class ChatSession:
                 if chunk.reasoning_delta:
                     _stop_spinner_once()
                     reasoning_parts.append(chunk.reasoning_delta)
-                    in_think = True
+                    splitter.in_think = True
                     path1_reasoning = True
                     if self.show_reasoning:
                         self.ui.on_reasoning_token(chunk.reasoning_delta)
@@ -7941,21 +7889,18 @@ class ChatSession:
                     # Close reasoning if transitioning from Path 1 reasoning
                     if path1_reasoning:
                         path1_reasoning = False
-                        in_think = False
-                    pending += chunk.content_delta
-                    _drain_pending()
+                        splitter.in_think = False
+                    splitter.feed(chunk.content_delta)
 
                 # Handle tool call deltas
                 if chunk.tool_call_deltas:
                     _stop_spinner_once()
                     # Flush any buffered content — model has moved to tool calls,
                     # so pending text cannot be a partial <think> tag.
-                    if pending:
-                        _flush_text(pending, in_think)
-                        pending = ""
+                    splitter.flush_pending()
                     # Close reasoning if transitioning from reasoning
-                    if in_think:
-                        in_think = False
+                    if splitter.in_think:
+                        splitter.in_think = False
                     for tcd in chunk.tool_call_deltas:
                         # THE tool-call merge rule, shared with drain_stream
                         # and the Google raw-fidelity capture — the chat
@@ -7985,8 +7930,7 @@ class ChatSession:
             raise
 
         # Flush any remaining buffered text
-        if pending:
-            _flush_text(pending, in_think)
+        splitter.flush_pending()
 
         # Warn on non-standard finish reasons
         if finish_reason == "length":

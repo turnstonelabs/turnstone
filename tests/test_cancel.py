@@ -418,8 +418,9 @@ class TestStreamFlushBeforeToolCalls:
             arguments_delta: str = ""
 
         def stream_content_then_tool():
-            # Content long enough to leave chars in pending buffer
-            # (_MAX_TAG_LEN = 13, so _drain_pending retains last 13 chars)
+            # Content long enough to leave chars in the tag-scan carry
+            # buffer (ThinkTagSplitter retains the last MAX_TAG_LEN = 12
+            # chars until a flush)
             yield FakeChunk(content_delta="Hello world, this is a test message")
             yield FakeChunk(
                 tool_call_deltas=[FakeToolDelta(index=0, id="tc_1", name="bash")],

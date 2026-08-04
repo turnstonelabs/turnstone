@@ -25,6 +25,7 @@ from turnstone.core.memory import load_last_error
 from turnstone.core.providers import StreamChunk, UsageInfo
 from turnstone.core.providers._protocol import IncompleteStreamError
 from turnstone.core.session import ChatSession
+from turnstone.core.streaming_text import ThinkTagSplitter
 from turnstone.core.trajectory import dicts_from_turns
 
 
@@ -175,10 +176,10 @@ class TestMidStreamRetry:
         assert len(assistant) == 1
         assert assistant[0]["content"] == "Hello world"
         # The dead attempt's tokens streamed live (minus the trailing
-        # _MAX_TAG_LEN chars the tag-scan buffer held back — never
+        # MAX_TAG_LEN chars the tag-scan buffer held back — never
         # displayed, so nothing needs to finalize them); the retried text
         # is a fresh bubble, not an append onto the dead attempt's.
-        flushed = first_text[: len(first_text) - ChatSession._MAX_TAG_LEN]
+        flushed = first_text[: len(first_text) - ThinkTagSplitter.MAX_TAG_LEN]
         assert ui.of("content") == [flushed, "Hello world"]
         # The dead attempt is finalized EVERYWHERE before re-streaming:
         # stream_end (client finalize) -> turn_committed (server buffer
