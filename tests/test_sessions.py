@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import sqlalchemy as sa
 
 from tests._oidc_test_helpers import keyed_app_state
+from turnstone.core import model_registry as mr_module
 from turnstone.core.memory import (
     delete_workstream,
     list_workstreams_with_history,
@@ -729,7 +730,6 @@ class TestWorkstreamConfig:
         """Logs the construction cause, not the unreachable-alias one."""
         import logging
 
-        import turnstone.core.model_registry as mr_module
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
         reg = ModelRegistry(

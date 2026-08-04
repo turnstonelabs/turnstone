@@ -55,7 +55,7 @@ from typing import Any
 
 import httpx
 
-import turnstone.core.mcp_oauth as mcp_oauth_module
+from turnstone.core import mcp_oauth as mcp_oauth_module
 from turnstone.core.mcp_crypto import (
     MCPTokenCipher,
     MCPTokenCipherConfig,

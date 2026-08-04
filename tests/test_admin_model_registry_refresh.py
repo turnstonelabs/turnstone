@@ -811,7 +811,7 @@ def _no_host_config(monkeypatch: pytest.MonkeyPatch) -> None:
     only ``turnstone.core.config`` misses ``load_model_registry``.
     """
     import turnstone.core.config as _cfg
-    import turnstone.core.model_registry as _mr
+    from turnstone.core import model_registry as _mr
 
     monkeypatch.setattr(_cfg, "load_config", lambda section=None: {})
     monkeypatch.setattr(_mr, "load_config", lambda section=None: {})

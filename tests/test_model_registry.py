@@ -11,6 +11,7 @@ import pytest
 
 from tests._oidc_test_helpers import keyed_app_state
 from tests._session_helpers import scripted_chat_client
+from turnstone.core import model_registry as mr_module
 from turnstone.core.model_registry import (
     KEY_GUARD_DEFERRED_TO_LIFESPAN,
     DynamicAuthKeyError,
@@ -1291,7 +1292,6 @@ class TestSessionModelCommand:
     def test_model_switch_construction_failure_surfaces_real_cause(self, monkeypatch: Any) -> None:
         """An alias that exists but cannot construct is not "unknown", and
         the binding stays untouched."""
-        import turnstone.core.model_registry as mr_module
 
         reg = ModelRegistry(
             models={
@@ -1854,7 +1854,6 @@ class TestSessionRemovedAliasDegradedTurns:
     def test_recreated_broken_alias_reports_construction_cause(self, monkeypatch: Any) -> None:
         """A re-created alias reports the construction cause, never a stale
         "removed" diagnosis: the latch clears on the has_alias pass."""
-        import turnstone.core.model_registry as mr_module
 
         reg = self._registry()
         session = _make_session(registry=reg, model_alias="gw")
@@ -1944,8 +1943,6 @@ class TestSessionConstructionFailureLatch:
     ) -> None:
         import logging
 
-        import turnstone.core.model_registry as mr_module
-
         reg = ModelRegistry(
             models={"gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model")},
             default="gw",
@@ -1981,8 +1978,6 @@ class TestSessionConstructionFailureLatch:
         self, monkeypatch: Any, caplog: Any
     ) -> None:
         import logging
-
-        import turnstone.core.model_registry as mr_module
 
         reg = ModelRegistry(
             models={"gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model")},
