@@ -239,7 +239,7 @@ def load_oidc_config() -> OIDCConfig:
         # mint legs resolve by exact name, so an unknown profile never mints.
         log.warning(
             "oidc: unknown obo_grant_profile %r (expected one of %s) — "
-            "oauth_obo MCP servers and entra_obo/entra_app model aliases will "
+            "oauth_obo MCP servers and dynamic-auth model aliases will "
             "not mint until this is fixed",
             obo_grant_profile,
             ", ".join(sorted(OBO_GRANT_PROFILES)),

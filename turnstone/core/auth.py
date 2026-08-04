@@ -1053,6 +1053,15 @@ def required_scope(method: str, path: str) -> str:
     ):
         return "approve"
 
+    # The node's model-status readout carries per-alias backend-auth
+    # configuration (auth mode, OBO audience, exchange scopes) — data the
+    # console serves only behind admin permissions — so this GET is
+    # classified with the admin endpoints instead of falling to the read
+    # default. Service tokens carry ``approve``, so the console collector's
+    # fan-out and scheduler lanes pass unchanged.
+    if normalized == "/api/_internal/model-status":
+        return "approve"
+
     # Write endpoints
     if method == "POST" and normalized in WRITE_PATHS:
         return "write"

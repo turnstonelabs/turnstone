@@ -5238,6 +5238,7 @@ class SQLiteBackend:
         replay_reasoning_to_model: bool = False,
         auth_mode: str = "static",
         obo_audience: str = "",
+        obo_scopes: str = "",
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -5261,6 +5262,7 @@ class SQLiteBackend:
                     "replay_reasoning_to_model": (1 if replay_reasoning_to_model else 0),
                     "auth_mode": auth_mode,
                     "obo_audience": obo_audience,
+                    "obo_scopes": obo_scopes,
                     "created_by": created_by,
                     "created": now,
                     "updated": now,

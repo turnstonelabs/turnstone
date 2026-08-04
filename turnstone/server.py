@@ -4284,7 +4284,13 @@ def internal_model_reload(request: Request) -> JSONResponse:
 
 
 def internal_model_status(request: Request) -> JSONResponse:
-    """GET /v1/api/_internal/model-status — return this node's model aliases."""
+    """GET /v1/api/_internal/model-status — return this node's model aliases.
+
+    Classified ``approve`` in :func:`turnstone.core.auth.required_scope`, not
+    the read default: the payload carries per-alias backend-auth
+    configuration (mode, audience, scopes) that the console serves only
+    behind admin permissions.
+    """
     registry = getattr(request.app.state, "registry", None)
     if registry is None:
         return JSONResponse({"models": {}})
@@ -4303,6 +4309,7 @@ def internal_model_status(request: Request) -> JSONResponse:
             "reasoning_effort": cfg.reasoning_effort,
             "auth_mode": cfg.auth_mode,
             "obo_audience": cfg.obo_audience,
+            "obo_scopes": cfg.obo_scopes,
         }
     return JSONResponse({"models": models})
 
@@ -4692,6 +4699,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.oidc import initialize_oidc_state
 
     await initialize_oidc_state(app.state)
+
+    # One boot-time visibility pass over the live registry: every dynamic
+    # alias whose mode names the other grant dialect gets the same
+    # will-not-mint warning ModelRegistry.reload emits on later swaps.
+    from turnstone.core.model_registry import warn_profile_mismatched_aliases
+
+    boot_registry = getattr(app.state, "registry", None)
+    if boot_registry is not None:
+        warn_profile_mismatched_aliases(boot_registry.models, app.state)
 
     # MCP-OAuth token-at-rest encryption — fail-loud on misconfiguration
     # when any mcp_servers row has auth_type='oauth_user'.

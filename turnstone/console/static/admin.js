@@ -6417,7 +6417,7 @@ let _modelAuthFetchGen = 0;
 // The (mode, audience) as persisted on the row being edited — empty for a
 // create. Drives the hide/enable/hint state only; the server alone validates
 // submits (a stale client copy must never block a server-valid save).
-let _modelAuthPersisted = { mode: "static", audience: "" };
+let _modelAuthPersisted = { mode: "static", audience: "", scopes: "" };
 // Reranker calibration fields extracted out of the capabilities textarea in the
 // edit modal (like server_compat), held here so they survive an unrelated edit
 // and are re-merged on save. Reset per modal open.
@@ -6813,20 +6813,50 @@ function _consoleWhenPermissionsReady(cb) {
   }
 }
 
-// The dynamic (non-shared-key) auth-mode predicate. The authoritative answer
-// is the FETCHED constraints' `dynamic_auth_modes` (server-derived from
-// DYNAMIC_MODEL_AUTH_MODES in turnstone/core/model_registry.py), so the
-// shelf's affordances track the server's classification by data. The
-// hand-list below is the FAIL-OPEN FALLBACK ONLY: constraints not yet
-// fetched, fetch failed, or a server that does not send the field.
-function _isDynamicAuthMode(mode) {
+// The served-data-first contract shared by the mode predicates: the FETCHED
+// constraints array under `constraintsKey` is authoritative when present
+// and well-formed (server-derived from the classification frozensets in
+// turnstone/core/model_registry.py), so the shelf's affordances track the
+// server's classification by data. `fallbackModes` is the hand-kept
+// FAIL-OPEN FALLBACK ONLY: constraints not yet fetched, fetch failed, or a
+// server that does not send the field.
+function _servedModeListHas(constraintsKey, fallbackModes, mode) {
   if (
     _modelAuthConstraints &&
-    Array.isArray(_modelAuthConstraints.dynamic_auth_modes)
+    Array.isArray(_modelAuthConstraints[constraintsKey])
   ) {
-    return _modelAuthConstraints.dynamic_auth_modes.indexOf(mode) !== -1;
+    return _modelAuthConstraints[constraintsKey].indexOf(mode) !== -1;
   }
-  return mode === "entra_obo" || mode === "entra_app";
+  return fallbackModes.indexOf(mode) !== -1;
+}
+
+// The hand-kept auth-mode -> grant-profile pairing, used ONLY as the
+// fail-open fallback when served constraints are missing; the dynamic-mode
+// fallback list derives from its keys so the two cannot drift.
+const _AUTH_MODE_FALLBACK_PROFILES = {
+  entra_obo: "entra",
+  entra_app: "entra",
+  rfc8693_obo: "rfc8693",
+};
+
+// The dynamic (non-shared-key) auth-mode predicate.
+function _isDynamicAuthMode(mode) {
+  return _servedModeListHas(
+    "dynamic_auth_modes",
+    Object.keys(_AUTH_MODE_FALLBACK_PROFILES),
+    mode,
+  );
+}
+
+// The scopes-reading mode predicate.
+function _isScopesAuthMode(mode) {
+  return _servedModeListHas("scopes_auth_modes", ["rfc8693_obo"], mode);
+}
+
+// The app-identity (shared deployment credential) mode predicate — drives
+// the model list's auth badge wording; per-user is every OTHER dynamic mode.
+function _isAppIdentityAuthMode(mode) {
+  return _servedModeListHas("app_identity_auth_modes", ["entra_app"], mode);
 }
 
 function _modelRolesAccessible() {
@@ -6978,27 +7008,53 @@ function _syncModelAuthFields() {
   const section = document.getElementById("model-auth-section");
   if (section) {
     const nothingDynamic =
-      !persistedDynamicMode && !dynamic && !_modelAuthPersisted.audience;
+      !persistedDynamicMode &&
+      !dynamic &&
+      !_modelAuthPersisted.audience &&
+      !_modelAuthPersisted.scopes;
     const useless =
       (known && !profile && nothingDynamic) || (!editable && nothingDynamic);
     section.style.display = useless ? "none" : "";
   }
 
-  // entra_app is client-credentials only — no RFC 8693 leg exists — so the
-  // option greys out when the profile is AFFIRMATIVELY known to be something
-  // else, but never for the mode the row is persisted with, or the select
-  // would fall back and rewrite the row on save. Unknown constraints disable
-  // nothing: affordance, not gate. Option labels live in index.html.
-  const appOpt = modeSel.querySelector('option[value="entra_app"]');
+  // Each dynamic mode pairs with exactly one grant profile (served as
+  // auth_mode_profiles), so an option greys out when the profile is
+  // AFFIRMATIVELY known to be a different one — but never for the mode the
+  // row is persisted with, or the select would fall back and rewrite the
+  // row on save. Unknown constraints disable nothing: affordance, not gate.
+  // Option labels live in index.html; the hand-kept map is only the
+  // fallback for a server that predates auth_mode_profiles.
+  const modeProfiles =
+    known && _isPlainObject(_modelAuthConstraints.auth_mode_profiles)
+      ? _modelAuthConstraints.auth_mode_profiles
+      : _AUTH_MODE_FALLBACK_PROFILES;
+  // Own-property lookups only: option values and the persisted mode are
+  // arbitrary server-supplied strings, and a name like "toString" must
+  // read as unmapped rather than pull a function off Object.prototype.
+  const profileOf = function (key) {
+    return Object.prototype.hasOwnProperty.call(modeProfiles, key)
+      ? modeProfiles[key]
+      : undefined;
+  };
   let unavailable = false;
-  if (appOpt) {
-    appOpt.disabled =
+  for (let i = 0; i < modeSel.options.length; i++) {
+    const opt = modeSel.options[i];
+    const required = profileOf(opt.value);
+    if (!required) continue; // static and injected server-defined modes
+    opt.disabled =
       known &&
       !!profile &&
-      profile !== "entra" &&
-      _modelAuthPersisted.mode !== "entra_app";
-    unavailable = appOpt.disabled;
+      profile !== required &&
+      _modelAuthPersisted.mode !== opt.value;
+    if (opt.disabled) unavailable = true;
   }
+
+  // A row PERSISTED on a mode this deployment's profile cannot mint (its
+  // option stays selectable above so the row round-trips) deserves the
+  // loudest hint: the save works but the credential never will.
+  const persistedRequired = profileOf(_modelAuthPersisted.mode);
+  const persistedMismatch =
+    known && !!profile && !!persistedRequired && persistedRequired !== profile;
 
   modeSel.disabled = !editable;
   const stored = audSel.value || "";
@@ -7011,9 +7067,11 @@ function _syncModelAuthFields() {
   if (modeHint) {
     modeHint.textContent = !editable
       ? "needs the MCP admin permission to change"
-      : unavailable
-        ? "app identity needs the deployment to sign in through Entra"
-        : "";
+      : persistedMismatch
+        ? "saved mode doesn't match this deployment's sign-in profile — it will not mint until changed"
+        : unavailable
+          ? "greyed-out modes need a different sign-in profile than this deployment uses"
+          : "";
   }
   if (audHint) {
     // The field is free text, so missing constraints cost suggestions, not
@@ -7035,6 +7093,31 @@ function _syncModelAuthFields() {
         "none registered yet — ask an administrator to add one";
     } else {
       audHint.textContent = "the resource the gateway expects";
+    }
+  }
+
+  // Scopes input: the audience's affordance rules exactly — editable when
+  // the selected mode reads it, or when residue lingers so it can be
+  // cleared. Null-guarded so a stale cached page without the input keeps
+  // repainting the rest of the block.
+  const scopesInput = document.getElementById("model-obo-scopes");
+  const scopesHint = document.getElementById("model-obo-scopes-hint");
+  if (scopesInput) {
+    const scopesMode = _isScopesAuthMode(mode);
+    const storedScopes = scopesInput.value || "";
+    scopesInput.disabled = !editable || (!scopesMode && !storedScopes);
+    if (scopesHint) {
+      if (!editable) {
+        scopesHint.textContent = "needs the MCP admin permission to change";
+      } else if (!scopesMode) {
+        // Mirrors the server's staging guard, like the audience hint above.
+        scopesHint.textContent = storedScopes
+          ? "unused by this mode — clear it to drop the value; a different value would be refused"
+          : "only used by token-exchange modes";
+      } else {
+        scopesHint.textContent =
+          "space-separated; requested on the token exchange (optional)";
+      }
     }
   }
 
@@ -7441,8 +7524,14 @@ function _renderModels(items) {
     if (m.replay_reasoning_to_model === true) overrides.push("replay=on");
     // Anything but the shared API key is worth showing: it changes whose
     // identity the gateway sees. Static is the default and stays silent.
-    if (m.auth_mode === "entra_obo") overrides.push("auth=per-user");
-    else if (m.auth_mode === "entra_app") overrides.push("auth=deployment");
+    // Derived from the shared mode predicates, never a hand list — a new
+    // dynamic mode gets a badge without touching this site.
+    if (_isDynamicAuthMode(m.auth_mode))
+      overrides.push(
+        _isAppIdentityAuthMode(m.auth_mode)
+          ? "auth=deployment"
+          : "auth=per-user",
+      );
     if (overrides.length) {
       const ovrSpan = document.createElement("span");
       ovrSpan.className = "model-overrides-hint";
@@ -7653,9 +7742,11 @@ function showCreateModelModal() {
   _clearInjectedAuthModeOptions(document.getElementById("model-auth-mode"));
   document.getElementById("model-auth-mode").value = "static";
   document.getElementById("model-obo-audience").value = "";
+  const scopesReset = document.getElementById("model-obo-scopes");
+  if (scopesReset) scopesReset.value = "";
   // A create has no persisted row; the constraints fetch (fresh per open)
   // supplies the suggestions and re-syncs the block when it lands.
-  _modelAuthPersisted = { mode: "static", audience: "" };
+  _modelAuthPersisted = { mode: "static", audience: "", scopes: "" };
   _fetchModelAuthConstraints();
   document.getElementById("model-detect-result").hidden = true;
   document.getElementById("model-detect-btn").disabled = false;
@@ -7743,6 +7834,7 @@ function showEditModelModal(definitionId) {
       _modelAuthPersisted = {
         mode: m.auth_mode || "static",
         audience: m.obo_audience || "",
+        scopes: m.obo_scopes || "",
       };
       const authModeSel = document.getElementById("model-auth-mode");
       // An unknown persisted mode gets its own (marked) option so the row
@@ -7753,6 +7845,8 @@ function showEditModelModal(definitionId) {
       // there regardless of what the suggestions contain.
       document.getElementById("model-obo-audience").value =
         m.obo_audience || "";
+      const scopesEl = document.getElementById("model-obo-scopes");
+      if (scopesEl) scopesEl.value = m.obo_scopes || "";
       // Repaint against the row's values. NOT a second constraints fetch:
       // showCreateModelModal's reset already started one this shelf open and
       // constraints are row-independent.
@@ -8053,16 +8147,19 @@ function submitCreateModel() {
     "model-replay-reasoning",
   ).checked;
 
-  // Backend auth: entra_obo mints a per-user OBO token for obo_audience at
-  // call time; entra_app mints an app-identity (client-credentials) token from
-  // Turnstone's SSO app reg. (The server re-validates the same pairing.)
-  // The || "static" default covers only a blank CREATE form: an edit-load
-  // injects an option for any server-defined mode (see
+  // Backend auth: entra_obo / rfc8693_obo mint a per-user OBO token for
+  // obo_audience at call time (the latter also requests obo_scopes on the
+  // exchange); entra_app mints an app-identity (client-credentials) token
+  // from Turnstone's SSO app reg. (The server re-validates the same
+  // pairing.) The || "static" default covers only a blank CREATE form: an
+  // edit-load injects an option for any server-defined mode (see
   // _ensureAuthModeOption), so edits always carry a real value.
   const authMode = document.getElementById("model-auth-mode").value || "static";
   const oboAudience = document
     .getElementById("model-obo-audience")
     .value.trim();
+  const scopesEl = document.getElementById("model-obo-scopes");
+  const oboScopes = scopesEl ? scopesEl.value.trim() : "";
   const authDynamic = _isDynamicAuthMode(authMode);
   if (authDynamic && oboAudience === "") {
     _showModelError("Enter a gateway audience for this auth mode");
@@ -8071,7 +8168,7 @@ function submitCreateModel() {
   const editId = document.getElementById("model-edit-id").value;
   Object.assign(
     form,
-    _authSubmitFields(authMode, oboAudience, !!editId, authDynamic),
+    _authSubmitFields(authMode, oboAudience, oboScopes, !!editId, !!scopesEl),
   );
 
   const apiKey = document.getElementById("model-api-key").value;
@@ -8113,15 +8210,30 @@ function submitCreateModel() {
     });
 }
 
-// Auth fields for a shelf submit, pure. A static CREATE OMITS the audience
-// key entirely: the server refuses ANY non-empty audience there (no stored
+// Auth fields for a shelf submit. A static CREATE OMITS the audience key
+// entirely: the server refuses ANY non-empty audience there (no stored
 // row's value needs preserving), so sending leftovers a mode round-trip
-// parked in the input would manufacture an avoidable 400. EDIT always sends
-// the pair — stored-residue semantics are the server's call.
-function _authSubmitFields(authMode, oboAudience, isEdit, authDynamic) {
+// parked in the input would manufacture an avoidable 400. Scopes get the
+// same treatment on a CREATE whose mode never reads them — and ride ONLY
+// when the page actually renders the scopes input: on a cached pre-scopes
+// index.html the read-back is a hardcoded "", and sending that on an EDIT
+// would silently wipe a stored value the operator never saw (absent key =
+// server preserves). The mode-derived facts are computed here, not
+// parameters — three adjacent booleans made call sites transposable with
+// no signal.
+function _authSubmitFields(
+  authMode,
+  oboAudience,
+  oboScopes,
+  isEdit,
+  hasScopesInput,
+) {
   const fields = { auth_mode: authMode };
-  if (isEdit || authDynamic) {
+  if (isEdit || _isDynamicAuthMode(authMode)) {
     fields.obo_audience = oboAudience;
+  }
+  if (hasScopesInput && (isEdit || _isScopesAuthMode(authMode))) {
+    fields.obo_scopes = oboScopes;
   }
   return fields;
 }

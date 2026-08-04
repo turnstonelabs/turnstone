@@ -1016,10 +1016,12 @@ class ModelDefinitionInfo(BaseModel):
     reasoning_effort: str | None = None
     surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
-    # "static" (send api_key), "entra_obo" (delegated-user token), or
-    # "entra_app" (shared app token) for obo_audience at call time.
+    # "static" (send api_key), "entra_obo" / "rfc8693_obo" (delegated-user
+    # token), or "entra_app" (shared app token) for obo_audience at call
+    # time; obo_scopes is the rfc8693 exchange-leg scope request.
     auth_mode: str = "static"
     obo_audience: str = ""
+    obo_scopes: str = ""
     source: str = ""
     created_by: str = ""
     created: str = ""
@@ -1064,6 +1066,7 @@ class CreateModelDefinitionRequest(BaseModel):
     replay_reasoning_to_model: bool = False
     auth_mode: str = "static"
     obo_audience: str = ""
+    obo_scopes: str = ""
 
 
 class UpdateModelDefinitionRequest(BaseModel):
@@ -1092,6 +1095,7 @@ class UpdateModelDefinitionRequest(BaseModel):
     replay_reasoning_to_model: bool | None = None
     auth_mode: str | None = None
     obo_audience: str | None = None
+    obo_scopes: str | None = None
 
 
 class ListModelDefinitionsResponse(BaseModel):
@@ -1125,9 +1129,10 @@ class ModelAuthConstraintsResponse(BaseModel):
     auth_grant_profile: str = Field(
         description=(
             "Deployment [oidc] obo_grant_profile, or empty when single sign-on "
-            "is not configured. entra_app requires 'entra'; entra_obo works "
-            "under either profile. A transient discovery outage reports the "
-            "configured profile, not empty."
+            "is not configured. Each dynamic auth_mode pairs with exactly one "
+            "profile (see auth_mode_profiles); the write validator refuses a "
+            "new pairing that contradicts it. A transient discovery outage "
+            "reports the configured profile, not empty."
         ),
     )
     dynamic_auth_modes: list[str] = Field(
@@ -1137,6 +1142,27 @@ class ModelAuthConstraintsResponse(BaseModel):
             "shelf's affordances (audience enable/require, section "
             "visibility) track it by data. Clients keep a hand-listed "
             "fallback only for a missing or failed constraints fetch."
+        ),
+    )
+    scopes_auth_modes: list[str] = Field(
+        description=(
+            "auth_mode values whose mint reads obo_scopes (the token-exchange "
+            "scope request), same server-derived contract as "
+            "dynamic_auth_modes; drives the scopes input's visibility."
+        ),
+    )
+    app_identity_auth_modes: list[str] = Field(
+        description=(
+            "auth_mode values that mint a shared app/deployment identity "
+            "rather than a per-user one, same server-derived contract as "
+            "dynamic_auth_modes; drives the model list's auth badge wording."
+        ),
+    )
+    auth_mode_profiles: dict[str, str] = Field(
+        description=(
+            "Required [oidc] obo_grant_profile per dynamic auth_mode. "
+            "Affordance for greying options that cannot validate under this "
+            "deployment's profile; the write validator remains the authority."
         ),
     )
 

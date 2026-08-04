@@ -644,6 +644,7 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "replay_reasoning_to_model",
         "auth_mode",
         "obo_audience",
+        "obo_scopes",
     }
 )
 # Sentinel for ``update_model_definition``'s optional conditional-write

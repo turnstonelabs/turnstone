@@ -186,6 +186,12 @@ class TestRequiredScope:
         assert required_scope("POST", "/api/admin/users") == "approve"
         assert required_scope("DELETE", "/api/admin/users/abc") == "approve"
 
+    def test_internal_model_status_is_admin_classified(self):
+        # The payload carries per-alias backend-auth configuration (mode,
+        # audience, exchange scopes); it must never fall to the read default.
+        assert required_scope("GET", "/v1/api/_internal/model-status") == "approve"
+        assert required_scope("GET", "/api/_internal/model-status") == "approve"
+
     def test_versioned_path(self):
         assert required_scope("POST", "/v1/api/workstreams/abc/send") == "write"
         assert required_scope("POST", "/v1/api/workstreams/abc/approve") == "approve"

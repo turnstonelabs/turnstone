@@ -137,28 +137,39 @@ always held to the strict public-address rule.
 ### Model gateway credentials
 
 The same OIDC registration can authenticate model gateways. A model definition
-with `auth_mode = "entra_obo"` redeems the driving user's captured credential
-for its exact `obo_audience`; `auth_mode = "entra_app"` uses the registration's
-client ID and secret with Entra client credentials. Both bind the result through
-the provider SDK's native credential option rather than injecting an override
-header. The grant mode is never inferred: missing user context or a failed OBO
-mint cannot switch an `entra_obo` definition to client credentials.
+with `auth_mode = "entra_obo"` (Entra grant profile) or `auth_mode =
+"rfc8693_obo"` (RFC 8693 token-exchange profile) redeems the driving user's
+captured credential for its exact `obo_audience`; `auth_mode = "entra_app"`
+uses the registration's client ID and secret with Entra client credentials.
+All three bind the result through the provider SDK's native credential option
+rather than injecting an override header. The grant mode is never inferred:
+missing user context or a failed OBO mint cannot switch a delegated definition
+to client credentials.
 
-`entra_obo` needs the MCP encryption key, a credential captured for the driving
-user, and delegated/admin-consented permission to the audience. It works under
-either grant profile, with one RFC 8693 caveat: the model mint sends **no scope
-parameter** (model definitions carry no per-row scopes, unlike MCP servers), so
-the IdP must grant the alias's audience to the app client **by default**; on
-Keycloak the exchange otherwise fails with "Requested audience not available"
-(see issue #955 for the tracked fix). Turning `capture_user_credential` off
-later stops *new* captures but does not invalidate credentials already stored,
-so existing users keep minting. `entra_app` requires `obo_grant_profile =
-"entra"` and a confidential-client secret; RFC 8693 client-credentials is not
-implemented. Configure the permitted resource IDs in the runtime setting
-`model.auth_audience_allowlist` before saving dynamic model definitions.
-De-listing an audience later blocks every write that would arm or re-aim a
-definition at it, but does not stop aliases already configured from minting —
-disabling the row (the `admin.models` disarm lever) is what stops minting. See
+Each dynamic mode pairs with the grant profile whose dialect it names:
+`entra_obo` and `entra_app` require `obo_grant_profile = "entra"`;
+`rfc8693_obo` requires `obo_grant_profile = "rfc8693"`. The pairing is
+enforced when a write chooses a `(auth_mode, obo_audience)` pair — a same-pair
+edit of a row saved before the pairing rule keeps working — and at runtime a
+mismatched legacy row refuses to mint with `cause=grant_profile_mismatch` and
+no IdP traffic. RFC 8693 client-credentials is not implemented.
+
+The delegated modes need the MCP encryption key, a credential captured for the
+driving user, and delegated/admin-consented permission to the audience.
+`rfc8693_obo` additionally carries `obo_scopes`, the space-separated scope
+list its exchange leg requests: exchange-capable IdPs that gate audiences
+behind optional scopes refuse the exchange without it ("Requested audience not
+available"), which is why the scope-less Entra-named mode could never mint on
+that profile (issue #955). Scopes are stored shape-checked only — whether a
+value satisfies the IdP stays the IdP's call at mint time. Turning
+`capture_user_credential` off later stops *new* captures but does not
+invalidate credentials already stored, so existing users keep minting.
+`entra_app` requires a confidential-client secret. Configure the permitted
+resource IDs in the runtime setting `model.auth_audience_allowlist` before
+saving dynamic model definitions. De-listing an audience later blocks every
+write that would arm or re-aim a definition at it, but does not stop aliases
+already configured from minting — disabling the row (the `admin.models` disarm
+lever) is what stops minting. See
 [Settings](settings.md#model-backend-authentication) for permissions, failure
 policy, and lane identity rules.
 

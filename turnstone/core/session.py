@@ -130,7 +130,10 @@ from turnstone.core.metacognition import (
     task_unrenderable_message,
 )
 from turnstone.core.model_registry import (
+    APP_IDENTITY_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
+    MODEL_AUTH_MODE_PROFILES,
+    SCOPES_MODEL_AUTH_MODES,
     ModelClientConstructionError,
 )
 from turnstone.core.model_turn import (
@@ -1439,23 +1442,41 @@ class BackendAuthUnavailableError(RuntimeError):
     """A fail-closed dynamic model credential could not be resolved."""
 
 
-def _mint_refusal_cause(prefix: str, audience: str, user_id: str = "") -> str:
+def _mint_refusal_cause(
+    prefix: str,
+    alias: str,
+    user_id: str = "",
+    grant_leg: str | None = None,
+) -> str:
     """The mint's last recorded refusal cause, for the heartbeat lines.
 
     mcp_oauth's cause layer is deduped to once per process, so mid-incident
     the retained logs may hold none of its lines; the per-turn warnings in
-    ``_model_backend_auth_token`` read this instead. Keyed per (prefix,
-    audience, user): an OBO read passes the minting user so a shared
-    audience cannot serve one user's cause on another user's heartbeat,
-    while ``model_app`` reads resolve to the shared app principal the app
-    mint records under. ``"unknown"`` when nothing was recorded.
+    ``_model_backend_auth_token`` read this instead. The record lives at the
+    mint-cache key's per-alias granularity — an OBO read additionally passes
+    the minting user and the grant leg the mint was asked for, so one
+    alias's cause never serves on another's heartbeat — while ``model_app``
+    reads resolve to the shared app principal the app mint records under.
+    ``"unknown"`` when nothing was recorded.
     """
     # Function-local import, matching the mint-client indirection: this
     # module never imports mcp_oauth at module scope.
-    from turnstone.core.mcp_oauth import MODEL_APP_MINT_PRINCIPAL, model_mint_refusal_cause
+    from turnstone.core.mcp_oauth import (
+        MODEL_APP_MINT_PRINCIPAL,
+        model_app_cache_server,
+        model_mint_refusal_cause,
+        model_obo_cause_key,
+    )
 
-    key_user = user_id if prefix == "model_obo" else MODEL_APP_MINT_PRINCIPAL
-    return model_mint_refusal_cause(prefix, audience, key_user) or "unknown"
+    if prefix == "model_obo":
+        return (
+            model_mint_refusal_cause(prefix, model_obo_cause_key(alias, grant_leg), user_id)
+            or "unknown"
+        )
+    return (
+        model_mint_refusal_cause(prefix, model_app_cache_server(alias), MODEL_APP_MINT_PRINCIPAL)
+        or "unknown"
+    )
 
 
 class ChatSession:
@@ -6371,8 +6392,9 @@ class ChatSession:
         A dynamic alias with no static key always fails closed rather than
         issuing the SDK-construction placeholder. When a real static key exists,
         mint failures retain that explicit fallback unless the operator enables
-        ``model.auth_fail_closed``. An ``entra_obo`` call with no user always
-        fails closed regardless of fallback policy.
+        ``model.auth_fail_closed``. A delegated-mode call (any dynamic mode
+        outside ``APP_IDENTITY_MODEL_AUTH_MODES``) with no user always fails
+        closed regardless of fallback policy.
         """
         registry = self._registry
         if registry is None or not alias:
@@ -6390,7 +6412,11 @@ class ChatSession:
         )
         must_fail_closed = configured_fail_closed or not has_static_key
         user_id = ""
-        if mode == "entra_obo":
+        if mode not in APP_IDENTITY_MODEL_AUTH_MODES:
+            # Delegated modes redeem the acting user's credential; membership
+            # is derived by complement so an unclassified future mode demands
+            # a user (fails closed and loud) rather than silently minting as
+            # the shared app identity.
             user_id = (self._mcp_effective_user_id or "").strip()
             if not user_id:
                 # ``audience=`` is load-bearing on all four warnings in this
@@ -6422,19 +6448,21 @@ class ChatSession:
                     f"Dynamic backend authentication unavailable for model alias {alias!r}"
                 )
             return None
-        if mode == "entra_app":
+        if mode in APP_IDENTITY_MODEL_AUTH_MODES:
             # App/managed identity via client-credentials — Turnstone's own SSO
-            # app reg. This is used only when the model definition explicitly
-            # selects entra_app; missing OBO context never switches grant modes.
-            # The gateway resolves it to one shared virtual account (no per-user
-            # attribution).
-            token = mcp.mint_app_token_sync(audience=cfg.obo_audience)
+            # app reg. Used only when the model definition explicitly selects
+            # an app-identity mode; missing OBO context never switches grant
+            # modes. Set membership, not a literal, so this dispatch and the
+            # no-user guard above cannot disagree about which modes carry a
+            # user. The gateway resolves it to one shared virtual account (no
+            # per-user attribution).
+            token = mcp.mint_app_token_sync(alias=alias, audience=cfg.obo_audience)
             if not token:
                 log.warning(
                     "model_app.fallback_to_static",
                     alias=alias,
                     audience=cfg.obo_audience,
-                    cause=_mint_refusal_cause("model_app", cfg.obo_audience),
+                    cause=_mint_refusal_cause("model_app", alias),
                     has_static_key=has_static_key,
                 )
                 if must_fail_closed:
@@ -6443,8 +6471,36 @@ class ChatSession:
                     )
                 return None
             return token
-        # entra_obo — per-user On-Behalf-Of.
-        token = mcp.mint_model_obo_token_sync(user_id=user_id, audience=cfg.obo_audience)
+        # Delegated user-context modes (entra_obo / rfc8693_obo) — per-user
+        # OBO. The mode pins its grant leg, and only scope-carrying modes
+        # forward the row's scopes, so residue on a mode that never reads
+        # them stays inert. ``grant_leg`` also keys the heartbeat's cause
+        # readback below — the record lives at the mint-cache key's
+        # per-alias granularity plus the leg.
+        mint_scopes = cfg.obo_scopes if mode in SCOPES_MODEL_AUTH_MODES else ""
+        grant_leg = MODEL_AUTH_MODE_PROFILES.get(mode)
+        if grant_leg is None:
+            # A delegated mode nobody registered a grant dialect for cannot
+            # pin a leg; minting with leg=None would run whatever leg the
+            # deployment profile names — the pre-dedicated-mode overload.
+            # Fail closed and loud, honoring the complement comment above.
+            log.warning(
+                "model_obo.unclassified_mode",
+                alias=alias,
+                auth_mode=mode,
+                audience=cfg.obo_audience,
+            )
+            raise BackendAuthUnavailableError(
+                f"Delegated backend authentication has no registered "
+                f"grant-profile pairing for model alias {alias!r}"
+            )
+        token = mcp.mint_model_obo_token_sync(
+            user_id=user_id,
+            alias=alias,
+            audience=cfg.obo_audience,
+            scopes=mint_scopes,
+            grant_leg=grant_leg,
+        )
         if not token:
             # A user IS driving but the mint yielded nothing (no captured
             # credential, decrypt failure, or the AS rejected the grant). Never
@@ -6456,7 +6512,7 @@ class ChatSession:
                 alias=alias,
                 audience=cfg.obo_audience,
                 user_id=user_id,
-                cause=_mint_refusal_cause("model_obo", cfg.obo_audience, user_id),
+                cause=_mint_refusal_cause("model_obo", alias, user_id, grant_leg),
                 has_static_key=has_static_key,
             )
             if must_fail_closed:

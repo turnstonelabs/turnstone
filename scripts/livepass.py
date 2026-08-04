@@ -452,7 +452,7 @@ CONSOLE_TEMPLATE = """<!doctype html>
           enabled: true, temperature: null, max_tokens: null,
           reasoning_effort: null, surface_persisted_reasoning: true,
           replay_reasoning_to_model: false,
-          auth_mode: "static", obo_audience: "",
+          auth_mode: "static", obo_audience: "", obo_scopes: "",
         };
         window.__putCount = 0;
         // Held under a private name too: auth.js's legacy window bridge
@@ -499,7 +499,12 @@ CONSOLE_TEMPLATE = """<!doctype html>
             return reply({
               auth_audience_allowlist: ["api://example-gateway"],
               auth_grant_profile: "entra",
-              dynamic_auth_modes: ["entra_app", "entra_obo"],
+              dynamic_auth_modes: ["entra_app", "entra_obo", "rfc8693_obo"],
+              scopes_auth_modes: ["rfc8693_obo"],
+              auth_mode_profiles: {
+                entra_app: "entra", entra_obo: "entra",
+                rfc8693_obo: "rfc8693",
+              },
             });
           if (url.indexOf("/model-definitions/def1") >= 0) return reply(MODEL);
           if (url.indexOf("/model-definitions") >= 0)

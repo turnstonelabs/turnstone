@@ -3662,3 +3662,52 @@ def test_coordinator_tool_output_pres_are_focusable() -> None:
         "the coordinator retry sweep must remove a bar emptied of its last "
         "control — screen readers announce empty 'Message actions' toolbars"
     )
+
+
+def test_admin_js_auth_mode_fallbacks_match_registry() -> None:
+    """The model shelf's fail-open fallback literals track the server maps.
+
+    At runtime the served constraints are authoritative and these hand-kept
+    fallbacks only cover a missing/failed fetch — but a drifted fallback
+    silently misclassifies exactly when the authority is unavailable, so
+    each one is pinned against the registry's classification maps.
+    """
+    from turnstone.core.model_registry import (
+        DYNAMIC_MODEL_AUTH_MODES,
+        MODEL_AUTH_MODE_PROFILES,
+        MODEL_AUTH_MODES,
+        SCOPES_MODEL_AUTH_MODES,
+    )
+
+    body = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    # The ONE hoisted fallback pairing map (_AUTH_MODE_FALLBACK_PROFILES):
+    # _syncModelAuthFields uses it directly and _isDynamicAuthMode's
+    # fallback list derives from its keys, so pinning the map's entries
+    # covers both consumers.
+    for mode, profile in MODEL_AUTH_MODE_PROFILES.items():
+        assert f'{mode}: "{profile}"' in body, f"fallback pairing for {mode} missing/drifted"
+    assert "Object.keys(_AUTH_MODE_FALLBACK_PROFILES)" in body, (
+        "the dynamic-mode fallback must derive from the pairing map's keys"
+    )
+    # Every registry-classified dynamic mode must appear as a map key.
+    for mode in DYNAMIC_MODEL_AUTH_MODES:
+        assert f'{mode}: "' in body, f"dynamic-mode fallback missing {mode}"
+    # The scopes fallback stays its own literal array (not derivable from
+    # the pairing map): every scopes mode must appear as a quoted literal.
+    for mode in SCOPES_MODEL_AUTH_MODES:
+        assert f'"{mode}"' in body, f"scopes-mode fallback missing {mode}"
+    # Same contract for the app-identity fallback (the model list's auth
+    # badge derives per-user vs deployment from it), and the badge site
+    # must classify via the shared predicates, never a hand list.
+    from turnstone.core.model_registry import APP_IDENTITY_MODEL_AUTH_MODES
+
+    for mode in APP_IDENTITY_MODEL_AUTH_MODES:
+        assert f'"{mode}"' in body, f"app-identity fallback missing {mode}"
+    assert body.count("_isAppIdentityAuthMode") >= 2, (
+        "the model-list badge must classify via the shared app-identity predicate"
+    )
+    # And the shelf's select ships an option per registry mode, so no mode
+    # depends on the injected-option skew path on a current page.
+    index_body = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    for mode in sorted(MODEL_AUTH_MODES):
+        assert f'value="{mode}"' in index_body, f"index.html option missing {mode}"

@@ -53,6 +53,7 @@ from turnstone.core.mcp_http_parsers import (
     parse_www_authenticate_scope,
 )
 from turnstone.core.mcp_oauth import (
+    MintDispatchContractError,
     TokenLookupResult,
     emit_oauth_failure_audit,
     get_obo_access_token_classified,
@@ -1019,23 +1020,41 @@ class MCPClientManager:
             app_state.obo_http_client = self._model_auth_http_client
 
     def mint_model_obo_token_sync(
-        self, *, user_id: str, audience: str, timeout: float = 20.0
+        self,
+        *,
+        user_id: str,
+        alias: str,
+        audience: str,
+        scopes: str = "",
+        grant_leg: str | None = None,
+        timeout: float = 20.0,
     ) -> str | None:
         """Resolve a per-user model-provider OBO access token synchronously.
 
         Bridges the sync agent/model loop to :func:`mint_obo_access_token` on
         the mcp-loop (same thread that owns the token store's asyncio locks),
-        mirroring ``call_tool_sync``.  Returns ``None`` on any failure — no
-        credential, mint rejected, OAuth unwired, timeout — so the model call
-        falls back to the backend's static credential.
+        mirroring ``call_tool_sync``.  ``alias`` is the owning model
+        definition — the mint's cache and cause records key on it — while
+        ``scopes`` and ``grant_leg`` pass through untouched: the
+        mode-specific exchange-scope request and the leg the caller's auth
+        mode pins.  Returns ``None`` on any failure — no credential, mint
+        rejected, OAuth unwired, timeout — so the model call falls back to
+        the backend's static credential.
         """
-        if not user_id or not audience:
+        if not user_id or not alias or not audience:
             return None
         loop = self._loop
         if loop is None or self._app_state is None:
             return None
         future = asyncio.run_coroutine_threadsafe(
-            mint_obo_access_token(app_state=self._app_state, user_id=user_id, audience=audience),
+            mint_obo_access_token(
+                app_state=self._app_state,
+                user_id=user_id,
+                alias=alias,
+                audience=audience,
+                scopes=scopes,
+                grant_leg=grant_leg,
+            ),
             loop,
         )
         try:
@@ -1043,45 +1062,70 @@ class MCPClientManager:
         except concurrent.futures.TimeoutError:
             future.cancel()
             log.warning(
-                "model obo token mint timed out user=%s audience=%s",
+                "model obo token mint timed out user=%s alias=%s audience=%s",
                 user_id,
+                alias,
                 audience,
+            )
+            return None
+        except MintDispatchContractError:
+            # The mint's dedicated caller-contract type (scopes without the
+            # exchange leg pinned, over-length scopes) — a programming error
+            # at the dispatch site that must not be demoted to debug. Any
+            # OTHER ValueError is an ordinary mint failure and falls through
+            # to the blanket arm below.
+            log.error(
+                "model obo token mint contract violation user=%s alias=%s audience=%s",
+                user_id,
+                alias,
+                audience,
+                exc_info=True,
             )
             return None
         except Exception:
             log.debug(
-                "model obo token mint failed user=%s audience=%s",
+                "model obo token mint failed user=%s alias=%s audience=%s",
                 user_id,
+                alias,
                 audience,
                 exc_info=True,
             )
             return None
 
-    def mint_app_token_sync(self, *, audience: str, timeout: float = 20.0) -> str | None:
+    def mint_app_token_sync(
+        self, *, alias: str, audience: str, timeout: float = 20.0
+    ) -> str | None:
         """Resolve an app-identity (client-credentials) model token synchronously.
 
         The ``auth_mode='entra_app'`` sibling of ``mint_model_obo_token_sync``:
         bridges to :func:`mint_app_access_token` on the mcp-loop. No user needed
-        — Turnstone's own SSO app registration is the identity. Returns ``None``
-        on any failure so the model call falls back to the static credential.
+        — Turnstone's own SSO app registration is the identity; ``alias`` is
+        the owning model definition the cache and cause records key on.
+        Returns ``None`` on any failure so the model call falls back to the
+        static credential.
         """
-        if not audience:
+        if not alias or not audience:
             return None
         loop = self._loop
         if loop is None or self._app_state is None:
             return None
         future = asyncio.run_coroutine_threadsafe(
-            mint_app_access_token(app_state=self._app_state, audience=audience),
+            mint_app_access_token(app_state=self._app_state, alias=alias, audience=audience),
             loop,
         )
         try:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
-            log.warning("model app token mint timed out audience=%s", audience)
+            log.warning("model app token mint timed out alias=%s audience=%s", alias, audience)
             return None
         except Exception:
-            log.debug("model app token mint failed audience=%s", audience, exc_info=True)
+            log.debug(
+                "model app token mint failed alias=%s audience=%s",
+                alias,
+                audience,
+                exc_info=True,
+            )
             return None
 
     def invalidate_model_mint_memo_sync(

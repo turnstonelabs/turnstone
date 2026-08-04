@@ -2421,6 +2421,7 @@ class StorageBackend(Protocol):
         replay_reasoning_to_model: bool = False,
         auth_mode: str = "static",
         obo_audience: str = "",
+        obo_scopes: str = "",
     ) -> None:
         """Create a model definition. No-op if definition_id already exists."""
         ...

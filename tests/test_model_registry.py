@@ -1175,6 +1175,153 @@ class TestReloadKeyGuard:
         assert reg.has_dynamic_auth()
 
 
+class TestProfileMismatchVisibility:
+    """``profile_mismatched_aliases`` and its reload-chokepoint warning: a
+    persisted row whose mode names the other grant dialect stays loadable
+    but can never mint, and every swap must say so."""
+
+    @staticmethod
+    def _mixed_models() -> dict[str, ModelConfig]:
+        return {
+            "plain": ModelConfig("plain", "http://x/v1", "key", "m"),
+            "gw-entra": ModelConfig(
+                "gw-entra",
+                "http://gw/v1",
+                "",
+                "m",
+                auth_mode="entra_obo",
+                obo_audience="api://gw",
+            ),
+            "gw-app": ModelConfig(
+                "gw-app",
+                "http://gw/v1",
+                "",
+                "m",
+                auth_mode="entra_app",
+                obo_audience="api://gw",
+            ),
+            "gw-kc": ModelConfig(
+                "gw-kc",
+                "http://gw/v1",
+                "",
+                "m",
+                auth_mode="rfc8693_obo",
+                obo_audience="api://gw",
+            ),
+        }
+
+    def test_helper_returns_mismatched_rows_sorted(self) -> None:
+        from turnstone.core.model_registry import profile_mismatched_aliases
+
+        assert profile_mismatched_aliases(self._mixed_models(), "rfc8693") == [
+            ("gw-app", "entra_app", "entra"),
+            ("gw-entra", "entra_obo", "entra"),
+        ]
+        assert profile_mismatched_aliases(self._mixed_models(), "entra") == [
+            ("gw-kc", "rfc8693_obo", "rfc8693")
+        ]
+
+    def test_helper_skips_static_and_unmapped_modes(self) -> None:
+        from turnstone.core.model_registry import profile_mismatched_aliases
+
+        # Direct construction bypasses load-path validation, standing in for
+        # a future dynamic mode nobody has paired yet: not a PROFILE
+        # mismatch — the write validator and dispatch own that class.
+        models = {
+            "plain": ModelConfig("plain", "http://x/v1", "key", "m"),
+            "gw-next": ModelConfig(
+                "gw-next",
+                "http://gw/v1",
+                "",
+                "m",
+                auth_mode="future_mode",
+                obo_audience="api://gw",
+            ),
+        }
+        assert profile_mismatched_aliases(models, "rfc8693") == []
+
+    def test_reload_warns_per_mismatched_row(self, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        reg = ModelRegistry(models={"a": ModelConfig("a", "http://x/v1", "key", "m")}, default="a")
+        state = keyed_app_state()
+        state.oidc_config = SimpleNamespace(enabled=True, obo_grant_profile="rfc8693")
+        models = {
+            "gw-entra": ModelConfig(
+                "gw-entra",
+                "http://gw/v1",
+                "",
+                "m",
+                auth_mode="entra_obo",
+                obo_audience="api://gw",
+            ),
+        }
+        with caplog.at_level(logging.WARNING):
+            reg.reload(models, "gw-entra", app_state=state)
+        blob = " ".join(r.getMessage() for r in caplog.records)
+        assert "gw-entra" in blob
+        assert "grant_profile_mismatch" in blob
+        assert "'rfc8693'" in blob and "'entra'" in blob
+
+    def test_no_mismatch_warning_when_oidc_disabled(self, caplog: pytest.LogCaptureFixture) -> None:
+        """OIDC-disabled deployments must NOT get the mismatch warning: the
+        loaded config defaults obo_grant_profile even when OIDC is off, and
+        the runtime refuses at the enabled check first — so the warning
+        would name a remedy (flip the profile) that cannot make the alias
+        mint, contradicting the heartbeat's oidc_not_enabled cause.
+        """
+        import logging
+
+        from turnstone.core.model_registry import warn_profile_mismatched_aliases
+
+        models = {
+            "gw-kc": ModelConfig(
+                "gw-kc",
+                "http://gw/v1",
+                "",
+                "m",
+                auth_mode="rfc8693_obo",
+                obo_audience="api://gw",
+            ),
+        }
+        for oidc in (
+            None,
+            SimpleNamespace(enabled=False, obo_grant_profile="entra"),
+        ):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                warn_profile_mismatched_aliases(models, SimpleNamespace(oidc_config=oidc))
+            assert not [r for r in caplog.records if "will not mint" in r.getMessage()]
+
+    def test_mismatch_warning_names_the_mode_correct_cause(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The warning's cause token must match what the alias's mint
+        actually records: the app-identity mint refuses a non-entra profile
+        as unsupported_grant_profile, the delegated legs as
+        grant_profile_mismatch — an operator greps the runtime heartbeat
+        for exactly the token the boot warning named.
+        """
+        import logging
+
+        from turnstone.core.model_registry import warn_profile_mismatched_aliases
+
+        state = SimpleNamespace(
+            oidc_config=SimpleNamespace(enabled=True, obo_grant_profile="rfc8693")
+        )
+        with caplog.at_level(logging.WARNING):
+            warn_profile_mismatched_aliases(self._mixed_models(), state)
+        by_alias = {
+            alias: r.getMessage()
+            for r in caplog.records
+            for alias in ("gw-app", "gw-entra")
+            if f"'{alias}'" in r.getMessage()
+        }
+        assert "unsupported_grant_profile" in by_alias["gw-app"]
+        assert "unsupported_grant_profile" not in by_alias["gw-entra"]
+        assert "grant_profile_mismatch" in by_alias["gw-entra"]
+
+
 # ---------------------------------------------------------------------------
 # Session integration
 # ---------------------------------------------------------------------------
@@ -2767,3 +2914,93 @@ class TestApplyRoutingOverrides:
         cs = _FakeCS(**{"model.task_alias": "nonexistent"})
         assert _apply_routing_overrides(reg, cs, _KEYED_STATE) is False
         assert reg.task_model is None  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# Auth-mode classification maps — drift guards
+# ---------------------------------------------------------------------------
+
+
+def test_model_auth_mode_profile_map_matches_mint_legs() -> None:
+    """The registry's pairing map and the mint-leg registry agree by test,
+    not by import: model_registry deliberately spells profile names as
+    literals to keep the mint stack off its import graph, so this is the
+    seam that catches a rename or an unclassified mode.
+    """
+    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+    # Every dynamic mode names its required profile — a mode missing here is
+    # never posture-approvable and never mints, which is fail-closed but
+    # must be a deliberate state, not an oversight.
+    assert set(mr_module.MODEL_AUTH_MODE_PROFILES) == set(mr_module.DYNAMIC_MODEL_AUTH_MODES)
+    # And every named profile has a real mint leg.
+    assert set(mr_module.MODEL_AUTH_MODE_PROFILES.values()) <= OBO_GRANT_PROFILES
+
+
+def test_auth_mode_classification_sets_are_subsets_of_dynamic() -> None:
+    assert mr_module.SCOPES_MODEL_AUTH_MODES <= mr_module.DYNAMIC_MODEL_AUTH_MODES
+    assert mr_module.APP_IDENTITY_MODEL_AUTH_MODES <= mr_module.DYNAMIC_MODEL_AUTH_MODES
+    # The scopes-reading and app-identity classes are disjoint: an app mode
+    # that read user-facing exchange scopes would have no coherent principal.
+    assert not (mr_module.SCOPES_MODEL_AUTH_MODES & mr_module.APP_IDENTITY_MODEL_AUTH_MODES)
+
+
+def test_obo_scopes_normalizers_agree_across_modules() -> None:
+    """The registry, console, and mint each own their scopes-normalization
+    POLICY (refuse-vs-strip on control garbage), but their SPELLING must
+    agree — or the console stores a value the mint keys its cache row under
+    differently than the session heartbeat's rebuild. All three now
+    delegate to ``sanitize_backend_auth_scopes``; this corpus pins the
+    delegation and the per-layer policies wrapped around it.
+    """
+    from turnstone.core.mcp_oauth import _normalized_mint_scopes
+
+    corpus = [
+        "",
+        "aud-gw",
+        "aud-gw openid",
+        "  aud-gw   openid  ",
+        "aud-gw\topenid",
+        "aud-gw\n  openid",
+        "aud-gw openid",  # already normalized — idempotence
+    ]
+    for raw in corpus:
+        registry_value = mr_module._normalize_auth_mode("gw", "rfc8693_obo", "api://gw", raw)[2]
+        shared = mr_module.sanitize_backend_auth_scopes(raw)
+        # The console's stored spelling IS the shared transform's output
+        # (its parser delegates), so pinning registry == mint == shared
+        # covers all three write/read surfaces.
+        assert registry_value == _normalized_mint_scopes(raw) == shared, raw
+    # Interior NON-whitespace controls are where the policies deliberately
+    # split: the registry refuses to LOAD what the write paths would have
+    # stripped before storing — and the stripping paths still agree with
+    # the shared transform.
+    dirty = "aud-gw" + chr(1) + "openid"
+    with pytest.raises(mr_module.ModelAuthConfigError):
+        mr_module._normalize_auth_mode("gw", "rfc8693_obo", "api://gw", dirty)
+    assert _normalized_mint_scopes(dirty) == "aud-gwopenid"
+    assert mr_module.sanitize_backend_auth_scopes(dirty) == "aud-gwopenid"
+    # The C0 separator block counts as Python whitespace, so a bare
+    # str.split() would swallow it before the guard could refuse; the
+    # registry must refuse it like every other control byte, while the
+    # sanctioned separators (tab/newline/CR, blessed in the corpus above)
+    # keep collapsing.
+    for sep_byte in (chr(0x1C), chr(0x1D), chr(0x1E), chr(0x1F)):
+        with pytest.raises(mr_module.ModelAuthConfigError):
+            mr_module._normalize_auth_mode(
+                "gw", "rfc8693_obo", "api://gw", f"aud-gw{sep_byte}openid"
+            )
+
+
+def test_control_bearing_alias_refuses_to_load() -> None:
+    """The alias is the identity every mint-cache, cooldown, cause and purge
+    key derives from, and the key builders strip control characters as a
+    raw-caller seam — so a control-bearing alias would silently collide with
+    its stripped twin, merging two definitions onto one identity. The load
+    refuses it like any other backend-auth text garbage, for every mode.
+    """
+    for mode in ("static", "rfc8693_obo"):
+        with pytest.raises(mr_module.ModelAuthConfigError, match="alias contains control"):
+            mr_module._normalize_auth_mode(
+                "gw" + chr(1), mode, "api://gw" if mode != "static" else "", ""
+            )

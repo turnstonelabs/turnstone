@@ -1716,6 +1716,9 @@
                       <option value="entra_app">
                         This deployment (entra_app)
                       </option>
+                      <option value="rfc8693_obo">
+                        Each user, via token exchange (rfc8693_obo)
+                      </option>
                     </select>
                   </div>
                   <div>
@@ -1737,6 +1740,19 @@
                       placeholder="api://your-application-id"
                     />
                     <datalist id="model-obo-audience-options"></datalist>
+                  </div>
+                </div>
+                <div class="field-pair">
+                  <div>
+                    <label for="model-obo-scopes"
+                      >Token-exchange scopes
+                      <span class="label-hint" id="model-obo-scopes-hint"></span
+                    ></label>
+                    <input
+                      type="text"
+                      id="model-obo-scopes"
+                      placeholder="space-separated scopes"
+                    />
                   </div>
                 </div>
               </div>

@@ -7,8 +7,10 @@ resilience when the primary model is unreachable.
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -20,7 +22,12 @@ from turnstone.core.providers import LLMProvider, create_client, create_provider
 
 log = get_logger(__name__)
 
-MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app"})
+MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app", "rfc8693_obo"})
+
+# One bound for the backend-auth text columns (obo_audience, obo_scopes),
+# shared with the console write path's cleaner so the two layers cannot
+# drift into "console stores it, registry refuses to load it".
+MODEL_AUTH_TEXT_MAX_LEN = 2048
 
 # Derived, never hand-listed (fail-safe defaults): any mode later added to
 # MODEL_AUTH_MODES lands in this set BY CONSTRUCTION unless it is literally
@@ -29,6 +36,34 @@ MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app"})
 # tuple is a drift seam where one missed site classifies a new mode as
 # static and skips the write gate entirely.
 DYNAMIC_MODEL_AUTH_MODES = frozenset(MODEL_AUTH_MODES) - {"static"}
+
+# Modes whose mint reads ``obo_scopes`` (the RFC 8693 exchange-leg scope
+# request). The console write path refuses a NEW non-empty obo_scopes on any
+# other mode, and the session dispatch passes scopes to the mint only for
+# members, so a value stored outside this set is inert by construction.
+SCOPES_MODEL_AUTH_MODES = frozenset({"rfc8693_obo"})
+
+# Modes that mint as the deployment's own app identity — no acting user
+# required. Every OTHER dynamic mode delegates the acting user's credential,
+# so the session's no-user-context refusal derives from this set's
+# complement: an unclassified future mode demands a user and fails closed
+# (loudly wrong for an app-identity mode, silently unsafe never).
+APP_IDENTITY_MODEL_AUTH_MODES = frozenset({"entra_app"})
+
+# Required ``[oidc] obo_grant_profile`` per dynamic mode — the type-pairing
+# the console validator enforces when a write CHOOSES a pair, and the grant
+# leg the session pins at mint time. Values are spelled as literals rather
+# than imported from mcp_oauth's OBO_GRANT_PROFILES: lightweight consumers
+# import this module and must not pull the mint stack with it; the
+# registry-vs-legs agreement (and full coverage of the dynamic set) is
+# pinned by test_model_auth_mode_profile_map_matches_mint_legs.
+MODEL_AUTH_MODE_PROFILES: Mapping[str, str] = MappingProxyType(
+    {
+        "entra_obo": "entra",
+        "entra_app": "entra",
+        "rfc8693_obo": "rfc8693",
+    }
+)
 
 
 def _is_dynamic_auth_mode(mode: str) -> bool:
@@ -112,6 +147,69 @@ def dynamic_auth_key_error(models: Mapping[str, ModelConfig], app_state: Any) ->
     )
 
 
+def profile_mismatched_aliases(
+    models: Mapping[str, ModelConfig], obo_grant_profile: str
+) -> list[tuple[str, str, str]]:
+    """Dynamic aliases whose mode's paired profile is not *obo_grant_profile*.
+
+    Pure projection for the swap/boot visibility warnings: such a row is
+    legal to keep (same-pair edits and re-arms pass the write validator) but
+    can never mint on this deployment — its mint refuses with
+    ``grant_profile_mismatch``. Returns sorted ``(alias, auth_mode,
+    required_profile)``. Static and unmapped modes are skipped: static never
+    mints, and an unmapped dynamic mode is refused at pair-choose and fails
+    closed at dispatch, so neither is a *profile* mismatch.
+    """
+    rows = [
+        (alias, cfg.auth_mode, MODEL_AUTH_MODE_PROFILES[cfg.auth_mode])
+        for alias, cfg in models.items()
+        if cfg.auth_mode in DYNAMIC_MODEL_AUTH_MODES
+        and cfg.auth_mode in MODEL_AUTH_MODE_PROFILES
+        and MODEL_AUTH_MODE_PROFILES[cfg.auth_mode] != obo_grant_profile
+    ]
+    return sorted(rows)
+
+
+def warn_profile_mismatched_aliases(models: Mapping[str, ModelConfig], app_state: Any) -> None:
+    """Warn for every alias whose mode can never mint on this deployment.
+
+    The one spelling of the visibility pass both swap surfaces run —
+    :meth:`ModelRegistry.reload` and the lifespan boot — so the wording and
+    the profile extraction cannot drift. Not a gate: such a row stays legal
+    to keep (same-pair edits pass the write validator), but its mint always
+    refuses. No-op unless OIDC is ENABLED and names a grant profile: the
+    runtime refuses at the enabled check first (the loaded config defaults
+    ``obo_grant_profile`` even when OIDC is off), so a mismatch warning on a
+    disabled deployment would name a remedy — flip the profile — that cannot
+    make the alias mint. The named cause matches what the alias's mint
+    actually records at refusal: the app-identity mint refuses a non-entra
+    profile as ``unsupported_grant_profile``; the delegated legs refuse as
+    ``grant_profile_mismatch`` — so an operator can grep the runtime
+    heartbeat for exactly the token this warning names.
+    """
+    oidc_config = getattr(app_state, "oidc_config", None)
+    if oidc_config is None or not getattr(oidc_config, "enabled", False):
+        return
+    profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
+    if not profile:
+        return
+    for alias, mode, required in profile_mismatched_aliases(models, profile):
+        cause = (
+            "unsupported_grant_profile"
+            if mode in APP_IDENTITY_MODEL_AUTH_MODES
+            else "grant_profile_mismatch"
+        )
+        log.warning(
+            "model alias %r auth_mode %r requires obo_grant_profile=%r "
+            "(configured: %r) — it will not mint (cause=%s)",
+            alias,
+            mode,
+            required,
+            profile,
+            cause,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Model configuration
 # ---------------------------------------------------------------------------
@@ -144,21 +242,89 @@ class ModelConfig:
     server_compat: dict[str, Any] = field(default_factory=dict)
     # Backend credential mode. ``static`` (default) sends ``api_key`` unchanged;
     # ``entra_obo`` mints a caller-delegated Entra token; ``entra_app`` mints a
-    # shared app-identity token. Dynamic tokens are bound as the SDK credential
-    # (x-api-key for Anthropic surfaces, Authorization: Bearer for OpenAI-style).
-    # ``obo_audience`` is the exact operator-approved resource App ID URI.
+    # shared app-identity token; ``rfc8693_obo`` mints a caller-delegated token
+    # via RFC 8693 token exchange. Dynamic tokens are bound as the SDK
+    # credential (x-api-key for Anthropic surfaces, Authorization: Bearer for
+    # OpenAI-style). ``obo_audience`` is the exact operator-approved resource
+    # identifier; ``obo_scopes`` is the space-separated scope list the
+    # rfc8693 exchange leg requests (inert for every other mode).
     auth_mode: str = "static"
     obo_audience: str = ""
+    obo_scopes: str = ""
 
 
-def _normalize_auth_mode(alias: str, mode: Any, audience: Any) -> tuple[str, str]:
+def strip_control_characters(value: str) -> str:
+    """Remove every C0 (U+0000–U+001F) and DEL (U+007F) character.
+
+    The ONE spelling of the control-character class every backend-auth text
+    surface guards — the scopes sanitize below, the registry's refuse
+    predicate, the mint entry points' audience/alias hygiene, and the
+    console's OAuth text cleaner all delegate here, so a later widening of
+    the class (or a narrowing) lands everywhere at once instead of silently
+    splitting the write path's strip from the load path's refusal.
+    """
+    return "".join(ch for ch in value if ord(ch) >= 32 and ord(ch) != 127)
+
+
+def sanitize_backend_auth_scopes(value: Any) -> str:
+    """The ONE spelling of the backend-auth scopes sanitize.
+
+    Collapse whitespace runs to single spaces, strip the remaining C0/DEL
+    control characters, then re-collapse the runs the stripping can reopen
+    (``"a \\x01 b"`` becomes ``"a  b"`` becomes ``"a b"``). Collapse-first
+    ordering is load-bearing: stripping a tab-separated list first would
+    CONCATENATE the scopes the tab separates. No length cap and no refusal —
+    policy (caps, and refuse-vs-strip on garbage) stays with each consuming
+    layer; this function only fixes the shared spelling those policies
+    measure, so the console store, the registry load, and the mint request
+    can never disagree on what a scopes value *is*.
+    """
+    collapsed = " ".join(str(value or "").split())
+    return " ".join(strip_control_characters(collapsed).split())
+
+
+def _check_auth_text(alias: str, field: str, value: str) -> None:
+    """Refuse control characters and over-length in a backend-auth text field.
+
+    The registry's REFUSE policy, shared by the audience and scopes arms of
+    :func:`_normalize_auth_mode` so the two cannot drift on wording or
+    bounds: the write path sanitizes, this layer refuses what sanitization
+    would have prevented, so DB-direct garbage fails loud rather than
+    loading.
+    """
+    if strip_control_characters(value) != value:
+        raise ModelAuthConfigError(f"Model '{alias}' {field} contains control characters")
+    if len(value) > MODEL_AUTH_TEXT_MAX_LEN:
+        raise ModelAuthConfigError(
+            f"Model '{alias}' {field} exceeds {MODEL_AUTH_TEXT_MAX_LEN} characters"
+        )
+
+
+def _normalize_auth_mode(
+    alias: str, mode: Any, audience: Any, scopes: Any = ""
+) -> tuple[str, str, str]:
     """Validate and normalize one model's backend-auth configuration.
 
     DB and config.toml rows share this path so a typo cannot silently downgrade
-    dynamic authentication to a static key. Audience values remain literal:
-    environment expansion would make authorization node-dependent and could
-    bypass the admin allow-list and length boundary.
+    dynamic authentication to a static key. Audience and scope values remain
+    literal: environment expansion would make authorization node-dependent and
+    could bypass the admin allow-list and length boundary.
+
+    ``obo_scopes`` gets shape checks only, and — like the audience's shape
+    checks — they run REGARDLESS of auth_mode: the write path sanitizes,
+    this layer refuses what sanitization would have prevented, so DB-direct
+    garbage fails loud rather than loading. What IS mode-tolerant is the
+    coupling: a stored value on a mode outside SCOPES_MODEL_AUTH_MODES is
+    accepted exactly like a stale audience on a static row — the console
+    refuses NEW staging, an already-stored value must not make the alias
+    unloadable, and the dispatch never reads it, so it is inert.
     """
+    # The alias is the identity every mint-cache, cooldown, cause and purge
+    # key derives from, so it takes the same refuse-not-strip guard as the
+    # auth text fields: a control-bearing alias would silently collide with
+    # its stripped twin at the key builders (which strip controls as a
+    # raw-caller seam), merging two definitions onto one identity.
+    _check_auth_text(alias, "alias", str(alias or ""))
     normalized_mode = str(mode or "static").strip() or "static"
     normalized_audience = str(audience or "").strip()
     if normalized_mode not in MODEL_AUTH_MODES:
@@ -170,11 +336,21 @@ def _normalize_auth_mode(alias: str, mode: Any, audience: Any) -> tuple[str, str
         raise ModelAuthConfigError(
             f"Model '{alias}' requires obo_audience when auth_mode is {normalized_mode!r}"
         )
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in normalized_audience):
-        raise ModelAuthConfigError(f"Model '{alias}' obo_audience contains control characters")
-    if len(normalized_audience) > 2048:
-        raise ModelAuthConfigError(f"Model '{alias}' obo_audience exceeds 2048 characters")
-    return normalized_mode, normalized_audience
+    _check_auth_text(alias, "obo_audience", normalized_audience)
+    # The guard sees the separator-tolerated spelling, NOT the sanitized
+    # one: the sanctioned separators — tab/newline/CR, the config spellings
+    # the corpus blesses — read as collapsed spaces, while every OTHER C0
+    # byte stays visible for the refusal. A bare str.split() would swallow
+    # the C0 separator block (U+001C–U+001F counts as Python whitespace)
+    # before the guard could see it, silently loading bytes the write path
+    # could never have stored (pinned:
+    # test_obo_scopes_normalizers_agree_across_modules). Once the guard
+    # passes, the spellings converge, so the returned value routes through
+    # the shared transform.
+    tolerated = re.sub(r"[ \t\n\r]+", " ", str(scopes or "")).strip()
+    _check_auth_text(alias, "obo_scopes", tolerated)
+    normalized_scopes = sanitize_backend_auth_scopes(scopes)
+    return normalized_mode, normalized_audience, normalized_scopes
 
 
 def _api_surface_of(cfg: ModelConfig) -> str | None:
@@ -483,6 +659,10 @@ class ModelRegistry:
             key_err = dynamic_auth_key_error(models, app_state)
             if key_err:
                 raise DynamicAuthKeyError(key_err)
+            # Visibility, not a gate: a persisted row whose mode names the
+            # other grant dialect stays valid to keep, but its mint always
+            # refuses on this deployment — say so at every swap chokepoint.
+            warn_profile_mismatched_aliases(models, app_state)
         _validate_registry_args(models, default, fallback, agent_model, task_model)
         with self._client_lock:
             # FIRST write inside the lock, deliberately BEFORE the map swap
@@ -669,12 +849,14 @@ def load_model_registry(
                 # pre-052 row missing these columns degrades gracefully.
                 row_surface_persisted_reasoning = bool(row.get("surface_persisted_reasoning", True))
                 row_replay_reasoning = bool(row.get("replay_reasoning_to_model", False))
-                # Per-user OBO auth (defaults match a pre-068 row missing the
-                # columns → "static", no audience → unchanged behaviour).
-                row_auth_mode, row_obo_audience = _normalize_auth_mode(
+                # Per-user OBO auth (defaults match a pre-068/pre-069 row
+                # missing the columns → "static", no audience/scopes →
+                # unchanged behaviour).
+                row_auth_mode, row_obo_audience, row_obo_scopes = _normalize_auth_mode(
                     alias,
                     row.get("auth_mode"),
                     row.get("obo_audience"),
+                    row.get("obo_scopes"),
                 )
                 configs[alias] = ModelConfig(
                     alias=alias,
@@ -695,6 +877,7 @@ def load_model_registry(
                     server_compat=row_server_compat,
                     auth_mode=row_auth_mode,
                     obo_audience=row_obo_audience,
+                    obo_scopes=row_obo_scopes,
                 )
         except ModelAuthConfigError:
             # Configuration errors are authoritative row content, not a
@@ -753,10 +936,11 @@ def load_model_registry(
         entry_server_compat = entry_caps.pop("server_compat", {})
         if not isinstance(entry_server_compat, dict):
             entry_server_compat = {}
-        entry_auth_mode, entry_obo_audience = _normalize_auth_mode(
+        entry_auth_mode, entry_obo_audience, entry_obo_scopes = _normalize_auth_mode(
             alias,
             entry.get("auth_mode", "static"),
             entry.get("obo_audience", ""),
+            entry.get("obo_scopes", ""),
         )
         configs[alias] = ModelConfig(
             alias=alias,
@@ -778,6 +962,7 @@ def load_model_registry(
             server_compat=entry_server_compat,
             auth_mode=entry_auth_mode,
             obo_audience=entry_obo_audience,
+            obo_scopes=entry_obo_scopes,
         )
 
     # 3. Back-compat shim: synthesize a "default" alias from CLI/auto-detected

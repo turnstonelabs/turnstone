@@ -62,9 +62,15 @@ from turnstone.core.mcp_crypto import STARTUP_KEY_REQUIRED_HINT, is_user_scoped_
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
 from turnstone.core.model_registry import (
+    APP_IDENTITY_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
+    MODEL_AUTH_MODE_PROFILES,
+    MODEL_AUTH_TEXT_MAX_LEN,
+    SCOPES_MODEL_AUTH_MODES,
     DynamicAuthKeyError,
     dynamic_auth_key_error,
+    sanitize_backend_auth_scopes,
+    strip_control_characters,
 )
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
 from turnstone.core.rendezvous import NoAvailableNodeError
@@ -9685,31 +9691,90 @@ _MCP_MAX_SERVERS = 200  # fallback; prefer cluster.mcp_max_servers from storage
 _MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user", "oauth_obo"})
 
 
-# Cleaning bound for a model definition's ``obo_audience``. ONE constant:
-# the derive-gate's stored-side normalization and the create/update twins'
-# input cleaning must truncate identically, or a long stored audience
-# cleans differently on the two sides of the pair-change compare and every
-# full-form save on such a row reads as a pair change.
-OBO_AUDIENCE_MAX_LEN = 2048
-
-
 def _clean_oauth_text(value: Any, *, max_length: int = 512) -> str | None:
     """Normalize an admin form OAuth text field — empty string -> None.
 
     Caps the input to ``max_length`` characters to bound DB row size on
     the admin.mcp write path.  Pass a larger ``max_length`` (e.g. 2048)
-    for URL fields where the default would otherwise truncate valid
-    long URLs; model ``obo_audience`` sites pass
-    :data:`OBO_AUDIENCE_MAX_LEN`.
+    for URL fields where the default would otherwise truncate valid long
+    URLs; model backend-auth sites (``obo_audience``/``obo_scopes``) pass
+    the REGISTRY's bound, :data:`MODEL_AUTH_TEXT_MAX_LEN`, so the console
+    never stores a length the registry load then refuses and the gate's
+    stored-side normalization truncates identically to the twins' input
+    cleaning.
     """
     if value is None:
         return None
     # OAuth identifiers/URLs have no valid C0 controls. Removing them here
-    # prevents log/header ambiguity and benefits both MCP and model auth.
-    text = re.sub(r"[\x00-\x1f\x7f]", "", str(value)).strip()
+    # (via the one shared spelling of the control class) prevents log/header
+    # ambiguity and benefits both MCP and model auth.
+    text = strip_control_characters(str(value)).strip()
     if not text:
         return None
     return text[:max_length]
+
+
+def _parse_obo_scopes_field(raw: Any, stored: Any = None) -> tuple[str | None, JSONResponse | None]:
+    """Parse a submitted ``obo_scopes`` field against the length policy.
+
+    The ONE parser both write twins use. Returns ``(value, None)`` to store
+    ``value``, ``(None, error)`` for a refused over-length submission, or
+    ``(None, None)`` — over-length but IDENTICAL to *stored* under the same
+    uncapped transform — which the update twin maps to "omit the column so
+    the server preserves the stored value". That omit-unchanged arm is what
+    keeps a DB-direct over-length row disarmable and full-form-resavable:
+    the echo of the row's own residue is not a change, and refusing it would
+    wedge the row (in particular, the pure-disable carve-out must never be
+    blocked by residue the operator is not touching).
+
+    The bound measures the CLEANED value: length policy bounds what is
+    STORED, and the stored form is the sanitized spelling — measuring the
+    raw paste would refuse input whose stored form fits (control bytes a
+    terminal paste smuggles in are stripped, never counted). ``stored=None``
+    (the create twin) has no residue to echo, so over-length always refuses.
+    """
+    full = sanitize_backend_auth_scopes(raw)
+    if len(full) <= MODEL_AUTH_TEXT_MAX_LEN:
+        return full, None
+    if stored is not None and full == sanitize_backend_auth_scopes(stored):
+        return None, None
+    return None, JSONResponse({"error": _SCOPES_TOO_LONG_ERROR}, status_code=400)
+
+
+def _purge_model_mint_cache(storage: Any, definition_id: str, alias: str) -> None:
+    """Best-effort purge of a model definition's mint-cache rows.
+
+    Deletes the definition's rows under BOTH synthetic prefixes — the
+    per-user OBO rows and the shared app-identity row — for the *alias* that
+    owned them. Sound because the keys are IDENTITY-keyed on the unique
+    alias, exactly as the MCP-server purges above key on the unique server
+    name: one owning definition per key, so a sibling definition's rows are
+    untouchable by construction. Purging a prefix the row's mode never
+    minted under is a no-op, so the helper needs no mode dispatch. The ONE
+    spelling both write twins call — update (rename / re-aim / scope
+    change) and delete — so the key build and the failure posture cannot
+    drift between them. Best-effort: the definition write is already
+    committed, and the mint-side freshness gate refuses a superseded row
+    regardless — this purge is at-rest hygiene, the gate is the serving
+    guarantee.
+    """
+    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+
+    if not alias:
+        return
+    # Per-prefix isolation: a failure deleting one prefix's rows must not
+    # abort the other's — the both-prefixes contract holds under partial
+    # storage failure, each miss logged on its own.
+    for server_key in (model_obo_cache_server(alias), model_app_cache_server(alias)):
+        try:
+            storage.delete_mcp_oauth_rows_by_server_name(server_key)
+        except Exception:
+            log.warning(
+                "admin.models.purge_mint_cache_failed definition_id=%s server=%s",
+                definition_id,
+                server_key,
+                exc_info=True,
+            )
 
 
 def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | None]:
@@ -11535,6 +11600,16 @@ _AUDIENCE_FORBIDS_STATIC_ERROR = (
     f"({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))}); "
     "omit it when auth_mode is 'static'"
 )
+# The scopes staging guard's refusal, shared by both twins like its audience
+# siblings above. Mode list derived, same rationale.
+_SCOPES_REQUIRE_EXCHANGE_MODE_ERROR = (
+    "obo_scopes is only used by auth_mode "
+    f"({'/'.join(sorted(SCOPES_MODEL_AUTH_MODES))}); "
+    "omit it for other modes"
+)
+# Over-length scopes are refused, not truncated: a silently shortened scope
+# list changes what the exchange leg requests. Shared by both twins.
+_SCOPES_TOO_LONG_ERROR = f"obo_scopes exceeds {MODEL_AUTH_TEXT_MAX_LEN} characters"
 
 
 def _canonical_capabilities(raw: Any) -> str | None:
@@ -11586,12 +11661,20 @@ class ModelAuthGateDecision:
     - ``enabled_armed`` implies ``not pure_disable`` — arming and
       disarming are directional opposites.
     - ``posture_event`` is exactly ``pair_changed or enabled_armed``.
+
+    ``scopes_value_changed`` is the gate's scopes comparator — exposed
+    because it is also a mint-cache purge trigger (a scope change re-shapes
+    the bearer the alias's rows hold), and the handler must fire the purge
+    on exactly the comparison the gate made, never a re-derivation that
+    could drift.
     """
 
     eff_auth_mode: str
     eff_audience: str
     audience_required_violation: bool
     static_new_audience_violation: bool
+    scopes_staging_violation: bool
+    scopes_value_changed: bool
     pair_changed: bool
     dynamic_involved: bool
     enabled_armed: bool
@@ -11645,7 +11728,7 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
     """
     old_auth_mode = str(existing.get("auth_mode") or "static")
     old_audience = (
-        _clean_oauth_text(existing.get("obo_audience"), max_length=OBO_AUDIENCE_MAX_LEN) or ""
+        _clean_oauth_text(existing.get("obo_audience"), max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
     )
     eff_auth_mode = str(updates.get("auth_mode", old_auth_mode))
     eff_audience = str(updates.get("obo_audience", old_audience))
@@ -11659,6 +11742,34 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
         and "obo_audience" in updates
         and bool(updates["obo_audience"])
         and str(updates["obo_audience"]) != old_audience
+    )
+    # The scopes twin of the staging guard: a mode that never reads scopes
+    # must not store a NEW value for a later mode flip to inherit. VALUE
+    # CHANGE only, so residue re-saves keep working — and a pure disable can
+    # never trip this (an unchanged or omitted scopes field is no violation,
+    # and a changed one already forecloses the carve-out via the gated-change
+    # loop below; pinned:
+    # test_pure_disable_with_stored_scopes_stays_carved_out).
+    # The stored-side baseline is the UNCAPPED shared sanitize: a DB-direct
+    # raw stored value must compare equal to its own collapsed re-save (the
+    # update ladder normalizes the incoming side), or every full-form
+    # submit — including the disarm — misreads residue as a change. The cap
+    # deliberately does NOT apply here: a capped baseline would let the
+    # capped SPELLING of over-cap residue compare as "no change", so an
+    # admin.models-only caller could rewrite a registry-refused value into
+    # a loadable, mintable one under the escalation gate's radar. Over-cap
+    # residue can never equal a storable submission, so any write to it is
+    # auth-gated; the wedge protection for untouched residue lives in the
+    # parser's omit-unchanged arm, not in this compare.
+    old_scopes = sanitize_backend_auth_scopes(existing.get("obo_scopes"))
+    # THE scopes comparator — the staging guard and the gated-change loop
+    # below both consume it, so the two predicates cannot drift on what
+    # counts as a value change.
+    scopes_value_changed = "obo_scopes" in updates and str(updates["obo_scopes"]) != old_scopes
+    scopes_staging_violation = (
+        eff_auth_mode not in SCOPES_MODEL_AUTH_MODES
+        and scopes_value_changed
+        and bool(updates["obo_scopes"])
     )
     # One derivation, two consumers: the outer gate and the validator's
     # posture tier.
@@ -11675,11 +11786,19 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
     caps_changed = "capabilities" in updates and _capabilities_value_changed(
         existing.get("capabilities"), updates["capabilities"]
     )
-    non_caps_gated_changed = any(
-        key not in ("enabled", "capabilities", "auth_mode", "obo_audience")
-        and key not in MODEL_AUTH_NEUTRAL_FIELDS
-        and str(existing.get(key) or "") != str(value or "")
-        for key, value in updates.items()
+    # obo_scopes joins the pair and capabilities in the loop's exclusion
+    # list: each excluded column has a dedicated normalization-correct
+    # comparator (scopes_value_changed above), and the raw-string loop
+    # would misread a DB-direct stored value's collapsed re-save as a
+    # change.
+    non_caps_gated_changed = (
+        any(
+            key not in ("enabled", "capabilities", "auth_mode", "obo_audience", "obo_scopes")
+            and key not in MODEL_AUTH_NEUTRAL_FIELDS
+            and str(existing.get(key) or "") != str(value or "")
+            for key, value in updates.items()
+        )
+        or scopes_value_changed
     )
     other_gated_changed = non_caps_gated_changed or caps_changed
     caps_blocks_disarm = (
@@ -11706,6 +11825,8 @@ def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> Mode
         eff_audience=eff_audience,
         audience_required_violation=audience_required_violation,
         static_new_audience_violation=static_new_audience_violation,
+        scopes_staging_violation=scopes_staging_violation,
+        scopes_value_changed=scopes_value_changed,
         pair_changed=pair_changed,
         dynamic_involved=dynamic_involved,
         enabled_armed=enabled_armed,
@@ -11721,6 +11842,7 @@ def _validate_dynamic_model_auth(
     auth_mode: str,
     audience: str,
     posture_event: bool = True,
+    pair_changed: bool = True,
 ) -> JSONResponse | None:
     """Validate a dynamic model-auth config at the write choke point.
 
@@ -11738,12 +11860,18 @@ def _validate_dynamic_model_auth(
     request CHOOSES the ``(auth_mode, obo_audience)`` pair rather than
     inheriting it, or RE-ARMS a disabled dynamic row (pinned:
     test_keyless_reenable_of_dynamic_row_returns_503). Checks, in sibling
-    order: token store present, OIDC configured, grant profile valid and
-    able to carry the mode. A same-pair edit is never posture-blocked — an
-    existing row must not be held hostage to posture that changed after it
-    was saved; the mint warns at runtime instead, exactly as the MCP
-    contract documents (pinned:
+    order: token store present, OIDC configured, grant profile valid. A
+    same-pair edit is never posture-blocked — an existing row must not be
+    held hostage to posture that changed after it was saved; the mint warns
+    at runtime instead, exactly as the MCP contract documents (pinned:
     test_base_url_edit_allowed_despite_typod_profile).
+
+    The mode/profile PAIRING is narrower still — a pair-CHOOSE rule, gated
+    on ``pair_changed``: re-arming an untouched pair keeps the row's
+    standing, whatever profile the deployment now runs (its mint refuses at
+    runtime with ``grant_profile_mismatch``, fallback-eligible by ruling),
+    while any request that picks the pair must pick one this deployment can
+    mint.
 
     Every refusal names its actual cause and echoes what the operator
     configured. A missing token store is 503 (deployment fault,
@@ -11823,17 +11951,53 @@ def _validate_dynamic_model_auth(
             },
             status_code=400,
         )
-    if auth_mode == "entra_app" and profile != "entra":
-        return JSONResponse(
-            {
-                "error": (
-                    f"auth_mode 'entra_app' requires [oidc] obo_grant_profile='entra' "
-                    f"(configured: {profile!r}); RFC 8693 client-credentials is not "
-                    "supported"
+    if pair_changed:
+        # Type-pairing: every dynamic mode names its grant dialect, so
+        # "mode matches deployment profile" is one derived rule instead of a
+        # per-mode special case. Only a pair CHOICE reaches this, so legacy
+        # rows persisted under the pre-pairing overload keep accepting
+        # same-pair edits and re-arms (pinned:
+        # test_base_url_edit_allowed_on_legacy_entra_obo_rfc8693_row,
+        # test_legacy_cross_profile_row_reenables_unchanged).
+        required = MODEL_AUTH_MODE_PROFILES.get(auth_mode)
+        if required is None:
+            # Fail-closed IN code, not by map absence: a dynamic mode nobody
+            # paired must be refused here with its remedy named — the
+            # registry drift test stays as the belt.
+            return JSONResponse(
+                {
+                    "error": (
+                        f"auth_mode {auth_mode!r} has no registered grant-profile "
+                        "pairing; add it to MODEL_AUTH_MODE_PROFILES before use"
+                    )
+                },
+                status_code=400,
+            )
+        elif profile != required:
+            if auth_mode in APP_IDENTITY_MODEL_AUTH_MODES:
+                remedy = "; RFC 8693 client-credentials is not supported"
+            else:
+                alternates = "/".join(
+                    sorted(
+                        mode
+                        for mode, mode_profile in MODEL_AUTH_MODE_PROFILES.items()
+                        if mode_profile == profile and mode not in APP_IDENTITY_MODEL_AUTH_MODES
+                    )
                 )
-            },
-            status_code=400,
-        )
+                remedy = (
+                    f"; delegated tokens under this profile use auth_mode {alternates!r}"
+                    if alternates
+                    else ""
+                )
+            return JSONResponse(
+                {
+                    "error": (
+                        f"auth_mode {auth_mode!r} requires [oidc] obo_grant_profile="
+                        f"{required!r} (configured: {profile!r}){remedy}"
+                    )
+                },
+                status_code=400,
+            )
     return None
 
 
@@ -12171,6 +12335,7 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
                 "reasoning_effort": nm.get("reasoning_effort"),
                 "auth_mode": nm.get("auth_mode", "static"),
                 "obo_audience": nm.get("obo_audience", ""),
+                "obo_scopes": nm.get("obo_scopes", ""),
                 "source": "config",
                 "created_by": "",
                 "created": "",
@@ -12243,6 +12408,14 @@ async def admin_model_auth_constraints(request: Request) -> JSONResponse:
             # mirror across the language seam; the client's hand-list is only
             # the fail-open fallback for a missing/failed fetch.
             "dynamic_auth_modes": sorted(DYNAMIC_MODEL_AUTH_MODES),
+            # Same contract for the scopes input's visibility and the mode
+            # options' profile pairing (which options grey out for THIS
+            # deployment's grant profile).
+            "scopes_auth_modes": sorted(SCOPES_MODEL_AUTH_MODES),
+            # And for the model list's auth badge: app-identity modes render
+            # as a deployment identity, every other dynamic mode as per-user.
+            "app_identity_auth_modes": sorted(APP_IDENTITY_MODEL_AUTH_MODES),
+            "auth_mode_profiles": dict(sorted(MODEL_AUTH_MODE_PROFILES.items())),
         }
     )
 
@@ -12356,7 +12529,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     if auth_mode not in _MODEL_AUTH_MODES:
         return JSONResponse({"error": f"Invalid auth_mode: {auth_mode!r}"}, status_code=400)
     obo_audience = (
-        _clean_oauth_text(body.get("obo_audience"), max_length=OBO_AUDIENCE_MAX_LEN) or ""
+        _clean_oauth_text(body.get("obo_audience"), max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
     )
     if auth_mode in DYNAMIC_MODEL_AUTH_MODES and not obo_audience:
         return JSONResponse({"error": _AUDIENCE_REQUIRED_ERROR}, status_code=400)
@@ -12367,6 +12540,18 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     # permission gate — it discriminates only on the request's own fields.
     if auth_mode == "static" and obo_audience:
         return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
+    # Scopes twin of the staging guard, same request-shape rationale: only a
+    # scope-reading mode may store scopes. Over-length input is REFUSED
+    # (audience keeps its truncate posture — the allow-list membership check
+    # backstops whatever a truncation produces; scopes have no such list).
+    # No stored row exists yet, so the parser's omit-unchanged arm never
+    # applies here: over-length always refuses.
+    obo_scopes_value, scopes_err = _parse_obo_scopes_field(body.get("obo_scopes"))
+    if scopes_err is not None:
+        return scopes_err
+    obo_scopes = obo_scopes_value or ""
+    if obo_scopes and auth_mode not in SCOPES_MODEL_AUTH_MODES:
+        return JSONResponse({"error": _SCOPES_REQUIRE_EXCHANGE_MODE_ERROR}, status_code=400)
     if auth_mode != "static":
         # Redeeming an operator-chosen audience is the same capability as
         # configuring oauth_audience on MCP; service credentials do not bypass
@@ -12402,6 +12587,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         replay_reasoning_to_model=replay_reasoning_to_model,
         auth_mode=auth_mode,
         obo_audience=obo_audience,
+        obo_scopes=obo_scopes,
     )
 
     # Record the auth pair, as the update path already does: it is a
@@ -12411,6 +12597,8 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     if auth_mode != "static":
         audit_detail["auth_mode"] = auth_mode
         audit_detail["obo_audience"] = obo_audience
+        if obo_scopes:
+            audit_detail["obo_scopes"] = obo_scopes
     record_audit(
         storage,
         audit_uid,
@@ -12605,8 +12793,23 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         updates["auth_mode"] = am
     if "obo_audience" in body:
         updates["obo_audience"] = (
-            _clean_oauth_text(body["obo_audience"], max_length=OBO_AUDIENCE_MAX_LEN) or ""
+            _clean_oauth_text(body["obo_audience"], max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
         )
+    if "obo_scopes" in body:
+        # Same refusal as the create twin — over-length scope lists never
+        # truncate into the store (see the audience-asymmetry note there) —
+        # via the shared parser, whose omit-unchanged arm drops the key when
+        # the submission merely echoes over-length DB-direct residue: the
+        # gate below then sees no scopes change and the stored value
+        # survives verbatim, so the residue row stays disarmable and
+        # full-form-resavable.
+        scopes_value, scopes_err = _parse_obo_scopes_field(
+            body["obo_scopes"], stored=existing.get("obo_scopes")
+        )
+        if scopes_err is not None:
+            return scopes_err
+        if scopes_value is not None:
+            updates["obo_scopes"] = scopes_value
     # Every gate fact derives purely in _derive_auth_gate, whose docstring
     # carries the rulings; this handler only maps fields to responses.
     gate = _derive_auth_gate(existing, updates)
@@ -12617,6 +12820,8 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         return JSONResponse({"error": _AUDIENCE_REQUIRED_ERROR}, status_code=400)
     if gate.static_new_audience_violation:
         return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
+    if gate.scopes_staging_violation:
+        return JSONResponse({"error": _SCOPES_REQUIRE_EXCHANGE_MODE_ERROR}, status_code=400)
     if gate.auth_config_changed:
         # Permission first: the validation 400s below describe deployment OIDC
         # posture and allow-list membership, which a caller lacking this scope
@@ -12632,12 +12837,23 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             auth_mode=gate.eff_auth_mode,
             audience=gate.eff_audience,
             posture_event=gate.posture_event,
+            pair_changed=gate.pair_changed,
         )
         if dynamic_auth_error is not None:
             return dynamic_auth_error
 
     if updates:
         storage.update_model_definition(definition_id, **updates)
+        old_alias = str(existing.get("alias") or "")
+        alias_changed = "alias" in updates and updates["alias"] != old_alias
+        if alias_changed or gate.pair_changed or gate.scopes_value_changed:
+            # A rename orphans the OLD alias's identity keys outright; a
+            # re-aim or scope change leaves rows whose bearer was minted for
+            # the superseded shape. Either way the rows purge under the old
+            # alias — the mint-side freshness gate refuses stale rows
+            # regardless, so this is at-rest hygiene, not the serving
+            # guarantee.
+            _purge_model_mint_cache(storage, definition_id, old_alias)
 
     audit_uid, ip = _audit_context(request)
     audit_detail = dict(updates)
@@ -12703,6 +12919,12 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     existing = storage.get_model_definition(definition_id)
     if existing is None:
         return JSONResponse({"error": "Model definition not found"}, status_code=404)
+
+    # Purge the definition's mint-cache rows before the row goes away —
+    # after the delete, nothing owns the alias's identity keys and their
+    # encrypted bearers would persist at rest until another definition
+    # claimed the alias.
+    _purge_model_mint_cache(storage, definition_id, str(existing.get("alias") or ""))
 
     storage.delete_model_definition(definition_id)
 

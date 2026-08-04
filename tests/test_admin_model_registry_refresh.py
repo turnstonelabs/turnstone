@@ -38,7 +38,10 @@ from turnstone.console.server import (
     admin_update_model_definition,
 )
 from turnstone.core.model_registry import (
+    APP_IDENTITY_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
+    MODEL_AUTH_MODE_PROFILES,
+    SCOPES_MODEL_AUTH_MODES,
     ModelConfig,
     ModelRegistry,
 )
@@ -87,6 +90,7 @@ def _seed_model_def(
     enabled: bool = True,
     auth_mode: str = "static",
     obo_audience: str = "",
+    obo_scopes: str = "",
     capabilities: str = "{}",
 ) -> None:
     """Insert a model definition row directly via the storage API."""
@@ -103,6 +107,7 @@ def _seed_model_def(
         created_by="admin",
         auth_mode=auth_mode,
         obo_audience=obo_audience,
+        obo_scopes=obo_scopes,
     )
 
 
@@ -956,6 +961,9 @@ def test_auth_constraints_serves_allowlist_and_profile(
     # Server-derived, so the shelf's mode affordances track the registry's
     # classification by data (the client hand-list is only a fail-open fallback).
     assert body["dynamic_auth_modes"] == sorted(DYNAMIC_MODEL_AUTH_MODES)
+    assert body["scopes_auth_modes"] == sorted(SCOPES_MODEL_AUTH_MODES)
+    assert body["app_identity_auth_modes"] == sorted(APP_IDENTITY_MODEL_AUTH_MODES)
+    assert body["auth_mode_profiles"] == dict(MODEL_AUTH_MODE_PROFILES)
 
 
 def test_auth_constraints_empty_allowlist_is_present_not_absent(
@@ -1546,12 +1554,72 @@ def test_entra_app_create_rejects_non_entra_profile(
     assert "RFC 8693" in resp.json()["error"]
 
 
-def test_entra_obo_allowed_on_rfc8693_profile(
+def test_entra_obo_create_rejects_rfc8693_profile(
+    storage: SQLiteBackend,
+) -> None:
+    """Every dynamic mode pairs with the profile whose dialect it names, so
+    the Entra-named delegated mode refuses a token-exchange deployment — and
+    the refusal names the mode that DOES fit it. Revises the pre-#955 ruling
+    that permitted the overload (the combination could never mint).
+    """
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+
+    resp = _dynamic_create(client, alias="gateway")
+
+    assert resp.status_code == 400, resp.text
+    assert "obo_grant_profile" in resp.json()["error"]
+    assert "rfc8693_obo" in resp.json()["error"]
+
+
+def test_rfc8693_obo_create_rejects_entra_profile(
+    storage: SQLiteBackend,
+) -> None:
+    """The pairing discriminates in both directions."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+
+    resp = _dynamic_create(client, alias="gateway", auth_mode="rfc8693_obo")
+
+    assert resp.status_code == 400, resp.text
+    assert "obo_grant_profile" in resp.json()["error"]
+    assert "entra_obo" in resp.json()["error"]
+
+
+def test_unmapped_dynamic_mode_is_refused_at_pair_choose(
     storage: SQLiteBackend,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The delegated leg is a refresh-token grant and works under either
-    profile — the pair above proves the check discriminates per mode.
+    """Fail-closed IN code, not by map absence: a dynamic mode nobody paired
+    draws its own 400 naming the remedy when a write CHOOSES it — the
+    registry drift test is only the belt.
+    """
+    from turnstone.console import server as server_module
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    # DYNAMIC_MODEL_AUTH_MODES stays intact — only the pairing map empties.
+    monkeypatch.setattr(server_module, "MODEL_AUTH_MODE_PROFILES", {})
+
+    resp = _dynamic_create(client)
+
+    assert resp.status_code == 400, resp.text
+    assert "grant-profile pairing" in resp.json()["error"]
+
+
+def test_rfc8693_obo_create_stores_scopes_on_matching_profile(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mode the pairing exists FOR: a token-exchange deployment accepts
+    rfc8693_obo and persists its exchange scopes.
     """
     _seed_model_def(storage, definition_id="m1", alias="local", model="m")
     client = _make_client(
@@ -1560,8 +1628,574 @@ def test_entra_obo_allowed_on_rfc8693_profile(
     client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
     _stub_console_mcp(monkeypatch)
 
-    resp = _dynamic_create(client, alias="gateway")
+    resp = _dynamic_create(
+        client, alias="gateway", auth_mode="rfc8693_obo", obo_scopes="aud-gw  openid"
+    )
+
     assert resp.status_code == 200, resp.text
+    row = storage.get_model_definition_by_alias("gateway")
+    assert row is not None
+    # Whitespace runs collapse at the write path, matching the registry
+    # normalizer, so the stored value is a stable mint-cache key component.
+    assert row["obo_scopes"] == "aud-gw openid"
+
+
+def test_base_url_edit_allowed_on_legacy_entra_obo_rfc8693_row(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row persisted under the pre-pairing overload keeps accepting
+    same-pair edits: the pairing lives in the posture tier, which only a
+    pair change or re-arm reaches.
+    """
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="entra_obo",
+        obo_audience="api://approved",
+    )
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"base_url": "https://other.example/v1"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_model_definition("m1")["base_url"] == "https://other.example/v1"
+
+
+def test_create_rejects_scopes_on_non_exchange_mode(storage: SQLiteBackend) -> None:
+    """The scopes staging guard, create side: a mode that never reads scopes
+    must not store them for a later flip to inherit. Request-shape, so even
+    full permissions draw the 400.
+    """
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+
+    resp = _dynamic_create(client, alias="gateway", obo_scopes="aud-gw")
+
+    assert resp.status_code == 400, resp.text
+    assert "obo_scopes" in resp.json()["error"]
+
+
+def test_update_rejects_new_scopes_on_static_row(storage: SQLiteBackend) -> None:
+    """Update side of the scopes staging guard, on the row class where no
+    escalation gate would otherwise run: a static row plus a new scopes value
+    is refused outright rather than parked.
+    """
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"obo_scopes": "aud-gw"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "obo_scopes" in resp.json()["error"]
+    assert storage.get_model_definition("m1")["obo_scopes"] == ""
+
+
+def test_create_rejects_over_length_scopes(storage: SQLiteBackend) -> None:
+    """Over-length scopes REFUSE rather than truncate: a silently shortened
+    list changes what the exchange leg requests. (The audience keeps its
+    truncate posture — allow-list membership backstops it; scopes have no
+    such list.) The bound measures the CLEANED value — what would actually
+    be stored — and on the create twin there is no stored residue to echo,
+    so a changed over-length value always refuses.
+    """
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+
+    resp = _dynamic_create(client, alias="gateway", auth_mode="rfc8693_obo", obo_scopes="s" * 2100)
+
+    assert resp.status_code == 400, resp.text
+    assert "exceeds" in resp.json()["error"]
+    assert storage.get_model_definition_by_alias("gateway") is None
+
+
+def test_update_rejects_over_length_scopes(storage: SQLiteBackend) -> None:
+    """Update side of the over-length refusal: a CHANGED over-length value
+    (here: the row stores short scopes) is refused, measured on the cleaned
+    form, and the stored value survives. An over-length ECHO of the row's
+    own residue is the one non-refusing case — see the residue pins below.
+    """
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://approved",
+        obo_scopes="aud-gw",
+    )
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"obo_scopes": "s" * 2100},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "exceeds" in resp.json()["error"]
+    assert storage.get_model_definition("m1")["obo_scopes"] == "aud-gw"
+
+
+def test_over_length_scopes_residue_row_still_disarms(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB-direct row carrying over-cap scopes residue still disarms via the
+    full form echoing its own residue: the echo parses as unchanged (the
+    column is omitted, the server preserves the stored value), so the
+    pure-disable carve-out is reachable instead of the over-length refusal
+    firing before the gate ever saw the disarm.
+    """
+    residue = "s" * 2100
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://approved",
+        obo_scopes=residue,
+    )
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={
+            "enabled": False,
+            "auth_mode": "rfc8693_obo",
+            "obo_audience": "api://approved",
+            "obo_scopes": residue,
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    row = storage.get_model_definition("m1")
+    assert not row["enabled"]
+    assert row["obo_scopes"] == residue
+
+
+def test_over_length_scopes_residue_row_resaves_unrelated_field(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same echo rule keeps a residue row editable at all: a
+    tuning-field save whose full form re-sends the stored over-cap scopes
+    lands, and the stored value survives byte-identical.
+    """
+    residue = "s" * 2100
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://approved",
+        obo_scopes=residue,
+    )
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"temperature": 0.5, "obo_scopes": residue},
+    )
+
+    assert resp.status_code == 200, resp.text
+    row = storage.get_model_definition("m1")
+    assert row["temperature"] == 0.5
+    assert row["obo_scopes"] == residue
+
+
+def test_over_length_paste_that_cleans_under_cap_is_accepted(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bound measures the CLEANED value: a paste whose raw length only
+    exceeds the cap because of control bytes the sanitize strips (terminal
+    escapes riding a copy-paste) stores its cleaned form instead of drawing
+    the over-length refusal against characters that were never stored.
+    """
+    # Built programmatically: 20 blocks of 102 'x's + ESC = 2060 raw chars,
+    # cleaning to 2040 — over the cap raw, under it cleaned.
+    raw = ("x" * 102 + chr(27)) * 20
+    cleaned = raw.replace(chr(27), "")
+    assert len(raw) > 2048
+    assert len(cleaned) <= 2048
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    _stub_console_mcp(monkeypatch)
+
+    resp = _dynamic_create(client, alias="gateway", auth_mode="rfc8693_obo", obo_scopes=raw)
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_model_definition_by_alias("gateway")["obo_scopes"] == cleaned
+
+
+def test_over_cap_residue_capped_rewrite_is_auth_gated(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The capped SPELLING of over-cap DB-direct residue is a real value
+    change: writing it flips a registry-refused row into a loadable,
+    mintable one, so it takes the full escalation gate — never the
+    unchanged-resave fast path. The gate's stored-side baseline is the
+    UNCAPPED sanitize, so over-cap residue never compares equal to any
+    storable submission.
+    """
+    from turnstone.core.mcp_oauth import model_obo_cache_server
+
+    residue = "s" * 2100
+    capped = "s" * 2048
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://approved",
+        obo_scopes=residue,
+    )
+    # admin.models alone: the write is auth-gated, refused, and unwritten.
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put("/v1/api/admin/model-definitions/m1", json={"obo_scopes": capped})
+
+    assert resp.status_code == 403, resp.text
+    assert storage.get_model_definition("m1")["obo_scopes"] == residue
+
+    # With admin.mcp the same write passes the gate, lands, and purges the
+    # alias's mint-cache rows like any other scopes change.
+    own_key = model_obo_cache_server("local")
+    _seed_mint_cache_row(storage, "alice", own_key)
+    gated = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    gated.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+
+    resp = gated.put("/v1/api/admin/model-definitions/m1", json={"obo_scopes": capped})
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_model_definition("m1")["obo_scopes"] == capped
+    assert storage.get_mcp_user_token("alice", own_key) is None
+
+
+def _seed_mint_cache_row(storage: SQLiteBackend, user: str, key: str) -> None:
+    storage.create_mcp_user_token(
+        user,
+        key,
+        access_token_ct=b"ct",
+        refresh_token_ct=None,
+        expires_at=None,
+        scopes="",
+        as_issuer="https://issuer.example",
+        audience="api://approved",
+    )
+
+
+def test_scopes_change_purges_the_alias_rows_never_a_siblings(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scope change purges the definition's OWN identity-keyed rows —
+    BOTH synthetic prefixes — and can never touch a sibling definition's
+    rows: the key carries the owning alias, so admin lifecycle on one
+    definition is invisible to every other (the shared-key over-delete
+    class is structurally closed).
+    """
+    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://approved",
+        obo_scopes="aud-gw",
+    )
+    own_obo = model_obo_cache_server("local")
+    own_app = model_app_cache_server("local")
+    sibling = model_obo_cache_server("sibling")
+    for key in (own_obo, own_app, sibling):
+        _seed_mint_cache_row(storage, "alice", key)
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"obo_scopes": "aud-gw openid"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_mcp_user_token("alice", own_obo) is None
+    assert storage.get_mcp_user_token("alice", own_app) is None
+    assert storage.get_mcp_user_token("alice", sibling) is not None
+
+
+def test_alias_rename_purges_the_old_alias_rows(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rename orphans the OLD alias's identity keys outright — nothing
+    would ever read or overwrite them again — so the update purges them,
+    exactly as the MCP update purges rows keyed on a renamed server name.
+    """
+    from turnstone.core.mcp_oauth import model_obo_cache_server
+
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://approved",
+        obo_scopes="aud-gw",
+    )
+    old_key = model_obo_cache_server("local")
+    _seed_mint_cache_row(storage, "alice", old_key)
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put("/v1/api/admin/model-definitions/m1", json={"alias": "renamed"})
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_mcp_user_token("alice", old_key) is None
+
+
+def test_delete_purges_mint_cache_rows(
+    storage: SQLiteBackend,
+) -> None:
+    """Deleting a definition purges its identity-keyed mint-cache rows —
+    both prefixes — before the row goes away, like the MCP delete purges
+    its server-name rows; a sibling definition's rows survive."""
+    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://approved",
+        obo_scopes="aud-gw",
+    )
+    own_obo = model_obo_cache_server("local")
+    own_app = model_app_cache_server("local")
+    sibling = model_obo_cache_server("sibling")
+    for key in (own_obo, own_app, sibling):
+        _seed_mint_cache_row(storage, "alice", key)
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.delete("/v1/api/admin/model-definitions/m1")
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_mcp_user_token("alice", own_obo) is None
+    assert storage.get_mcp_user_token("alice", own_app) is None
+    assert storage.get_mcp_user_token("alice", sibling) is not None
+
+
+def test_purge_partial_failure_still_purges_the_other_prefix(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The both-prefixes contract holds under partial storage failure: a
+    transient error deleting one prefix's rows must not abort the other's
+    delete (each prefix purges in its own best-effort arm).
+    """
+    from turnstone.console.server import _purge_model_mint_cache
+    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+
+    obo_key = model_obo_cache_server("local")
+    app_key = model_app_cache_server("local")
+    for key in (obo_key, app_key):
+        _seed_mint_cache_row(storage, "alice", key)
+    real_delete = storage.delete_mcp_oauth_rows_by_server_name
+
+    def flaky(server_name: str) -> int:
+        if server_name == obo_key:
+            raise RuntimeError("transient storage error")
+        return real_delete(server_name)
+
+    monkeypatch.setattr(storage, "delete_mcp_oauth_rows_by_server_name", flaky)
+
+    _purge_model_mint_cache(storage, "m1", "local")
+
+    assert storage.get_mcp_user_token("alice", obo_key) is not None
+    assert storage.get_mcp_user_token("alice", app_key) is None
+
+
+def test_mode_flip_away_keeps_unchanged_scopes_residue(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flipping an exchange-mode row to entra_obo with the full form re-sending
+    its stored scopes is not a staging violation (VALUE CHANGE only), so the
+    flip lands and the residue stays inert — while a DIFFERENT value on the
+    now-non-exchange row is refused.
+    """
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://approved",
+        obo_scopes="aud-gw",
+    )
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    _stub_console_mcp(monkeypatch)
+
+    flip = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={
+            "auth_mode": "entra_obo",
+            "obo_audience": "api://approved",
+            "obo_scopes": "aud-gw",
+        },
+    )
+    assert flip.status_code == 200, flip.text
+    assert storage.get_model_definition("m1")["obo_scopes"] == "aud-gw"
+
+    changed = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"obo_scopes": "aud-other"},
+    )
+    assert changed.status_code == 400, changed.text
+    assert storage.get_model_definition("m1")["obo_scopes"] == "aud-gw"
+
+
+def test_create_normalizes_tab_separated_scopes(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whitespace separators collapse BEFORE control-char cleaning, so a
+    pasted tab-separated scope list stores as distinct scopes — cleaning
+    first would delete the tab and CONCATENATE them into one bogus scope
+    the IdP refuses.
+    """
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(
+        storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
+    )
+    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    _stub_console_mcp(monkeypatch)
+
+    resp = _dynamic_create(
+        client, alias="gateway", auth_mode="rfc8693_obo", obo_scopes="aud-gw\topenid"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_model_definition_by_alias("gateway")["obo_scopes"] == "aud-gw openid"
+
+
+def test_raw_stored_scopes_residue_resave_and_disarm_stay_open(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB-direct stored scopes value with interior whitespace runs compares
+    equal to its own collapsed full-form re-save — both sides go through the
+    one normalizer — so neither the ordinary re-save nor the admin.models
+    disarm misreads residue as a staged change.
+    """
+    for definition_id, alias in (("m1", "local"), ("m2", "other")):
+        _seed_model_def(
+            storage,
+            definition_id=definition_id,
+            alias=alias,
+            model="m",
+            auth_mode="entra_obo",
+            obo_audience="api://approved",
+            obo_scopes="aud-gw   openid",
+        )
+    _stub_console_mcp(monkeypatch)
+
+    resave_client = _make_client(
+        storage,
+        _make_registry(alias="local", model="m", extras={"other": "m"}),
+        perms="admin.models,admin.mcp",
+    )
+    resave = resave_client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={
+            "auth_mode": "entra_obo",
+            "obo_audience": "api://approved",
+            "obo_scopes": "aud-gw openid",
+        },
+    )
+    assert resave.status_code == 200, resave.text
+
+    disarm_client = _make_client(
+        storage, _make_registry(alias="local", model="m", extras={"other": "m"})
+    )
+    disarm = disarm_client.put(
+        "/v1/api/admin/model-definitions/m2",
+        json={"enabled": False, "obo_scopes": "aud-gw openid"},
+    )
+    assert disarm.status_code == 200, disarm.text
+    assert storage.get_model_definition("m2")["enabled"] is False
+
+
+def test_pure_disable_with_stored_scopes_stays_carved_out(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stored scopes never block de-escalation: the lone enabled-off submit on
+    an exchange-mode row is still the pure-disable carve-out (admin.models,
+    no validator).
+    """
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://approved",
+        obo_scopes="aud-gw",
+    )
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    _stub_console_mcp(monkeypatch)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"enabled": False},
+    )
+
+    assert resp.status_code == 200, resp.text
+    row = storage.get_model_definition("m1")
+    assert row["enabled"] is False and row["obo_scopes"] == "aud-gw"
 
 
 def test_unchanged_dynamic_auth_fields_do_not_require_admin_mcp(
@@ -1978,6 +2612,38 @@ def test_keyless_reenable_of_dynamic_row_returns_503(
     # Same remediation the create twin's refusal and the boot guard carry.
     assert "mcp_token_encryption" in resp.json()["error"]
     assert not storage.get_model_definition("m1")["enabled"]
+
+
+def test_legacy_cross_profile_row_reenables_unchanged(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pairing is a pair-CHOOSE rule: a row persisted under the other grant
+    dialect disables AND re-enables untouched — re-arming keeps the row's
+    standing, and its mint refuses at runtime with grant_profile_mismatch
+    (fallback-eligible by ruling) rather than the shelf holding it hostage.
+    """
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="gw",
+        model="m",
+        auth_mode="entra_obo",
+        obo_audience="api://approved",
+    )
+    client = _make_client(
+        storage, _make_registry(alias="gw", model="m"), perms="admin.models,admin.mcp"
+    )
+    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    _stub_console_mcp(monkeypatch)
+
+    off = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": False})
+    assert off.status_code == 200, off.text
+    assert not storage.get_model_definition("m1")["enabled"]
+
+    on = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": True})
+    assert on.status_code == 200, on.text
+    assert storage.get_model_definition("m1")["enabled"]
 
 
 def test_keyless_pure_disable_still_succeeds(storage: SQLiteBackend) -> None:
@@ -3034,6 +3700,7 @@ def test_model_definition_schema_auth_classification(storage: SQLiteBackend) -> 
         "enabled",
         "auth_mode",
         "obo_audience",
+        "obo_scopes",
     } == MODEL_DEFINITION_MUTABLE - MODEL_AUTH_NEUTRAL_FIELDS
 
 
@@ -3067,6 +3734,7 @@ def test_every_mutable_column_probes_its_classification(
         "replay_reasoning_to_model": True,
         "auth_mode": "entra_app",
         "obo_audience": "api://other",
+        "obo_scopes": "aud-gw openid",
     }
     assert set(probes) == set(MODEL_DEFINITION_MUTABLE), (
         "a mutable column has no probe value — add one so its classification "
@@ -3082,7 +3750,10 @@ def test_every_mutable_column_probes_its_classification(
             alias=f"gw-{column}",
             model="m",
             enabled=(column != "enabled"),
-            auth_mode="entra_obo",
+            # The scopes probe seeds the one mode that accepts a scopes
+            # value, so the 403 (permission enforced) is what the probe
+            # observes rather than the earlier staging-shape 400.
+            auth_mode="rfc8693_obo" if column == "obo_scopes" else "entra_obo",
             obo_audience="api://approved",
         )
         client = _make_client(storage, _make_registry(alias=f"gw-{column}", model="m"))

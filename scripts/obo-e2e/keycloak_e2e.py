@@ -17,25 +17,18 @@ Checks E1–E7 mirror the Entra harness:
   E6 unconsented audience C → NOT token, credential SURVIVES
   E7 cache flush → re-mint
 
-M1/M2 drive the MODEL-backend mint (``mint_obo_access_token``, issue #898) on
-the same captured credential — the path an ``auth_mode=entra_obo`` model alias
-takes, distinct from the classified MCP path above:
-  M1 model mint audience A → token carries A. Currently KNOWN-GAP on KC 26
-     standard token exchange (issue #955: model definitions carry no per-row
-     scopes, so the exchange leg sends none and KC refuses the audience) —
-     accepted ONLY on the exact gap signature: kc_calls == 2 AND E1
-     VERIFIED AND the exchange-leg refusal the mint swallows (captured via
-     a module-logger hook) carries the IdP's documented no-scope refusal
-     text. A None with any other signature — including a 2-call refusal
-     with different IdP error text (malformed exchange request) — is a
-     mint-path regression and FAILS the run
-  M2 warm re-mint serves the synthetic ``__model_obo__`` cache row with zero
-     IdP calls (KNOWN-GAP while blocked behind an M1 KNOWN-GAP, FAILED
-     behind an M1 failure)
-
-A KNOWN-GAP status counts as a passing run (exit 0): it marks a documented
-frontier, scoped to its exact signature so a regression cannot hide under it;
-the #955 fix flips those legs back to hard VERIFIED/FAILED checks.
+M1-M3 drive the MODEL-backend mint (``mint_obo_access_token``, #898/#955) on
+the same captured credential — the path an ``auth_mode=rfc8693_obo`` model
+alias takes, distinct from the classified MCP path above:
+  M1 model mint audience A with the alias's exchange scopes → token carries A
+     (the #955 fix: model definitions now carry per-row ``obo_scopes``, so
+     the exchange leg requests the audience's scope exactly as MCP rows do)
+  M2 warm re-mint serves the synthetic ``__model_obo__`` cache row —
+     identity-keyed on the owning alias, audience + scopes in the row's
+     own columns — with zero IdP calls
+  M3 an entra-leg mode (``entra_obo``) on this rfc8693 deployment refuses
+     BEFORE any IdP traffic, recording cause=grant_profile_mismatch — the
+     mode/profile pairing that replaced the pre-#955 overload
 
 Env (set by keycloak_e2e.sh):
   KC_TOKEN_ENDPOINT, KC_ISSUER, KC_CLIENT_ID, KC_CLIENT_SECRET,
@@ -55,16 +48,17 @@ from typing import Any
 
 import httpx
 
-from turnstone.core import mcp_oauth as mcp_oauth_module
 from turnstone.core.mcp_crypto import (
     MCPTokenCipher,
     MCPTokenCipherConfig,
     MCPTokenStore,
 )
 from turnstone.core.mcp_oauth import (
-    MODEL_OBO_CACHE_PREFIX,
     get_obo_access_token_classified,
     mint_obo_access_token,
+    model_mint_refusal_cause,
+    model_obo_cache_server,
+    model_obo_cause_key,
 )
 from turnstone.core.oidc import OIDCConfig
 from turnstone.core.storage._sqlite import SQLiteBackend
@@ -104,39 +98,6 @@ class _CountingClient:
     async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
         self.posts += 1
         return await self._inner.post(*args, **kwargs)
-
-
-# The IdP text of the #955 refusal: KC 26 standard token exchange rejecting
-# an audience requested with no scope. Live-verified on the MCP leg (the
-# comment beside the exchange builder in core/mcp_oauth.py records it); the
-# model leg builds the identical exchange request minus the scope param, so
-# the same error_description is expected — a live run must confirm the model
-# leg's captured text matches before this narrowing is called proven.
-_KNOWN_GAP_REFUSAL_TEXT = "requested audience not available"
-
-
-class _MintFailureLogHook:
-    """Capture the exchange-leg refusal text ``mint_obo_access_token`` swallows.
-
-    The mint catches ``MCPOAuthRefreshFailed`` and returns ``None``, so the
-    None the harness sees carries no cause. Wrapping the module logger
-    recovers it without touching the production mint: the log call happens
-    INSIDE the except block, so ``sys.exc_info()`` still holds the live
-    exception there.
-    """
-
-    def __init__(self, inner: Any) -> None:
-        self.inner = inner
-        self.mint_failures: list[str] = []
-
-    def warning(self, event: Any, *args: Any, **kwargs: Any) -> Any:
-        if event == "model_obo.mint_failed":
-            exc = sys.exc_info()[1]
-            self.mint_failures.append(str(exc) if exc is not None else "")
-        return self.inner.warning(event, *args, **kwargs)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.inner, name)
 
 
 def _password_login(cfg: dict[str, str]) -> str:
@@ -219,12 +180,8 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
             ok, aud = aud_carries(r.token, cfg["AUD_A"])
             row = storage.get_mcp_user_token(USER, "kc-a")
             cache_ok = row is not None and row["refresh_token_ct"] is None
-            # A local, so M1's KNOWN-GAP signature consumes it directly
-            # instead of re-scanning RESULTS message prefixes, which a
-            # relabel would silently flip.
-            e1_status = "VERIFIED" if ok and cache_ok else "FAILED"
             record(
-                e1_status,
+                "VERIFIED" if ok and cache_ok else "FAILED",
                 f"E1 mint A (refresh→exchange): kind=token aud={aud} want={cfg['AUD_A']} "
                 f"cache_row_refreshless={cache_ok}",
             )
@@ -298,71 +255,51 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
             f"E7 flush→re-mint: kind={r7.kind} kc_calls={client.posts - posts_before} (want >=1)",
         )
 
-        # M1/M2 — MODEL backend mint (#898) on the rfc8693 profile: same
-        # captured credential and legs, but through mint_obo_access_token,
-        # the path an auth_mode=entra_obo alias takes. entra_obo is allowed
-        # under either grant profile (only entra_app is entra-only), and this
-        # is the one place that combination runs against a real IdP.
+        # M1-M3 — MODEL backend mint on the rfc8693 profile: same captured
+        # credential and legs as E1-E7, but through mint_obo_access_token —
+        # the path an auth_mode=rfc8693_obo alias takes, carrying the
+        # per-alias exchange scopes MCP rows always had (#955). The mint's
+        # cache and cause records are identity-keyed on the owning alias, so
+        # the harness names one per mode-variant exactly as a deployment
+        # would define separate rows.
         posts_before = client.posts
-        log_hook = _MintFailureLogHook(mcp_oauth_module.log)
-        mcp_oauth_module.log = log_hook  # type: ignore[assignment]
-        try:
-            m1 = await mint_obo_access_token(
-                app_state=app_state, user_id=USER, audience=cfg["AUD_A"]
-            )
-        finally:
-            mcp_oauth_module.log = log_hook.inner
+        m1 = await mint_obo_access_token(
+            app_state=app_state,
+            user_id=USER,
+            alias="model-a",
+            audience=cfg["AUD_A"],
+            scopes=cfg.get("SCOPE_A", ""),
+            grant_leg="rfc8693",
+        )
         m1_kc_calls = client.posts - posts_before
-        m1_refusal = " | ".join(log_hook.mint_failures)
-        m1_refusal_matches = _KNOWN_GAP_REFUSAL_TEXT in m1_refusal.lower()
-        ok1, why1 = aud_carries(m1, cfg["AUD_A"]) if m1 else (False, "no token")
-        e1_verified = e1_status == "VERIFIED"
         if m1:
-            m1_status = "VERIFIED" if ok1 and m1_kc_calls > 0 else "FAILED"
+            ok1, why1 = aud_carries(m1, cfg["AUD_A"])
             record(
-                m1_status,
-                f"M1 model mint (rfc8693): token={redact(m1)} aud_ok={ok1} ({why1}) "
-                f"kc_calls={m1_kc_calls} (want >=1)",
-            )
-        elif m1_kc_calls == 2 and e1_verified and m1_refusal_matches:
-            # #955's exact signature, nothing broader: both mint legs ran
-            # against the live IdP (refresh grant + token exchange = 2 KC
-            # calls), E1 VERIFIED proves the shared legs are healthy, AND the
-            # swallowed exchange-leg error carries the IdP's documented
-            # no-scope refusal text. The TEXT check is what separates the
-            # documented gap from a mint-side exchange regression with the
-            # same call count (wrong audience parameter, dropped subject
-            # token, bad grant_type all also draw a 2-call refusal). The #955
-            # fix flips this branch back to a hard VERIFIED/FAILED check.
-            m1_status = "KNOWN-GAP"
-            record(
-                m1_status,
-                "M1 model mint (rfc8693): no scope wire-through for model "
-                f"aliases — see issue #955 (kc_calls={m1_kc_calls}, refusal "
-                f"text matched {_KNOWN_GAP_REFUSAL_TEXT!r})",
+                "VERIFIED" if ok1 and m1_kc_calls > 0 else "FAILED",
+                f"M1 model mint (rfc8693_obo, scoped exchange): token={redact(m1)} "
+                f"aud_ok={ok1} ({why1}) kc_calls={m1_kc_calls} (want >=1)",
             )
         else:
-            # None with any OTHER signature (no KC traffic, a single leg,
-            # unhealthy shared legs, or a 2-call refusal whose IdP error text
-            # is NOT the documented no-scope refusal) is a regression in or
-            # upstream of the mint, and must fail the run rather than wear
-            # the KNOWN-GAP label.
-            m1_status = "FAILED"
             record(
-                m1_status,
-                "M1 model mint (rfc8693): no token and the failure signature "
-                f"does not match the #955 gap (kc_calls={m1_kc_calls}, want 2 "
-                f"with E1 VERIFIED; e1_verified={e1_verified}; "
-                f"refusal_text_matched={m1_refusal_matches} "
-                f"captured={m1_refusal[:300]!r}) — mint-path regression, not "
-                "the no-scope exchange refusal",
+                "FAILED",
+                f"M1 model mint (rfc8693_obo): no token (kc_calls={m1_kc_calls}) — "
+                "the #955 scope wire-through should mint here",
             )
 
-        # M2 — warm re-mint serves the synthetic __model_obo__ cache row with
-        # zero IdP calls, and the row is named so deprovisioning can find it.
+        # M2 — warm re-mint serves the synthetic __model_obo__ cache row —
+        # identity-keyed on the owning alias, audience + scopes in the row's
+        # own columns — with zero IdP calls, and the row is named so
+        # deprovisioning can find it by prefix.
         posts_before = client.posts
-        m2 = await mint_obo_access_token(app_state=app_state, user_id=USER, audience=cfg["AUD_A"])
-        cache_row = storage.get_mcp_user_token(USER, f"{MODEL_OBO_CACHE_PREFIX}{cfg['AUD_A']}")
+        m2 = await mint_obo_access_token(
+            app_state=app_state,
+            user_id=USER,
+            alias="model-a",
+            audience=cfg["AUD_A"],
+            scopes=cfg.get("SCOPE_A", ""),
+            grant_leg="rfc8693",
+        )
+        cache_row = storage.get_mcp_user_token(USER, model_obo_cache_server("model-a"))
         if m1:
             record(
                 "VERIFIED"
@@ -373,12 +310,31 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
                 f"{'present' if cache_row is not None else 'MISSING'}",
             )
         else:
-            # Blocked behind M1: inherit its classification, so a FAILED M1
-            # cannot launder its downstream leg into a KNOWN-GAP pass.
-            if m1_status == "KNOWN-GAP":
-                record("KNOWN-GAP", "M2 model cache-hit: blocked behind M1 — see issue #955")
-            else:
-                record("FAILED", "M2 model cache-hit: blocked behind M1 — M1 failed, see above")
+            record("FAILED", "M2 model cache-hit: blocked behind M1 — M1 failed, see above")
+
+        # M3 — the mode/profile pairing refusal that replaced the pre-#955
+        # overload: an entra-leg mode on this rfc8693 deployment must yield
+        # None with ZERO IdP calls and record the grant_profile_mismatch
+        # cause the session heartbeat reads (under its own alias — a
+        # deployment defines the entra-mode variant as its own row).
+        posts_before = client.posts
+        m3 = await mint_obo_access_token(
+            app_state=app_state,
+            user_id=USER,
+            alias="model-a-entra",
+            audience=cfg["AUD_A"],
+            grant_leg="entra",
+        )
+        m3_cause = model_mint_refusal_cause(
+            "model_obo", model_obo_cause_key("model-a-entra", grant_leg="entra"), USER
+        )
+        record(
+            "VERIFIED"
+            if m3 is None and client.posts == posts_before and m3_cause == "grant_profile_mismatch"
+            else "FAILED",
+            f"M3 mode/profile mismatch refusal: token={redact(m3)} (want absent) "
+            f"kc_calls={client.posts - posts_before} (want 0) cause={m3_cause!r}",
+        )
     finally:
         await inner.aclose()
 
@@ -408,7 +364,7 @@ def main() -> int:
     print("\n=== summary ===")
     for status, msg in RESULTS:
         print(f"  {status:>8}  {msg}")
-    return 0 if all(s in ("VERIFIED", "SKIPPED", "KNOWN-GAP") for s, _ in RESULTS) else 1
+    return 0 if all(s in ("VERIFIED", "SKIPPED") for s, _ in RESULTS) else 1
 
 
 if __name__ == "__main__":

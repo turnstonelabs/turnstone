@@ -23,6 +23,7 @@ from turnstone.core.model_registry import ModelConfig, ModelRegistry
 from turnstone.server import (
     _collect_node_models_metadata,
     _publish_models_metadata,
+    internal_model_status,
 )
 
 
@@ -123,6 +124,29 @@ def test_alias_with_no_tracker_yet_defaults_to_healthy():
     state = SimpleNamespace(registry=reg, health_registry=health_reg)
     rows = json.loads(_collect_node_models_metadata(state)[1])
     assert rows[0]["healthy"] is True
+
+
+def test_model_status_route_carries_backend_auth_fields():
+    """The node model-status payload serves the per-alias backend-auth
+    trio (mode, audience, scopes) — the console's model shelf and the
+    cluster status view read them from THIS route, so dropping a field
+    here silently blanks the admin surface."""
+    cfg = ModelConfig(
+        alias="gw",
+        base_url="http://gw/v1",
+        api_key="",
+        model="m",
+        auth_mode="rfc8693_obo",
+        obo_audience="api://gw",
+        obo_scopes="aud-gw openid",
+    )
+    reg = ModelRegistry(models={"gw": cfg}, default="gw")
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(registry=reg)))
+    body = json.loads(internal_model_status(request).body)
+    entry = body["models"]["gw"]
+    assert entry["auth_mode"] == "rfc8693_obo"
+    assert entry["obo_audience"] == "api://gw"
+    assert entry["obo_scopes"] == "aud-gw openid"
 
 
 # ---------------------------------------------------------------------------

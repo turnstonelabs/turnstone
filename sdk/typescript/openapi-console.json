@@ -10932,6 +10932,11 @@
             "title": "Obo Audience",
             "type": "string"
           },
+          "obo_scopes": {
+            "default": "",
+            "title": "Obo Scopes",
+            "type": "string"
+          },
           "source": {
             "default": "",
             "title": "Source",
@@ -11060,6 +11065,11 @@
           "obo_audience": {
             "default": "",
             "title": "Obo Audience",
+            "type": "string"
+          },
+          "obo_scopes": {
+            "default": "",
+            "title": "Obo Scopes",
             "type": "string"
           },
           "source": {
@@ -11191,6 +11201,11 @@
           "obo_audience": {
             "default": "",
             "title": "Obo Audience",
+            "type": "string"
+          },
+          "obo_scopes": {
+            "default": "",
+            "title": "Obo Scopes",
             "type": "string"
           }
         },
@@ -11377,6 +11392,18 @@
             ],
             "default": null,
             "title": "Obo Audience"
+          },
+          "obo_scopes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Obo Scopes"
           }
         },
         "title": "UpdateModelDefinitionRequest",
@@ -11416,7 +11443,7 @@
             "type": "array"
           },
           "auth_grant_profile": {
-            "description": "Deployment [oidc] obo_grant_profile, or empty when single sign-on is not configured. entra_app requires 'entra'; entra_obo works under either profile. A transient discovery outage reports the configured profile, not empty.",
+            "description": "Deployment [oidc] obo_grant_profile, or empty when single sign-on is not configured. Each dynamic auth_mode pairs with exactly one profile (see auth_mode_profiles); the write validator refuses a new pairing that contradicts it. A transient discovery outage reports the configured profile, not empty.",
             "title": "Auth Grant Profile",
             "type": "string"
           },
@@ -11427,12 +11454,39 @@
             },
             "title": "Dynamic Auth Modes",
             "type": "array"
+          },
+          "scopes_auth_modes": {
+            "description": "auth_mode values whose mint reads obo_scopes (the token-exchange scope request), same server-derived contract as dynamic_auth_modes; drives the scopes input's visibility.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes Auth Modes",
+            "type": "array"
+          },
+          "app_identity_auth_modes": {
+            "description": "auth_mode values that mint a shared app/deployment identity rather than a per-user one, same server-derived contract as dynamic_auth_modes; drives the model list's auth badge wording.",
+            "items": {
+              "type": "string"
+            },
+            "title": "App Identity Auth Modes",
+            "type": "array"
+          },
+          "auth_mode_profiles": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Required [oidc] obo_grant_profile per dynamic auth_mode. Affordance for greying options that cannot validate under this deployment's profile; the write validator remains the authority.",
+            "title": "Auth Mode Profiles",
+            "type": "object"
           }
         },
         "required": [
           "auth_audience_allowlist",
           "auth_grant_profile",
-          "dynamic_auth_modes"
+          "dynamic_auth_modes",
+          "scopes_auth_modes",
+          "app_identity_auth_modes",
+          "auth_mode_profiles"
         ],
         "title": "ModelAuthConstraintsResponse",
         "type": "object"
