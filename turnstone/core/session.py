@@ -5304,10 +5304,14 @@ class ChatSession:
         # Frames only — ``exc_info=True`` would render the raw exception
         # message, which can carry credentials verbatim (the sanitize floor
         # the lines above exist to hold); format_tb renders the stack
-        # without the message.
+        # without the message.  ws + error_type mirror the ERROR line so a
+        # trace correlates to its session.fatal.recorded event under
+        # concurrent sessions.
         if exc.__traceback__ is not None:
             log.debug(
                 "session.fatal.recorded.trace",
+                ws=self._ws_id,
+                error_type=type(exc).__name__,
                 trace="".join(traceback.format_tb(exc.__traceback__)),
             )
         try:
