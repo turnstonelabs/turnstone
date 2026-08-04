@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import dataclasses
 import difflib
 import functools
 import hashlib
@@ -1894,11 +1895,15 @@ class ChatSession:
         # the model detached on purpose.  close() reaps everything.
         self._background_shells = BackgroundShellRegistry(on_exit=self._on_background_shell_exit)
         self._cancelled_partial_msg: dict[str, Any] | None = None
-        # The most recent dead attempt's flushed content, stashed by
-        # _stream_attempt's non-cancel death arm so the resilient wrapper
-        # can preserve it when a cancel lands in the retry window (a Stop
-        # during backoff must not vaporize text the user already saw).
-        self._midstream_dead_partial: str = ""
+        # The provider that created the LIVE stream (primary or fallback) —
+        # the mid-stream retry gate consults ITS retryable set, and the
+        # fatal formatter labels errors with it.  Best-effort under
+        # supersede races; None falls back to the primary binding.
+        self._active_stream_provider: LLMProvider | None = None
+        # The wire-message fold the live stream was actually created from —
+        # a mid-retry rebind re-prepares it, and send()'s token-table
+        # calibration must count the fold the provider counted.
+        self._active_wire_msgs: list[dict[str, Any]] | None = None
         self._pending_retry: str | None = None
         # True when a fatal exception's text has been persisted to
         # workstream_config["last_error"] for the coord's inspect/wait
@@ -5454,7 +5459,12 @@ class ChatSession:
             log.debug("session.fatal.base_url_lookup_failed", exc_info=True)
         provider_label = "?"
         try:
-            prov = self._provider
+            # Prefer the provider that actually owned the live stream — a
+            # fallback-carried turn's failure must not be labeled with the
+            # primary binding it never touched.  getattr: this helper is
+            # bound to lightweight stubs in tests (see the module-scope
+            # note on the _BACKEND_* sets) that predate the field.
+            prov = getattr(self, "_active_stream_provider", None) or self._provider
             provider_label = (
                 getattr(prov, "provider_name", None) or type(prov).__name__ if prov else "?"
             )
@@ -5944,6 +5954,12 @@ class ChatSession:
         for attempt in range(self._MAX_RETRIES + 1):
             self._check_cancelled()
             self._cancel_ref.clear()  # discard stale handle from prior attempt
+            # The provider about to own the live stream — read by the
+            # mid-stream retry gate (retryable-set membership) and the
+            # fatal formatter's label.  Written here so the fallback walk
+            # (which routes through this method with provider=fb_provider)
+            # is covered by construction.
+            self._active_stream_provider = prov
             try:
                 return prov.create_streaming(
                     client=client,
@@ -6844,11 +6860,31 @@ class ChatSession:
                             # site already guards.
                             self._compact_messages(auto=True, my_generation=my_generation)
                             msgs = self._prepare_wire_messages(self._full_messages())
-                            self.ui.on_thinking_start()
-                            assistant_msg = self._stream_response(msgs, my_generation)
                         except Exception:
+                            # RECOVERY-machinery failure: the overflow error
+                            # is still the actionable one, and its wording
+                            # already anticipates this case ("compaction
+                            # could not reduce it enough").
                             log.warning(
                                 "Compact-and-retry failed, raising original error",
+                                exc_info=True,
+                            )
+                            raise ctx_err from None
+                        self.ui.on_thinking_start()
+                        try:
+                            assistant_msg = self._stream_response(msgs, my_generation)
+                        except Exception as retry_err:
+                            if not _is_ctx_overflow(retry_err):
+                                # A post-compaction failure that is NOT a
+                                # recurring overflow surfaces as ITSELF
+                                # (implicitly chained to ctx_err): masking
+                                # a dead wire or bad credentials behind
+                                # "Context window exceeded" sends the
+                                # operator to shrink a conversation that
+                                # already compacted fine.
+                                raise
+                            log.warning(
+                                "Compact-and-retry re-overflowed, raising original error",
                                 exc_info=True,
                             )
                             raise ctx_err from None
@@ -6869,7 +6905,11 @@ class ChatSession:
                 # (perf-2); passing the already-prepared list keeps the
                 # calibration char count aligned with what the provider
                 # actually counted.
-                self._update_token_table(assistant_msg, msgs=msgs)
+                # The wire fold the provider ACTUALLY counted — a mid-retry
+                # rebind re-prepares it inside _stream_response, invisibly
+                # to this frame's msgs local (the calibration contract:
+                # char counts align with the counted fold).
+                self._update_token_table(assistant_msg, msgs=self._active_wire_msgs or msgs)
                 self._print_status_line()  # Report usage for EVERY API call
                 self.messages.append(turn_from_dict(assistant_msg))
                 # Clear per-turn inflight buffers — the assistant
@@ -7697,46 +7737,104 @@ class ChatSession:
         non-retryable class.
         """
         attempt = 0
+        # The latest non-empty dead attempt's flushed text.  Wrapper-LOCAL:
+        # each death carries its partial on the raised exception (thread-
+        # private), so an orphaned superseded generation cannot poison a
+        # live generation's preservation the way a shared session slot
+        # could.
+        dead_partial = ""
+
+        def _promote_dead_partial() -> None:
+            """Hand send()'s cancel handler the retry window's partial.
+
+            Runs on a same-generation Stop anywhere in the retry window.
+            Unconditional when no partial was recorded — empty content
+            still takes the cancel handler's marker-as-message branch,
+            preserving the invariant that a cancelled streaming turn
+            always persists the cancellation-marker row.  Backfills a
+            recorded-but-EMPTY partial (a Stop in the re-create/TTFT
+            window records the new attempt's empty content) with the
+            previous attempt's text: cancel-in-retry preserves the latest
+            text the user actually saw.  Never writes for a superseded
+            generation — an orphan must not touch the successor's slot.
+            """
+            if self._generation != my_generation:
+                return
+            cur = self._cancelled_partial_msg
+            if cur is None or (not cur.get("content") and dead_partial):
+                self._cancelled_partial_msg = {
+                    "role": "assistant",
+                    "content": dead_partial,
+                }
+
+        # Exported for send()'s token-table calibration — the char count
+        # must match the fold the provider actually counted, and a
+        # mid-retry rebind can re-prepare it below.
+        self._active_wire_msgs = msgs
         stream = self._create_stream_with_retry(msgs)
         while True:
             try:
                 return self._stream_attempt(transport_guarded(stream), my_generation)
-            # GenerationCancelled subclasses BaseException, so this arm
-            # structurally cannot swallow the cancel path.
+            except GenerationCancelled:
+                # A Stop during an attempt (incl. the re-create/TTFT window
+                # after a death) — preserve the window's best partial.
+                _promote_dead_partial()
+                raise
+            except KeyboardInterrupt:
+                # BaseException — the Exception arm below never sees it,
+                # but send() treats Ctrl-C as a survivable, recorded path,
+                # so the dead attempt still needs its client-side finalize
+                # (the CLI's markdown fence resets only in on_stream_end).
+                if self._generation == my_generation:
+                    self.ui.on_stream_end()
+                raise
             except Exception as e:
-                # self._provider, not a creation-time local: after
-                # _try_fallback the live stream belongs to the fallback
-                # provider (the sets overlap on IncompleteStreamError, so
-                # the gate is correct either way — but read the session's
-                # current binding).  The terminal predicate is the SHARED
-                # _stop_retrying, capped at _MID_STREAM_RETRIES: its
-                # overflow arm applies here too — an overflow can surface
-                # mid-consumption (error-frame lanes), and it must fall
-                # through to send()'s compact-and-retry arm rather than
-                # burn re-issues on a deterministic failure.
+                # The death carries the attempt's flushed text (attached by
+                # _stream_attempt's death arm).  Keep the previous
+                # attempt's text when the new death had none — the user
+                # saw it, and a later Stop must preserve it.
+                dead_partial = getattr(e, "_dead_partial", "") or dead_partial
                 if self._generation != my_generation:
                     # Superseded (force-cancel started a newer generation):
                     # an orphaned thread must not touch the UI — a finalize
                     # emitted here would clobber the NEW generation's
                     # in-flight stream state.
                     raise
+                # The provider whose stream actually died: after
+                # _try_fallback the live stream belongs to the FALLBACK
+                # provider, whose retryable set can differ (e.g.
+                # ResponsesStreamFailedError) — judging it by the primary
+                # binding's set would declare fallback transients terminal.
+                # Best-effort field (a racing creation could re-write it);
+                # at worst one gate decision consults a sibling set.
+                live_provider = self._active_stream_provider or self._provider
+                # The terminal predicate is the SHARED _stop_retrying,
+                # capped at _MID_STREAM_RETRIES: its overflow arm applies
+                # here too — an overflow can surface mid-consumption
+                # (error-frame lanes), and it must fall through to send()'s
+                # compact-and-retry arm rather than burn re-issues on a
+                # deterministic failure.
                 if self._stop_retrying(
-                    e, attempt, self._provider, max_retries=self._MID_STREAM_RETRIES
+                    e, attempt, live_provider, max_retries=self._MID_STREAM_RETRIES
                 ):
-                    # Terminal: finalize the dead attempt exactly as the
-                    # retry path below does, or the last attempt's partial
-                    # stays un-flushed in every consumer — the CLI is the
-                    # sharp case (its markdown fence state resets only in
-                    # on_stream_end; the server /send workers emit their own
-                    # stream_end after a fatal, the CLI's direct send() does
-                    # not).  An attempt that died before its first token
-                    # finalizes empty buffers, which no-ops everywhere.
+                    # Terminal: client-side finalize only (the CLI's
+                    # markdown fence resets in on_stream_end; the server
+                    # /send workers emit their own after a fatal, the
+                    # CLI's direct send() does not).  on_turn_committed is
+                    # DELIBERATELY absent here, unlike the retry arm
+                    # below: the dead partial is in neither history nor
+                    # storage, so the in-progress snapshot is its only
+                    # surviving copy — wiping it would silently lose
+                    # visible text on the most reconnect-prone path.  It
+                    # clears at the next send, the pre-#937 fatal
+                    # behavior.
                     self.ui.on_stream_end()
-                    self.ui.on_turn_committed()
                     raise  # fatal path otherwise unchanged
+                # Delay from the PRE-increment attempt index — the same
+                # convention as the three sibling ladders' range loops.
+                delay = self._RETRY_BASE_DELAY * (2**attempt)
                 attempt += 1
                 cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
-                delay = self._RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 log.warning(
                     "stream.retry",
                     error_type=cause,
@@ -7758,6 +7856,13 @@ class ChatSession:
                     f"[stream died mid-response ({cause}) — retrying in "
                     f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
                 )
+                # Stop-then-start: a pre-first-token death leaves the
+                # spinner RUNNING (_stop_spinner_once never fired), and the
+                # CLI's on_thinking_start is not idempotent — it replaces
+                # the spinner object without stopping the old one, leaking
+                # its render thread (the compact-retry arm guards the same
+                # way).
+                self.ui.on_thinking_stop()
                 self.ui.on_thinking_start()
                 try:
                     self._backoff_or_cancelled(delay, my_generation)
@@ -7769,27 +7874,36 @@ class ChatSession:
                     # generation-gated (two compares when nothing changed),
                     # so this is free in the common case and re-binds
                     # exactly when reload made the old client unusable.
-                    client_before = self.client
+                    binding_before = (self.client, self.model, self._provider)
                     self._refresh_model_from_registry()
-                    if self.client is not client_before:
+                    if (self.client, self.model, self._provider) != binding_before:
                         # The rebind may have changed the model family, and
                         # the wire fold is capability-sensitive
                         # (fold_system_turns) — re-prepare against the new
                         # binding, the same pass the overflow arm runs
-                        # mid-send.  Identity compare: _bind_model_from_
-                        # registry replaces the client object on any
-                        # connection-relevant change.
+                        # mid-send.  Compared as the full binding triple:
+                        # reload() deliberately KEEPS the pooled client
+                        # when only the alias's model id changed, so a
+                        # client-identity check alone would re-issue the
+                        # old model's fold against the new model.
                         msgs = self._prepare_wire_messages(self._full_messages())
+                        self._active_wire_msgs = msgs
                     try:
                         stream = self._create_stream_with_retry(msgs)
                     except Exception as recreate_exc:
-                        # The re-create's failure must not mask the true
-                        # stream-death error: a closed-client recreate
-                        # surfaces as a retryable APIConnectionError and
-                        # would otherwise replace the operator-actionable
-                        # wording after burning its own ladder.  Class name
-                        # only — a ConnectError's text can carry a
-                        # credential-bearing base_url verbatim.
+                        if _is_ctx_overflow(recreate_exc):
+                            # Deterministic — surface as ITSELF so send()'s
+                            # compact-and-retry arm can recover the turn; a
+                            # rebind can land on a smaller-window model
+                            # mid-retry.
+                            raise
+                        # Otherwise the re-create's failure must not mask
+                        # the true stream-death error: a closed-client
+                        # recreate surfaces as a retryable
+                        # APIConnectionError and would replace the
+                        # operator-actionable wording after burning its own
+                        # ladder.  Class name only — a ConnectError's text
+                        # can carry a credential-bearing base_url verbatim.
                         log.warning(
                             "stream.retry.recreate_failed",
                             error_type=type(recreate_exc).__name__,
@@ -7798,15 +7912,8 @@ class ChatSession:
                 except GenerationCancelled:
                     # A Stop landing in the backoff/re-create window aborts
                     # the turn with the dead attempt's partial preserved —
-                    # the same disposition a cancel DURING the attempt gets
-                    # (send()'s cancel handler persists it with the
-                    # cancellation marker).  Without this, cancel-in-backoff
-                    # silently drops text the user already saw.
-                    if self._midstream_dead_partial:
-                        self._cancelled_partial_msg = {
-                            "role": "assistant",
-                            "content": self._midstream_dead_partial,
-                        }
+                    # the same disposition a cancel DURING the attempt gets.
+                    _promote_dead_partial()
                     raise
 
     def _stream_attempt(
@@ -7837,7 +7944,6 @@ class ChatSession:
         # `_assistant_pending_tokens or ...` fallback.
         self._last_usage = None
         self._assistant_pending_tokens = 0
-        self._midstream_dead_partial = ""
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -7870,10 +7976,24 @@ class ChatSession:
                 self.ui.on_thinking_stop()
                 first_token = False
 
+        def _partial_content() -> str:
+            """THE partial-content rule, in one form: flushed content plus
+            the splitter's carry tail when it is content-state (an in-think
+            tail is reasoning and stays out).  Both preservation paths —
+            the cancel arms' record below and the death arm's exception
+            payload — derive from this single closure so a Stop landing in
+            the retry window persists the same text as a Stop during the
+            attempt."""
+            return "".join(content_parts) + (splitter.pending if not splitter.in_think else "")
+
         def _record_cancelled_partial() -> None:
             """Flush buffered text, finalize the stream in the UI, and stash
             the partial for send()'s cancel handler — the one sequence both
             cancel arms (cooperative and stream-close-converted) must run.
+            No-op for a SUPERSEDED generation: an orphaned thread must
+            touch neither the UI (its stream_end would reset the successor
+            generation's inflight buffers mid-stream) nor the shared
+            partial slot the successor's cancel handler consumes.
             ``tool_calls`` and ``_provider_content`` are DELIBERATELY
             OMITTED from the partial:
 
@@ -7888,11 +8008,12 @@ class ChatSession:
               appends to ``content``, hiding the partial-output signal
               from the model.
             """
+            if self._generation != my_generation:
+                return
+            content = _partial_content()
             splitter.flush_pending()
             self.ui.on_stream_end()
-            partial: dict[str, Any] = {"role": "assistant"}
-            partial["content"] = "".join(content_parts) or ""
-            self._cancelled_partial_msg = partial
+            self._cancelled_partial_msg = {"role": "assistant", "content": content}
 
         finish_reason = None
         try:
@@ -7916,13 +8037,7 @@ class ChatSession:
                 # so the dict write cannot defer to stream end.
                 if chunk.usage:
                     usage_acc = merge_usage(usage_acc, chunk.usage)
-                    self._last_usage = {
-                        "prompt_tokens": usage_acc.prompt_tokens,
-                        "completion_tokens": usage_acc.completion_tokens,
-                        "total_tokens": usage_acc.total_tokens,
-                        "cache_creation_tokens": usage_acc.cache_creation_tokens,
-                        "cache_read_tokens": usage_acc.cache_read_tokens,
-                    }
+                    self._last_usage = dataclasses.asdict(usage_acc)
 
                 if self.debug:
                     parts = []
@@ -7977,10 +8092,17 @@ class ChatSession:
                 # Raw provider content blocks (for multi-turn preservation)
                 if chunk.provider_blocks:
                     provider_blocks = chunk.provider_blocks
+            # A Stop that raced the trailing-metadata window: cancel()
+            # closed the stream, and transport_guarded's post-finish
+            # tolerance ended it CLEANLY instead of letting the closed-
+            # stream raise reach the conversion arm below — without this
+            # re-check the turn would commit as complete and its tool
+            # calls would execute despite the Stop.
+            self._check_cancelled(my_generation)
         except GenerationCancelled:
             _record_cancelled_partial()
             raise
-        except Exception:
+        except Exception as death_exc:
             # cancel() closed the underlying SDK stream, aborting the HTTP
             # connection.  The blocked next() call on the iterator raises a
             # transport-level error (httpx, httpcore, etc.).  Convert to
@@ -7988,16 +8110,12 @@ class ChatSession:
             if self._cancel_event.is_set():
                 _record_cancelled_partial()
                 raise GenerationCancelled() from None
-            # A non-cancel death: stash the flushed partial so the resilient
-            # wrapper can preserve it if a cancel lands in the retry window
-            # (its backoff arm promotes the stash to _cancelled_partial_msg).
-            # The splitter's carry tail rides along when it is content-state
-            # — matching _record_cancelled_partial, which flushes it into
-            # content_parts — but without emitting mid-exception UI tokens;
-            # an in-think tail is reasoning and stays out, as there too.
-            self._midstream_dead_partial = "".join(content_parts) + (
-                splitter.pending if not splitter.in_think else ""
-            )
+            # A non-cancel death: the attempt's flushed text rides the
+            # EXCEPTION (thread-private, so an orphaned generation's death
+            # can never poison a live generation's preservation) for the
+            # resilient wrapper's Stop-in-retry-window promotion.  No UI
+            # emission here — the wrapper finalizes the dead attempt.
+            death_exc._dead_partial = _partial_content()  # type: ignore[attr-defined]
             raise
 
         # Flush any remaining buffered text

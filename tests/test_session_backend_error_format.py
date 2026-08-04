@@ -463,10 +463,20 @@ def test_record_fatal_falls_back_for_unknown(monkeypatch):
     assert captured["persist"] == "ValueError: plain old error"
 
 
-def test_record_fatal_logs_session_fatal_recorded_at_error(monkeypatch, caplog):
-    """The one journal trace of a fatal turn — the UI/persist sinks are
-    invisible to log scrapers, so the chokepoint must emit
-    ``session.fatal.recorded`` with the sanitized text."""
+@pytest.mark.parametrize(
+    ("exc", "expect_error_level", "message_substring"),
+    [
+        pytest.param(ReadTimeout("timed out"), True, "ReadTimeout", id="fault-at-error"),
+        pytest.param(KeyboardInterrupt(), False, None, id="ctrl-c-at-info"),
+    ],
+)
+def test_record_fatal_log_level_contract(
+    monkeypatch, caplog, exc, expect_error_level, message_substring
+):
+    """The one journal trace of a fatal turn emits ``session.fatal.recorded``
+    with the sanitized text — at ERROR for genuine faults; a Ctrl-C routes
+    through the same chokepoint but is a user action, not a fault, and must
+    not add an ERROR-level line per CLI interrupt."""
     import logging
 
     import turnstone.core.memory as memory_mod
@@ -480,36 +490,17 @@ def test_record_fatal_logs_session_fatal_recorded_at_error(monkeypatch, caplog):
 
     stub = _record_fatal_stub(_UI(), {})
     with caplog.at_level(logging.INFO, logger="turnstone.core.session"):
-        ChatSession._record_fatal_error(stub, ReadTimeout("timed out"))  # type: ignore[arg-type]
+        ChatSession._record_fatal_error(stub, exc)  # type: ignore[arg-type]
 
     recorded = [r for r in caplog.records if "session.fatal.recorded" in r.message]
     assert recorded
-    assert any(r.levelno == logging.ERROR for r in recorded)
-    assert any("ReadTimeout" in r.message for r in recorded)
-
-
-def test_record_fatal_logs_keyboard_interrupt_at_info(monkeypatch, caplog):
-    """Ctrl-C routes through the same chokepoint but is a user action, not a
-    fault — it must not add an ERROR-level line per CLI interrupt."""
-    import logging
-
-    import turnstone.core.memory as memory_mod
-
-    monkeypatch.setattr(memory_mod, "persist_last_error", lambda ws_id, msg: None)
-    monkeypatch.setattr(memory_mod, "sanitize_error_text", lambda text, **kw: text)
-
-    class _UI:
-        def on_error(self, msg: str) -> None:
-            pass
-
-    stub = _record_fatal_stub(_UI(), {})
-    with caplog.at_level(logging.INFO, logger="turnstone.core.session"):
-        ChatSession._record_fatal_error(stub, KeyboardInterrupt())  # type: ignore[arg-type]
-
-    recorded = [r for r in caplog.records if "session.fatal.recorded" in r.message]
-    assert recorded
-    assert all(r.levelno < logging.ERROR for r in recorded)
-    assert any(r.levelno == logging.INFO for r in recorded)
+    if expect_error_level:
+        assert any(r.levelno == logging.ERROR for r in recorded)
+    else:
+        assert all(r.levelno < logging.ERROR for r in recorded)
+        assert any(r.levelno == logging.INFO for r in recorded)
+    if message_substring:
+        assert any(message_substring in r.message for r in recorded)
 
 
 def test_backend_auth_unavailable_names_the_mint_not_the_key():
