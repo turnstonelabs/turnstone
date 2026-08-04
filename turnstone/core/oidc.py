@@ -232,9 +232,15 @@ def load_oidc_config() -> OIDCConfig:
     from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
 
     if obo_grant_profile not in OBO_GRANT_PROFILES:
+        # Warn-only, deliberately: the raw value must survive so the write-time
+        # validators can echo the operator's actual typo back in their 400s,
+        # rather than a coerced value that turns a self-diagnosing message
+        # into a startup-log scavenger hunt. Runtime is already safe — the
+        # mint legs resolve by exact name, so an unknown profile never mints.
         log.warning(
             "oidc: unknown obo_grant_profile %r (expected one of %s) — "
-            "oauth_obo MCP servers will not mint until this is fixed",
+            "oauth_obo MCP servers and entra_obo/entra_app model aliases will "
+            "not mint until this is fixed",
             obo_grant_profile,
             ", ".join(sorted(OBO_GRANT_PROFILES)),
         )

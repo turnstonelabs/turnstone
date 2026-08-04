@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._oidc_test_helpers import keyed_app_state
 from tests._session_helpers import (
     FakeAnthropicBlock,
     as_stream,
@@ -1491,7 +1492,13 @@ class TestAgentModelOverride:
         # followed by sync-to-nodes / internal_model_reload).
         new_models = dict(reg.models)
         new_models["bigboi"] = ModelConfig("bigboi", "x", "x", "m")
-        reg.reload(new_models, reg.default, reg.fallback, reg.agent_model)
+        reg.reload(
+            new_models,
+            reg.default,
+            reg.fallback,
+            reg.agent_model,
+            app_state=keyed_app_state(),
+        )
 
         session.refresh_agent_tool_schemas()
 
@@ -1565,7 +1572,11 @@ class TestAgentModelOverride:
 
         # Reload the registry down to only ``default`` (admin removed
         # every other model definition).
-        reg.reload({"default": ModelConfig("default", "x", "x", "m")}, "default")
+        reg.reload(
+            {"default": ModelConfig("default", "x", "x", "m")},
+            "default",
+            app_state=keyed_app_state(),
+        )
         session.refresh_agent_tool_schemas()
 
         task_tool = self._agent_tool(session, "task_agent")

@@ -67,9 +67,38 @@ Model definitions support three backend credential modes:
 Dynamic modes require an exact `obo_audience` resource App ID URI. Before an
 admin can save one, an operator must add that literal audience to
 `model.auth_audience_allowlist` (comma- or newline-separated). Wildcards and
-base-URL host matching are intentionally unsupported. Changing dynamic auth,
-its audience, or the gateway `base_url` also requires `admin.mcp`; service
-tokens do not bypass this capability-escalation gate.
+base-URL host matching are intentionally unsupported, and a row whose
+effective mode is `static` refuses to store a new non-empty `obo_audience` on
+either create or update — an audience cannot be staged for a later flip
+(clearing a stale value, or re-saving it unchanged, stays allowed). On a row
+that is (or becomes) dynamic, every change except the tuning fields — context
+window, temperature, max tokens, reasoning effort, and the two
+reasoning-persistence toggles — also requires `admin.mcp`; service tokens do
+not bypass this capability-escalation gate. The one exception is
+de-escalation: a save whose only gated change is switching `enabled` off is a
+pure disable, needs only `admin.models`, and skips validation — a de-listed
+audience must never block disarming its own row. The gate is deny-by-default:
+a field counts as auth-relevant unless it is provably neutral, so re-enabling
+a disabled dynamic row, re-pointing its `base_url`, or swapping its provider
+or alias all escalate.
+
+Validation runs in two tiers, matching the MCP `oauth_obo` write rules. Row
+validity — the audience is allow-listed — applies to every gated write that
+touches a dynamic configuration, so a revoked audience can be neither silently
+re-pointed at a new `base_url` nor re-armed by an enable flip. Deployment
+posture — the token encryption key installed, single sign-on configured, and
+the grant profile valid and able to carry the mode — is checked when a write
+*chooses* the mode/audience pair and when it re-enables a disabled dynamic
+row (arming is the flip that resumes minting, so it must meet what minting
+needs); other edits to an existing row stay open if the deployment's posture
+changed after it was saved (its mints warn at runtime instead). Refusals name
+their cause and echo the configured value.
+
+One asymmetry to be aware of: the write path counts a transient discovery
+outage (`enabled=false`, retryable) as configured, but the mints themselves
+require discovery to have completed — a config saved during an outage starts
+minting only once any authenticated request heals discovery. Until then calls
+warn and follow the fail-open/fail-closed policy above.
 
 `entra_app` is supported only with `[oidc] obo_grant_profile = "entra"`.
 Judge, output-guard, perception, utility, and sub-agent lanes inherit the

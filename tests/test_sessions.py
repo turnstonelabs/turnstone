@@ -1,9 +1,10 @@
 """Tests for workstream persistence and resume functionality."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import sqlalchemy as sa
 
+from tests._oidc_test_helpers import keyed_app_state
 from turnstone.core.memory import (
     delete_workstream,
     list_workstreams_with_history,
@@ -648,6 +649,123 @@ class TestWorkstreamConfig:
         # Constructor's coherent default is preserved — saved orphan
         # model name is NOT copied over.
         assert session.model == "gpt-5-nano"
+
+    def test_resume_restore_stamps_current_generation(self, tmp_db):
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        reg = ModelRegistry(
+            models={
+                "a": ModelConfig("a", "http://a/v1", "k", "m-a"),
+                "b": ModelConfig("b", "http://b/v1", "k", "m-b"),
+            },
+            default="a",
+        )
+        register_workstream("gen_ws")
+        save_message("gen_ws", "user", "hello")
+        save_workstream_config("gen_ws", {"model": "m-b", "model_alias": "b"})
+        session = ChatSession(
+            client=MagicMock(),
+            model="m-a",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            registry=reg,
+            model_alias="a",
+        )
+        reg.reload(
+            {
+                "a": ModelConfig("a", "http://a/v1", "k", "m-a"),
+                "b": ModelConfig("b", "http://b/v1", "k", "m-b"),
+            },
+            "a",
+            app_state=keyed_app_state(),
+        )
+
+        assert session.resume("gen_ws") is True
+
+        assert session.model == "m-b"
+        assert session.client is reg.get_client("b")
+        assert session._registry_generation == reg.generation
+
+    def test_resume_keeps_binding_when_alias_vanishes_mid_restore(self, tmp_db):
+        """The has_alias/resolve straddle must not raise out of resume."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        reg = ModelRegistry(
+            models={"a": ModelConfig("a", "http://a/v1", "k", "m-a")},
+            default="a",
+        )
+        register_workstream("race_ws")
+        save_message("race_ws", "user", "hello")
+        save_workstream_config("race_ws", {"model": "m-a", "model_alias": "a"})
+        session = ChatSession(
+            client=MagicMock(),
+            model="m-a",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            registry=reg,
+            model_alias="a",
+        )
+        old_client = session.client
+        old_provider = session._provider
+
+        # has_alias passes, then the resolve finds the alias gone — the
+        # straddle a concurrent reload produces.
+        with patch.object(reg, "resolve_binding", side_effect=ValueError("Unknown model alias: a")):
+            assert session.resume("race_ws") is True  # must not raise
+
+        assert session.client is old_client
+        assert session._provider is old_provider
+        assert session.model == "m-a"
+
+    def test_resume_construction_failure_logs_true_cause_keeps_binding(
+        self, tmp_db, monkeypatch, caplog
+    ):
+        """Logs the construction cause, not the unreachable-alias one."""
+        import logging
+
+        import turnstone.core.model_registry as mr_module
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        reg = ModelRegistry(
+            models={"a": ModelConfig("a", "http://a/v1", "k", "m-a")},
+            default="a",
+        )
+        register_workstream("cons_ws")
+        save_message("cons_ws", "user", "hello")
+        save_workstream_config("cons_ws", {"model": "m-a", "model_alias": "a"})
+        session = ChatSession(
+            client=MagicMock(),
+            model="m-a",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            registry=reg,
+            model_alias="a",
+        )
+        old_client = session.client
+        old_provider = session._provider
+
+        def _boom(provider: str, **kwargs: object) -> object:
+            raise FileNotFoundError("/etc/ssl/missing-ca.pem")
+
+        monkeypatch.setattr(mr_module, "create_client", _boom)
+        with caplog.at_level(logging.WARNING):
+            assert session.resume("cons_ws") is True  # must not raise
+
+        assert session.client is old_client
+        assert session._provider is old_provider
+        blob = " ".join(r.getMessage() for r in caplog.records)
+        assert "could not be constructed" in blob
+        assert "details in server log" in blob
+        assert "unreachable" not in blob
 
     def test_init_does_not_clobber_existing_config(self, tmp_db):
         """ChatSession.__init__ must NOT overwrite existing

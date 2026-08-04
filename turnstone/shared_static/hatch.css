@@ -516,9 +516,11 @@
   align-items: center;
   gap: 8px;
 }
-.sh-section:first-child {
-  margin-top: 0;
-}
+/* No :first-child zeroing: every shelf body opens with its error div, so a
+   .sh-section is never the first element child OF A .sh-body — the old
+   bare-form rule could only ever fire wrongly, on sections that ARE first
+   children of wrapper containers (Backend auth, Server compatibility),
+   collapsing their 24px separator. */
 .sh-section::before {
   content: "";
   width: 4px;

@@ -27,6 +27,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -57,11 +58,17 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
-from turnstone.core.mcp_crypto import is_user_scoped_auth
+from turnstone.core.mcp_crypto import STARTUP_KEY_REQUIRED_HINT, is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
+from turnstone.core.model_registry import (
+    DYNAMIC_MODEL_AUTH_MODES,
+    DynamicAuthKeyError,
+    dynamic_auth_key_error,
+)
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
 from turnstone.core.rendezvous import NoAvailableNodeError
+from turnstone.core.rerank_calibrate import canonical_caps_value
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
@@ -4018,21 +4025,6 @@ async def _fanout_on_children(
     return ok, failed, skipped
 
 
-async def _require_json_object(request: Request) -> dict[str, Any] | JSONResponse:
-    """Parse the request body and require a JSON object.
-
-    ``read_json_or_400`` only validates that the body parses as JSON,
-    not that it's an object.  A ``null``/list/scalar body otherwise
-    reaches ``body.get(...)`` and raises ``AttributeError`` → 500.
-    """
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
-    return body
-
-
 async def _resolve_coord_session(
     request: Request,
     *,
@@ -4135,7 +4127,7 @@ async def coordinator_trust(request: Request) -> JSONResponse:
         return resolved
     session, storage, user_id, ws_id = resolved
 
-    body = await _require_json_object(request)
+    body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     raw_send = body.get("send")
@@ -4162,7 +4154,7 @@ async def coordinator_restrict(request: Request) -> JSONResponse:
         return resolved
     session, storage, user_id, ws_id = resolved
 
-    body = await _require_json_object(request)
+    body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     raw_revoke = body.get("revoke")
@@ -4297,7 +4289,7 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
     del coord_mgr  # children_snapshot moved to the adapter
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
 
-    body = await _require_json_object(request)
+    body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     raw_reason = body.get("reason", "")
@@ -4959,6 +4951,40 @@ def _bootstrap_coord_subsystem(
     )
 
 
+def _record_coord_key_refusal(app_state: Any, key_err: str) -> None:
+    """Record a dynamic-auth key refusal from a coordinator install/swap path.
+
+    Shared by the lifespan bootstrap, the CRUD-triggered runtime bootstrap
+    and :func:`_refresh_coord_registry` so the three cannot drift: an ERROR
+    log (the observable while the coordinator is live) plus the
+    ``coord_registry_error`` banner (rendered by the 503 path while down).
+    """
+    log.error("console.model_auth_key_missing: %s", key_err)
+    app_state.coord_registry_error = key_err
+
+
+def _refuse_keyless_registry(app_state: Any, registry: Any) -> bool:
+    """Refuse a freshly-loaded registry whose dynamic aliases lack the key.
+
+    The shared refusal step of both bootstrap twins. Derives the error
+    against the REGISTRY, not raw rows — config.toml overrides DB.
+    Returns True when the registry was refused (the caller must not
+    install it).
+    """
+    key_err = dynamic_auth_key_error(registry.models, app_state)
+    if not key_err:
+        return False
+    _record_coord_key_refusal(app_state, key_err)
+    # Defensive teardown of the throwaway, mirroring
+    # _refresh_coord_registry's finally: iterates empty dicts today, kept
+    # against the day the loader grows eager client init.
+    try:
+        registry.shutdown()
+    except Exception:
+        log.warning("console.coord_bootstrap_shutdown_failed", exc_info=True)
+    return True
+
+
 def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_store: Any) -> None:
     """Synchronous lifespan-startup entry point: load the model
     registry from storage, run :func:`_bootstrap_coord_subsystem` on
@@ -4983,6 +5009,12 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
             # operator can recover at runtime by adding a model in the
             # admin panel (see :func:`_maybe_bootstrap_coord_subsystem`).
             app.state.coord_registry_error = str(exc)
+            return
+        # Console-side twin of initialize_mcp_crypto_state's dynamic-auth key
+        # requirement: that guard runs before this registry exists and can
+        # only see the MCP half. Non-fatal by design — the subsystem reports
+        # through coord_registry_error rather than killing the admin surface.
+        if _refuse_keyless_registry(app.state, coord_registry):
             return
         _bootstrap_coord_subsystem(app, storage, config_store, coord_registry)
     except Exception:
@@ -9653,13 +9685,22 @@ _MCP_MAX_SERVERS = 200  # fallback; prefer cluster.mcp_max_servers from storage
 _MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user", "oauth_obo"})
 
 
+# Cleaning bound for a model definition's ``obo_audience``. ONE constant:
+# the derive-gate's stored-side normalization and the create/update twins'
+# input cleaning must truncate identically, or a long stored audience
+# cleans differently on the two sides of the pair-change compare and every
+# full-form save on such a row reads as a pair change.
+OBO_AUDIENCE_MAX_LEN = 2048
+
+
 def _clean_oauth_text(value: Any, *, max_length: int = 512) -> str | None:
     """Normalize an admin form OAuth text field — empty string -> None.
 
     Caps the input to ``max_length`` characters to bound DB row size on
     the admin.mcp write path.  Pass a larger ``max_length`` (e.g. 2048)
     for URL fields where the default would otherwise truncate valid
-    long URLs.
+    long URLs; model ``obo_audience`` sites pass
+    :data:`OBO_AUDIENCE_MAX_LEN`.
     """
     if value is None:
         return None
@@ -11447,15 +11488,281 @@ def _model_auth_audience_allowlist(request: Request) -> frozenset[str]:
     return frozenset(item.strip() for item in re.split(r"[,\n]", str(raw or "")) if item.strip())
 
 
+def _oidc_configured_for_model_auth(request: Request) -> bool:
+    """Whether ``[oidc]`` is configured, counting the healing state as yes.
+
+    Mirrors the MCP ``oauth_obo`` validator's disjunction: a host that booted
+    during a transient IdP outage is ``discovery_retryable`` and heals on the
+    next token validation, so it must not be refused config work meanwhile.
+    """
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    return bool(
+        getattr(oidc_config, "enabled", False) or getattr(oidc_config, "discovery_retryable", False)
+    )
+
+
+# Provably auth-NEUTRAL model-definition columns. The update gate below is
+# built by EXCLUSION — fail-safe defaults + complete mediation: any OTHER
+# column whose VALUE changes on a row that is or becomes dynamic is an
+# auth-relevant change requiring admin.mcp plus row validation, so a new
+# column fails CLOSED until classified here (pinned by
+# test_model_definition_schema_auth_classification). Every entry claims
+# "changing this column can neither redirect where a minted credential is
+# sent nor re-arm minting that a disable or revocation stopped": the four
+# sampling/shaping knobs hit the same endpoint with the same credential,
+# and the two reasoning toggles only select what history surfaces.
+MODEL_AUTH_NEUTRAL_FIELDS = frozenset(
+    {
+        "context_window",
+        "temperature",
+        "max_tokens",
+        "reasoning_effort",
+        "surface_persisted_reasoning",
+        "replay_reasoning_to_model",
+    }
+)
+
+# The two cross-field refusal messages, shared verbatim by the create and
+# update twins (their guard CONDITIONS differ — raw body vs post-merge pair —
+# but the text must not drift). Mode lists come from the frozenset so a
+# fourth dynamic mode cannot make either message lie.
+_AUDIENCE_REQUIRED_ERROR = (
+    "obo_audience is required when auth_mode is dynamic "
+    f"({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))})"
+)
+_AUDIENCE_FORBIDS_STATIC_ERROR = (
+    "obo_audience requires a dynamic auth_mode "
+    f"({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))}); "
+    "omit it when auth_mode is 'static'"
+)
+
+
+def _canonical_capabilities(raw: Any) -> str | None:
+    """Canonical form of a ``capabilities`` blob, or ``None`` when unparseable.
+
+    Canonicalized through ``canonical_caps_value`` — the ONE normalization
+    this column's two comparators share, so this guard and the calibrate
+    confinement guard cannot disagree on an edge. Equality on the result
+    ignores exactly the serialization noise the shelf introduces (key order,
+    whitespace, integral-float spelling) while preserving every value-level
+    difference, including bool-vs-int.
+    """
+    try:
+        parsed = json.loads(str(raw or "") or "{}")
+    except ValueError:
+        return None
+    return canonical_caps_value(parsed)
+
+
+def _capabilities_value_changed(stored: Any, submitted: Any) -> bool:
+    """Whether a submitted ``capabilities`` blob VALUE-differs from the row's.
+
+    Canonicalized compare, so serialization noise on a full-form shelf save
+    does not gate while value-level changes still do; pinned by
+    test_reserialized_capabilities_do_not_defeat_pure_disable and
+    test_capabilities_value_change_still_gates_dynamic_row.
+
+    An unparseable STORED blob compares as CHANGED (fail closed). The ONE
+    exception is the update twin's pure-disable derivation, which treats it
+    as not-blocking (see :func:`_derive_auth_gate`).
+    """
+    stored_canonical = _canonical_capabilities(stored)
+    return stored_canonical is None or stored_canonical != _canonical_capabilities(submitted)
+
+
+@dataclass(frozen=True)
+class ModelAuthGateDecision:
+    """The update twin's auth-gate facts, derived purely from (row, updates).
+
+    Produced only by :func:`_derive_auth_gate`; the handler maps fields to
+    responses and never re-derives. Exclusivity invariants, each directly
+    unit-pinned:
+
+    - ``pure_disable`` implies ``not pair_changed`` and
+      ``not auth_config_changed`` — the carve-out never coexists with a
+      gated change.
+    - ``pure_disable`` implies ``not audience_required_violation`` — the
+      audience-required refusal yields to de-escalation.
+    - ``enabled_armed`` implies ``not pure_disable`` — arming and
+      disarming are directional opposites.
+    - ``posture_event`` is exactly ``pair_changed or enabled_armed``.
+    """
+
+    eff_auth_mode: str
+    eff_audience: str
+    audience_required_violation: bool
+    static_new_audience_violation: bool
+    pair_changed: bool
+    dynamic_involved: bool
+    enabled_armed: bool
+    pure_disable: bool
+    auth_config_changed: bool
+    posture_event: bool
+
+
+def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> ModelAuthGateDecision:
+    """Derive every auth-gate fact the update twin consumes, purely.
+
+    ``existing`` is the stored row, ``updates`` the validated + normalized
+    presence-keyed column ladder the handler built from the body. No
+    request, no I/O, so the gate semantics are testable without endpoint
+    scaffolding.
+
+    The effective pair merges updates over the row, with both existing-side
+    values normalized the same way a submission is — auth_mode ""-residue
+    reads as static, and the stored audience passes through
+    ``_clean_oauth_text`` — or every full-form save on such a row reads as
+    a pair change. Two-arg ``.get`` on the updates side, not ``or``: a
+    deliberate ""-clear of obo_audience must still win over the stored
+    value.
+
+    Default-deny (fail-safe defaults): enumerate the provably NEUTRAL
+    columns and treat every other VALUE change as auth-relevant whenever
+    the row is or becomes dynamic. Value-diff, not key-presence — the admin
+    UI always submits the full form (pinned:
+    test_unchanged_dynamic_auth_fields_do_not_require_admin_mcp).
+    ``enabled`` compares bool-normalized, ``capabilities`` compares
+    canonical forms, and the pair is EXCLUDED from the value-diff loop
+    because ``pair_changed`` is its dedicated normalization-correct
+    comparator; the remaining gated columns are TEXT and compare
+    None-as-"".
+
+    PURE DISABLE: the only non-neutral change is ``enabled`` true→false.
+    De-escalation is the one monotone exception to default-deny — a
+    de-listed audience must never block its own disarm, so admin.models
+    suffices and the validator is skipped entirely. Re-enabling re-arms
+    minting and stays gated + posture-validated (``enabled_armed`` feeds
+    ``posture_event``); a disable BUNDLED with any other gated change still
+    gates. For THIS derivation only, an unparseable STORED capabilities
+    blob does not block the disarm — the row is leaving every registry
+    (pinned: test_corrupt_stored_capabilities_does_not_block_pure_disable).
+    ``not pair_changed`` is implied but stated, so the predicate cannot
+    silently widen.  The audience-required refusal yields to the disarm for
+    the same reason: a row already STORED dynamic with an empty audience
+    (DB-direct writes) fails the post-merge check on every submission, so
+    without the exemption it could never be disabled (pinned:
+    test_empty_audience_dynamic_row_disarms_under_admin_models).
+    """
+    old_auth_mode = str(existing.get("auth_mode") or "static")
+    old_audience = (
+        _clean_oauth_text(existing.get("obo_audience"), max_length=OBO_AUDIENCE_MAX_LEN) or ""
+    )
+    eff_auth_mode = str(updates.get("auth_mode", old_auth_mode))
+    eff_audience = str(updates.get("obo_audience", old_audience))
+    # The staging guard, mirrored on the create twin: a row whose effective
+    # mode is static must not store a NEW non-empty audience, or an
+    # unvalidated value (the validator returns at static, never reaching the
+    # allow-list) is staged for a later flip to inherit. VALUE CHANGE only,
+    # so a legacy row carrying stale residue keeps saving.
+    static_new_audience_violation = (
+        eff_auth_mode == "static"
+        and "obo_audience" in updates
+        and bool(updates["obo_audience"])
+        and str(updates["obo_audience"]) != old_audience
+    )
+    # One derivation, two consumers: the outer gate and the validator's
+    # posture tier.
+    pair_changed = eff_auth_mode != old_auth_mode or eff_audience != old_audience
+    dynamic_involved = (
+        old_auth_mode in DYNAMIC_MODEL_AUTH_MODES or eff_auth_mode in DYNAMIC_MODEL_AUTH_MODES
+    )
+    # Named booleans, not a set: the consumers need direction and
+    # exclusivity, facts a collapsed any() cannot carry.
+    enabled_flip = "enabled" in updates and bool(existing.get("enabled")) != bool(
+        updates["enabled"]
+    )
+    enabled_armed = enabled_flip and bool(updates["enabled"])
+    caps_changed = "capabilities" in updates and _capabilities_value_changed(
+        existing.get("capabilities"), updates["capabilities"]
+    )
+    non_caps_gated_changed = any(
+        key not in ("enabled", "capabilities", "auth_mode", "obo_audience")
+        and key not in MODEL_AUTH_NEUTRAL_FIELDS
+        and str(existing.get(key) or "") != str(value or "")
+        for key, value in updates.items()
+    )
+    other_gated_changed = non_caps_gated_changed or caps_changed
+    caps_blocks_disarm = (
+        caps_changed and _canonical_capabilities(existing.get("capabilities")) is not None
+    )
+    pure_disable = (
+        enabled_flip
+        and not bool(updates["enabled"])
+        and not non_caps_gated_changed
+        and not caps_blocks_disarm
+        and not pair_changed
+    )
+    # A dynamic effective pair without an audience is unmintable and refused
+    # — except for the pure disable, whose de-escalation must never be
+    # blocked (the row is leaving the registry; nothing is armed).
+    audience_required_violation = (
+        eff_auth_mode in DYNAMIC_MODEL_AUTH_MODES and not eff_audience and not pure_disable
+    )
+    auth_config_changed = pair_changed or (
+        dynamic_involved and (other_gated_changed or enabled_flip) and not pure_disable
+    )
+    return ModelAuthGateDecision(
+        eff_auth_mode=eff_auth_mode,
+        eff_audience=eff_audience,
+        audience_required_violation=audience_required_violation,
+        static_new_audience_violation=static_new_audience_violation,
+        pair_changed=pair_changed,
+        dynamic_involved=dynamic_involved,
+        enabled_armed=enabled_armed,
+        pure_disable=pure_disable,
+        auth_config_changed=auth_config_changed,
+        posture_event=pair_changed or enabled_armed,
+    )
+
+
 def _validate_dynamic_model_auth(
     request: Request,
     *,
     auth_mode: str,
     audience: str,
+    posture_event: bool = True,
 ) -> JSONResponse | None:
-    """Validate allow-list/profile constraints for a changed dynamic config."""
+    """Validate a dynamic model-auth config at the write choke point.
+
+    A structural sibling of the MCP ``oauth_obo`` validator, in two tiers:
+
+    **Row validity — always runs when the mode is dynamic.** Exactly one
+    check: the audience must be operator-approved. Value-based, so a revoked
+    audience blocks even a base-URL-only edit (pinned:
+    test_delisted_audience_blocks_base_url_edit). One exception, on the
+    caller's side: a PURE DISABLE never calls this validator at all, so
+    de-escalation is not blocked by an audience that has left the allow-list
+    (pinned: test_pure_disable_with_admin_mcp_skips_validator_on_delisted_audience).
+
+    **Deployment posture — runs only on a ``posture_event``**: when this
+    request CHOOSES the ``(auth_mode, obo_audience)`` pair rather than
+    inheriting it, or RE-ARMS a disabled dynamic row (pinned:
+    test_keyless_reenable_of_dynamic_row_returns_503). Checks, in sibling
+    order: token store present, OIDC configured, grant profile valid and
+    able to carry the mode. A same-pair edit is never posture-blocked — an
+    existing row must not be held hostage to posture that changed after it
+    was saved; the mint warns at runtime instead, exactly as the MCP
+    contract documents (pinned:
+    test_base_url_edit_allowed_despite_typod_profile).
+
+    Every refusal names its actual cause and echoes what the operator
+    configured. A missing token store is 503 (deployment fault,
+    remedy-and-retry), matching the MCP sibling; config choices are 400.
+
+    DELIBERATELY a mirror of :func:`_enforce_oauth_obo_requirements`, not an
+    extraction from it. One accepted divergence: the sibling additionally
+    gates on ``capture_user_credential``, which the model mint never reads
+    (pinned: test_entra_obo_allowed_without_user_credential_capture). Any
+    rule change here must be weighed against the sibling, and vice versa.
+    """
     if auth_mode == "static":
         return None
+
+    # --- Row validity: every write that touches a dynamic config -----------
+    # ONLY the allow-list lives here: a revoked audience must never be
+    # re-aimable at a new base_url, whichever field the operator edited. The
+    # profile checks are deployment config, not row facts, so they sit in the
+    # posture tier below — matching the MCP sibling.
     if audience not in _model_auth_audience_allowlist(request):
         return JSONResponse(
             {
@@ -11465,15 +11772,64 @@ def _validate_dynamic_model_auth(
             },
             status_code=400,
         )
-    profile = str(
-        getattr(getattr(request.app.state, "oidc_config", None), "obo_grant_profile", "") or ""
-    )
+
+    # --- Deployment posture: pair chosen by this request, or re-arming -----
+    if not posture_event:
+        return None
+    # Function-local import, same as the MCP validator above: oidc and
+    # mcp_oauth reference each other lazily, so this stays off the module
+    # import graph.
+    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+    # Check ORDER mirrors the MCP sibling: token store first, then
+    # OIDC-configured, then profile semantics — so a no-SSO host is told
+    # "single sign-on is not set up" rather than being steered at a profile
+    # knob whose emptiness is a symptom (pinned by
+    # test_no_sso_posture_refusal_names_sso_not_profile).
+    if getattr(request.app.state, "mcp_token_store", None) is None:
+        # 503, not 400: a missing encryption key is a deployment fault the
+        # operator remedies and retries — the MCP sibling's classification
+        # for the identical state (_OAUTH_TOKEN_STORE_503_MSG).
+        return JSONResponse(
+            {
+                "error": (
+                    f"auth_mode {auth_mode!r} mints and caches encrypted tokens, but "
+                    f"{STARTUP_KEY_REQUIRED_HINT}"
+                )
+            },
+            status_code=503,
+        )
+    if not _oidc_configured_for_model_auth(request):
+        return JSONResponse(
+            {
+                "error": (
+                    f"auth_mode {auth_mode!r} requires a configured [oidc] deployment; "
+                    "single sign-on is not set up"
+                )
+            },
+            status_code=400,
+        )
+    profile = _obo_profile(request)
+    if profile not in OBO_GRANT_PROFILES:
+        # Echo the configured value — the typo is the diagnosis. Mirrors the
+        # MCP validator's unknown-profile reject rather than coercing at load.
+        return JSONResponse(
+            {
+                "error": (
+                    f"[oidc] obo_grant_profile={profile!r} is not a valid grant profile "
+                    f"({', '.join(sorted(OBO_GRANT_PROFILES))}); dynamic model auth "
+                    "cannot mint until it is fixed"
+                )
+            },
+            status_code=400,
+        )
     if auth_mode == "entra_app" and profile != "entra":
         return JSONResponse(
             {
                 "error": (
-                    "auth_mode 'entra_app' requires [oidc] obo_grant_profile='entra'; "
-                    "RFC 8693 client-credentials is not supported"
+                    f"auth_mode 'entra_app' requires [oidc] obo_grant_profile='entra' "
+                    f"(configured: {profile!r}); RFC 8693 client-credentials is not "
+                    "supported"
                 )
             },
             status_code=400,
@@ -11564,9 +11920,10 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
 
     - new coordinator sessions see the new state at create-time;
     - active coordinator sessions auto-pick up the swap at next ``send()``
-      via ``ChatSession._refresh_model_from_registry`` (the per-send
-      check compares ``cfg.model`` against ``self.model`` and re-resolves
-      on mismatch).
+      via ``ChatSession._refresh_model_from_registry``: the per-send check
+      compares the registry's reload generation as well as ``cfg.model``
+      against ``self.model``, so the swap propagates even when an alias
+      keeps its backend model id (base-URL or auth redirects included).
 
     Errors are logged + swallowed.  The DB write that triggered this
     refresh has already succeeded, and the explicit reload button
@@ -11574,6 +11931,12 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
     (e.g. admin deleted the alias that ``registry.default`` points at)
     leave the existing registry intact rather than tearing down a
     working coordinator.
+
+    The swap runs through the chokepoint in ``ModelRegistry.reload``: a
+    keyless console must not acquire dynamic aliases through a peer
+    console's DB write or a reload click, so that refusal keeps the
+    last-good registry and is recorded via
+    :func:`_record_coord_key_refusal`.
     """
     from turnstone.core.model_registry import load_model_registry
 
@@ -11606,11 +11969,24 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
             new_registry.default,
             new_registry.fallback,
             new_registry.agent_model,
+            app_state=app_state,
             task_model=new_registry.task_model,
             task_effort=new_registry.task_effort,
         )
+    except DynamicAuthKeyError as exc:
+        # The swap chokepoint refused (dynamic aliases, no key): the live
+        # coordinator keeps its last-good registry. The ERROR log is the
+        # observable here, but the string is still set so a later subsystem
+        # outage names the real blocker instead of a stale cause.
+        _record_coord_key_refusal(app_state, str(exc))
     except Exception:
         log.warning("console.coord_registry_refresh_reload_failed", exc_info=True)
+    else:
+        # A completed swap is the registry passing its own admission check,
+        # so any earlier refusal no longer describes it. Same staleness rule
+        # as the refusal arm, in the recovery direction (pinned:
+        # test_refresh_clears_key_refusal_after_recovery).
+        app_state.coord_registry_error = ""
     finally:
         # Defensive — load_model_registry doesn't eagerly create clients
         # (ModelRegistry.__init__ leaves _clients/_providers empty; they
@@ -11681,6 +12057,10 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
         except Exception:
             log.warning("console.coord_bootstrap_load_failed", exc_info=True)
             return
+        # Same refusal as the lifespan twin: a CRUD write must not revive
+        # a keyless coordinator and erase the remediation banner.
+        if _refuse_keyless_registry(app.state, coord_registry):
+            return
         try:
             # ``_bootstrap_coord_subsystem`` stamps ``coord_registry``
             # and clears ``coord_registry_error`` itself as the final
@@ -11739,6 +12119,10 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
+    # NOT allow_service_bypass=False: every sibling model-definition endpoint
+    # keeps the bypass, so refusing it here alone would break read-modify-write
+    # automation while leaving the writes wide open. Tightening this is a
+    # decision for the whole endpoint family, not one read.
     err = require_permission(request, "admin.models")
     if err:
         return err
@@ -11755,50 +12139,38 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
         m["source"] = "db"
         result.append(_mask_model_secrets(m))
 
-    # Merge config-sourced models visible on nodes but not in DB
+    # Merge config-sourced models visible on nodes but not in DB. One flat
+    # pass first (first node reporting an alias wins, matching node_statuses
+    # order) so the synthetic-entry loop below does not rescan every node's
+    # payload per alias.
     config_aliases: set[str] = set()
+    node_alias_info: dict[str, dict[str, Any]] = {}
     for node_models in node_statuses.values():
-        for alias in node_models:
-            if alias not in db_aliases:
-                config_aliases.add(alias)
+        for alias, nm in node_models.items():
+            if alias in db_aliases:
+                continue
+            config_aliases.add(alias)
+            if nm and alias not in node_alias_info:
+                node_alias_info[alias] = nm
     for alias in sorted(config_aliases):
         # Build a synthetic read-only entry from node-reported data
-        model_name = ""
-        provider = "openai"
-        context_window = 0
-        cfg_temperature = None
-        cfg_max_tokens = None
-        cfg_reasoning_effort = None
-        cfg_auth_mode = "static"
-        cfg_obo_audience = ""
-        for node_models in node_statuses.values():
-            nm = node_models.get(alias)
-            if nm:
-                model_name = nm.get("model", "")
-                provider = nm.get("provider", "openai")
-                context_window = nm.get("context_window", 0)
-                cfg_temperature = nm.get("temperature")
-                cfg_max_tokens = nm.get("max_tokens")
-                cfg_reasoning_effort = nm.get("reasoning_effort")
-                cfg_auth_mode = nm.get("auth_mode", "static")
-                cfg_obo_audience = nm.get("obo_audience", "")
-                break
+        nm = node_alias_info.get(alias) or {}
         result.append(
             {
                 "definition_id": "",
                 "alias": alias,
-                "model": model_name,
-                "provider": provider,
+                "model": nm.get("model", ""),
+                "provider": nm.get("provider", "openai"),
                 "base_url": "",
                 "api_key": "",
-                "context_window": context_window,
+                "context_window": nm.get("context_window", 0),
                 "capabilities": "{}",
                 "enabled": True,
-                "temperature": cfg_temperature,
-                "max_tokens": cfg_max_tokens,
-                "reasoning_effort": cfg_reasoning_effort,
-                "auth_mode": cfg_auth_mode,
-                "obo_audience": cfg_obo_audience,
+                "temperature": nm.get("temperature"),
+                "max_tokens": nm.get("max_tokens"),
+                "reasoning_effort": nm.get("reasoning_effort"),
+                "auth_mode": nm.get("auth_mode", "static"),
+                "obo_audience": nm.get("obo_audience", ""),
                 "source": "config",
                 "created_by": "",
                 "created": "",
@@ -11830,7 +12202,49 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
     else:
         default_alias = ""
 
+    # Deliberately NO auth constraints here: serving the allow-list and grant
+    # profile under admin.models (or to a service token via the bypass) hands
+    # out the enumeration the write siblings were reordered to prevent. The
+    # shelf fetches them from the admin.mcp-gated auth-constraints route.
     return JSONResponse({"models": result, "default_alias": default_alias})
+
+
+async def admin_model_auth_constraints(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/model-definitions/auth-constraints.
+
+    The shelf's affordance data: the operator-approved audiences (rendered as
+    datalist suggestions) and the deployment grant profile (labels the
+    ``entra_app`` option and decides whether the Backend-auth section shows
+    at all on a no-SSO deployment).
+
+    Gated on ``admin.mcp`` as DEFENSE IN DEPTH, not confidentiality — each
+    row's CHOSEN audience is already readable under ``admin.models`` on the
+    list/get siblings. What the gate covers is the DEPLOYMENT-WIDE
+    enumeration: the full approved audience set, including audiences no row
+    has chosen, is not served to a cheaper scope than the write that uses it.
+
+    Affordance, not gate: the shelf must fail OPEN on any failure to fetch
+    this (free-text audience input, no modes disabled). The write validator
+    is the authority; this exists so the common path never meets its 400s.
+    """
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+    if err:
+        return err
+    return JSONResponse(
+        {
+            "auth_audience_allowlist": sorted(_model_auth_audience_allowlist(request)),
+            "auth_grant_profile": (
+                _obo_profile(request) if _oidc_configured_for_model_auth(request) else ""
+            ),
+            # Server-derived, so the shelf's dynamic-mode affordances track
+            # the server's classification by data rather than a hand-kept
+            # mirror across the language seam; the client's hand-list is only
+            # the fail-open fallback for a missing/failed fetch.
+            "dynamic_auth_modes": sorted(DYNAMIC_MODEL_AUTH_MODES),
+        }
+    )
 
 
 async def admin_create_model_definition(request: Request) -> JSONResponse:
@@ -11883,12 +12297,26 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     base_url = str(body.get("base_url", "")).strip()
     api_key = str(body.get("api_key", "")).strip()
     ctx_raw = body.get("context_window", 32768)
+    # json admits NaN/Infinity literals, which pass the isinstance check but
+    # crash int(); refuse non-finite floats as invalid values instead.
+    if isinstance(ctx_raw, float) and not math.isfinite(ctx_raw):
+        return JSONResponse({"error": "context_window must be a finite number"}, status_code=400)
     context_window = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
     caps = body.get("capabilities", {})
+    if not isinstance(caps, dict):
+        # Mirror of the update twin's refusal: coercing a null or the STRING
+        # shape GET returns to "{}" silently drops server_compat, thinking
+        # keys and reranker calibration on a clone-via-GET script. Only a
+        # PRESENT non-object is refused (twin parity pinned:
+        # test_create_and_update_twins_agree_on_non_dict_capabilities).
+        return JSONResponse(
+            {"error": "capabilities must be an object; omit for defaults"},
+            status_code=400,
+        )
     err_msg = _validate_api_surface(caps)
     if err_msg:
         return JSONResponse({"error": err_msg}, status_code=400)
-    capabilities = json.dumps(caps) if isinstance(caps, dict) else "{}"
+    capabilities = json.dumps(caps)
     enabled = bool(body.get("enabled", True))
 
     # Per-model sampling overrides (None = use global default)
@@ -11927,12 +12355,27 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     auth_mode = str(body.get("auth_mode", "static")).strip() or "static"
     if auth_mode not in _MODEL_AUTH_MODES:
         return JSONResponse({"error": f"Invalid auth_mode: {auth_mode!r}"}, status_code=400)
-    obo_audience = _clean_oauth_text(body.get("obo_audience"), max_length=2048) or ""
-    if auth_mode in ("entra_obo", "entra_app") and not obo_audience:
-        return JSONResponse(
-            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
-            status_code=400,
-        )
+    obo_audience = (
+        _clean_oauth_text(body.get("obo_audience"), max_length=OBO_AUDIENCE_MAX_LEN) or ""
+    )
+    if auth_mode in DYNAMIC_MODEL_AUTH_MODES and not obo_audience:
+        return JSONResponse({"error": _AUDIENCE_REQUIRED_ERROR}, status_code=400)
+    # The staging guard, mirrored on the update twin: a static row must not
+    # STORE an audience, or an admin.models-only caller (the escalation gate
+    # below is skipped entirely for static) parks an unvalidated one for a
+    # later flip to inherit. A request-shape 400, so it may precede the
+    # permission gate — it discriminates only on the request's own fields.
+    if auth_mode == "static" and obo_audience:
+        return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
+    if auth_mode != "static":
+        # Redeeming an operator-chosen audience is the same capability as
+        # configuring oauth_audience on MCP; service credentials do not bypass
+        # it. Runs BEFORE the config validation below, whose 400s describe
+        # deployment posture and allow-list contents this caller must not
+        # enumerate one guess at a time.
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
     dynamic_auth_error = _validate_dynamic_model_auth(
         request,
         auth_mode=auth_mode,
@@ -11940,13 +12383,6 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     )
     if dynamic_auth_error is not None:
         return dynamic_auth_error
-    if auth_mode != "static":
-        # Redeeming an operator-chosen audience is the same capability as
-        # configuring oauth_audience on MCP. Service credentials do not bypass
-        # this capability-escalation gate.
-        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
-        if err:
-            return err
 
     storage.create_model_definition(
         definition_id=definition_id,
@@ -11968,13 +12404,20 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         obo_audience=obo_audience,
     )
 
+    # Record the auth pair, as the update path already does: it is a
+    # capability-escalating choice, so the audit trail must cover the request
+    # that INTRODUCES it, not only later edits.
+    audit_detail: dict[str, Any] = {"alias": alias}
+    if auth_mode != "static":
+        audit_detail["auth_mode"] = auth_mode
+        audit_detail["obo_audience"] = obo_audience
     record_audit(
         storage,
         audit_uid,
         "model_definition.create",
         "model_definition",
         definition_id,
-        {"alias": alias},
+        audit_detail,
         ip,
     )
 
@@ -11985,6 +12428,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     await asyncio.to_thread(_ensure_console_mcp_client, request.app)
     _emit_models_changed(request)
+    # Same refused-swap surfacing as the update twin (see its comment): the
+    # row is stored, but a keyless console's live registry may have refused
+    # to adopt it, so the shelf warns instead of toasting success.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
 
     created = storage.get_model_definition(definition_id)
     if created is None:
@@ -11992,7 +12439,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": f"Model alias '{alias}' already exists (concurrent insert)"},
             status_code=409,
         )
-    return JSONResponse(_mask_model_secrets(created))
+    payload = _mask_model_secrets(created)
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_get_model_definition(request: Request) -> JSONResponse:
@@ -12075,13 +12525,28 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             updates["api_key"] = api_key
     if "context_window" in body:
         ctx_raw = body["context_window"]
+        # Twin of the create guard: a NaN/Infinity literal passes the
+        # isinstance check but crashes int(); refuse it as invalid.
+        if isinstance(ctx_raw, float) and not math.isfinite(ctx_raw):
+            return JSONResponse(
+                {"error": "context_window must be a finite number"}, status_code=400
+            )
         updates["context_window"] = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
     if "capabilities" in body:
         caps = body["capabilities"]
+        if not isinstance(caps, dict):
+            # Coercing a null or the STRING shape GET returns to "{}"
+            # silently erases server_compat, thinking_mode and reranker
+            # calibration on a read-modify-write; an absent key already
+            # means "leave unchanged" (this ladder is presence-keyed).
+            return JSONResponse(
+                {"error": "capabilities must be an object; omit to leave unchanged"},
+                status_code=400,
+            )
         err_msg = _validate_api_surface(caps)
         if err_msg:
             return JSONResponse({"error": err_msg}, status_code=400)
-        updates["capabilities"] = json.dumps(caps) if isinstance(caps, dict) else "{}"
+        updates["capabilities"] = json.dumps(caps)
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
 
@@ -12139,44 +12604,37 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             return JSONResponse({"error": f"Invalid auth_mode: {am!r}"}, status_code=400)
         updates["auth_mode"] = am
     if "obo_audience" in body:
-        updates["obo_audience"] = _clean_oauth_text(body["obo_audience"], max_length=2048) or ""
-    # Cross-field: entra_obo needs an audience. Validate the POST-merge state so
-    # a request that touches only one of the pair still checks against the other.
-    eff_auth_mode = updates.get("auth_mode", existing.get("auth_mode", "static"))
-    eff_audience = updates.get("obo_audience", existing.get("obo_audience", ""))
-    if eff_auth_mode in ("entra_obo", "entra_app") and not eff_audience:
-        return JSONResponse(
-            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
-            status_code=400,
+        updates["obo_audience"] = (
+            _clean_oauth_text(body["obo_audience"], max_length=OBO_AUDIENCE_MAX_LEN) or ""
         )
-    old_auth_mode = str(existing.get("auth_mode") or "static")
-    old_audience = str(existing.get("obo_audience") or "")
-    old_base_url = str(existing.get("base_url") or "")
-    eff_base_url = str(updates.get("base_url", old_base_url))
-    auth_config_changed = (
-        str(eff_auth_mode) != old_auth_mode
-        or str(eff_audience) != old_audience
-        # A base-URL change on either side of a dynamic configuration can
-        # redirect a valid bearer even when the auth fields are unchanged.
-        or (
-            eff_base_url != old_base_url
-            and (
-                old_auth_mode in ("entra_obo", "entra_app")
-                or eff_auth_mode in ("entra_obo", "entra_app")
-            )
-        )
-    )
-    if auth_config_changed:
-        dynamic_auth_error = _validate_dynamic_model_auth(
-            request,
-            auth_mode=str(eff_auth_mode),
-            audience=str(eff_audience),
-        )
-        if dynamic_auth_error is not None:
-            return dynamic_auth_error
+    # Every gate fact derives purely in _derive_auth_gate, whose docstring
+    # carries the rulings; this handler only maps fields to responses.
+    gate = _derive_auth_gate(existing, updates)
+    # Cross-field: a dynamic mode needs an audience, validated on the
+    # POST-merge state so a request touching only one of the pair still
+    # checks against the other.
+    if gate.audience_required_violation:
+        return JSONResponse({"error": _AUDIENCE_REQUIRED_ERROR}, status_code=400)
+    if gate.static_new_audience_violation:
+        return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
+    if gate.auth_config_changed:
+        # Permission first: the validation 400s below describe deployment OIDC
+        # posture and allow-list membership, which a caller lacking this scope
+        # must not be able to probe.
         err = require_permission(request, "admin.mcp", allow_service_bypass=False)
         if err:
             return err
+        # An edit leaving the pair untouched still needs the scope above — it
+        # can redirect or re-arm a live bearer — but is not held to deployment
+        # posture it did not choose.
+        dynamic_auth_error = _validate_dynamic_model_auth(
+            request,
+            auth_mode=gate.eff_auth_mode,
+            audience=gate.eff_audience,
+            posture_event=gate.posture_event,
+        )
+        if dynamic_auth_error is not None:
+            return dynamic_auth_error
 
     if updates:
         storage.update_model_definition(definition_id, **updates)
@@ -12185,6 +12643,17 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     audit_detail = dict(updates)
     if "api_key" in audit_detail:
         audit_detail["api_key"] = "(updated)"
+    if gate.auth_config_changed:
+        # Make the gate decision reconstructable from the audit row alone.
+        # Inserted FIRST: the audit tab renders only a detail's first three
+        # keys, past which a full-form save buries an appended marker
+        # (pinned: test_auth_markers_render_in_audit_detail_first_keys).
+        audit_detail = {"auth_gated": True, **audit_detail}
+    elif gate.dynamic_involved and gate.pure_disable:
+        # The carve-out's own marker — auth_gated would claim a gate that
+        # deliberately did not run, but a disarm is still an auth-relevant
+        # event the trail must reconstruct. Same first-position insert.
+        audit_detail = {"auth_disarmed": True, **audit_detail}
     record_audit(
         storage,
         audit_uid,
@@ -12195,14 +12664,26 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         ip,
     )
 
+    registry_warning = ""
     if updates:
         await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
         await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
         await asyncio.to_thread(_ensure_console_mcp_client, request.app)
         _emit_models_changed(request)
+        # The DB write is committed either way, but THIS console's live
+        # registry swap may have been refused (keyless host + dynamic rows).
+        # The refresh's refusal arm records ``coord_registry_error`` and its
+        # success arm clears it, so a non-empty value here means the running
+        # coordinator did NOT adopt this write. With the subsystem UP the 503
+        # remediation path never renders, so surfacing it on the response is
+        # the only evidence the shelf can show.
+        registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
 
     model_def = storage.get_model_definition(definition_id)
-    return JSONResponse(_mask_model_secrets(model_def or {}))
+    payload = _mask_model_secrets(model_def or {})
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_delete_model_definition(request: Request) -> JSONResponse:
@@ -12240,7 +12721,14 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     _emit_models_changed(request)
 
-    return JSONResponse({"status": "ok", "definition_id": definition_id})
+    # Same refused-swap surfacing as the create/update twins: the row is gone
+    # from the DB, but a keyless console's refused swap keeps SERVING the
+    # deleted alias to running and new coordinator sessions.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    payload: dict[str, Any] = {"status": "ok", "definition_id": definition_id}
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_model_reload(request: Request) -> JSONResponse:
@@ -12269,7 +12757,14 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     _emit_models_changed(request)
 
     results = await _notify_nodes_model_reload(request)
-    return JSONResponse({"status": "ok", "results": results})
+    # This route's whole purpose is "make the live registry match the DB", so
+    # a refused console swap is the one outcome it must not report as
+    # unqualified success. Same surfacing as the create/update twins.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    payload: dict[str, Any] = {"status": "ok", "results": results}
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 def _global_rerank_instruction(app_state: Any) -> str:
@@ -12428,10 +12923,15 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
     Probe a saved reranker model's /rerank endpoint with the labelled set,
     persist the three calibration fields onto its capabilities, and return a
     verdict. A calibration failure is graceful (``error`` set, ``separated``
-    False, nothing persisted) — never a 500.
+    False, nothing persisted) — never a 500. The one 500 this route returns
+    is the confinement refusal below, where the merge wrote outside its
+    calibration-keys contract: an internal fault, not a calibration outcome.
     """
     from turnstone.core.auth import require_permission
-    from turnstone.core.rerank_calibrate import merge_calibration_into_caps
+    from turnstone.core.rerank_calibrate import (
+        calibration_confinement_violations,
+        merge_calibration_into_caps,
+    )
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -12489,10 +12989,73 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
         )
 
     # Merge the calibration fields into the stored capabilities JSON.
-    storage.update_model_definition(
-        definition_id,
-        capabilities=merge_calibration_into_caps(existing.get("capabilities"), cal),
-    )
+    #
+    # ``capabilities`` is a GATED column on the model-definition write path
+    # (its server_compat half selects the provider factory), yet this write
+    # runs under admin.models: safe because merge_calibration_into_caps is
+    # structurally confined to the probe-derived calibration keys and cannot
+    # reach server_compat or carry request-controlled JSON (pinned:
+    # test_calibrate_merge_confined_to_calibration_fields). ENFORCED, not
+    # merely pinned (complete mediation on the column's second producer):
+    # the merge is verified to have changed nothing outside its contract and
+    # the write refused otherwise, so a future merge edit cannot smuggle a
+    # gated change past the admin.mcp gate this endpoint deliberately lacks
+    # (pinned: test_calibrate_refuses_merge_that_writes_out_of_band_keys).
+    #
+    # RE-READ the row at persist time, then write CONDITIONALLY: the probe
+    # above holds no lock and can run for up to 90 seconds, so a capabilities
+    # write landing in that window (an admin.mcp-gated PUT — the very writes
+    # the gate protects) must survive this merge. The fresh read only NARROWS
+    # the window; what closes it is the conditional persist
+    # (``expected_capabilities``), where a write landing between read and
+    # update misses the compare and the loop re-merges onto the newer value.
+    # Bounded retries, so under sustained write pressure the calibration
+    # yields with a 409 rather than last-writer-winning over a gated edit
+    # (pinned: test_concurrent_capabilities_put_survives_calibrate and
+    # test_calibrate_cas_retries_when_write_lands_between_reread_and_persist).
+    persisted = False
+    for _ in range(3):
+        current = storage.get_model_definition(definition_id)
+        if current is None:
+            # The row was deleted while the probe ran; same not-found
+            # classification as the head-of-handler check.
+            return JSONResponse({"error": "Model definition not found"}, status_code=404)
+        merged_caps = merge_calibration_into_caps(current.get("capabilities"), cal)
+        violations = calibration_confinement_violations(
+            current.get("capabilities"), merged_caps, cal
+        )
+        if violations:
+            log.error(
+                "model_calibrate.confinement_violation definition_id=%s keys=%s",
+                definition_id,
+                ",".join(violations),
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        "calibration merge changed capabilities keys outside its "
+                        f"contract ({', '.join(violations)}); write refused"
+                    )
+                },
+                status_code=500,
+            )
+        if storage.update_model_definition(
+            definition_id,
+            capabilities=merged_caps,
+            expected_capabilities=current.get("capabilities"),
+        ):
+            persisted = True
+            break
+    if not persisted:
+        return JSONResponse(
+            {
+                "error": (
+                    "capabilities changed concurrently on every persist attempt; "
+                    "calibration not saved — retry once the edits settle"
+                )
+            },
+            status_code=409,
+        )
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -12512,17 +13075,22 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     _emit_models_changed(request)
 
-    return JSONResponse(
-        {
-            "separated": cal.separated,
-            "suggested_threshold": cal.suggested_threshold,
-            "raw_scale": cal.raw_scale,
-            "relevant": [cal.relevant_min, cal.relevant_max],
-            "irrelevant": [cal.irrelevant_min, cal.irrelevant_max],
-            "applied": True,
-            "error": "",
-        }
-    )
+    # Same refused-swap surfacing as the create/update twins: the
+    # calibration is stored, but a keyless console's live registry may
+    # have refused to adopt it.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    payload = {
+        "separated": cal.separated,
+        "suggested_threshold": cal.suggested_threshold,
+        "raw_scale": cal.raw_scale,
+        "relevant": [cal.relevant_min, cal.relevant_max],
+        "irrelevant": [cal.irrelevant_min, cal.irrelevant_max],
+        "applied": True,
+        "error": "",
+    }
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_model_capabilities(request: Request) -> JSONResponse:
@@ -14987,6 +15555,12 @@ def create_app(
                     ),
                     # System: Model Definitions
                     Route("/api/admin/model-definitions", admin_list_model_definitions),
+                    # Static path — must precede the {definition_id} routes or
+                    # Starlette matches it as definition_id="auth-constraints".
+                    Route(
+                        "/api/admin/model-definitions/auth-constraints",
+                        admin_model_auth_constraints,
+                    ),
                     Route(
                         "/api/admin/model-definitions",
                         admin_create_model_definition,

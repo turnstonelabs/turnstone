@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.8.0a2",
+    "version": "1.8.0a5",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -639,7 +639,7 @@
         "tags": [
           "Streaming"
         ],
-        "description": "Server-Sent Events stream for node-level state broadcasts. Emits a node_snapshot event on connect (workstreams, health, aggregate), followed by real-time delta events (ws_state, ws_activity, ws_created, ws_closed, ws_rename, health_changed, aggregate). Pass ?expected_node_id=X for identity verification (returns 409 on mismatch).",
+        "description": "Server-Sent Events stream for node-level state broadcasts. Emits a node_snapshot event on connect (workstreams, health, aggregate), followed by real-time delta events (ws_state, ws_activity, ws_created, ws_closed, ws_rename, health_changed, aggregate). Pass ?expected_node_id=X for identity verification (returns 409 on mismatch). Every event's SSE id is an opaque '{boot_epoch}-{counter}' string; presenting it on reconnect (Last-Event-ID header or ?last_event_id=) replays missed events, or emits a replay_truncated event (reason: ring_evicted with lost_count + earliest_available_id, or boot_epoch when the cursor predates this server process) followed by a fresh node_snapshot. Treat the id as opaque \u2014 its format may change.",
         "responses": {
           "200": {
             "description": "Success"

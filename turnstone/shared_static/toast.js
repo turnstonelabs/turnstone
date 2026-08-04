@@ -28,8 +28,12 @@ export function showToast(message, type) {
 
 function _displayToast(el, message, type) {
   el.textContent = message;
-  el.classList.remove("toast-error");
+  el.classList.remove("toast-error", "toast-warn");
   if (type === "error") el.classList.add("toast-error");
+  // "warn": the operation succeeded but with a caveat the operator should
+  // read (e.g. a model save whose live registry adoption was refused) —
+  // amber, between the neutral default and the red error.
+  if (type === "warn") el.classList.add("toast-warn");
   // A document-modal <dialog> owns the top layer, which stacks above every
   // z-index — a toast fired while one is open (e.g. "Token copied" over the
   // token-created dialog) would render underneath. Promote to a manual

@@ -1009,7 +1009,7 @@ def resolve_doctor_brain(
             storage=storage,
             allow_empty=True,
         )
-        client, model_name, cfg = registry.resolve(alias or None)
+        client, model_name, cfg, _ = registry.resolve(alias or None)
     except Exception as exc:  # noqa: BLE001 - any failure means "no usable model"
         return None, BackendVerdict(False, f"no usable model configured: {exc}")
 

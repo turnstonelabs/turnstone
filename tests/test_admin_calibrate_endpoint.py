@@ -162,6 +162,165 @@ def test_calibrate_persists_and_returns_verdict(
     assert caps["supports_rerank"] is True  # merge, not replace
 
 
+def test_concurrent_capabilities_put_survives_calibrate(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The merge bases itself on a persist-time re-read, not the pre-probe
+    snapshot."""
+    _seed_reranker(storage, caps={"supports_rerank": True})
+
+    def _calibrate_and_race(
+        base_url: str,
+        model: str,
+        api_key: str,
+        *,
+        instruction: str = "",
+        timeout: float = 60.0,
+    ) -> CalibrationResult:
+        # Mid-probe writer: a capabilities PUT lands while the probe runs.
+        storage.update_model_definition(
+            "r1",
+            capabilities=json.dumps(
+                {"supports_rerank": True, "server_compat": {"extra_body": {"x": 1}}}
+            ),
+        )
+        return _result(separated=True, threshold=0.45)
+
+    monkeypatch.setattr("turnstone.core.rerank_calibrate.calibrate_model", _calibrate_and_race)
+    client = _make_client(storage, _make_registry())
+
+    resp = client.post("/v1/api/admin/model-definitions/r1/calibrate")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is True
+    caps = json.loads(storage.get_model_definition("r1")["capabilities"])
+    assert caps["server_compat"] == {"extra_body": {"x": 1}}
+    assert caps["rerank_threshold"] == 0.45
+    assert caps["rerank_separated"] is True
+
+
+def test_calibrate_cas_retries_when_write_lands_between_reread_and_persist(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persist is conditional: a missed compare re-merges onto the
+    newer value."""
+    _seed_reranker(storage, caps={"supports_rerank": True})
+    _stub_calibrate(monkeypatch, _result(separated=True, threshold=0.45))
+
+    real_update = storage.update_model_definition
+    state = {"interleaved": False}
+
+    def _update_with_interleaved_writer(definition_id: str, **kwargs: Any) -> bool:
+        if not state["interleaved"]:
+            state["interleaved"] = True
+            # Lands after the handler's re-read + merge, before its persist.
+            real_update(
+                definition_id,
+                capabilities=json.dumps(
+                    {"supports_rerank": True, "server_compat": {"extra_body": {"x": 2}}}
+                ),
+            )
+        return real_update(definition_id, **kwargs)
+
+    monkeypatch.setattr(storage, "update_model_definition", _update_with_interleaved_writer)
+    client = _make_client(storage, _make_registry())
+
+    resp = client.post("/v1/api/admin/model-definitions/r1/calibrate")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is True
+    assert state["interleaved"]
+    caps = json.loads(storage.get_model_definition("r1")["capabilities"])
+    assert caps["server_compat"] == {"extra_body": {"x": 2}}
+    assert caps["rerank_threshold"] == 0.45
+    assert caps["rerank_separated"] is True
+
+
+def test_calibrate_yields_409_under_sustained_concurrent_writes(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retries are bounded: under sustained pressure the competing writes
+    win, not the calibrate."""
+    _seed_reranker(storage, caps={"supports_rerank": True})
+    _stub_calibrate(monkeypatch, _result(separated=True, threshold=0.45))
+
+    real_update = storage.update_model_definition
+    state = {"n": 0}
+
+    def _update_with_persistent_writer(definition_id: str, **kwargs: Any) -> bool:
+        if "expected_capabilities" in kwargs:
+            # A different value before every attempt, so each fresh
+            # re-read is stale by persist time.
+            state["n"] += 1
+            real_update(
+                definition_id,
+                capabilities=json.dumps({"supports_rerank": True, "rev": state["n"]}),
+            )
+        return real_update(definition_id, **kwargs)
+
+    monkeypatch.setattr(storage, "update_model_definition", _update_with_persistent_writer)
+    client = _make_client(storage, _make_registry())
+
+    resp = client.post("/v1/api/admin/model-definitions/r1/calibrate")
+
+    assert resp.status_code == 409, resp.text
+    assert "concurrently" in resp.json()["error"]
+    assert state["n"] == 3  # the retry budget
+    caps = json.loads(storage.get_model_definition("r1")["capabilities"])
+    assert "rerank_threshold" not in caps
+    assert caps["rev"] == 3
+
+
+def test_row_deleted_mid_probe_is_not_found(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_reranker(storage)
+
+    def _calibrate_and_delete(
+        base_url: str,
+        model: str,
+        api_key: str,
+        *,
+        instruction: str = "",
+        timeout: float = 60.0,
+    ) -> CalibrationResult:
+        storage.delete_model_definition("r1")
+        return _result(separated=True, threshold=0.45)
+
+    monkeypatch.setattr("turnstone.core.rerank_calibrate.calibrate_model", _calibrate_and_delete)
+    client = _make_client(storage, _make_registry())
+
+    resp = client.post("/v1/api/admin/model-definitions/r1/calibrate")
+
+    assert resp.status_code == 404, resp.text
+    assert storage.get_model_definition("r1") is None
+
+
+def test_calibrate_refuses_merge_that_writes_out_of_band_keys(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A merge reaching a non-calibration key is refused, not smuggled past
+    the admin.mcp gate this endpoint lacks."""
+    _seed_reranker(storage)
+    _stub_calibrate(monkeypatch, _result(separated=True, threshold=0.42))
+    stored_before = storage.get_model_definition("r1")["capabilities"]
+
+    def _rogue_merge(raw_caps: Any, result: CalibrationResult) -> str:
+        caps = json.loads(raw_caps or "{}")
+        caps["rerank_threshold"] = 0.42
+        caps["server_compat"] = {"api_surface": "responses"}
+        return json.dumps(caps)
+
+    monkeypatch.setattr("turnstone.core.rerank_calibrate.merge_calibration_into_caps", _rogue_merge)
+    client = _make_client(storage, _make_registry())
+
+    resp = client.post("/v1/api/admin/model-definitions/r1/calibrate")
+
+    assert resp.status_code == 500, resp.text
+    assert "server_compat" in resp.json()["error"]
+    assert storage.get_model_definition("r1")["capabilities"] == stored_before
+
+
 def test_calibrate_no_separation_persists_marker(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -32,7 +32,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar
 
 import httpx
 
@@ -2104,8 +2104,9 @@ async def _maybe_persist_rotation(
         await persist_rotation(rotated)
 
 
-#: Audiences already warned about ignored entra scopes — dedupes the warning to
-#: once per audience per process (see _obo_mint_entra).
+#: Audiences already warned about ignored entra scopes — once per audience per
+#: process (see _obo_mint_entra). One of the module's _warn_dedup_once
+#: namespaces; the mechanics live with that helper.
 _ENTRA_SCOPE_IGNORED_WARNED: set[str] = set()
 
 
@@ -2130,7 +2131,7 @@ async def _obo_mint_entra(
     list would drop the audience and yield a wrong-audience token); they are a
     ``rfc8693``-only knob.
     """
-    if scopes and audience not in _ENTRA_SCOPE_IGNORED_WARNED:
+    if scopes:
         # Entra ignores oauth_scopes (it pins <audience>/.default), so a
         # configured scope restriction silently does not apply on this
         # credential-minting path. The admin write path rejects NEW
@@ -2138,8 +2139,9 @@ async def _obo_mint_entra(
         # (rfc8693→entra) leaves pre-existing scoped rows — surface that ONCE
         # per audience per process (not per mint) so it's visible at default log
         # levels without flooding.
-        _ENTRA_SCOPE_IGNORED_WARNED.add(audience)
-        log.warning(
+        _warn_dedup_once(
+            _ENTRA_SCOPE_IGNORED_WARNED,
+            audience,
             "mcp_server.oauth.obo_entra_scopes_ignored",
             audience=audience,
             hint=(
@@ -2712,8 +2714,177 @@ async def get_obo_access_token_classified(
 # server name. The DB row shares the token across workers; a loop-local memo
 # avoids a SQL read + decrypt on every warm model turn.
 
+# Once-per-(cause, audience) dedup for the OPERATOR-CONFIG model-mint
+# misconfiguration warnings: the conditions are deployment-stable and the
+# mints run per model call per lane, so repeating them is amplification, not
+# signal. The caller's per-turn fallback/refusal line remains the heartbeat
+# and names the cause inline via ``model_mint_refusal_cause``, so dedup here
+# never costs mid-incident visibility.
+#
+# SPLIT namespaces, deliberately: this set holds only deployment-config
+# causes, bounded by causes x configured audiences, while the one PER-USER
+# cause lives in its own bounded set below. Shared, enough users without an
+# OIDC sign-in would saturate the cap and permanently silence every later
+# operator-config cause; split, neither class can starve the other.
+_MODEL_MINT_MISCONFIG_WARNED: set[str] = set()
+# Per-(user, audience) dedup for model_obo.missing_credential; its
+# saturation silences only THIS cause. Tuple keys, not joined strings: user
+# ids and api:// audiences can both contain ``:``, so a concatenated key
+# could collide two distinct pairs.
+_MODEL_OBO_MISSING_CRED_WARNED: set[tuple[str, str]] = set()
+
+
+# Hard cap per dedup namespace. Keys derive from operator config or the user
+# population, so growth is bounded in practice; the cap only stops a
+# pathological deployment from turning a dedup set into a leak. Past it,
+# later keys go unlogged rather than unbounded, and the per-turn heartbeat
+# still fires on every occurrence.
+_WARN_DEDUP_CAP = 512
+
+
+_DedupKey = TypeVar("_DedupKey", str, tuple[str, str])
+
+
+def _warn_dedup_once(warned: set[_DedupKey], key: _DedupKey, event: str, **fields: Any) -> None:
+    """Emit ``log.warning(event, **fields)`` once per ``key`` in ``warned``.
+
+    The shared mechanics of the module's once-per-key warn namespaces, in
+    one home so a dedup-policy change (cap size, eviction, key
+    normalization) cannot land in one namespace and silently leave another
+    unbounded. The namespaces themselves stay split: each caller passes its
+    own set, so saturating one can never starve the others.
+    """
+    if key in warned:
+        return
+    if len(warned) >= _WARN_DEDUP_CAP:
+        return
+    warned.add(key)
+    log.warning(event, **fields)
+
+
+# Last-known mint refusal cause per (prefix, audience, user). The CAUSE
+# layer above is deduped to once per process, so this record lets the
+# DECISION layer (the session's per-turn heartbeat) name the cause inline on
+# every occurrence without re-amplifying the deduped warning. The key
+# carries the USER: on a shared audience, one user's successful mint must
+# not clear another's recorded cause, nor stamp its own into another's
+# heartbeat — app-identity mints record under the shared
+# MODEL_APP_MINT_PRINCIPAL. Written at every refusal diagnosis even when the
+# warning was dedup-suppressed; cleared only by the recording user's
+# successful mint. Capped like the per-user warn set. Tuple keys — user ids
+# and api:// audiences can both contain ``:``.
+_MODEL_MINT_LAST_CAUSE: dict[tuple[str, str, str], str] = {}
+
+
+def _record_mint_refusal_cause(prefix: str, audience: str, user_id: str, cause: str) -> None:
+    key = (prefix, audience, user_id)
+    if key not in _MODEL_MINT_LAST_CAUSE and len(_MODEL_MINT_LAST_CAUSE) >= _WARN_DEDUP_CAP:
+        return
+    _MODEL_MINT_LAST_CAUSE[key] = cause
+
+
+# Cooldown short-circuits need no re-stamp: the cause persists until its user's mint succeeds.
+
+
+def _clear_mint_refusal_cause(prefix: str, audience: str, user_id: str) -> None:
+    _MODEL_MINT_LAST_CAUSE.pop((prefix, audience, user_id), None)
+
+
+def model_mint_refusal_cause(prefix: str, audience: str, user_id: str) -> str:
+    """Best-effort cause of the most recent refused mint for *audience*.
+
+    ``prefix`` is ``"model_obo"`` or ``"model_app"``; ``user_id`` is the
+    minting principal the cause was recorded under — the acting user for
+    OBO mints, :data:`MODEL_APP_MINT_PRINCIPAL` for app-identity mints.
+    Returns ``""`` when no refusal has been recorded in this process for
+    that principal (or their mint has succeeded since); callers render that
+    as unknown.
+    """
+    return _MODEL_MINT_LAST_CAUSE.get((prefix, audience, user_id), "")
+
+
+def reset_model_mint_warn_state_for_tests() -> None:
+    """Empty every process-global mint warn/dedup/cause namespace.
+
+    Test support, exported from the module that OWNS the state so a new
+    namespace must be added to this reset in the same file. Test modules
+    reach it through ``tests/_oidc_test_helpers.mint_warn_state_reset()``
+    rather than hand-listing namespaces, which drifts.
+    """
+    _MODEL_MINT_MISCONFIG_WARNED.clear()
+    _MODEL_OBO_MISSING_CRED_WARNED.clear()
+    _ENTRA_SCOPE_IGNORED_WARNED.clear()
+    _MODEL_MINT_LAST_CAUSE.clear()
+
+
+def _warn_model_mint_misconfig_once(event: str, audience: str, user_id: str, **fields: Any) -> None:
+    # Record the cause FIRST, unconditionally: the warning below is deduped,
+    # but the heartbeat's readback must reflect every occurrence, attributed
+    # to the principal whose mint was refused.
+    prefix, _, cause = event.partition(".")
+    _record_mint_refusal_cause(prefix, audience, user_id, cause)
+    _warn_dedup_once(
+        _MODEL_MINT_MISCONFIG_WARNED, f"{event}:{audience}", event, audience=audience, **fields
+    )
+
+
+def _warn_model_obo_missing_credential_once(audience: str, user_id: str) -> None:
+    """Name the missing-credential cause once per (user, audience).
+
+    ``user_id`` deliberately stays IN the log line: this is an auth event,
+    and remediation — link THIS user's OIDC sign-in — needs the principal,
+    the same practice as the audit rows, which carry ids.
+    """
+    _record_mint_refusal_cause("model_obo", audience, user_id, "missing_credential")
+    _warn_dedup_once(
+        _MODEL_OBO_MISSING_CRED_WARNED,
+        (user_id, audience),
+        "model_obo.missing_credential",
+        audience=audience,
+        user_id=user_id,
+    )
+
+
+def _warn_mint_oidc_cause(prefix: str, oidc_config: Any, audience: str, user_id: str) -> None:
+    """Name the OIDC-not-ready cause for a model mint, once per (cause, audience).
+
+    Single-sourced for both mints (``model_obo``/``model_app`` prefix) so the
+    healing-state condition and the cause taxonomy cannot diverge. The
+    healing state stays distinct: ``discovery_retryable`` means OIDC is
+    configured and self-heals via ordinary auth traffic, so reporting it as
+    "not enabled" would aim the operator at healthy config and burn the
+    not-enabled dedup slot on a transient.
+    """
+    if getattr(oidc_config, "discovery_retryable", False):
+        _warn_model_mint_misconfig_once(f"{prefix}.oidc_discovery_pending", audience, user_id)
+    else:
+        _warn_model_mint_misconfig_once(f"{prefix}.oidc_not_enabled", audience, user_id)
+
+
+def _warn_mint_store_unavailable(
+    prefix: str, audience: str, user_id: str, token_store: Any, storage: Any
+) -> None:
+    """Name the missing token-store/storage cause, once per (cause, audience).
+
+    Single-sourced for both mints, same rationale as
+    :func:`_warn_mint_oidc_cause`.
+    """
+    _warn_model_mint_misconfig_once(
+        f"{prefix}.token_store_unavailable",
+        audience,
+        user_id,
+        has_token_store=token_store is not None,
+        has_storage=storage is not None,
+    )
+
+
 MODEL_OBO_CACHE_PREFIX = "__model_obo__:"
 MODEL_APP_CACHE_PREFIX = "__model_app__:"
+# The pseudo-principal app-identity mints run as: they carry no user, so
+# cache rows, cooldowns and the refusal-cause record all key under this
+# one shared identity. Public because the session's heartbeat reads the
+# model_app cause record under the same principal the mint records it as.
+MODEL_APP_MINT_PRINCIPAL = "__app__"
 _SYNTHETIC_TOKEN_PREFIXES = (MODEL_OBO_CACHE_PREFIX, MODEL_APP_CACHE_PREFIX)
 
 
@@ -2874,17 +3045,26 @@ async def mint_obo_access_token(
     """
     if not user_id or not audience:
         return None
+    # The caller's ``fallback_to_static`` is the DECISION layer and fires per
+    # turn but names no cause; these branches are the CAUSE layer, deduped to
+    # once per (cause, audience) per process.
     oidc_config = getattr(app_state, "oidc_config", None)
     if oidc_config is None or not getattr(oidc_config, "enabled", False):
+        _warn_mint_oidc_cause("model_obo", oidc_config, audience, user_id)
         return None
     token_store: MCPTokenStore | None = getattr(app_state, "mcp_token_store", None)
     storage = _get_storage(app_state)
     if token_store is None or storage is None:
+        _warn_mint_store_unavailable("model_obo", audience, user_id, token_store, storage)
         return None
     profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
     mint = _OBO_MINT_LEGS.get(profile)
     if mint is None:
-        log.warning("model_obo.unsupported_grant_profile", profile=profile)
+        # Deployment-stable, per-call-per-lane — same dedup rationale as the
+        # sibling causes.
+        _warn_model_mint_misconfig_once(
+            "model_obo.unsupported_grant_profile", audience, user_id, profile=profile
+        )
         return None
     issuer = str(getattr(oidc_config, "issuer", "") or "")
     cache_server = _model_obo_cache_server(audience)
@@ -2941,6 +3121,21 @@ async def mint_obo_access_token(
                 prune_on_missing=False,
             )
             if isinstance(credential, TokenLookupResult):
+                if credential.kind == "missing":
+                    # The most common per-user failure: no completed OIDC
+                    # sign-in, so no captured credential to redeem. Deduped
+                    # in its OWN namespace so a large user population cannot
+                    # saturate the operator-config cause set.
+                    _warn_model_obo_missing_credential_once(audience, user_id)
+                elif credential.kind == "decrypt_failure":
+                    # The credential exists but decrypts under no active key
+                    # (the keyring rotated away from it). Recording the cause
+                    # here — ``_read_obo_credential`` already warns per call —
+                    # keeps the heartbeat from rendering this class as
+                    # unknown, as every sibling refusal exit does.
+                    _record_mint_refusal_cause(
+                        "model_obo", audience, user_id, "credential_decrypt_failure"
+                    )
                 _arm_cooldown(app_state, user_id, cache_server)
                 return None
 
@@ -2976,6 +3171,7 @@ async def mint_obo_access_token(
                     )
             except MCPOAuthRefreshFailed:
                 _arm_cooldown(app_state, user_id, cache_server)
+                _record_mint_refusal_cause("model_obo", audience, user_id, "mint_failed")
                 log.warning(
                     "model_obo.mint_failed",
                     user_id=user_id,
@@ -2987,6 +3183,9 @@ async def mint_obo_access_token(
             access_token = tokens.get("access_token")
             if not isinstance(access_token, str) or not access_token:
                 _arm_cooldown(app_state, user_id, cache_server)
+                _record_mint_refusal_cause(
+                    "model_obo", audience, user_id, "mint_missing_access_token"
+                )
                 log.warning(
                     "model_obo.mint_missing_access_token",
                     user_id=user_id,
@@ -3025,6 +3224,7 @@ async def mint_obo_access_token(
                 audience=audience,
             )
             _clear_refresh_backoff(app_state, user_id, cache_server)
+            _clear_mint_refusal_cause("model_obo", audience, user_id)
             log.info(
                 "model_obo.minted",
                 user_id=user_id,
@@ -3046,7 +3246,7 @@ async def mint_obo_access_token(
 # to a single machine (virtual-account) identity with no per-user attribution. It
 # reuses the same DB mint-cache under a synthetic ``__app__`` user.
 
-_APP_CACHE_USER = "__app__"
+_APP_CACHE_USER = MODEL_APP_MINT_PRINCIPAL
 
 
 def _model_app_cache_server(audience: str) -> str:
@@ -3081,12 +3281,17 @@ async def mint_app_access_token(
     """
     if not audience:
         return None
+    # The CAUSE layer, as in mint_obo_access_token: same
+    # once-per-(cause, audience) dedup.
     oidc_config = getattr(app_state, "oidc_config", None)
     if oidc_config is None or not getattr(oidc_config, "enabled", False):
+        _warn_mint_oidc_cause("model_app", oidc_config, audience, _APP_CACHE_USER)
         return None
     profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
     if profile != "entra":
-        log.warning("model_app.unsupported_grant_profile", profile=profile)
+        _warn_model_mint_misconfig_once(
+            "model_app.unsupported_grant_profile", audience, _APP_CACHE_USER, profile=profile
+        )
         return None
     client_id = str(getattr(oidc_config, "client_id", "") or "")
     client_secret = str(getattr(oidc_config, "client_secret", "") or "")
@@ -3094,6 +3299,7 @@ async def mint_app_access_token(
     token_store: MCPTokenStore | None = getattr(app_state, "mcp_token_store", None)
     storage = _get_storage(app_state)
     if token_store is None or storage is None:
+        _warn_mint_store_unavailable("model_app", audience, _APP_CACHE_USER, token_store, storage)
         return None
     issuer = str(getattr(oidc_config, "issuer", "") or "")
 
@@ -3113,6 +3319,9 @@ async def mint_app_access_token(
         return None
     if not (client_id and client_secret and token_endpoint):
         _arm_cooldown(app_state, _APP_CACHE_USER, cache_server)
+        _record_mint_refusal_cause(
+            "model_app", audience, _APP_CACHE_USER, "credentials_unavailable"
+        )
         log.warning(
             "model_app.credentials_unavailable",
             has_client_id=bool(client_id),
@@ -3156,12 +3365,16 @@ async def mint_app_access_token(
                     )
             except MCPOAuthRefreshFailed:
                 _arm_cooldown(app_state, _APP_CACHE_USER, cache_server)
+                _record_mint_refusal_cause("model_app", audience, _APP_CACHE_USER, "mint_failed")
                 log.warning("model_app.mint_failed", audience=audience, exc_info=True)
                 return None
 
             access_token = tokens.get("access_token")
             if not isinstance(access_token, str) or not access_token:
                 _arm_cooldown(app_state, _APP_CACHE_USER, cache_server)
+                _record_mint_refusal_cause(
+                    "model_app", audience, _APP_CACHE_USER, "mint_missing_access_token"
+                )
                 log.warning("model_app.mint_missing_access_token", audience=audience)
                 return None
             expires_at = _expires_at_from_response(
@@ -3191,6 +3404,7 @@ async def mint_app_access_token(
                 audience=audience,
             )
             _clear_refresh_backoff(app_state, _APP_CACHE_USER, cache_server)
+            _clear_mint_refusal_cause("model_app", audience, _APP_CACHE_USER)
             log.info("model_app.minted", audience=audience, cache_server=cache_server)
             return access_token
     finally:

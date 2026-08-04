@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
@@ -19,9 +22,94 @@ log = get_logger(__name__)
 
 MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app"})
 
+# Derived, never hand-listed (fail-safe defaults): any mode later added to
+# MODEL_AUTH_MODES lands in this set BY CONSTRUCTION unless it is literally
+# "static", so membership tests fail CLOSED for modes nobody classified.
+# Import THIS wherever "is a dynamic auth mode" is asked; a hand-spelled
+# tuple is a drift seam where one missed site classifies a new mode as
+# static and skips the write gate entirely.
+DYNAMIC_MODEL_AUTH_MODES = frozenset(MODEL_AUTH_MODES) - {"static"}
+
+
+def _is_dynamic_auth_mode(mode: str) -> bool:
+    """The one in-module spelling of "this mode mints at runtime".
+
+    ``has_dynamic_auth`` (boot-guard input) and :func:`dynamic_auth_key_error`
+    (install/swap-guard input) both delegate here, so the two guards cannot
+    disagree about which registries need the encryption key.
+    """
+    return mode in DYNAMIC_MODEL_AUTH_MODES
+
 
 class ModelAuthConfigError(ValueError):
     """A model definition contains unsafe or internally inconsistent auth settings."""
+
+
+class ModelClientConstructionError(ValueError):
+    """A registry alias exists but its binding could not be constructed.
+
+    Covers BOTH construction legs: the SDK client (``create_client``) and
+    the provider adapter (``create_provider`` refusing the row's provider /
+    api_surface pairing, re-typed in :meth:`ModelRegistry.resolve_binding`).
+
+    A ``ValueError`` subclass so the HTTP routes' existing ValueError arms
+    keep mapping it unchanged, while in-process callers — the session bind
+    path — can tell "the alias is gone" (plain ``ValueError`` from the
+    lookup) from "the alias is present but its binding cannot be built" and
+    surface the construction cause. Conflating the two gave
+    self-contradictory diagnoses, e.g. a ``/model`` switch reporting the
+    alias unknown while listing it as available.
+    """
+
+
+class DynamicAuthKeyError(RuntimeError):
+    """A registry install or swap was refused: dynamic auth present, key absent.
+
+    Deliberately NOT a ``ValueError``: the node reload endpoint maps
+    ``ValueError`` to 422 (bad registry arguments), while this is a 503-class
+    deployment fault — the same classification the console write validator
+    gives the identical state. A distinct type keeps the two exits from being
+    conflated by a broad ``except`` arm.
+    """
+
+
+# Pre-lifespan swaps only. The node builds and re-shapes its registry in
+# ``main()`` before the app exists, so there is no token store to check yet —
+# ``initialize_mcp_crypto_state`` (SystemExit at boot) owns key enforcement
+# for that process phase moments later. Passing this sentinel says exactly
+# that and nothing else: every post-lifespan caller hands the real
+# ``app.state`` so :meth:`ModelRegistry.reload` can refuse. The parameter is
+# required rather than defaulted so a new call site must actively choose —
+# fail-safe defaults, not fail-open ones.
+KEY_GUARD_DEFERRED_TO_LIFESPAN: Any = object()
+
+
+def dynamic_auth_key_error(models: Mapping[str, ModelConfig], app_state: Any) -> str:
+    """The dynamic-auth key requirement, shared by every install/swap site.
+
+    One derivation so no two sites can drift: a registry carrying
+    dynamic-auth aliases must not become live on a host whose token store is
+    absent, or every mint fails per-call while the operator sees nothing.
+    Used by the swap chokepoint in :meth:`ModelRegistry.reload` and by the
+    console's first-install bootstrap paths. Returns ``""`` when permitted,
+    else the refusal message. Token-store presence is process-constant, so a
+    refusal here is stable until restart.
+    """
+    if not any(_is_dynamic_auth_mode(cfg.auth_mode) for cfg in models.values()):
+        return ""
+    if getattr(app_state, "mcp_token_store", None) is not None:
+        return ""
+    # Function-local: model_registry is imported by lightweight consumers
+    # that never touch crypto; keep the cryptography dependency off this
+    # module's import graph.
+    from turnstone.core.mcp_crypto import STARTUP_KEY_REQUIRED_HINT
+
+    # Mode list derived from the frozenset above, so a fourth dynamic mode
+    # cannot make this refusal name only the modes it was written against.
+    return (
+        f"dynamic model auth ({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))}) "
+        "is configured but " + STARTUP_KEY_REQUIRED_HINT
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -174,67 +262,81 @@ class ModelRegistry:
         self._clients: dict[str, Any] = {}
         self._providers: dict[str, LLMProvider] = {}
         self._client_lock = threading.Lock()
+        # Monotone count of completed reload() swaps. A counter, not a field
+        # diff: sessions re-resolve on ANY difference at the next send, so an
+        # in-place swap propagates even when the backend model id is
+        # unchanged, and future auth-relevant columns are covered by
+        # construction.
+        self._generation = 0
 
     # -- query methods -------------------------------------------------------
 
     def get_client(self, alias: str) -> Any:
         """Get or lazily create an API client for *alias*. Thread-safe."""
         with self._client_lock:
-            if alias not in self._models:
-                raise ValueError(f"Unknown model alias: {alias}")
-            if alias not in self._clients:
-                cfg = self._models[alias]
-                # An entra_obo / entra_app backend authenticates per-call via a
-                # minted token bound with ``client.with_options(api_key=...)``, so
-                # the cached client only needs to CONSTRUCT — feed a placeholder
-                # when no static fallback key is set (the SDKs reject an empty key
-                # that also has no env fallback).  The real credential is supplied
-                # per call and never rides on this base client object.
-                client_key = cfg.api_key
-                if not client_key and cfg.auth_mode in ("entra_obo", "entra_app"):
-                    client_key = "backend-auth-placeholder-unused"
-                try:
-                    self._clients[alias] = create_client(
-                        cfg.provider, base_url=cfg.base_url, api_key=client_key
-                    )
-                except ValueError:
-                    # create_client's own misconfig errors already carry
-                    # remediation text — pass through untouched.
-                    raise
-                except Exception as exc:
-                    # SDK construction can fail on environment problems the
-                    # config never sees — e.g. httpx resolving a CA-bundle
-                    # path that a venv rebuild deleted (FileNotFoundError).
-                    # Routes map ValueError to a 503 with the message;
-                    # anything else surfaces as an opaque 500, so re-type
-                    # here where the alias is known.  The ValueError text is
-                    # echoed to HTTP callers, so it carries only the
-                    # exception TYPE — arbitrary SDK exception text can
-                    # embed filesystem paths; the full detail goes to the
-                    # server log instead.
-                    log.warning(
-                        "Client construction failed for model alias %r (provider %s)",
-                        alias,
-                        cfg.provider,
-                        exc_info=True,
-                    )
-                    raise ValueError(
-                        f"failed to construct {cfg.provider} client for model "
-                        f"alias {alias!r}: {type(exc).__name__} (details in server log)"
-                    ) from exc
-            return self._clients[alias]
+            return self._get_client_locked(alias)
+
+    def _get_client_locked(self, alias: str) -> Any:
+        """``get_client`` body; the caller holds ``_client_lock``."""
+        if alias not in self._models:
+            raise ValueError(f"Unknown model alias: {alias}")
+        if alias not in self._clients:
+            cfg = self._models[alias]
+            # An entra_obo / entra_app backend authenticates per-call via a
+            # minted token bound with ``client.with_options(api_key=...)``, so
+            # the cached client only needs to CONSTRUCT — feed a placeholder
+            # when no static fallback key is set (the SDKs reject an empty key
+            # that also has no env fallback).  The real credential is supplied
+            # per call and never rides on this base client object.
+            client_key = cfg.api_key
+            if not client_key and _is_dynamic_auth_mode(cfg.auth_mode):
+                client_key = "backend-auth-placeholder-unused"
+            try:
+                self._clients[alias] = create_client(
+                    cfg.provider, base_url=cfg.base_url, api_key=client_key
+                )
+            except ValueError as exc:
+                # create_client's own misconfig errors already carry
+                # remediation text — keep the message verbatim, add the
+                # type so callers can tell "construction failed" from
+                # "alias missing".
+                raise ModelClientConstructionError(str(exc)) from exc
+            except Exception as exc:
+                # SDK construction can fail on environment problems the
+                # config never sees — e.g. httpx resolving a CA-bundle
+                # path that a venv rebuild deleted (FileNotFoundError).
+                # Routes map ValueError to a 503 with the message;
+                # anything else surfaces as an opaque 500, so re-type
+                # here where the alias is known.  The message text is
+                # echoed to HTTP callers, so it carries only the
+                # exception TYPE — arbitrary SDK exception text can
+                # embed filesystem paths; the full detail goes to the
+                # server log instead.
+                log.warning(
+                    "Client construction failed for model alias %r (provider %s)",
+                    alias,
+                    cfg.provider,
+                    exc_info=True,
+                )
+                raise ModelClientConstructionError(
+                    f"failed to construct {cfg.provider} client for model "
+                    f"alias {alias!r}: {type(exc).__name__} (details in server log)"
+                ) from exc
+        return self._clients[alias]
 
     def get_provider(self, alias: str) -> LLMProvider:
         """Get the ``LLMProvider`` for *alias*. Thread-safe, cached."""
         with self._client_lock:
-            if alias not in self._models:
-                raise ValueError(f"Unknown model alias: {alias}")
-            if alias not in self._providers:
-                cfg = self._models[alias]
-                self._providers[alias] = create_provider(
-                    cfg.provider, api_surface=_api_surface_of(cfg)
-                )
-            return self._providers[alias]
+            return self._get_provider_locked(alias)
+
+    def _get_provider_locked(self, alias: str) -> LLMProvider:
+        """``get_provider`` body; the caller holds ``_client_lock``."""
+        if alias not in self._models:
+            raise ValueError(f"Unknown model alias: {alias}")
+        if alias not in self._providers:
+            cfg = self._models[alias]
+            self._providers[alias] = create_provider(cfg.provider, api_surface=_api_surface_of(cfg))
+        return self._providers[alias]
 
     def get_config(self, alias: str) -> ModelConfig:
         """Return the ModelConfig for *alias*."""
@@ -248,20 +350,57 @@ class ModelRegistry:
 
     def has_dynamic_auth(self) -> bool:
         """Return whether any alias needs a runtime-minted backend credential."""
-        return any(cfg.auth_mode != "static" for cfg in self._models.values())
+        return any(_is_dynamic_auth_mode(cfg.auth_mode) for cfg in self._models.values())
 
     def list_aliases(self) -> list[str]:
         """Return all registered model aliases."""
         return list(self._models.keys())
 
-    def resolve(self, alias: str | None = None) -> tuple[Any, str, ModelConfig]:
-        """Resolve *alias* to ``(client, model_name, config)``.
+    def resolve(self, alias: str | None = None) -> tuple[Any, str, ModelConfig, int]:
+        """Resolve *alias* to ``(client, model_name, config, generation)``.
 
-        Uses the default alias when *alias* is ``None``.
+        Uses the default alias when *alias* is ``None``. One lock
+        acquisition, so config, client and generation all come from the same
+        registry snapshot and a caller stamping the returned generation
+        beside the returned client holds an exactly-paired binding.
         """
-        alias = alias or self.default
-        cfg = self.get_config(alias)
-        return self.get_client(alias), cfg.model, cfg
+        with self._client_lock:
+            alias = alias or self.default
+            cfg = self._models.get(alias)
+            if cfg is None:
+                raise ValueError(f"Unknown model alias: {alias}")
+            return self._get_client_locked(alias), cfg.model, cfg, self._generation
+
+    def resolve_binding(
+        self, alias: str | None = None
+    ) -> tuple[Any, str, ModelConfig, LLMProvider, int]:
+        """Resolve *alias* to ``(client, model_name, config, provider, generation)``.
+
+        The session bind primitive: everything a rebind commits, read under
+        ONE lock acquisition, so a :meth:`reload` landing between separate
+        ``resolve()`` / ``get_provider()`` calls cannot tear the binding by
+        pairing old-map client and config with a new-map provider. The
+        generation is read in the same hold, so the caller's stamp is
+        exactly the snapshot its binding came from.
+
+        Provider-leg construction failures are re-typed to
+        :class:`ModelClientConstructionError`, matching the client leg: the
+        alias provably exists here, so a plain ``ValueError`` would be
+        misread by the bind path as alias-missing.
+        """
+        with self._client_lock:
+            alias = alias or self.default
+            cfg = self._models.get(alias)
+            if cfg is None:
+                raise ValueError(f"Unknown model alias: {alias}")
+            client = self._get_client_locked(alias)
+            try:
+                provider = self._get_provider_locked(alias)
+            except ModelClientConstructionError:
+                raise
+            except ValueError as exc:
+                raise ModelClientConstructionError(str(exc)) from exc
+            return (client, cfg.model, cfg, provider, self._generation)
 
     def resolve_agent_alias(self, kind: str) -> str | None:
         """Return the configured alias for a sub-agent ``kind``.
@@ -294,6 +433,16 @@ class ModelRegistry:
         return len(self._models)
 
     @property
+    def generation(self) -> int:
+        """Monotone count of completed :meth:`reload` swaps.
+
+        Consumers compare by EQUALITY against the generation their binding
+        was resolved from; any difference means "re-resolve everything
+        derived from here". Never compare by ordering.
+        """
+        return self._generation
+
+    @property
     def models(self) -> dict[str, ModelConfig]:
         """Return a copy of the models dict (public accessor for reload)."""
         return dict(self._models)
@@ -306,16 +455,51 @@ class ModelRegistry:
         default: str,
         fallback: list[str] | None = None,
         agent_model: str | None = None,
+        *,
+        app_state: Any,
         task_model: str | None = None,
         task_effort: str | None = None,
     ) -> None:
         """Hot-reload all model configs. Thread-safe; clears cached clients.
 
+        THE model-registry swap chokepoint (complete mediation): every
+        live-registry swap on every host routes through here, so the
+        dynamic-auth-needs-key refusal below cannot be forgotten at a call
+        site (fail-safe defaults). ``app_state`` is required; pre-lifespan
+        boot paths pass :data:`KEY_GUARD_DEFERRED_TO_LIFESPAN` (see its
+        comment for why that is not a bypass). Raises
+        :class:`DynamicAuthKeyError` WITHOUT mutating when refused, and the
+        caller applies per-host policy.
+
         Validates arguments before mutating state so a bad reload
         does not leave the registry in an inconsistent state.
+
+        Every completed swap bumps :attr:`generation`; live sessions compare
+        it per send and re-resolve on mismatch, so the swap reaches them even
+        when an alias keeps its backend model id (see
+        ``ChatSession._refresh_model_from_registry``).
         """
+        if app_state is not KEY_GUARD_DEFERRED_TO_LIFESPAN:
+            key_err = dynamic_auth_key_error(models, app_state)
+            if key_err:
+                raise DynamicAuthKeyError(key_err)
         _validate_registry_args(models, default, fallback, agent_model, task_model)
         with self._client_lock:
+            # FIRST write inside the lock, deliberately BEFORE the map swap
+            # and the client teardown. The per-send refresh reads the maps
+            # lock-free and samples the generation AFTER them (see
+            # ``ChatSession._refresh_model_from_registry``); with the bump
+            # ordered first, that reader can observe new-generation +
+            # old-maps — a benign extra rebind, since ``resolve_binding()``
+            # takes this lock and lands on the completed swap — but never
+            # stale-generation + new-maps, which would let the skip-compare
+            # pass and route the turn into a client this reload is about to
+            # close. Sessions' STAMPED values come from
+            # resolve()/resolve_binding() under this same lock, so a stamp
+            # can never be newer than the binding it vouches for. Never
+            # bumped on a refused reload: both guards raise above, before
+            # any mutation.
+            self._generation += 1
             old_models = self._models
             self._models = dict(models)
             self.default = default

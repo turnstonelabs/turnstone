@@ -1656,7 +1656,7 @@
                 <div>
                   <label for="model-base-url"
                     >Base URL
-                    <span class="label-hint"
+                    <span class="label-hint" id="model-base-url-hint"
                       >empty = provider default</span
                     ></label
                   >
@@ -1695,33 +1695,49 @@
                   />
                 </div>
               </div>
-              <div class="sh-section">Backend auth</div>
-              <div class="field-pair">
-                <div>
-                  <label for="model-auth-mode">Auth mode</label>
-                  <select id="model-auth-mode">
-                    <option value="static">static (API key)</option>
-                    <option value="entra_obo">
-                      entra_obo (per-user OBO)
-                    </option>
-                    <option value="entra_app">
-                      entra_app (app identity)
-                    </option>
-                  </select>
-                </div>
-                <div>
-                  <label for="model-obo-audience"
-                    >OBO audience
-                    <span class="label-hint"
-                      >resource App ID URI; required for entra_obo /
-                      entra_app</span
-                    ></label
-                  >
-                  <input
-                    type="text"
-                    id="model-obo-audience"
-                    placeholder="https://your-resource.example.com"
-                  />
+              <!-- Hidden outright on a deployment that cannot mint any dynamic
+                   credential and whose row is not already using one; same
+                   treatment the Roles sub-tab gets when its scope is missing. -->
+              <div id="model-auth-section">
+                <div class="sh-section">Backend auth</div>
+                <div class="field-pair">
+                  <div>
+                    <label for="model-auth-mode"
+                      >Who this model authenticates as
+                      <span class="label-hint" id="model-auth-mode-hint"></span
+                    ></label>
+                    <select id="model-auth-mode">
+                      <option value="static">
+                        The shared API key (static)
+                      </option>
+                      <option value="entra_obo">
+                        Each user, as themselves (entra_obo)
+                      </option>
+                      <option value="entra_app">
+                        This deployment (entra_app)
+                      </option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="model-obo-audience"
+                      >Gateway audience
+                      <span
+                        class="label-hint"
+                        id="model-obo-audience-hint"
+                      ></span
+                    ></label>
+                    <!-- A datalist, not a <select>: registered audiences are
+                         suggestions, not the only permissible input. A closed
+                         list would block an operator holding a stale copy and
+                         strand a persisted value that has left the list. -->
+                    <input
+                      type="text"
+                      id="model-obo-audience"
+                      list="model-obo-audience-options"
+                      placeholder="api://your-application-id"
+                    />
+                    <datalist id="model-obo-audience-options"></datalist>
+                  </div>
                 </div>
               </div>
               <label class="toggle-switch">
@@ -1947,17 +1963,15 @@
                   ><span class="cap-name">Reasoning-effort control</span></label
                 >
                 <label class="cap"
-                  ><input
-                    type="checkbox"
-                    data-cap="supports_verbosity"
-                  /><span class="cap-led"></span
+                  ><input type="checkbox" data-cap="supports_verbosity" /><span
+                    class="cap-led"
+                  ></span
                   ><span class="cap-name">Output verbosity</span></label
                 >
                 <label class="cap"
-                  ><input
-                    type="checkbox"
-                    data-cap="supports_pro_mode"
-                  /><span class="cap-led"></span
+                  ><input type="checkbox" data-cap="supports_pro_mode" /><span
+                    class="cap-led"
+                  ></span
                   ><span class="cap-name">Standard / Pro mode</span></label
                 >
                 <label class="cap"
@@ -2837,8 +2851,8 @@
                 <span class="label-hint"
                   >how agents and the CLI launch it — persona=&lt;name&gt; on
                   task_agent / spawn_workstream / spawn_batch, --persona
-                  &lt;name&gt; on the CLI. Case doesn't matter; the display
-                  name below is only a label in lists</span
+                  &lt;name&gt; on the CLI. Case doesn't matter; the display name
+                  below is only a label in lists</span
                 ></label
               >
               <input

@@ -337,7 +337,7 @@ def transcribe(
     emits a clean transcript rather than a conversational reply.
     """
     try:
-        client, model, cfg = registry.resolve(alias)
+        client, model, cfg, _ = registry.resolve(alias)
     except Exception as exc:  # unknown/removed alias
         raise AudioUnavailableError(f"STT model alias {alias!r} is not available") from exc
     # Defence in depth: resolve_role_alias already gates this, but a stale
@@ -411,7 +411,7 @@ def transcribe_stream(*, registry: Any, alias: str, data: bytes, prompt: str = "
     transcript as a single chunk.
     """
     try:
-        client, model, cfg = registry.resolve(alias)
+        client, model, cfg, _ = registry.resolve(alias)
     except Exception as exc:  # unknown/removed alias
         raise AudioUnavailableError(f"STT model alias {alias!r} is not available") from exc
     if not _provider_carries_audio(cfg):
@@ -492,7 +492,7 @@ def synthesize(
 ) -> SpeechResult:
     """Synthesize ``text`` to speech using the TTS role alias's audio backend."""
     try:
-        client, model, _cfg = registry.resolve(alias)
+        client, model, _cfg, _ = registry.resolve(alias)
     except Exception as exc:
         raise AudioUnavailableError(f"TTS model alias {alias!r} is not available") from exc
     try:

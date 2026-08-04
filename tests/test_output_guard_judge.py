@@ -114,15 +114,16 @@ class TestCapabilityThreading:
         cfg.capabilities = {"supports_tools": False}
         registry = MagicMock()
         registry.has_alias.return_value = True
-        registry.resolve.return_value = (
+        registry.resolve_binding.return_value = (
             MagicMock(base_url="http://a", api_key="k"),
             "local-9b",
             cfg,
+            provider,
+            0,
         )
         # The unified lane resolver (model_turn.resolve_capabilities) fetches
-        # the config itself rather than taking resolve()'s copy.
+        # the config itself rather than taking resolve_binding()'s copy.
         registry.get_config.return_value = cfg
-        registry.get_provider.return_value = provider
         client = MagicMock(base_url="http://s", api_key="k")
         judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True, output_guard_model="og"),
@@ -379,8 +380,13 @@ class TestOversizeGuard:
         cfg.context_window = 0
         registry = MagicMock()
         registry.has_alias.return_value = True
-        registry.resolve.return_value = (MagicMock(base_url="http://a", api_key="k"), "m", cfg)
-        registry.get_provider.return_value = _make_provider()
+        registry.resolve_binding.return_value = (
+            MagicMock(base_url="http://a", api_key="k"),
+            "m",
+            cfg,
+            _make_provider(),
+            0,
+        )
         alias_judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True, output_guard_model="og"),
             session_provider=_make_provider(),
@@ -427,8 +433,13 @@ class TestAliasResolution:
         alias_client = MagicMock(base_url="http://alias", api_key="alias-key")
         alias_provider = MagicMock()
         alias_provider.provider_name = "anthropic"
-        registry.resolve.return_value = (alias_client, "claude-haiku-4-5", None)
-        registry.get_provider.return_value = alias_provider
+        registry.resolve_binding.return_value = (
+            alias_client,
+            "claude-haiku-4-5",
+            None,
+            alias_provider,
+            0,
+        )
         config = JudgeConfig(
             output_guard_llm=True,
             output_guard_model="my-judge",

@@ -302,6 +302,143 @@ def test_model_reload_endpoint_rewrites_models_metadata(monkeypatch, tmp_path):
     assert {r["alias"] for r in payload} == {"a", "b"}
 
 
+def test_model_reload_refuses_dynamic_auth_without_key(monkeypatch, tmp_path, caplog):
+    """A keyless node cannot acquire a dynamic alias via model-reload: 503,
+    a deployment fault, not the 422 bad-arguments exit."""
+    from turnstone.core.storage._sqlite import SQLiteBackend
+    from turnstone.server import internal_model_reload
+
+    storage = SQLiteBackend(str(tmp_path / "reload.db"))
+
+    old_reg = _registry(("a", "http://x"))
+    new_reg = ModelRegistry(
+        {
+            "a": ModelConfig(
+                alias="a", base_url="http://x", api_key="k", model="a", provider="openai"
+            ),
+            "gw": ModelConfig(
+                alias="gw",
+                base_url="http://gw",
+                api_key="",
+                model="m",
+                provider="openai",
+                auth_mode="entra_obo",
+                obo_audience="api://gateway",
+            ),
+        },
+        default="a",
+    )
+    app_state = SimpleNamespace(
+        registry=old_reg,
+        health_registry=HealthTrackerRegistry(),
+        cli_model_args={
+            "base_url": "",
+            "api_key": "",
+            "model": "",
+            "context_window": 0,
+            "provider": "openai",
+        },
+        config_store=None,
+        node_id="node-a",
+        mcp_token_store=None,
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+    monkeypatch.setattr("turnstone.core.model_registry.load_model_registry", lambda **_kw: new_reg)
+    monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
+    monkeypatch.setattr("turnstone.server._broadcast_agent_tool_schema_refresh", lambda _s: None)
+
+    with caplog.at_level("ERROR", logger="turnstone.server"):
+        response = internal_model_reload(request)  # type: ignore[arg-type]
+
+    assert response.status_code == 503
+    assert "mcp_token_encryption" in json.loads(response.body)["reason"]
+    # Refusal must not mutate: the old registry keeps serving.
+    assert not old_reg.has_alias("gw")
+    assert not old_reg.has_dynamic_auth()
+    assert any("model_auth_key_missing" in r.message for r in caplog.records)
+
+
+def test_model_reload_maps_auth_config_error_to_422(monkeypatch, tmp_path):
+    """A row whose auth fields the loader rejects exits as the structured
+    422 naming the problem, never a bare 500."""
+    from turnstone.core.model_registry import ModelAuthConfigError
+    from turnstone.core.storage._sqlite import SQLiteBackend
+    from turnstone.server import internal_model_reload
+
+    storage = SQLiteBackend(str(tmp_path / "reload.db"))
+    old_reg = _registry(("a", "http://x"))
+    app_state = SimpleNamespace(
+        registry=old_reg,
+        health_registry=HealthTrackerRegistry(),
+        cli_model_args={
+            "base_url": "",
+            "api_key": "",
+            "model": "",
+            "context_window": 0,
+            "provider": "openai",
+        },
+        config_store=None,
+        node_id="node-a",
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+    def _raise_auth_config(**_kw):
+        raise ModelAuthConfigError("Model 'gw' requires obo_audience when auth_mode is 'entra_obo'")
+
+    monkeypatch.setattr("turnstone.core.model_registry.load_model_registry", _raise_auth_config)
+    monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
+
+    response = internal_model_reload(request)  # type: ignore[arg-type]
+
+    assert response.status_code == 422
+    assert "obo_audience" in json.loads(response.body)["reason"]
+    assert old_reg.has_alias("a")
+
+
+def test_config_reload_maps_dynamic_auth_key_error_to_503(monkeypatch, tmp_path, caplog):
+    """Every caller of the reload chokepoint handles its refusal the same
+    way: the settings fan-out answers 503, not an unhandled 500."""
+    from turnstone.server import config_reload
+
+    old_reg = ModelRegistry(
+        {
+            "a": ModelConfig(
+                alias="a", base_url="http://x", api_key="k", model="a", provider="openai"
+            ),
+            "gw": ModelConfig(
+                alias="gw",
+                base_url="http://gw",
+                api_key="",
+                model="m",
+                provider="openai",
+                auth_mode="entra_obo",
+                obo_audience="api://gateway",
+            ),
+        },
+        default="a",
+    )
+    config_store = MagicMock()
+    config_store.get.side_effect = lambda key, default=None: (
+        "gw" if key == "model.default_alias" else default
+    )
+    app_state = SimpleNamespace(
+        registry=old_reg,
+        config_store=config_store,
+        mcp_token_store=None,
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+    with caplog.at_level("ERROR", logger="turnstone.server"):
+        response = config_reload(request)  # type: ignore[arg-type]
+
+    assert response.status_code == 503
+    assert "mcp_token_encryption" in json.loads(response.body)["reason"]
+    # Refused without mutating: the routing override did NOT apply.
+    assert old_reg.default == "a"
+    assert any("model_auth_key_missing" in r.message for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Shutdown race: heartbeat write must NOT resurrect post-shutdown delete
 # ---------------------------------------------------------------------------

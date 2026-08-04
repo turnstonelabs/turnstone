@@ -566,8 +566,9 @@ class TestPerceptionFallback:
         s._config_store.get = lambda k, *a: "omni" if k == "perception.model_alias" else ""
         s._registry = MagicMock()
         s._registry.has_alias = lambda a: a == "omni"
-        s._registry.resolve = lambda a: (object(), "omni-model", object())
-        s._registry.get_provider = lambda a: prov
+        # The perception lane binds through resolve_binding — one locked
+        # snapshot for client + provider, never a tearable pair.
+        s._registry.resolve_binding = lambda a: (object(), "omni-model", object(), prov, 0)
         s._resolve_capabilities = lambda *a, **k: perc_caps  # type: ignore[method-assign]
         return prov
 

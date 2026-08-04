@@ -646,6 +646,11 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "obo_audience",
     }
 )
+# Sentinel for ``update_model_definition``'s optional conditional-write
+# compare: distinguishes "no compare requested" (every ordinary caller)
+# from "compare against NULL". Shared by both backends so the calibrate
+# retry loop reads one contract.
+CAPS_COMPARE_UNSET: object = object()
 PROJECT_MUTABLE = frozenset({"name", "visibility", "state", "parent_project_id"})
 PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})
 # ``name`` (the slug create requests reference) is deliberately immutable —

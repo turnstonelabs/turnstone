@@ -58,7 +58,7 @@ class _FakeRegistry:
     def resolve(self, alias: str | None = None):
         if alias not in (None, self._alias):
             raise ValueError(alias)
-        return self._client, self._cfg.model, self._cfg
+        return self._client, self._cfg.model, self._cfg, 0
 
 
 # ---------------------------------------------------------------------------

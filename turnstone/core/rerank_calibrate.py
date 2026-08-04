@@ -196,6 +196,85 @@ def merge_calibration_into_caps(raw_caps: str | None, result: CalibrationResult)
     return json.dumps(caps)
 
 
+def _normalize_caps_value(value: Any) -> Any:
+    """Recursive normalization behind :func:`canonical_caps_value`."""
+    # bool FIRST — bool subclasses int, and the float normalization must
+    # not touch it.
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {key: _normalize_caps_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_caps_value(item) for item in value]
+    return value
+
+
+def canonical_caps_value(value: Any) -> str:
+    """Canonical JSON dump of one parsed ``capabilities`` value.
+
+    THE normalization shared by the two comparators over the
+    model-definition ``capabilities`` column: the console write gate's blob
+    comparator canonicalizes through here, and
+    :func:`calibration_confinement_violations` canonicalizes per key through
+    here — one helper, so the two guards cannot disagree on an edge. Rules:
+    bool stays distinct from int (Python ``==`` conflates them, which would
+    let a type-flip rewrite pass unrefused), integral floats collapse to int
+    (shelf round-tripping is serialization noise, not a value change), keys
+    sort. Every other value-level difference survives.
+    """
+    import json
+
+    return json.dumps(_normalize_caps_value(value), sort_keys=True)
+
+
+def calibration_confinement_violations(
+    raw_caps: str | None, merged: str, result: CalibrationResult
+) -> list[str]:
+    """Top-level keys *merged* changed OUTSIDE the calibration contract.
+
+    The console calibrate endpoint persists :func:`merge_calibration_into_caps`
+    output under ``admin.models`` even though ``capabilities`` is a gated
+    column on the definition write path — safe only while the merge stays
+    confined to the :func:`calibration_caps_fields` keys. This computes the
+    violations of that contract (keys added, removed, or value-changed beyond
+    the allowed set, against the same tolerant parse of the stored blob the
+    merge itself uses) so the caller can refuse the write instead of trusting
+    the convention. Unparseable or non-object merge output is a violation
+    outright — there is nothing confineable to verify.
+
+    Per-key values compare CANONICALLY (:func:`canonical_caps_value`), the
+    same normalization as the write gate's comparator: plain ``!=`` conflates
+    ``True`` with ``1`` recursively, so a type-flip rewrite — exactly the
+    out-of-contract change this guard refuses — would pass as equal.
+    """
+    import json
+
+    allowed = set(calibration_caps_fields(result))
+    stored: dict[str, Any] = {}
+    if raw_caps:
+        try:
+            parsed = json.loads(raw_caps)
+            if isinstance(parsed, dict):
+                stored = parsed
+        except (TypeError, ValueError):
+            stored = {}
+    try:
+        merged_parsed = json.loads(merged)
+    except (TypeError, ValueError):
+        return ["<merge output is not JSON>"]
+    if not isinstance(merged_parsed, dict):
+        return ["<merge output is not a JSON object>"]
+    changed = {
+        key
+        for key in set(stored) | set(merged_parsed)
+        if (key in stored) != (key in merged_parsed)
+        or canonical_caps_value(stored.get(key)) != canonical_caps_value(merged_parsed.get(key))
+    }
+    return sorted(changed - allowed)
+
+
 def calibrate_model(
     base_url: str,
     model: str,

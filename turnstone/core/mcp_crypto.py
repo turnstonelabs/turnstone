@@ -58,7 +58,7 @@ _KEY_GEN_HINT = (
 # Operator-facing tail for the two startup key-requirement SystemExit logs
 # (user-scoped servers / credential capture) — one copy so the guidance
 # can't drift between them.
-_STARTUP_KEY_REQUIRED_HINT = (
+STARTUP_KEY_REQUIRED_HINT = (
     "no [security] mcp_token_encryption_keys (rotation list) or "
     "mcp_token_encryption_key (single) in config.toml. Generate a key with: "
     "python -c 'from cryptography.fernet import Fernet; "
@@ -600,7 +600,11 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
        (``oauth_user`` or ``oauth_obo``; see ``is_user_scoped_auth``). If
        any exist AND no key is configured, raises ``SystemExit(1)``.
        Same enforcement when ``[oidc] capture_user_credential`` is
-       enabled (the captured IdP credential must be encrypted at rest).
+       enabled (the captured IdP credential must be encrypted at rest),
+       and when the host's model registry holds a dynamic-auth alias
+       (``entra_obo``/``entra_app`` mint-cache rows are encrypted with
+       the same cipher). The console's registry loads later; its
+       equivalent check lives in the coordinator bootstrap.
     3. On success, sets ``app_state.mcp_token_cipher`` and
        ``app_state.mcp_token_store`` (both possibly ``None`` when no
        key + no user-scoped rows).
@@ -626,6 +630,14 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     user_scoped_count = sum(
         1 for row in storage.list_mcp_servers() if is_user_scoped_auth(row.get("auth_type"))
     )
+    # Dynamic model auth needs the same cipher: both mints persist encrypted
+    # cache rows. The REGISTRY is the only truthful oracle — config.toml
+    # overrides the DB for a same-named alias, so a raw ``model_definitions``
+    # probe would demand a key for a row the registry resolves as static, and
+    # SystemExit on a false positive bricks every host. Nodes have a registry
+    # before this runs; the console does NOT, so its equivalent enforcement
+    # lives in ``_load_and_bootstrap_coord_subsystem``, which re-checks after
+    # its registry loads and reports through ``coord_registry_error``.
     model_registry = getattr(app_state, "registry", None) or getattr(
         app_state, "coord_registry", None
     )
@@ -640,7 +652,7 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
             "mcp.oauth: %d user-scoped MCP server(s), dynamic_model_auth=%s, but %s",
             user_scoped_count,
             dynamic_model_auth,
-            _STARTUP_KEY_REQUIRED_HINT,
+            STARTUP_KEY_REQUIRED_HINT,
         )
         raise SystemExit(1)
 
@@ -666,7 +678,7 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     ):
         log.error(
             "oidc.capture: [oidc] capture_user_credential is enabled but %s",
-            _STARTUP_KEY_REQUIRED_HINT,
+            STARTUP_KEY_REQUIRED_HINT,
         )
         raise SystemExit(1)
 

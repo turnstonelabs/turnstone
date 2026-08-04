@@ -37,26 +37,40 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
+from tests._oidc_test_helpers import (
+    ISSUER,
+    TOKEN_ENDPOINT,
+    make_oidc_config,
+    mint_warn_state_reset,
+)
 from tests.conftest import make_mcp_token_cipher
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import get_obo_access_token_classified
-from turnstone.core.oidc import OIDCConfig
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from turnstone.core.oidc import OIDCConfig
 
 USER = "user-1"
 SERVER = "srv-obo"
 SERVER_ID = "srv-obo-id"
-ISSUER = "https://idp.test"
-TOKEN_ENDPOINT = "https://idp.test/token"
 AUDIENCE = "api://aud-a"
 
 _ISO = "%Y-%m-%dT%H:%M:%S"
+
+
+@pytest.fixture(autouse=True)
+def _reset_warn_dedup_state() -> Iterator[None]:
+    """Per-test mint warn/cause reset — see ``mint_warn_state_reset``."""
+    yield from mint_warn_state_reset()
 
 
 # ---------------------------------------------------------------------------
@@ -67,20 +81,6 @@ _ISO = "%Y-%m-%dT%H:%M:%S"
 @pytest.fixture
 def storage(tmp_path: Any) -> SQLiteBackend:
     return SQLiteBackend(str(tmp_path / "test.db"))
-
-
-def _make_oidc_config(**overrides: Any) -> OIDCConfig:
-    """Real ``OIDCConfig`` for the OBO engine (``obo_grant_profile`` defaults
-    to ``"entra"`` on the dataclass; tests override it explicitly)."""
-    defaults: dict[str, Any] = {
-        "enabled": True,
-        "issuer": ISSUER,
-        "client_id": "cid",
-        "client_secret": "csecret",
-        "token_endpoint": TOKEN_ENDPOINT,
-    }
-    defaults.update(overrides)
-    return OIDCConfig(**defaults)
 
 
 def _make_app_state(
@@ -200,7 +200,7 @@ class TestEntraLeg:
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
         before = datetime.now(UTC)
 
@@ -247,7 +247,7 @@ class TestEntraLeg:
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         result = _mint(state)
@@ -275,7 +275,7 @@ class TestEntraLeg:
         client.post.return_value = _mk_response(
             200, {"access_token": "at-broad-default", "expires_in": 3600}
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         result = _mint(state)
@@ -305,7 +305,7 @@ class TestEntraLeg:
                 {"access_token": "at-minted", "expires_in": 3600, "refresh_token": "rt-2"},
             )
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state, refresh_token="rt-1")
 
         result = _mint(state)
@@ -351,7 +351,7 @@ class TestRfc8693Leg:
         state = _make_app_state(
             storage,
             http_client=client,
-            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+            oidc_config=make_oidc_config(obo_grant_profile="rfc8693"),
         )
         _seed_credential(state, refresh_token="rt-1")
 
@@ -403,7 +403,7 @@ class TestRfc8693Leg:
         state = _make_app_state(
             storage,
             http_client=client,
-            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+            oidc_config=make_oidc_config(obo_grant_profile="rfc8693"),
         )
         _seed_credential(state)
 
@@ -438,7 +438,7 @@ class TestRfc8693Leg:
         state = _make_app_state(
             storage,
             http_client=client,
-            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+            oidc_config=make_oidc_config(obo_grant_profile="rfc8693"),
         )
         _seed_credential(state)
 
@@ -475,7 +475,7 @@ class TestRfc8693Leg:
         state = _make_app_state(
             storage,
             http_client=client,
-            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+            oidc_config=make_oidc_config(obo_grant_profile="rfc8693"),
         )
         _seed_credential(state, refresh_token="rt-1")
 
@@ -507,7 +507,7 @@ class TestRfc8693Leg:
         client = MagicMock(spec=httpx.AsyncClient)
         # Entra-shaped single-POST mint, but the IdP omits expires_in.
         client.post = AsyncMock(return_value=_mk_response(200, {"access_token": "at-no-exp"}))
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         result = _mint(state)
@@ -547,7 +547,7 @@ class TestRfc8693Leg:
         state = _make_app_state(
             storage,
             http_client=client,
-            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+            oidc_config=make_oidc_config(obo_grant_profile="rfc8693"),
         )
         _seed_credential(state, refresh_token="rt-1")
 
@@ -573,7 +573,7 @@ class TestCacheAndCredentialLookup:
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
         _seed_cache_row(state, expires_in_seconds=3600, access_token="cached-at")
 
@@ -602,7 +602,7 @@ class TestCacheAndCredentialLookup:
             client.post = AsyncMock(
                 return_value=_mk_response(200, {"access_token": "minted-at", "expires_in": 3600})
             )
-            state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+            state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
             _seed_credential(state)
             reads = {"n": 0}
             real = storage.get_oidc_user_credential
@@ -645,7 +645,7 @@ class TestCacheAndCredentialLookup:
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "reminted-at", "expires_in": 3600})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
         # A fresh, refresh-less cache row — but for the OLD/broader audience.
         _seed_cache_row(
@@ -679,7 +679,7 @@ class TestCacheAndCredentialLookup:
         state = _make_app_state(
             storage,
             http_client=client,
-            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+            oidc_config=make_oidc_config(obo_grant_profile="rfc8693"),
         )
         _seed_credential(state)
         # Fresh, right-audience, refresh-less — but minted with the OLD wider scopes.
@@ -712,7 +712,7 @@ class TestCacheAndCredentialLookup:
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         # Deliberately NO upsert_oidc_credential.
 
         result = _mint(state)
@@ -749,7 +749,7 @@ class TestFailureHandling:
                 },
             )
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
         _seed_cache_row(state, expires_in_seconds=-1000, access_token="stale-at")
 
@@ -780,7 +780,7 @@ class TestFailureHandling:
         client.post = AsyncMock(
             return_value=_mk_response(503, {"error": "temporarily_unavailable"})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         async def _run() -> tuple[Any, Any]:
@@ -806,7 +806,7 @@ class TestFailureHandling:
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(return_value=_mk_response(200, {"expires_in": 3600}))
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         result = _mint(state)
@@ -834,7 +834,7 @@ class TestFailureHandling:
         client.post = AsyncMock(
             return_value=_mk_response(400, {"error": "invalid_grant", "pad": "x" * (70 * 1024)})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         result = _mint(state)
@@ -859,7 +859,7 @@ class TestFailureHandling:
                 {"error": "invalid_grant", "error_description": "AADSTS65001: no consent"},
             )
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         with caplog.at_level(logging.WARNING, logger="turnstone.mcp"):
@@ -885,7 +885,7 @@ class TestFailureHandling:
         client.post = AsyncMock(
             return_value=_mk_response(400, {"error": "invalid_grant", "error_description": "dead"})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)  # no cache row — the common missing-tenant-grant case
 
         async def _run() -> tuple[Any, Any]:
@@ -921,7 +921,7 @@ class TestFailureHandling:
         client.post = AsyncMock(
             return_value=_mk_response(400, {"error": "invalid_grant", "error_description": "dead"})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
         _seed_cache_row(state, expires_in_seconds=-1000, access_token="stale-at")  # forces a mint
 
@@ -958,7 +958,7 @@ class TestFailureHandling:
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-reminted", "expires_in": 3600})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
         # Backdated so the under-lock reuse gate reads it as an OLD mint —
         # this test is about the cooldown fall-through re-minting, not the
@@ -999,7 +999,7 @@ class TestFailureHandling:
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()  # any IdP call would be a gate failure
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         def _fresh_row(access_token: str) -> Any:
@@ -1049,7 +1049,7 @@ class TestFailureHandling:
                 200, {"access_token": "genuinely-reminted", "expires_in": 3600}
             )
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         rejected = {
@@ -1108,7 +1108,7 @@ class TestFailureHandling:
         state = _make_app_state(
             storage,
             http_client=client,
-            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+            oidc_config=make_oidc_config(obo_grant_profile="rfc8693"),
         )
         _seed_credential(state, refresh_token="rt-1")
 
@@ -1142,11 +1142,11 @@ class TestFailureHandling:
             return_value=_mk_response(200, {"access_token": "minted-at", "expires_in": 3600})
         )
         boot_failed = _dc.replace(
-            _make_oidc_config(), enabled=False, token_endpoint="", discovery_retryable=True
+            make_oidc_config(), enabled=False, token_endpoint="", discovery_retryable=True
         )
         state = _make_app_state(storage, http_client=client, oidc_config=boot_failed)
         _seed_credential(state)
-        healed = _make_oidc_config()  # enabled, token_endpoint populated
+        healed = make_oidc_config()  # enabled, token_endpoint populated
 
         async def _fake_discover(cfg: Any, *, client: Any = None) -> Any:
             return healed
@@ -1171,7 +1171,7 @@ class TestFailureHandling:
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         with patch.object(
@@ -1204,7 +1204,7 @@ class TestMisconfiguration:
         state = _make_app_state(
             storage,
             http_client=client,
-            oidc_config=_make_oidc_config(obo_grant_profile=profile),
+            oidc_config=make_oidc_config(obo_grant_profile=profile),
         )
         _seed_credential(state)  # credential present — config alone blocks the mint
 
@@ -1221,7 +1221,7 @@ class TestMisconfiguration:
         _seed_obo_server(storage, oauth_audience=None)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         result = _mint(state)

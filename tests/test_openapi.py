@@ -210,3 +210,45 @@ class TestConsoleSpec:
                 assert "Coordinator" in op.get("tags", []), (
                     f"{path} missing Coordinator tag (tags={op.get('tags')})"
                 )
+
+
+class TestCheckedInArtifactFreshness:
+    """The checked-in `sdk/typescript/*.json` specs must match their source.
+
+    ``info.version`` is normalised out on purpose: it tracks
+    ``turnstone.__version__``, so comparing it would fail every release bump
+    with a misdiagnosing "spec is stale" message.
+    """
+
+    @staticmethod
+    def _schema_only(spec: dict) -> dict:
+        """The spec with the release-coupled version stripped."""
+        pruned = dict(spec)
+        pruned["info"] = {k: v for k, v in spec.get("info", {}).items() if k != "version"}
+        return pruned
+
+    def _checked_in(self, name: str) -> dict:
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        return json.loads((root / "sdk" / "typescript" / name).read_text())
+
+    def test_server_spec_matches_checked_in_artifact(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        assert self._schema_only(build_server_spec()) == self._schema_only(
+            self._checked_in("openapi-server.json")
+        ), (
+            "openapi-server.json is stale; regenerate with "
+            "`uv run python scripts/generate-types.py` in sdk/typescript/"
+        )
+
+    def test_console_spec_matches_checked_in_artifact(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        assert self._schema_only(build_console_spec()) == self._schema_only(
+            self._checked_in("openapi-console.json")
+        ), (
+            "openapi-console.json is stale; regenerate with "
+            "`uv run python scripts/generate-types.py` in sdk/typescript/"
+        )

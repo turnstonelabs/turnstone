@@ -284,10 +284,9 @@ def test_trust_toggle_rejects_non_object_body(storage):
     coord = mgr.create(user_id="user-1", name="coord-a")
     coord.session, _ = _make_session_mock()
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    # Non-dict JSON values — all must 400.  Different bodies may hit
-    # `read_json_or_400`'s own parse error ("Invalid JSON body") or the
-    # downstream dict-shape guard ("body must be a JSON object"); we
-    # only care that none 500.
+    # Non-dict JSON values — all must 400.  `read_json_or_400` enforces
+    # the object shape itself ("Request body must be a JSON object");
+    # there is no downstream shape guard.  We only care that none 500.
     for body in ([], 42, "string"):
         resp = client.post(
             f"/v1/api/workstreams/{coord.id}/trust",

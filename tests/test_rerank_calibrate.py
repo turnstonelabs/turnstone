@@ -93,3 +93,60 @@ class TestCalibrate:
         assert not res.separated
         assert res.suggested_threshold is None
         assert res.raw_scale == "unknown (no scores)"
+
+
+class TestCalibrationCapsConfinement:
+    def test_calibrate_merge_confined_to_calibration_fields(self):
+        """The merge touches only the three probe-derived keys and preserves
+        everything else in the gated ``capabilities`` column."""
+        import json
+
+        from turnstone.core.rerank_calibrate import (
+            calibration_caps_fields,
+            merge_calibration_into_caps,
+        )
+
+        result = _build_result("m", "probability (0-1)", [0.9, 0.95], [0.1, 0.2])
+        fields = calibration_caps_fields(result)
+        assert set(fields) == {"rerank_threshold", "rerank_scale", "rerank_separated"}
+
+        existing = {
+            "server_compat": {"api_surface": "chat", "extra_body": {"x": 1}},
+            "context_window": 5,
+        }
+        merged = json.loads(merge_calibration_into_caps(json.dumps(existing), result))
+        assert merged["server_compat"] == existing["server_compat"]
+        assert merged["context_window"] == 5
+        assert set(merged) == set(existing) | set(fields)
+
+    def test_confinement_refuses_type_flip_that_python_equality_masks(self):
+        """Python ``!=`` conflates ``True`` with ``1``; the confinement
+        compare canonicalizes per key like the write gate's comparator."""
+        import json
+
+        from turnstone.core.rerank_calibrate import (
+            calibration_caps_fields,
+            calibration_confinement_violations,
+        )
+
+        result = _build_result("m", "probability (0-1)", [0.9, 0.95], [0.1, 0.2])
+        stored = json.dumps({"server_compat": {"stream": 1}})
+        merged = json.dumps({"server_compat": {"stream": True}, **calibration_caps_fields(result)})
+
+        assert calibration_confinement_violations(stored, merged, result) == ["server_compat"]
+
+    def test_confinement_ignores_integral_float_spelling(self):
+        """``1.0`` vs ``1`` is JSON round-trip spelling, not a value change,
+        so a healthy merge is not refused over it."""
+        import json
+
+        from turnstone.core.rerank_calibrate import (
+            calibration_caps_fields,
+            calibration_confinement_violations,
+        )
+
+        result = _build_result("m", "probability (0-1)", [0.9, 0.95], [0.1, 0.2])
+        stored = json.dumps({"server_compat": {"scale": 1.0}})
+        merged = json.dumps({"server_compat": {"scale": 1}, **calibration_caps_fields(result)})
+
+        assert calibration_confinement_violations(stored, merged, result) == []

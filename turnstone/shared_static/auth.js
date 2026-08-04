@@ -144,6 +144,36 @@ if (typeof window !== "undefined") {
   window.permissionsReady = _permissionsReady;
 }
 
+// Generic scope check over the permission list this module itself populates
+// (sessionStorage "turnstone_permissions", comma-separated).  Absent means
+// DENIED: the key is also absent for a principal holding zero permissions,
+// so granting on absent would hand a control to exactly the caller who
+// cannot use it.  The home for the parse contract.  LOCKSTEP: admin.js's
+// _consoleHasPermission shim inlines this exact parse as its stale-cache
+// fallback, so a change to the key or the format here must land there too.
+export function hasPermission(scope) {
+  const perms = sessionStorage.getItem("turnstone_permissions") || "";
+  return perms.split(",").indexOf(scope) !== -1;
+}
+
+// Run cb once the initial whoami has settled: via window.permissionsReady
+// when it is populated, else after one 500 ms whoami round-trip window.
+// cb runs exactly once per call, whichever path fires.  permissionsReady
+// is one-shot per page load, so a late registration settles in one
+// microtask — bounded, PROVIDED the registration site is not reachable
+// from cb's own continuation; register from an entry point, never from a
+// repaint the continuation triggers (that shape is an unbounded loop).
+export function whenPermissionsReady(cb) {
+  if (
+    window.permissionsReady &&
+    typeof window.permissionsReady.then === "function"
+  ) {
+    window.permissionsReady.then(cb);
+  } else {
+    setTimeout(cb, 500);
+  }
+}
+
 async function _tryRefresh() {
   // Don't start a refresh if logout already won the race.
   if (_loggedOut) return false;
@@ -831,4 +861,6 @@ Object.assign(window, {
   logout,
   initLogin,
   noteVersionMismatch,
+  hasPermission,
+  whenPermissionsReady,
 });

@@ -129,6 +129,10 @@ from turnstone.core.metacognition import (
     task_too_long_message,
     task_unrenderable_message,
 )
+from turnstone.core.model_registry import (
+    DYNAMIC_MODEL_AUTH_MODES,
+    ModelClientConstructionError,
+)
 from turnstone.core.model_turn import (
     ModelTurnResult,
     ensure_tool_call_ids,
@@ -235,7 +239,7 @@ if TYPE_CHECKING:
     from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
     from turnstone.core.judge import IntentJudge, JudgeConfig
     from turnstone.core.mcp_client import MCPClientManager
-    from turnstone.core.model_registry import ModelRegistry
+    from turnstone.core.model_registry import ModelConfig, ModelRegistry
     from turnstone.core.output_guard import OutputAssessment
     from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
     from turnstone.core.providers import (
@@ -1435,6 +1439,25 @@ class BackendAuthUnavailableError(RuntimeError):
     """A fail-closed dynamic model credential could not be resolved."""
 
 
+def _mint_refusal_cause(prefix: str, audience: str, user_id: str = "") -> str:
+    """The mint's last recorded refusal cause, for the heartbeat lines.
+
+    mcp_oauth's cause layer is deduped to once per process, so mid-incident
+    the retained logs may hold none of its lines; the per-turn warnings in
+    ``_model_backend_auth_token`` read this instead. Keyed per (prefix,
+    audience, user): an OBO read passes the minting user so a shared
+    audience cannot serve one user's cause on another user's heartbeat,
+    while ``model_app`` reads resolve to the shared app principal the app
+    mint records under. ``"unknown"`` when nothing was recorded.
+    """
+    # Function-local import, matching the mint-client indirection: this
+    # module never imports mcp_oauth at module scope.
+    from turnstone.core.mcp_oauth import MODEL_APP_MINT_PRINCIPAL, model_mint_refusal_cause
+
+    key_user = user_id if prefix == "model_obo" else MODEL_APP_MINT_PRINCIPAL
+    return model_mint_refusal_cause(prefix, audience, key_user) or "unknown"
+
+
 class ChatSession:
     # The mid-turn interjection queue's cap — an ALIAS of the shared
     # per-workstream backpressure bound (see workstream.PENDING_SENDS_MAX):
@@ -1460,6 +1483,7 @@ class ChatSession:
         mcp_client: MCPClientManager | None = None,
         registry: ModelRegistry | None = None,
         model_alias: str | None = None,
+        registry_generation: int | None = None,
         health_registry: HealthTrackerRegistry | None = None,
         node_id: str | None = None,
         ws_id: str | None = None,
@@ -1510,7 +1534,51 @@ class ChatSession:
         self._revoked_tools: frozenset[str] = frozenset()
         self._governance_lock = threading.Lock()
         self._registry = registry
+        # Registry reload generation the passed-in ``client`` was resolved
+        # from; compared against ``registry.generation`` at the top of every
+        # send. Factories pass the value ``registry.resolve()`` returned
+        # BESIDE the client — read inside the registry lock, so the pair
+        # cannot tear. The fallback serves direct constructors (eval / CLI
+        # utility / tests) whose registries have no reload path. Distinct
+        # from ``self._generation`` below, which counts turn abandonment —
+        # never conflate the two.
+        if registry_generation is not None:
+            self._registry_generation: int = registry_generation
+        else:
+            self._registry_generation = registry.generation if registry is not None else 0
         self._model_alias = model_alias
+        # The ModelConfig this session's binding was built from — the value
+        # basis for "did the binding actually change" in
+        # ``_bind_model_from_registry`` (frozen dataclass, compared by value,
+        # so an unrelated alias's reload rebuilds equal-valued objects that
+        # must not read as a change). SEEDED here, not left None, so the
+        # first generation-only rebind already compares by value instead of
+        # reading as changed and refilling the output-guard limiter.
+        self._bound_model_cfg: ModelConfig | None = None
+        if registry is not None and model_alias:
+            try:
+                self._bound_model_cfg = registry.get_config(model_alias)
+            except (ValueError, KeyError):
+                self._bound_model_cfg = None
+        # Dead-binding latch: set to the alias when the per-send refresh
+        # finds it gone from the registry. Sends still PROCEED so the
+        # fallback chain can carry the turn; the latch only lets the
+        # terminal no-fallback error name the TRUE cause instead of the raw
+        # closed-transport symptom. Cleared as soon as the alias is listed
+        # again or on the next successful bind, so a re-created-but-broken
+        # alias reports its construction cause, never a stale "removed".
+        self._registry_alias_removed: str | None = None
+        # Once-per-(alias, generation) dedup for that warning — the removed
+        # state persists across sends.
+        self._alias_removed_warned: tuple[str, int] | None = None
+        # Construction-failure latch: the (alias, generation) whose rebind
+        # last failed, plus the cause text for the terminal error surface.
+        # The refresh skips re-attempting until the generation changes,
+        # because construction runs under the registry-wide client lock and
+        # retrying per send would serialize every session on a row that
+        # cannot improve until an admin edits it.
+        self._rebind_failed_key: tuple[str, int] | None = None
+        self._rebind_failed_cause: str | None = None
         self._health_registry = health_registry
         # Resolve provider for the current model
         self._provider: LLMProvider = (
@@ -2257,8 +2325,19 @@ class ChatSession:
         alias must raise loudly (pre-#827 semantics), never silently cache
         degraded static-table caps for the session lifetime.  The defensive
         never-crash fetch is a judge-constructor property, not a session one.
+
+        The ONE tolerated miss is a binding the per-send refresh already
+        DIAGNOSED dead (``_registry_alias_removed``): raising here would
+        kill the turn before the stream attempt the degraded lane depends
+        on, and overrides for a row that no longer exists honestly degrade
+        to the static table. The cache heals on rebind.
         """
-        cfg = self._registry.get_config(alias) if (self._registry and alias) else None
+        try:
+            cfg = self._registry.get_config(alias) if (self._registry and alias) else None
+        except (ValueError, KeyError):
+            if not (alias and self._registry_alias_removed == alias):
+                raise
+            cfg = None
         return resolve_capabilities(provider, model, alias or "", self._registry, cfg=cfg)
 
     def _get_capabilities(self, provider: Any = None, model: str = "") -> ModelCapabilities:
@@ -2954,46 +3033,185 @@ class ChatSession:
         """
         self._init_system_messages()
 
-    def _refresh_model_from_registry(self) -> None:
-        """Re-resolve model from registry if the backend changed.
+    def _bind_model_from_registry(self, alias: str) -> tuple[ModelConfig, bool] | None:
+        """Resolve ``alias`` and rebind client/model/provider/generation.
 
-        Called at the top of ``send()`` — two string compares when nothing
-        changed, full re-resolve when the health monitor detected a model swap.
+        The single ATOMIC resolve-and-bind primitive; the per-send driver
+        that decides WHEN to call it is :meth:`_refresh_model_from_registry`.
+        Also shared by the resume restore, the ``/model`` switch, and (via
+        the factory-passed ``registry_generation`` constructor argument) the
+        construction path, so a member of the bind set cannot land in some
+        sites and not others.
+
+        Disciplines, both load-bearing:
+
+        - Read client, config, provider AND generation from ONE registry
+          snapshot (``resolve_binding`` holds the lock across all four), so
+          a reload between separate reads can neither tear the binding nor
+          stamp a generation newer than the config actually bound; assign
+          session fields only after every read succeeded, so a concurrent
+          alias deletion keeps the old binding rather than half-swapping.
+        - Reset judges and the output-guard limiter ONLY when the binding
+          actually changed (client identity, model id, provider identity, or
+          config value). A generation-only rebind resolving to the identical
+          binding — where every reload of an UNRELATED alias lands — must
+          not refill ``_output_guard_judge_rl``, or config churn hands every
+          throttled session a fresh burst. A real swap still resets: a
+          lazily-built judge caches the previous binding.
+
+        A successful bind also clears the two dead-binding latches — the
+        bind IS the recovery they wait for.
+
+        Returns ``(config, binding_changed)`` so the per-send driver can
+        keep a no-op rebind silent, or ``None`` when the alias could not be
+        resolved, with the old binding untouched. Raises
+        :class:`ModelClientConstructionError` when the alias EXISTS but its
+        client or provider cannot be built, so callers surface that real
+        cause instead of misdiagnosing it as alias-missing.
+        """
+        if not self._registry:
+            return None
+        try:
+            client, model_name, cfg, provider, registry_generation = self._registry.resolve_binding(
+                alias
+            )
+        except ModelClientConstructionError:
+            raise
+        except (ValueError, KeyError):
+            return None  # alias disappeared during concurrent reload
+        binding_changed = (
+            client is not self.client
+            or model_name != self.model
+            or provider is not self._provider
+            or cfg != self._bound_model_cfg
+        )
+        self.client = client
+        self.model = model_name
+        self._provider = provider
+        self._registry_generation = registry_generation
+        self._model_alias = alias
+        self._bound_model_cfg = cfg
+        self._registry_alias_removed = None
+        self._rebind_failed_key = None
+        self._rebind_failed_cause = None
+        if binding_changed:
+            # The capabilities memo keys on (provider identity, model
+            # string), so a config-value-only change would be invisible
+            # without this clear; an identical rebind keeps it warm.
+            self._cached_capabilities = None
+            self._judge = None
+            if self._output_guard_judge is not None:
+                self._output_guard_judge = None
+                # The limiter budget is tied to the judge model.
+                self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
+        return cfg, binding_changed
+
+    def _refresh_model_from_registry(self) -> None:
+        """Re-resolve model/client from the registry when it changed.
+
+        The per-send DRIVER, called at the top of ``send()``: two cheap
+        compares when nothing changed (the backend model id AND the
+        registry's reload generation), delegating the actual rebind to
+        :meth:`_bind_model_from_registry`. The generation compare is what
+        carries an in-place ``reload()`` into live sessions when the swap
+        kept the model id but changed connection-relevant config (base-URL
+        redirect, provider swap, auth_mode/audience flip) — the registry
+        closes its cached client for exactly those rows, so without the
+        rebind the session streams through a now-closed client to the OLD
+        host while minting per-turn credentials from the NEW config. A
+        generation, not a field enumeration, so every future
+        connection-relevant column is covered by construction.
+
+        Failure outcomes DIAGNOSE, never foreclose: an alias REMOVED from
+        the registry latches ``_registry_alias_removed``, and a
+        construction failure records its (alias, generation) plus the real
+        cause so the rebind is not re-attempted until the registry changes.
+        In both cases the send proceeds with the old binding so the
+        fallback chain can carry the turn, and only a terminal no-fallback
+        failure surfaces the latched cause (see ``_format_backend_error``).
+        Each failure warns once per (alias, generation).
         """
         if not self._registry or not self._model_alias:
             return
         try:
             if not self._registry.has_alias(self._model_alias):
+                # The alias is gone — the reload that removed it already
+                # close()d its pooled client. Record the true cause for the
+                # terminal error surface and let the send proceed.
+                removed_key = (self._model_alias, self._registry.generation)
+                if self._alias_removed_warned != removed_key:
+                    self._alias_removed_warned = removed_key
+                    log.warning(
+                        "session.model_refresh_alias_removed ws=%s alias=%s",
+                        self._ws_id,
+                        self._model_alias,
+                    )
+                self._registry_alias_removed = self._model_alias
                 return
+            # Listed again: clearing here, not only on a successful bind,
+            # keeps a re-created-but-broken alias from reporting "removed"
+            # while the registry lists it; the construction arm below owns
+            # that diagnosis.
+            self._registry_alias_removed = None
             cfg = self._registry.get_config(self._model_alias)
-            if cfg.model == self.model:
+            # Sampled AFTER the map reads above, pairing with reload()'s
+            # bump-before-swap ordering: this reader can observe a new
+            # generation with old maps (one extra idempotent rebind), but
+            # never a stale generation with new maps — which would pass the
+            # compare below and stream the turn into a client reload just
+            # closed. The sample only DECIDES whether to rebind; the stamp
+            # always comes from resolve_binding's locked return, so this
+            # ordering cannot wedge a binding.
+            registry_generation = self._registry.generation
+            if cfg.model == self.model and registry_generation == self._registry_generation:
                 return
-            client, model_name, new_cfg = self._registry.resolve(self._model_alias)
         except (ValueError, KeyError):
             return  # alias disappeared during concurrent reload
-        self.client = client
-        self.model = model_name
-        self._provider = self._registry.get_provider(self._model_alias)
-        self._cached_capabilities = None
+        if (self._model_alias, registry_generation) == self._rebind_failed_key:
+            # Construction already failed at this exact registry state;
+            # re-attempting per send would rebuild the same failure under
+            # the registry-wide client lock, serializing every other
+            # session's resolve. Keep the old binding limping until a
+            # reload changes the generation.
+            return
+        try:
+            bind = self._bind_model_from_registry(self._model_alias)
+        except ModelClientConstructionError as exc:
+            # The alias still exists but its client or provider cannot be
+            # built (SDK, environment, or api_surface fault). Keep the old
+            # binding — it may still limp through the retry/fallback
+            # machinery — and record the attempted (alias, generation) plus
+            # the cause, so the rebind is not retried until a reload changes
+            # the registry and the terminal error surface can name the fault.
+            self._rebind_failed_key = (self._model_alias, registry_generation)
+            self._rebind_failed_cause = str(exc)
+            log.warning(
+                "session.model_refresh_client_construction_failed ws=%s alias=%s err=%s",
+                self._ws_id,
+                self._model_alias,
+                exc,
+            )
+            return
+        if bind is None:
+            return  # alias disappeared during concurrent reload
+        new_cfg, binding_changed = bind
         if new_cfg.context_window and new_cfg.context_window != self.context_window:
             self.context_window = new_cfg.context_window
             # Recompute auto tool truncation for new context window
             if not self._manual_tool_truncation:
                 self.tool_truncation = int(new_cfg.context_window * self._chars_per_token * 0.5)
-        # Reset judges so they pick up the new model/provider
-        if self._judge is not None:
-            self._judge = None
-        if self._output_guard_judge is not None:
-            self._output_guard_judge = None
-            # Rate limiter is tied to the judge model; a swap invalidates it.
-            self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
-        self._init_system_messages()
-        log.info(
-            "session.model_updated ws=%s model=%s ctx=%d",
-            self._ws_id,
-            model_name,
-            self.context_window,
-        )
+        if binding_changed:
+            # A generation-only rebind resolving the identical binding
+            # stamps silently: recomposing and logging on every unrelated
+            # admin edit would redefine ``model_updated`` from "this
+            # session's model changed" to "a reload happened somewhere".
+            self._init_system_messages()
+            log.info(
+                "session.model_updated ws=%s model=%s ctx=%d",
+                self._ws_id,
+                self.model,
+                self.context_window,
+            )
 
     def _rebuild_tool_search(self) -> None:
         """Reconstruct ToolSearchManager, preserving expanded tools."""
@@ -3822,30 +4040,49 @@ class ChatSession:
             # since-discovered tools visible), and a soft set must gain one.
             self._rebuild_tool_search()
         if config:
-            # Restore model via registry (same path as /model command)
+            # Restore model via registry (same path as /model command).
+            # An alias vanishing between the ``has_alias`` check and the
+            # resolve returns None with the binding untouched, so the
+            # constructor's coherent default falls through to the
+            # unreachable-alias branch instead of raising out of the resume.
             saved_alias = config.get("model_alias", "")
             saved_model = config.get("model", "")
+            bound_cfg: ModelConfig | None = None
+            bind_cause_logged = False
             if saved_alias and self._registry and self._registry.has_alias(saved_alias):
-                client, model_name, cfg = self._registry.resolve(saved_alias)
-                self.client = client
-                self.model = model_name
-                self._model_alias = saved_alias
-                self._provider = self._registry.get_provider(saved_alias)
-                self._cached_capabilities = None
-                self._judge = None  # re-create with new client/model
-                self._output_guard_judge = None  # same — re-create
-                self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
-                self.context_window = cfg.context_window
+                try:
+                    bind_res = self._bind_model_from_registry(saved_alias)
+                    bound_cfg = bind_res[0] if bind_res is not None else None
+                except ModelClientConstructionError as exc:
+                    # The saved alias IS in the registry; its client failed
+                    # to construct. Log that cause — the unreachable-alias
+                    # arm below would point operators at a registry state
+                    # that is not the problem — and keep the constructor's
+                    # default binding, as for a missing alias.
+                    log.warning(
+                        "Resume: saved alias=%r is in the registry but its "
+                        "client could not be constructed (%s); keeping "
+                        "default provider=%s model=%s",
+                        saved_alias,
+                        exc,
+                        type(self._provider).__name__,
+                        self.model,
+                    )
+                    bind_cause_logged = True
+            if bound_cfg is not None:
+                self.context_window = bound_cfg.context_window
                 if not self._manual_tool_truncation:
-                    self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
+                    self.tool_truncation = int(
+                        bound_cfg.context_window * self._chars_per_token * 0.5
+                    )
                 log.info(
                     "Resume: resolved alias=%s → provider=%s, model=%s, ctx=%d",
                     saved_alias,
                     type(self._provider).__name__,
-                    model_name,
-                    cfg.context_window,
+                    self.model,
+                    bound_cfg.context_window,
                 )
-            elif saved_alias or saved_model:
+            elif not bind_cause_logged and (saved_alias or saved_model):
                 # Saved alias is unset or no longer in the registry.
                 # Don't copy ``saved_model`` onto the constructor's
                 # default provider/client — pairing a removed model
@@ -4548,8 +4785,10 @@ class ChatSession:
         if not alias or not self._registry.has_alias(alias):
             return None
         try:
-            client, model, _cfg = self._registry.resolve(alias)
-            provider = self._registry.get_provider(alias)
+            # One locked snapshot for client + provider — separate
+            # resolve()/get_provider() calls could pair an old-map client
+            # with a new-map provider (wrong SDK dialect).
+            client, model, _cfg, provider, _ = self._registry.resolve_binding(alias)
             caps = self._resolve_capabilities(provider, model, alias)
         except Exception as exc:
             log.warning("perception alias %r not resolvable: %s", alias, exc)
@@ -5108,6 +5347,49 @@ class ChatSession:
                 f"seeing this means compaction could not reduce it enough.{raw_tail}"
             )
 
+        # A refusal to mint is a configuration fault, not a backend fault, so
+        # it never reaches the identity/enrichment below; the exception's own
+        # message already names the alias and the reason.
+        if isinstance(exc, BackendAuthUnavailableError):
+            # No raw_tail: unlike the branches below, the prefix IS the
+            # exception text, so it would render the same sentence twice.
+            return (
+                f"{exc}. This model alias is configured to mint a credential per call; "
+                f"check its auth mode and gateway audience, and the deployment's [oidc] "
+                f"settings. It is NOT the alias's static API key."
+            )
+
+        # A binding the per-send refresh diagnosed dead outranks the raw
+        # transport symptom, which points at network health instead of the
+        # admin action that caused it. Reached only when no fallback carried
+        # the turn. Remediation is PER-LANE: /model is routable only on the
+        # CLI and node-interactive command lanes, so the console coordinator
+        # — which routes no slash commands — gets recreate-or-adjust wording.
+        if self._registry_alias_removed or (
+            self._rebind_failed_key is not None and self._rebind_failed_key[0] == self._model_alias
+        ):
+            available = ""
+            if self._registry is not None and self._registry.count:
+                available = f" Available: {', '.join(self._registry.list_aliases())}"
+            if self._kind == WorkstreamKind.COORDINATOR:
+                remedy = "Recreate the alias or adjust the workstream model."
+            else:
+                remedy = "Switch to another model with /model <alias>."
+            if self._registry_alias_removed:
+                return (
+                    f"The model '{self._registry_alias_removed}' this session "
+                    f"was using has been removed from the registry, and no "
+                    f"fallback model could carry the turn. {remedy}"
+                    f"{available}{raw_tail}"
+                )
+            cause = self._rebind_failed_cause or "client construction failed"
+            return (
+                f"The model '{self._model_alias}' is in the registry but its "
+                f"client could not be rebuilt after a registry change: {cause}. "
+                f"The previous binding then failed to carry the turn. {remedy}"
+                f"{available}{raw_tail}"
+            )
+
         if name not in _BACKEND_KNOWN_EXC_NAMES:
             return None
 
@@ -5513,8 +5795,11 @@ class ChatSession:
             else None
         )
         try:
-            fb_client, fb_model, _ = self._registry.resolve(alias)
-            fb_provider = self._registry.get_provider(alias)
+            # One locked snapshot for client + provider — separate
+            # resolve()/get_provider() calls could pair an old-map client
+            # with a new-map provider, burning the healthy fallback on a
+            # self-inflicted wrong-dialect failure.
+            fb_client, fb_model, _, fb_provider, _ = self._registry.resolve_binding(alias)
             fb_caps = self._resolve_capabilities(fb_provider, fb_model, alias)
             self.ui.on_info(f"[Primary model failed, falling back to {alias}]")
             result = self._try_stream(
@@ -6097,7 +6382,7 @@ class ChatSession:
         except (KeyError, ValueError):
             return None
         mode = getattr(cfg, "auth_mode", "static")
-        if mode not in ("entra_obo", "entra_app") or not cfg.obo_audience:
+        if mode not in DYNAMIC_MODEL_AUTH_MODES or not cfg.obo_audience:
             return None
         has_static_key = bool(getattr(cfg, "api_key", ""))
         configured_fail_closed = bool(
@@ -6108,6 +6393,12 @@ class ChatSession:
         if mode == "entra_obo":
             user_id = (self._mcp_effective_user_id or "").strip()
             if not user_id:
+                # ``audience=`` is load-bearing on all four warnings in this
+                # resolver: mcp_oauth's cause layer — the only other
+                # audience-bearing log — never fires for this cause or
+                # mint_client_unavailable, and fires at most once per process
+                # for the two fallback causes, so these per-turn lines are the
+                # only per-occurrence record of WHICH gateway audience.
                 log.warning(
                     "model_obo.no_user_context",
                     alias=alias,
@@ -6143,6 +6434,7 @@ class ChatSession:
                     "model_app.fallback_to_static",
                     alias=alias,
                     audience=cfg.obo_audience,
+                    cause=_mint_refusal_cause("model_app", cfg.obo_audience),
                     has_static_key=has_static_key,
                 )
                 if must_fail_closed:
@@ -6162,8 +6454,9 @@ class ChatSession:
             log.warning(
                 "model_obo.fallback_to_static",
                 alias=alias,
-                user_id=user_id,
                 audience=cfg.obo_audience,
+                user_id=user_id,
+                cause=_mint_refusal_cause("model_obo", cfg.obo_audience, user_id),
                 has_static_key=has_static_key,
             )
             if must_fail_closed:
@@ -6283,6 +6576,9 @@ class ChatSession:
         """
         if acting_user_id is not None:
             self.bind_acting_user(acting_user_id)
+        # A dead binding diagnosed by the refresh does NOT fail fast here:
+        # the send proceeds so the fallback chain can carry the turn, and
+        # ``_format_backend_error`` surfaces the latched cause if it cannot.
         self._refresh_model_from_registry()
         # Token budget approval gate
         if self._budget_exhausted:
@@ -16859,8 +17155,12 @@ class ChatSession:
         else:
             agent_alias = self._registry.resolve_agent_alias(label) if self._registry else None
         if self._registry and agent_alias:
-            agent_client, agent_model, _ = self._registry.resolve(agent_alias)
-            agent_provider = self._registry.get_provider(agent_alias)
+            # One locked snapshot for client + provider — separate
+            # resolve()/get_provider() calls could pair an old-map client
+            # with a new-map provider (wrong SDK dialect).
+            agent_client, agent_model, _, agent_provider, _ = self._registry.resolve_binding(
+                agent_alias
+            )
         else:
             agent_client = self.client
             agent_model = self.model
@@ -18863,48 +19163,60 @@ class ChatSession:
                     if self._registry.agent_model:
                         info += f"\nAgent model: {self._registry.agent_model}"
                 self.ui.on_info(info)
-            elif self._registry and self._registry.has_alias(arg):
-                client, model_name, cfg = self._registry.resolve(arg)
-                self.client = client
-                self.model = model_name
-                self._model_alias = arg
-                self._provider = self._registry.get_provider(arg)
-                self._cached_capabilities = None
-                self.context_window = cfg.context_window
-                if not self._manual_tool_truncation:
-                    self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
-                # Re-resolve the sampling knobs for the new alias through the
-                # SAME shared resolvers session_factory uses, so switching
-                # away from a model with overrides doesn't leak them and
-                # every surface samples identically on the same alias.
-                # Unset resolves to None (wire omission), replacing any prior
-                # model's value.  STORE-LESS sessions (the CLI) are the
-                # exception: there the current knobs ARE the user's explicit
-                # flags (--temperature / /reason) — the only authority that
-                # exists — so the switch keeps them unless the new alias
-                # declares its own (mirrors the max_tokens fallback below).
-                cs = self._config_store
-                if cs:
-                    self.temperature = resolve_temperature_setting(cfg, cs)
-                    self.reasoning_effort = resolve_effort_setting(cfg, cs)
-                else:
-                    if cfg.temperature is not None:
-                        self.temperature = cfg.temperature
-                    if cfg.reasoning_effort:
-                        self.reasoning_effort = cfg.reasoning_effort
-                self.max_tokens = (
-                    cfg.max_tokens
-                    if cfg.max_tokens is not None
-                    else (cs.get("model.max_tokens") if cs else self.max_tokens)
-                )
-                self._init_system_messages()
-                self._save_config()
-                self.ui.on_info(f"Switched to {cyan(arg)}: {model_name}")
             else:
-                available = ""
+                # An alias deleted mid-switch returns None and lands in the
+                # unknown-alias arm below with the old binding intact. An
+                # alias that EXISTS but cannot construct raises instead, and
+                # its cause is surfaced verbatim rather than falling into the
+                # unknown-alias text — which would claim the alias unknown
+                # while listing it as available.
+                cfg = None
+                construction_error: str | None = None
                 if self._registry:
-                    available = f" Available: {', '.join(self._registry.list_aliases())}"
-                self.ui.on_info(f"Unknown model alias: {arg}.{available}")
+                    try:
+                        switch_bind = self._bind_model_from_registry(arg)
+                        cfg = switch_bind[0] if switch_bind is not None else None
+                    except ModelClientConstructionError as exc:
+                        construction_error = str(exc)
+                if cfg is not None:
+                    self.context_window = cfg.context_window
+                    if not self._manual_tool_truncation:
+                        self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
+                    # Re-resolve the sampling knobs for the new alias through
+                    # the SAME shared resolvers session_factory uses, so
+                    # switching away from a model with overrides doesn't leak
+                    # them and every surface samples identically on the same
+                    # alias.  Unset resolves to None (wire omission),
+                    # replacing any prior model's value.  STORE-LESS sessions
+                    # (the CLI) are the exception: there the current knobs
+                    # ARE the user's explicit flags (--temperature / /reason)
+                    # — the only authority that exists — so the switch keeps
+                    # them unless the new alias declares its own (mirrors the
+                    # max_tokens fallback below).
+                    cs = self._config_store
+                    if cs:
+                        self.temperature = resolve_temperature_setting(cfg, cs)
+                        self.reasoning_effort = resolve_effort_setting(cfg, cs)
+                    else:
+                        if cfg.temperature is not None:
+                            self.temperature = cfg.temperature
+                        if cfg.reasoning_effort:
+                            self.reasoning_effort = cfg.reasoning_effort
+                    self.max_tokens = (
+                        cfg.max_tokens
+                        if cfg.max_tokens is not None
+                        else (cs.get("model.max_tokens") if cs else self.max_tokens)
+                    )
+                    self._init_system_messages()
+                    self._save_config()
+                    self.ui.on_info(f"Switched to {cyan(arg)}: {self.model}")
+                elif construction_error is not None:
+                    self.ui.on_info(f"Cannot switch to {cyan(arg)}: {construction_error}")
+                else:
+                    available = ""
+                    if self._registry:
+                        available = f" Available: {', '.join(self._registry.list_aliases())}"
+                    self.ui.on_info(f"Unknown model alias: {arg}.{available}")
 
         elif cmd == "/raw":
             self.show_reasoning = not self.show_reasoning

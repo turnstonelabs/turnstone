@@ -3865,6 +3865,21 @@ async def update_interface_setting(request: Request, key: str = "") -> JSONRespo
     return JSONResponse({"status": "ok", "key": key, "value": typed_value})
 
 
+def _model_auth_key_refusal_response(exc: Exception) -> JSONResponse:
+    """The node's uniform answer to the reload chokepoint's key refusal.
+
+    Shared by every node-lane ``ModelRegistry.reload`` caller so the same
+    keyless deployment state cannot report through two diverging arms: keep
+    serving the old registry, emit the one grep signature, answer a
+    structured 503 (deployment fault — install the key and retry), never 422
+    (the bad-arguments exit). The console-lane sibling is
+    ``_record_coord_key_refusal``; the boot-time twin is
+    ``initialize_mcp_crypto_state``'s SystemExit.
+    """
+    log.error("node.model_auth_key_missing: %s", exc)
+    return JSONResponse({"status": "error", "reason": str(exc)}, status_code=503)
+
+
 def config_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/config-reload — invalidate config cache."""
     cs = getattr(request.app.state, "config_store", None)
@@ -3877,7 +3892,16 @@ def config_reload(request: Request) -> JSONResponse:
     # routing until a model-reload or restart.
     registry = getattr(request.app.state, "registry", None)
     if registry is not None:
-        _apply_routing_overrides(registry, cs)
+        from turnstone.core.model_registry import DynamicAuthKeyError
+
+        try:
+            _apply_routing_overrides(registry, cs, request.app.state)
+        except DynamicAuthKeyError as exc:
+            # Latent today — a live registry with dynamic aliases implies the
+            # key was present at install — but this endpoint reaches
+            # ModelRegistry.reload with real app state, and complete
+            # mediation is only complete if every caller handles the refusal.
+            return _model_auth_key_refusal_response(exc)
     # Broadcast settings_changed event to all connected clients
     if gq is not None:
         with contextlib.suppress(queue.Full):
@@ -4091,12 +4115,19 @@ def _broadcast_agent_tool_schema_refresh(app_state: Any) -> None:
             refresh()
 
 
-def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
+def _apply_routing_overrides(registry: Any, cs: Any, app_state: Any) -> bool:
     """Apply ConfigStore routing overrides to a live *registry* in place.
 
     Used by the startup path and by ``config_reload`` (admin settings
     update fan-out) — both keep the existing model definitions and only
     rewrite routing fields.  Returns True when a reload happened.
+
+    ``app_state`` feeds the swap chokepoint in ``ModelRegistry.reload``: the
+    startup caller runs before the app exists and passes
+    ``KEY_GUARD_DEFERRED_TO_LIFESPAN``, the endpoint caller passes the real
+    state. Same-models swaps make the guard vacuous, but routing every swap
+    through the chokepoint means no site needs that reasoning (complete
+    mediation).
     """
     if not registry.models:
         # Degraded (empty) registry — no aliases to route to yet. Routing
@@ -4119,6 +4150,7 @@ def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
             eff[0],
             registry.fallback,
             registry.agent_model,
+            app_state=app_state,
             task_model=eff[1],
             task_effort=eff[2],
         )
@@ -4128,7 +4160,11 @@ def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
 
 def internal_model_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/model-reload — rebuild registry from DB + config."""
-    from turnstone.core.model_registry import load_model_registry
+    from turnstone.core.model_registry import (
+        DynamicAuthKeyError,
+        ModelAuthConfigError,
+        load_model_registry,
+    )
     from turnstone.core.storage._registry import get_storage
 
     registry = getattr(request.app.state, "registry", None)
@@ -4137,14 +4173,23 @@ def internal_model_reload(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "reason": "no registry"}, status_code=503)
 
     storage = get_storage()
-    new_registry = load_model_registry(
-        base_url=cli_args["base_url"],
-        api_key=cli_args["api_key"],
-        model=cli_args["model"],
-        context_window=cli_args["context_window"],
-        provider=cli_args["provider"],
-        storage=storage,
-    )
+    try:
+        new_registry = load_model_registry(
+            base_url=cli_args["base_url"],
+            api_key=cli_args["api_key"],
+            model=cli_args["model"],
+            context_window=cli_args["context_window"],
+            provider=cli_args["provider"],
+            storage=storage,
+        )
+    except ModelAuthConfigError as exc:
+        # A row whose auth fields violate _normalize_auth_mode, reachable via
+        # direct SQL, a migration mishap, or console version skew (console
+        # writes are validated). The loader deliberately propagates it; this
+        # arm keeps the node from answering a bare 500 where the console's
+        # refresh path catches the same row. Same structured 422 contract as
+        # the bad-arguments arm below: the reason names the row and field.
+        return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
     cs = getattr(request.app.state, "config_store", None)
     if cs is not None:
         cs.reload()  # Ensure latest settings from DB
@@ -4182,9 +4227,14 @@ def internal_model_reload(request: Request) -> JSONResponse:
             eff_default,
             new_registry.fallback,
             new_registry.agent_model,
+            app_state=request.app.state,
             task_model=eff_task_model,
             task_effort=eff_task_effort,
         )
+    except DynamicAuthKeyError as exc:
+        # Matches the console write validator's classification of the
+        # identical state; see the shared helper for the full policy.
+        return _model_auth_key_refusal_response(exc)
     except ValueError as exc:
         return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
     finally:
@@ -5513,7 +5563,12 @@ def main() -> None:
     # ConfigStore returns the SettingDef default ("" for these keys) when
     # unset — distinct from the registry's None for unconfigured fields.
     config_store.reload()  # symmetry with internal_model_reload's cs.reload()
-    _apply_routing_overrides(registry, config_store)
+    # Pre-lifespan: no app.state exists yet, so there is no token store to
+    # check. initialize_mcp_crypto_state owns the dynamic-auth key
+    # requirement for this boot phase — see the sentinel's definition.
+    from turnstone.core.model_registry import KEY_GUARD_DEFERRED_TO_LIFESPAN
+
+    _apply_routing_overrides(registry, config_store, KEY_GUARD_DEFERRED_TO_LIFESPAN)
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
@@ -5641,7 +5696,9 @@ def main() -> None:
         # loud; the manager filters those out via its model_validator
         # before the alias reaches this factory.
         model_alias = model_alias or _effective_default_alias()
-        r_client, r_model, r_cfg = registry.resolve(model_alias)
+        # The generation comes back from resolve()'s own lock hold, exactly
+        # paired with the client it vouches for; hand it to the constructor.
+        r_client, r_model, r_cfg, registry_generation = registry.resolve(model_alias)
         # Read MCP client from shared ref — may have been replaced after startup
         # by internal_mcp_reload (Sync to Nodes) when no --mcp-config was passed.
         live_mcp_client = _mcp_ref[0]
@@ -5714,6 +5771,7 @@ def main() -> None:
             mcp_client=live_mcp_client,
             registry=registry,
             model_alias=model_alias,
+            registry_generation=registry_generation,
             health_registry=health_registry,
             node_id=_node_id,
             ws_id=ws_id,

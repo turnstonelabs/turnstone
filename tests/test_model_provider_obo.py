@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -34,6 +34,12 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 
+from tests._oidc_test_helpers import (
+    ISSUER,
+    TOKEN_ENDPOINT,
+    make_oidc_config,
+    mint_warn_state_reset,
+)
 from tests.conftest import make_mcp_token_cipher
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.mcp_crypto import MCPTokenStore
@@ -44,18 +50,26 @@ from turnstone.core.model_registry import (
     ModelRegistry,
     load_model_registry,
 )
-from turnstone.core.oidc import OIDCConfig
 from turnstone.core.session import BackendAuthUnavailableError, ChatSession
 from turnstone.core.storage._sqlite import SQLiteBackend
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from turnstone.core.oidc import OIDCConfig
+
 USER = "user-1"
-ISSUER = "https://idp.test"
-TOKEN_ENDPOINT = "https://idp.test/token"
 AUDIENCE = "https://models.example.com"
 
 _MIGRATIONS_DIR = str(
     Path(__file__).resolve().parent.parent / "turnstone" / "core" / "storage" / "migrations"
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_warn_dedup_state() -> Iterator[None]:
+    """Per-test mint warn/cause reset — see ``mint_warn_state_reset``."""
+    yield from mint_warn_state_reset()
 
 
 # ---------------------------------------------------------------------------
@@ -279,18 +293,6 @@ class TestGetClientKeyInjection:
 # ---------------------------------------------------------------------------
 
 
-def _make_oidc_config(**overrides: Any) -> OIDCConfig:
-    defaults: dict[str, Any] = {
-        "enabled": True,
-        "issuer": ISSUER,
-        "client_id": "cid",
-        "client_secret": "csecret",
-        "token_endpoint": TOKEN_ENDPOINT,
-    }
-    defaults.update(overrides)
-    return OIDCConfig(**defaults)
-
-
 def _make_app_state(
     storage: SQLiteBackend, *, http_client: httpx.AsyncClient, oidc_config: OIDCConfig
 ) -> SimpleNamespace:
@@ -336,7 +338,7 @@ class TestMintOboAccessToken:
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
         state.mcp_token_store.get_user_token = MagicMock(  # type: ignore[method-assign]
             wraps=state.mcp_token_store.get_user_token
@@ -375,7 +377,7 @@ class TestMintOboAccessToken:
         node_a = SimpleNamespace(
             auth_storage=storage,
             mcp_token_store=MCPTokenStore(storage, cipher, node_id="A"),
-            oidc_config=_make_oidc_config(),
+            oidc_config=make_oidc_config(),
             obo_http_client=client,
             mcp_oauth_refresh_locks={},
         )
@@ -398,7 +400,7 @@ class TestMintOboAccessToken:
         node_b = SimpleNamespace(
             auth_storage=storage,
             mcp_token_store=MCPTokenStore(storage, cipher, node_id="B"),
-            oidc_config=_make_oidc_config(),
+            oidc_config=make_oidc_config(),
             obo_http_client=client,
             mcp_oauth_refresh_locks={},
         )
@@ -412,7 +414,7 @@ class TestMintOboAccessToken:
                 200, {"access_token": "at", "expires_in": 3600, "refresh_token": "rt-2"}
             )
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state, refresh_token="rt-1")
 
         assert _mint(state) == "at"
@@ -427,7 +429,7 @@ class TestMintOboAccessToken:
                 _mk_response(200, {"access_token": "at-2", "expires_in": 3600}),
             ]
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
 
         assert _mint(state) == "at-1"
@@ -437,26 +439,158 @@ class TestMintOboAccessToken:
     def test_missing_credential_returns_none_no_http(self, storage: SQLiteBackend) -> None:
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         # No captured credential seeded.
         assert _mint(state) is None
         assert client.post.call_count == 0
+
+    def test_missing_credential_names_cause_once_per_user(
+        self, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The missing-credential cause is deduped per (user, audience)."""
+        from turnstone.core import mcp_oauth as mcp_oauth_module
+
+        warned: set[tuple[str, str]] = set()
+        monkeypatch.setattr(mcp_oauth_module, "_MODEL_OBO_MISSING_CRED_WARNED", warned)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        assert _mint(state) is None
+        assert _mint(state) is None  # repeat turn: still exactly one entry
+        # Tuple key, not a joined string — user ids and api:// audiences
+        # can both contain ':'.
+        assert warned == {(USER, AUDIENCE)}
+
+    def test_missing_credential_cap_cannot_starve_operator_causes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The two dedup namespaces are independent by construction."""
+        from turnstone.core import mcp_oauth as mcp_oauth_module
+
+        user_full = {(f"user-{i}", "api://aud") for i in range(512)}
+        operator_fresh: set[str] = set()
+        monkeypatch.setattr(mcp_oauth_module, "_MODEL_OBO_MISSING_CRED_WARNED", user_full)
+        monkeypatch.setattr(mcp_oauth_module, "_MODEL_MINT_MISCONFIG_WARNED", operator_fresh)
+        mcp_oauth_module._warn_model_mint_misconfig_once(
+            "model_obo.oidc_not_enabled", "api://aud", "u-any"
+        )
+        assert operator_fresh == {"model_obo.oidc_not_enabled:api://aud"}
+
+        operator_full = {f"cause-{i}:api://aud" for i in range(512)}
+        user_fresh: set[tuple[str, str]] = set()
+        monkeypatch.setattr(mcp_oauth_module, "_MODEL_MINT_MISCONFIG_WARNED", operator_full)
+        monkeypatch.setattr(mcp_oauth_module, "_MODEL_OBO_MISSING_CRED_WARNED", user_fresh)
+        mcp_oauth_module._warn_model_obo_missing_credential_once("api://aud", "u-new")
+        assert user_fresh == {("u-new", "api://aud")}
+
+    def test_success_clears_only_the_minting_users_cause(self, storage: SQLiteBackend) -> None:
+        """The last-cause record is keyed per (prefix, audience, user)."""
+        from turnstone.core.mcp_oauth import model_mint_refusal_cause
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "at-bob", "expires_in": 3600})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        # bob has a captured credential; alice does not.
+        state.mcp_token_store.upsert_oidc_credential("bob", ISSUER, refresh_token="rt-bob")
+
+        async def _mint_as(user: str) -> Any:
+            return await mint_obo_access_token(app_state=state, user_id=user, audience=AUDIENCE)
+
+        assert asyncio.run(_mint_as("alice")) is None
+        assert model_mint_refusal_cause("model_obo", AUDIENCE, "alice") == "missing_credential"
+
+        assert asyncio.run(_mint_as("bob")) == "at-bob"
+        assert model_mint_refusal_cause("model_obo", AUDIENCE, "bob") == ""
+        assert model_mint_refusal_cause("model_obo", AUDIENCE, "alice") == "missing_credential"
+
+    def test_cooldown_window_keeps_the_recorded_cause(self, storage: SQLiteBackend) -> None:
+        """The record persists across cooldown short-circuits: only the
+        recording user's successful mint clears a cause."""
+        from turnstone.core.mcp_oauth import model_mint_refusal_cause
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "at-bob", "expires_in": 3600})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        state.mcp_token_store.upsert_oidc_credential("bob", ISSUER, refresh_token="rt-bob")
+
+        async def _mint_as(user: str) -> Any:
+            return await mint_obo_access_token(app_state=state, user_id=user, audience=AUDIENCE)
+
+        # First refusal records the cause and arms alice's cooldown.
+        assert asyncio.run(_mint_as("alice")) is None
+        # Another user's success on the shared audience must not disturb it.
+        assert asyncio.run(_mint_as("bob")) == "at-bob"
+        posts_after_bob = client.post.call_count
+
+        # Alice's next turn lands inside the cooldown window: the mint
+        # short-circuits (no IdP traffic) and the cause survives.
+        assert asyncio.run(_mint_as("alice")) is None
+        assert client.post.call_count == posts_after_bob
+        assert model_mint_refusal_cause("model_obo", AUDIENCE, "alice") == "missing_credential"
 
     def test_oidc_disabled_returns_none_no_http(self, storage: SQLiteBackend) -> None:
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
-            storage, http_client=client, oidc_config=_make_oidc_config(enabled=False)
+            storage, http_client=client, oidc_config=make_oidc_config(enabled=False)
         )
         _seed_credential(state)
         assert _mint(state) is None
+        assert client.post.call_count == 0
+
+    def test_discovery_pending_posture_logs_pending_cause_not_disabled(
+        self, storage: SQLiteBackend, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Discovery-pending self-heals, so it is not ``oidc_not_enabled``."""
+        import logging
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(
+            storage,
+            http_client=client,
+            oidc_config=make_oidc_config(enabled=False, discovery_retryable=True),
+        )
+        _seed_credential(state)
+        with caplog.at_level(logging.WARNING):
+            assert _mint(state) is None
+        blob = " ".join(r.getMessage() + str(getattr(r, "__dict__", "")) for r in caplog.records)
+        assert "model_obo.oidc_discovery_pending" in blob
+        assert "model_obo.oidc_not_enabled" not in blob
+        assert client.post.call_count == 0
+
+    def test_missing_token_store_logs_store_cause_with_shape_fields(
+        self, storage: SQLiteBackend, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The cause carries which half of the store/storage pair is absent."""
+        import logging
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        state.mcp_token_store = None
+        with caplog.at_level(logging.WARNING):
+            assert _mint(state) is None
+        matching = [
+            r
+            for r in caplog.records
+            if "model_obo.token_store_unavailable" in r.getMessage() + str(r.__dict__)
+        ]
+        assert matching, caplog.records
+        blob = " ".join(r.getMessage() + str(r.__dict__) for r in matching)
+        assert "has_token_store" in blob and "False" in blob
+        assert "has_storage" in blob and "True" in blob
         assert client.post.call_count == 0
 
     def test_unusable_profile_returns_none_no_http(self, storage: SQLiteBackend) -> None:
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
-            storage, http_client=client, oidc_config=_make_oidc_config(obo_grant_profile="")
+            storage, http_client=client, oidc_config=make_oidc_config(obo_grant_profile="")
         )
         _seed_credential(state)
         assert _mint(state) is None
@@ -469,7 +603,7 @@ class TestMintOboAccessToken:
                 400, {"error": "invalid_grant", "error_description": "AADSTS65001"}
             )
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
         # A failed mint falls back to the static credential (None), and never
         # auto-deletes the shared credential.
@@ -499,7 +633,7 @@ class TestMintAppAccessToken:
             return_value=_mk_response(200, {"access_token": "app-at", "expires_in": 3600})
         )
         # NOTE: no captured user credential seeded — app identity needs none.
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
 
         assert _mint_app(state) == "app-at"
         # Exact client-credentials wire shape — scope pins <audience>/.default.
@@ -524,7 +658,7 @@ class TestMintAppAccessToken:
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "app-at", "expires_in": 3600})
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         # The credential store is empty; the app grant still succeeds.
         assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is None
         assert _mint_app(state) == "app-at"
@@ -533,7 +667,7 @@ class TestMintAppAccessToken:
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
-            storage, http_client=client, oidc_config=_make_oidc_config(enabled=False)
+            storage, http_client=client, oidc_config=make_oidc_config(enabled=False)
         )
         assert _mint_app(state) is None
         assert client.post.call_count == 0
@@ -545,7 +679,7 @@ class TestMintAppAccessToken:
                 400, {"error": "invalid_client", "error_description": "AADSTS7000215"}
             )
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         assert _mint_app(state) is None
         assert _mint_app(state) is None
         assert client.post.call_count == 1
@@ -556,7 +690,7 @@ class TestMintAppAccessToken:
         state = _make_app_state(
             storage,
             http_client=client,
-            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+            oidc_config=make_oidc_config(obo_grant_profile="rfc8693"),
         )
 
         assert _mint_app(state) is None
@@ -570,7 +704,7 @@ class TestMintAppAccessToken:
                 _mk_response(200, {"access_token": "app-2", "expires_in": 3600}),
             ]
         )
-        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         assert _mint_app(state) == "app-1"
         assert _mint_app(state, force_refresh=True) == "app-2"
         assert client.post.call_count == 2
@@ -629,6 +763,92 @@ class TestModelOboToken:
         sess._mcp_mint_client.mint_model_obo_token_sync.assert_called_once_with(
             user_id=USER, audience=AUDIENCE
         )
+
+    def test_fallback_warn_names_last_recorded_mint_cause(
+        self, storage: SQLiteBackend, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The per-turn fallback warn names the last recorded cause inline."""
+        import logging
+
+        # A refused mint records its cause (typo'd grant profile).
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(
+            storage,
+            http_client=client,
+            oidc_config=make_oidc_config(obo_grant_profile="bogus"),
+        )
+        _seed_credential(state)
+        assert _mint(state) is None
+
+        # The decision layer: the mint client yields nothing.
+        reg = _registry_with(self._obo_cfg())
+        sess = _fake_session(registry=reg, user_id=USER, mint_token=None)
+        with caplog.at_level(logging.WARNING):
+            token = ChatSession._model_backend_auth_token(sess, "tf")
+        assert token is None  # explicit static key stands, fail-open
+        matching = [
+            r
+            for r in caplog.records
+            if "model_obo.fallback_to_static" in r.getMessage() + str(r.__dict__)
+        ]
+        assert matching, caplog.records
+        blob = " ".join(r.getMessage() + str(r.__dict__) for r in matching)
+        assert "unsupported_grant_profile" in blob
+
+    def test_decrypt_failure_names_cause_on_heartbeat(
+        self, storage: SQLiteBackend, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A key-rotation refusal must not render as cause=unknown."""
+        import logging
+
+        # Credential captured under one encryption key; the store then
+        # runs under a different key (rotation) — the real decrypt path.
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        _seed_credential(state)
+        state.mcp_token_store = MCPTokenStore(storage, make_mcp_token_cipher(), node_id="B")
+
+        assert _mint(state) is None
+        assert client.post.call_count == 0  # refused before any IdP traffic
+
+        from turnstone.core.mcp_oauth import model_mint_refusal_cause
+
+        assert model_mint_refusal_cause("model_obo", AUDIENCE, USER) == "credential_decrypt_failure"
+
+        # And the per-turn heartbeat renders it inline.
+        reg = _registry_with(self._obo_cfg())
+        sess = _fake_session(registry=reg, user_id=USER, mint_token=None)
+        with caplog.at_level(logging.WARNING):
+            ChatSession._model_backend_auth_token(sess, "tf")
+        matching = [
+            r
+            for r in caplog.records
+            if "model_obo.fallback_to_static" in r.getMessage() + str(r.__dict__)
+        ]
+        assert matching, caplog.records
+        blob = " ".join(r.getMessage() + str(r.__dict__) for r in matching)
+        assert "credential_decrypt_failure" in blob
+
+    def test_fallback_warn_cause_unknown_when_nothing_recorded(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No recorded refusal renders as ``cause=unknown``, never omitted."""
+        import logging
+
+        reg = _registry_with(self._obo_cfg())
+        sess = _fake_session(registry=reg, user_id=USER, mint_token=None)
+        with caplog.at_level(logging.WARNING):
+            ChatSession._model_backend_auth_token(sess, "tf")
+        matching = [
+            r
+            for r in caplog.records
+            if "model_obo.fallback_to_static" in r.getMessage() + str(r.__dict__)
+        ]
+        assert matching, caplog.records
+        blob = " ".join(r.getMessage() + str(r.__dict__) for r in matching)
+        assert "unknown" in blob
 
     def test_token_is_provider_agnostic(self) -> None:
         # The raw token is returned regardless of provider surface — the caller

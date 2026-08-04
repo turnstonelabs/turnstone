@@ -44,7 +44,8 @@ class _CapturingRegistry:
     ``has_alias`` answers from the configured known set so the
     ``model.default_alias`` validation tier behaves realistically.
     Mirrors the public surface ``ModelRegistry`` exposes to
-    session_factory: ``has_alias``, ``resolve``, and ``default``.
+    session_factory: ``has_alias``, ``resolve`` (which returns the
+    reload generation beside the binding), and ``default``.
     """
 
     def __init__(self, *, default: str, known: set[str]) -> None:

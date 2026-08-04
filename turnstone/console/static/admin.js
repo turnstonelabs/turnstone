@@ -6399,6 +6399,25 @@ function _pollInstallStatus(serverId, serverName, attempt) {
 
 let _modelDefs = [];
 let _modelDefaultAlias = "";
+// Dynamic-auth affordance data, fetched from the admin.mcp-gated
+// auth-constraints route on each shelf open — never from the list endpoint,
+// so an admin.models-only caller is not handed the deployment's approved
+// audience set, and an open shelf can't go stale under a background list
+// refresh.
+//
+// null = not fetched (in flight, not permitted, or failed — see the failed
+// flag). An OBJECT is the server's answer, whose empty allowlist is a real
+// deny-all. Affordance only: every reader must fail OPEN on null.
+let _modelAuthConstraints = null;
+let _modelAuthConstraintsFailed = false;
+// Guards the stale-response race: a fetch started for a previous shelf open
+// must not overwrite the state a newer open has reset. Bumped per
+// _fetchModelAuthConstraints call; handlers compare their captured value.
+let _modelAuthFetchGen = 0;
+// The (mode, audience) as persisted on the row being edited — empty for a
+// create. Drives the hide/enable/hint state only; the server alone validates
+// submits (a stale client copy must never block a server-valid save).
+let _modelAuthPersisted = { mode: "static", audience: "" };
 // Reranker calibration fields extracted out of the capabilities textarea in the
 // edit modal (like server_compat), held here so they survive an unrelated edit
 // and are re-merged on save. Reset per modal open.
@@ -6757,9 +6776,61 @@ function _audioModelEligible(md, capFlag, mediaRole) {
 // permission gating the Models tab itself.  When the user has Models
 // access but not Settings, hide the sub-tab button + force the
 // Definitions panel visible so they don't see a perpetual 403 loader.
-function _modelRolesAccessible() {
+// The console page's ONE cache-skew shim pair over the auth.js permission
+// globals — shared by this file AND app.js (index.html loads admin.js
+// first, both classic scripts, so these are defined before app.js runs;
+// keep it that way or hoist the pair if the order ever changes).
+//
+// Deny-on-absent scope checks delegate to the shared hasPermission in
+// auth.js, the module that populates the storage, so a storage-format
+// change cannot diverge between the admin shelf and the home composer.
+// (``adminTabAllowed`` up top deliberately differs: it grants on absent so
+// an unknown-scope deployment still renders its admin IA.)
+//
+// Reached through window AT CALL TIME as a cache-skew shim: auth.js is an ES
+// module, so a classic script's bare-identifier call would throw
+// ReferenceError whenever the browser revalidates this file but serves
+// /shared/auth.js from heuristic cache (StaticFiles sends no Cache-Control),
+// and one thrown boot tail blanks the whole tab. Absent globals fall back to
+// the storage parse rather than to deny-until-fresh: a stale auth.js still
+// populates sessionStorage from whoami, so denying would black out three
+// working surfaces for the cache entry's whole revalidation window.
+function _consoleHasPermission(scope) {
+  if (window.hasPermission) return window.hasPermission(scope);
+  // Deliberate 3-line duplication of auth.js's hasPermission parse (same
+  // storage key, comma-split, absent-storage = deny) so scope checks
+  // survive a stale-cached auth.js; a pointer comment on the original
+  // binds the two — change the key or format in BOTH places.
   const perms = sessionStorage.getItem("turnstone_permissions") || "";
-  return perms.split(",").indexOf("admin.settings") !== -1;
+  return perms.split(",").indexOf(scope) !== -1;
+}
+
+function _consoleWhenPermissionsReady(cb) {
+  if (typeof window.whenPermissionsReady === "function") {
+    window.whenPermissionsReady(cb);
+  } else {
+    setTimeout(cb, 500);
+  }
+}
+
+// The dynamic (non-shared-key) auth-mode predicate. The authoritative answer
+// is the FETCHED constraints' `dynamic_auth_modes` (server-derived from
+// DYNAMIC_MODEL_AUTH_MODES in turnstone/core/model_registry.py), so the
+// shelf's affordances track the server's classification by data. The
+// hand-list below is the FAIL-OPEN FALLBACK ONLY: constraints not yet
+// fetched, fetch failed, or a server that does not send the field.
+function _isDynamicAuthMode(mode) {
+  if (
+    _modelAuthConstraints &&
+    Array.isArray(_modelAuthConstraints.dynamic_auth_modes)
+  ) {
+    return _modelAuthConstraints.dynamic_auth_modes.indexOf(mode) !== -1;
+  }
+  return mode === "entra_obo" || mode === "entra_app";
+}
+
+function _modelRolesAccessible() {
+  return _consoleHasPermission("admin.settings");
 }
 
 function _applyModelRolesPermission() {
@@ -6777,6 +6848,212 @@ function _applyModelRolesPermission() {
   }
 }
 
+// Setting or changing a model's auth mode / audience escalates what a
+// credential can reach, so the server demands admin.mcp for it — the same
+// scope the equivalent write on an MCP server takes — rather than the
+// admin.models that opens this shelf.
+function _modelAuthEditable() {
+  return _consoleHasPermission("admin.mcp");
+}
+
+// Fill the audience datalist from the fetched constraints. Suggestions only:
+// the field is free text, so absent constraints degrade to "no suggestions"
+// rather than a deny-all, and the input's VALUE is never touched here — a
+// de-listed or mid-typing audience survives every re-render.
+function _renderModelAudienceOptions() {
+  const list = document.getElementById("model-obo-audience-options");
+  if (!list) return;
+  list.textContent = "";
+  const allow = _modelAuthConstraints
+    ? _modelAuthConstraints.auth_audience_allowlist
+    : [];
+  allow.forEach(function (value) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    list.appendChild(opt);
+  });
+}
+
+// Fetch the affordance data for the Backend-auth block, once per shelf open,
+// and only for an operator who can actually edit auth — the route is gated on
+// admin.mcp, and an admin.models-only operator sees the controls disabled
+// with a permission hint. Fail OPEN: on any failure the shelf keeps free-text
+// input with nothing disabled, and the write validator remains the authority.
+function _fetchModelAuthConstraints() {
+  // Invalidate any in-flight fetch from a previous shelf open: its handlers
+  // compare this captured generation and drop themselves, so a slow response
+  // can never overwrite the state a fresh open just reset.
+  const gen = ++_modelAuthFetchGen;
+  _modelAuthConstraints = null;
+  _modelAuthConstraintsFailed = false;
+  _renderModelAudienceOptions();
+  // Repaint NOW from the reset (constraints-unknown) state, on every path, or
+  // a stalled request leaves the block wearing the previous shelf's
+  // visibility/enable/hint state for the whole open. The settle handlers
+  // below repaint again with real data.
+  _syncModelAuthFields();
+  if (!_modelAuthEditable()) {
+    // Permissions arrive from an async whoami; a shelf opened from a
+    // restored tab can render before they land, and the deny-on-absent
+    // default must not stick for an operator who does hold the scope.
+    // Registered HERE — the per-shelf-open ENTRY — and never from
+    // _syncModelAuthFields: registering inside a repaint re-enters
+    // registration from its own continuation, which on the already-resolved
+    // permissionsReady promise is an unbounded microtask loop. From this
+    // entry it is bounded at one callback per shelf open, since the
+    // continuation runs the fetch/sync pair and never this registration.
+    if (!sessionStorage.getItem("turnstone_permissions")) {
+      _consoleWhenPermissionsReady(function () {
+        // A newer shelf open owns the state now.
+        if (gen !== _modelAuthFetchGen) return;
+        // Re-fetch only if the resolved permission set actually grants the
+        // scope; otherwise settle the hints into their read-only state.
+        if (_modelAuthEditable()) {
+          _fetchModelAuthConstraints();
+        } else {
+          _syncModelAuthFields();
+        }
+      });
+    }
+    return;
+  }
+  authFetch("/v1/api/admin/model-definitions/auth-constraints")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      if (gen !== _modelAuthFetchGen) return;
+      // No coalescing: both keys are always sent, so a malformed answer is
+      // treated as a failed fetch rather than laundered into an empty one.
+      if (
+        !Array.isArray(data.auth_audience_allowlist) ||
+        typeof data.auth_grant_profile !== "string"
+      ) {
+        throw new Error("Malformed");
+      }
+      _modelAuthConstraints = data;
+      _renderModelAudienceOptions();
+      _syncModelAuthFields();
+    })
+    .catch(function () {
+      if (gen !== _modelAuthFetchGen) return;
+      _modelAuthConstraintsFailed = true;
+      _syncModelAuthFields();
+    });
+}
+
+// Enable-state and hint copy for the Backend-auth block. Reads the persisted
+// values in `_modelAuthPersisted` so it can MIRROR the server's rules rather
+// than approximate them — the server treats any non-tuning value change as
+// an auth change whenever the STORED or the newly selected mode is dynamic
+// (default-deny; tuning fields like temperature stay open to admin.models).
+function _syncModelAuthFields() {
+  const modeSel = document.getElementById("model-auth-mode");
+  const audSel = document.getElementById("model-obo-audience");
+  const modeHint = document.getElementById("model-auth-mode-hint");
+  const audHint = document.getElementById("model-obo-audience-hint");
+  if (!modeSel || !audSel) return;
+
+  const editable = _modelAuthEditable();
+  const known = _modelAuthConstraints !== null;
+  const profile = known ? _modelAuthConstraints.auth_grant_profile : "";
+  const allowCount = known
+    ? _modelAuthConstraints.auth_audience_allowlist.length
+    : 0;
+
+  const persistedDynamicMode = _isDynamicAuthMode(_modelAuthPersisted.mode);
+  const mode = modeSel.value || "static";
+  const dynamic = _isDynamicAuthMode(mode);
+
+  // Hidden when there is provably nothing here for THIS operator: a no-SSO
+  // deployment (constraints known, no profile), or an operator without the
+  // edit scope looking at a fully-static row — disabled controls plus a
+  // "needs the MCP admin permission" hint were a dead end there. Matches the
+  // Roles-subtab hide precedent. Kept visible whenever the row carries
+  // dynamic auth or a leftover audience (hiding would strand a value the
+  // operator cannot then clear), the live selection is dynamic, or the
+  // constraints are unknown — a fetch failure must not make a configured
+  // capability silently vanish.
+  const section = document.getElementById("model-auth-section");
+  if (section) {
+    const nothingDynamic =
+      !persistedDynamicMode && !dynamic && !_modelAuthPersisted.audience;
+    const useless =
+      (known && !profile && nothingDynamic) || (!editable && nothingDynamic);
+    section.style.display = useless ? "none" : "";
+  }
+
+  // entra_app is client-credentials only — no RFC 8693 leg exists — so the
+  // option greys out when the profile is AFFIRMATIVELY known to be something
+  // else, but never for the mode the row is persisted with, or the select
+  // would fall back and rewrite the row on save. Unknown constraints disable
+  // nothing: affordance, not gate. Option labels live in index.html.
+  const appOpt = modeSel.querySelector('option[value="entra_app"]');
+  let unavailable = false;
+  if (appOpt) {
+    appOpt.disabled =
+      known &&
+      !!profile &&
+      profile !== "entra" &&
+      _modelAuthPersisted.mode !== "entra_app";
+    unavailable = appOpt.disabled;
+  }
+
+  modeSel.disabled = !editable;
+  const stored = audSel.value || "";
+
+  // Editable whenever a dynamic mode is selected, and ALSO when a stale value
+  // lingers on a static row — otherwise it can never be cleared and every
+  // later save writes it back.
+  audSel.disabled = !editable || (!dynamic && !stored);
+
+  if (modeHint) {
+    modeHint.textContent = !editable
+      ? "needs the MCP admin permission to change"
+      : unavailable
+        ? "app identity needs the deployment to sign in through Entra"
+        : "";
+  }
+  if (audHint) {
+    // The field is free text, so missing constraints cost suggestions, not
+    // the ability to save — the copy must never imply otherwise.
+    if (!editable) {
+      audHint.textContent = "needs the MCP admin permission to change";
+    } else if (_modelAuthConstraintsFailed) {
+      audHint.textContent = "suggestions unavailable — saving still works";
+    } else if (!dynamic) {
+      // Mirrors the server's staging guard: on a shared-key row only
+      // clearing or re-saving the stored audience is accepted; any NEW value
+      // draws a 400. Reachable only via residue — a clean shared-key row's
+      // input is disabled above.
+      audHint.textContent = stored
+        ? "unused on the shared key — clear it to drop the value; a different value would be refused"
+        : "only used when not on the shared key";
+    } else if (known && !allowCount) {
+      audHint.textContent =
+        "none registered yet — ask an administrator to add one";
+    } else {
+      audHint.textContent = "the resource the gateway expects";
+    }
+  }
+
+  // The server treats a base-URL edit as an auth change when EITHER the
+  // stored or the newly selected mode is dynamic, so mirror that
+  // disjunction — keying only off the current selection would stay silent
+  // exactly when an operator flips a live dynamic row to static and
+  // re-points its URL in one save.
+  const urlHint = document.getElementById("model-base-url-hint");
+  if (urlHint) {
+    // Append rather than replace: "empty = provider default" is this field's
+    // only documentation anywhere, and it is no less true on a dynamic row.
+    urlHint.textContent =
+      dynamic || persistedDynamicMode
+        ? "empty = provider default; changing it counts as an auth change"
+        : "empty = provider default";
+  }
+}
+
 function loadAdminModels() {
   _applyModelRolesPermission();
   authFetch("/v1/api/admin/model-definitions")
@@ -6787,6 +7064,9 @@ function loadAdminModels() {
     .then(function (data) {
       _modelDefs = data.models || [];
       _modelDefaultAlias = data.default_alias || "";
+      // Auth constraints deliberately do NOT ride on this response — the shelf
+      // fetches them from the admin.mcp-gated auth-constraints route on open,
+      // so a background list refresh can never restyle an open shelf.
       _renderModels(_modelDefs);
       // Roles sub-tab piggybacks on the model list; skip it when the
       // user has no settings permission since the underlying API will
@@ -7159,10 +7439,10 @@ function _renderModels(items) {
     // operator opt-in). Default values are silent.
     if (m.surface_persisted_reasoning === false) overrides.push("surface=off");
     if (m.replay_reasoning_to_model === true) overrides.push("replay=on");
-    // Per-user OBO / app-identity backend auth surfaces as a hint (static is
-    // the default).
-    if (m.auth_mode === "entra_obo") overrides.push("obo");
-    else if (m.auth_mode === "entra_app") overrides.push("app");
+    // Anything but the shared API key is worth showing: it changes whose
+    // identity the gateway sees. Static is the default and stays silent.
+    if (m.auth_mode === "entra_obo") overrides.push("auth=per-user");
+    else if (m.auth_mode === "entra_app") overrides.push("auth=deployment");
     if (overrides.length) {
       const ovrSpan = document.createElement("span");
       ovrSpan.className = "model-overrides-hint";
@@ -7300,8 +7580,11 @@ function _renderModels(items) {
               if (!r.ok) throw new Error();
               return r.json();
             })
-            .then(function () {
-              showToast("Model deleted");
+            .then(function (d) {
+              // Amber when the live registry refused the swap and keeps
+              // serving the deleted alias (same caveat as save).
+              const toast = _modelActionToast("Model deleted", d);
+              showToast(toast.message, toast.type);
               _flagModelSyncPending();
               loadAdminModels();
             })
@@ -7365,8 +7648,15 @@ function showCreateModelModal() {
   document.getElementById("model-enabled").checked = true;
   document.getElementById("model-surface-persisted-reasoning").checked = true;
   document.getElementById("model-replay-reasoning").checked = false;
+  // Drop any option a prior edit-open injected for a server-defined mode:
+  // a mode this page cannot describe is never offered for NEW rows.
+  _clearInjectedAuthModeOptions(document.getElementById("model-auth-mode"));
   document.getElementById("model-auth-mode").value = "static";
   document.getElementById("model-obo-audience").value = "";
+  // A create has no persisted row; the constraints fetch (fresh per open)
+  // supplies the suggestions and re-syncs the block when it lands.
+  _modelAuthPersisted = { mode: "static", audience: "" };
+  _fetchModelAuthConstraints();
   document.getElementById("model-detect-result").hidden = true;
   document.getElementById("model-detect-btn").disabled = false;
   document.getElementById("model-detect-btn").textContent = "Detect";
@@ -7387,6 +7677,33 @@ function showCreateModelModal() {
   _applyProviderDefaults();
   window.TurnstoneHatch.openShelf(document.getElementById("model-shelf"));
   document.getElementById("model-alias").focus();
+}
+
+// Ensure `select` can represent `mode` without coercion: a row persisted
+// with an auth mode this page has no <option> for (newer server, cached
+// page — the codebase's stated skew model) must ROUND-TRIP its mode on an
+// unrelated edit. Assigning an unmatched value to a <select> yields "", and
+// the submit's blank-create default would then rewrite the row to "static",
+// silently downgrading credential minting to the shared API key. Injected
+// options are marked so the create-reset can remove them: a mode this page
+// cannot describe is selectable only on the row that already carries it,
+// never offered for new rows.
+function _ensureAuthModeOption(select, mode) {
+  for (let i = 0; i < select.options.length; i++) {
+    if (select.options[i].value === mode) return;
+  }
+  const opt = document.createElement("option");
+  opt.value = mode;
+  opt.textContent = mode + " (server-defined mode)";
+  opt.setAttribute("data-injected-mode", "1");
+  select.appendChild(opt);
+}
+
+function _clearInjectedAuthModeOptions(select) {
+  const injected = select.querySelectorAll("option[data-injected-mode]");
+  for (let i = 0; i < injected.length; i++) {
+    injected[i].remove();
+  }
 }
 
 function showEditModelModal(definitionId) {
@@ -7420,10 +7737,26 @@ function showEditModelModal(definitionId) {
         m.max_tokens != null ? m.max_tokens : "";
       document.getElementById("model-reasoning-effort").value =
         m.reasoning_effort != null ? m.reasoning_effort : "";
-      document.getElementById("model-auth-mode").value =
-        m.auth_mode || "static";
+      // Capture the persisted values BEFORE syncing: the enable-state and
+      // the base-URL hint key off the OLD mode and audience as well as the
+      // new ones, mirroring the server's is-or-becomes-dynamic rule.
+      _modelAuthPersisted = {
+        mode: m.auth_mode || "static",
+        audience: m.obo_audience || "",
+      };
+      const authModeSel = document.getElementById("model-auth-mode");
+      // An unknown persisted mode gets its own (marked) option so the row
+      // round-trips it — see _ensureAuthModeOption.
+      _ensureAuthModeOption(authModeSel, m.auth_mode || "static");
+      authModeSel.value = m.auth_mode || "static";
+      // The value lives in the input itself — a de-listed audience survives
+      // there regardless of what the suggestions contain.
       document.getElementById("model-obo-audience").value =
         m.obo_audience || "";
+      // Repaint against the row's values. NOT a second constraints fetch:
+      // showCreateModelModal's reset already started one this shelf open and
+      // constraints are row-independent.
+      _syncModelAuthFields();
       // Parse capabilities JSON and extract server_compat for structured fields
       let capsObj = {};
       try {
@@ -7723,27 +8056,27 @@ function submitCreateModel() {
   // Backend auth: entra_obo mints a per-user OBO token for obo_audience at
   // call time; entra_app mints an app-identity (client-credentials) token from
   // Turnstone's SSO app reg. (The server re-validates the same pairing.)
-  const authMode =
-    document.getElementById("model-auth-mode").value || "static";
+  // The || "static" default covers only a blank CREATE form: an edit-load
+  // injects an option for any server-defined mode (see
+  // _ensureAuthModeOption), so edits always carry a real value.
+  const authMode = document.getElementById("model-auth-mode").value || "static";
   const oboAudience = document
     .getElementById("model-obo-audience")
     .value.trim();
-  if (
-    (authMode === "entra_obo" || authMode === "entra_app") &&
-    oboAudience === ""
-  ) {
-    _showModelError(
-      "OBO audience is required when auth mode is 'entra_obo' or 'entra_app'",
-    );
+  const authDynamic = _isDynamicAuthMode(authMode);
+  if (authDynamic && oboAudience === "") {
+    _showModelError("Enter a gateway audience for this auth mode");
     return;
   }
-  form.auth_mode = authMode;
-  form.obo_audience = oboAudience;
+  const editId = document.getElementById("model-edit-id").value;
+  Object.assign(
+    form,
+    _authSubmitFields(authMode, oboAudience, !!editId, authDynamic),
+  );
 
   const apiKey = document.getElementById("model-api-key").value;
   if (apiKey) form.api_key = apiKey;
 
-  const editId = document.getElementById("model-edit-id").value;
   const method = editId ? "PUT" : "POST";
   const url = editId
     ? "/v1/api/admin/model-definitions/" + encodeURIComponent(editId)
@@ -7762,9 +8095,10 @@ function submitCreateModel() {
         });
       return r.json();
     })
-    .then(function () {
+    .then(function (d) {
       hideCreateModelModal();
-      showToast(editId ? "Model updated" : "Model created");
+      const toast = _modelSaveToast(!!editId, d);
+      showToast(toast.message, toast.type);
       _flagModelSyncPending();
       loadAdminModels();
     })
@@ -7777,6 +8111,38 @@ function submitCreateModel() {
         false,
       );
     });
+}
+
+// Auth fields for a shelf submit, pure. A static CREATE OMITS the audience
+// key entirely: the server refuses ANY non-empty audience there (no stored
+// row's value needs preserving), so sending leftovers a mode round-trip
+// parked in the input would manufacture an avoidable 400. EDIT always sends
+// the pair — stored-residue semantics are the server's call.
+function _authSubmitFields(authMode, oboAudience, isEdit, authDynamic) {
+  const fields = { auth_mode: authMode };
+  if (isEdit || authDynamic) {
+    fields.obo_audience = oboAudience;
+  }
+  return fields;
+}
+
+// Toast shape for any model action whose 200 can carry registry_warning
+// (create/update/delete/reload/calibrate), pure. The warning means the DB
+// write landed but THIS console's live registry refused the swap, so amber
+// with the server's text rather than plain success while the running
+// coordinator keeps streaming to the old config.
+function _modelActionToast(baseMsg, body) {
+  const warning = body && body.registry_warning;
+  if (warning) {
+    return { message: baseMsg + " — " + warning, type: "warn" };
+  }
+  return { message: baseMsg, type: undefined };
+}
+
+// Toast for a successful model save, pure — the create/update variant of
+// _modelActionToast.
+function _modelSaveToast(isEdit, body) {
+  return _modelActionToast(isEdit ? "Model updated" : "Model created", body);
 }
 
 function _showModelError(msg) {
@@ -8094,6 +8460,12 @@ function recalibrateModel() {
       resultDiv.style.borderColor = d.separated
         ? "var(--green)"
         : "var(--yellow)";
+      if (d.registry_warning) {
+        // Stored, but this console's live registry refused to adopt it —
+        // same amber caveat as the other model actions.
+        const toast = _modelActionToast("Calibration saved", d);
+        showToast(toast.message, toast.type);
+      }
     })
     .catch(function (e) {
       if (e.message === "auth") return;
@@ -8402,6 +8774,12 @@ function _refreshModelSuggestions() {
   const tmEl = document.getElementById("model-thinking-mode");
   if (tmEl) tmEl.addEventListener("change", _toggleThinkingParam);
   if (tmEl) tmEl.addEventListener("change", _scheduleEffortLadder);
+  const authModeEl = document.getElementById("model-auth-mode");
+  if (authModeEl)
+    authModeEl.addEventListener("change", function () {
+      // The typed audience is untouched; only mode-dependent state recomputes.
+      _syncModelAuthFields();
+    });
   _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
     const select = document.getElementById(spec.elementId);
     if (select)
@@ -8493,8 +8871,11 @@ function reloadModelNodes() {
       if (!r.ok) throw new Error();
       return r.json();
     })
-    .then(function () {
-      showToast("Model reload dispatched");
+    .then(function (d) {
+      // The button's whole purpose is DB→live sync: amber when this
+      // console's own registry refused the swap.
+      const toast = _modelActionToast("Model reload dispatched", d);
+      showToast(toast.message, toast.type);
       _clearModelSyncPending();
       loadAdminModels();
     })

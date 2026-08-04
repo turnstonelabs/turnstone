@@ -2437,8 +2437,18 @@ class StorageBackend(Protocol):
         """Return model definitions ordered by alias."""
         ...
 
-    def update_model_definition(self, definition_id: str, **fields: Any) -> bool:
-        """Update specified fields on a model definition. Returns True if found."""
+    def update_model_definition(
+        self, definition_id: str, *, expected_capabilities: Any = ..., **fields: Any
+    ) -> bool:
+        """Update specified fields on a model definition.
+
+        Returns True when a row was updated. When ``expected_capabilities``
+        is passed, the update applies only while the row's ``capabilities``
+        column still equals it: a concurrent write turns the call into a
+        False miss the caller re-reads and re-merges onto, never a silent
+        last-writer-wins revert. Omitted, the update is unconditional and
+        False means the row was not found.
+        """
         ...
 
     def delete_model_definition(self, definition_id: str) -> bool:

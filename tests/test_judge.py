@@ -899,11 +899,18 @@ class TestModelAliasResolution:
         # resolution path is exercised, not a MagicMock leak.
         cfg.temperature = 0.3
         registry.has_alias.side_effect = lambda a: a == alias
-        registry.resolve.return_value = (alias_client, underlying_model, cfg)
+        # One locked snapshot: resolve_binding binds client + config +
+        # provider together, never a pair a reload could tear.
+        registry.resolve_binding.return_value = (
+            alias_client,
+            underlying_model,
+            cfg,
+            alias_provider,
+            0,
+        )
         # The unified lane resolver (model_turn.resolve_capabilities) fetches
-        # the config itself rather than taking resolve()'s copy.
+        # the config itself rather than taking the resolve copy.
         registry.get_config.return_value = cfg
-        registry.get_provider.return_value = alias_provider
         return registry
 
     def test_alias_capabilities_merged_and_threaded_to_wire(self):
@@ -1067,8 +1074,13 @@ class TestModelAliasResolution:
         cfg.context_window = 0
         registry = MagicMock()
         registry.has_alias.side_effect = lambda a: a == "judge-mini"
-        registry.resolve.return_value = (MagicMock(base_url="http://a", api_key="k"), "m", cfg)
-        registry.get_provider.return_value = _make_mock_provider()
+        registry.resolve_binding.return_value = (
+            MagicMock(base_url="http://a", api_key="k"),
+            "m",
+            cfg,
+            _make_mock_provider(),
+            0,
+        )
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
             session_provider=_make_mock_provider(),
@@ -1110,6 +1122,34 @@ class TestModelAliasResolution:
         assert judge._model == "session-default-model"
         # Context window mirrors the session, not the (uncalled) caps lookup.
         assert judge._judge_context_window == 100_000
+
+    def test_construction_failure_warns_with_cause_not_registration_advice(self, caplog):
+        """A REGISTERED alias whose binding cannot be built keeps the
+        session-model fallback, but the warning names the construction
+        cause — the register-the-alias advice would misdiagnose a row
+        that is already registered."""
+        from turnstone.core.model_registry import ModelClientConstructionError
+
+        registry = MagicMock()
+        registry.has_alias.side_effect = lambda a: a == "judge-mini"
+        registry.resolve_binding.side_effect = ModelClientConstructionError(
+            "provider 'openai' does not support api_surface 'messages'"
+        )
+
+        with caplog.at_level("WARNING", logger="turnstone.core.judge"):
+            judge = IntentJudge(
+                config=JudgeConfig(enabled=True, model="judge-mini"),
+                session_provider=_make_mock_provider(),
+                session_client=MagicMock(base_url="https://s/v1", api_key="s"),
+                session_model="session-model",
+                session_capabilities=MagicMock(context_window=100_000),
+                model_registry=registry,
+            )
+
+        assert judge._model == "session-model"  # fallback behavior unchanged
+        warned = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("does not support api_surface" in m for m in warned)
+        assert not any("not a registered alias" in m for m in warned)
 
     def test_empty_model_inherits_session_model(self):
         """Empty ``config.model`` is the documented self-consistency path."""

@@ -6,6 +6,11 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+# TC002 suppressed deliberately: pydantic resolves the stringified annotation
+# at class-build time, so SkipJsonSchema must exist at runtime — under
+# TYPE_CHECKING the import vanishes and model creation fails.
+from pydantic.json_schema import SkipJsonSchema  # noqa: TC002
+
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 
@@ -1021,6 +1026,28 @@ class ModelDefinitionInfo(BaseModel):
     updated: str = ""
 
 
+class ModelDefinitionWriteResponse(ModelDefinitionInfo):
+    """Create/update response: the stored row plus an optional caveat.
+
+    ``registry_warning`` is present only when the DB write succeeded but
+    THIS console's live coordinator registry refused to adopt it (keyless
+    host with dynamic-auth rows): the row is saved, yet running sessions
+    keep the previous config until the deployment fault is remedied.
+    Clients should surface it as a warning beside the success, never as a
+    failure. Absent on a clean save (SkipJsonSchema: the server omits the
+    key rather than sending null).
+    """
+
+    registry_warning: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Set when the save landed but this console's live registry refused "
+            "the swap (e.g. dynamic auth configured without the startup "
+            "encryption key); carries the operator-facing remediation text."
+        ),
+    )
+
+
 class CreateModelDefinitionRequest(BaseModel):
     alias: str
     model: str
@@ -1046,7 +1073,17 @@ class UpdateModelDefinitionRequest(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     context_window: int | None = None
-    capabilities: dict[str, Any] | None = None
+    # SkipJsonSchema drops the null member from the ADVERTISED union while the
+    # Python type still tolerates None: the presence-keyed update handler
+    # refuses an explicit JSON null, so advertising null would let generated
+    # clients legally produce a request the server rejects.
+    capabilities: dict[str, Any] | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Full replacement capabilities object. Omit to leave the stored "
+            "value unchanged; JSON null is refused (400)."
+        ),
+    )
     enabled: bool | None = None
     temperature: float | None = None
     max_tokens: int | None = None
@@ -1059,6 +1096,49 @@ class UpdateModelDefinitionRequest(BaseModel):
 
 class ListModelDefinitionsResponse(BaseModel):
     models: list[ModelDefinitionInfo]
+    # No default: the server always sends it, and a default would make the key
+    # optional in the generated OpenAPI, forcing every consumer to write a
+    # ``?? ""`` branch the server never produces.
+    default_alias: str = Field(
+        description="Effective default alias after the config/enabled-list fallbacks",
+    )
+
+
+class ModelAuthConstraintsResponse(BaseModel):
+    """Affordance data for the model shelf's Backend-auth section.
+
+    Suggestions and labels only — never a gate. The write validator is the
+    authority; a client that fails to fetch this must degrade to free-text
+    input with server-side validation, not to a refusal.
+    """
+
+    # No defaults: both keys are always present, so absence is a protocol
+    # error rather than an empty answer.
+    auth_audience_allowlist: list[str] = Field(
+        description=(
+            "Exact gateway audiences a definition may use with entra_obo / "
+            "entra_app, rendered as input suggestions. Empty means none are "
+            "registered yet; writes are refused until an operator populates "
+            "model.auth_audience_allowlist."
+        ),
+    )
+    auth_grant_profile: str = Field(
+        description=(
+            "Deployment [oidc] obo_grant_profile, or empty when single sign-on "
+            "is not configured. entra_app requires 'entra'; entra_obo works "
+            "under either profile. A transient discovery outage reports the "
+            "configured profile, not empty."
+        ),
+    )
+    dynamic_auth_modes: list[str] = Field(
+        description=(
+            "auth_mode values that mint per-call backend credentials, derived "
+            "server-side from the registry's mode classification so the "
+            "shelf's affordances (audience enable/require, section "
+            "visibility) track it by data. Clients keep a hand-listed "
+            "fallback only for a missing or failed constraints fetch."
+        ),
+    )
 
 
 class PersonaInfo(BaseModel):
@@ -1153,6 +1233,38 @@ class ListPersonasResponse(BaseModel):
 class ModelReloadResponse(BaseModel):
     status: str = "ok"
     results: dict[str, Any] = Field(default_factory=dict)
+    # Same refused-swap caveat as ModelDefinitionWriteResponse; this route's
+    # purpose is DB→live sync, so a refused swap must not read as success.
+    registry_warning: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Set when the node fan-out ran but THIS console's live registry "
+            "refused the swap (e.g. dynamic auth configured without the "
+            "startup encryption key); carries the operator-facing "
+            "remediation text."
+        ),
+    )
+
+
+class DeleteModelDefinitionResponse(BaseModel):
+    """Delete response: the removed row id plus an optional caveat.
+
+    ``registry_warning`` mirrors ModelDefinitionWriteResponse: the DB row
+    is gone, but a keyless console's live registry refused the swap and
+    keeps SERVING the deleted alias to running and new coordinator
+    sessions until the deployment fault is remedied.
+    """
+
+    status: str = "ok"
+    definition_id: str
+    registry_warning: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Set when the delete landed but this console's live registry "
+            "refused the swap and keeps serving the deleted alias; carries "
+            "the operator-facing remediation text."
+        ),
+    )
 
 
 class DetectModelRequest(BaseModel):
@@ -1189,6 +1301,16 @@ class CalibrateModelResponse(BaseModel):
     irrelevant: list[float] = Field(default_factory=list)
     applied: bool = False
     error: str = ""
+    # Same refused-swap caveat as ModelDefinitionWriteResponse, for the
+    # calibrate persist (a capabilities write like the twins').
+    registry_warning: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Set when the calibration was stored but this console's live "
+            "registry refused the swap; carries the operator-facing "
+            "remediation text."
+        ),
+    )
 
 
 class ModelCapabilitiesResponse(BaseModel):

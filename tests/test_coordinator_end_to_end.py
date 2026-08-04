@@ -105,7 +105,7 @@ class _FakeConfigStore:
 def _fake_registry() -> MagicMock:
     """Registry stub that always succeeds on .resolve() so the 503 gate passes."""
     reg = MagicMock()
-    reg.resolve.return_value = (MagicMock(), "gpt-test", MagicMock())
+    reg.resolve.return_value = (MagicMock(), "gpt-test", MagicMock(), 0)
     return reg
 
 

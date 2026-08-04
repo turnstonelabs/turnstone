@@ -986,14 +986,19 @@ window.addEventListener("popstate", function (e) {
 });
 
 // ---------------------------------------------------------------------------
+// Permission checks use the console page's ONE cache-skew shim pair —
+// _consoleHasPermission / _consoleWhenPermissionsReady, defined in admin.js
+// (which index.html loads first). The skew rationale lives on the pair.
+// ---------------------------------------------------------------------------
 // Coordinator session creation — used by the home-landing composer.
 // Permission check lives in _hasCoordPermission (admin.coordinator);
 // _createCoordinator does the POST + redirect.
 // ---------------------------------------------------------------------------
 
 function _hasCoordPermission() {
-  const perms = sessionStorage.getItem("turnstone_permissions") || "";
-  return perms.split(",").indexOf("admin.coordinator") !== -1;
+  // Deny-on-absent parse lives in the shared hasPermission (auth.js, the
+  // module that populates the storage) — one contract for every surface.
+  return _consoleHasPermission("admin.coordinator");
 }
 
 // POST /v1/api/workstreams/new.  Accepts the three request fields
@@ -1087,8 +1092,7 @@ function _createCoordinator(opts) {
 }
 
 function _hasInteractivePermission() {
-  const perms = sessionStorage.getItem("turnstone_permissions") || "";
-  return perms.split(",").indexOf("workstreams.create") !== -1;
+  return _consoleHasPermission("workstreams.create");
 }
 
 // Which workstream KIND the launcher creates: "coordinator" (console-local)
@@ -2522,25 +2526,15 @@ window.TS_APP.boot = function () {
   });
   _ensureHomeComposerInit();
   // Refresh the coord button visibility once auth.js has populated
-  // sessionStorage from the initial whoami.  window.permissionsReady
-  // resolves after that completes (success or failure); fall back to a
-  // short timeout if the promise isn't available (older auth.js).
+  // sessionStorage from the initial whoami.  The settling protocol lives in
+  // the shared whenPermissionsReady (auth.js), reached through the
+  // cache-skew shim so a stale-cached auth.js degrades to the timer.
   //
   // NOTE: permissionsReady is one-shot — it fires exactly once per page
   // load (see auth.js).  Subsequent re-logins are caught by the
   // onLoginSuccess hook above which calls loadSavedCoordinators() again.
-  if (
-    window.permissionsReady &&
-    typeof window.permissionsReady.then === "function"
-  ) {
-    window.permissionsReady.then(function () {
-      _refreshHomeComposerVisibility();
-      loadSavedCoordinators();
-    });
-  } else {
-    setTimeout(function () {
-      _refreshHomeComposerVisibility();
-      loadSavedCoordinators();
-    }, 500);
-  }
+  _consoleWhenPermissionsReady(function () {
+    _refreshHomeComposerVisibility();
+    loadSavedCoordinators();
+  });
 };

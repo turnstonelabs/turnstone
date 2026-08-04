@@ -107,6 +107,11 @@ async def read_json_or_400(request: Request) -> dict[str, Any] | JSONResponse:
 
     try:
         body: dict[str, Any] = await request.json()
+        if not isinstance(body, dict):
+            # Valid JSON, wrong shape (list/string/number at top level):
+            # without this check the declared dict type is a lie and every
+            # caller's first ``body.get`` raises into a 500.
+            return _JSONResponse({"error": "Request body must be a JSON object"}, status_code=400)
         return body
     except (ValueError, json.JSONDecodeError):
         return _JSONResponse({"error": "Invalid JSON body"}, status_code=400)

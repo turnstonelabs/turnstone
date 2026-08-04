@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.8.0a4",
+    "version": "1.8.0a5",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -3723,7 +3723,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ModelDefinitionInfo"
+                  "$ref": "#/components/schemas/ModelDefinitionWriteResponse"
                 }
               }
             }
@@ -3738,8 +3738,59 @@
               }
             }
           },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/model-definitions/auth-constraints": {
+      "get": {
+        "summary": "Dynamic-auth affordance data for the model editor (requires admin.mcp)",
+        "operationId": "v1_api_admin_model-definitions_auth-constraints_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelAuthConstraintsResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
             "content": {
               "application/json": {
                 "schema": {
@@ -3844,13 +3895,23 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ModelDefinitionInfo"
+                  "$ref": "#/components/schemas/ModelDefinitionWriteResponse"
                 }
               }
             }
           },
           "400": {
             "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
             "content": {
               "application/json": {
                 "schema": {
@@ -3871,6 +3932,16 @@
           },
           "409": {
             "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -3899,7 +3970,14 @@
         ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteModelDefinitionResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "Error 404",
@@ -3985,6 +4063,26 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
             "content": {
               "application/json": {
                 "schema": {
@@ -10863,6 +10961,142 @@
         "title": "ModelDefinitionInfo",
         "type": "object"
       },
+      "ModelDefinitionWriteResponse": {
+        "description": "Create/update response: the stored row plus an optional caveat.\n\n``registry_warning`` is present only when the DB write succeeded but\nTHIS console's live coordinator registry refused to adopt it (keyless\nhost with dynamic-auth rows): the row is saved, yet running sessions\nkeep the previous config until the deployment fault is remedied.\nClients should surface it as a warning beside the success, never as a\nfailure. Absent on a clean save (SkipJsonSchema: the server omits the\nkey rather than sending null).",
+        "properties": {
+          "definition_id": {
+            "title": "Definition Id",
+            "type": "string"
+          },
+          "alias": {
+            "title": "Alias",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "provider": {
+            "default": "openai",
+            "title": "Provider",
+            "type": "string"
+          },
+          "base_url": {
+            "default": "",
+            "title": "Base Url",
+            "type": "string"
+          },
+          "api_key": {
+            "default": "",
+            "title": "Api Key",
+            "type": "string"
+          },
+          "context_window": {
+            "default": 32768,
+            "title": "Context Window",
+            "type": "integer"
+          },
+          "capabilities": {
+            "default": "{}",
+            "title": "Capabilities",
+            "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Temperature"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Tokens"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          },
+          "surface_persisted_reasoning": {
+            "default": true,
+            "title": "Surface Persisted Reasoning",
+            "type": "boolean"
+          },
+          "replay_reasoning_to_model": {
+            "default": false,
+            "title": "Replay Reasoning To Model",
+            "type": "boolean"
+          },
+          "auth_mode": {
+            "default": "static",
+            "title": "Auth Mode",
+            "type": "string"
+          },
+          "obo_audience": {
+            "default": "",
+            "title": "Obo Audience",
+            "type": "string"
+          },
+          "source": {
+            "default": "",
+            "title": "Source",
+            "type": "string"
+          },
+          "created_by": {
+            "default": "",
+            "title": "Created By",
+            "type": "string"
+          },
+          "created": {
+            "default": "",
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "default": "",
+            "title": "Updated",
+            "type": "string"
+          },
+          "registry_warning": {
+            "default": null,
+            "description": "Set when the save landed but this console's live registry refused the swap (e.g. dynamic auth configured without the startup encryption key); carries the operator-facing remediation text.",
+            "title": "Registry Warning",
+            "type": "string"
+          }
+        },
+        "required": [
+          "definition_id",
+          "alias",
+          "model"
+        ],
+        "title": "ModelDefinitionWriteResponse",
+        "type": "object"
+      },
       "CreateModelDefinitionRequest": {
         "properties": {
           "alias": {
@@ -11042,17 +11276,11 @@
             "title": "Context Window"
           },
           "capabilities": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "additionalProperties": true,
             "default": null,
-            "title": "Capabilities"
+            "description": "Full replacement capabilities object. Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Capabilities",
+            "type": "object"
           },
           "enabled": {
             "anyOf": [
@@ -11162,12 +11390,51 @@
             },
             "title": "Models",
             "type": "array"
+          },
+          "default_alias": {
+            "description": "Effective default alias after the config/enabled-list fallbacks",
+            "title": "Default Alias",
+            "type": "string"
           }
         },
         "required": [
-          "models"
+          "models",
+          "default_alias"
         ],
         "title": "ListModelDefinitionsResponse",
+        "type": "object"
+      },
+      "ModelAuthConstraintsResponse": {
+        "description": "Affordance data for the model shelf's Backend-auth section.\n\nSuggestions and labels only \u2014 never a gate. The write validator is the\nauthority; a client that fails to fetch this must degrade to free-text\ninput with server-side validation, not to a refusal.",
+        "properties": {
+          "auth_audience_allowlist": {
+            "description": "Exact gateway audiences a definition may use with entra_obo / entra_app, rendered as input suggestions. Empty means none are registered yet; writes are refused until an operator populates model.auth_audience_allowlist.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Auth Audience Allowlist",
+            "type": "array"
+          },
+          "auth_grant_profile": {
+            "description": "Deployment [oidc] obo_grant_profile, or empty when single sign-on is not configured. entra_app requires 'entra'; entra_obo works under either profile. A transient discovery outage reports the configured profile, not empty.",
+            "title": "Auth Grant Profile",
+            "type": "string"
+          },
+          "dynamic_auth_modes": {
+            "description": "auth_mode values that mint per-call backend credentials, derived server-side from the registry's mode classification so the shelf's affordances (audience enable/require, section visibility) track it by data. Clients keep a hand-listed fallback only for a missing or failed constraints fetch.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Dynamic Auth Modes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "auth_audience_allowlist",
+          "auth_grant_profile",
+          "dynamic_auth_modes"
+        ],
+        "title": "ModelAuthConstraintsResponse",
         "type": "object"
       },
       "PersonaInfo": {
@@ -11520,9 +11787,40 @@
             "additionalProperties": true,
             "title": "Results",
             "type": "object"
+          },
+          "registry_warning": {
+            "default": null,
+            "description": "Set when the node fan-out ran but THIS console's live registry refused the swap (e.g. dynamic auth configured without the startup encryption key); carries the operator-facing remediation text.",
+            "title": "Registry Warning",
+            "type": "string"
           }
         },
         "title": "ModelReloadResponse",
+        "type": "object"
+      },
+      "DeleteModelDefinitionResponse": {
+        "description": "Delete response: the removed row id plus an optional caveat.\n\n``registry_warning`` mirrors ModelDefinitionWriteResponse: the DB row\nis gone, but a keyless console's live registry refused the swap and\nkeeps SERVING the deleted alias to running and new coordinator\nsessions until the deployment fault is remedied.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "definition_id": {
+            "title": "Definition Id",
+            "type": "string"
+          },
+          "registry_warning": {
+            "default": null,
+            "description": "Set when the delete landed but this console's live registry refused the swap and keeps serving the deleted alias; carries the operator-facing remediation text.",
+            "title": "Registry Warning",
+            "type": "string"
+          }
+        },
+        "required": [
+          "definition_id"
+        ],
+        "title": "DeleteModelDefinitionResponse",
         "type": "object"
       },
       "DetectModelRequest": {
@@ -11690,6 +11988,12 @@
           "error": {
             "default": "",
             "title": "Error",
+            "type": "string"
+          },
+          "registry_warning": {
+            "default": null,
+            "description": "Set when the calibration was stored but this console's live registry refused the swap; carries the operator-facing remediation text.",
+            "title": "Registry Warning",
             "type": "string"
           }
         },

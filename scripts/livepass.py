@@ -405,6 +405,28 @@ CONSOLE_TEMPLATE = """<!doctype html>
     <div id="toast" role="status" aria-live="polite"></div>
     <script>
       (function () {
+        // Freeze window.fetch BEFORE the module scripts evaluate: auth.js
+        // fires a boot-time whoami at import, and a non-OK answer from the
+        // fixture server would CLEAR the permissions grant seeded below
+        // mid-pass. A never-settling fetch keeps the seed authoritative;
+        // everything the passes drive flows through the authFetch fixture
+        // (reinstated after auth.js's window bridge runs — see the load
+        // handler).
+        window.fetch = function () {
+          return new Promise(function () {});
+        };
+        // Grant the operator scopes admin.js gates on: _modelAuthEditable()
+        // reads this exact key THROUGH the real auth.js hasPermission
+        // (loaded below, before admin.js) — without the grant, or without
+        // auth.js supplying window.hasPermission, the auth-constraints
+        // stub below is dead code: _fetchModelAuthConstraints returns
+        // before authFetch and every pass renders the Backend-auth section
+        // in its read-only degraded state. The headless profile is fresh
+        // per pass, so nothing else seeds it.
+        sessionStorage.setItem(
+          "turnstone_permissions",
+          "admin.models,admin.mcp",
+        );
         function reply(data) {
           return Promise.resolve({
             ok: true,
@@ -430,9 +452,15 @@ CONSOLE_TEMPLATE = """<!doctype html>
           enabled: true, temperature: null, max_tokens: null,
           reasoning_effort: null, surface_persisted_reasoning: true,
           replay_reasoning_to_model: false,
+          auth_mode: "static", obo_audience: "",
         };
         window.__putCount = 0;
-        window.authFetch = function (url, opts) {
+        // Held under a private name too: auth.js's legacy window bridge
+        // (Object.assign(window, {authFetch})) runs at module-import time
+        // and clobbers the plain window.authFetch assigned here — the load
+        // handler reinstates the fixture from this name after the modules
+        // have evaluated.
+        window.__consoleAuthFetch = window.authFetch = function (url, opts) {
           var method = (opts && opts.method) || "GET";
           if (method === "PUT" && url.indexOf("/model-definitions/def1") >= 0) {
             window.__putCount++;
@@ -462,8 +490,20 @@ CONSOLE_TEMPLATE = """<!doctype html>
                 supports_effort: true,
               },
             });
+          if (url.indexOf("/model-definitions/auth-constraints") >= 0)
+            // Fetched by the shelf ON OPEN (showCreateModelModal /
+            // showEditModelModal), so this stub is exercised by any pass that
+            // opens the model editor — no tab-switch plumbing needed. Omitting
+            // it would render the Backend-auth block in its degraded
+            // no-suggestions state and quietly stop exercising the section.
+            return reply({
+              auth_audience_allowlist: ["api://example-gateway"],
+              auth_grant_profile: "entra",
+              dynamic_auth_modes: ["entra_app", "entra_obo"],
+            });
           if (url.indexOf("/model-definitions/def1") >= 0) return reply(MODEL);
-          if (url.indexOf("/model-definitions") >= 0) return reply({ models: [] });
+          if (url.indexOf("/model-definitions") >= 0)
+            return reply({ models: [], default_alias: "fable-5" });
           if (url.indexOf("/api/models") >= 0)
             return reply({ models: [
               { alias: "fable-5", model: "claude-fable-5" },
@@ -490,10 +530,22 @@ CONSOLE_TEMPLATE = """<!doctype html>
     </script>
     <script type="module" src="shared/utils.js"></script>
     <script type="module" src="shared/hatch.js"></script>
+    <!-- The REAL auth.js, loaded (and therefore parsed) before admin.js's
+         permission shims run any pass: it owns the sessionStorage parse
+         contract and assigns the window.hasPermission /
+         window.whenPermissionsReady globals the shims probe at call time.
+         Without it the seeded permissions grant is never READ, the
+         Backend-auth section renders read-only/hidden, and the
+         auth-constraints stub above is dead code in every pass. -->
+    <script type="module" src="shared/auth.js"></script>
     <script src="console-static/admin.js"></script>
     <script src="console-static/governance.js"></script>
     <script>
       window.addEventListener("load", function () {
+        // Reinstate the fixture fetch now the modules (and auth.js's
+        // window bridge) have evaluated — passes run after load, so every
+        // shelf-open fetch flows through the fixture, not the bridge.
+        window.authFetch = window.__consoleAuthFetch;
         var q = new URLSearchParams(location.search);
         if (q.get("theme") === "light")
           document.documentElement.dataset.theme = "light";

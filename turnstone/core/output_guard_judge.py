@@ -53,6 +53,7 @@ from turnstone.core.judge import (
     _positive_window,
 )
 from turnstone.core.log import get_logger
+from turnstone.core.model_registry import ModelClientConstructionError
 from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
 from turnstone.core.trajectory import Turn
 
@@ -302,13 +303,17 @@ class OutputGuardJudge:
         # defensively coerces any non-positive window (which would zero out the
         # guard) to the session window, then a floor.
         resolved = False
+        construction_error: ModelClientConstructionError | None = None
         if config.output_guard_model and model_registry is not None:
             try:
                 if model_registry.has_alias(config.output_guard_model):
-                    client, model_name, model_cfg = model_registry.resolve(
+                    # One locked snapshot for client + provider — separate
+                    # resolve()/get_provider() calls could pair an old-map
+                    # client with a new-map provider (wrong SDK dialect).
+                    client, model_name, model_cfg, provider, _ = model_registry.resolve_binding(
                         config.output_guard_model
                     )
-                    self._provider = model_registry.get_provider(config.output_guard_model)
+                    self._provider = provider
                     self._client_factory_args = self._extract_client_config(
                         client, self._provider.provider_name
                     )
@@ -331,6 +336,8 @@ class OutputGuardJudge:
                         session_window,
                     )
                     resolved = True
+            except ModelClientConstructionError as exc:
+                construction_error = exc
             except Exception:
                 log.debug(
                     "output_guard_judge.alias_resolution_failed",
@@ -338,7 +345,20 @@ class OutputGuardJudge:
                 )
 
         if not resolved:
-            if config.output_guard_model:
+            if construction_error is not None:
+                # The alias IS registered; its binding could not be built.
+                # Same session-model fallback, but name the construction
+                # cause — the register-the-alias advice below would
+                # misdiagnose a row that is already registered.
+                log.warning(
+                    "judge.output_guard_model=%r is registered but its client "
+                    "could not be constructed (%s) — falling back to session "
+                    "model %r.",
+                    config.output_guard_model,
+                    construction_error,
+                    session_model,
+                )
+            elif config.output_guard_model:
                 log.warning(
                     "judge.output_guard_model=%r is not a registered alias — "
                     "falling back to session model %r.  Register the model in "

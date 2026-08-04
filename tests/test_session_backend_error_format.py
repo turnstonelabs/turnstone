@@ -41,6 +41,10 @@ def _stub(
         _provider=SimpleNamespace(provider_name=provider_name),
         model=model,
         _model_alias=model_alias,
+        # Dead-binding latches, clear: the formatter checks them first and
+        # short-circuits when both are unset, like a healthy session.
+        _registry_alias_removed=None,
+        _rebind_failed_key=None,
     )
 
 
@@ -244,6 +248,8 @@ def test_client_base_url_raises_degrades_gracefully():
         _provider=SimpleNamespace(provider_name="openai-compatible"),
         model="flatspark",
         _model_alias="flatspark",
+        _registry_alias_removed=None,
+        _rebind_failed_key=None,
     )
     msg = _format(stub, ReadTimeout())
     assert msg is not None
@@ -282,6 +288,8 @@ def _record_fatal_stub(ui: Any, captured: dict[str, str]) -> Any:
         _provider=SimpleNamespace(provider_name="openai-compatible"),
         model="flatspark",
         _model_alias="flatspark",
+        _registry_alias_removed=None,
+        _rebind_failed_key=None,
         _ws_id="ws-test",
         _has_persisted_error=False,
         ui=ui,
@@ -364,3 +372,20 @@ def test_record_fatal_falls_back_for_unknown(monkeypatch):
 
     assert ui.errors == ["ValueError: plain old error"]
     assert captured["persist"] == "ValueError: plain old error"
+
+
+def test_backend_auth_unavailable_names_the_mint_not_the_key():
+    """The prefix here IS the exception text, so no ``raw_tail`` is appended,
+    and the hint points at the mint configuration, not the static key."""
+    from turnstone.core.session import BackendAuthUnavailableError
+
+    exc = BackendAuthUnavailableError(
+        "Delegated backend authentication unavailable for model alias 'gw'"
+    )
+    msg = _format(_stub(), exc)
+    assert msg is not None
+    assert "model alias 'gw'" in msg
+    assert "check its auth mode and gateway audience" in msg
+    assert "NOT the alias's static API key" in msg
+    assert "raw=" not in msg
+    assert msg.count("unavailable for model alias 'gw'") == 1

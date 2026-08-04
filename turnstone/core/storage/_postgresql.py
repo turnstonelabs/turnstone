@@ -79,6 +79,9 @@ from turnstone.core.storage._schema import (
     prompt_policies as prompt_policies_t,
 )
 from turnstone.core.storage._utils import (
+    CAPS_COMPARE_UNSET as _CAPS_COMPARE_UNSET,
+)
+from turnstone.core.storage._utils import (
     COMPACTION_SOURCE as _COMPACTION_SOURCE,
 )
 from turnstone.core.storage._utils import (
@@ -5153,7 +5156,13 @@ class PostgreSQLBackend:
                 for r in rows
             ]
 
-    def update_model_definition(self, definition_id: str, **fields: Any) -> bool:
+    def update_model_definition(
+        self,
+        definition_id: str,
+        *,
+        expected_capabilities: Any = _CAPS_COMPARE_UNSET,
+        **fields: Any,
+    ) -> bool:
 
         fields = {k: v for k, v in fields.items() if k in _MODEL_DEF_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -5166,11 +5175,18 @@ class PostgreSQLBackend:
         if "replay_reasoning_to_model" in fields:
             fields["replay_reasoning_to_model"] = 1 if fields["replay_reasoning_to_model"] else 0
         with self._conn() as conn:
-            result = conn.execute(
-                sa.update(model_definitions)
-                .where(model_definitions.c.definition_id == definition_id)
-                .values(**fields)
+            stmt = sa.update(model_definitions).where(
+                model_definitions.c.definition_id == definition_id
             )
+            if expected_capabilities is not _CAPS_COMPARE_UNSET:
+                # Conditional write: apply only while capabilities still
+                # equal the caller's re-read value, so a concurrent write is
+                # a rowcount-0 miss to re-merge onto, not a silent revert.
+                if expected_capabilities is None:
+                    stmt = stmt.where(model_definitions.c.capabilities.is_(None))
+                else:
+                    stmt = stmt.where(model_definitions.c.capabilities == expected_capabilities)
+            result = conn.execute(stmt.values(**fields))
             conn.commit()
             return result.rowcount > 0
 

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._oidc_test_helpers import keyed_app_state
 from tests._session_helpers import scripted_chat_client
 from turnstone.core.model_registry import (
+    KEY_GUARD_DEFERRED_TO_LIFESPAN,
+    DynamicAuthKeyError,
     ModelConfig,
     ModelRegistry,
     _resolve_env_vars,
@@ -17,6 +21,13 @@ from turnstone.core.model_registry import (
     load_model_registry,
 )
 from turnstone.core.trajectory import Turn
+from turnstone.core.workstream import WorkstreamKind
+
+# ``reload`` requires ``app_state`` so its dynamic-auth key guard cannot be
+# skipped. Mechanics tests below exercise reload behavior, not key policy,
+# so they pass the shared keyed posture; the guard itself is tested in
+# TestReloadKeyGuard.
+_KEYED_STATE = keyed_app_state()
 
 # ---------------------------------------------------------------------------
 # ModelConfig
@@ -126,20 +137,22 @@ class TestModelRegistry:
 
     def test_resolve_default(self) -> None:
         reg = self._make_registry()
-        client, model, cfg = reg.resolve()
+        client, model, cfg, _ = reg.resolve()
         assert model == "qwen3-32b"
         assert cfg.alias == "default"
 
     def test_resolve_alias(self) -> None:
         reg = self._make_registry()
-        client, model, cfg = reg.resolve("openai")
+        client, model, cfg, generation = reg.resolve("openai")
         assert model == "gpt-4o"
+        # The generation rides the same locked snapshot as the binding.
+        assert generation == reg.generation
         assert cfg.context_window == 128000
 
     def test_resolve_none_uses_default(self) -> None:
         reg = self._make_registry()
-        _, model1, _ = reg.resolve(None)
-        _, model2, _ = reg.resolve()
+        _, model1, _, _ = reg.resolve(None)
+        _, model2, _, _ = reg.resolve()
         assert model1 == model2
 
     def test_lazy_client_creation(self) -> None:
@@ -204,6 +217,26 @@ class TestModelRegistry:
             pytest.raises(ValueError, match="^anthropic-compatible requires base_url$"),
         ):
             reg.get_client("default")
+
+    def test_provider_leg_failure_in_resolve_binding_is_construction_error(self) -> None:
+        """Re-typed so the bind path cannot read it as the alias vanishing."""
+        from turnstone.core.model_registry import ModelClientConstructionError
+
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig(
+                    "gw",
+                    "http://gw.example/v1",
+                    "k",
+                    "gw-model",
+                    provider="openai-compatible",
+                    server_compat={"api_surface": "bogus"},
+                )
+            },
+            default="gw",
+        )
+        with pytest.raises(ModelClientConstructionError, match="bogus"):
+            reg.resolve_binding("gw")
 
     def test_shutdown(self) -> None:
         reg = self._make_registry()
@@ -334,7 +367,7 @@ class TestLoadModelRegistry:
             )
         assert reg.count == 1
         assert reg.default == "default"
-        _, model, cfg = reg.resolve()
+        _, model, cfg, _ = reg.resolve()
         assert model == "qwen3-32b"
         assert cfg.base_url == "http://localhost:8000/v1"
 
@@ -365,7 +398,7 @@ class TestLoadModelRegistry:
         assert reg.has_alias("openai")
         assert not reg.has_alias("default")
         assert reg.default == "openai"
-        _, model, _ = reg.resolve()
+        _, model, _, _ = reg.resolve()
         assert model == "gpt-4o"
 
     def test_config_context_window_zero_inherits_detected(self) -> None:
@@ -391,7 +424,7 @@ class TestLoadModelRegistry:
                 model="local-model",
                 context_window=40_000,  # the CLI-detected window
             )
-        _, _, cfg = reg.resolve("local")
+        _, _, cfg, _ = reg.resolve("local")
         assert cfg.context_window == 40_000  # inherited, not the literal 0
 
     def test_fallback_from_config(self) -> None:
@@ -959,7 +992,7 @@ class TestRegistryReload:
         assert reg.has_alias("a")
 
         models_b = {"b": ModelConfig("b", "y", "y", "m2")}
-        reg.reload(models_b, "b")
+        reg.reload(models_b, "b", app_state=_KEYED_STATE)
         assert not reg.has_alias("a")
         assert reg.has_alias("b")
         assert reg.default == "b"
@@ -977,7 +1010,7 @@ class TestRegistryReload:
 
         # Same endpoint (base_url, api_key, provider), only ``model`` changed.
         new_models = {"a": ModelConfig("a", "http://x/v1", "key", "m2", provider="openai")}
-        reg.reload(new_models, "a")
+        reg.reload(new_models, "a", app_state=_KEYED_STATE)
 
         assert "a" in reg._clients
         assert reg._clients["a"] is client_before
@@ -995,7 +1028,7 @@ class TestRegistryReload:
         provider_before = reg.get_provider("a")
 
         new_models = {"a": ModelConfig("a", "http://y/v1", "key", "m", provider="openai")}
-        reg.reload(new_models, "a")
+        reg.reload(new_models, "a", app_state=_KEYED_STATE)
 
         assert "a" not in reg._clients
         assert "a" in reg._providers
@@ -1028,7 +1061,7 @@ class TestRegistryReload:
                 obo_audience="api://gateway",
             )
         }
-        reg.reload(new_models, "a")
+        reg.reload(new_models, "a", app_state=_KEYED_STATE)
 
         assert "a" not in reg._clients
 
@@ -1042,7 +1075,7 @@ class TestRegistryReload:
         reg.get_provider("a")
 
         new_models = {"a": ModelConfig("a", "http://x/v1", "key", "m", provider="anthropic")}
-        reg.reload(new_models, "a")
+        reg.reload(new_models, "a", app_state=_KEYED_STATE)
 
         assert "a" not in reg._clients
         assert "a" not in reg._providers
@@ -1061,7 +1094,7 @@ class TestRegistryReload:
 
         # Drop "b" entirely.
         new_models = {"a": ModelConfig("a", "http://x/v1", "key", "m")}
-        reg.reload(new_models, "a")
+        reg.reload(new_models, "a", app_state=_KEYED_STATE)
 
         assert "a" in reg._clients  # unchanged endpoint, kept warm
         assert "b" not in reg._clients
@@ -1070,7 +1103,7 @@ class TestRegistryReload:
         models_a = {"a": ModelConfig("a", "x", "x", "m")}
         reg = ModelRegistry(models=models_a, default="a")
         with pytest.raises(ValueError, match="Default model"):
-            reg.reload(models_a, "nonexistent")
+            reg.reload(models_a, "nonexistent", app_state=_KEYED_STATE)
         # Registry should be unchanged after failed reload
         assert reg.has_alias("a")
         assert reg.default == "a"
@@ -1079,7 +1112,7 @@ class TestRegistryReload:
         models_a = {"a": ModelConfig("a", "x", "x", "m")}
         reg = ModelRegistry(models=models_a, default="a")
         with pytest.raises(ValueError, match="not found in empty registry"):
-            reg.reload({}, "a")
+            reg.reload({}, "a", app_state=_KEYED_STATE)
 
     def test_reload_to_empty_degraded(self) -> None:
         # Reloading down to zero models (default unset) is allowed: the
@@ -1087,8 +1120,58 @@ class TestRegistryReload:
         # return (e.g. an admin removes every model definition at runtime).
         models_a = {"a": ModelConfig("a", "x", "x", "m")}
         reg = ModelRegistry(models=models_a, default="a")
-        reg.reload({}, "")
+        reg.reload({}, "", app_state=_KEYED_STATE)
         assert reg.count == 0
+
+
+class TestReloadKeyGuard:
+    """The dynamic-auth key guard pinned at ``reload``, the one swap
+    chokepoint every call site routes through."""
+
+    @staticmethod
+    def _static_models() -> dict[str, ModelConfig]:
+        return {"a": ModelConfig("a", "http://x/v1", "key", "m")}
+
+    @staticmethod
+    def _dynamic_models() -> dict[str, ModelConfig]:
+        return {
+            "a": ModelConfig("a", "http://x/v1", "key", "m"),
+            "gw": ModelConfig(
+                "gw",
+                "http://gw/v1",
+                "",
+                "m",
+                auth_mode="entra_obo",
+                obo_audience="api://gateway",
+            ),
+        }
+
+    def test_reload_refuses_dynamic_auth_without_key(self) -> None:
+        reg = ModelRegistry(models=self._static_models(), default="a")
+        keyless = SimpleNamespace(mcp_token_store=None)
+        with pytest.raises(DynamicAuthKeyError, match="dynamic model auth"):
+            reg.reload(self._dynamic_models(), "a", app_state=keyless)
+        # Refusal must not mutate: the old registry keeps serving.
+        assert reg.list_aliases() == ["a"]
+        assert not reg.has_dynamic_auth()
+
+    def test_reload_allows_dynamic_auth_with_key(self) -> None:
+        reg = ModelRegistry(models=self._static_models(), default="a")
+        reg.reload(self._dynamic_models(), "a", app_state=_KEYED_STATE)
+        assert reg.has_dynamic_auth()
+
+    def test_reload_all_static_permitted_keyless(self) -> None:
+        # The guard fires on dynamic auth being present, not on a missing key.
+        reg = ModelRegistry(models=self._static_models(), default="a")
+        keyless = SimpleNamespace(mcp_token_store=None)
+        reg.reload({"b": ModelConfig("b", "http://y/v1", "key", "m")}, "b", app_state=keyless)
+        assert reg.has_alias("b")
+
+    def test_reload_boot_sentinel_defers_key_guard(self) -> None:
+        """Boot defers to ``initialize_mcp_crypto_state``, not a bypass."""
+        reg = ModelRegistry(models=self._static_models(), default="a")
+        reg.reload(self._dynamic_models(), "a", app_state=KEY_GUARD_DEFERRED_TO_LIFESPAN)
+        assert reg.has_dynamic_auth()
 
 
 # ---------------------------------------------------------------------------
@@ -1142,13 +1225,19 @@ def _make_session(
     registry: ModelRegistry | None = None,
     model_alias: str | None = None,
     reasoning_effort: str = "medium",
+    client: Any | None = None,
+    kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
+    user_id: str = "",
 ) -> Any:
-    """Create a ChatSession with a mock client and optional registry."""
+    """Create a ChatSession with a mock client and optional registry.
+
+    Pass ``client=registry.get_client(alias)`` to mirror the factories,
+    which resolve the client from the registry before construction.
+    """
     from turnstone.core.session import ChatSession
 
-    client = MagicMock()
     return ChatSession(
-        client=client,
+        client=client if client is not None else MagicMock(),
         model="test-model",
         ui=_FakeUI(),
         instructions=None,
@@ -1158,6 +1247,8 @@ def _make_session(
         registry=registry,
         model_alias=model_alias,
         reasoning_effort=reasoning_effort,
+        kind=kind,
+        user_id=user_id,
     )
 
 
@@ -1196,6 +1287,86 @@ class TestSessionModelCommand:
         assert session.model_alias == "alt"
         assert session.context_window == 64000
         assert "Switched to" in session.ui.infos[-1]
+
+    def test_model_switch_construction_failure_surfaces_real_cause(self, monkeypatch: Any) -> None:
+        """An alias that exists but cannot construct is not "unknown", and
+        the binding stays untouched."""
+        import turnstone.core.model_registry as mr_module
+
+        reg = ModelRegistry(
+            models={
+                "default": ModelConfig("default", "x", "x", "default-model"),
+                "gw": ModelConfig("gw", "http://gw.example/v1", "k", "gw-model"),
+            },
+            default="default",
+        )
+        session = _make_session(registry=reg, model_alias="default")
+        old_client = session.client
+
+        def _boom(provider: str, **kwargs: Any) -> Any:
+            raise FileNotFoundError("/etc/ssl/missing-ca.pem")
+
+        monkeypatch.setattr(mr_module, "create_client", _boom)
+        session.handle_command("/model gw")
+
+        info = session.ui.infos[-1]
+        assert "Unknown model alias" not in info
+        assert "failed to construct" in info
+        assert "details in server log" in info
+        assert session.client is old_client
+        assert session.model == "test-model"
+        assert session.model_alias == "default"
+
+    def test_model_switch_provider_leg_failure_surfaces_real_cause(self) -> None:
+        """The provider leg (api_surface selection) is a construction failure
+        too, not an unknown alias."""
+        reg = ModelRegistry(
+            models={
+                "default": ModelConfig("default", "x", "x", "default-model"),
+                "gw": ModelConfig(
+                    "gw",
+                    "http://gw.example/v1",
+                    "k",
+                    "gw-model",
+                    provider="openai-compatible",
+                    server_compat={"api_surface": "bogus"},
+                ),
+            },
+            default="default",
+        )
+        session = _make_session(registry=reg, model_alias="default")
+        old_client = session.client
+
+        session.handle_command("/model gw")
+
+        info = session.ui.infos[-1]
+        assert "Unknown model alias" not in info
+        assert "bogus" in info  # the real api_surface cause, verbatim
+        assert session.client is old_client
+        assert session.model == "test-model"
+        assert session.model_alias == "default"
+
+    def test_model_switch_resets_judges(self) -> None:
+        """The switch drops the judges, which cache the previous binding."""
+        reg = ModelRegistry(
+            models={
+                "default": ModelConfig("default", "x", "x", "default-model"),
+                "alt": ModelConfig("alt", "y", "y", "alt-model"),
+            },
+            default="default",
+        )
+        session = _make_session(registry=reg, model_alias="default")
+        session._judge = object()
+        session._output_guard_judge = object()
+        old_limiter = session._output_guard_judge_rl
+
+        session.handle_command("/model alt")
+
+        assert "Switched to" in session.ui.infos[-1]
+        assert session._judge is None
+        assert session._output_guard_judge is None
+        # The limiter budget is tied to the judge model — a swap renews it.
+        assert session._output_guard_judge_rl is not old_limiter
 
     def test_model_switch_applies_sampling_params(self) -> None:
         reg = ModelRegistry(
@@ -1274,6 +1445,600 @@ class TestSessionModelCommand:
         info = session.ui.infos[-1]
         assert "Fallback: b" in info
         assert "Agent model: b" in info
+
+
+class TestSessionRegistryGenerationPropagation:
+    """An in-place ``reload()`` must reach live sessions even when the alias
+    keeps its backend model id: sessions cache the generation their client
+    came from and re-resolve on any mismatch.
+    """
+
+    def test_reload_with_changed_base_url_same_model_id_rebinds_client(self) -> None:
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model")},
+            default="gw",
+        )
+        session = _make_session(registry=reg, model_alias="gw")
+        # Bind the registry's real client, as the factories do.
+        session.client = reg.get_client("gw")
+        old_client = session.client
+
+        # Same generation + same model id: the refresh must be a no-op.
+        session._refresh_model_from_registry()
+        assert session.client is old_client
+
+        # In-place swap: NEW base_url, SAME backend model id — the registry
+        # closes and drops the cached client.
+        reg.reload(
+            {"gw": ModelConfig("gw", "http://b.example/v1", "k", "test-model")},
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        session._refresh_model_from_registry()
+
+        assert session.client is not old_client
+        assert session.client is reg.get_client("gw")
+        assert str(session.client.base_url).startswith("http://b.example")
+        assert session._registry_generation == reg.generation
+
+    def test_construction_window_reload_detected_on_first_send(self) -> None:
+        """A reload landing between the factory's resolve and construction is
+        caught by the first send, because the generation is passed in beside
+        the client rather than sampled inside ``__init__``.
+        """
+        from turnstone.core.session import ChatSession
+
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model")},
+            default="gw",
+        )
+        # Factory sequence: the resolve returns the paired generation.
+        factory_client, _model, _cfg, pre_resolve_generation = reg.resolve("gw")
+        # The reload lands in the construction window: same backend model
+        # id, moved base_url.
+        reg.reload(
+            {"gw": ModelConfig("gw", "http://b.example/v1", "k", "test-model")},
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        session = ChatSession(
+            client=factory_client,
+            model="test-model",
+            ui=_FakeUI(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=4096,
+            tool_timeout=30,
+            registry=reg,
+            model_alias="gw",
+            registry_generation=pre_resolve_generation,
+        )
+
+        session._refresh_model_from_registry()
+
+        assert session.client is not factory_client
+        assert session.client is reg.get_client("gw")
+        assert session._registry_generation == reg.generation
+
+    def test_alias_deletion_race_keeps_old_binding_without_raise(self) -> None:
+        """A deletion landing mid-rebind must neither raise out of send nor
+        half-swap; the next refresh self-heals."""
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model")},
+            default="gw",
+        )
+        session = _make_session(registry=reg, model_alias="gw")
+        session.client = reg.get_client("gw")
+        old_client = session.client
+        old_provider = session._provider
+        old_generation = session._registry_generation
+
+        reg.reload(
+            {"gw": ModelConfig("gw", "http://b.example/v1", "k", "test-model")},
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        # The deletion race: the alias vanishes before the bind's locked
+        # snapshot, so the resolve raises and nothing is assigned.
+        with patch.object(
+            reg, "resolve_binding", side_effect=ValueError("Unknown model alias: gw")
+        ):
+            session._refresh_model_from_registry()  # must not raise
+
+        assert session.client is old_client
+        assert session._provider is old_provider
+        assert session._registry_generation == old_generation
+        assert session.model == "test-model"
+
+        # Unpatched, the next send's refresh completes the rebind.
+        session._refresh_model_from_registry()
+        assert session.client is reg.get_client("gw")
+        assert session._registry_generation == reg.generation
+
+    def test_bind_reads_client_and_provider_under_one_lock_acquisition(self) -> None:
+        """Client, config and provider come from one lock acquisition, so a
+        concurrent ``reload()`` cannot tear the committed binding."""
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model")},
+            default="gw",
+        )
+        session = _make_session(registry=reg, model_alias="gw")
+
+        class CountingLock:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+                self.acquisitions = 0
+
+            def __enter__(self) -> Any:
+                self.acquisitions += 1
+                return self._inner.__enter__()
+
+            def __exit__(self, *exc: Any) -> Any:
+                return self._inner.__exit__(*exc)
+
+        counting = CountingLock(reg._client_lock)
+        reg._client_lock = counting  # type: ignore[assignment]
+
+        cfg = session._bind_model_from_registry("gw")
+
+        assert cfg is not None
+        assert session.client is reg._clients["gw"]
+        assert counting.acquisitions == 1
+
+    def test_model_switch_stamps_current_generation(self) -> None:
+        """Switching after a reload stamps the current generation, so the
+        next send's compare is a no-op instead of a spurious rebind."""
+        reg = ModelRegistry(
+            models={
+                "a": ModelConfig("a", "http://a/v1", "k", "m-a"),
+                "b": ModelConfig("b", "http://b/v1", "k", "m-b"),
+            },
+            default="a",
+        )
+        session = _make_session(registry=reg, model_alias="a")
+        reg.reload(
+            {
+                "a": ModelConfig("a", "http://a/v1", "k", "m-a"),
+                "b": ModelConfig("b", "http://b/v1", "k", "m-b"),
+            },
+            "a",
+            app_state=_KEYED_STATE,
+        )
+
+        session.handle_command("/model b")
+
+        assert session.model == "m-b"
+        assert session.client is reg.get_client("b")
+        assert session._registry_generation == reg.generation
+
+    def test_unrelated_alias_reload_keeps_judges_and_limiter_budget(self) -> None:
+        """A rebind resolving to the identical binding stamps the generation
+        and leaves the judges and the output-guard limiter untouched."""
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model"),
+                "other": ModelConfig("other", "http://o.example/v1", "k", "o-model"),
+            },
+            default="gw",
+        )
+        session = _make_session(registry=reg, model_alias="gw")
+        session._bind_model_from_registry("gw")  # establish the baseline binding
+        guard = MagicMock()
+        judge = MagicMock()
+        session._output_guard_judge = guard
+        session._judge = judge
+        limiter = session._output_guard_judge_rl
+
+        # The session's own row is byte-identical; only the unrelated alias
+        # moves, so the selective teardown keeps gw's pooled client.
+        reg.reload(
+            {
+                "gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model"),
+                "other": ModelConfig("other", "http://moved.example/v1", "k", "o-model"),
+            },
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        session._refresh_model_from_registry()
+
+        assert session._registry_generation == reg.generation  # stamped
+        assert session._output_guard_judge is guard  # no reset
+        assert session._output_guard_judge_rl is limiter  # no refill
+        assert session._judge is judge
+
+    def test_first_unrelated_reload_after_construction_keeps_limiter(self) -> None:
+        """Construction seeds ``_bound_model_cfg``, so even the first
+        generation-only rebind compares as unchanged."""
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model"),
+                "other": ModelConfig("other", "http://o.example/v1", "k", "o-model"),
+            },
+            default="gw",
+        )
+        # Mirror the factories: the client is resolved from the registry
+        # before construction, so client identity holds across the rebind.
+        session = _make_session(registry=reg, model_alias="gw", client=reg.get_client("gw"))
+        guard = MagicMock()
+        judge = MagicMock()
+        session._output_guard_judge = guard
+        session._judge = judge
+        limiter = session._output_guard_judge_rl
+
+        # No explicit bind: the first refresh below is the session's first
+        # rebind since construction.
+        reg.reload(
+            {
+                "gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model"),
+                "other": ModelConfig("other", "http://moved.example/v1", "k", "o-model"),
+            },
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        session._refresh_model_from_registry()
+
+        assert session._registry_generation == reg.generation  # stamped
+        assert session._output_guard_judge is guard  # no reset
+        assert session._output_guard_judge_rl is limiter  # no refill on the FIRST edit
+        assert session._judge is judge
+
+    def test_noop_rebind_is_silent_and_keeps_capabilities_cache(self, caplog: Any) -> None:
+        """A generation-only rebind stamps silently and keeps the
+        capabilities memo warm; a real swap still logs."""
+        import logging
+
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model"),
+                "other": ModelConfig("other", "http://o.example/v1", "k", "o-model"),
+            },
+            default="gw",
+        )
+        session = _make_session(registry=reg, model_alias="gw", client=reg.get_client("gw"))
+        caps_sentinel = object()
+        session._cached_capabilities = caps_sentinel
+
+        reg.reload(
+            {
+                "gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model"),
+                "other": ModelConfig("other", "http://moved.example/v1", "k", "o-model"),
+            },
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        with caplog.at_level(logging.INFO):
+            session._refresh_model_from_registry()
+
+        assert session._registry_generation == reg.generation  # stamped anyway
+        assert not any("model_updated" in r.getMessage() for r in caplog.records)
+        assert session._cached_capabilities is caps_sentinel  # memo kept
+
+        # Contrast: a swap that moves THIS alias's connection target logs.
+        reg.reload(
+            {
+                "gw": ModelConfig("gw", "http://b.example/v1", "k", "test-model"),
+                "other": ModelConfig("other", "http://moved.example/v1", "k", "o-model"),
+            },
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        with caplog.at_level(logging.INFO):
+            session._refresh_model_from_registry()
+        assert any("model_updated" in r.getMessage() for r in caplog.records)
+        assert session._cached_capabilities is None  # real change drops the memo
+
+    def test_reload_changing_sessions_alias_still_resets_judges(self) -> None:
+        """The gate is "binding actually changed", not "never reset": moving
+        this session's alias must drop the judges and the limiter."""
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model")},
+            default="gw",
+        )
+        session = _make_session(registry=reg, model_alias="gw")
+        session._bind_model_from_registry("gw")
+        session._output_guard_judge = MagicMock()
+        session._judge = MagicMock()
+        limiter = session._output_guard_judge_rl
+
+        reg.reload(
+            {"gw": ModelConfig("gw", "http://b.example/v1", "k", "test-model")},
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        session._refresh_model_from_registry()
+
+        assert session._judge is None
+        assert session._output_guard_judge is None
+        assert session._output_guard_judge_rl is not limiter
+
+
+class TestSessionRemovedAliasDegradedTurns:
+    """An alias removed by a reload leaves the session holding a closed
+    client. The refresh latches the diagnosis but the send still proceeds
+    to the stream attempt, so a configured fallback carries the turn; only
+    a terminal no-fallback failure surfaces the latched cause, worded per
+    surface because /model routes on the interactive lanes only.
+    """
+
+    @staticmethod
+    def _dead_client_error() -> RuntimeError:
+        return RuntimeError("Cannot send a request, as the client has been closed.")
+
+    # provider="openai-compatible" pins the Chat Completions surface, the
+    # one the patched ``chat.completions.create`` stubs below speak.
+    def _registry(self, fallback: list[str] | None = None) -> ModelRegistry:
+        return ModelRegistry(
+            models={
+                "gw": ModelConfig(
+                    "gw", "http://a.example/v1", "k", "test-model", provider="openai-compatible"
+                ),
+                "other": ModelConfig(
+                    "other", "http://o.example/v1", "k", "o-model", provider="openai-compatible"
+                ),
+            },
+            default="gw",
+            fallback=fallback,
+        )
+
+    def _delete_gw(self, reg: ModelRegistry, fallback: list[str] | None = None) -> None:
+        reg.reload(
+            {
+                "other": ModelConfig(
+                    "other", "http://o.example/v1", "k", "o-model", provider="openai-compatible"
+                )
+            },
+            "other",
+            fallback,
+            app_state=_KEYED_STATE,
+        )
+
+    def test_fallback_carries_turn_after_alias_deletion(self, caplog: Any) -> None:
+        """Deleting a live session's alias degrades the turn onto the
+        configured fallback instead of killing every subsequent send."""
+        import logging
+
+        reg = self._registry(fallback=["other"])
+        fb_client = reg.get_client("other")
+        fb_client.chat.completions.create = scripted_chat_client({"content": "carried"})
+        session = _make_session(registry=reg, model_alias="gw")
+        session.client.chat.completions.create = MagicMock(side_effect=self._dead_client_error())
+
+        self._delete_gw(reg, fallback=["other"])
+        with caplog.at_level(logging.WARNING):
+            session.send("hello")
+            session._refresh_model_from_registry()  # repeat: warning stays deduped
+
+        assert not session.ui.errors, session.ui.errors
+        assert any("falling back to other" in i for i in session.ui.infos)
+        removed_warns = [
+            r for r in caplog.records if "model_refresh_alias_removed" in r.getMessage()
+        ]
+        assert len(removed_warns) == 1  # once per (alias, generation)
+
+    def test_no_fallback_turn_errors_with_removed_cause_and_model_remedy(self) -> None:
+        """With no fallback the error names the alias-removed cause, not the
+        raw closed-transport symptom."""
+        reg = self._registry()
+        session = _make_session(registry=reg, model_alias="gw")
+        session.client.chat.completions.create = MagicMock(side_effect=self._dead_client_error())
+
+        self._delete_gw(reg)
+        with pytest.raises(RuntimeError):
+            session.send("hello")
+
+        assert session.ui.errors, "terminal failure must surface an error"
+        message = session.ui.errors[-1]
+        assert "removed from the registry" in message
+        assert "/model" in message  # interactive lanes route slash commands
+        assert "other" in message  # the remedy lists what is available
+
+    def test_coordinator_error_omits_slash_model_remedy(self) -> None:
+        """The coordinator routes no slash commands, so its error carries
+        recreate-or-adjust wording instead."""
+        reg = self._registry()
+        session = _make_session(
+            registry=reg, model_alias="gw", kind=WorkstreamKind.COORDINATOR, user_id="u1"
+        )
+        session.client.chat.completions.create = MagicMock(side_effect=self._dead_client_error())
+
+        self._delete_gw(reg)
+        with pytest.raises(RuntimeError):
+            session.send("hello")
+
+        assert session.ui.errors
+        message = session.ui.errors[-1]
+        assert "removed from the registry" in message
+        assert "/model" not in message
+        assert "adjust the workstream model" in message
+
+    def test_recreated_broken_alias_reports_construction_cause(self, monkeypatch: Any) -> None:
+        """A re-created alias reports the construction cause, never a stale
+        "removed" diagnosis: the latch clears on the has_alias pass."""
+        import turnstone.core.model_registry as mr_module
+
+        reg = self._registry()
+        session = _make_session(registry=reg, model_alias="gw")
+        session.client.chat.completions.create = MagicMock(side_effect=self._dead_client_error())
+
+        self._delete_gw(reg)
+        session._refresh_model_from_registry()
+        assert session._registry_alias_removed == "gw"
+
+        # Admin re-creates gw, but its client cannot be built.
+        monkeypatch.setattr(
+            mr_module,
+            "create_client",
+            MagicMock(side_effect=FileNotFoundError("/gone/cacert.pem")),
+        )
+        reg.reload(
+            {
+                "gw": ModelConfig(
+                    "gw", "http://b.example/v1", "k", "test-model", provider="openai-compatible"
+                ),
+                "other": ModelConfig(
+                    "other", "http://o.example/v1", "k", "o-model", provider="openai-compatible"
+                ),
+            },
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        session._refresh_model_from_registry()
+        assert session._registry_alias_removed is None  # cleared on has_alias pass
+        assert session._rebind_failed_key == ("gw", reg.generation)
+
+        with pytest.raises(RuntimeError):
+            session.send("hello")
+
+        assert session.ui.errors
+        message = session.ui.errors[-1]
+        assert "could not be rebuilt" in message
+        # The cause is path-scrubbed: the exception type plus a server-log
+        # pointer, since SDK text can embed filesystem paths.
+        assert "FileNotFoundError" in message
+        assert "details in server log" in message
+        assert "removed from the registry" not in message
+
+    def test_recreated_alias_recovers_on_next_refresh(self) -> None:
+        """Re-creating the alias bumps the generation, so the next refresh
+        rebinds and sends flow again without a restart."""
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model"),
+                "other": ModelConfig("other", "http://o.example/v1", "k", "o-model"),
+            },
+            default="gw",
+        )
+        session = _make_session(registry=reg, model_alias="gw")
+        reg.reload(
+            {"other": ModelConfig("other", "http://o.example/v1", "k", "o-model")},
+            "other",
+            app_state=_KEYED_STATE,
+        )
+        session._refresh_model_from_registry()
+        assert session._registry_alias_removed == "gw"
+
+        reg.reload(
+            {
+                "gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model"),
+                "other": ModelConfig("other", "http://o.example/v1", "k", "o-model"),
+            },
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        session._refresh_model_from_registry()
+
+        assert session._registry_alias_removed is None
+        assert session.client is reg.get_client("gw")
+        assert session._registry_generation == reg.generation
+
+
+class TestSessionConstructionFailureLatch:
+    """A rebind whose client construction fails must not retry per send:
+    construction runs under the registry-wide client lock. The refresh
+    records the attempted (alias, generation), warns once per key, and
+    re-attempts only when the registry actually changes.
+    """
+
+    def test_construction_attempted_once_per_generation(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        import logging
+
+        import turnstone.core.model_registry as mr_module
+
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model")},
+            default="gw",
+        )
+        session = _make_session(registry=reg, model_alias="gw")
+        calls = {"n": 0}
+
+        def _boom(provider: str, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            raise FileNotFoundError("/gone/cacert.pem")
+
+        monkeypatch.setattr(mr_module, "create_client", _boom)
+        reg.reload(
+            {"gw": ModelConfig("gw", "http://b.example/v1", "k", "test-model")},
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        with caplog.at_level(logging.WARNING):
+            session._refresh_model_from_registry()  # attempts, fails, latches
+            session._refresh_model_from_registry()  # latched: no attempt
+            session._refresh_model_from_registry()
+
+        assert calls["n"] == 1
+        session_warns = [
+            r
+            for r in caplog.records
+            if "model_refresh_client_construction_failed" in r.getMessage()
+        ]
+        assert len(session_warns) == 1  # once per (alias, generation)
+        assert session._rebind_failed_key == ("gw", reg.generation)
+
+    def test_generation_change_retries_and_success_clears_latch(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        import logging
+
+        import turnstone.core.model_registry as mr_module
+
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://a.example/v1", "k", "test-model")},
+            default="gw",
+        )
+        session = _make_session(registry=reg, model_alias="gw")
+        real_create_client = mr_module.create_client
+        state = {"broken": True, "calls": 0}
+
+        def _flaky(provider: str, **kwargs: Any) -> Any:
+            state["calls"] += 1
+            if state["broken"]:
+                raise FileNotFoundError("/gone/cacert.pem")
+            return real_create_client(provider, **kwargs)
+
+        monkeypatch.setattr(mr_module, "create_client", _flaky)
+        reg.reload(
+            {"gw": ModelConfig("gw", "http://b.example/v1", "k", "test-model")},
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        with caplog.at_level(logging.WARNING):
+            session._refresh_model_from_registry()
+            session._refresh_model_from_registry()  # latched
+        assert state["calls"] == 1
+
+        # A further reload (still broken) is a NEW generation: exactly one
+        # more attempt and one more warning.
+        reg.reload(
+            {"gw": ModelConfig("gw", "http://c.example/v1", "k", "test-model")},
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        with caplog.at_level(logging.WARNING):
+            session._refresh_model_from_registry()
+            session._refresh_model_from_registry()  # latched again
+        assert state["calls"] == 2
+        session_warns = [
+            r
+            for r in caplog.records
+            if "model_refresh_client_construction_failed" in r.getMessage()
+        ]
+        assert len(session_warns) == 2
+
+        # Environment repaired + another reload: the rebind succeeds and
+        # clears the latch.
+        state["broken"] = False
+        reg.reload(
+            {"gw": ModelConfig("gw", "http://d.example/v1", "k", "test-model")},
+            "gw",
+            app_state=_KEYED_STATE,
+        )
+        session._refresh_model_from_registry()
+        assert session._rebind_failed_key is None
+        assert session.client is reg.get_client("gw")
+        assert session._registry_generation == reg.generation
 
 
 class TestSessionFallback:
@@ -1982,7 +2747,7 @@ class TestApplyRoutingOverrides:
             )
         )
 
-        assert _apply_routing_overrides(reg, cs) is False
+        assert _apply_routing_overrides(reg, cs, _KEYED_STATE) is False
         assert called["count"] == 0
 
     def test_reload_when_cs_differs(self) -> None:
@@ -1990,14 +2755,14 @@ class TestApplyRoutingOverrides:
 
         reg = self._registry()  # task_model=None
         cs = _FakeCS(**{"model.task_alias": "fast"})
-        assert _apply_routing_overrides(reg, cs) is True
+        assert _apply_routing_overrides(reg, cs, _KEYED_STATE) is True
         assert reg.task_model == "fast"
 
     def test_no_reload_when_cs_is_none(self) -> None:
         from turnstone.server import _apply_routing_overrides
 
         reg = self._registry()
-        assert _apply_routing_overrides(reg, None) is False
+        assert _apply_routing_overrides(reg, None, _KEYED_STATE) is False
 
     def test_unknown_alias_does_not_trigger_reload(self) -> None:
         """Invalid CS aliases are silently dropped — no spurious reload."""
@@ -2005,5 +2770,5 @@ class TestApplyRoutingOverrides:
 
         reg = self._registry()
         cs = _FakeCS(**{"model.task_alias": "nonexistent"})
-        assert _apply_routing_overrides(reg, cs) is False
+        assert _apply_routing_overrides(reg, cs, _KEYED_STATE) is False
         assert reg.task_model is None  # unchanged

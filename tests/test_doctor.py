@@ -803,7 +803,7 @@ class TestResolveDoctorBrain:
             provider=provider,
         )
         registry = MagicMock()
-        registry.resolve.return_value = (MagicMock(), "test-model", cfg)
+        registry.resolve.return_value = (MagicMock(), "test-model", cfg, 0)
         monkeypatch.setattr(
             "turnstone.core.config_store.ConfigStore",
             lambda **kw: MagicMock(get=lambda *a, **k: ""),

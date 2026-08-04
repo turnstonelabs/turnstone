@@ -1313,7 +1313,9 @@ def main() -> None:
             resolve_temperature_setting,
         )
 
-        r_client, r_model, r_cfg = registry.resolve(model_alias)
+        # The generation comes back from resolve()'s own lock hold, exactly
+        # paired with the client it vouches for; hand it to the constructor.
+        r_client, r_model, r_cfg, registry_generation = registry.resolve(model_alias)
         # An explicit CLI flag is the user speaking; otherwise the knobs
         # ride the shared assignment scheme (the CLI has no ConfigStore,
         # so the rungs are the model config, then unset = wire omission).
@@ -1339,6 +1341,7 @@ def main() -> None:
             tool_truncation=args.tool_truncation,
             mcp_client=mcp_client,
             registry=registry,
+            registry_generation=registry_generation,
             model_alias=model_alias or registry.default,
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,

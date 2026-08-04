@@ -127,7 +127,9 @@ def build_console_session_factory(
             registry=registry,
         )
 
-        r_client, r_model, r_cfg = registry.resolve(effective_alias)
+        # The generation comes back from resolve()'s own lock hold, exactly
+        # paired with the client it vouches for; hand it to the constructor.
+        r_client, r_model, r_cfg, registry_generation = registry.resolve(effective_alias)
 
         uid = getattr(ui, "_user_id", "") or ""
         _username = ""
@@ -215,6 +217,7 @@ def build_console_session_factory(
             mcp_client=live_mcp_client,
             registry=registry,
             model_alias=effective_alias,
+            registry_generation=registry_generation,
             health_registry=None,
             node_id=node_id,
             ws_id=ws_id,

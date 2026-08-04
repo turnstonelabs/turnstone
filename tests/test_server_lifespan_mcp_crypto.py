@@ -15,6 +15,7 @@ from cryptography.fernet import Fernet
 
 import turnstone.core.config as cfg_mod
 from turnstone.core.mcp_crypto import (
+    STARTUP_KEY_REQUIRED_HINT,
     MCPTokenCipher,
     MCPTokenStore,
     initialize_mcp_crypto_state,
@@ -97,6 +98,42 @@ class TestInitializeMcpCryptoState:
         messages = " ".join(record.message for record in caplog.records)
         assert "mcp_token_encryption_keys" in messages
         assert re.search(r"mcp_token_encryption_key(?!s)", messages) is not None
+
+    def test_registry_dynamic_auth_requires_key(
+        self, backend, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A wired registry reporting dynamic auth demands the key (node shape)."""
+        _patch_security(monkeypatch, {})
+
+        state = types.SimpleNamespace(registry=types.SimpleNamespace(has_dynamic_auth=lambda: True))
+        with (
+            caplog.at_level("ERROR", logger="turnstone.core.mcp_crypto"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            initialize_mcp_crypto_state(state, node_id="n1")
+        assert exc_info.value.code == 1
+        messages = " ".join(r.message for r in caplog.records)
+        assert "dynamic_model_auth" in messages
+        assert STARTUP_KEY_REQUIRED_HINT in messages
+
+    def test_raw_dynamic_model_row_alone_does_not_abort_boot(
+        self, backend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The registry, not a raw row, is the oracle: config.toml can shadow
+        a dynamic row with a static alias, so the row alone must not abort."""
+        backend.create_model_definition(
+            definition_id="m-dyn",
+            alias="gateway",
+            model="gpt-4o",
+            auth_mode="entra_obo",
+            obo_audience="api://approved",
+        )
+        _patch_security(monkeypatch, {})
+
+        # Bare state — exactly what the console has when this guard runs.
+        state = types.SimpleNamespace()
+        initialize_mcp_crypto_state(state, node_id="console")
+        assert state.mcp_token_store is None
 
     def test_startup_aborts_with_invalid_key(
         self, backend, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
