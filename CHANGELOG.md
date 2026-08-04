@@ -197,6 +197,26 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Fixed
 
+- **A transport failure mid-generation no longer kills the interactive
+  turn (#937).** A wire death during body streaming (TLS record failure,
+  connection reset — `httpx.ReadError` and kin) surfaces after the
+  request has already returned its stream handle, so neither the SDK's
+  request retries nor the creation-time retry ladder ever saw it: the
+  turn died with a bare `ReadError: …`, the partial output was
+  discarded, and nothing was logged. The interactive loop now normalizes
+  mid-body transport deaths exactly like the single-shot lanes and
+  re-issues the turn (bounded, cancel-aware, exponential backoff),
+  finalizing the dead attempt across every UI surface first so retried
+  text never double-renders (web transcript, CLI markdown fences,
+  Slack/Discord streamed messages). Before re-creating the stream the
+  session re-resolves its registry binding, so a concurrent model-registry
+  reload that closed the old client cannot turn the retry into a
+  misleading closed-client error. On exhaustion the surfaced error names
+  the provider, endpoint, and model with a stream-death message instead
+  of a bare exception string, and every fatal turn now leaves a
+  `session.fatal.recorded` log line (INFO for a user Ctrl-C, ERROR
+  otherwise).
+
 - **A failed worker-thread spawn no longer wedges the workstream — at
   either spawn site — and never masquerades as success.** If
   `Thread.start()` itself raised (thread exhaustion, out-of-memory), the

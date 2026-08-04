@@ -284,7 +284,7 @@ def sanitize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[st
 
     The stream accumulator commits ``arguments`` verbatim, and the only guard that
     drops a malformed tool call is ``finish_reason == "length"``
-    (``ChatSession._stream_response``); a model that emits invalid JSON with a
+    (``ChatSession._stream_attempt``); a model that emits invalid JSON with a
     ``stop`` / ``tool_calls`` finish reason slips through, and one such turn then
     poison-pills every later request that replays it on a strict renderer.  This
     legalizes each offending ``arguments`` to a JSON-object string.

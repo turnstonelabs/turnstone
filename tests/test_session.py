@@ -135,16 +135,10 @@ def _send_with_mocks(session, responses, mock_execute, **extra_patches):
     """
     from unittest.mock import patch as _patch
 
-    def mock_stream(_msgs):
-        return iter([])
-
-    def mock_response(_stream, _gen):
+    def mock_response(_msgs, _gen):
         return responses.pop(0)
 
     with contextlib.ExitStack() as stack:
-        stack.enter_context(
-            _patch.object(session, "_create_stream_with_retry", side_effect=mock_stream)
-        )
         stack.enter_context(_patch.object(session, "_stream_response", side_effect=mock_response))
         stack.enter_context(_patch.object(session, "_execute_tools", side_effect=mock_execute))
         for attr, side_effect in extra_patches.items():
@@ -6447,7 +6441,7 @@ class TestUserAdvisoryCancelClear:
         session._title_generated = True
         stream_calls = 0
 
-        def mock_create_stream(msgs):
+        def mock_stream_response(msgs, my_generation=0):
             nonlocal stream_calls
             stream_calls += 1
             if stream_calls == 1:
@@ -6455,15 +6449,10 @@ class TestUserAdvisoryCancelClear:
                 # time the no-tool branch runs ``_flush_queued_messages``,
                 # this item is in the queue waiting to be drained.
                 session.queue_message("late arrival", queue_msg_id="q-late")
-            return iter([])
+            return {"role": "assistant", "content": "ok"}
 
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=mock_create_stream),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", side_effect=mock_stream_response),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),

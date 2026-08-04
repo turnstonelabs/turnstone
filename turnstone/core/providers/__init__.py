@@ -18,6 +18,7 @@ from turnstone.core.providers._protocol import (
     UsageInfo,
     accumulate_tool_call_delta,
     drain_stream,
+    transport_guarded,
 )
 from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
 
@@ -39,6 +40,7 @@ __all__ = [
     "drain_stream",
     "list_known_models",
     "lookup_model_capabilities",
+    "transport_guarded",
 ]
 
 # Singleton instances (stateless, safe to share).

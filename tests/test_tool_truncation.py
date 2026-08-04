@@ -205,20 +205,17 @@ class TestContextOverflowRecovery:
 
         call_count = 0
 
-        def mock_create_stream(msgs):
+        def mock_stream_response(msgs, my_generation=0):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise Exception("maximum context length exceeded")
-            return iter([])
+            return {"role": "assistant", "content": "ok"}
 
         compact_mock = MagicMock()
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=mock_create_stream),
+            patch.object(session, "_stream_response", side_effect=mock_stream_response),
             patch.object(session, "_compact_messages", compact_mock),
-            patch.object(
-                session, "_stream_response", return_value={"role": "assistant", "content": "ok"}
-            ),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -238,20 +235,17 @@ class TestContextOverflowRecovery:
 
         call_count = 0
 
-        def mock_create_stream(msgs):
+        def mock_stream_response(msgs, my_generation=0):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise Exception("prompt is too long: 250000 tokens > 200000 maximum")
-            return iter([])
+            return {"role": "assistant", "content": "ok"}
 
         compact_mock = MagicMock()
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=mock_create_stream),
+            patch.object(session, "_stream_response", side_effect=mock_stream_response),
             patch.object(session, "_compact_messages", compact_mock),
-            patch.object(
-                session, "_stream_response", return_value={"role": "assistant", "content": "ok"}
-            ),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -328,16 +322,10 @@ def _send_with_tool_batches(session, batches, **extra_patches):
     ] + [{"role": "assistant", "content": "done"}]
     exec_results = [(results, []) for _, results in batches]
 
-    def mock_stream(_msgs):
-        return iter([])
-
-    def mock_response(_stream, _gen):
+    def mock_response(_msgs, _gen):
         return responses.pop(0)
 
     with contextlib.ExitStack() as stack:
-        stack.enter_context(
-            patch.object(session, "_create_stream_with_retry", side_effect=mock_stream)
-        )
         stack.enter_context(patch.object(session, "_stream_response", side_effect=mock_response))
         stack.enter_context(patch.object(session, "_execute_tools", side_effect=exec_results))
         for attr, value in extra_patches.items():

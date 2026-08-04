@@ -8,7 +8,7 @@ provider_blocks shape on the wire, so the captured reasoning text is
 stamped onto ``_provider_content`` as a synthetic
 ``{type: "reasoning_text"}`` block at the end of the turn by
 ``model_turn.synth_reasoning_block`` — the one synthesizer every lane
-runs (the main loop reaches it through ``ChatSession._stream_response``
+runs (the main loop reaches it through ``ChatSession._stream_attempt``
 → ``_finalize_provider_blocks``; agents and judges through
 ``model_turn``).
 
@@ -210,9 +210,9 @@ class TestOpenAIChatExtractReasoningText:
         assert provider.extract_reasoning_text(blocks) == ""
 
 
-class TestStreamResponseSynthBlockIntegration:
+class TestStreamAttemptSynthBlockIntegration:
     """Integration test: drives a fake reasoning-emitting stream
-    through ``ChatSession._stream_response`` and asserts the
+    through ``ChatSession._stream_attempt`` and asserts the
     synthesizer wires up correctly.  Pins the call site at
     ``session.py`` (where ``model_turn.synth_reasoning_block`` is
     invoked — via ``_finalize_provider_blocks`` — on the assembled
@@ -250,17 +250,17 @@ class TestStreamResponseSynthBlockIntegration:
         )
         return iter(chunks)
 
-    def test_stream_response_stamps_synth_block_when_path3_reasoning_captured(
+    def test_stream_attempt_stamps_synth_block_when_path3_reasoning_captured(
         self,
     ) -> None:
         """Drive a fake stream emitting reasoning_delta chunks (no
-        native provider_blocks) through ``_stream_response``; assert
+        native provider_blocks) through ``_stream_attempt``; assert
         the resulting assistant_msg carries a synthetic reasoning_text
         block stamped onto ``_provider_content``."""
         session = _make_session()
         # No registry → source field omitted from synth block.
         stream = self._make_stream(content="Final answer.", reasoning="path-3 reasoning")
-        msg = session._stream_response(stream)
+        msg = session._stream_attempt(stream)
         assert msg["role"] == "assistant"
         assert msg["content"] == "Final answer."
         # Synthetic block should be stamped onto _provider_content.
@@ -270,17 +270,17 @@ class TestStreamResponseSynthBlockIntegration:
         assert provider_content[0]["type"] == "reasoning_text"
         assert provider_content[0]["text"] == "path-3 reasoning"
 
-    def test_stream_response_no_synth_when_no_reasoning_captured(self) -> None:
+    def test_stream_attempt_no_synth_when_no_reasoning_captured(self) -> None:
         """Stream emits only content (no reasoning_delta).  No synth
         block stamped — _provider_content key absent on assistant_msg."""
         session = _make_session()
         stream = self._make_stream(content="just content", reasoning="")
-        msg = session._stream_response(stream)
+        msg = session._stream_attempt(stream)
         assert msg["content"] == "just content"
         # No synth block (and no native blocks either) → key absent.
         assert "_provider_content" not in msg
 
-    def test_stream_response_synth_block_carries_source_when_server_type_resolvable(
+    def test_stream_attempt_synth_block_carries_source_when_server_type_resolvable(
         self,
     ) -> None:
         """When the active model has server_compat.server_type set,
@@ -294,7 +294,7 @@ class TestStreamResponseSynthBlockIntegration:
         )
         session._model_alias = "qwen3-32b"
         stream = self._make_stream(content="answer", reasoning="reasoning text")
-        msg = session._stream_response(stream)
+        msg = session._stream_attempt(stream)
         provider_content = msg.get("_provider_content")
         assert isinstance(provider_content, list)
         assert provider_content[0]["source"] == "vllm"

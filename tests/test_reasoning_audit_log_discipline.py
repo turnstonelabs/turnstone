@@ -226,10 +226,10 @@ class TestReasoningAuditLogDiscipline:
             f"reasoning text into INFO+ logs: {offending}"
         )
 
-    def test_synth_reasoning_block_via_stream_response_does_not_log_reasoning(
+    def test_synth_reasoning_block_via_stream_attempt_does_not_log_reasoning(
         self,
     ) -> None:
-        """Drives ChatSession._stream_response (which invokes
+        """Drives ChatSession._stream_attempt (which invokes
         model_turn.synth_reasoning_block at end-of-stream via
         _finalize_provider_blocks) with a fake
         ``reasoning_delta=_MARKER`` chunk; asserts no log call carried
@@ -247,7 +247,7 @@ class TestReasoningAuditLogDiscipline:
         for p in patchers:
             p.start()
         try:
-            msg = session._stream_response(iter(chunks))
+            msg = session._stream_attempt(iter(chunks))
             # Synth block stamped onto _provider_content with the marker.
             assert msg["_provider_content"][0]["text"] == _MARKER
         finally:
@@ -259,7 +259,7 @@ class TestReasoningAuditLogDiscipline:
             if _payload_contains_marker(args, kwargs)
         ]
         assert offending == [], (
-            f"_stream_response + synth_reasoning_block leaked reasoning "
+            f"_stream_attempt + synth_reasoning_block leaked reasoning "
             f"text into INFO+ logs: {offending}"
         )
 

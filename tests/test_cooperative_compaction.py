@@ -1093,19 +1093,16 @@ class TestProactivePreSend:
                 forwarded["preserve_tail"] = kwargs.get("preserve_tail")
             return True
 
-        def fake_stream(*_args, **_kwargs):
+        def fake_stream_response(*_args, **_kwargs):
             order.append("stream")
-            return iter([])
+            return {"role": "assistant", "content": "done"}
 
         with (
             # 9999 > hard (9000) → compaction is owed at send time.
             patch.object(session, "_estimated_prompt_tokens", return_value=9_999),
             patch.object(session, "_check_metacognitive_nudge", return_value=None),
             patch.object(session, "_do_auto_compact", side_effect=fake_compact),
-            patch.object(session, "_create_stream_with_retry", side_effect=fake_stream),
-            patch.object(
-                session, "_stream_response", return_value={"role": "assistant", "content": "done"}
-            ),
+            patch.object(session, "_stream_response", side_effect=fake_stream_response),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),

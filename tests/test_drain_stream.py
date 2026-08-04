@@ -16,6 +16,7 @@ from turnstone.core.providers import (
     ToolCallDelta,
     UsageInfo,
     drain_stream,
+    transport_guarded,
 )
 from turnstone.core.providers._openai_common import RETRYABLE_ERROR_NAMES
 from turnstone.core.providers._protocol import IncompleteStreamError
@@ -268,6 +269,85 @@ class TestInfoDelta:
                     ]
                 )
             )
+
+
+class TestTransportGuarded:
+    """``transport_guarded`` — drain's conversion rule for consumers that
+    keep streaming semantics (the interactive loop)."""
+
+    @pytest.mark.parametrize("exc_name", ["ReadError", "RemoteProtocolError"])
+    def test_pre_finish_transport_error_becomes_retryable_incomplete(self, exc_name):
+        import httpx
+
+        exc_cls = getattr(httpx, exc_name)
+
+        def chunks():
+            yield StreamChunk(content_delta="partial")
+            raise exc_cls("wire died")
+
+        it = transport_guarded(chunks())
+        assert next(it).content_delta == "partial"
+        with pytest.raises(IncompleteStreamError, match=exc_name) as excinfo:
+            next(it)
+        assert isinstance(excinfo.value.__cause__, exc_cls)
+
+    def test_message_byte_matches_drains_shape(self):
+        # The wrapper and the drain are the SAME conversion rule; any test
+        # or log filter pinned to drain's message must match the wrapper's.
+        import httpx
+
+        def chunks():
+            yield StreamChunk(content_delta="partial")
+            raise httpx.ReadError("[SSL] record layer failure (_ssl.c:2590)")
+
+        with pytest.raises(IncompleteStreamError) as guarded:
+            list(transport_guarded(chunks()))
+        with pytest.raises(IncompleteStreamError) as drained:
+            drain_stream(chunks())
+        assert str(guarded.value) == str(drained.value)
+
+    def test_post_finish_blip_ends_stream_cleanly(self, caplog):
+        # The generation already completed — the blip only cost trailing
+        # metadata, so the stream ends instead of raising.
+        import logging
+
+        import httpx
+
+        def chunks():
+            yield StreamChunk(content_delta="done")
+            yield StreamChunk(finish_reason="stop")
+            raise httpx.ReadError("late blip")
+
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.providers._protocol"):
+            out = list(transport_guarded(chunks()))
+        assert [c.content_delta for c in out] == ["done", ""]
+        assert out[-1].finish_reason == "stop"
+        assert any("stream.post_finish_blip" in r.message for r in caplog.records)
+
+    def test_chunks_pass_through_untouched(self):
+        src = [
+            StreamChunk(content_delta="a"),
+            StreamChunk(reasoning_delta="r"),
+            StreamChunk(finish_reason="stop"),
+        ]
+        out = list(transport_guarded(iter(src)))
+        assert all(a is b for a, b in zip(out, src, strict=True))
+
+    def test_exhaustion_without_finish_reason_passes_through(self):
+        # No complete-or-error gate here — that stays drain-only; the
+        # interactive consumer shows partial output live.
+        out = list(transport_guarded(iter([StreamChunk(content_delta="x")])))
+        assert len(out) == 1
+
+    def test_non_transport_exception_propagates_verbatim(self):
+        def chunks():
+            yield StreamChunk(content_delta="x")
+            raise ValueError("upstream broke")
+
+        it = transport_guarded(chunks())
+        assert next(it).content_delta == "x"
+        with pytest.raises(ValueError, match="upstream broke"):
+            next(it)
 
 
 class TestErrorPropagation:

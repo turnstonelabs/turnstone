@@ -172,7 +172,11 @@ from turnstone.core.preview import (
     resolve_preview_kind,
     transcode_text,
 )
-from turnstone.core.providers import accumulate_tool_call_delta, create_provider
+from turnstone.core.providers import (
+    accumulate_tool_call_delta,
+    create_provider,
+    transport_guarded,
+)
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.settings_registry import DEFAULT_AUTO_COMPACT_PCT
@@ -1162,6 +1166,18 @@ _BACKEND_AUTH_EXC_NAMES: frozenset[str] = frozenset(
     {"AuthenticationError", "PermissionDeniedError"}
 )
 _BACKEND_RATE_LIMIT_EXC_NAMES: frozenset[str] = frozenset({"RateLimitError"})
+# Mid-response stream deaths: the normalized shape every guarded iterator
+# raises (``IncompleteStreamError`` from ``drain_stream`` /
+# ``transport_guarded``) plus the raw httpx names for any future unguarded
+# path (defense in depth).  Unioning them into ``_BACKEND_KNOWN_EXC_NAMES``
+# is required — ``_format_backend_error`` gates on that set before the
+# branch lookups — and makes these three names ineligible for
+# ``_is_ctx_overflow``'s text-based overflow detection (its class
+# self-gate): harmless, since their texts are fixed transport/SSL strings
+# that never carry overflow phrases.
+_BACKEND_STREAM_EXC_NAMES: frozenset[str] = frozenset(
+    {"IncompleteStreamError", "ReadError", "RemoteProtocolError"}
+)
 
 _BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
     _BACKEND_TIMEOUT_EXC_NAMES
@@ -1169,6 +1185,7 @@ _BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
     | _BACKEND_NOT_FOUND_EXC_NAMES
     | _BACKEND_AUTH_EXC_NAMES
     | _BACKEND_RATE_LIMIT_EXC_NAMES
+    | _BACKEND_STREAM_EXC_NAMES
 )
 
 
@@ -5246,6 +5263,19 @@ class ChatSession:
 
         raw = self._format_backend_error(exc) or f"{type(exc).__name__}: {exc}"
         safe = sanitize_error_text(raw)
+        # The one journal trace of a fatal turn — UI sinks and the config row
+        # are invisible to log scrapers.  Sanitized text only (same
+        # confidentiality floor as the sinks below).  KeyboardInterrupt routes
+        # through this chokepoint too; it is a user action, not a fault, so it
+        # logs at INFO instead of ERROR.
+        fatal_log = log.info if isinstance(exc, KeyboardInterrupt) else log.error
+        fatal_log(
+            "session.fatal.recorded",
+            ws=self._ws_id,
+            error_type=type(exc).__name__,
+            error=safe,
+        )
+        log.debug("session.fatal.recorded", exc_info=True)
         try:
             self.ui.on_error(safe)
         except Exception:
@@ -5448,6 +5478,15 @@ class ChatSession:
                 f"Backend rate-limited ({name}): {provider_label} "
                 f"at {base_url} (model={model_label})."
                 f"{raw_tail}"
+            )
+        if name in _BACKEND_STREAM_EXC_NAMES:
+            # First sentence kept short so Discord's message[:500] cut keeps
+            # the identity even when it loses the raw tail.
+            return (
+                f"Backend stream died mid-response ({name}): connection to "
+                f"{provider_label} at {base_url} dropped while model={model_label} "
+                f"was generating; retries did not recover it. Check "
+                f"network-path/TLS stability to the endpoint.{raw_tail}"
             )
         return None  # unreachable — `name` is in _BACKEND_KNOWN_EXC_NAMES by construction
 
@@ -5710,6 +5749,11 @@ class ChatSession:
 
     # Retryable error names are now provided by LLMProvider.retryable_error_names.
     _MAX_RETRIES = 3
+    # Mid-stream re-issues of the interactive turn after a wire death DURING
+    # body iteration (see _stream_response) — the consumer-side twin of
+    # model_turn's _DRAIN_RETRIES, distinct from the creation-time
+    # _MAX_RETRIES above.
+    _MID_STREAM_RETRIES = 2
     _RETRY_BASE_DELAY = 1.0  # seconds
 
     # Chunked-compaction tuning (see _summarize_blocks / _summary_input_budget_chars).
@@ -5821,15 +5865,24 @@ class ChatSession:
             self.ui.on_info(f"[Fallback {alias} also failed: {fb_err}]")
             return None
 
-    def _stop_retrying(self, exc: BaseException, attempt: int, provider: LLMProvider) -> bool:
-        """Terminal-retry predicate shared by every API retry loop (stream, summary,
-        task_agent): stop on a non-retryable error class, a deterministic
-        context-overflow (retrying an identical oversized payload is pointless), or
-        retry exhaustion."""
+    def _stop_retrying(
+        self,
+        exc: BaseException,
+        attempt: int,
+        provider: LLMProvider,
+        max_retries: int | None = None,
+    ) -> bool:
+        """Terminal-retry predicate shared by every API retry loop (stream
+        creation, summary, task_agent, mid-stream re-issue): stop on a
+        non-retryable error class, a deterministic context-overflow (retrying
+        an identical oversized payload is pointless), or ladder exhaustion.
+        *max_retries* overrides the creation ladder's ``_MAX_RETRIES`` for
+        loops with their own cap (``_MID_STREAM_RETRIES``)."""
+        cap = self._MAX_RETRIES if max_retries is None else max_retries
         return (
             type(exc).__name__ not in provider.retryable_error_names
             or _is_ctx_overflow(exc)
-            or attempt == self._MAX_RETRIES
+            or attempt == cap
         )
 
     def _try_stream(
@@ -6752,7 +6805,7 @@ class ChatSession:
                 self.ui.on_thinking_start()
                 try:
                     try:
-                        stream = self._create_stream_with_retry(msgs)
+                        assistant_msg = self._stream_response(msgs, my_generation)
                     except Exception as ctx_err:
                         # Context overflow recovery: if the API rejects the
                         # request due to exceeding the context window, compact
@@ -6776,14 +6829,13 @@ class ChatSession:
                             self._compact_messages(auto=True, my_generation=my_generation)
                             msgs = self._prepare_wire_messages(self._full_messages())
                             self.ui.on_thinking_start()
-                            stream = self._create_stream_with_retry(msgs)
+                            assistant_msg = self._stream_response(msgs, my_generation)
                         except Exception:
                             log.warning(
                                 "Compact-and-retry failed, raising original error",
                                 exc_info=True,
                             )
                             raise ctx_err from None
-                    assistant_msg = self._stream_response(stream, my_generation)
                 finally:
                     # Only clear if this generation is still active —
                     # an orphaned thread must not clobber a newer stream.
@@ -7255,7 +7307,7 @@ class ChatSession:
             # flagged ("…cannot simultaneously guarantee Consistency,"
             # surfaced as if it were a complete sentence).
             if self._cancelled_partial_msg:
-                # _stream_response was interrupted — save partial
+                # _stream_attempt was interrupted — save partial
                 # assistant msg.  Two shapes:
                 #
                 # - Some text streamed before cancel: append the
@@ -7601,16 +7653,110 @@ class ChatSession:
                 text = text[:start] + text[end + len(close_t) :] if end != -1 else text[:start]
         return text.strip()
 
+    def _stream_response(
+        self, msgs: list[dict[str, Any]], my_generation: int = 0
+    ) -> dict[str, Any]:
+        """Run one resilient streaming turn: acquire, consume, re-issue on death.
+
+        The single-pass consumer is :meth:`_stream_attempt`; this wrapper
+        owns ALL stream acquisition — first attempt included — so every
+        attempt's stream comes from the same seam and callers hand over
+        wire-ready *msgs*, never a stream.  A wire death DURING body
+        iteration surfaces after the request already returned its stream
+        handle, so neither the SDK's ``max_retries`` nor the creation-time
+        ``_try_stream`` ladder ever sees it.  ``transport_guarded``
+        normalizes those deaths to the retryable ``IncompleteStreamError``;
+        this loop finalizes the dead attempt in every UI consumer, then
+        re-issues the whole turn (the APIs cannot resume a generation) up
+        to ``_MID_STREAM_RETRIES`` times.
+
+        Ladder stacking: a 3-way stack — each re-issue runs the full
+        creation ladder, itself the ``_MAX_RETRIES`` loop times the
+        fallback-chain walk, so a persistently transient-shaped failure
+        burns (_MID_STREAM_RETRIES + 1) x ((_MAX_RETRIES + 1) + fallback
+        passes) calls before the terminal error surfaces.  Both inner
+        layers are the pre-existing creation path (task_agent's
+        ``_api_call`` documents the equivalent 2-way stack); only the
+        outer factor is new, and every layer stops immediately on a
+        non-retryable class.
+        """
+        attempt = 0
+        stream = self._create_stream_with_retry(msgs)
+        while True:
+            try:
+                return self._stream_attempt(transport_guarded(stream), my_generation)
+            # GenerationCancelled subclasses BaseException, so this arm
+            # structurally cannot swallow the cancel path.
+            except Exception as e:
+                # self._provider, not a creation-time local: after
+                # _try_fallback the live stream belongs to the fallback
+                # provider (the sets overlap on IncompleteStreamError, so
+                # the gate is correct either way — but read the session's
+                # current binding).  The terminal predicate is the SHARED
+                # _stop_retrying, capped at _MID_STREAM_RETRIES: its
+                # overflow arm applies here too — an overflow can surface
+                # mid-consumption (error-frame lanes), and it must fall
+                # through to send()'s compact-and-retry arm rather than
+                # burn re-issues on a deterministic failure.
+                if self._generation != my_generation or self._stop_retrying(
+                    e, attempt, self._provider, max_retries=self._MID_STREAM_RETRIES
+                ):
+                    raise  # fatal path unchanged
+                attempt += 1
+                cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
+                delay = self._RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                log.warning(
+                    "stream.retry",
+                    error_type=cause,
+                    attempt=attempt,
+                    model=self.model,
+                    retry_in=delay,
+                )
+                # Finalize the dead attempt EVERYWHERE before re-streaming.
+                # Order matters: stream_end (client-side finalize — browser
+                # bubble, CLI markdown flush/fence reset, Slack/Discord
+                # StreamingMessage) -> turn_committed (server buffer reset —
+                # in_progress_snapshot, IDLE payload, turn-content cap) ->
+                # notice -> spinner for the backoff+recreate window.
+                # Without the pair every consumer appends the retried
+                # attempt's text onto the dead attempt's.
+                self.ui.on_stream_end()
+                self.ui.on_turn_committed()
+                self.ui.on_info(
+                    f"[stream died mid-response ({cause}) — retrying in "
+                    f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
+                )
+                self.ui.on_thinking_start()
+                self._backoff_or_cancelled(delay, my_generation)
+                self._cancel_stream = None  # drop the dead SDK handle
+                # A concurrent ModelRegistry.reload() closes cached clients
+                # whose connection config changed — the in-flight read then
+                # dies with a ReadError and self.client is CLOSED.  The
+                # refresh is generation-gated (two compares when nothing
+                # changed), so this is free in the common case and re-binds
+                # exactly when reload made the old client unusable.
+                self._refresh_model_from_registry()
+                try:
+                    stream = self._create_stream_with_retry(msgs)
+                except Exception:
+                    # The re-create's failure must not mask the true
+                    # stream-death error: a closed-client recreate surfaces
+                    # as a retryable APIConnectionError and would otherwise
+                    # replace the operator-actionable wording after burning
+                    # its own ladder.
+                    log.warning("stream.retry.recreate_failed", exc_info=True)
+                    raise e from None
+
     # Tags that delimit reasoning blocks in content stream.
     # Checked in order; first match wins.
     _THINK_OPEN_TAGS = ("<think>", "<reasoning>")
     _THINK_CLOSE_TAGS = ("</think>", "</reasoning>")
     _MAX_TAG_LEN = max(len(t) for t in _THINK_OPEN_TAGS + _THINK_CLOSE_TAGS)
 
-    def _stream_response(
+    def _stream_attempt(
         self, stream: Iterator[StreamChunk], my_generation: int = 0
     ) -> dict[str, Any]:
-        """Stream response, dispatching tokens to the UI as they arrive.
+        """Consume ONE streaming attempt, dispatching tokens to the UI live.
 
         Handles two reasoning delivery mechanisms:
         1. The `reasoning_delta` field (e.g. vLLM with --reasoning-parser)
@@ -7619,12 +7765,22 @@ class ChatSession:
         Calls self.ui.on_thinking_stop() on the first received delta.
 
         Returns the complete assistant message as a dict suitable for
-        appending to self.messages.
+        appending to self.messages.  Single-pass by contract: the
+        acquisition + mid-stream-retry wrapper is :meth:`_stream_response`,
+        which hands this method a ``transport_guarded`` iterator per
+        attempt.
         """
         # Reset so this API call captures fresh usage — prevents stale
         # completion_tokens from a prior tool-chain iteration leaking
-        # through the max() accumulator.
+        # through the max() accumulator.  _assistant_pending_tokens is the
+        # same staleness one hop later: a post-finish transport blip
+        # (transport_guarded's tolerance) can end this stream with the
+        # trailing usage chunk lost, and _update_token_table's falsy-usage
+        # early-return would then leave the PREVIOUS turn's completion
+        # count to be appended as this turn's estimate by send()'s
+        # `_assistant_pending_tokens or ...` fallback.
         self._last_usage = None
+        self._assistant_pending_tokens = 0
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []

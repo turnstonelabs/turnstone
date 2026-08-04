@@ -164,7 +164,7 @@ class TestCancelEvent:
 
 
 class TestCancelDuringStreaming:
-    """Cancel while _stream_response is iterating chunks."""
+    """Cancel while _stream_attempt is iterating chunks."""
 
     def test_preserves_partial_content(self, tmp_db):
         """Partial content already streamed should be preserved in messages."""
@@ -706,7 +706,7 @@ class TestForceCancelGeneration:
 
         # We can't trivially test the full threading scenario in a unit test,
         # so directly verify that _check_cancelled raises when my_generation
-        # is stale, which is what guards _stream_response against orphaned
+        # is stale, which is what guards _stream_attempt against orphaned
         # (force-cancelled) threads continuing to mutate messages.
         session._generation = 5
         with pytest.raises(GenerationCancelled):

@@ -156,6 +156,53 @@ def accumulate_tool_call_delta(
     return tc
 
 
+def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
+    """Normalize mid-body transport deaths on a ``create_streaming`` iterator.
+
+    Streaming moves the body read out of the SDK's
+    ``APIConnectionError``-wrapped request into raw iteration, so a
+    mid-body wire death (connection drop, TLS record failure, read
+    timeout) surfaces as a bare ``httpx.TransportError`` no retry
+    predicate recognizes.  This wrapper is that conversion rule made
+    reusable for consumers that keep streaming semantics (the
+    interactive loop); :func:`drain_stream` applies the same rule for
+    the single-shot lanes.
+
+    - A ``TransportError`` BEFORE any finish reason re-raises (chained)
+      as the retryable :class:`IncompleteStreamError`.
+    - A ``TransportError`` AFTER a finish reason passed through ends the
+      stream cleanly: the generation already completed, and the blip
+      only cost trailing metadata (a usage-only chunk or the citation
+      footer) — logged as ``stream.post_finish_blip``.
+    - Everything else — chunks, exhaustion, non-transport exceptions —
+      passes through untouched.
+    """
+    import httpx  # noqa: PLC0415 — heavyweight; deferred off the type-module import path
+
+    finish_seen = False
+    iterator = iter(chunks)
+    while True:
+        try:
+            sc = next(iterator)
+        except StopIteration:
+            return
+        except httpx.TransportError as exc:
+            if finish_seen:
+                import structlog  # noqa: PLC0415 — deferred with httpx off the type-module path
+
+                structlog.get_logger(__name__).warning(
+                    "stream.post_finish_blip",
+                    error_type=type(exc).__name__,
+                )
+                return
+            raise IncompleteStreamError(
+                f"stream transport failed mid-response ({type(exc).__name__}: {exc})"
+            ) from exc
+        if sc.finish_reason:
+            finish_seen = True
+        yield sc
+
+
 def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     """Drain a ``create_streaming`` iterator into a ``CompletionResult``.
 

@@ -1292,7 +1292,7 @@ def _normalize_finish_reason(reason: str) -> str:
         # drain gate only errors on an ABSENT finish reason.  "content_filter"
         # is the
         # OpenAI-vocabulary equivalent this function normalizes onto, and both
-        # consumers already handle it: ChatSession._stream_response warns the
+        # consumers already handle it: ChatSession._stream_attempt warns the
         # user, and the sub-agent loop stops early instead of flailing on an
         # empty turn.  Falling through to the raw "refusal" string instead
         # would land a truncated answer as a complete result.
