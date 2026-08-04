@@ -2982,14 +2982,17 @@ def test_obo_scopes_normalizers_agree_across_modules() -> None:
     assert mr_module.sanitize_backend_auth_scopes(dirty) == "aud-gwopenid"
     # The C0 separator block counts as Python whitespace, so a bare
     # str.split() would swallow it before the guard could refuse; the
-    # registry must refuse it like every other control byte, while the
-    # sanctioned separators (tab/newline/CR, blessed in the corpus above)
-    # keep collapsing.
+    # registry must refuse it like every other control byte, and the
+    # SANITIZE must strip it like every other control — never promote it to
+    # a separator that splits one token into two valid-looking scopes —
+    # while the sanctioned separators (tab/newline/CR, blessed in the
+    # corpus above) keep collapsing.
     for sep_byte in (chr(0x1C), chr(0x1D), chr(0x1E), chr(0x1F)):
         with pytest.raises(mr_module.ModelAuthConfigError):
             mr_module._normalize_auth_mode(
                 "gw", "rfc8693_obo", "api://gw", f"aud-gw{sep_byte}openid"
             )
+        assert mr_module.sanitize_backend_auth_scopes(f"aud-gw{sep_byte}openid") == "aud-gwopenid"
 
 
 def test_control_bearing_alias_refuses_to_load() -> None:

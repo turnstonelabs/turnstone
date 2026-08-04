@@ -269,18 +269,22 @@ def strip_control_characters(value: str) -> str:
 def sanitize_backend_auth_scopes(value: Any) -> str:
     """The ONE spelling of the backend-auth scopes sanitize.
 
-    Collapse whitespace runs to single spaces, strip the remaining C0/DEL
-    control characters, then re-collapse the runs the stripping can reopen
-    (``"a \\x01 b"`` becomes ``"a  b"`` becomes ``"a b"``). Collapse-first
-    ordering is load-bearing: stripping a tab-separated list first would
-    CONCATENATE the scopes the tab separates. No length cap and no refusal —
-    policy (caps, and refuse-vs-strip on garbage) stays with each consuming
+    The sanctioned separators — tab, newline, CR — read as spaces FIRST
+    (stripping a tab-separated list outright would CONCATENATE the scopes
+    the tab separates), then every remaining C0/DEL control character is
+    stripped, and finally whitespace runs collapse to single spaces. The
+    separator vocabulary deliberately matches the registry guard's: the C0
+    separator block (U+001C–U+001F) is a CONTROL here, never a separator —
+    a bare ``str.split()`` would silently promote it to one — so a control
+    byte inside a token strips-and-joins rather than splitting the token
+    into two valid-looking scopes. No length cap and no refusal — policy
+    (caps, and refuse-vs-strip on garbage) stays with each consuming
     layer; this function only fixes the shared spelling those policies
     measure, so the console store, the registry load, and the mint request
     can never disagree on what a scopes value *is*.
     """
-    collapsed = " ".join(str(value or "").split())
-    return " ".join(strip_control_characters(collapsed).split())
+    blessed = re.sub(r"[\t\n\r]", " ", str(value or ""))
+    return " ".join(strip_control_characters(blessed).split())
 
 
 def _check_auth_text(alias: str, field: str, value: str) -> None:

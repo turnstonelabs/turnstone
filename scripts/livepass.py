@@ -501,6 +501,7 @@ CONSOLE_TEMPLATE = """<!doctype html>
               auth_grant_profile: "entra",
               dynamic_auth_modes: ["entra_app", "entra_obo", "rfc8693_obo"],
               scopes_auth_modes: ["rfc8693_obo"],
+              app_identity_auth_modes: ["entra_app"],
               auth_mode_profiles: {
                 entra_app: "entra", entra_obo: "entra",
                 rfc8693_obo: "rfc8693",

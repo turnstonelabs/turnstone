@@ -1640,9 +1640,7 @@ class TestModelOboToken:
         """A delegated mode with no registered grant-profile pairing cannot
         pin a leg, so the dispatch refuses loudly before the mint bridge —
         minting with leg=None would run the pre-dedicated-mode overload."""
-        import turnstone.core.session as session_module
-
-        monkeypatch.setattr(session_module, "MODEL_AUTH_MODE_PROFILES", {})
+        monkeypatch.setattr("turnstone.core.session.MODEL_AUTH_MODE_PROFILES", {})
         reg = _registry_with(self._obo_cfg())
         sess = _fake_session(registry=reg, user_id=USER, mint_token="never")
         with pytest.raises(BackendAuthUnavailableError, match="grant-profile pairing"):
