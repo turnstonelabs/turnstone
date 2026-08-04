@@ -127,6 +127,11 @@ class TerminalUI(SessionUI):
         pass
 
     def on_thinking_start(self) -> None:
+        # Idempotent: replacing a RUNNING spinner would orphan its render
+        # thread (painting frames over all later output for the process
+        # lifetime) — callers must not need a stop-first protocol.
+        if self.spinner:
+            self.spinner.stop()
         self.spinner = Spinner("Thinking")
         self.spinner.start()
 

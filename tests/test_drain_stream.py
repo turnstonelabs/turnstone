@@ -322,7 +322,11 @@ class TestTransportGuarded:
             out = list(transport_guarded(chunks()))
         assert [c.content_delta for c in out] == ["done", ""]
         assert out[-1].finish_reason == "stop"
-        assert any("stream.post_finish_blip" in r.message for r in caplog.records)
+        blips = [r.message for r in caplog.records if "stream.post_finish_blip" in r.message]
+        assert blips
+        # usage_captured is the missing-spend attribution signal: this
+        # stream never delivered a usage chunk, so the blip must say so.
+        assert any("usage_captured" in m and "False" in m for m in blips)
 
     def test_chunks_pass_through_untouched(self):
         src = [

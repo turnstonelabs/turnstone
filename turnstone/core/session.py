@@ -1897,15 +1897,14 @@ class ChatSession:
         # the model detached on purpose.  close() reaps everything.
         self._background_shells = BackgroundShellRegistry(on_exit=self._on_background_shell_exit)
         self._cancelled_partial_msg: dict[str, Any] | None = None
-        # The provider that created the LIVE stream (primary or fallback) —
-        # the mid-stream retry gate consults ITS retryable set, and the
-        # fatal formatter labels errors with it.  Best-effort under
-        # supersede races; None falls back to the primary binding.
+        # Creation-time HANDOFF REGISTER: _try_stream stamps the provider
+        # that owns the stream it is about to return (fallback walk
+        # included), and _stream_response copies it into a frame local
+        # immediately after each create returns.  Nothing else reads it —
+        # a late read would race a superseding generation's creation — and
+        # it is deliberately never cleared (stale values are unreachable
+        # by construction).
         self._active_stream_provider: LLMProvider | None = None
-        # The wire-message fold the live stream was actually created from —
-        # a mid-retry rebind re-prepares it, and send()'s token-table
-        # calibration must count the fold the provider counted.
-        self._active_wire_msgs: list[dict[str, Any]] | None = None
         self._pending_retry: str | None = None
         # True when a fatal exception's text has been persisted to
         # workstream_config["last_error"] for the coord's inspect/wait
@@ -3945,7 +3944,7 @@ class ChatSession:
             # tag from lanes that pre-inject the opening ``<think>`` into the
             # prompt (only ``</think>`` reaches ``content``). See ``_TITLE_*``.
             stripped = self._strip_reasoning(raw)
-            for _close in ("</think>", "</reasoning>"):
+            for _close in ThinkTagSplitter.CLOSE_TAGS:
                 _pos = stripped.rfind(_close)
                 if _pos != -1:
                     stripped = stripped[_pos + len(_close) :]
@@ -5461,12 +5460,12 @@ class ChatSession:
             log.debug("session.fatal.base_url_lookup_failed", exc_info=True)
         provider_label = "?"
         try:
-            # Prefer the provider that actually owned the live stream — a
-            # fallback-carried turn's failure must not be labeled with the
-            # primary binding it never touched.  getattr: this helper is
-            # bound to lightweight stubs in tests (see the module-scope
-            # note on the _BACKEND_* sets) that predate the field.
-            prov = getattr(self, "_active_stream_provider", None) or self._provider
+            # The PRIMARY binding, deliberately: base_url and model_label
+            # above come from the primary too, and a mixed identity (a
+            # fallback's provider name over the primary's URL and alias)
+            # sends the operator to debug the wrong backend.  Stamping the
+            # full producing identity onto turns/errors is #964.
+            prov = self._provider
             provider_label = (
                 getattr(prov, "provider_name", None) or type(prov).__name__ if prov else "?"
             )
@@ -6907,11 +6906,16 @@ class ChatSession:
                 # (perf-2); passing the already-prepared list keeps the
                 # calibration char count aligned with what the provider
                 # actually counted.
-                # The wire fold the provider ACTUALLY counted — a mid-retry
-                # rebind re-prepares it inside _stream_response, invisibly
-                # to this frame's msgs local (the calibration contract:
-                # char counts align with the counted fold).
-                self._update_token_table(assistant_msg, msgs=self._active_wire_msgs or msgs)
+                # The wire fold the provider ACTUALLY counted rides the
+                # returned message (a mid-retry rebind re-prepares it
+                # inside _stream_response, invisibly to this frame's msgs
+                # local) — popped BEFORE the message is committed so the
+                # carrier key never persists.  Frame-owned, so a
+                # superseding generation cannot alias it; plain-dict fakes
+                # without the key fall through to the frame-local fold.
+                self._update_token_table(
+                    assistant_msg, msgs=assistant_msg.pop("_wire_msgs", None) or msgs
+                )
                 self._print_status_line()  # Report usage for EVERY API call
                 self.messages.append(turn_from_dict(assistant_msg))
                 # Clear per-turn inflight buffers — the assistant
@@ -7409,12 +7413,23 @@ class ChatSession:
             # Do NOT re-raise — return normally so server worker thread
             # completes cleanly.
         except KeyboardInterrupt as exc:
+            if self._generation != my_generation:
+                raise  # orphaned: no history mutation or fatal over the live turn
             self._synthesize_cancelled_results("Interrupted by user.")
             self._flush_queued_messages()
             self._drain_pending_advisories()
             self._record_fatal_error(exc)
             raise
         except Exception as exc:
+            # Orphan gate: a superseded thread's stream death can escape
+            # cancel conversion (the successor replaced the cancel event
+            # before the blocked read died) and reach here — recording it
+            # would flash an error banner over the HEALTHY successor turn,
+            # wipe its buffers via the error-state drain, and persist a
+            # wrong last_error for the coord's inspect/wait.  The wrapper's
+            # orphan arm re-raises for exactly this gate to absorb.
+            if self._generation != my_generation:
+                raise
             self._flush_queued_messages()
             self._drain_pending_advisories()
             self._record_fatal_error(exc)
@@ -7425,15 +7440,6 @@ class ChatSession:
             # an idle session until the next send.  Restores the "None outside a
             # send" invariant on every exit (success, cancel, or error).
             self._wire_part_cache = None
-            # Send-scoped stream bookkeeping: the live-stream provider label
-            # must not leak into a LATER lane's fatal formatting (title/
-            # summary/task_agent fatals would otherwise wear a stale
-            # interactive binding), and the wire fold is a full-context-
-            # sized copy that must not outlive its calibration use above.
-            # Cleared HERE (after the except arms' _record_fatal_error ran,
-            # which is what reads the provider on the fatal path).
-            self._active_stream_provider = None
-            self._active_wire_msgs = None
             # Consume this generation's cancel signal on exit so a cancel that
             # targeted THIS send can't later abort an unrelated idle operation
             # (e.g. a manual /compact between sends would otherwise inherit the
@@ -7709,11 +7715,16 @@ class ChatSession:
 
     @staticmethod
     def _strip_reasoning(text: str) -> str:
-        """Remove <think>/<reasoning> tags and their content."""
-        for open_t, close_t in [
-            ("<think>", "</think>"),
-            ("<reasoning>", "</reasoning>"),
-        ]:
+        """Remove think-tag blocks and their content.
+
+        The tag vocabulary is ThinkTagSplitter's — deriving it keeps this
+        strip (and the title lane's) from going blind when a variant is
+        added to the splitter, which would leak raw chain-of-thought into
+        compaction summaries.
+        """
+        for open_t, close_t in zip(
+            ThinkTagSplitter.OPEN_TAGS, ThinkTagSplitter.CLOSE_TAGS, strict=True
+        ):
             while open_t in text:
                 start = text.find(open_t)
                 end = text.find(close_t, start)
@@ -7778,14 +7789,25 @@ class ChatSession:
                     "content": dead_partial,
                 }
 
-        # Exported for send()'s token-table calibration — the char count
-        # must match the fold the provider actually counted, and a
-        # mid-retry rebind can re-prepare it below.
-        self._active_wire_msgs = msgs
         stream = self._create_stream_with_retry(msgs)
+        # FRAME-LOCAL copy of the creation-time handoff register, taken
+        # immediately after the create returns: the retry gate must judge a
+        # death by the provider that owns THIS stream (a fallback's set can
+        # differ), and reading the shared register later would race a
+        # superseding generation's own creation.
+        live_provider = self._active_stream_provider or self._provider
         while True:
             try:
-                return self._stream_attempt(transport_guarded(stream), my_generation)
+                result = self._stream_attempt(transport_guarded(stream), my_generation)
+                # The fold this turn was ACTUALLY created from rides the
+                # returned message (popped by send() at calibration, before
+                # commit — the message-dict underscore lane, like
+                # _provider_content): a mid-retry rebind re-prepares msgs,
+                # and send()'s frame-local copy cannot see that.  Carried on
+                # the frame-owned dict rather than a session slot so a
+                # superseding generation can never alias it.
+                result["_wire_msgs"] = msgs
+                return result
             except GenerationCancelled:
                 # A Stop during an attempt (incl. the re-create/TTFT window
                 # after a death) — preserve the window's best partial.
@@ -7811,16 +7833,11 @@ class ChatSession:
                     # emitted here would clobber the NEW generation's
                     # in-flight stream state.
                     raise
-                # The provider whose stream actually died: after
-                # _try_fallback the live stream belongs to the FALLBACK
-                # provider, whose retryable set can differ (e.g.
-                # ResponsesStreamFailedError) — judging it by the primary
-                # binding's set would declare fallback transients terminal.
-                # Best-effort field (a racing creation could re-write it);
-                # at worst one gate decision consults a sibling set.
-                live_provider = self._active_stream_provider or self._provider
                 # The terminal predicate is the SHARED _stop_retrying,
-                # capped at _MID_STREAM_RETRIES: its overflow arm applies
+                # capped at _MID_STREAM_RETRIES, judged by the FRAME-LOCAL
+                # live_provider (the provider that owns this stream — a
+                # fallback's retryable set can differ, e.g.
+                # ResponsesStreamFailedError).  The overflow arm applies
                 # here too — an overflow can surface mid-consumption
                 # (error-frame lanes), and it must fall through to send()'s
                 # compact-and-retry arm rather than burn re-issues on a
@@ -7828,18 +7845,16 @@ class ChatSession:
                 if self._stop_retrying(
                     e, attempt, live_provider, max_retries=self._MID_STREAM_RETRIES
                 ):
-                    # Terminal: client-side finalize only (the CLI's
-                    # markdown fence resets in on_stream_end; the server
-                    # /send workers emit their own after a fatal, the
-                    # CLI's direct send() does not).  on_turn_committed is
-                    # DELIBERATELY absent here, unlike the retry arm
-                    # below: the dead partial is in neither history nor
-                    # storage, so the in-progress snapshot is its only
-                    # surviving copy — wiping it would silently lose
-                    # visible text on the most reconnect-prone path.  It
-                    # clears at the next send, the pre-#937 fatal
-                    # behavior.
+                    # Terminal: finalize AND discard, exactly like the
+                    # retry arm.  Keeping the buffers bought nothing — the
+                    # fatal path's _emit_state("error") drains and wipes
+                    # them anyway on every SessionUIBase lane — and an
+                    # overflow that send()'s compact-and-retry RECOVERS
+                    # re-streams into buffers that would otherwise still
+                    # hold the dead attempt's text, concatenating the two
+                    # in the idle payload.
                     self.ui.on_stream_end()
+                    self.ui.on_stream_discarded()
                     raise  # fatal path otherwise unchanged
                 # Delay from the PRE-increment attempt index — the same
                 # convention as the three sibling ladders' range loops.
@@ -7878,13 +7893,10 @@ class ChatSession:
                     f"[stream died mid-response ({cause}) — retrying in "
                     f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
                 )
-                # Stop-then-start: a pre-first-token death leaves the
-                # spinner RUNNING (_stop_spinner_once never fired), and the
-                # CLI's on_thinking_start is not idempotent — it replaces
-                # the spinner object without stopping the old one, leaking
-                # its render thread (the compact-retry arm guards the same
-                # way).
-                self.ui.on_thinking_stop()
+                # A pre-first-token death leaves the spinner RUNNING
+                # (_stop_spinner_once never fired) — on_thinking_start is
+                # idempotent at the callee (TerminalUI stops a live spinner
+                # before replacing it), so no stop-first dance here.
                 self.ui.on_thinking_start()
                 try:
                     self._backoff_or_cancelled(delay, my_generation)
@@ -7909,9 +7921,12 @@ class ChatSession:
                         # client-identity check alone would re-issue the
                         # old model's fold against the new model.
                         msgs = self._prepare_wire_messages(self._full_messages())
-                        self._active_wire_msgs = msgs
                     try:
                         stream = self._create_stream_with_retry(msgs)
+                        # Refresh the frame-local gate identity: the
+                        # re-create may have walked to a different
+                        # provider (fallback, rebind).
+                        live_provider = self._active_stream_provider or self._provider
                     except Exception as recreate_exc:
                         if _is_ctx_overflow(recreate_exc):
                             # Deterministic — surface as ITSELF so send()'s

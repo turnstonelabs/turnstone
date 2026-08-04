@@ -229,14 +229,13 @@ class TestMidStreamRetry:
         assert persisted and "Backend stream died mid-response" in persisted
         fatal = [r for r in caplog.records if "session.fatal.recorded" in r.message]
         assert fatal and any(r.levelno == logging.ERROR for r in fatal)
-        # Every dead attempt is finalized client-side — two retry-path
-        # stream_ends plus the terminal arm's (the CLI markdown fence reset
-        # rides on it).  The retry arms DISCARD their dead segments; no
-        # commit ever happens, and the terminal arm deliberately keeps the
-        # in-progress snapshot, the last partial's only surviving copy, for
-        # refresh-replay.
+        # Every dead attempt is finalized AND discarded — the terminal arm
+        # included (keeping its buffers bought nothing: the fatal path's
+        # error-state drain wipes them anyway, and an overflow recovered by
+        # compact-and-retry would otherwise concatenate dead text into the
+        # idle payload).  No commit ever happens.
         assert ui.kinds().count("stream_end") == 3
-        assert ui.kinds().count("stream_discarded") == 2
+        assert ui.kinds().count("stream_discarded") == 3
         assert ui.kinds().count("turn_committed") == 0
 
     def test_cancel_during_backoff_stops_without_recreate(self, tmp_db):
@@ -329,7 +328,7 @@ class TestMidStreamRetry:
         # hardening).
         assert refresh.call_count == 3
 
-    def test_retry_window_stops_then_restarts_spinner(self, tmp_db):
+    def test_retry_window_restarts_spinner(self, tmp_db):
         ui = RecordingUI()
         session = _make_session(ui)
         streams = [
@@ -343,12 +342,12 @@ class TestMidStreamRetry:
             session.send("test")
 
         # A pre-first-token death leaves the spinner RUNNING; the CLI's
-        # on_thinking_start replaces the spinner object without stopping
-        # the old one (thread leak), so the retry arm must stop-then-start.
+        # on_thinking_start is idempotent at the callee (it stops a live
+        # spinner before replacing it), so the retry arm restarts with a
+        # single call.
         notice = [i for i, (k, d) in enumerate(ui.events) if k == "info" and "stream died" in d]
         assert notice
-        after = [k for k, _ in ui.events[notice[0] + 1 : notice[0] + 3]]
-        assert after == ["thinking_stop", "thinking_start"]
+        assert ui.events[notice[0] + 1][0] == "thinking_start"
 
     def test_pretoken_death_stop_persists_marker_row(self, tmp_db):
         ui = RecordingUI()
@@ -638,6 +637,63 @@ class TestMidStreamRetry:
         # retried attempt's text reaches the IDLE payload.
         assert "".join(ui._ws_turn_content) == "final answer"
 
+    def test_overflow_recovery_discards_dead_text_from_turn_buffer(self, tmp_db):
+        # A mid-consumption overflow is TERMINAL for the retry ladder but
+        # RECOVERED by send()'s compact-and-retry — the dead attempt's text
+        # must not concatenate with the recovered answer in the idle
+        # payload (the terminal arm discards, same as the retry arm).
+        class _BufferUI(NullUI):
+            def on_state_change(self, state):
+                pass
+
+        ui = _BufferUI()
+        session = _make_session(ui)
+        calls = {"n": 0}
+
+        def create(msgs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _dying_stream(
+                    "dead overflow text",
+                    exc=RuntimeError("maximum context length exceeded"),
+                )
+            return _good_stream("recovered")
+
+        with (
+            patch.object(session, "_create_stream_with_retry", side_effect=create),
+            patch.object(session, "_compact_messages"),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("test")
+
+        assert calls["n"] == 2
+        assert "".join(ui._ws_turn_content) == "recovered"
+
+    def test_orphan_death_records_no_fatal_over_successor(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+
+        def dying_superseded():
+            yield StreamChunk(content_delta="Hel")
+            # A force-cancel claims a successor generation before the
+            # orphan's death propagates (its cancel event was replaced, so
+            # cancel conversion cannot fire).
+            session._generation += 1
+            raise ValueError("orphan death")
+
+        with (
+            patch.object(session, "_create_stream_with_retry", side_effect=[dying_superseded()]),
+            patch.object(session, "_full_messages", return_value=[]),
+            pytest.raises(ValueError, match="orphan death"),
+        ):
+            session.send("test")
+
+        # The orphan must not flash an error banner over the live
+        # successor turn or persist a wrong last_error for the coord.
+        assert ("state", "error") not in ui.events
+        assert not ui.of("error")
+        assert not load_last_error(session._ws_id)
+
     def test_non_retryable_error_is_immediately_fatal(self, tmp_db):
         ui = RecordingUI()
         session = _make_session(ui)
@@ -655,10 +711,9 @@ class TestMidStreamRetry:
         assert create.call_count == 1  # zero retries
         assert ("state", "error") in ui.events
         assert not any("stream died mid-response" in d for d in ui.of("info"))
-        # The terminal arm finalizes even a zero-retry death — client-side
-        # only; the snapshot survives for refresh-replay of the partial.
+        # The terminal arm finalizes and discards even a zero-retry death.
         assert ui.kinds().count("stream_end") == 1
-        assert ui.kinds().count("stream_discarded") == 0
+        assert ui.kinds().count("stream_discarded") == 1
         assert ui.kinds().count("turn_committed") == 0
 
     def test_recreate_failure_surfaces_original_stream_death(self, tmp_db, caplog):

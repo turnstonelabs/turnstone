@@ -182,6 +182,7 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     import httpx  # noqa: PLC0415 — heavyweight; deferred off the type-module import path
 
     finish_seen = False
+    usage_seen = False
     iterator = iter(chunks)
     while True:
         try:
@@ -192,9 +193,15 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
             if finish_seen:
                 import structlog  # noqa: PLC0415 — deferred with httpx off the type-module path
 
+                # usage_captured distinguishes "completed result kept but
+                # its spend went missing from usage accounting" (the chat
+                # lane's usage chunk trails the finish) from a harmless
+                # citation-footer loss — the one log signal that lets a
+                # missing-spend incident be attributed afterward.
                 structlog.get_logger(__name__).warning(
                     "stream.post_finish_blip",
                     error_type=type(exc).__name__,
+                    usage_captured=usage_seen,
                 )
                 return
             raise IncompleteStreamError(
@@ -202,6 +209,8 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
             ) from exc
         if sc.finish_reason:
             finish_seen = True
+        if sc.usage is not None:
+            usage_seen = True
         yield sc
 
 

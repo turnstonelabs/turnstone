@@ -3194,9 +3194,11 @@ class SessionUIBase:
         payload drains — which :meth:`on_turn_committed` deliberately does
         NOT clear (earlier segments of a tool-looping turn must survive
         commits).  Truncating back to the segment watermark removes exactly
-        the dead attempt's contribution; the pending token batch is
-        dropped, not flushed (its text was never displayed and must not
-        be).
+        the dead attempt's contribution.  The pending-batch reset is
+        DEFENSIVE: in the shipped sequence the preceding ``stream_end``
+        already flushed (and broadcast) any pending tail, so the reset
+        no-ops — it matters only for a caller that discards without
+        finalizing first, whose tail genuinely was never displayed.
         """
         with self._ws_lock:
             self._reset_pending_locked()

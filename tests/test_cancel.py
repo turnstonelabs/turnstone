@@ -39,6 +39,9 @@ class NullUI:
     def on_turn_committed(self):
         pass
 
+    def on_stream_discarded(self):
+        pass
+
     def on_thinking_start(self):
         pass
 

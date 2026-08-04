@@ -76,6 +76,10 @@ class RecordingUI:
     def on_turn_committed(self):
         self.events.append(("turn_committed",))
 
+    def on_stream_discarded(self):
+        # A live-wire blip entering the retry arm must not crash the fake.
+        self.events.append(("stream_discarded",))
+
     def on_thinking_start(self):
         self.events.append(("thinking_start",))
 
