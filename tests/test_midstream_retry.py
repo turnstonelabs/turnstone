@@ -5,9 +5,11 @@ returned its stream handle, so neither the SDK's ``max_retries`` nor the
 creation-time ``_try_stream`` ladder ever sees it.  These tests drive
 ``ChatSession.send()`` with scripted provider streams and pin the retry
 loop's contract: bounded re-issue on the normalized retryable shape, the
-dead attempt finalized in every UI consumer (``stream_end`` +
-``turn_committed`` BEFORE the retry notice), cancel-during-backoff
-abort, exhaustion surfacing the stream-death wording, and the
+dead attempt finalized client-side before the retry notice
+(``stream_end``) and discarded from the server buffers once the backoff
+survives the Stop window (``stream_discarded`` — never
+``turn_committed``, whose semantics keep the turn buffer), cancel-in-
+retry-window abort, exhaustion surfacing the stream-death wording, and the
 ``_assistant_pending_tokens`` reset that keeps a post-finish blip from
 recycling the prior turn's token count.
 
@@ -22,92 +24,12 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from tests._session_helpers import NullUI, make_session
+from tests._session_helpers import NullUI, RecordingUI, make_session
 from turnstone.core.memory import load_last_error
 from turnstone.core.providers import IncompleteStreamError, StreamChunk, UsageInfo
 from turnstone.core.session import GenerationCancelled
 from turnstone.core.streaming_text import ThinkTagSplitter
 from turnstone.core.trajectory import dicts_from_turns
-
-
-class RecordingUI:
-    """UI adapter recording the ordered event stream ``send()`` emits."""
-
-    def __init__(self):
-        self.events = []
-
-    def _rec(self, kind, detail=""):
-        self.events.append((kind, detail))
-
-    def on_turn_start(self):
-        self._rec("turn_start")
-
-    def on_turn_committed(self):
-        self._rec("turn_committed")
-
-    def on_stream_discarded(self):
-        self._rec("stream_discarded")
-
-    def on_thinking_start(self):
-        self._rec("thinking_start")
-
-    def on_thinking_stop(self):
-        self._rec("thinking_stop")
-
-    def on_reasoning_token(self, text):
-        self._rec("reasoning", text)
-
-    def on_content_token(self, text):
-        self._rec("content", text)
-
-    def on_stream_end(self):
-        self._rec("stream_end")
-
-    def approve_tools(self, items):
-        return True, None
-
-    def on_tool_result(self, call_id, name, output, **kwargs):
-        pass
-
-    def on_tool_output_chunk(self, call_id, chunk):
-        pass
-
-    def on_status(self, usage, context_window, effort):
-        pass
-
-    def on_info(self, message):
-        self._rec("info", message)
-
-    def on_error(self, message):
-        self._rec("error", message)
-
-    def on_state_change(self, state):
-        self._rec("state", state)
-
-    def on_rename(self, name):
-        pass
-
-    def on_output_warning(self, call_id, assessment):
-        pass
-
-    def record_output_assessment(
-        self,
-        call_id,
-        assessment,
-        *,
-        tier="heuristic",
-        reasoning="",
-        judge_model="",
-        latency_ms=0,
-        confidence=0.0,
-    ):
-        pass
-
-    def kinds(self):
-        return [k for k, _ in self.events]
-
-    def of(self, kind):
-        return [d for k, d in self.events if k == kind]
 
 
 def _make_session(ui=None, **kwargs):
@@ -179,10 +101,12 @@ class TestMidStreamRetry:
         # is a fresh bubble, not an append onto the dead attempt's.
         flushed = first_text[: len(first_text) - ThinkTagSplitter.MAX_TAG_LEN]
         assert ui.of("content") == [flushed, "Hello world"]
-        # The dead attempt is finalized EVERYWHERE before re-streaming:
-        # stream_end (client finalize) -> stream_discarded (server buffer
-        # truncate) -> notice -> spinner, then the retried stream's own
-        # end-of-turn pair (a real commit).
+        # The dead attempt is finalized client-side before the notice, and
+        # DISCARDED only after the backoff survives the Stop window (a
+        # Stop during backoff must find the dead text still in the turn
+        # buffer, matching what the cancel handler persists): stream_end
+        # -> notice -> (backoff) -> stream_discarded -> spinner, then the
+        # retried stream's own end-of-turn pair (a real commit).
         seq = [
             (k, d)
             for k, d in ui.events
@@ -192,13 +116,13 @@ class TestMidStreamRetry:
         assert [k for k, _ in seq] == [
             "thinking_start",
             "stream_end",
-            "stream_discarded",
             "info",
+            "stream_discarded",
             "thinking_start",
             "stream_end",
             "turn_committed",
         ]
-        notice = seq[3][1]
+        notice = seq[2][1]
         assert "(ReadError)" in notice
         assert "(1/2)" in notice
         assert ("state", "idle") in ui.events
@@ -344,10 +268,11 @@ class TestMidStreamRetry:
         # A pre-first-token death leaves the spinner RUNNING; the CLI's
         # on_thinking_start is idempotent at the callee (it stops a live
         # spinner before replacing it), so the retry arm restarts with a
-        # single call.
+        # single call — after the backoff-gated discard.
         notice = [i for i, (k, d) in enumerate(ui.events) if k == "info" and "stream died" in d]
         assert notice
-        assert ui.events[notice[0] + 1][0] == "thinking_start"
+        after = [k for k, _ in ui.events[notice[0] + 1 : notice[0] + 3]]
+        assert after == ["stream_discarded", "thinking_start"]
 
     def test_pretoken_death_stop_persists_marker_row(self, tmp_db):
         ui = RecordingUI()
@@ -636,6 +561,41 @@ class TestMidStreamRetry:
         # The dead segment was truncated at the watermark; only the
         # retried attempt's text reaches the IDLE payload.
         assert "".join(ui._ws_turn_content) == "final answer"
+
+    def test_stop_in_backoff_keeps_dead_text_in_turn_buffer(self, tmp_db):
+        # The discard is gated on the backoff SURVIVING: a Stop during the
+        # window persists the promoted partial to history, and the idle
+        # payload (drained from the turn buffer) must carry the same text
+        # — discarding first rendered the cancelled turn empty on the
+        # dashboard while the transcript had it.
+        class _BufferUI(NullUI):
+            def on_state_change(self, state):
+                pass
+
+        ui = _BufferUI()
+        session = _make_session(ui)
+        session._RETRY_BASE_DELAY = 30.0
+        real_backoff = session._backoff_or_cancelled
+
+        def cancel_then_backoff(delay, my_generation=0):
+            session.cancel()
+            real_backoff(delay, my_generation)
+
+        dead_text = "a dead attempt long enough to flush past the carry window"
+        with (
+            patch.object(
+                session,
+                "_create_stream_with_retry",
+                side_effect=[_dying_stream(dead_text, exc=httpx.ReadError("wire died"))],
+            ),
+            patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("test")
+
+        assert "a dead attempt" in "".join(ui._ws_turn_content)
+        assistant = _assistant_msgs(session)
+        assert assistant and assistant[-1]["content"].startswith("a dead attempt")
 
     def test_overflow_recovery_discards_dead_text_from_turn_buffer(self, tmp_db):
         # A mid-consumption overflow is TERMINAL for the retry ladder but

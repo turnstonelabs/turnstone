@@ -5463,8 +5463,7 @@ class ChatSession:
             # The PRIMARY binding, deliberately: base_url and model_label
             # above come from the primary too, and a mixed identity (a
             # fallback's provider name over the primary's URL and alias)
-            # sends the operator to debug the wrong backend.  Stamping the
-            # full producing identity onto turns/errors is #964.
+            # sends the operator to debug the wrong backend.
             prov = self._provider
             provider_label = (
                 getattr(prov, "provider_name", None) or type(prov).__name__ if prov else "?"
@@ -7826,7 +7825,8 @@ class ChatSession:
                 # _stream_attempt's death arm).  Keep the previous
                 # attempt's text when the new death had none — the user
                 # saw it, and a later Stop must preserve it.
-                dead_partial = getattr(e, "_dead_partial", "") or dead_partial
+                new_dead = getattr(e, "_dead_partial", "")
+                dead_partial = new_dead or dead_partial
                 if self._generation != my_generation:
                     # Superseded (force-cancel started a newer generation):
                     # an orphaned thread must not touch the UI — a finalize
@@ -7874,32 +7874,41 @@ class ChatSession:
                     # prompt tokens; None on the OpenAI chat lane, whose
                     # usage chunk trails the finish), and the char count
                     # lets an operator estimate the discarded completion.
+                    # THIS death's flushed text only — a pre-token re-death
+                    # logs 0, never the Stop-preservation carry from a
+                    # prior attempt (that would double-count spend).
                     dead_usage=self._last_usage,
-                    dead_content_chars=len(dead_partial),
+                    dead_content_chars=len(new_dead),
                 )
-                # Finalize the dead attempt EVERYWHERE before re-streaming.
-                # Order matters: stream_end (client-side finalize — browser
-                # bubble, CLI markdown flush/fence reset, Slack/Discord
-                # StreamingMessage) -> stream_discarded (server buffers:
-                # the dead segment truncated from the multi-segment turn
-                # buffer the IDLE payload drains, pending batch dropped,
-                # inflight snapshot reset) -> notice -> spinner for the
-                # backoff+recreate window.  Without the pair every consumer
-                # appends the retried attempt's text onto the dead
-                # attempt's.
+                # Finalize the dead attempt client-side, then WAIT before
+                # discarding: stream_end (browser bubble, CLI markdown
+                # flush/fence reset, Slack/Discord StreamingMessage) ->
+                # notice -> backoff.  The server-buffer discard runs only
+                # AFTER the backoff survives the Stop window — a Stop
+                # during backoff persists the promoted partial to history,
+                # and the idle payload (drained from the turn buffer)
+                # must carry the same text, or the dashboard renders the
+                # cancelled turn empty while the transcript has it.
                 self.ui.on_stream_end()
-                self.ui.on_stream_discarded()
                 self.ui.on_info(
                     f"[stream died mid-response ({cause}) — retrying in "
                     f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
                 )
-                # A pre-first-token death leaves the spinner RUNNING
-                # (_stop_spinner_once never fired) — on_thinking_start is
-                # idempotent at the callee (TerminalUI stops a live spinner
-                # before replacing it), so no stop-first dance here.
-                self.ui.on_thinking_start()
                 try:
                     self._backoff_or_cancelled(delay, my_generation)
+                    # Retry is proceeding: truncate the dead segment from
+                    # the multi-segment turn buffer (the IDLE payload's
+                    # source) and reset the inflight snapshot BEFORE any
+                    # retried token lands, or every consumer appends the
+                    # retried text onto the dead attempt's.
+                    self.ui.on_stream_discarded()
+                    # Spinner for the recreate+TTFT window, and the fresh
+                    # segment watermark — AFTER the truncate, so a later
+                    # discard cannot resurrect this dead segment.  A
+                    # pre-first-token death leaves the spinner RUNNING
+                    # (_stop_spinner_once never fired) — on_thinking_start
+                    # is idempotent at the callee.
+                    self.ui.on_thinking_start()
                     self._cancel_stream = None  # drop the dead SDK handle
                     # A concurrent ModelRegistry.reload() closes cached
                     # clients whose connection config changed — the

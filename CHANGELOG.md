@@ -142,7 +142,7 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 ### Changed
 
 - **Log event rename: `drain_stream.post_finish_blip` is now
-  `stream.post_finish_blip`, without the `usage_captured` field.** The
+  `stream.post_finish_blip`; its `usage_captured` field is retained.** The
   single-shot drain normalizes mid-body transport deaths through the same
   `transport_guarded` wrapper the interactive loop uses, so its
   post-finish-blip tolerance logs under the wrapper's event name. Update

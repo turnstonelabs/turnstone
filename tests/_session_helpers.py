@@ -347,3 +347,82 @@ def as_stream(result: Any) -> list[StreamChunk]:
             provider_blocks=list(result.provider_blocks or []),
         )
     ]
+
+class RecordingUI:
+    """UI adapter recording the ordered event stream ``send()`` emits."""
+
+    def __init__(self):
+        self.events = []
+
+    def _rec(self, kind, detail=""):
+        self.events.append((kind, detail))
+
+    def on_turn_start(self):
+        self._rec("turn_start")
+
+    def on_turn_committed(self):
+        self._rec("turn_committed")
+
+    def on_stream_discarded(self):
+        self._rec("stream_discarded")
+
+    def on_thinking_start(self):
+        self._rec("thinking_start")
+
+    def on_thinking_stop(self):
+        self._rec("thinking_stop")
+
+    def on_reasoning_token(self, text):
+        self._rec("reasoning", text)
+
+    def on_content_token(self, text):
+        self._rec("content", text)
+
+    def on_stream_end(self):
+        self._rec("stream_end")
+
+    def approve_tools(self, items):
+        return True, None
+
+    def on_tool_result(self, call_id, name, output, **kwargs):
+        pass
+
+    def on_tool_output_chunk(self, call_id, chunk):
+        pass
+
+    def on_status(self, usage, context_window, effort):
+        pass
+
+    def on_info(self, message):
+        self._rec("info", message)
+
+    def on_error(self, message):
+        self._rec("error", message)
+
+    def on_state_change(self, state):
+        self._rec("state", state)
+
+    def on_rename(self, name):
+        pass
+
+    def on_output_warning(self, call_id, assessment):
+        pass
+
+    def record_output_assessment(
+        self,
+        call_id,
+        assessment,
+        *,
+        tier="heuristic",
+        reasoning="",
+        judge_model="",
+        latency_ms=0,
+        confidence=0.0,
+    ):
+        pass
+
+    def kinds(self):
+        return [k for k, _ in self.events]
+
+    def of(self, kind):
+        return [d for k, d in self.events if k == kind]
