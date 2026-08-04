@@ -90,6 +90,9 @@ class NullUI:
     def on_turn_committed(self) -> None:
         pass
 
+    def on_stream_discarded(self) -> None:
+        pass
+
     def on_thinking_start(self) -> None:
         pass
 

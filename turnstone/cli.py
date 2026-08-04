@@ -121,6 +121,11 @@ class TerminalUI(SessionUI):
         # Terminal UI has no inflight buffer to reset.
         pass
 
+    def on_stream_discarded(self) -> None:
+        # Printed text cannot be unprinted; the renderer reset rides the
+        # stream_end that precedes this call.
+        pass
+
     def on_thinking_start(self) -> None:
         self.spinner = Spinner("Thinking")
         self.spinner.start()

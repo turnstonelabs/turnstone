@@ -635,6 +635,10 @@ class SessionUIBase:
         # turns within one user-facing send.
         self._ws_turn_content: list[str] = []
         self._ws_turn_content_size: int = 0
+        # Segment watermark for :meth:`on_stream_discarded` — (list length,
+        # size) of ``_ws_turn_content`` at the current stream segment's
+        # start, snapshotted in :meth:`on_thinking_start`.
+        self._turn_content_watermark: tuple[int, int] = (0, 0)
         # Per-turn inflight accumulators: the in-progress turn's content
         # + reasoning, exposed to a reconnecting SSE client via the
         # ``in_progress_snapshot`` event so a mid-stream page refresh
@@ -3181,6 +3185,26 @@ class SessionUIBase:
             self._flush_all_chunk_batches_locked()
             self._reset_inflight_buffers_locked()
 
+    def on_stream_discarded(self) -> None:
+        """Drop a dead stream attempt's text from every server buffer.
+
+        The mid-stream retry re-issues the turn; the dead attempt's tokens
+        were finalized client-side (``stream_end``) but its batches also
+        landed in ``_ws_turn_content`` — the multi-segment buffer the IDLE
+        payload drains — which :meth:`on_turn_committed` deliberately does
+        NOT clear (earlier segments of a tool-looping turn must survive
+        commits).  Truncating back to the segment watermark removes exactly
+        the dead attempt's contribution; the pending token batch is
+        dropped, not flushed (its text was never displayed and must not
+        be).
+        """
+        with self._ws_lock:
+            self._reset_pending_locked()
+            watermark_len, watermark_size = self._turn_content_watermark
+            del self._ws_turn_content[watermark_len:]
+            self._ws_turn_content_size = watermark_size
+            self._reset_inflight_buffers_locked()
+
     def on_thinking_start(self) -> None:
         """Track that the model is thinking; broadcast activity + enqueue.
 
@@ -3190,6 +3214,16 @@ class SessionUIBase:
         ``thinking_start`` event still flows for the spinner UIs.
         """
         with self._ws_lock:
+            # Segment watermark for on_stream_discarded: thinking_start
+            # precedes every stream segment (send start, mid-stream retry,
+            # compaction wrap), and no content batch lands between it and
+            # the segment's first token — so the buffer position here is
+            # the truncation point should the segment that follows be
+            # discarded.
+            self._turn_content_watermark = (
+                len(self._ws_turn_content),
+                self._ws_turn_content_size,
+            )
             if not self._compaction_activity_live:
                 self._ws_current_activity = "Thinking…"
                 self._ws_activity_state = "thinking"

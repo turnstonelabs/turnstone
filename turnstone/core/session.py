@@ -1255,6 +1255,8 @@ def _coerce_event_id(value: Any) -> int | None:
 class SessionUI(Protocol):
     def on_turn_start(self) -> None: ...
     def on_turn_committed(self) -> None: ...
+
+    def on_stream_discarded(self) -> None: ...
     def on_thinking_start(self) -> None: ...
     def on_thinking_stop(self) -> None: ...
     def on_reasoning_token(self, text: str) -> None: ...
@@ -7423,6 +7425,15 @@ class ChatSession:
             # an idle session until the next send.  Restores the "None outside a
             # send" invariant on every exit (success, cancel, or error).
             self._wire_part_cache = None
+            # Send-scoped stream bookkeeping: the live-stream provider label
+            # must not leak into a LATER lane's fatal formatting (title/
+            # summary/task_agent fatals would otherwise wear a stale
+            # interactive binding), and the wire fold is a full-context-
+            # sized copy that must not outlive its calibration use above.
+            # Cleared HERE (after the except arms' _record_fatal_error ran,
+            # which is what reads the provider on the fatal path).
+            self._active_stream_provider = None
+            self._active_wire_msgs = None
             # Consume this generation's cancel signal on exit so a cancel that
             # targeted THIS send can't later abort an unrelated idle operation
             # (e.g. a manual /compact between sends would otherwise inherit the
@@ -7841,17 +7852,28 @@ class ChatSession:
                     attempt=attempt,
                     model=self.model,
                     retry_in=delay,
+                    # Spend trace for the abandoned generation: the wire
+                    # reports usage only at stream end, so a dead attempt's
+                    # billed tokens are otherwise invisible — dead_usage
+                    # carries what the wire DID deliver (Anthropic's early
+                    # prompt tokens; None on the OpenAI chat lane, whose
+                    # usage chunk trails the finish), and the char count
+                    # lets an operator estimate the discarded completion.
+                    dead_usage=self._last_usage,
+                    dead_content_chars=len(dead_partial),
                 )
                 # Finalize the dead attempt EVERYWHERE before re-streaming.
                 # Order matters: stream_end (client-side finalize — browser
                 # bubble, CLI markdown flush/fence reset, Slack/Discord
-                # StreamingMessage) -> turn_committed (server buffer reset —
-                # in_progress_snapshot, IDLE payload, turn-content cap) ->
-                # notice -> spinner for the backoff+recreate window.
-                # Without the pair every consumer appends the retried
-                # attempt's text onto the dead attempt's.
+                # StreamingMessage) -> stream_discarded (server buffers:
+                # the dead segment truncated from the multi-segment turn
+                # buffer the IDLE payload drains, pending batch dropped,
+                # inflight snapshot reset) -> notice -> spinner for the
+                # backoff+recreate window.  Without the pair every consumer
+                # appends the retried attempt's text onto the dead
+                # attempt's.
                 self.ui.on_stream_end()
-                self.ui.on_turn_committed()
+                self.ui.on_stream_discarded()
                 self.ui.on_info(
                     f"[stream died mid-response ({cause}) — retrying in "
                     f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"

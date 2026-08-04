@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from tests._session_helpers import make_session
+from tests._session_helpers import NullUI, make_session
 from turnstone.core.memory import load_last_error
 from turnstone.core.providers import IncompleteStreamError, StreamChunk, UsageInfo
 from turnstone.core.session import GenerationCancelled
@@ -44,6 +44,9 @@ class RecordingUI:
 
     def on_turn_committed(self):
         self._rec("turn_committed")
+
+    def on_stream_discarded(self):
+        self._rec("stream_discarded")
 
     def on_thinking_start(self):
         self._rec("thinking_start")
@@ -177,19 +180,19 @@ class TestMidStreamRetry:
         flushed = first_text[: len(first_text) - ThinkTagSplitter.MAX_TAG_LEN]
         assert ui.of("content") == [flushed, "Hello world"]
         # The dead attempt is finalized EVERYWHERE before re-streaming:
-        # stream_end (client finalize) -> turn_committed (server buffer
-        # reset) -> notice -> spinner, then the retried stream's own
-        # end-of-turn pair.
+        # stream_end (client finalize) -> stream_discarded (server buffer
+        # truncate) -> notice -> spinner, then the retried stream's own
+        # end-of-turn pair (a real commit).
         seq = [
             (k, d)
             for k, d in ui.events
-            if k in ("stream_end", "turn_committed", "thinking_start")
+            if k in ("stream_end", "stream_discarded", "turn_committed", "thinking_start")
             or (k == "info" and "stream died mid-response" in d)
         ]
         assert [k for k, _ in seq] == [
             "thinking_start",
             "stream_end",
-            "turn_committed",
+            "stream_discarded",
             "info",
             "thinking_start",
             "stream_end",
@@ -228,11 +231,13 @@ class TestMidStreamRetry:
         assert fatal and any(r.levelno == logging.ERROR for r in fatal)
         # Every dead attempt is finalized client-side — two retry-path
         # stream_ends plus the terminal arm's (the CLI markdown fence reset
-        # rides on it).  turn_committed comes only from the RETRY arms: the
-        # terminal arm deliberately keeps the in-progress snapshot, the
-        # last partial's only surviving copy, for refresh-replay.
+        # rides on it).  The retry arms DISCARD their dead segments; no
+        # commit ever happens, and the terminal arm deliberately keeps the
+        # in-progress snapshot, the last partial's only surviving copy, for
+        # refresh-replay.
         assert ui.kinds().count("stream_end") == 3
-        assert ui.kinds().count("turn_committed") == 2
+        assert ui.kinds().count("stream_discarded") == 2
+        assert ui.kinds().count("turn_committed") == 0
 
     def test_cancel_during_backoff_stops_without_recreate(self, tmp_db):
         ui = RecordingUI()
@@ -605,6 +610,34 @@ class TestMidStreamRetry:
         assert session._cancelled_partial_msg is None
         assert not _assistant_msgs(session)
 
+    def test_dead_attempt_text_absent_from_turn_buffer(self, tmp_db):
+        # Real SessionUIBase buffers — a recording fake cannot see the
+        # multi-segment turn buffer the IDLE payload drains, which
+        # on_turn_committed deliberately does NOT clear.  on_state_change
+        # is a web-fanout concern narrowed off the shared base.
+        class _BufferUI(NullUI):
+            def on_state_change(self, state):
+                pass
+
+        ui = _BufferUI()
+        session = _make_session(ui)
+        streams = [
+            _dying_stream(
+                "dead attempt text that must not surface",
+                exc=httpx.ReadError("wire died"),
+            ),
+            _good_stream("final answer"),
+        ]
+        with (
+            patch.object(session, "_create_stream_with_retry", side_effect=streams),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("test")
+
+        # The dead segment was truncated at the watermark; only the
+        # retried attempt's text reaches the IDLE payload.
+        assert "".join(ui._ws_turn_content) == "final answer"
+
     def test_non_retryable_error_is_immediately_fatal(self, tmp_db):
         ui = RecordingUI()
         session = _make_session(ui)
@@ -625,6 +658,7 @@ class TestMidStreamRetry:
         # The terminal arm finalizes even a zero-retry death — client-side
         # only; the snapshot survives for refresh-replay of the partial.
         assert ui.kinds().count("stream_end") == 1
+        assert ui.kinds().count("stream_discarded") == 0
         assert ui.kinds().count("turn_committed") == 0
 
     def test_recreate_failure_surfaces_original_stream_death(self, tmp_db, caplog):
