@@ -18,6 +18,18 @@ spec:
         app.kubernetes.io/component: server
     spec:
       serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      {{- with .Values.server.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: server
           image: {{ include "turnstone.image" . }}

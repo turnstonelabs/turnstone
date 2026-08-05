@@ -29,6 +29,18 @@ spec:
         app.kubernetes.io/component: console
     spec:
       serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      {{- with .Values.console.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.console.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.console.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: console
           image: {{ include "turnstone.image" . }}

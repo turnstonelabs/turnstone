@@ -31,6 +31,18 @@ spec:
     spec:
       serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
       restartPolicy: OnFailure
+      {{- with .Values.migrate.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.migrate.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.migrate.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: migrate
           image: {{ include "turnstone.image" . }}

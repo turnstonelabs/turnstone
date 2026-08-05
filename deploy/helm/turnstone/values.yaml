@@ -43,6 +43,10 @@ server:
   service:
     type: ClusterIP
     port: 8080
+  # -- Node scheduling constraints
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
 
 # -- Turnstone console (cluster dashboard)
 console:
@@ -57,6 +61,17 @@ console:
   service:
     type: ClusterIP
     port: 8090
+  # -- Node scheduling constraints
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+
+# -- Database migration Job (post-install/pre-upgrade hook)
+migrate:
+  # -- Node scheduling constraints
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
 
 # -- LLM provider configuration
 llm:
