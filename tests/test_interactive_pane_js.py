@@ -208,7 +208,7 @@ def test_media_playback_lifted_and_pane_owned() -> None:
         assert fn in body, f"media player helper must be lifted into the pane: {fn}"
     # The HLS vendor is fetched by absolute /shared/ URL (resolves in BOTH the
     # standalone server and the console, where /shared is mounted at the root).
-    assert 'script.src = "/shared/hls-1.6.16/hls.min.js";' in body
+    assert 'script.src = "/shared/hls-1.6.17/hls.min.js";' in body
     # Pane-owned + root-scoped — NOT a document-level delegated listener.
     assert 'this.el.addEventListener("click"' in body, (
         "media play must be wired on this.el (pane-owned), not document"
