@@ -1202,3 +1202,41 @@ class TestModelAliasResolution:
         assert callback_results[0].tier == "llm"
         assert callback_results[0].tier != "llm_fallback"
         assert "did not return a verdict" not in callback_results[0].reasoning
+
+
+class TestInlineReasoningSeam:
+    """#965 per-lane pins: judge content arrives IR-clean from the drain."""
+
+    def test_think_wrapped_verdict_parses_clean(self):
+        # Reasoning around the verdict JSON is segregated at the seam, so
+        # _parse_verdict reads pure JSON — a draft verdict INSIDE the think
+        # block can no longer shadow the real one.
+        content = (
+            '<think>draft: {"recommendation": "block", "risk_level": "critical"}</think>'
+            + _good_verdict_json()
+        )
+        provider = _make_mock_provider(response_content=content)
+        judge = _make_judge(provider)
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        assert result is not None
+        assert result.recommendation == "approve"
+        assert result.risk_level == "low"
+
+    def test_think_only_response_takes_empty_ladder(self):
+        # An all-reasoning judge turn drains to empty content and rides the
+        # SAME empty-response ladder as a genuinely empty turn — it never
+        # reaches _parse_verdict with tag text.
+        provider = _make_mock_provider(response_content="<think>only deliberation</think>")
+        judge = _make_judge(provider)
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        assert result is None

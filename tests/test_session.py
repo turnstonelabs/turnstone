@@ -18,6 +18,7 @@ from tests._session_helpers import (
     mock_completion_result,
     scripted_anthropic_client,
     scripted_chat_client,
+    seam_provider,
 )
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 from turnstone.core.trajectory import (
@@ -1800,9 +1801,10 @@ class TestTitleRetry:
         """A reasoning model's answer can arrive wrapped in an unparsed
         ``<think>`` span (lanes that don't split it into reasoning_content)
         plus markdown / quotes. There is no portable switch to disable thinking,
-        so the title pass gives reasoning room (raised max_tokens), reuses
-        ``_strip_reasoning``, and peels wrapping decoration — keeping INTERNAL
-        punctuation (the hyphen survives)."""
+        so the title pass gives reasoning room (raised max_tokens), relies on
+        the drain seam's segregation (``split_inline_reasoning`` — this lane
+        holds no strip of its own), and peels wrapping decoration — keeping
+        INTERNAL punctuation (the hyphen survives)."""
         from turnstone.core.providers._protocol import ModelCapabilities
         from turnstone.core.session import _TITLE_MAX_TOKENS
 
@@ -1858,7 +1860,15 @@ class TestTitleRetry:
         """Reasoning reaches ``content`` in several shapes the title pass must
         survive: an opener-absent ``…</think>`` (templates that pre-inject the
         opening tag), a paired ``<reasoning>`` block, and a trailing
-        explanation after the title (only the first non-empty line is kept)."""
+        explanation after the title (only the first non-empty line is kept).
+
+        The last two cases pin the BOTH-VOCABULARY shape in either order.
+        The peel walks the close-tag vocabularies in sequence, which is
+        equivalent to one cut after whichever close occurs last: the
+        remainder of the first cut begins after the last ``</think>``, so a
+        ``</reasoning>`` still found in it is necessarily the later tag.
+        Title text after the last stray close always survives; only
+        reasoning between the tags is dropped."""
         from turnstone.core.providers._protocol import ModelCapabilities
 
         cases = [
@@ -1868,6 +1878,14 @@ class TestTitleRetry:
                 "Cluster Health Digest",
             ),
             ("Auth Layer Refactor\n\nThis title captures the request well.", "Auth Layer Refactor"),
+            (
+                "weighing</reasoning>still weighing</think>\n\nRendezvous Routing",
+                "Rendezvous Routing",
+            ),
+            (
+                "weighing</think>still weighing</reasoning>\n\nCluster Health Digest",
+                "Cluster Health Digest",
+            ),
         ]
         for content, expected in cases:
             session = _make_session()
@@ -7620,3 +7638,112 @@ def test_record_aux_usage_attributes_explicit_model():
     # The explicit agent model wins over the session default.
     assert ui.aux_calls[0]["model"] == "plan-model-xyz"
     assert ui.aux_calls[0]["prompt_tokens"] == 900
+
+
+def _fake_fetched_page() -> MagicMock:
+    """Response fake for the monkeypatched web_fetch guard fetch."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.headers = {"content-type": "text/plain"}
+    resp.text = "Page body."
+    return resp
+
+
+class TestInlineReasoningSeamLanes:
+    """#965 per-lane pins: web_fetch extraction (the #940 repro) and the
+    task_agent synthesis path receive IR-clean content from the drain seam."""
+
+    def test_web_fetch_extraction_result_is_clean(self, monkeypatch, tmp_db):
+        # The #940 class: a passthrough server wraps the extraction answer
+        # in think tags; the tool result (persisted and replayed every
+        # following turn) must carry ONLY the answer.
+        session = _make_session()
+        monkeypatch.setattr(
+            "turnstone.core.session.fetch_with_ssrf_guard",
+            lambda url, **kw: _fake_fetched_page(),
+        )
+        session._provider = seam_provider(
+            "<think>scanning the page for the answer</think>HRW hashing weights nodes.",
+            provider_name="openai",
+        )
+        call_id, answer = session._exec_web_fetch(
+            {"call_id": "wf1", "url": "https://example.com/x", "question": "What is HRW?"}
+        )
+        assert answer == "HRW hashing weights nodes."
+
+    def test_web_fetch_think_only_extraction_is_honest_error(self, monkeypatch, tmp_db):
+        # An all-reasoning extraction drains to empty content — the tool
+        # result flips to an explicit error instead of silently persisting
+        # think text as a "success".
+        session = _make_session()
+        monkeypatch.setattr(
+            "turnstone.core.session.fetch_with_ssrf_guard",
+            lambda url, **kw: _fake_fetched_page(),
+        )
+        session._provider = seam_provider("<think>hmm, unclear</think>", provider_name="openai")
+        call_id, answer = session._exec_web_fetch(
+            {"call_id": "wf2", "url": "https://example.com/x", "question": "What is HRW?"}
+        )
+        assert answer == "Error: extraction returned no answer"
+
+    def test_task_agent_synthesis_is_clean(self, tmp_db):
+        # The audit's unverified sibling, scripted: a sub-agent turn wrapped
+        # in think tags reaches the coordinator-visible synthesis clean.
+        from turnstone.core.trajectory import Turn
+
+        session = _make_session()
+        session._provider = seam_provider(
+            "<think>sub-agent deliberation</think>Sub-agent findings.", provider_name="openai"
+        )
+        out = session._run_agent(
+            [Turn.system("You are a test agent."), Turn.user("Report findings.")],
+            label="task",
+            tools=[],
+            auto_tools=set(),
+        )
+        assert out == "Sub-agent findings."
+
+    def test_task_agent_think_only_turn_reports_no_output(self, tmp_db):
+        from turnstone.core.trajectory import Turn
+
+        session = _make_session()
+        session._provider = seam_provider(
+            "<think>nothing but reasoning</think>", provider_name="openai"
+        )
+        out = session._run_agent(
+            [Turn.system("You are a test agent."), Turn.user("Report findings.")],
+            label="task",
+            tools=[],
+            auto_tools=set(),
+        )
+        assert out == "(no output)"
+
+
+class TestWhitespaceOnlyBlanknessGates:
+    """Whitespace-only drained content takes the no-answer fallbacks —
+    blankness, not truthiness, campaign-wide."""
+
+    def test_task_agent_whitespace_only_turn_reports_no_output(self, tmp_db):
+        from turnstone.core.trajectory import Turn
+
+        session = _make_session()
+        session._provider = seam_provider("\n\n", provider_name="openai")
+        out = session._run_agent(
+            [Turn.system("You are a test agent."), Turn.user("Report findings.")],
+            label="task",
+            tools=[],
+            auto_tools=set(),
+        )
+        assert out == "(no output)"
+
+    def test_web_fetch_whitespace_only_extraction_is_honest_error(self, monkeypatch, tmp_db):
+        session = _make_session()
+        monkeypatch.setattr(
+            "turnstone.core.session.fetch_with_ssrf_guard",
+            lambda url, **kw: _fake_fetched_page(),
+        )
+        session._provider = seam_provider("\n\n", provider_name="openai")
+        call_id, answer = session._exec_web_fetch(
+            {"call_id": "wf3", "url": "https://example.com/x", "question": "What?"}
+        )
+        assert answer == "Error: extraction returned no answer"

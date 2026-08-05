@@ -637,3 +637,25 @@ class TestExtractJson:
             " (note: not valid JSON, missing braces and quote handling)"
         )
         assert _extract_json(broken) is None
+
+
+class TestInlineReasoningSeam:
+    """#965 per-lane pins: guard content arrives IR-clean from the drain."""
+
+    def test_draft_verdict_inside_think_cannot_shadow_real_verdict(self) -> None:
+        judge = _make_judge(
+            content=(
+                '<think>draft: {"risk_level": "high", "flags": ["exfil"]}</think>'
+                '{"risk_level": "none", "flags": []}'
+            )
+        )
+        v = judge.evaluate("tool output", func_name="bash", call_id="c1")
+        assert v.succeeded
+        assert v.risk_level == "none"
+        assert v.flags == ()
+
+    def test_think_only_response_is_empty_response_error(self) -> None:
+        judge = _make_judge(content="<think>all deliberation, no verdict</think>")
+        v = judge.evaluate("tool output", func_name="bash", call_id="c1")
+        assert not v.succeeded
+        assert v.error == "empty_response"

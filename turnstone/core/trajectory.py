@@ -23,7 +23,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 
 class Role(StrEnum):
@@ -379,6 +379,43 @@ def turns_from_dicts(msgs: list[dict[str, Any]]) -> list[Turn]:
 
 def dicts_from_turns(turns: list[Turn]) -> list[dict[str, Any]]:
     return [turn_to_dict(t) for t in turns]
+
+
+def last_assistant_text(turns: Sequence[Turn]) -> str | None:
+    """Text of the most recent assistant turn with non-blank text.
+
+    The SALVAGE walk (partial-work recovery): assistant turns that said
+    nothing quotable — tool-call-only, all-reasoning, or whitespace-only
+    — are skipped, so the caller recovers the last SUBSTANTIVE assistant
+    text, or ``None`` when the trajectory has none.  A same-named
+    dict-row walk with DIFFERENT deliberate semantics lives in
+    ``console/coordinator_client._last_assistant_text`` (skips
+    list-content rows, tri-state return for its storage try/except) —
+    a substantiveness-rule change here does not reach it, and vice
+    versa; keep both docstrings pointing at each other.  Skipping means an
+    empty final turn falls back to an EARLIER turn's text, which is
+    exactly what salvage wants and exactly what a final-answer read must
+    NOT do — callers reporting "the final say" (an analyst diagnosis, an
+    eval's final_content) should read the last assistant turn directly
+    instead of using this walk.
+    """
+    for t in reversed(turns):
+        if t.role is Role.ASSISTANT and t.text.strip():
+            return t.text
+    return None
+
+
+def final_assistant_text(turns: Sequence[Turn]) -> str:
+    """The LAST assistant turn's text, stripped — ``""`` when the
+    trajectory has no assistant turn or its final say was empty
+    (tool-call-only, all-reasoning, or whitespace).
+
+    The FINAL-SAY read (optimizer analyst diagnosis, eval final_content):
+    NO walk-back — an empty final say reports empty, never replaced by an
+    earlier turn's mid-loop narration presented as the conclusion.
+    Salvage wants the opposite walk: :func:`last_assistant_text`.
+    """
+    return next((t.text for t in reversed(turns) if t.role is Role.ASSISTANT), "").strip()
 
 
 def resolve_attachment_parts(

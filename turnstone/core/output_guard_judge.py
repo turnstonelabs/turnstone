@@ -596,7 +596,7 @@ class OutputGuardJudge:
                 verdict_id, call_id, start, f"provider_error: {type(e).__name__}"
             )
 
-        content = (getattr(result, "content", "") or "").strip()
+        content = (result.content or "").strip()
         if not content:
             return self._error_verdict(verdict_id, call_id, start, "empty_response")
 

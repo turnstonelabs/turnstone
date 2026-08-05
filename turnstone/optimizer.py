@@ -30,7 +30,7 @@ from openai import OpenAI
 from turnstone.core.model_turn import cap_tool_calls, model_turn, resolve_lane
 from turnstone.core.providers import LLMProvider, create_provider
 from turnstone.core.session import ChatSession
-from turnstone.core.trajectory import Role, Turn
+from turnstone.core.trajectory import Turn, final_assistant_text
 from turnstone.eval.core import (
     _MCP_ONLY_TOOLS,
     BOLD,
@@ -226,6 +226,23 @@ Output the modified optimizer instructions only.\
 """
 
 
+def _strip_markdown_fence(text: str) -> str:
+    """Unwrap a markdown-fenced block from MODEL output.
+
+    THE fence rule, in one place: a complete ``` pair yields its innards
+    (discarding any prose outside the fences); an unterminated opening
+    fence drops just the fence line.  Callers apply this to normalized
+    model output ONLY — never to an ``or``-fallback value, which must
+    survive verbatim.
+    """
+    fence_match = re.search(r"```[^\n]*\n(.*?)```", text, re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+    if text.startswith("```"):
+        return "\n".join(text.split("\n")[1:]).strip()
+    return text
+
+
 def _diversify_prompts(
     client: Any,
     model: str,
@@ -304,17 +321,7 @@ def _diversify_prompts(
                 max_tokens=8192,
             )
             raw = (cr.content or "").strip()
-            # Strip reasoning tags
-            raw = re.sub(
-                r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
-                "",
-                raw,
-                flags=re.DOTALL,
-            ).strip()
-            # Strip markdown fences
-            fence_match = re.search(r"```[^\n]*\n(.*?)```", raw, re.DOTALL)
-            if fence_match:
-                raw = fence_match.group(1).strip()
+            raw = _strip_markdown_fence(raw)
 
             new_variants = json.loads(raw)
             if isinstance(new_variants, list) and all(isinstance(v, str) for v in new_variants):
@@ -454,18 +461,11 @@ def _observe_and_update_optimizer(
         max_tokens=8192,
     )
 
-    result = cr.content or optimizer_system
-    result = re.sub(
-        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
-        "",
-        result,
-        flags=re.DOTALL,
-    ).strip()
-
-    # Strip markdown code fences if wrapped
-    fence_match = re.search(r"```[^\n]*\n(.*?)```", result, re.DOTALL)
-    if fence_match:
-        result = fence_match.group(1).strip()
+    # Normalize the MODEL's output first (strip, then unfence), and only
+    # then fall back: a no-answer pass — empty, whitespace-only, or
+    # fence-with-nothing — keeps the current observer system VERBATIM,
+    # never wiped and never itself fence-stripped.
+    result = _strip_markdown_fence((cr.content or "").strip()) or optimizer_system
 
     # Reject degenerate outputs (>200% of input length)
     if len(result) > len(optimizer_system) * 2.0:
@@ -789,22 +789,10 @@ def _run_analyst(
             output = _exec_analyst_tool(func_name, tc["function"]["arguments"])
             turns.append(Turn.tool(tc["id"], output))
 
-    # Extract final text response
-    result = ""
-    for t in reversed(turns):
-        if t.role is Role.ASSISTANT and t.text:
-            result = t.text
-            break
-
-    # Strip reasoning tags if present
-    result = re.sub(
-        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
-        "",
-        result,
-        flags=re.DOTALL,
-    ).strip()
-
-    return result
+    # The analysis is the analyst's FINAL say only — the no-walk-back read
+    # (an all-reasoning or silent final turn yields "" and the analyst
+    # section is skipped, never an earlier mid-loop narration).
+    return final_assistant_text(turns)
 
 
 TOOL_OPTIMIZER_SYSTEM = """\
@@ -912,15 +900,7 @@ def _propose_tool_overrides(
         max_tokens=8192,
     )
 
-    raw = (cr.content or "").strip()
-    # Strip reasoning tags
-    raw = re.sub(
-        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>", "", raw, flags=re.DOTALL
-    ).strip()
-    # Strip markdown fences
-    fence_match = re.search(r"```[^\n]*\n(.*?)```", raw, re.DOTALL)
-    if fence_match:
-        raw = fence_match.group(1).strip()
+    raw = _strip_markdown_fence((cr.content or "").strip())
 
     try:
         new_overrides = json.loads(raw)
@@ -1053,26 +1033,12 @@ def _propose_prompt_modification(
         max_tokens=16384,
     )
 
-    new_prompt = cr.content or current_prompt
-
-    # Strip reasoning tags if present
-    new_prompt = re.sub(
-        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
-        "",
-        new_prompt,
-        flags=re.DOTALL,
-    ).strip()
-
-    # Strip markdown code fences if the model wrapped the prompt.
-    # Also discard any explanation text outside the fences.
-    fence_match = re.search(r"```[^\n]*\n(.*?)```", new_prompt, re.DOTALL)
-    if fence_match:
-        new_prompt = fence_match.group(1).strip()
-    elif new_prompt.startswith("```"):
-        # Opening fence without closing — strip just the first line
-        new_prompt = "\n".join(new_prompt.split("\n")[1:]).strip()
-
-    return new_prompt
+    # Normalize the MODEL's output first (strip, then unfence), and only
+    # then fall back: a no-answer pass — empty, whitespace-only, or
+    # fence-with-nothing — keeps the current prompt VERBATIM (reads as
+    # "no changes" downstream; never an empty-prompt tree node, and the
+    # fence-strip must never run on the fallback itself).
+    return _strip_markdown_fence((cr.content or "").strip()) or current_prompt
 
 
 def _simple_diff(old: str, new: str) -> str:

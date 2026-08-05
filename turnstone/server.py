@@ -100,7 +100,7 @@ from turnstone.core.session_ui_base import (
     fire_judge_verdict_metric,
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
-from turnstone.core.trajectory import turn_to_dict
+from turnstone.core.trajectory import final_assistant_text
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
@@ -2225,22 +2225,13 @@ def _validate_notify_targets(raw: Any) -> tuple[str, str]:
 
 
 def _extract_last_assistant_content(session: Any) -> str:
-    """Return the text content of the last assistant message."""
-    for turn in reversed(session.messages):
-        msg = turn_to_dict(turn)
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text")
-                        if isinstance(text, str) and text:
-                            parts.append(text)
-                return "\n".join(parts)
-    return ""
+    """Return the text of the session's final assistant say.
+
+    THE final-say read (``trajectory.final_assistant_text``): no
+    walk-back, whitespace-only says report empty — so the notify
+    fallback fires instead of sending raw whitespace.
+    """
+    return final_assistant_text(session.messages)
 
 
 def _fire_notify_targets(ws: Any, content: str) -> None:

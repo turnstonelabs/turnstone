@@ -220,6 +220,8 @@ class TestExtractLastAssistantContent:
         assert _extract_last_assistant_content(session) == "world"
 
     def test_structured_content(self):
+        # Multi-block text flattens via the canonical Turn.text projection
+        # (the shared final-say read), not a notify-private join.
         session = MagicMock()
         session.messages = turns_from_dicts(
             [
@@ -232,7 +234,14 @@ class TestExtractLastAssistantContent:
                 },
             ]
         )
-        assert _extract_last_assistant_content(session) == "part one\npart two"
+        assert _extract_last_assistant_content(session) == "part onepart two"
+
+    def test_whitespace_only_final_say_reports_empty(self):
+        # A whitespace-only final say is empty — the notify fallback fires
+        # instead of sending raw whitespace.
+        session = MagicMock()
+        session.messages = turns_from_dicts([{"role": "assistant", "content": " \n"}])
+        assert _extract_last_assistant_content(session) == ""
 
     def test_empty_messages(self):
         session = MagicMock()

@@ -6246,3 +6246,24 @@ class TestTransportRetryability:
 
         provider = create_provider(provider_name)
         assert "IncompleteStreamError" in provider.retryable_error_names
+
+
+def test_sanitize_keeps_empty_content_assistant_turn_with_tool_calls():
+    # A think-only assistant turn drains to empty content beside its tool
+    # calls — the exact shape every prose-less tool-call turn already has.
+    # The chat-lane sanitizer must pass it through unmangled.
+    msgs = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "out"},
+    ]
+    out = sanitize_messages(msgs)
+    assert out[1]["content"] == ""
+    assert out[1]["tool_calls"][0]["id"] == "c1"
+    assert out[2]["tool_call_id"] == "c1"

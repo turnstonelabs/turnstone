@@ -166,3 +166,51 @@ def test_describe_peek_returns_cached_without_recompute() -> None:
         is None
     )
     assert prov.calls == 1
+
+
+def test_describe_cached_memoizes_empty_descriptions() -> None:
+    # A completed-but-empty description (an all-reasoning pass) memoizes
+    # like any other result: one perceive per key, ever — bounded cost.
+    # The pin-until-restart residual is deliberate; the remediation is
+    # server-side (reasoning parser / template thinking toggle).
+    prov = _StubProvider(content="")
+    kw: dict[str, Any] = {
+        "provider": prov,
+        "client": object(),
+        "model": "m",
+        "principal_id": "user-a",
+        "alias": "omni",
+        "content_hash": "h-empty",
+        "parts": _parts(),
+    }
+    assert perception.describe_cached(**kw) == ""
+    assert perception.describe_cached(**kw) == ""
+    assert prov.calls == 1  # second call served from the memo
+    assert (
+        perception.describe_peek(principal_id="user-a", alias="omni", content_hash="h-empty") == ""
+    )
+
+
+def test_racing_empty_result_never_clobbers_memoized_real_description(monkeypatch) -> None:
+    # The describe call runs unlocked: a racer can memoize a REAL
+    # description while another call is producing "".  The empty commit
+    # must yield to the existing memo, never overwrite it.
+    key_kwargs = {"principal_id": "user-a", "alias": "omni", "content_hash": "h-race"}
+
+    def _racing_describe(**_kw: Any) -> str:
+        with perception._cache_lock:
+            perception._cache[perception._cache_key(**key_kwargs)] = "real from racer"
+        return ""
+
+    monkeypatch.setattr(perception, "describe", _racing_describe)
+    out = perception.describe_cached(
+        provider=_StubProvider(content=""),
+        client=object(),
+        model="m",
+        parts=_parts(),
+        **key_kwargs,
+    )
+    assert out == "real from racer"
+    assert (
+        perception.describe_peek(**key_kwargs) == "real from racer"
+    )  # the billed real description survived

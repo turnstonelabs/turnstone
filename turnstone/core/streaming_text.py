@@ -1,4 +1,11 @@
-"""Streaming think-tag splitting for interactive content streams."""
+"""Think-tag splitting: streaming (interactive) and one-shot (drained) forms.
+
+:class:`ThinkTagSplitter` is the ONE tag-semantics engine — vocabulary,
+earliest-tag-wins selection, any-close-closes-any-open, the partial-tag
+carry.  :func:`split_inline_reasoning` is its drained form: the same
+engine applied to a complete text (feed + flush), plus the residue
+whitespace rule.  All tag selection happens inside the class; the
+one-shot's fast path tests only tag PRESENCE, never position."""
 
 from __future__ import annotations
 
@@ -33,7 +40,8 @@ class ThinkTagSplitter:
 
     OPEN_TAGS: tuple[str, ...] = ("<think>", "<reasoning>")
     CLOSE_TAGS: tuple[str, ...] = ("</think>", "</reasoning>")
-    MAX_TAG_LEN = max(len(t) for t in OPEN_TAGS + CLOSE_TAGS)
+    ALL_TAGS: tuple[str, ...] = OPEN_TAGS + CLOSE_TAGS
+    MAX_TAG_LEN = max(len(t) for t in ALL_TAGS)
 
     def __init__(self, emit: Callable[[str, bool], None]) -> None:
         self._emit = emit
@@ -80,3 +88,71 @@ class ThinkTagSplitter:
                 self._emit(self.pending[:safe], self.in_think)
                 self.pending = self.pending[safe:]
             break
+
+
+def split_inline_reasoning(text: str) -> tuple[str, str]:
+    """Split a complete drained text into ``(content, reasoning)``.
+
+    The one-shot form of :class:`ThinkTagSplitter` for non-streaming
+    consumers (``drain_stream``): a plain feed-and-flush of ONE content
+    run — the interactive lane's per-run rule, no more.  The caller owns
+    run boundaries (``drain_stream`` closes a run when tool-call deltas
+    or provider-parsed reasoning interleave, mirroring the interactive
+    consumer's flush-and-reset at those signals); a partial tag never
+    spans an interleaving signal.  Balanced
+    blocks land in the reasoning lane; an unterminated open sends the
+    tail to reasoning; an orphan CLOSE tag (no prior open) stays in
+    content untouched.  That last case is deliberate: a close tag whose
+    open never arrived is indistinguishable from prose that merely
+    QUOTES the tag, and drained lanes routinely quote third-party text
+    (a web-fetch answer citing a page about reasoning models, a guard
+    verdict echoing judged content) — reclassifying everything before
+    it would let that text destroy the result.  Display-string lanes
+    that want stricter cosmetic peeling (the title) own it locally as
+    formatting, not segregation.
+
+    The split is RAW: tag residue (the ``"\\n\\n"`` a leading block
+    leaves behind) stays in the returned content.  Exactly ONE trim
+    policy exists in the tree and ``drain_stream`` owns it — it joins
+    the per-run splits and applies :func:`strip_blank_edge_lines` once
+    over the whole when any run consumed a tag (a run edge may be
+    INTERIOR after joining, where a genuine paragraph separator must
+    survive).  With no tag present anywhere the input returns
+    byte-identical (fast path), so tag-free lanes cannot drift.
+    """
+    if not any(tag in text for tag in ThinkTagSplitter.ALL_TAGS):
+        return text, ""
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+
+    def _collect(span: str, is_reasoning: bool) -> None:
+        (reasoning_parts if is_reasoning else content_parts).append(span)
+
+    splitter = ThinkTagSplitter(_collect)
+    splitter.feed(text)
+    splitter.flush_pending()
+    content = "".join(content_parts)
+    if len(content) == len(text):
+        # Only orphan close tags were present — nothing was consumed;
+        # the text passes through byte-identical.
+        return text, ""
+    return content, "".join(reasoning_parts)
+
+
+def strip_blank_edge_lines(text: str) -> str:
+    """Remove leading/trailing lines that are entirely whitespace.
+
+    The residue-trim unit ``drain_stream`` applies once over its joined
+    per-run splits: kills the separator lines a consumed tag leaves
+    behind while preserving the first surviving line's significant
+    indentation — ``.strip()`` would delete it and silently reformat
+    whitespace-significant output.
+    """
+    lines = text.split("\n")
+    start, end = 0, len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return "\n".join(lines[start:end])

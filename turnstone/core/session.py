@@ -220,6 +220,7 @@ from turnstone.core.trajectory import (
     ToolCall,
     Turn,
     dicts_from_turns,
+    last_assistant_text,
     turn_from_dict,
     turn_to_dict,
     turns_from_dicts,
@@ -959,10 +960,10 @@ _SPEC_ARGUMENTS_LITERAL_RE = re.compile(r"\$ARGUMENTS\b(?!\[)")
 # assignment scheme unless the operator set one), so the budget must fit a
 # full thinking pass at the MODEL'S OWN default — the prompt's hard word cap
 # keeps the visible answer trivially cheap, and ``_TITLE_MAX_TOKENS`` carries
-# the rest.  Recover the title from ``content``: reuse
-# :meth:`ChatSession._strip_reasoning` (the canonical ``<think>``/
-# ``<reasoning>`` remover, for lanes that leave reasoning inline rather than
-# in ``reasoning_content``), take the first non-empty line (a model that
+# the rest.  Recover the title from ``content`` — IR-clean at the drain
+# seam (``split_inline_reasoning``; servers that leave reasoning inline
+# rather than in ``reasoning_content`` are segregated there, this lane
+# holds no strip of its own): take the first non-empty line (a model that
 # appends an explanation shouldn't fold prose into the title), then peel a
 # ``Title:`` label and wrapping markdown/quote decoration.  Internal
 # punctuation is preserved so ``.NET``, ``CI/CD``, ``v1.6.0`` survive.
@@ -1207,6 +1208,12 @@ _BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
     | _BACKEND_RATE_LIMIT_EXC_NAMES
     | _BACKEND_STREAM_EXC_NAMES
 )
+
+
+def _non_blank_or(text: str | None, fallback: str) -> str:
+    """*text* when it has any non-whitespace, else *fallback* — the
+    campaign-wide blankness doctrine for drained no-answer fallbacks."""
+    return text if text is not None and text.strip() else fallback
 
 
 def _is_ctx_overflow(exc: BaseException) -> bool:
@@ -3985,18 +3992,22 @@ class ChatSession:
             )
             raw = result.content or ""
             log.info("ws.title.llm_response", ws_id=ws_id[:8], raw=raw[:200])
-            # Take the assistant's answer (``content``), never its reasoning.
-            # Reuse the canonical reasoning stripper, then drop a leftover close
-            # tag from lanes that pre-inject the opening ``<think>`` into the
-            # prompt (only ``</think>`` reaches ``content``). See ``_TITLE_*``.
-            stripped = self._strip_reasoning(raw)
+            # ``content`` arrives with balanced/unterminated inline reasoning
+            # already segregated at the drain seam (``split_inline_reasoning``).
+            # The seam deliberately passes ORPHAN close tags through (a close
+            # with no open is indistinguishable from quoted prose, and
+            # reclassifying would let quoted text destroy real answers) —
+            # for a 3-word display string the cheap cosmetic call goes the
+            # other way, so peel through the LAST stray close tag here.
+            # This is title formatting like ``_TITLE_WRAP_CHARS``, not
+            # reasoning segregation.  See ``_TITLE_*``.
             for _close in ThinkTagSplitter.CLOSE_TAGS:
-                _pos = stripped.rfind(_close)
+                _pos = raw.rfind(_close)
                 if _pos != -1:
-                    stripped = stripped[_pos + len(_close) :]
+                    raw = raw[_pos + len(_close) :]
             # First non-empty line, with a ``Title:`` label and wrapping
             # markdown/quote decoration peeled (internal punctuation kept).
-            line = next((ln for ln in stripped.splitlines() if ln.strip()), "")
+            line = next((ln for ln in raw.splitlines() if ln.strip()), "")
             line = _TITLE_LABEL_RE.sub("", line.strip(_TITLE_WRAP_CHARS))
             title = line.strip(_TITLE_WRAP_CHARS)[:_TITLE_MAX_CHARS]
             if title and self._ws_id == ws_id:
@@ -5591,6 +5602,11 @@ class ChatSession:
     ) -> ModelTurnResult:
         """Run a lightweight internal completion (title gen, compaction,
         extraction) through ``model_turn`` on the session's primary lane.
+
+        Inline-reasoning segregation is SEAM-OWNED (``drain_stream`` runs
+        ``split_inline_reasoning``): ``result.content`` is think-tag-free
+        for every caller of this funnel — present and future — and no
+        caller may add a private strip.
 
         ``max_tokens`` is clamped to the model's advertised output limit so
         small models don't error.
@@ -7797,24 +7813,6 @@ class ChatSession:
         self._persist_truncation(removed_count)
         return content
 
-    @staticmethod
-    def _strip_reasoning(text: str) -> str:
-        """Remove think-tag blocks and their content.
-
-        The tag vocabulary is ThinkTagSplitter's — deriving it keeps this
-        strip (and the title lane's) from going blind when a variant is
-        added to the splitter, which would leak raw chain-of-thought into
-        compaction summaries.
-        """
-        for open_t, close_t in zip(
-            ThinkTagSplitter.OPEN_TAGS, ThinkTagSplitter.CLOSE_TAGS, strict=True
-        ):
-            while open_t in text:
-                start = text.find(open_t)
-                end = text.find(close_t, start)
-                text = text[:start] + text[end + len(close_t) :] if end != -1 else text[:start]
-        return text.strip()
-
     def _ui_stream_discarded(self) -> None:
         """Best-effort dead-segment discard across UI generations.
 
@@ -8884,9 +8882,9 @@ class ChatSession:
     def _summarize_once(self, system_prompt: str, body: str, my_generation: int = 0) -> str:
         """Run one summary completion over ``body`` and return the cleaned text.
 
-        Owns the retry loop (transient errors only, exponential backoff) and the
-        reasoning-tag strip.  Raises on a non-retryable error or retry exhaustion
-        so the caller can abort the whole compaction before any message swap.
+        Owns the retry loop (transient errors only, exponential backoff).
+        Raises on a non-retryable error or retry exhaustion so the caller
+        can abort the whole compaction before any message swap.
         """
         summary_msgs = [
             Turn.system(system_prompt),
@@ -8932,8 +8930,11 @@ class ChatSession:
                 )
                 self._backoff_or_cancelled(delay, my_generation)
         assert result is not None
-        # Strip any <think>/<reasoning> tags the summarizer may emit
-        summary = self._strip_reasoning(result.content or "")
+        # Inline think tags are already segregated at the drain seam; the
+        # trim is summary formatting (tag-free output is deliberately
+        # byte-identical at the seam, so edge whitespace is trimmed here
+        # before the summary is persisted and re-joined into merge input).
+        summary = (result.content or "").strip()
         if result.finish_reason == "length":
             self._compaction_event(
                 my_generation, {"phase": "progress", "warning": "summary_truncated"}
@@ -17751,10 +17752,10 @@ class ChatSession:
                 # propagates past this ``except Exception``.
                 overflow = _is_ctx_overflow(e)
                 note = "context limit reached" if overflow else f"error ({type(e).__name__})"
-                for t in reversed(agent_turns):
-                    if t.role is Role.ASSISTANT and t.text:
-                        self.ui.on_info(f"[{label}] {note}, returning partial work")
-                        return self._guard_subagent_synthesis(t.text, label)
+                salvage = last_assistant_text(agent_turns)
+                if salvage:
+                    self.ui.on_info(f"[{label}] {note}, returning partial work")
+                    return self._guard_subagent_synthesis(salvage, label)
                 # No partial work to salvage: surface overflow as a calm stop message,
                 # but re-raise any other terminal error so the real failure isn't
                 # masked as an empty success.
@@ -17766,7 +17767,9 @@ class ChatSession:
             # Handle truncation or content filter — stop agent early
             if result.finish_reason == "length":
                 self.ui.on_info(f"[{label}] response truncated, stopping early")
-                return self._guard_subagent_synthesis(result.content or "(truncated)", label)
+                return self._guard_subagent_synthesis(
+                    _non_blank_or(result.content, "(truncated)"), label
+                )
             if result.finish_reason == "content_filter":
                 self.ui.on_info(f"[{label}] blocked by content filter")
                 return "(content filter)"
@@ -17779,7 +17782,7 @@ class ChatSession:
             agent_turns.append(result.turn)
 
             if not result.tool_calls:
-                content = result.content or "(no output)"
+                content = _non_blank_or(result.content, "(no output)")
                 self.ui.on_info(f"[{label} done] {len(content)} chars")
                 return self._guard_subagent_synthesis(content, label)
 
@@ -17935,7 +17938,7 @@ class ChatSession:
             )
         )
         result = _api_call(agent_turns, _tools=[])
-        content = result.content or "(no output)"
+        content = _non_blank_or(result.content, "(no output)")
         self.ui.on_info(f"[{label} done] {len(content)} chars")
         return self._guard_subagent_synthesis(content, label)
 
@@ -19170,7 +19173,7 @@ class ChatSession:
                 reasoning_effort=self.reasoning_effort,
             )
             answer = result.content or ""
-            if not answer:
+            if not answer.strip():
                 answer = "Error: extraction returned no answer"
         except Exception as e:
             answer = f"Extraction failed (page was fetched but summarization errored): {e}"

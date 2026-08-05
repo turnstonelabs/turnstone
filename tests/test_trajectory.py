@@ -19,6 +19,8 @@ from turnstone.core.trajectory import (
     TextBlock,
     ToolCall,
     Turn,
+    final_assistant_text,
+    last_assistant_text,
     materialize_attachments,
     resolve_attachment_parts,
     turn_from_dict,
@@ -287,3 +289,53 @@ def test_materialize_attachments_noop_without_resolver_or_placeholders() -> None
     messages = [{"role": "user", "content": "hi"}]
     assert materialize_attachments(messages, None) is messages
     assert materialize_attachments(messages, lambda ids: {}) is messages
+
+
+def test_last_assistant_text_picks_most_recent_substantive() -> None:
+    turns = [
+        Turn.user("q"),
+        Turn.assistant("early answer"),
+        Turn.assistant("", tool_calls=(ToolCall(id="c1", name="bash", arguments="{}"),)),
+        Turn.tool("c1", "out"),
+        Turn.assistant("final answer"),
+    ]
+    assert last_assistant_text(turns) == "final answer"
+
+
+def test_last_assistant_text_skips_textless_finals() -> None:
+    # Tool-call-only and all-reasoning (empty-text) finals are skipped —
+    # the walk falls back to the last SUBSTANTIVE assistant text.
+    turns = [
+        Turn.assistant("substantive"),
+        Turn.assistant("", tool_calls=(ToolCall(id="c2", name="bash", arguments="{}"),)),
+        Turn.assistant(""),
+    ]
+    assert last_assistant_text(turns) == "substantive"
+
+
+def test_last_assistant_text_none_when_no_assistant_text() -> None:
+    assert last_assistant_text([]) is None
+    assert last_assistant_text([Turn.user("q"), Turn.assistant("")]) is None
+
+
+def test_last_assistant_text_skips_whitespace_only_turns() -> None:
+    # "Substantive" means non-blank, not merely truthy: a whitespace-only
+    # final turn must not be salvaged as partial work.
+    turns = [Turn.assistant("real work"), Turn.assistant(" \n")]
+    assert last_assistant_text(turns) == "real work"
+    assert last_assistant_text([Turn.assistant(" \n")]) is None
+
+
+def test_final_assistant_text_reads_last_turn_only() -> None:
+    # The final-say read: no walk-back — an empty final say reports empty,
+    # never an earlier turn's narration.
+    substantive_then_empty = [Turn.assistant("mid-loop narration"), Turn.assistant("")]
+    assert final_assistant_text(substantive_then_empty) == ""
+    tool_final = [
+        Turn.assistant("narration"),
+        Turn.assistant("", tool_calls=(ToolCall(id="c1", name="bash", arguments="{}"),)),
+    ]
+    assert final_assistant_text(tool_final) == ""
+    assert final_assistant_text([Turn.assistant("  the answer\n")]) == "the answer"
+    assert final_assistant_text([Turn.user("q")]) == ""
+    assert final_assistant_text([]) == ""

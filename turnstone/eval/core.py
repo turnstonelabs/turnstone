@@ -37,7 +37,7 @@ from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
 from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
-from turnstone.core.trajectory import Role, Turn, turn_from_dict, turns_from_dicts
+from turnstone.core.trajectory import Turn, final_assistant_text, turn_from_dict, turns_from_dicts
 
 # Eval evaluates interactive-session agent behaviour — coordinator tools
 # require a console-hosted session and aren't exercised by the harness.
@@ -779,12 +779,9 @@ def _run_single_test(
         return session, _drive
 
     def _finish(session: Any, tool_log: list[dict[str, Any]]) -> dict[str, Any]:
-        # Extract results before releasing session
-        final_content = ""
-        for msg in reversed(session.messages):
-            if msg.role is Role.ASSISTANT and msg.text:
-                final_content = msg.text
-                break
+        # The run's final content is the final-say read — no walk-back: an
+        # earlier turn's narration must never be scored as the final answer.
+        final_content = final_assistant_text(session.messages)
         return {
             "tool_log": tool_log,
             "final_content": final_content,

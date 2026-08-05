@@ -50,6 +50,144 @@ class TestContentAndReasoning:
         assert result.reasoning == "think hard"
         assert result.content == "answer"
 
+    def test_inline_tags_segregated_at_the_seam(self):
+        # The one-shot splitter runs on the joined content, so EVERY
+        # drained consumer receives IR-clean content by construction —
+        # the tag arrives split across deltas exactly as a passthrough
+        # server streams it.
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(content_delta="<thi"),
+                    StreamChunk(content_delta="nk>plan</think>"),
+                    StreamChunk(content_delta="answer"),
+                    StreamChunk(finish_reason="stop"),
+                ]
+            )
+        )
+        assert result.content == "answer"
+        assert result.reasoning == "plan"
+
+    def test_extracted_reasoning_appends_after_server_parsed(self):
+        # Segregate, never discard: server-parsed reasoning_delta first,
+        # inline-extracted after, with a boundary — two distinct passes
+        # must never read as one run-together sentence.
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(reasoning_delta="parsed."),
+                    StreamChunk(content_delta="<think>inline.</think>answer"),
+                    StreamChunk(finish_reason="stop"),
+                ]
+            )
+        )
+        assert result.reasoning == "parsed.\n\ninline."
+        assert result.content == "answer"
+
+    def test_extracted_reasoning_alone_carries_no_separator(self):
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(content_delta="<think>inline.</think>answer"),
+                    StreamChunk(finish_reason="stop"),
+                ]
+            )
+        )
+        assert result.reasoning == "inline."
+
+    def test_all_reasoning_turn_drops_citations_footer(self):
+        # An all-reasoning turn's footer is sourcing for an answer that
+        # does not exist; folding it would hand downstream emptiness
+        # checks a truthy, footer-only "answer".
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(content_delta="<think>all reasoning</think>"),
+                    StreamChunk(finish_reason="stop"),
+                    StreamChunk(info_delta="Sources:\n- x"),
+                ]
+            )
+        )
+        assert result.content == ""
+        assert result.reasoning == "all reasoning"
+
+    def test_double_reasoning_shape_logs_chars_only(self, caplog):
+        # Inline-extracted text alongside a NATIVE reasoning block has no
+        # native lane to land in downstream — observable here, chars-only.
+        import logging
+
+        secret = "the plan nobody logs"
+        with caplog.at_level(logging.DEBUG):
+            result = drain_stream(
+                iter(
+                    [
+                        StreamChunk(content_delta=f"<think>{secret}</think>answer"),
+                        StreamChunk(
+                            finish_reason="stop",
+                            provider_blocks=[{"type": "thinking", "thinking": "native"}],
+                        ),
+                    ]
+                )
+            )
+        assert result.content == "answer"
+        assert "drain.inline_reasoning_alongside_native" in caplog.text
+        assert secret not in caplog.text
+
+    def test_routine_reasoning_delta_mirror_does_not_log(self, caplog):
+        # reasoning_delta beside a native block is the NORMAL shape on
+        # Anthropic/Responses lanes (the delta mirrors the block) — it
+        # must not drown the anomaly signal.
+        import logging
+
+        with caplog.at_level(logging.DEBUG):
+            drain_stream(
+                iter(
+                    [
+                        StreamChunk(reasoning_delta="mirrored"),
+                        StreamChunk(content_delta="answer"),
+                        StreamChunk(
+                            finish_reason="stop",
+                            provider_blocks=[{"type": "thinking", "thinking": "mirrored"}],
+                        ),
+                    ]
+                )
+            )
+        assert "drain.inline_reasoning_alongside_native" not in caplog.text
+
+    def test_trailing_footer_folds_after_split_and_is_never_scanned(self):
+        # The citations footer is web-controlled text: it folds onto the
+        # ALREADY-split content, so a tag-shaped citation title cannot
+        # reclassify the result.
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(content_delta="<think>x</think>answer"),
+                    StreamChunk(finish_reason="stop"),
+                    StreamChunk(info_delta="Sources:\n- how </think> works"),
+                ]
+            )
+        )
+        assert result.content == "answer\n\nSources:\n- how </think> works"
+        assert result.reasoning == "x"
+
+    def test_tool_call_turn_with_in_think_tail(self):
+        # A drained tool-call turn whose trailing content is an
+        # unterminated think block: the tail is reasoning, the calls ride.
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(content_delta="<think>pondering tools"),
+                    StreamChunk(
+                        tool_call_deltas=[ToolCallDelta(index=0, id="c1", name="bash")],
+                        finish_reason="tool_calls",
+                    ),
+                ]
+            )
+        )
+        assert result.content == ""
+        assert result.reasoning == "pondering tools"
+        assert result.tool_calls is not None and result.tool_calls[0]["id"] == "c1"
+
     def test_stream_without_finish_reason_raises_incomplete(self):
         # Complete-or-error: every adapter emits a finish reason on a
         # healthy stream, so its absence means the generation died
@@ -244,7 +382,12 @@ class TestInfoDelta:
         )
         assert result.content == format_citations("body", anns)
 
-    def test_trailing_fold_with_empty_content_matches_too(self):
+    def test_trailing_fold_onto_empty_content_is_dropped(self):
+        # A turn with NO content (tool-call-only here, all-reasoning in the
+        # split case) keeps content empty: a footer-only "answer" would be
+        # truthy and defeat every downstream emptiness check.  This pin
+        # replaced the old byte-match-the-retired-non-streaming-lane rule
+        # (which appended the footer onto the empty base).
         result = drain_stream(
             iter(
                 [
@@ -253,7 +396,7 @@ class TestInfoDelta:
                 ]
             )
         )
-        assert result.content == "\n\nSources:\n- x"
+        assert result.content == ""
 
     def test_finishless_stream_raises_even_with_trailing_info(self):
         # A stream that dies after a status ping must NOT return the ping
@@ -395,3 +538,130 @@ class TestErrorPropagation:
 
         with pytest.raises(RuntimeError, match="upstream broke"):
             drain_stream(chunks())
+
+
+def test_whitespace_only_content_does_not_gain_footer():
+    # Blankness, not truthiness: tag-free whitespace-only content is
+    # byte-identical at the split (never normalized), and a citations
+    # footer folded onto it would read as a truthy footer-only "answer".
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(content_delta="\n\n"),
+                StreamChunk(reasoning_delta="all the substance"),
+                StreamChunk(finish_reason="stop"),
+                StreamChunk(info_delta="Sources:\n- x"),
+            ]
+        )
+    )
+    assert result.content == "\n\n"
+    assert result.reasoning == "all the substance"
+
+
+def test_unterminated_think_before_tool_calls_does_not_swallow_answer():
+    # Content runs are bounded by interleaving signals, mirroring the
+    # interactive consumer's flush-and-reset when tool calls begin: an
+    # unterminated <think> before the calls is reasoning, the post-call
+    # answer is CONTENT — never swallowed into the open block.
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(content_delta="<think>plan"),
+                StreamChunk(tool_call_deltas=[ToolCallDelta(index=0, id="c1", name="bash")]),
+                StreamChunk(content_delta="Answer: 42"),
+                StreamChunk(finish_reason="stop"),
+            ]
+        )
+    )
+    assert result.content == "Answer: 42"
+    assert result.reasoning == "plan"
+    assert result.tool_calls is not None and result.tool_calls[0]["id"] == "c1"
+
+
+def test_unterminated_think_before_reasoning_delta_does_not_swallow_answer():
+    # The mixed-dialect shape: provider-parsed reasoning interleaving a raw
+    # content stream also closes the run (the interactive Path-1 reset).
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(content_delta="<think>plan"),
+                StreamChunk(reasoning_delta="parsed."),
+                StreamChunk(content_delta="answer"),
+                StreamChunk(finish_reason="stop"),
+            ]
+        )
+    )
+    assert result.content == "answer"
+    assert result.reasoning == "parsed.\n\nplan"
+
+
+def test_whitespace_only_extraction_does_not_pollute_reasoning():
+    # The field-common no-think shape: an empty think body must not append
+    # blank text (or a separator) into persisted reasoning.
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(reasoning_delta="parsed."),
+                StreamChunk(content_delta="<think>\n\n</think>answer"),
+                StreamChunk(finish_reason="stop"),
+            ]
+        )
+    )
+    assert result.reasoning == "parsed."
+    assert result.content == "answer"
+
+
+def test_combined_content_and_tool_chunk_keeps_content_in_prior_run():
+    # Within a chunk the interactive ordering holds — reasoning, content,
+    # THEN the tool-call close: a combined content+tools chunk feeds its
+    # content into the pre-boundary run, so a close tag arriving in that
+    # chunk still closes the open block instead of stranding as a literal
+    # orphan in drained content.
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(content_delta="Let me plan. <think>use bash"),
+                StreamChunk(
+                    content_delta="</think>Running it.",
+                    tool_call_deltas=[ToolCallDelta(index=0, id="c1", name="bash")],
+                ),
+                StreamChunk(finish_reason="tool_calls"),
+            ]
+        )
+    )
+    assert result.content == "Let me plan. Running it."
+    assert result.reasoning == "use bash"
+    assert result.tool_calls is not None and result.tool_calls[0]["id"] == "c1"
+
+
+def test_inter_run_paragraph_separator_survives_reasoning_boundary():
+    # The edge trim runs ONCE over the joined whole: a genuine paragraph
+    # break the model emitted before an interleaving signal is interior
+    # after the join and must survive.
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(content_delta="<think>plan</think>First part.\n\n"),
+                StreamChunk(reasoning_delta="server-parsed"),
+                StreamChunk(content_delta="Second part."),
+                StreamChunk(finish_reason="stop"),
+            ]
+        )
+    )
+    assert result.content == "First part.\n\nSecond part."
+    assert result.reasoning == "server-parsed\n\nplan"
+
+
+def test_inter_run_separator_survives_tool_boundary():
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(content_delta="Narration.<think>x</think>\n\nIntro:\n\n"),
+                StreamChunk(tool_call_deltas=[ToolCallDelta(index=0, id="c1", name="bash")]),
+                StreamChunk(content_delta="Post-call answer."),
+                StreamChunk(finish_reason="stop"),
+            ]
+        )
+    )
+    assert result.content == "Narration.\n\nIntro:\n\nPost-call answer."
+    assert result.reasoning == "x"
