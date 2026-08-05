@@ -1,0 +1,40 @@
+{
+  "cancelled_partial": null,
+  "last_usage": {
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "completion_tokens": 7,
+    "prompt_tokens": 11,
+    "total_tokens": 18
+  },
+  "raised": null,
+  "result": {
+    "content": "Calling.",
+    "provider_content": null,
+    "tool_calls": [
+      {
+        "function": {
+          "arguments": "{\"city\": \"Paris\"}",
+          "name": "get_weather"
+        },
+        "id": "call_1",
+        "type": "function"
+      }
+    ]
+  },
+  "scenario": "tools_simple",
+  "ui_events": [
+    [
+      "thinking_stop",
+      ""
+    ],
+    [
+      "content",
+      "Calling."
+    ],
+    [
+      "stream_end",
+      ""
+    ]
+  ]
+}

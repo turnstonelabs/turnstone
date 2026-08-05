@@ -1,0 +1,31 @@
+{
+  "cancelled_partial": null,
+  "last_usage": {
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "completion_tokens": 0,
+    "prompt_tokens": 11,
+    "total_tokens": 11
+  },
+  "raised": null,
+  "result": {
+    "content": "Half an ans",
+    "provider_content": null,
+    "tool_calls": null
+  },
+  "scenario": "no_finish_clean_exhaust",
+  "ui_events": [
+    [
+      "thinking_stop",
+      ""
+    ],
+    [
+      "content",
+      "Half an ans"
+    ],
+    [
+      "stream_end",
+      ""
+    ]
+  ]
+}

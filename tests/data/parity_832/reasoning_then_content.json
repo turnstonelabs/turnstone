@@ -1,0 +1,44 @@
+{
+  "cancelled_partial": null,
+  "last_usage": {
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "completion_tokens": 7,
+    "prompt_tokens": 11,
+    "total_tokens": 18
+  },
+  "raised": null,
+  "result": {
+    "content": "Answer.",
+    "provider_content": [
+      {
+        "text": "think a think b",
+        "type": "reasoning_text"
+      }
+    ],
+    "tool_calls": null
+  },
+  "scenario": "reasoning_then_content",
+  "ui_events": [
+    [
+      "thinking_stop",
+      ""
+    ],
+    [
+      "reasoning",
+      "think a"
+    ],
+    [
+      "reasoning",
+      " think b"
+    ],
+    [
+      "content",
+      "Answer."
+    ],
+    [
+      "stream_end",
+      ""
+    ]
+  ]
+}

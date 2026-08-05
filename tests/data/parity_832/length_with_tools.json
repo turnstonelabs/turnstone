@@ -1,0 +1,43 @@
+{
+  "cancelled_partial": null,
+  "last_usage": {
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "completion_tokens": 7,
+    "prompt_tokens": 11,
+    "total_tokens": 18
+  },
+  "raised": null,
+  "result": {
+    "content": "Partial answer",
+    "provider_content": null,
+    "tool_calls": null
+  },
+  "scenario": "length_with_tools",
+  "ui_events": [
+    [
+      "thinking_stop",
+      ""
+    ],
+    [
+      "content",
+      "Pa"
+    ],
+    [
+      "content",
+      "rtial answer"
+    ],
+    [
+      "error",
+      "Warning: response truncated (hit 4096 token limit). Use --max-tokens to increase, or /compact to free context."
+    ],
+    [
+      "error",
+      "Discarding partial tool calls from truncated response."
+    ],
+    [
+      "stream_end",
+      ""
+    ]
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "cancelled_partial": null,
+  "last_usage": {
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "completion_tokens": 7,
+    "prompt_tokens": 11,
+    "total_tokens": 18
+  },
+  "raised": null,
+  "result": {
+    "content": "Redac",
+    "provider_content": null,
+    "tool_calls": null
+  },
+  "scenario": "content_filter",
+  "ui_events": [
+    [
+      "thinking_stop",
+      ""
+    ],
+    [
+      "content",
+      "Redac"
+    ],
+    [
+      "error",
+      "Warning: response blocked by content filter."
+    ],
+    [
+      "stream_end",
+      ""
+    ]
+  ]
+}
