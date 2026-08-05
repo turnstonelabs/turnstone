@@ -376,15 +376,28 @@ class _CancelRef(list[Any]):
 
     @property
     def aborted(self) -> bool:
-        """Whether this ref's stream must not be resurrected.
+        """Whether this ref's call must not proceed or be resurrected.
 
-        ``model_turn`` consults ``cancel_ref.aborted`` before re-issuing a
-        request after a mid-drain transport failure (the deadline daemon's
-        :class:`~turnstone.core.deadline.StreamAbortRef` contract): a
-        stream that died because :meth:`ChatSession.cancel` closed it — or
-        because it belongs to a superseded generation — must not be
-        resurrected behind the user's Stop; the failure surfaces and the
-        caller's own cancel check turns it into ``GenerationCancelled``.
+        ``model_turn`` consults ``cancel_ref.aborted`` before every
+        dispatch and again before re-issuing after a mid-drain transport
+        failure (the deadline daemon's
+        :class:`~turnstone.core.deadline.StreamAbortRef` contract): a call
+        the user's Stop abandoned — or one belonging to a superseded
+        generation — issues no request, and a stream that died because
+        :meth:`ChatSession.cancel` closed it is not resurrected behind
+        that Stop; the failure surfaces and the caller's own cancel check
+        turns it into ``GenerationCancelled``.
+
+        Deliberately the same two conditions as :meth:`_check_cancelled`
+        — provided both are asked about the same generation, which on the
+        compaction lane they are (this ref and that call carry the same
+        ``my_generation``).  Compaction depends on the pairing:
+        ``_summarize_once``'s handler calls ``_check_cancelled`` before it
+        reads the error, which is what converts ``model_turn``'s
+        pre-dispatch raise into a cancelled compaction instead of a red
+        failure row.  Widening this predicate without widening that one,
+        or pairing a ref with a check on a different generation, breaks
+        the translation.
         """
         return self._session._cancel_event.is_set() or self._superseded()
 

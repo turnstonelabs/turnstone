@@ -8,6 +8,7 @@ single-shot lanes (phase 2) can build on it without re-deriving semantics.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -231,10 +232,17 @@ def test_model_turn_abort_during_backoff_suppresses_reissue(
     assert len(provider.calls) == 1
 
 
-def test_model_turn_does_not_retry_after_abort() -> None:
-    # A deadline that closed the stream must not have the request
-    # resurrected behind its back: the closed stream dies with an error
-    # that LOOKS retryable, but the aborted cancel_ref gates the re-issue.
+def test_model_turn_does_not_retry_after_abort(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A call the deadline abandoned must not have its request resurrected
+    # behind its back: in the field the abort closes the stream and the
+    # drain dies with an error that LOOKS retryable.  The fixture models
+    # only the shape of that — abort landing after dispatch, drain raising
+    # IncompleteStreamError — because the aborted ref is what gates the
+    # re-issue regardless of which of the two produced the error.  This is
+    # the RE-ISSUE gate; of the tests below, two cover the pre-dispatch reads
+    # and the third pins the raised message.
     from turnstone.core.deadline import StreamAbortRef
 
     provider = _FlakyProvider(
@@ -242,12 +250,107 @@ def test_model_turn_does_not_retry_after_abort() -> None:
     )
     lane = ModelLane(provider=provider, client=object(), model="m")
     ref = StreamAbortRef()
-    ref.abort()
+    dispatch = provider.create_streaming
 
-    with pytest.raises(IncompleteStreamError):
+    def _abort_after_dispatch(**kwargs: Any) -> Any:
+        stream = dispatch(**kwargs)
+        ref.abort()  # the deadline daemon fires; the request is already out
+        return stream
+
+    monkeypatch.setattr(provider, "create_streaming", _abort_after_dispatch)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="turnstone.core.model_turn"),
+        pytest.raises(IncompleteStreamError),
+    ):
         model_turn(lane, [Turn.user("x")], cancel_ref=ref)
 
     assert len(provider.calls) == 1
+    # Isolates THIS gate from the post-backoff one its sibling covers.  The
+    # abort is read where the failure surfaces, so the loop never announces a
+    # re-issue it will not make; delete that gate and the backoff arm still
+    # ends at one dispatch, but it logs on the way — which is what makes this
+    # assertion, and not the call count, the discriminating one.
+    assert "model_turn.drain_retry" not in caplog.text
+
+
+def test_abort_landing_during_the_backend_auth_mint_still_never_dispatches() -> None:
+    # The window an entry-only check cannot see: on a dynamic-auth alias
+    # the resolve can block for seconds on a cache miss, so an abort can
+    # land after the entry read and before the request.  The read
+    # immediately before create_streaming is what covers it.
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+
+    provider = _FakeProvider([CompletionResult(content="never")])
+    ref = StreamAbortRef()
+    client = MagicMock()
+
+    def _abort_during_mint(alias: str) -> str:
+        ref.abort()  # the user hits Stop while the mint is blocked
+        return "minted-token"
+
+    lane = ModelLane(
+        provider=provider,
+        client=client,
+        model="m",
+        alias="obo-gateway",
+        backend_auth_resolver=_abort_during_mint,
+    )
+
+    with pytest.raises(DeadlineCancelledError):
+        model_turn(lane, [Turn.user("x")], cancel_ref=ref)
+
+    assert provider.calls == []
+
+
+def test_pre_dispatch_abort_precedes_the_backend_auth_mint() -> None:
+    # Placement of the FIRST read: an already-abandoned call skips the
+    # resolve entirely.  On a cache miss that resolve is a network mint
+    # under a cluster-wide lock, so this is work worth not doing — but the
+    # invariant itself rides the read before create_streaming, not this one.
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+
+    provider = _FakeProvider([CompletionResult(content="never")])
+    resolver = MagicMock(return_value="minted-token")
+    client = MagicMock()
+    lane = ModelLane(
+        provider=provider,
+        client=client,
+        model="m",
+        alias="obo-gateway",
+        backend_auth_resolver=resolver,
+    )
+    ref = StreamAbortRef()
+    ref.abort()
+
+    with pytest.raises(DeadlineCancelledError):
+        model_turn(lane, [Turn.user("x")], cancel_ref=ref)
+
+    resolver.assert_not_called()
+    client.with_options.assert_not_called()
+    assert provider.calls == []
+
+
+def test_pre_dispatch_abort_does_not_read_as_a_context_overflow() -> None:
+    # A latent coupling, pinned deliberately rather than a live path: today
+    # compaction's ``except`` arm re-checks the session first and raises
+    # GenerationCancelled, and ``_stop_retrying`` short-circuits on the class
+    # gate, so this message never reaches ``_is_ctx_overflow``.  It would the
+    # moment either shortcut moves — and ``_is_ctx_overflow`` classifies an
+    # unrecognized class by TEXT, so an overflow reading would send the
+    # compaction lane subdividing.  The message is a wire contract; pin it.
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+    from turnstone.core.session import _is_ctx_overflow
+
+    provider = _FakeProvider([CompletionResult(content="never")])
+    lane = ModelLane(provider=provider, client=object(), model="m")
+    ref = StreamAbortRef()
+    ref.abort()
+
+    with pytest.raises(DeadlineCancelledError) as excinfo:
+        model_turn(lane, [Turn.user("x")], cancel_ref=ref)
+
+    assert not _is_ctx_overflow(excinfo.value)
 
 
 def _real_semantics_store(**stored: Any) -> SimpleNamespace:

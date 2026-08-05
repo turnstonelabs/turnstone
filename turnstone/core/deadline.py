@@ -80,10 +80,16 @@ class StreamAbortRef(list[Any]):
     def aborted(self) -> bool:
         """Whether :meth:`abort` has fired.
 
-        ``model_turn``'s drain-retry gate reads this (duck-typed off any
-        ``cancel_ref``): an aborted stream dies with a transport error
-        that looks retryable, and re-issuing the request would resurrect
-        a call its deadline already abandoned.
+        ``model_turn`` reads this (duck-typed off any ``cancel_ref``) in
+        three roles, all load-bearing.  On entry, so an abandoned call
+        skips the lowering and the credential resolve.  Immediately
+        before it dispatches, so an abort observed by then costs no
+        request.  And at its drain-retry gates, where an aborted stream
+        dies with a transport error that looks retryable and re-issuing
+        would resurrect a call its deadline already abandoned.  No read
+        closes the window — an abort firing after the last one still
+        meets the arriving handle at :meth:`append`, which is why that
+        hook is not redundant with them.
         """
         return self._aborted
 

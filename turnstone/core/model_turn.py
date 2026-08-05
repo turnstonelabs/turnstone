@@ -15,7 +15,12 @@ Contract, held deliberately narrow:
 * **Policy-free.**  No retry, no deadline, no tool execution, no usage
   recording inside — those belong to each caller.  The callers are
   different organs (a judge is not a sub-agent is not a title generator);
-  the plant call is the one thing they share.
+  the plant call is the one thing they share.  Two carve-outs, both about
+  a call that is already dead rather than about policy: the drain-retry
+  loop re-issues a mid-stream death, and an aborted ``cancel_ref`` raises
+  ``DeadlineCancelledError`` rather than dispatch — the caller still owns
+  the deadline, this only refuses to spend on a call already abandoned
+  (see ``Raises`` on :func:`model_turn`).
 * **Providers stay codegen.**  The provider boundary keeps taking lowered
   wire dicts; Turn IR does not enter the provider Protocol, and
   ``lowering.py`` remains the only wire-mutation owner.  This module
@@ -48,6 +53,7 @@ if TYPE_CHECKING:
         UsageInfo,
     )
 
+from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
@@ -629,6 +635,27 @@ def cap_tool_calls(result: ModelTurnResult, max_calls: int) -> tuple[list[dict[s
     return capped, turn
 
 
+def _raise_if_aborted(cancel_ref: Any, lane: ModelLane) -> None:
+    """Refuse to go on with a call whose caller has already gone away (#972).
+
+    Duck-typed on the same ``aborted`` predicate the drain-retry gate
+    reads, so a ``None`` ref — most lanes — and a plain-list ref stay
+    legal.  One definition, two call sites in :func:`model_turn`: entry,
+    and immediately before ``create_streaming``.  The credential resolve
+    between them is NOT re-checked — a mint already under way completes
+    even when the abort lands inside it, and only the request is skipped.
+
+    The raised message is control flow, not prose.  ``_is_ctx_overflow``
+    classifies an exception class it does not recognize by TEXT, so
+    context-window vocabulary here would read downstream as a real
+    overflow and send the compaction lane subdividing.
+    """
+    if not getattr(cancel_ref, "aborted", False):
+        return
+    log.debug("model_turn.abort_before_dispatch", model=lane.model, alias=lane.alias)
+    raise DeadlineCancelledError("cancel_ref aborted before dispatch")
+
+
 def model_turn(
     lane: ModelLane,
     turns: Sequence[Turn],
@@ -691,7 +718,30 @@ def model_turn(
     stream object (which has ``.close()``) before the first chunk, so a
     deadline daemon can abort the blocked HTTP read from another thread
     instead of abandoning it (transport is a drained ``create_streaming``
-    — see :func:`drain_stream`).
+    — see :func:`drain_stream`).  Its ``aborted`` predicate gates every
+    dispatch, not only a re-issue (:func:`_raise_if_aborted`): an
+    abandoned call is not worth a request, and on a delegated-auth alias
+    not worth the credential resolve either — hence one read at entry,
+    ahead of lowering and ``lane.backend_auth_resolver``, and one
+    immediately before ``create_streaming``, which is the read that
+    actually keeps bytes off the wire.  The entry read costs a pending
+    credential failure, which a pending abort now masks; right, because
+    the caller is gone.  Neither read closes anything: a resolve already
+    under way finishes despite an abort landing inside it, and an abort
+    landing after the second read reaches the in-flight call the way it
+    always did — ``cancel_ref.append`` closes a handle that has not
+    arrived yet, ``abort`` closes one that has.
+
+    The raise is :class:`~turnstone.core.deadline.DeadlineCancelledError`,
+    the deadline module's abandonment vocabulary.  ``GenerationCancelled``
+    is deliberately not raised here: it subclasses ``BaseException``, so
+    the ``except Exception`` arms around these calls cannot see it, and
+    it lives in ``session``, which imports this module.  A caller whose
+    ref means something narrower than "this call is abandoned" owns the
+    translation — compaction does exactly that, its ``except`` arm
+    re-checking the session and raising ``GenerationCancelled`` before it
+    reads the error at all, which is what keeps a Stop mid-summary off
+    the red-error path.
 
     Raises whatever the provider raises — retry/deadline/fallback policy
     is the caller's — EXCEPT transient mid-stream deaths: a failure the
@@ -703,7 +753,10 @@ def model_turn(
     that retry's new home (request-time failures still get the SDK's own
     policy inside ``create_streaming`` and propagate unchanged).  An
     aborted *cancel_ref* suppresses retries — a deadline that closed the
-    stream must not have the request resurrected behind its back.
+    stream must not have the request resurrected behind its back — and,
+    read before each dispatch, raises
+    :class:`~turnstone.core.deadline.DeadlineCancelledError` instead of
+    issuing the request at all (see *cancel_ref* above).
 
     *backend_auth_token* is a delegated-user or app-identity credential for a
     dynamically authenticated backend. When set, the call is issued on
@@ -722,6 +775,7 @@ def model_turn(
             "model_turn: mint requires wire_id_map — minted ids are "
             "unrestorable on the wire without the recovery map"
         )
+    _raise_if_aborted(cancel_ref, lane)
     # ONE config fetch per plant call feeds both live per-call flags — a
     # registry hot-reload cannot hand the replay gate and the attach gate
     # different config generations within a single request.
@@ -755,6 +809,10 @@ def model_turn(
     )
     attempt = 0
     while True:
+        # Last read before the wire — it covers everything the entry read is
+        # too early to see: the lowering, and on a delegated-auth alias the
+        # credential resolve, which can block.
+        _raise_if_aborted(cancel_ref, lane)
         # ``create_streaming`` stays OUTSIDE the try: every adapter issues
         # the HTTP request eagerly in its body (inside the SDK's own
         # request-level retry), so an exception from it is a request-time
@@ -801,9 +859,10 @@ def model_turn(
             if delay > 0:
                 time.sleep(delay)
             if bool(getattr(cancel_ref, "aborted", False)):
-                # The deadline abandoned this worker while it was backing
-                # off — die with the original failure instead of
-                # resurrecting the request from an abandoned thread.
+                # The deadline abandoned this worker while it was backing off.
+                # The loop-top read would stop the re-issue anyway; this arm
+                # exists to die with the ORIGINAL transport failure rather than
+                # the abandonment error, so the cause of the death survives.
                 raise
 
     raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])
