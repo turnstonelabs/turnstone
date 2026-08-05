@@ -645,9 +645,11 @@ def _raise_if_aborted(cancel_ref: Any, lane: ModelLane) -> None:
     Duck-typed on the same ``aborted`` predicate the drain-retry gate
     reads, so a ``None`` ref — most lanes — and a plain-list ref stay
     legal.  One definition, two call sites in :func:`model_turn`: entry,
-    and immediately before ``create_streaming``.  The credential resolve
-    between them is NOT re-checked — a mint already under way completes
-    even when the abort lands inside it, and only the request is skipped.
+    and immediately before ``create_streaming``.  Nothing interrupts the
+    credential resolve that runs between them — a mint already under way
+    completes even when the abort lands inside it.  The second read is
+    what turns such an abort into a skipped request rather than a sent
+    one, which is why it is not redundant with the first.
 
     The raised message is control flow, not prose.  ``_is_ctx_overflow``
     classifies an exception class it does not recognize by TEXT, so
