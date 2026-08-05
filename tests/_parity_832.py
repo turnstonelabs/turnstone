@@ -34,13 +34,52 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from tests._session_helpers import RecordingUI, make_session
+from turnstone.core.model_turn import ModelTurnResult
 from turnstone.core.providers._protocol import (
     ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
 )
-from turnstone.core.trajectory import Turn
+from turnstone.core.trajectory import ProviderNative, ToolCall, Turn
+
+
+def make_result(
+    content: str = "",
+    *,
+    tool_calls: list[dict[str, Any]] | None = None,
+    finish_reason: str = "stop",
+    usage: UsageInfo | None = None,
+    native_blocks: list[dict[str, Any]] | None = None,
+    producer: str = "openai-compatible",
+    wire_msgs: list[dict[str, Any]] | None = None,
+) -> ModelTurnResult:
+    """A ``ModelTurnResult`` shaped like the streaming wrapper's return —
+    triage recipe R1's patched-result form, for tests that only need "a
+    turn happened" and patch ``_stream_response`` wholesale.  The Turn and
+    the ``tool_calls`` mirror are built from the same dicts, preserving
+    the #825 pairing invariant fakes must not break."""
+    calls = list(tool_calls or [])
+    tc_tuple = tuple(
+        ToolCall(
+            id=tc.get("id", ""),
+            name=tc.get("function", {}).get("name", ""),
+            arguments=tc.get("function", {}).get("arguments", ""),
+        )
+        for tc in calls
+    )
+    native = (
+        ProviderNative(producer=producer, blocks=tuple(native_blocks)) if native_blocks else None
+    )
+    return ModelTurnResult(
+        turn=Turn.assistant(content, tool_calls=tc_tuple, native=native),
+        finish_reason=finish_reason,
+        usage=usage,
+        tool_calls=calls,
+        wire_msgs=wire_msgs,
+        producer=producer,
+    )
+
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "parity_832"
 UPDATE = os.environ.get("UPDATE_832_PARITY") == "1"
