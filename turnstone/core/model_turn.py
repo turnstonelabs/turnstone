@@ -15,12 +15,15 @@ Contract, held deliberately narrow:
 * **Policy-free.**  No retry, no deadline, no tool execution, no usage
   recording inside — those belong to each caller.  The callers are
   different organs (a judge is not a sub-agent is not a title generator);
-  the plant call is the one thing they share.  Two carve-outs, both about
-  a call that is already dead rather than about policy: the drain-retry
-  loop re-issues a mid-stream death, and an aborted ``cancel_ref`` raises
-  ``DeadlineCancelledError`` rather than dispatch — the caller still owns
-  the deadline, this only refuses to spend on a call already abandoned
-  (see ``Raises`` on :func:`model_turn`).
+  the plant call is the one thing they share.  Three carve-outs, each
+  about a call that is already dead rather than about policy: the
+  drain-retry loop re-issues a mid-stream death; an aborted ``cancel_ref``
+  raises ``DeadlineCancelledError`` rather than dispatch — the caller
+  still owns the deadline, this only refuses to spend on a call already
+  abandoned; and ``on_chunk`` DISABLES that drain retry — a
+  partially-surfaced stream is dead to silent re-issue, because a UI
+  already rendered its tokens and only the streaming caller can finalize
+  a display per attempt (see ``Raises`` on :func:`model_turn`).
 * **Providers stay codegen.**  The provider boundary keeps taking lowered
   wire dicts; Turn IR does not enter the provider Protocol, and
   ``lowering.py`` remains the only wire-mutation owner.  This module
@@ -43,15 +46,10 @@ from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
     from types import EllipsisType
 
     from turnstone.core.model_registry import ModelRegistry
-    from turnstone.core.providers._protocol import (
-        LLMProvider,
-        ModelCapabilities,
-        UsageInfo,
-    )
 
 from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
@@ -60,10 +58,30 @@ from turnstone.core.lowering import (
     restore_provider_tool_ids,
     sanitize_tool_call_arguments,
 )
+
+# Protocol names imported at runtime (not TYPE_CHECKING) and re-exported with
+# the explicit ``as`` idiom: post-#832 ``ChatSession`` types its provider
+# handles, chunk callback, and capabilities against THIS module, so the
+# provider package stays a single-import-site dependency of the plant layer.
+from turnstone.core.providers._protocol import (
+    LLMProvider as LLMProvider,
+)
+from turnstone.core.providers._protocol import (
+    ModelCapabilities as ModelCapabilities,
+)
+from turnstone.core.providers._protocol import (
+    StreamChunk as StreamChunk,
+)
+from turnstone.core.providers._protocol import (
+    UsageInfo as UsageInfo,
+)
 from turnstone.core.providers._protocol import (
     drain_stream,
     has_reasoning_bearing_block,
     thinking_off_template_kwargs,
+)
+from turnstone.core.providers._protocol import (
+    merge_usage as merge_usage,
 )
 from turnstone.core.storage._utils import (
     _CLIENT_TOOL_CALL_BLOCK_TYPES,
@@ -734,12 +752,20 @@ class ModelTurnResult:
     ``function.name`` / ``function.arguments`` dicts everywhere today.
     *finish_reason* / *usage* are transport facts, not trajectory content
     — which is why they ride the result, not the Turn.
+
+    *wire_msgs* is the exact lowered list handed to ``create_streaming``
+    (post every pass, including the caller's ``prepare_wire``) — the
+    main loop's token-table calibration reads it so the chars-per-token
+    estimate is computed against what the provider actually counted,
+    surviving lowerings the caller cannot see (#832; the successor of
+    the session's ``_wire_msgs`` message-dict carrier).
     """
 
     turn: Turn
     finish_reason: str
     usage: UsageInfo | None
     tool_calls: list[dict[str, Any]]
+    wire_msgs: list[dict[str, Any]] | None = None
 
     @property
     def content(self) -> str:
@@ -760,6 +786,26 @@ def cap_tool_calls(result: ModelTurnResult, max_calls: int) -> tuple[list[dict[s
     if len(result.tool_calls) > len(capped):
         turn = Turn.assistant(result.content, tool_calls=turn.tool_calls[: len(capped)])
     return capped, turn
+
+
+def _tee_chunks(
+    chunks: Iterator[StreamChunk],
+    on_chunk: Callable[[StreamChunk], None],
+) -> Iterator[StreamChunk]:
+    """Surface each chunk to *on_chunk* before the drain accumulates it.
+
+    Sits UPSTREAM of ``drain_stream``'s own ``transport_guarded`` wrapper, so
+    the callback observes exactly the chunk sequence the assembler consumes —
+    no more (transport deaths raise at ``next()`` and never reach the
+    callback) and no fewer (a callback raise at chunk N, the cancellation
+    path, discards N from display and assembly alike, matching the
+    interactive loop's check-before-dispatch ordering).  The callback's
+    exceptions propagate untouched: ``GenerationCancelled`` is a
+    ``BaseException``, invisible to the drain-retry arm by design.
+    """
+    for sc in chunks:
+        on_chunk(sc)
+        yield sc
 
 
 def _raise_if_aborted(cancel_ref: Any, lane: ModelLane) -> None:
@@ -798,6 +844,9 @@ def model_turn(
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     cancel_ref: list[Any] | None = None,
     backend_auth_token: str | None = None,
+    deferred_names: frozenset[str] | None = None,
+    prepare_wire: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+    on_chunk: Callable[[StreamChunk], None] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
 
@@ -872,11 +921,41 @@ def model_turn(
     reads the error at all, which is what keeps a Stop mid-summary off
     the red-error path.
 
+    *prepare_wire* is the caller's OWN deterministic lowering, composed
+    after the seam passes and before the Phase-5 attach — the main loop's
+    system-message prepend, sender labels, capability-sensitive system-turn
+    fold, empty-user drop, and orphan repair live here (#832), each a
+    ``lowering.py``-composed pass.  It must be pure lowering: no learned
+    selection, no provider calls, no side effects (the session's debug
+    request dump, a read-only latch, is the tolerated exception).  The
+    exact post-``prepare_wire``, post-attach list that went to the wire is
+    returned as ``ModelTurnResult.wire_msgs`` for caller-side calibration.
+
+    *deferred_names* passes through to ``create_streaming`` — the
+    tool-search deferred-loading set is per-call state (it grows as the
+    session discovers tools), which is why it is a parameter here and not
+    a ``ModelLane`` field.
+
+    *on_chunk* is the streaming surface (#832): each normalized
+    :class:`StreamChunk` is surfaced to the caller as it arrives — via a
+    tee UPSTREAM of the drain, so the callback sees exactly the sequence
+    the assembler consumes — and the fully assembled result is returned as
+    usual.  Chunk→UI translation is entirely the caller's business; the
+    canonical Turn always comes from the drain's assembly, never from
+    anything the callback accumulated.  A callback raise aborts the call
+    with that exception (the interactive cancellation path rides this:
+    ``GenerationCancelled`` is a ``BaseException`` and passes the retry
+    arm untouched).  **With *on_chunk* present the mid-stream drain retry
+    below is DISABLED** — the third and final policy carve-out: a
+    partially-surfaced stream must never be silently re-issued behind a
+    UI that already rendered its tokens; the streaming caller owns
+    re-issue, finalizing its display per attempt.
+
     Raises whatever the provider raises — retry/deadline/fallback policy
     is the caller's — EXCEPT transient mid-stream deaths: a failure the
     provider's own ``retryable_error_names`` recognizes, raised while
     DRAINING (``IncompleteStreamError`` and friends), is re-issued in
-    place up to ``_DRAIN_RETRIES`` times.  The retired non-streaming
+    place up to ``_DRAIN_RETRIES`` times (zero with *on_chunk*, above).  The retired non-streaming
     transport read the whole body inside the SDK's retried request, so
     single-shot callers never saw a mid-body wire blip; this loop is
     that retry's new home (request-time failures still get the SDK's own
@@ -913,6 +992,8 @@ def model_turn(
         sanitize_tool_call_arguments(dicts_from_turns(list(turns))),
         wire_id_map if wire_id_map is not None else {},
     )
+    if prepare_wire is not None:
+        wire = prepare_wire(wire)
     wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
     # The effort assignment scheme's lower rungs: explicit relay → lane
     # (operator) → in-code model definition → None.  None/unset knobs are
@@ -936,6 +1017,9 @@ def model_turn(
         if resolved_backend_auth
         else lane.client
     )
+    # A partially-surfaced stream is never silently re-issued (see the
+    # on_chunk docstring section) — the streaming caller owns re-issue.
+    drain_retries = 0 if on_chunk is not None else _DRAIN_RETRIES
     attempt = 0
     while True:
         # Last read before the wire — it covers everything the entry read is
@@ -959,6 +1043,7 @@ def model_turn(
             temperature=temperature if temperature is not None else lane.temperature,
             reasoning_effort=effective_effort,
             extra_params=lane.extra_params,
+            deferred_names=deferred_names,
             cancel_ref=cancel_ref,
             capabilities=lane.capabilities,
             replay_reasoning_to_model=resolve_replay_reasoning_to_model(
@@ -968,7 +1053,7 @@ def model_turn(
         )
         try:
             result = drain_stream(
-                chunks,
+                _tee_chunks(chunks, on_chunk) if on_chunk else chunks,
                 # A lane with no declared capabilities keeps the
                 # passthrough-server default: scan.
                 scan_inline_reasoning=not (
@@ -979,7 +1064,7 @@ def model_turn(
         except Exception as exc:
             attempt += 1
             if (
-                attempt > _DRAIN_RETRIES
+                attempt > drain_retries
                 or bool(getattr(cancel_ref, "aborted", False))
                 or type(exc).__name__ not in lane.provider.retryable_error_names
             ):
@@ -1058,4 +1143,5 @@ def model_turn(
         finish_reason=result.finish_reason,
         usage=result.usage,
         tool_calls=raw_calls,
+        wire_msgs=wire,
     )
