@@ -40,6 +40,7 @@ from turnstone.core.providers._protocol import (
     ToolCallDelta,
     UsageInfo,
 )
+from turnstone.core.trajectory import Turn
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "parity_832"
 UPDATE = os.environ.get("UPDATE_832_PARITY") == "1"
@@ -198,16 +199,17 @@ def run_scenario(name: str) -> dict[str, Any]:
     ui = RecordingUI()
     session = make_session(ui=ui)
     session._provider = scripted_provider(SCENARIOS[name])
-    msgs = [{"role": "user", "content": "hi"}]
+    session.messages.append(Turn.user("hi"))
 
     record: dict[str, Any] = {"scenario": name}
     try:
-        msg = session._stream_response(msgs, 0)
-        msg.pop("_wire_msgs", None)
+        result = session._stream_response(0)
         record["result"] = {
-            "content": msg.get("content", ""),
-            "tool_calls": msg.get("tool_calls"),
-            "provider_content": msg.get("_provider_content"),
+            "content": result.content,
+            "tool_calls": result.tool_calls or None,
+            "provider_content": (
+                [dict(b) for b in result.turn.native.blocks] if result.turn.native else None
+            ),
         }
         record["raised"] = None
     except BaseException as exc:  # noqa: BLE001 — the record IS the observation

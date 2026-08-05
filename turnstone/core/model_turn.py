@@ -59,6 +59,12 @@ from turnstone.core.lowering import (
     sanitize_tool_call_arguments,
 )
 
+# The provider FACTORY rides the same re-export seam: the session's
+# no-registry default construction is the one provider-construction site
+# left outside the registry, and routing it through here keeps the
+# provider package a plant-layer-only import.
+from turnstone.core.providers import create_provider as create_provider
+
 # Protocol names imported at runtime (not TYPE_CHECKING) and re-exported with
 # the explicit ``as`` idiom: post-#832 ``ChatSession`` types its provider
 # handles, chunk callback, and capabilities against THIS module, so the
@@ -759,6 +765,12 @@ class ModelTurnResult:
     estimate is computed against what the provider actually counted,
     surviving lowerings the caller cannot see (#832; the successor of
     the session's ``_wire_msgs`` message-dict carrier).
+
+    *producer* is the SERVING lane's provider name — the same identity
+    stamped on ``turn.native`` when a native lane exists, carried
+    separately so a native-less turn still records who produced it (the
+    storage row's ``producer`` column; pre-fold this read the session's
+    PRIMARY binding and mislabeled fallback-served turns).
     """
 
     turn: Turn
@@ -766,6 +778,7 @@ class ModelTurnResult:
     usage: UsageInfo | None
     tool_calls: list[dict[str, Any]]
     wire_msgs: list[dict[str, Any]] | None = None
+    producer: str = ""
 
     @property
     def content(self) -> str:
@@ -1144,4 +1157,5 @@ def model_turn(
         usage=result.usage,
         tool_calls=raw_calls,
         wire_msgs=wire,
+        producer=lane.provider.provider_name,
     )
