@@ -10,7 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from turnstone.core.streaming_text import split_inline_reasoning, strip_blank_edge_lines
+from turnstone.core.streaming_text import (
+    partial_tag_tail,
+    split_inline_reasoning,
+    strip_blank_edge_lines,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -247,8 +251,15 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
         yield sc
 
 
-def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
+def drain_stream(
+    chunks: Iterator[StreamChunk], *, scan_inline_reasoning: bool = True
+) -> CompletionResult:
     """Drain a ``create_streaming`` iterator into a ``CompletionResult``.
+
+    *scan_inline_reasoning* ``False`` (``capabilities.server_parses_reasoning``
+    — the backend puts reasoning in its own channel) skips the inline
+    split: there is none to find, and the scan could only misroute prose
+    that quotes a tag.
 
     The ONE non-streaming transport: single-shot callers (``model_turn``)
     sample through the provider's streaming entry and accumulate here, so
@@ -316,11 +327,24 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     usage: UsageInfo | None = None
     finish_reason: str | None = None
     provider_blocks: list[dict[str, Any]] = []
+    tag_carry = ""
 
-    def _close_segment() -> None:
-        if segment_parts:
-            content_segments.append("".join(segment_parts))
-            segment_parts.clear()
+    def _close_segment(*, carry_tail: bool = False) -> None:
+        # *carry_tail* (the reasoning_delta boundary): hold back a
+        # possible partial tag for the NEXT run — a reasoning delta
+        # cannot terminate a tag, so a tag the server split across it
+        # must reassemble ('…<thi' + delta + 'nk>…'), or the halves
+        # would pass through as visible content.  Tool boundaries close
+        # WITHOUT carry: no tag spans a tool call (the interactive
+        # consumer's flush-at-tool-boundary rule).
+        nonlocal tag_carry
+        seg = tag_carry + "".join(segment_parts)
+        segment_parts.clear()
+        tag_carry = partial_tag_tail(seg) if carry_tail else ""
+        if tag_carry:
+            seg = seg[: -len(tag_carry)]
+        if seg:
+            content_segments.append(seg)
 
     for sc in transport_guarded(chunks):
         # Content accumulates in RUNS bounded by interleaving signals
@@ -338,7 +362,7 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
         # run exactly as the interactive consumer emits it.
         if sc.reasoning_delta:
             reasoning_parts.append(sc.reasoning_delta)
-            _close_segment()
+            _close_segment(carry_tail=True)
         if sc.content_delta:
             segment_parts.append(sc.content_delta)
         if sc.tool_call_deltas:
@@ -369,7 +393,9 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     # distinguish tag residue from a genuine paragraph separator the
     # model emitted just before an interleaving signal — trimming each
     # run's edges fused sentences across the separator-less join.
-    split_segments = [split_inline_reasoning(seg) for seg in content_segments]
+    split_segments = [
+        split_inline_reasoning(seg, scan_tags=scan_inline_reasoning) for seg in content_segments
+    ]
     content = "".join(c for c, _ in split_segments)
     extracted = "".join(r for _, r in split_segments)
     # The splitter can only REMOVE characters, so a shrunken total is the
@@ -429,6 +455,16 @@ class ModelCapabilities:
     # Ignored when thinking_mode is "none" or by providers that handle
     # thinking natively (real Anthropic).
     thinking_param: str = "enable_thinking"
+    # The backend segregates model reasoning into its OWN channel
+    # (``reasoning_content`` deltas, native reasoning blocks) instead of
+    # leaving it in the content stream — a vLLM launched with a reasoning
+    # parser, a commercial provider.  True turns the inline tag scan OFF
+    # everywhere (drain seam and interactive consumer alike): content is
+    # trusted verbatim, so prose that merely QUOTES a tag can no longer be
+    # misrouted, and the lanes that need no reasoning stop suppressing it
+    # (segregated reasoning costs the caller nothing).  Default False is
+    # the passthrough-server fallback this whole dialect exists for.
+    server_parses_reasoning: bool = False
     # For local-server lanes (openai-compatible, anthropic-compatible):
     # the chat_template_kwargs key that carries a graded reasoning-effort
     # value, for templates that have one (e.g. "reasoning_effort" for
@@ -688,6 +724,32 @@ def reasoning_template_kwargs(
         if effort:
             updates[effort_param] = effort
     return updates
+
+
+def thinking_off_template_kwargs(thinking_mode: str, thinking_param: str) -> dict[str, Any]:
+    """``chat_template_kwargs`` that turn the template's thinking toggle OFF.
+
+    THE spelling of "this lane needs no reasoning", shared by every lane
+    that asks the model for a bounded artifact rather than a considered
+    answer: omni transcription (:func:`audio._omni_chat_extra_body`) and
+    the drained utility completions (title, compaction, web-fetch
+    extraction).  Those lanes pay for reasoning twice — latency, and a
+    chain-of-thought that lands in the artifact whenever the server does
+    not segregate it (#940: the leaked reasoning then rides every
+    following turn as tool-result context).
+
+    Only the DECLARED toggle is sent — the alias's own
+    ``thinking_param``, and only at a ``thinking_mode`` that has a toggle
+    at all.  A model that declares none keeps its template default: this
+    is not a licence to guess a key.  Note ``adaptive`` deliberately
+    always sends ``true`` through :func:`reasoning_template_kwargs` (the
+    knob may not force-disable a self-regulating model), so a lane that
+    genuinely needs silence must pin the key itself — that pin wins,
+    since the merge only ``setdefault``s.
+    """
+    if thinking_param and thinking_mode in ("manual", "adaptive"):
+        return {thinking_param: False}
+    return {}
 
 
 def merge_reasoning_template_kwargs(

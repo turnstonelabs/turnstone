@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
+from turnstone.core.providers._protocol import ModelCapabilities
 from turnstone.core.trajectory import Role
 
 # ---------------------------------------------------------------------------
@@ -28,10 +29,13 @@ def _make_mock_provider(
     """Create a mock LLM provider that returns a fixed response."""
     provider = MagicMock()
     provider.provider_name = "openai"
-    caps = MagicMock()
-    caps.context_window = 100_000
-    caps.max_output_tokens = 4096
-    provider.get_capabilities.return_value = caps
+    # A REAL ModelCapabilities, never a MagicMock: every attribute of a
+    # mock is truthy, so any boolean capability the code consults (the
+    # drain's ``server_parses_reasoning`` scan gate, and whatever field
+    # lands next) would silently flip behavior for the whole suite.
+    provider.get_capabilities.return_value = ModelCapabilities(
+        context_window=100_000, max_output_tokens=4096
+    )
 
     if side_effect:
         provider.create_streaming.side_effect = side_effect
@@ -70,7 +74,9 @@ def _make_judge(
         session_provider=provider,
         session_client=client,
         session_model="test-model",
-        session_capabilities=MagicMock(context_window=100_000),
+        # Real caps for the same reason as in ``_make_mock_provider`` —
+        # the judge PREFERS session_capabilities over the provider's.
+        session_capabilities=ModelCapabilities(context_window=100_000),
     )
 
 
@@ -365,10 +371,9 @@ class TestMultiTurnToolUse:
         """Provider requests read_file, then returns verdict."""
         provider = MagicMock()
         provider.provider_name = "openai"
-        caps = MagicMock()
-        caps.context_window = 100_000
-        caps.max_output_tokens = 4096
-        provider.get_capabilities.return_value = caps
+        provider.get_capabilities.return_value = ModelCapabilities(
+            context_window=100_000, max_output_tokens=4096
+        )
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Turn 1: tool call
@@ -405,10 +410,9 @@ class TestMultiTurnToolUse:
         """Provider keeps requesting tools — stops at _JUDGE_MAX_TURNS."""
         provider = MagicMock()
         provider.provider_name = "openai"
-        caps = MagicMock()
-        caps.context_window = 100_000
-        caps.max_output_tokens = 4096
-        provider.get_capabilities.return_value = caps
+        provider.get_capabilities.return_value = ModelCapabilities(
+            context_window=100_000, max_output_tokens=4096
+        )
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Every turn returns a tool call
@@ -937,7 +941,7 @@ class TestModelAliasResolution:
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="https://s/v1", api_key="s"),
             session_model="session-model",
-            session_capabilities=MagicMock(context_window=100_000),
+            session_capabilities=ModelCapabilities(context_window=100_000),
             model_registry=registry,
         )
         # Merged at construction: overrides applied, untouched fields survive.
@@ -975,7 +979,7 @@ class TestModelAliasResolution:
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="https://s/v1", api_key="s"),
             session_model="session-model",
-            session_capabilities=MagicMock(context_window=100_000),
+            session_capabilities=ModelCapabilities(context_window=100_000),
             model_registry=registry,
         )
         assert registry.get_config.call_count == 0
@@ -1086,7 +1090,7 @@ class TestModelAliasResolution:
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="http://s", api_key="s"),
             session_model="session-model",
-            session_capabilities=MagicMock(context_window=100_000),
+            session_capabilities=ModelCapabilities(context_window=100_000),
             model_registry=registry,
         )
         assert judge._judge_context_window == 100_000  # session window, not 0
@@ -1114,7 +1118,7 @@ class TestModelAliasResolution:
             session_provider=session_provider,
             session_client=session_client,
             session_model="session-default-model",
-            session_capabilities=MagicMock(context_window=100_000),
+            session_capabilities=ModelCapabilities(context_window=100_000),
             model_registry=registry,
         )
 
@@ -1142,7 +1146,7 @@ class TestModelAliasResolution:
                 session_provider=_make_mock_provider(),
                 session_client=MagicMock(base_url="https://s/v1", api_key="s"),
                 session_model="session-model",
-                session_capabilities=MagicMock(context_window=100_000),
+                session_capabilities=ModelCapabilities(context_window=100_000),
                 model_registry=registry,
             )
 

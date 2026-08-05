@@ -24,8 +24,11 @@ def test_text_joins_only_textblocks() -> None:
         Role.USER,
         (TextBlock("look at "), AttachmentRef("sha-1", "image"), TextBlock("this")),
     )
-    # Attachment blocks contribute nothing to the FTS/text projection.
-    assert turn.text == "look at this"
+    # Attachment blocks contribute nothing to the FTS/text projection, and
+    # adjacent text blocks join with a NEWLINE — they are distinct spans,
+    # and a bare concatenation fused words across block boundaries in
+    # every flattened read (notification bodies, final_assistant_text).
+    assert turn.text == "look at \nthis"
 
 
 def test_user_helper() -> None:

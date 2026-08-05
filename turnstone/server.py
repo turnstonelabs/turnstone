@@ -2224,16 +2224,6 @@ def _validate_notify_targets(raw: Any) -> tuple[str, str]:
     return json.dumps(normalized), ""
 
 
-def _extract_last_assistant_content(session: Any) -> str:
-    """Return the text of the session's final assistant say.
-
-    THE final-say read (``trajectory.final_assistant_text``): no
-    walk-back, whitespace-only says report empty — so the notify
-    fallback fires instead of sending raw whitespace.
-    """
-    return final_assistant_text(session.messages)
-
-
 def _fire_notify_targets(ws: Any, content: str) -> None:
     """Send completion notifications to all configured targets."""
     if not ws.notify_targets:
@@ -2816,7 +2806,10 @@ async def _interactive_create_post_install(
                 # empty-content "(Task completed)" fallback, not "Failed:" —
                 # is deferred to #865.
                 try:
-                    last_content = _extract_last_assistant_content(session)
+                    # THE final-say read: no walk-back, whitespace-only
+                    # says report empty — so the notify fallback fires
+                    # instead of sending raw whitespace.
+                    last_content = final_assistant_text(session.messages)
                     _fire_notify_targets(ws, last_content)
                 except Exception:
                     log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)

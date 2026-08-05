@@ -159,6 +159,10 @@ CASES: tuple[DialectCase, ...] = (
         # OPEN tag in legitimate prose misroutes the remainder — the same
         # false positive the interactive splitter has carried in the
         # field.  This pin makes any future fix a conscious change.
+        # Scope note: R2 applies only where the scan runs — a backend
+        # declaring ``server_parses_reasoning`` turns the scan off and
+        # this utterance passes through byte-identical (pinned in
+        # test_scan_tags_off_returns_every_utterance_byte_identical).
         id="literal_open_tag_false_positive_r2",
         utterance="The `<think>` tag opens a block.",
         content="The `",

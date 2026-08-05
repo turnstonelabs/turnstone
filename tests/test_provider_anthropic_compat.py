@@ -313,6 +313,19 @@ class TestCompatReasoningControl:
             "foo": 1,
         }
 
+    def test_utility_pin_survives_adaptive_injection(self) -> None:
+        """The exact pair ``lane_without_thinking`` relies on: an adaptive
+        model's injection always sends ``true``, but the utility lanes'
+        pinned ``false`` is already present in extra_params and existing
+        keys win — the pin reaches the wire."""
+        caps = dataclasses.replace(self._MANUAL_CAPS, thinking_mode="adaptive")
+        kwargs = self._stream_kwargs(
+            caps,
+            "high",
+            extra_params={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+
     def test_caller_extra_params_not_mutated(self) -> None:
         """The session's extra_params dict must never be written through."""
         extra = {"chat_template_kwargs": {"foo": 1}}

@@ -1859,16 +1859,17 @@ class TestTitleRetry:
     def test_title_strips_reasoning_variants(self, tmp_db):
         """Reasoning reaches ``content`` in several shapes the title pass must
         survive: an opener-absent ``…</think>`` (templates that pre-inject the
-        opening tag), a paired ``<reasoning>`` block, and a trailing
-        explanation after the title (only the first non-empty line is kept).
+        opening tag), a paired ``<reasoning>`` block, trailing prose after the
+        title (an explanation sentence, a short sign-off, a parenthetical —
+        each rejected by the word cap or the ends-alphanumeric check, so the
+        end-first scan still lands on the title), an over-cap padded answer
+        (kept via the last-line fallback rather than replaced by a
+        reasoning fragment from higher up), and a CJK title whose trailing
+        explanation whitespace-counts as one word but ends in terminal
+        punctuation.
 
-        The last two cases pin the BOTH-VOCABULARY shape in either order.
-        The peel walks the close-tag vocabularies in sequence, which is
-        equivalent to one cut after whichever close occurs last: the
-        remainder of the first cut begins after the last ``</think>``, so a
-        ``</reasoning>`` still found in it is necessarily the later tag.
-        Title text after the last stray close always survives; only
-        reasoning between the tags is dropped."""
+        Two cases pin the BOTH-VOCABULARY peel shape in either order — the
+        cut lands after whichever close tag occurs LAST."""
         from turnstone.core.providers._protocol import ModelCapabilities
 
         cases = [
@@ -1878,6 +1879,13 @@ class TestTitleRetry:
                 "Cluster Health Digest",
             ),
             ("Auth Layer Refactor\n\nThis title captures the request well.", "Auth Layer Refactor"),
+            ("Fix Login Bug\n\nHope this helps!", "Fix Login Bug"),
+            ("Alembic Migration Fix\n\n(3 words)", "Alembic Migration Fix"),
+            (
+                "Hmm, let me reconsider.\n\nAlembic Async Migration Failure Debugging Session",
+                "Alembic Async Migration Failure Debugging Session",
+            ),
+            ("数据库迁移问题\n\n这个标题很好地概括了用户的请求。", "数据库迁移问题"),
             (
                 "weighing</reasoning>still weighing</think>\n\nRendezvous Routing",
                 "Rendezvous Routing",
@@ -1905,9 +1913,77 @@ class TestTitleRetry:
                 session._generate_title()
             assert captured.get("title") == expected, (content, captured)
 
+    def test_title_from_unmarked_reasoning_takes_the_answer(self, tmp_db):
+        """A server can leave reasoning inline and entirely UNMARKED — no open
+        tag, no close tag, no ``reasoning_content`` — so there is nothing for
+        the seam to segregate and nothing for the lane to peel.  Measured on
+        the dev vLLM (qwen3.6-27b, 20 sampled responses): the chain-of-thought
+        opens with a ``Thinking Process:`` heading, which BECAME the title.
+
+        The answer is last and honors the prompt's word cap; the reasoning
+        lines around it do not."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        session._title_generated = True
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
+        result = mock_completion_result()
+        # Condensed from a captured qwen3.6-27b streamed response.
+        result.content = (
+            "Thinking Process:\n"
+            "1.  **Analyze the Request:** The user wants a title of at most 3 words.\n"
+            "2.  **Brainstorm:** Alembic Migration Failure, Migration Debugging.\n"
+            "6.  **Final Output Generation:** Alembic Migration Fix\n"
+            "\n\n"
+            "Alembic Migration Fix"
+        )
+        session._provider = MagicMock()
+        session._provider.get_capabilities.return_value = ModelCapabilities()
+        session._provider.create_streaming.return_value = as_stream(result)
+
+        captured: dict[str, str] = {}
+        with patch(
+            "turnstone.core.session.update_workstream_title",
+            side_effect=lambda ws_id, title: captured.update(title=title),
+        ):
+            session._generate_title()
+
+        assert captured["title"] == "Alembic Migration Fix"
+
+    def test_title_peel_off_when_backend_segregates(self, tmp_db):
+        """On a backend that segregates reasoning (``server_parses_reasoning``)
+        a close tag in content IS quoted prose — the title lane's cosmetic
+        peel is off there, like the seam's scan, so a title that mentions
+        the tag survives intact."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        session._title_generated = True
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
+        result = mock_completion_result()
+        result.content = "Fixing </think> Leak"
+        session._provider = MagicMock()
+        session._provider.provider_name = "openai-compatible"
+        session._provider.get_capabilities.return_value = ModelCapabilities(
+            server_parses_reasoning=True
+        )
+        session._provider.create_streaming.return_value = as_stream(result)
+
+        captured: dict[str, str] = {}
+        with patch(
+            "turnstone.core.session.update_workstream_title",
+            side_effect=lambda ws_id, title: captured.update(title=title),
+        ):
+            session._generate_title()
+
+        assert captured["title"] == "Fixing </think> Leak"
+
     def test_title_truncates_to_max_chars(self, tmp_db):
         """The ``[:_TITLE_MAX_CHARS]`` slice is the only length guard now that
-        the persist-time ``title[:80]`` is gone — a long title is bounded."""
+        the persist-time ``title[:80]`` is gone — a long title is bounded.
+
+        No line here honors the word cap, so the scan falls back to the last
+        non-empty line rather than yielding nothing."""
         from turnstone.core.providers._protocol import ModelCapabilities
         from turnstone.core.session import _TITLE_MAX_CHARS
 
@@ -7516,6 +7592,104 @@ def test_utility_completion_defers_temperature_to_session():
     session._utility_completion([Turn.user("hi")], temperature=0.9)
     _, kw2 = session._provider.create_streaming.call_args
     assert kw2["temperature"] == 0.9  # explicit override still honored
+
+
+def test_utility_completion_asks_a_passthrough_backend_for_no_reasoning():
+    """#940: a server that does not segregate reasoning leaves it in
+    ``content``, and when it arrives UNMARKED the seam cannot lift it out —
+    the chain-of-thought becomes the artifact (the web-fetch tool result,
+    then every following turn's context).  The bounded-artifact lanes
+    therefore ask for none through EVERY channel: the alias's OWN declared
+    toggle pinned off (over any operator ``server_compat`` flag, surviving
+    the provider's adaptive-``true`` injection), the model definition's
+    default-effort rung cleared, and the caller's relayed effort knob
+    zeroed — an effort value beside a pinned-off toggle re-requests the
+    reasoning the pin declined."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+    session = _make_session()
+    session._provider = MagicMock()
+    session._provider.provider_name = "openai-compatible"
+    session._provider.get_capabilities.return_value = ModelCapabilities(
+        thinking_mode="adaptive",
+        thinking_param="enable_thinking",
+        default_reasoning_effort="high",
+    )
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
+
+    # The web-fetch relay shape: an explicit caller effort rides in.
+    session._utility_completion([Turn.user("hi")], reasoning_effort="high")
+    _, kw = session._provider.create_streaming.call_args
+    assert kw["extra_params"]["chat_template_kwargs"] == {"enable_thinking": False}
+    # Neither the caller rung nor the definition's default survives.
+    assert kw["reasoning_effort"] is None
+
+
+def test_utility_completion_suppresses_effort_on_toggle_less_passthrough():
+    """A passthrough box with NO template toggle (thinking_mode="none",
+    effort-passthrough) has no off switch — but the effort channel alone is
+    a reasoning request, so the utility lanes omit it entirely rather than
+    asking a non-segregating box for more chain-of-thought."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+    session = _make_session()
+    session._provider = MagicMock()
+    session._provider.provider_name = "openai-compatible"
+    session._provider.get_capabilities.return_value = ModelCapabilities(
+        thinking_mode="none",
+        effort_passthrough=True,
+        default_reasoning_effort="high",
+    )
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
+
+    session._utility_completion([Turn.user("hi")], reasoning_effort="high")
+    _, kw = session._provider.create_streaming.call_args
+    assert kw["reasoning_effort"] is None
+    # No toggle declared → no guessed key.
+    assert (kw["extra_params"] or {}).get("chat_template_kwargs") is None
+
+
+def test_utility_completion_keeps_reasoning_when_the_backend_segregates_it():
+    """The pin is remediation for a lane that cannot separate reasoning from
+    the artifact.  A backend that puts reasoning in its own channel has no
+    such problem, so nothing is suppressed — reasoning there costs the
+    artifact nothing, and silencing a model the operator chose for its
+    reasoning would be the harness overriding them for no gain."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+    session = _make_session()
+    session._provider = MagicMock()
+    session._provider.provider_name = "openai-compatible"
+    session._provider.get_capabilities.return_value = ModelCapabilities(
+        thinking_mode="adaptive",
+        thinking_param="enable_thinking",
+        server_parses_reasoning=True,
+    )
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
+
+    session._utility_completion([Turn.user("hi")], reasoning_effort="high")
+    _, kw = session._provider.create_streaming.call_args
+    assert (kw["extra_params"] or {}).get("chat_template_kwargs") is None
+    # The relayed effort knob stands — the operator chose a reasoning
+    # model whose reasoning costs the artifact nothing.
+    assert kw["reasoning_effort"] == "high"
+
+
+def test_utility_completion_never_guesses_a_toggle_key():
+    """A model that declares no thinking toggle keeps its template default:
+    the pin sends the alias's declared key or nothing at all.  Inventing one
+    would flip a lever the operator never wired."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+    session = _make_session()
+    session._provider = MagicMock()
+    session._provider.provider_name = "openai-compatible"
+    session._provider.get_capabilities.return_value = ModelCapabilities(thinking_mode="none")
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
+
+    session._utility_completion([Turn.user("hi")])
+    _, kw = session._provider.create_streaming.call_args
+    assert (kw["extra_params"] or {}).get("chat_template_kwargs") is None
 
 
 def test_web_fetch_extraction_inherits_session_max_tokens_and_effort():

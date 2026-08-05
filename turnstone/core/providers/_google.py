@@ -46,6 +46,10 @@ _GOOGLE_DEFAULT = ModelCapabilities(
     max_output_tokens=65_536,
     supports_temperature=True,
     supports_vision=True,
+    # The commercial endpoint segregates reasoning natively (thought
+    # parts / ``reasoning_content`` on the compat surface) — content
+    # never carries inline think tags, so the inline tag scan is off.
+    server_parses_reasoning=True,
     # Gemini's OpenAI-compat endpoint accepts max_tokens (not
     # max_completion_tokens which is OpenAI Responses-specific).
     token_param="max_tokens",

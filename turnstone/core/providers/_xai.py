@@ -40,6 +40,7 @@ reasoning-replay behaviour.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from turnstone.core.providers._openai_common import resolve_server_side_tools
@@ -128,7 +129,18 @@ _GROK_DEFAULT = ModelCapabilities(
     max_output_tokens=64_000,
     supports_web_search=True,
     server_side_tools=("web_search",),
+    # The commercial endpoint segregates reasoning natively
+    # (``reasoning_content``) — content never carries inline think tags,
+    # so the inline tag scan is off; the table transform below applies
+    # the same rule to every known entry.
+    server_parses_reasoning=True,
 )
+
+# ONE rule for the whole table — a per-entry flag would be forgotten on
+# the next model row (see the default's comment).
+GROK_CAPABILITIES = {
+    name: replace(caps, server_parses_reasoning=True) for name, caps in GROK_CAPABILITIES.items()
+}
 
 
 def lookup_grok_capabilities(model: str) -> ModelCapabilities:

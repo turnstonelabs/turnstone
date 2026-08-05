@@ -200,6 +200,53 @@ def test_one_shot_passthrough_byte_identity(case):
 
 
 @pytest.mark.parametrize("case", DIALECT_CASES, ids=[c.id for c in DIALECT_CASES])
+def test_scan_tags_off_returns_every_utterance_byte_identical(case):
+    """``server_parses_reasoning`` backends put reasoning in their own
+    channel, so content carries none — the scan is turned OFF and EVERY
+    catalog utterance passes through untouched, including the ones the
+    scan would otherwise consume.  This is what buys back residual R2:
+    prose that merely QUOTES a tag can no longer be misrouted."""
+    content, reasoning = split_inline_reasoning(case.utterance, scan_tags=False)
+    assert content == case.utterance
+    assert reasoning == ""
+
+
+def test_session_consumer_scan_follows_server_parses_reasoning():
+    """The interactive consumer wires ``scan_tags`` from the SAME capability
+    the drain seam reads (``server_parses_reasoning``), so the two lanes
+    cannot disagree.  With the flag declared, streamed tag text reaches the
+    UI verbatim as content — it is prose on such a backend, not a
+    boundary."""
+    from turnstone.core.providers._protocol import ModelCapabilities
+
+    session = make_session()
+    session._cached_capabilities = ModelCapabilities(server_parses_reasoning=True)
+    ui = _TokenRecorderUI()
+    session.ui = ui
+    msg = session._stream_attempt(iter([_c("<think>quoted</think>answer"), _FINISH]))
+    assert msg["content"] == "<think>quoted</think>answer"
+    assert all(kind == "content" for kind, _ in ui.tokens)
+
+
+def test_scan_tags_off_holds_no_carry_and_honors_out_of_band_state():
+    """With the scan off there is nothing to resolve, so nothing is held:
+    every span emits immediately at the current state.  The state machine
+    stays live — the consumer still writes ``in_think`` for the
+    provider-parsed reasoning transitions, which is the whole point on a
+    backend that segregates."""
+    events = []
+    splitter = ThinkTagSplitter(
+        lambda text, is_reasoning: events.append((text, is_reasoning)), scan_tags=False
+    )
+    splitter.feed("a<think>b</think>c")
+    assert events == [("a<think>b</think>c", False)]
+    assert splitter.pending == ""
+    splitter.in_think = True
+    splitter.feed("<think>still content-lane text")
+    assert events[-1] == ("<think>still content-lane text", True)
+
+
+@pytest.mark.parametrize("case", DIALECT_CASES, ids=[c.id for c in DIALECT_CASES])
 def test_one_shot_equivalent_to_streaming_over_random_chunkings(case):
     """One-shot ≡ the streaming class fed the same utterance in arbitrary
     chunkings, EXACTLY — the one-shot is a pure raw split with no rules of

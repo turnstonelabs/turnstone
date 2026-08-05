@@ -36,6 +36,14 @@ class ThinkTagSplitter:
     Tag selection: at each step the EARLIEST occurrence wins among the
     tag variants for the current state (open tags outside a block, close
     tags inside).
+
+    *scan_tags* ``False`` turns the tag scan OFF for backends that
+    segregate reasoning themselves (``capabilities.server_parses_reasoning``
+    — a vLLM launched with a reasoning parser, a commercial provider):
+    spans pass straight through at the current state, so prose that merely
+    QUOTES a tag can no longer be misrouted, and no carry is held.  The
+    state machine stays live either way — :attr:`in_think` still mirrors
+    the out-of-band transitions its consumer writes.
     """
 
     OPEN_TAGS: tuple[str, ...] = ("<think>", "<reasoning>")
@@ -43,8 +51,9 @@ class ThinkTagSplitter:
     ALL_TAGS: tuple[str, ...] = OPEN_TAGS + CLOSE_TAGS
     MAX_TAG_LEN = max(len(t) for t in ALL_TAGS)
 
-    def __init__(self, emit: Callable[[str, bool], None]) -> None:
+    def __init__(self, emit: Callable[[str, bool], None], *, scan_tags: bool = True) -> None:
         self._emit = emit
+        self._scan_tags = scan_tags
         self.pending = ""
         self.in_think = False
 
@@ -64,6 +73,12 @@ class ThinkTagSplitter:
             self.pending = ""
 
     def _drain(self) -> None:
+        if not self._scan_tags:
+            # Nothing to resolve, so nothing to hold: a tag-free contract
+            # makes every span immediately safe — the same emit
+            # ``flush_pending`` performs at a stream boundary.
+            self.flush_pending()
+            return
         while self.pending:
             tags = self.CLOSE_TAGS if self.in_think else self.OPEN_TAGS
             best_idx, best_tag = None, None
@@ -90,8 +105,32 @@ class ThinkTagSplitter:
             break
 
 
-def split_inline_reasoning(text: str) -> tuple[str, str]:
+def partial_tag_tail(text: str) -> str:
+    """The longest suffix of *text* that could still grow into a tag.
+
+    Tag-vocabulary knowledge for boundary handling: a consumer that must
+    finalize a span at an interleaving signal (``drain_stream`` closing a
+    content run at a ``reasoning_delta``) uses this to hold back ONLY a
+    possible partial tag for the next span — reassembling a tag the
+    server split across the signal — while everything decided emits with
+    the span it arrived in.  Returns ``""`` when no suffix is a proper
+    prefix of any tag (a complete tag is not a partial one).
+    """
+    limit = min(len(text), ThinkTagSplitter.MAX_TAG_LEN - 1)
+    for size in range(limit, 0, -1):
+        suffix = text[-size:]
+        if any(tag.startswith(suffix) for tag in ThinkTagSplitter.ALL_TAGS):
+            return suffix
+    return ""
+
+
+def split_inline_reasoning(text: str, *, scan_tags: bool = True) -> tuple[str, str]:
     """Split a complete drained text into ``(content, reasoning)``.
+
+    *scan_tags* ``False`` (the backend segregates reasoning itself —
+    ``capabilities.server_parses_reasoning``) returns the text unsplit:
+    there is no inline reasoning to find, and scanning could only
+    misroute prose that quotes a tag.
 
     The one-shot form of :class:`ThinkTagSplitter` for non-streaming
     consumers (``drain_stream``): a plain feed-and-flush of ONE content
@@ -99,7 +138,10 @@ def split_inline_reasoning(text: str) -> tuple[str, str]:
     run boundaries (``drain_stream`` closes a run when tool-call deltas
     or provider-parsed reasoning interleave, mirroring the interactive
     consumer's flush-and-reset at those signals); a partial tag never
-    spans an interleaving signal.  Balanced
+    spans a TOOL boundary, and across a reasoning delta the caller
+    carries a possible partial-tag tail into the next run
+    (:func:`partial_tag_tail`) so a tag the server split there still
+    reassembles.  Balanced
     blocks land in the reasoning lane; an unterminated open sends the
     tail to reasoning; an orphan CLOSE tag (no prior open) stays in
     content untouched.  That last case is deliberate: a close tag whose
@@ -120,7 +162,7 @@ def split_inline_reasoning(text: str) -> tuple[str, str]:
     survive).  With no tag present anywhere the input returns
     byte-identical (fast path), so tag-free lanes cannot drift.
     """
-    if not any(tag in text for tag in ThinkTagSplitter.ALL_TAGS):
+    if not scan_tags or not any(tag in text for tag in ThinkTagSplitter.ALL_TAGS):
         return text, ""
 
     content_parts: list[str] = []

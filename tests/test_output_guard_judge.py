@@ -26,10 +26,12 @@ def _make_provider(
     """Build a mock LLMProvider whose create_streaming returns the given content."""
     provider = MagicMock()
     provider.provider_name = "openai"
-    # The judge reads context_window at construction for its oversize guard.
-    caps = MagicMock()
-    caps.context_window = 200_000
-    provider.get_capabilities = MagicMock(return_value=caps)
+    # The judge reads context_window at construction for its oversize
+    # guard.  A REAL ModelCapabilities, never a MagicMock: every mock
+    # attribute is truthy, so any boolean capability the code consults
+    # (the drain's ``server_parses_reasoning`` scan gate, and whatever
+    # field lands next) would silently flip behavior for the suite.
+    provider.get_capabilities = MagicMock(return_value=ModelCapabilities(context_window=200_000))
 
     def _create_streaming(**_kwargs: Any) -> Any:
         if delay:
@@ -130,7 +132,7 @@ class TestCapabilityThreading:
             session_provider=_make_provider(),
             session_client=client,
             session_model="m",
-            session_capabilities=MagicMock(context_window=100_000),
+            session_capabilities=ModelCapabilities(context_window=100_000),
             model_registry=registry,
         )
         judge._create_client = lambda: client  # type: ignore[method-assign]
@@ -358,7 +360,9 @@ class TestOversizeGuard:
         local model and would leave the guard blind to overflow."""
         provider = _make_provider(content='{"risk_level": "none", "flags": []}')
         # provider caps report the fictitious 200k; the guard must ignore it.
-        provider.get_capabilities = MagicMock(return_value=MagicMock(context_window=200_000))
+        provider.get_capabilities = MagicMock(
+            return_value=ModelCapabilities(context_window=200_000)
+        )
         judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True),  # no output_guard_model
             session_provider=provider,
@@ -366,7 +370,7 @@ class TestOversizeGuard:
             session_model="test-model",
             # The session's real window rides in the resolved caps the caller
             # passes; the guard must key off it, not provider.get_capabilities().
-            session_capabilities=MagicMock(context_window=40_000),
+            session_capabilities=ModelCapabilities(context_window=40_000),
         )
         assert judge._judge_context_window == 40_000
 
@@ -393,7 +397,7 @@ class TestOversizeGuard:
             session_client=MagicMock(base_url="http://s", api_key="s"),
             session_model="m",
             model_registry=registry,
-            session_capabilities=MagicMock(context_window=64_000),
+            session_capabilities=ModelCapabilities(context_window=64_000),
         )
         assert alias_judge._judge_context_window == 64_000
 

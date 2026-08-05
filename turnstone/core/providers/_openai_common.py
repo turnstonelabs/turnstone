@@ -8,6 +8,7 @@ formatting, and message sanitisation live here so both
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from typing import Any
 
 import structlog
@@ -170,8 +171,19 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
     ),
 }
 
+# The commercial endpoint segregates reasoning natively (Responses
+# reasoning items / ``reasoning_content``) — content never carries inline
+# think tags, so the inline tag scan is off for every entry, known or
+# defaulted, as ONE rule applied to the whole table (a per-entry flag
+# would be forgotten on the next model row).  The compat default below is
+# deliberately NOT covered: local checkpoints are exactly the
+# passthrough dialect the scan exists for.
+OPENAI_CAPABILITIES = {
+    name: replace(caps, server_parses_reasoning=True) for name, caps in OPENAI_CAPABILITIES.items()
+}
+
 # Default for unknown models on the commercial lane.
-OPENAI_DEFAULT = ModelCapabilities()
+OPENAI_DEFAULT = ModelCapabilities(server_parses_reasoning=True)
 
 # The ``openai-compatible`` lane (either API surface) never consults the
 # commercial table above: a local server serves whatever the operator

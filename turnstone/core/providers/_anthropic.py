@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.attachments import safe_attachment_label
@@ -301,6 +302,19 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_pdf=True,
         supports_reasoning_replay=True,
     ),
+}
+
+# The commercial endpoint segregates reasoning natively (``thinking`` /
+# ``redacted_thinking`` blocks) — content never carries inline think
+# tags, so the inline tag scan is off for every entry, known or
+# defaulted, as ONE rule applied to the whole table (a per-entry flag
+# would be forgotten on the next model row).  ``_ANTHROPIC_COMPAT_DEFAULT``
+# is deliberately NOT covered: local /v1/messages checkpoints are exactly
+# the passthrough dialect the scan exists for.
+_ANTHROPIC_DEFAULT = replace(_ANTHROPIC_DEFAULT, server_parses_reasoning=True)
+_ANTHROPIC_CAPABILITIES = {
+    name: replace(caps, server_parses_reasoning=True)
+    for name, caps in _ANTHROPIC_CAPABILITIES.items()
 }
 
 

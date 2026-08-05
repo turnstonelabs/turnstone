@@ -142,6 +142,8 @@ from turnstone.core.model_turn import (
     ModelTurnResult,
     ensure_tool_call_ids,
     finalize_provider_blocks,
+    lane_thinking_suppressed,
+    lane_without_thinking,
     maybe_attach_vllm_chat_reasoning,
     model_turn,
     provider_extra_params,
@@ -960,17 +962,27 @@ _SPEC_ARGUMENTS_LITERAL_RE = re.compile(r"\$ARGUMENTS\b(?!\[)")
 # assignment scheme unless the operator set one), so the budget must fit a
 # full thinking pass at the MODEL'S OWN default — the prompt's hard word cap
 # keeps the visible answer trivially cheap, and ``_TITLE_MAX_TOKENS`` carries
-# the rest.  Recover the title from ``content`` — IR-clean at the drain
-# seam (``split_inline_reasoning``; servers that leave reasoning inline
-# rather than in ``reasoning_content`` are segregated there, this lane
-# holds no strip of its own): take the first non-empty line (a model that
-# appends an explanation shouldn't fold prose into the title), then peel a
-# ``Title:`` label and wrapping markdown/quote decoration.  Internal
-# punctuation is preserved so ``.NET``, ``CI/CD``, ``v1.6.0`` survive.
+# the rest.  Recover the title from ``content`` — TAGGED reasoning is
+# segregated at the drain seam (``split_inline_reasoning``) and this lane
+# holds no strip of its own, but a server can also leave reasoning inline
+# and UNMARKED — no tags, no ``reasoning_content`` — which no seam may
+# reclassify.  So the pick is the prompt's own contract rather than a
+# position: the last line that reads as a title (word cap + ends in a
+# word character — see the pick loop), then peel a ``Title:`` label and
+# wrapping markdown/quote decoration.  Internal punctuation is preserved
+# so ``.NET``, ``CI/CD``, ``v1.6.0`` survive.
 _TITLE_MAX_TOKENS = 8192
 # Match the manual-rename (alias) cap so generated and hand-set titles share
 # one length bound.
 _TITLE_MAX_CHARS = 80
+# The prompt's hard rule is 3 words; the slack absorbs sloppy compliance
+# while still rejecting reasoning prose — the shape that has to lose is a
+# sentence ("This title captures the request well." — 6), never a title a
+# model padded by a word or two.  Whitespace word counts are meaningless
+# in unspaced scripts (a CJK sentence is one token), so the cap always
+# pairs with the pick loop's ends-alphanumeric check, which rejects prose
+# by its terminal punctuation instead.
+_TITLE_MAX_WORDS = 5
 _TITLE_LABEL_RE = re.compile(r"(?i)^\s*title\s*[:\-—]\s*")
 # Wrapping decoration peeled off both ends of a generated title.
 _TITLE_WRAP_CHARS = "*`\"' "
@@ -1951,13 +1963,17 @@ class ChatSession:
         self._background_shells = BackgroundShellRegistry(on_exit=self._on_background_shell_exit)
         self._cancelled_partial_msg: dict[str, Any] | None = None
         # Creation-time HANDOFF REGISTER: _try_stream stamps the provider
-        # that owns the stream it is about to return (fallback walk
-        # included), and _stream_response copies it into a frame local
-        # immediately after each create returns.  Nothing else reads it —
-        # a late read would race a superseding generation's creation — and
-        # it is deliberately never cleared (stale values are unreachable
-        # by construction).
+        # AND resolved capabilities that own the stream it is about to
+        # return (fallback walk included), and _stream_response copies
+        # them into frame locals immediately after each create returns.
+        # Nothing else reads them — a late read would race a superseding
+        # generation's creation — and they are deliberately never cleared
+        # (stale values are unreachable by construction).  The caps ride
+        # beside the provider so the consumer's tag-scan posture
+        # (``server_parses_reasoning``) follows the ACTIVE lane, never
+        # the primary's, exactly like the retry gate's retryable set.
         self._active_stream_provider: LLMProvider | None = None
+        self._active_stream_caps: ModelCapabilities | None = None
         self._pending_retry: str | None = None
         # True when a fatal exception's text has been persisted to
         # workstream_config["last_error"] for the coord's inspect/wait
@@ -3998,18 +4014,55 @@ class ChatSession:
             # with no open is indistinguishable from quoted prose, and
             # reclassifying would let quoted text destroy real answers) —
             # for a 3-word display string the cheap cosmetic call goes the
-            # other way, so peel through the LAST stray close tag here.
-            # This is title formatting like ``_TITLE_WRAP_CHARS``, not
-            # reasoning segregation.  See ``_TITLE_*``.
-            for _close in ThinkTagSplitter.CLOSE_TAGS:
-                _pos = raw.rfind(_close)
-                if _pos != -1:
-                    raw = raw[_pos + len(_close) :]
-            # First non-empty line, with a ``Title:`` label and wrapping
-            # markdown/quote decoration peeled (internal punctuation kept).
-            line = next((ln for ln in raw.splitlines() if ln.strip()), "")
-            line = _TITLE_LABEL_RE.sub("", line.strip(_TITLE_WRAP_CHARS))
-            title = line.strip(_TITLE_WRAP_CHARS)[:_TITLE_MAX_CHARS]
+            # other way, so cut through the LAST stray close tag of either
+            # vocabulary here.  This is title formatting like
+            # ``_TITLE_WRAP_CHARS``, not reasoning segregation — and like
+            # the seam's scan it is OFF on a backend that segregates
+            # (``server_parses_reasoning``): there a close tag in content
+            # IS quoted prose, and cutting would eat a title that mentions
+            # it.  See ``_TITLE_*``.
+            if not self._get_capabilities().server_parses_reasoning:
+                _cut = max(
+                    (raw.rfind(_t) + len(_t) for _t in ThinkTagSplitter.CLOSE_TAGS if _t in raw),
+                    default=0,
+                )
+                raw = raw[_cut:]
+            # Then the line, with a ``Title:`` label and wrapping markdown/
+            # quote decoration peeled (internal punctuation kept).  Scanning
+            # from the END applies the same law as the peel above: where a
+            # lane's reasoning shares the content field, the ANSWER comes
+            # last.  A tag is not always there to peel — a server can leave
+            # reasoning inline and entirely UNMARKED: no open tag, no close
+            # tag, and no ``reasoning_content`` either (measured on the dev
+            # vLLM, which prefaces its chain-of-thought with a heading like
+            # ``Thinking Process:`` — that heading then BECAME the title).
+            # Nothing downstream can segregate that, and nothing should
+            # try: unmarked prose is exactly what the seam must pass
+            # through.  So the pick is a contract check, not a position —
+            # the first line from the end that reads AS a title:
+            #   * within the word cap — the prose rejector for spaced
+            #     scripts ("This title captures the request well." is six
+            #     words); and
+            #   * ending in a letter/digit — the sentence/heading/sign-off
+            #     rejector ("Hope that helps!", "(3 words)", "Thinking
+            #     Process:", "Hmm, let me reconsider.") that also carries
+            #     unspaced scripts, where whitespace word counts are
+            #     meaningless but prose still ends in terminal punctuation
+            #     (``…请求。``) while a title ends in a word character.
+            # Else the last non-empty line (a model that answered in one
+            # long or padded line still gets titled, bounded by
+            # ``_TITLE_MAX_CHARS`` — a padded answer beats promoting a
+            # reasoning fragment from higher up).
+            title = ""
+            for _ln in reversed(raw.splitlines()):
+                _cand = _TITLE_LABEL_RE.sub("", _ln.strip(_TITLE_WRAP_CHARS))
+                _cand = _cand.strip(_TITLE_WRAP_CHARS)
+                if not _cand:
+                    continue
+                title = title or _cand[:_TITLE_MAX_CHARS]
+                if len(_cand.split()) <= _TITLE_MAX_WORDS and _cand[-1].isalnum():
+                    title = _cand[:_TITLE_MAX_CHARS]
+                    break
             if title and self._ws_id == ws_id:
                 log.info("ws.title.updating", ws_id=ws_id[:8], title=title)
                 update_workstream_title(ws_id, title)
@@ -5608,6 +5661,25 @@ class ChatSession:
         for every caller of this funnel — present and future — and no
         caller may add a private strip.
 
+        Segregation only reaches reasoning the model MARKED, though, and a
+        passthrough server can emit it as unmarked prose — no tags, no
+        ``reasoning_content`` — which nothing downstream may reclassify
+        (#940: that prose became the web-fetch tool result, and tool
+        results ride every following turn).  So when the backend does not
+        segregate reasoning itself, this funnel asks for none through
+        EVERY channel: the alias's declared thinking toggle is pinned off
+        and the lane/definition effort rungs cleared
+        (:func:`lane_without_thinking`), and the caller's relayed effort
+        knob is zeroed under the same predicate
+        (:func:`lane_thinking_suppressed`) — an effort value beside a
+        pinned-off toggle re-requests the reasoning the pin declined.
+        This is the same call omni transcription makes for the same
+        reason.  Every caller here wants a bounded artifact — a title, a
+        summary, an extracted answer — not a considered one, and the
+        whole posture is skipped on a backend that segregates
+        (``server_parses_reasoning``), where reasoning costs the artifact
+        nothing and the operator's knobs stand.
+
         ``max_tokens`` is clamped to the model's advertised output limit so
         small models don't error.
 
@@ -5626,7 +5698,9 @@ class ChatSession:
         generously for exactly that reason.  Callers relaying the session's
         user-facing effort knob (web-fetch extraction) pass it explicitly.
         extra_params resolve inside the lane from the same single config
-        fetch as the rest.
+        fetch as the rest, and the thinking pin is layered onto that
+        resolved dict rather than resolved separately — one config
+        generation, as ``resolve_lane`` intends.
         """
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
@@ -5640,12 +5714,14 @@ class ChatSession:
             config_store=self._config_store,
             backend_auth_resolver=self._model_backend_auth_token,
         )
+        suppress_reasoning = lane_thinking_suppressed(lane)
+        lane = lane_without_thinking(lane)
         result = model_turn(
             lane,
             turns,
             max_tokens=clamped,
             temperature=self.temperature if temperature is None else temperature,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=None if suppress_reasoning else reasoning_effort,
             # The abort seam (default None): compaction passes a fresh
             # per-attempt _CancelRef so a user Stop closes the in-flight
             # summary HTTP stream instead of waiting it out.  Title-gen
@@ -6020,12 +6096,14 @@ class ChatSession:
         for attempt in range(self._MAX_RETRIES + 1):
             self._check_cancelled()
             self._cancel_ref.clear()  # discard stale handle from prior attempt
-            # The provider about to own the live stream — read by the
-            # mid-stream retry gate (retryable-set membership) and the
-            # fatal formatter's label.  Written here so the fallback walk
-            # (which routes through this method with provider=fb_provider)
-            # is covered by construction.
+            # The provider (and its resolved caps) about to own the live
+            # stream — read by the mid-stream retry gate (retryable-set
+            # membership), the fatal formatter's label, and the consumer's
+            # tag-scan posture.  Written here so the fallback walk (which
+            # routes through this method with provider=fb_provider) is
+            # covered by construction.
             self._active_stream_provider = prov
+            self._active_stream_caps = resolved_caps
             try:
                 return prov.create_streaming(
                     client=client,
@@ -7890,12 +7968,17 @@ class ChatSession:
         # FRAME-LOCAL copy of the creation-time handoff register, taken
         # immediately after the create returns: the retry gate must judge a
         # death by the provider that owns THIS stream (a fallback's set can
-        # differ), and reading the shared register later would race a
-        # superseding generation's own creation.
+        # differ), the consumer must scan tags by THIS stream's caps (a
+        # fallback's ``server_parses_reasoning`` can differ), and reading
+        # the shared register later would race a superseding generation's
+        # own creation.
         live_provider = self._active_stream_provider or self._provider
+        live_caps = self._active_stream_caps or self._get_capabilities()
         while True:
             try:
-                result = self._stream_attempt(transport_guarded(stream), my_generation)
+                result = self._stream_attempt(
+                    transport_guarded(stream), my_generation, caps=live_caps
+                )
                 # The fold this turn was ACTUALLY created from rides the
                 # returned message (popped by send() at calibration, before
                 # commit — the message-dict underscore lane, like
@@ -8030,10 +8113,11 @@ class ChatSession:
                         msgs = self._prepare_wire_messages(self._full_messages())
                     try:
                         stream = self._create_stream_with_retry(msgs)
-                        # Refresh the frame-local gate identity: the
+                        # Refresh the frame-local gate identities: the
                         # re-create may have walked to a different
-                        # provider (fallback, rebind).
+                        # provider (fallback, rebind) with different caps.
                         live_provider = self._active_stream_provider or self._provider
+                        live_caps = self._active_stream_caps or self._get_capabilities()
                     except Exception as recreate_exc:
                         if _is_ctx_overflow(recreate_exc):
                             # Deterministic — surface as ITSELF so send()'s
@@ -8061,7 +8145,11 @@ class ChatSession:
                     raise
 
     def _stream_attempt(
-        self, stream: Iterator[StreamChunk], my_generation: int = 0
+        self,
+        stream: Iterator[StreamChunk],
+        my_generation: int = 0,
+        *,
+        caps: ModelCapabilities | None = None,
     ) -> dict[str, Any]:
         """Consume ONE streaming attempt, dispatching tokens to the UI live.
 
@@ -8075,8 +8163,13 @@ class ChatSession:
         appending to self.messages.  Single-pass by contract: the
         acquisition + mid-stream-retry wrapper is :meth:`_stream_response`,
         which hands this method a ``transport_guarded`` iterator per
-        attempt.
+        attempt — along with *caps*, the ACTIVE lane's capabilities from
+        the creation-time handoff register, so the tag-scan posture
+        follows the stream actually being consumed (a fallback's
+        ``server_parses_reasoning`` can differ from the primary's).
+        ``None`` (direct callers, tests) resolves the primary's.
         """
+        caps = caps or self._get_capabilities()
         # Reset so this API call captures fresh usage — prevents stale
         # completion_tokens from a prior tool-chain iteration leaking
         # through the max() accumulator.  _assistant_pending_tokens is the
@@ -8110,8 +8203,16 @@ class ChatSession:
                 self.ui.on_content_token(text)
 
         # Owns the partial-tag carry buffer and the in-think state;
-        # dispatch stays here in _flush_text.
-        splitter = ThinkTagSplitter(_flush_text)
+        # dispatch stays here in _flush_text.  The tag scan follows the
+        # SAME capability the drain seam reads
+        # (``server_parses_reasoning``) so the interactive and drained
+        # lanes cannot disagree about whether a backend's content may
+        # contain inline reasoning — read from the ACTIVE lane's caps
+        # (the *caps* parameter), never the primary's.
+        splitter = ThinkTagSplitter(
+            _flush_text,
+            scan_tags=not caps.server_parses_reasoning,
+        )
 
         def _stop_spinner_once() -> None:
             """Stop the spinner on first real content. Call is idempotent."""
@@ -19172,9 +19273,7 @@ class ChatSession:
                 max_tokens=min(self.max_tokens, self.context_window // 4),
                 reasoning_effort=self.reasoning_effort,
             )
-            answer = result.content or ""
-            if not answer.strip():
-                answer = "Error: extraction returned no answer"
+            answer = _non_blank_or(result.content, "Error: extraction returned no answer")
         except Exception as e:
             answer = f"Extraction failed (page was fetched but summarization errored): {e}"
 

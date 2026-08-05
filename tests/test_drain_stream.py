@@ -652,6 +652,60 @@ def test_inter_run_paragraph_separator_survives_reasoning_boundary():
     assert result.reasoning == "server-parsed\n\nplan"
 
 
+def test_tag_split_across_reasoning_boundary_reassembles():
+    """A reasoning delta cannot terminate a tag: a think tag the server
+    split across one must reassemble — a partial-tag TAIL is carried into
+    the next run (``partial_tag_tail``) instead of the halves passing
+    through as visible content."""
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(content_delta="Hello <thi"),
+                StreamChunk(reasoning_delta="server-parsed"),
+                StreamChunk(content_delta="nk> secret plan"),
+                StreamChunk(finish_reason="stop"),
+            ]
+        )
+    )
+    assert result.content == "Hello "
+    assert result.reasoning == "server-parsed\n\n secret plan"
+
+
+def test_partial_tag_carry_flushes_when_stream_ends():
+    """A carried tail that never completes a tag is CONTENT — the final
+    close emits it, byte-preserved."""
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(content_delta="abc <thi"),
+                StreamChunk(reasoning_delta="r"),
+                StreamChunk(finish_reason="stop"),
+            ]
+        )
+    )
+    assert result.content == "abc <thi"
+    assert result.reasoning == "r"
+
+
+def test_scan_off_keeps_content_verbatim_and_reasoning_in_its_own_channel():
+    """``server_parses_reasoning`` backends deliver reasoning through
+    ``reasoning_delta``, so the drain does not scan content at all: tag
+    text stays put (it is prose, not a boundary) and no edge trim fires,
+    while the server-parsed lane is unaffected."""
+    result = drain_stream(
+        iter(
+            [
+                StreamChunk(reasoning_delta="server-parsed"),
+                StreamChunk(content_delta="The `<think>` tag opens a block.\n"),
+                StreamChunk(finish_reason="stop"),
+            ]
+        ),
+        scan_inline_reasoning=False,
+    )
+    assert result.content == "The `<think>` tag opens a block.\n"
+    assert result.reasoning == "server-parsed"
+
+
 def test_inter_run_separator_survives_tool_boundary():
     result = drain_stream(
         iter(

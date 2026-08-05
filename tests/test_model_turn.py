@@ -866,3 +866,28 @@ def test_synth_bail_is_silent_and_leaks_nothing(
         )
     assert blocks == [{"type": "thinking", "thinking": "native"}]
     assert secret_reasoning not in caplog.text
+
+
+def test_capability_bool_overrides_coerced() -> None:
+    """The capabilities dict is hand-edited JSON: a string "false" is
+    truthy, and left raw it would flip every downstream truthiness read
+    (a ``server_parses_reasoning: "false"`` typo silently turning the
+    inline tag scan off is #940 reopened by punctuation).  Recognized
+    spellings coerce, ints pass through ``bool()``, and an unrecognized
+    value drops the key so the field keeps its default."""
+    from turnstone.core.model_turn import apply_capability_overrides
+
+    base = ModelCapabilities()
+    off = apply_capability_overrides(base, {"server_parses_reasoning": "false"})
+    assert off.server_parses_reasoning is False
+    on = apply_capability_overrides(base, {"server_parses_reasoning": "true"})
+    assert on.server_parses_reasoning is True
+    coerced = apply_capability_overrides(base, {"supports_vision": 1, "supports_tools": 0})
+    assert coerced.supports_vision is True
+    assert coerced.supports_tools is False
+    # Unrecognized string: key dropped, default kept; non-bool fields untouched.
+    kept = apply_capability_overrides(
+        base, {"server_parses_reasoning": "maybe", "thinking_mode": "manual"}
+    )
+    assert kept.server_parses_reasoning is False
+    assert kept.thinking_mode == "manual"

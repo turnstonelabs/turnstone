@@ -29,10 +29,9 @@ from turnstone.console.server import (
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.storage._sqlite import SQLiteBackend
-from turnstone.core.trajectory import turns_from_dicts
+from turnstone.core.trajectory import final_assistant_text, turns_from_dicts
 from turnstone.server import (
     _deliver_notification,
-    _extract_last_assistant_content,
     _fire_notify_targets,
     _validate_notify_targets,
 )
@@ -208,22 +207,25 @@ class TestValidateNotifyTargets:
 # ---------------------------------------------------------------------------
 
 
-class TestExtractLastAssistantContent:
+class TestNotifyFinalSayRead:
+    """The notify hook reads ``trajectory.final_assistant_text`` directly —
+    these pin the read's semantics over the notify path's turn shapes."""
+
     def test_string_content(self):
-        session = MagicMock()
-        session.messages = turns_from_dicts(
+        turns = turns_from_dicts(
             [
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": "world"},
             ]
         )
-        assert _extract_last_assistant_content(session) == "world"
+        assert final_assistant_text(turns) == "world"
 
     def test_structured_content(self):
         # Multi-block text flattens via the canonical Turn.text projection
-        # (the shared final-say read), not a notify-private join.
-        session = MagicMock()
-        session.messages = turns_from_dicts(
+        # (the shared final-say read), not a notify-private join — with a
+        # newline separator, so the delivered notification never fuses
+        # the last word of one block to the first word of the next.
+        turns = turns_from_dicts(
             [
                 {
                     "role": "assistant",
@@ -234,39 +236,33 @@ class TestExtractLastAssistantContent:
                 },
             ]
         )
-        assert _extract_last_assistant_content(session) == "part onepart two"
+        assert final_assistant_text(turns) == "part one\npart two"
 
     def test_whitespace_only_final_say_reports_empty(self):
         # A whitespace-only final say is empty — the notify fallback fires
         # instead of sending raw whitespace.
-        session = MagicMock()
-        session.messages = turns_from_dicts([{"role": "assistant", "content": " \n"}])
-        assert _extract_last_assistant_content(session) == ""
+        turns = turns_from_dicts([{"role": "assistant", "content": " \n"}])
+        assert final_assistant_text(turns) == ""
 
     def test_empty_messages(self):
-        session = MagicMock()
-        session.messages = []
-        assert _extract_last_assistant_content(session) == ""
+        assert final_assistant_text([]) == ""
 
     def test_no_assistant_messages(self):
-        session = MagicMock()
-        session.messages = turns_from_dicts([{"role": "user", "content": "hello"}])
-        assert _extract_last_assistant_content(session) == ""
+        turns = turns_from_dicts([{"role": "user", "content": "hello"}])
+        assert final_assistant_text(turns) == ""
 
     def test_picks_last_assistant(self):
-        session = MagicMock()
-        session.messages = turns_from_dicts(
+        turns = turns_from_dicts(
             [
                 {"role": "assistant", "content": "first"},
                 {"role": "user", "content": "question"},
                 {"role": "assistant", "content": "second"},
             ]
         )
-        assert _extract_last_assistant_content(session) == "second"
+        assert final_assistant_text(turns) == "second"
 
     def test_skips_non_text_blocks(self):
-        session = MagicMock()
-        session.messages = turns_from_dicts(
+        turns = turns_from_dicts(
             [
                 {
                     "role": "assistant",
@@ -277,7 +273,7 @@ class TestExtractLastAssistantContent:
                 },
             ]
         )
-        assert _extract_last_assistant_content(session) == "result"
+        assert final_assistant_text(turns) == "result"
 
 
 # ---------------------------------------------------------------------------

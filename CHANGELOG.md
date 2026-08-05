@@ -18,6 +18,17 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **`server_parses_reasoning` model capability.** Declare it on a model
+  definition whose backend segregates reasoning into its own channel (a
+  vLLM launched with a reasoning parser, a commercial provider): the
+  inline think-tag scan turns off on every lane — interactive and
+  drained alike — so content is trusted verbatim and prose that merely
+  quotes a tag can no longer be misrouted into the reasoning lane, and
+  the utility lanes stop suppressing reasoning they'd otherwise pin off.
+  Default off for local lanes, preserving the passthrough-server
+  behavior; the built-in capability tables declare it for every real
+  commercial endpoint (known models and table-miss defaults alike),
+  which also removes the quoted-tag false positive from those lanes.
 - **Per-model Entra gateway authentication.** Model definitions can bind either
   a caller-delegated OBO token (`entra_obo`) or a shared app-identity token
   (`entra_app`) through the provider SDK credential surface. Mints reuse the
@@ -229,7 +240,42 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   sub-agents, optimizer, eval) — and web-fetch extraction deliberately
   never will, since it runs on parallel tool threads where registering one
   would clobber the main stream's.
-
+- **Unmarked chain-of-thought no longer leaks into titles, summaries, or
+  web-fetch tool results (#940).** Some serving setups emit reasoning
+  inline with no tags and no `reasoning_content` at all — nothing any
+  parser can segregate. The bounded-artifact lanes (title, compaction,
+  web-fetch extraction) now ask the model for no reasoning instead:
+  the model definition's declared thinking toggle is pinned off for that
+  call — the same suppression transcription already used — and the
+  reasoning-effort channels (the relayed session knob, the definition's
+  default, the graded template key) are withheld with it, since an
+  effort value beside a pinned-off toggle re-requests the reasoning the
+  pin declined. A no-op on backends that segregate reasoning
+  server-side. Title generation additionally stopped trusting line
+  position: it takes the last line that reads as a title (within the
+  word cap and ending in a word character, so explanation sentences,
+  sign-offs, and reasoning headings lose in any script) rather than the
+  first non-empty line, which unmarked reasoning turned into titles
+  like "Thinking Process:".
+- **A think tag split across a reasoning delta now reassembles.** The
+  non-streaming drain closes content runs at interleaving signals; a
+  partial-tag tail is carried across reasoning-delta boundaries (a
+  reasoning delta cannot terminate a tag) so the tag is consumed instead
+  of its halves passing through as visible content. Tool-call boundaries
+  still flush — no tag spans a tool call.
+- **Streaming consumers follow the ACTIVE model's capabilities.** The
+  interactive tag-scan posture and the drain's scan gate now read the
+  capabilities of the lane that owns the stream being consumed (fallback
+  walks included) instead of the session's primary alias.
+- **Notification bodies no longer fuse multi-block answers.** `Turn.text`
+  joins text blocks with a newline; a final assistant turn stored as
+  multiple text blocks previously concatenated the last word of one
+  block to the first word of the next in completion notifications and
+  every other flattened read.
+- **String-typed boolean capability overrides coerce instead of
+  truthiness-flipping.** A hand-edited `"false"`/`"0"` in a model
+  definition's capabilities JSON now means false; unrecognized values
+  drop the key and keep the field's default.
 - **Inline `<think>`/`<reasoning>` blocks no longer leak into drained
   results (#965, #940).** On servers without a reasoning parser
   (parserless vLLM/llama.cpp, LM Studio, bare gateways), reasoning

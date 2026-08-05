@@ -146,9 +146,14 @@ class Turn:
     def text(self) -> str:
         """The turn's text content — the FTS projection and the str fast-path.
 
-        Joins the text of every :class:`TextBlock`; non-text blocks (attachments)
+        Joins the text of every non-empty :class:`TextBlock` with a
+        newline — adjacent blocks are distinct spans (an assistant's text
+        around a tool use, a user's text beside an attachment), and a
+        bare concatenation fused the last word of one to the first word
+        of the next in every downstream read (FTS tokens, notification
+        bodies, ``final_assistant_text``).  Non-text blocks (attachments)
         contribute nothing (you cannot full-text-search an image)."""
-        return "".join(b.text for b in self.content if isinstance(b, TextBlock))
+        return "\n".join(t for t in (b.text for b in self.content if isinstance(b, TextBlock)) if t)
 
     @property
     def effect_status(self) -> EffectStatus | None:

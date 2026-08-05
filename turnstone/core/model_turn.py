@@ -63,6 +63,7 @@ from turnstone.core.lowering import (
 from turnstone.core.providers._protocol import (
     drain_stream,
     has_reasoning_bearing_block,
+    thinking_off_template_kwargs,
 )
 from turnstone.core.storage._utils import (
     _CLIENT_TOOL_CALL_BLOCK_TYPES,
@@ -146,6 +147,19 @@ def resolve_capabilities(
     return caps
 
 
+_CAPABILITY_BOOL_STRINGS = {
+    "true": True,
+    "yes": True,
+    "on": True,
+    "1": True,
+    "false": False,
+    "no": False,
+    "off": False,
+    "0": False,
+    "": False,
+}
+
+
 def apply_capability_overrides(caps: ModelCapabilities, overrides_raw: Any) -> ModelCapabilities:
     """Field-filtered merge of an operator ``capabilities`` dict onto *caps*.
 
@@ -154,13 +168,46 @@ def apply_capability_overrides(caps: ModelCapabilities, overrides_raw: Any) -> M
     overrides dict use this directly instead of faking a ModelConfig.
     Unknown keys are ignored (the registry accepts free-form dicts) and a
     non-dict value degrades to "no overrides".
+
+    Values landing on BOOL-defaulted fields are coerced: the capabilities
+    dict is hand-edited JSON, and a string ``"false"`` is truthy — left
+    raw it would silently FLIP every downstream truthiness read (a
+    ``server_parses_reasoning: "false"`` typo turning the inline tag scan
+    off is the #940 leak reopened by punctuation).  Recognized spellings
+    map to their boolean, ints pass through ``bool()`` (0/1 rows), and an
+    unrecognized value drops the key — the field keeps its default, the
+    same degrade-not-crash posture as the non-dict case.
     """
     if isinstance(overrides_raw, dict) and overrides_raw:
-        names = {f.name for f in fields(type(caps))}
-        overrides = {k: v for k, v in overrides_raw.items() if k in names}
+        by_name = {f.name: f for f in fields(type(caps))}
+        overrides: dict[str, Any] = {}
+        for key, value in overrides_raw.items():
+            fld = by_name.get(key)
+            if fld is None:
+                continue
+            # bool check FIRST — bool is an int subclass, so the int arm
+            # below would otherwise claim real booleans.
+            if isinstance(fld.default, bool) and not isinstance(value, bool):
+                if isinstance(value, int):
+                    value = bool(value)
+                elif isinstance(value, str) and value.strip().lower() in _CAPABILITY_BOOL_STRINGS:
+                    value = _CAPABILITY_BOOL_STRINGS[value.strip().lower()]
+                else:
+                    continue
+            overrides[key] = value
         if overrides:
             caps = replace(caps, **overrides)
     return caps
+
+
+# Providers whose request shape carries an ``extra_body`` dict, so
+# operator ``server_compat`` pins and template-kwarg reasoning levers
+# reach the wire through it.  Real Anthropic and Google keep their own
+# param paths inside their providers and must never be handed one.  THE
+# membership test — shared by :func:`provider_extra_params` and the
+# callers that layer their own pins onto a resolved lane, so the two
+# cannot disagree about which lanes accept extra_body at all.
+EXTRA_BODY_PROVIDERS: tuple[str, ...] = ("openai", "openai-compatible", "anthropic-compatible")
 
 
 def provider_extra_params(
@@ -180,7 +227,7 @@ def provider_extra_params(
     """
     from turnstone.core.server_compat import merge_server_compat
 
-    if provider.provider_name not in ("openai", "openai-compatible", "anthropic-compatible"):
+    if provider.provider_name not in EXTRA_BODY_PROVIDERS:
         return None
     if cfg is ...:
         cfg = _get_config_or_none(registry, alias)
@@ -383,6 +430,82 @@ class ModelLane:
     # Runtime credential resolver supplied by the host that owns OAuth state.
     # Kept on the lane because this synchronous module has no manager singleton.
     backend_auth_resolver: Callable[[str], str | None] | None = None
+
+
+def lane_thinking_suppressed(lane: ModelLane) -> bool:
+    """True when *lane* gets the bounded-artifact no-reasoning posture.
+
+    THE gate for :func:`lane_without_thinking` — exposed so a caller that
+    relays its own effort knob (``_utility_completion``'s web-fetch
+    relay) can zero the caller rung under exactly the same condition the
+    lane rungs are zeroed under, instead of re-deriving it.  False when
+    the backend segregates reasoning (``server_parses_reasoning`` —
+    reasoning then costs the artifact nothing and the operator's knobs
+    stand), when the lane carries no resolved capabilities, or on
+    providers that take no ``extra_body`` (real Anthropic/Google shape
+    their own thinking params).
+    """
+    caps = lane.capabilities
+    return (
+        caps is not None
+        and not caps.server_parses_reasoning
+        and lane.provider.provider_name in EXTRA_BODY_PROVIDERS
+    )
+
+
+def lane_without_thinking(lane: ModelLane) -> ModelLane:
+    """*lane* with every reasoning request it owns turned OFF.
+
+    For the bounded-artifact lanes (the session's ``_utility_completion``:
+    title, compaction, web-fetch extraction): a server that does not
+    segregate reasoning leaves it in ``content``, and when it arrives
+    UNMARKED — no tags, no ``reasoning_content`` — the drain seam cannot
+    lift it out, so it lands in the artifact (#940).  Asking for no
+    reasoning is the only lever that survives that, so when
+    :func:`lane_thinking_suppressed` holds, EVERY channel this lane
+    controls goes silent:
+
+    - the declared template toggle is pinned ``False``
+      (:func:`thinking_off_template_kwargs` — the alias's OWN key, never
+      a guessed one), layered into the already-resolved ``extra_params``
+      (no second config fetch) over any operator ``server_compat``
+      thinking flag — that flag speaks for the answering lane, and these
+      calls are not it.  The provider's own injection only
+      ``setdefault``s, so the pin also beats the ``adaptive`` branch's
+      unconditional ``true``;
+    - the lane's operator effort rung and the model definition's
+      ``default_reasoning_effort`` rung are cleared, so ``model_turn``
+      resolves NO effective effort and neither the flat
+      ``reasoning_effort`` param (effort-passthrough boxes) nor the
+      graded template ``effort_param`` is emitted — an effort value
+      beside a pinned-off toggle re-requests the reasoning the pin just
+      declined, and on toggle-less templates the effort key alone is a
+      reasoning request.  Where a box reasons unconditionally (no toggle,
+      no effort semantics), omitting the knobs at least never asks for
+      MORE — the remediation there is server-side
+      (``server_parses_reasoning`` once a parser is configured).
+
+    Callers relaying a caller-rung effort must zero it under the same
+    predicate — see :func:`lane_thinking_suppressed`.
+    """
+    if not lane_thinking_suppressed(lane):
+        return lane
+    caps = lane.capabilities
+    assert caps is not None  # lane_thinking_suppressed guarantees it
+    extra = lane.extra_params
+    off = thinking_off_template_kwargs(caps.thinking_mode, caps.thinking_param)
+    if off:
+        extra = dict(lane.extra_params or {})
+        raw_ctk = extra.get("chat_template_kwargs")
+        ctk = dict(raw_ctk) if isinstance(raw_ctk, dict) else {}
+        ctk.update(off)
+        extra["chat_template_kwargs"] = ctk
+    return replace(
+        lane,
+        extra_params=extra,
+        reasoning_effort=None,
+        capabilities=replace(caps, default_reasoning_effort=""),
+    )
 
 
 def resolve_lane(
@@ -844,7 +967,14 @@ def model_turn(
             resolve_attachments=resolve_attachments,
         )
         try:
-            result = drain_stream(chunks)
+            result = drain_stream(
+                chunks,
+                # A lane with no declared capabilities keeps the
+                # passthrough-server default: scan.
+                scan_inline_reasoning=not (
+                    lane.capabilities.server_parses_reasoning if lane.capabilities else False
+                ),
+            )
             break
         except Exception as exc:
             attempt += 1
