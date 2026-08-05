@@ -132,10 +132,12 @@ A user message flows through the system as follows:
      |                                  lane-swap fallback walk; per-lane ladder:
      |                                  up to 3 retries (4 total attempts), exponential backoff
      v
- the on_chunk consumer  ----------->  dispatch tokens to UI:
+ the on_chunk consumer  ----------->  display grid ONLY:
      |                                  on_reasoning_token() / on_content_token()
-     |                                  accumulate tool_calls from deltas
-     |                                  track finish_reason
+     |                                  tool-call deltas just flush the splitter
+     |                                    (assembly lives in drain_stream, inside
+     |                                    model_turn — the consumer never accumulates)
+     |                                  track finish_reason (citations-footer gate)
      |                                  _check_cancelled() per chunk (cooperative cancel)
      v
  finish_reason check:
@@ -1261,28 +1263,34 @@ warns if the summary was truncated.
 `_run_single_test()`: wraps `session.send_headless()` in a retry loop (3
 attempts) to avoid transient API errors from poisoning evaluation scores.
 
-### Health Monitor & Circuit Breaker
+### Backend Health Tracking
 
-`BackendHealthMonitor` (`turnstone/core/healthcheck.py`) runs a daemon thread
-that probes the LLM backend by calling `client.models.list()` every
-`backend_probe_interval` seconds (default 30). Probe results drive a three-state
-circuit breaker:
+`BackendHealthTracker` (`turnstone/core/healthcheck.py`) records LLM backend
+health passively from real request outcomes — there is no probe thread and no
+circuit breaker, and requests are never blocked. Two states:
 
 ```
-CLOSED  ──(N consecutive failures)──>  OPEN
-OPEN    ──(cooldown expires)────────>  HALF_OPEN
-HALF_OPEN ──(probe succeeds)────────>  CLOSED
-HALF_OPEN ──(probe fails)──────────>  OPEN
+healthy  ──(failure_threshold consecutive failures)──>  degraded
+degraded ──(any success)───────────────────────────>  healthy
 ```
 
-- `record_success()` / `record_failure()` update `_consecutive_failures` and
-  transition the `_state` (`CircuitState` enum: `CLOSED`, `OPEN`, `HALF_OPEN`).
-- `acquire_request_permit()` returns `False` when the circuit is `OPEN` or when
-  in `HALF_OPEN` and the single probe permit has already been consumed. Causes
-  `ChatSession._model_turn_with_fallback` to skip the backend and surface an
-  error immediately.
-- The `/health` endpoint reads the monitor's state: `"status": "ok"` when the
-  circuit is closed, `"status": "degraded"` when open or half-open.
+- `record_success()` fires at the request-accepted instant: the streaming
+  consumer's `on_stream_armed` hook, driven by the eager `cancel_ref` append
+  every adapter performs at HTTP-response time.
+- `record_failure()` fires once per lane's whole creation ladder, in
+  `ChatSession._model_turn_with_fallback` / `_try_fallback_lane`. A mid-stream
+  death (the stream armed, then died) records neither — it belongs to the
+  re-issue ladder, not the fallback walk. `BackendAuthUnavailableError` and
+  `WirePreparationError` also record nothing: an auth refusal is fail-closed
+  configuration policy and a wire-preparation fault is session data — neither
+  says anything about the backend.
+- `is_degraded` is advisory ordering, not admission: the fallback walk tries
+  non-degraded aliases first and degraded ones as a last resort, and the
+  primary lane is always dialed.
+- `HealthTrackerRegistry` keys trackers by `(provider, base_url)` so aliases
+  sharing a backend share one tracker. The `/health` endpoint projects the
+  same trackers: `"status": "ok"` when the backend is healthy, `"degraded"`
+  otherwise.
 
 ### Rate Limiting
 

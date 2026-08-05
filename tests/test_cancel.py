@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._session_helpers import arm_session
 from turnstone.core.session import (
     ChatSession,
     GenerationCancelled,
@@ -23,51 +24,6 @@ from turnstone.core.trajectory import (
     dicts_from_turns,
     turn_from_dict,
 )
-
-
-def _armed_provider(session, *streams, name="openai-compatible"):
-    """Install a provider fake for the post-#832 seam on *session*.
-
-    ``create_streaming`` arms the
-    per-attempt ``cancel_ref`` with a closeable handle (mirroring every
-    real adapter's eager append — the creation-vs-midstream classifier and
-    ``cancel()``'s stream-close path both depend on it) and serves the
-    given *streams* SEQUENTIALLY, one per create call, each consumed once —
-    so side-effectful generator scripts (yield → ``session.cancel()`` →
-    yield) drive the REAL wrapper+consumer+drain path these tests assert
-    against, and a multi-turn send (tool round-trips) scripts one stream
-    per turn.  A create call beyond the script list fails LOUDLY — the
-    old silent-empty-commit that used to absorb it is gone (the strict
-    finish gate, ruled on #832).
-
-    Title generation is quieted on the session: with a provider-LEVEL
-    fake, the best-effort title lane would otherwise consume the one-shot
-    script before the main loop ran (pre-fold, the session-level seam
-    patches hid that lane and its attempt failed silently against the
-    MagicMock client).
-    """
-    from turnstone.core.providers._protocol import ModelCapabilities
-
-    session._generate_title = lambda *a, **kw: None
-    provider = MagicMock()
-    provider.provider_name = name
-    provider.get_capabilities.return_value = ModelCapabilities()
-    provider.retryable_error_names = frozenset({"IncompleteStreamError"})
-    handle = MagicMock()
-    remaining = list(streams)
-
-    def _create(**kwargs):
-        ref = kwargs.get("cancel_ref")
-        if ref is not None:
-            ref.append(handle)
-        assert remaining, "scripted provider exhausted: send looped for more turns than scripted"
-        stream = remaining.pop(0)
-        return iter(stream) if not hasattr(stream, "__next__") else stream
-
-    provider.create_streaming = MagicMock(side_effect=_create)
-    provider._armed_handle = handle
-    session._provider = provider
-    return provider
 
 
 class NullUI:
@@ -201,7 +157,7 @@ class TestCancelEvent:
 
         fake_stream = iter([FakeChunk(content_delta="Hello", finish_reason="stop")])
 
-        _armed_provider(session, fake_stream)
+        arm_session(session, fake_stream)
         session.send("test")
 
         # Should complete normally — cancel flag was cleared
@@ -233,7 +189,7 @@ class TestCancelDuringStreaming:
             session.cancel()
             yield FakeChunk(content_delta=" — this should not appear")
 
-        _armed_provider(session, cancelling_stream())
+        arm_session(session, cancelling_stream())
         session.send("test")
 
         # Session should be idle (not error)
@@ -297,7 +253,7 @@ class TestCancelDuringToolExecution:
             session.cancel()
             raise GenerationCancelled()
 
-        _armed_provider(session, stream_with_tool())
+        arm_session(session, stream_with_tool())
         with patch.object(session, "_execute_tools", side_effect=cancel_before_execute):
             session.send("run something")
 
@@ -337,7 +293,7 @@ class TestCancelWhenIdle:
             provider_blocks: list = field(default_factory=list)
 
         fake_stream = iter([FakeChunk(content_delta="ok", finish_reason="stop")])
-        _armed_provider(session, fake_stream)
+        arm_session(session, fake_stream)
         session.send("hello")
 
         # Should complete normally
@@ -371,23 +327,22 @@ class TestCancelThreadSafety:
             time.sleep(2)  # Simulate slow streaming
             yield FakeChunk(content_delta=" end", finish_reason="stop")
 
-        _armed_provider(session, slow_stream())
-        with contextlib.nullcontext():
-            # Run send() in a thread
-            error = []
+        arm_session(session, slow_stream())
+        # Run send() in a thread
+        error = []
 
-            def run():
-                try:
-                    session.send("test")
-                except Exception as e:
-                    error.append(e)
+        def run():
+            try:
+                session.send("test")
+            except Exception as e:
+                error.append(e)
 
-            t = threading.Thread(target=run)
-            t.start()
-            barrier.wait(timeout=5)
-            # Cancel from main thread
-            session.cancel()
-            t.join(timeout=5)
+        t = threading.Thread(target=run)
+        t.start()
+        barrier.wait(timeout=5)
+        # Cancel from main thread
+        session.cancel()
+        t.join(timeout=5)
 
         assert not error
         assert ui.states[-1] == "idle"
@@ -462,7 +417,7 @@ class TestStreamFlushBeforeToolCalls:
         # exhausted-iterator path was silently committed as an empty turn
         # by the pre-fold lax consumer; the strict finish gate (ruled,
         # #832) rejects it now.
-        _armed_provider(
+        arm_session(
             session,
             stream_content_then_tool(),
             iter([FakeChunk(finish_reason="stop")]),
@@ -539,7 +494,7 @@ class TestStreamAbort:
             seen["handle_at_first_chunk"] = session._cancel_stream
             yield FakeChunk(content_delta="hi", finish_reason="stop")
 
-        provider = _armed_provider(session, observing_stream())
+        provider = arm_session(session, observing_stream())
         session.send("test")
 
         assert seen["handle_at_first_chunk"] is provider._armed_handle
@@ -567,7 +522,7 @@ class TestStreamAbort:
             session._cancel_event.set()
             raise ConnectionError("stream closed")
 
-        _armed_provider(session, stream_that_errors())
+        arm_session(session, stream_that_errors())
         session.send("test")
 
         # Should complete as cancelled, not error
@@ -601,7 +556,7 @@ class TestStreamAbort:
             yield FakeChunk(content_delta="Hello")
             raise ValueError("unexpected error")
 
-        _armed_provider(session, stream_that_errors())
+        arm_session(session, stream_that_errors())
         with pytest.raises(ValueError, match="unexpected error"):
             session.send("test")
 
@@ -618,7 +573,7 @@ class TestStreamAbort:
         session = _make_session()
         session._cancel_event.set()
         resolver = MagicMock(return_value=None)
-        provider = _armed_provider(session, iter(()))
+        provider = arm_session(session, iter(()))
 
         with (
             patch.object(session, "_model_backend_auth_token", resolver),
@@ -700,7 +655,7 @@ class TestCancelRef:
             info_delta: str = ""
             provider_blocks: list = field(default_factory=list)
 
-        _armed_provider(session, iter([FakeChunk(content_delta="hi", finish_reason="stop")]))
+        arm_session(session, iter([FakeChunk(content_delta="hi", finish_reason="stop")]))
         session.send("test")
 
         # During the stream the armed handle was registered; after send()
@@ -769,7 +724,7 @@ class TestForceCancelOrphanNoReissue:
             session._claim_generation()
             raise ConnectionError("connection reset")
 
-        provider = _armed_provider(session, dying_orphan_stream())
+        provider = arm_session(session, dying_orphan_stream())
         my_generation = session._claim_generation()
         ends_before = ui.stream_ends
 
@@ -807,8 +762,8 @@ class TestForceCancelGeneration:
 
         # We can't trivially test the full threading scenario in a unit test,
         # so directly verify that _check_cancelled raises when my_generation
-        # is stale, which is what guards _stream_attempt against orphaned
-        # (force-cancelled) threads continuing to mutate messages.
+        # is stale — the per-chunk check the streaming consumer runs, which
+        # guards orphaned (force-cancelled) threads out of mutating messages.
         session._generation = 5
         with pytest.raises(GenerationCancelled):
             session._check_cancelled(my_generation=4)  # orphaned generation
@@ -830,7 +785,7 @@ class TestForceCancelGeneration:
 
         original_event = session._cancel_event
 
-        _armed_provider(session, iter([FakeChunk(content_delta="hi", finish_reason="stop")]))
+        arm_session(session, iter([FakeChunk(content_delta="hi", finish_reason="stop")]))
         session.send("test")
 
         # After send() completes, _cancel_event should be a NEW Event
@@ -868,7 +823,7 @@ class TestForceCancelThreaded:
             yield FakeChunk(content_delta=" more", finish_reason="stop")
 
         # Start generation 1 (will get stuck)
-        _armed_provider(session, slow_stream())
+        arm_session(session, slow_stream())
         if True:
 
             def run_old():
@@ -920,7 +875,7 @@ class TestForceCancelThreaded:
             yield FakeChunk(content_delta=" end", finish_reason="stop")
 
         # Start stuck generation
-        _armed_provider(session, stuck_stream())
+        arm_session(session, stuck_stream())
         t = threading.Thread(target=lambda: session.send("old"), daemon=True)
         t.start()
         assert barrier.wait(timeout=5), "stream did not start"
@@ -929,7 +884,7 @@ class TestForceCancelThreaded:
         session.cancel()
 
         # New generation should work
-        _armed_provider(session, iter([FakeChunk(content_delta="Fresh response")]))
+        arm_session(session, iter([FakeChunk(content_delta="Fresh response")]))
         session.send("new message")
 
         # The new generation should have completed successfully

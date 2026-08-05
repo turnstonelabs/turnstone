@@ -20,8 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests._parity_832 import make_result
-from tests._session_helpers import make_session
+from tests._session_helpers import make_result, make_session
 from turnstone.core.session import (
     COMPACTION_SOURCE,
     COMPACTION_SUMMARY_LABEL,

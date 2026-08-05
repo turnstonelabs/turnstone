@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests._parity_832 import make_result
+from tests._session_helpers import make_result
 from turnstone.core.personas import PersonaSnapshot, snapshot_from_persona
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage

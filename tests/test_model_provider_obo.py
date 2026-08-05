@@ -1547,6 +1547,32 @@ class TestModelOboToken:
         assert lane.temperature == 0.5
         assert lane.reasoning_effort is None
 
+    def test_main_lane_never_consults_config_store(self) -> None:
+        """The alias/global sampling rungs must not reach the main loop:
+        the session's own knobs replace both values ``config_store``
+        would feed, so ``_build_main_lane`` omits the store entirely —
+        a store with configured rungs contributes nothing to the lane
+        (wire parity with the pre-fold loop, which never consulted it)."""
+        sess = MagicMock()
+        sess._registry = None
+        store = MagicMock()
+        sess._config_store = store
+        sess.temperature = None
+        sess.reasoning_effort = "high"
+
+        lane = ChatSession._build_main_lane(
+            sess,
+            provider=MagicMock(provider_name="openai-compatible"),
+            client=MagicMock(),
+            model="m",
+            alias="a",
+            capabilities=SimpleNamespace(),
+        )
+
+        assert not store.mock_calls
+        assert lane.temperature is None
+        assert lane.reasoning_effort == "high"
+
     def test_primary_lane_built_with_session_alias_for_obo(self) -> None:
         # Regression: the primary lane must carry the session alias, or the
         # backend-auth resolver can't resolve the OBO token and an

@@ -29,12 +29,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tests._parity_832 import scripted_provider
 from tests._reasoning_dialect import CASES as DIALECT_CASES
-from tests._session_helpers import make_session
+from tests._session_helpers import make_session, scripted_provider
 from turnstone.core.model_turn import ModelLane
 from turnstone.core.providers import StreamChunk, ToolCallDelta
-from turnstone.core.session import _StreamTurnConsumer
+from turnstone.core.session import _CancelRef, _StreamTurnConsumer
 from turnstone.core.streaming_text import ThinkTagSplitter, split_inline_reasoning
 from turnstone.core.trajectory import Turn
 
@@ -78,7 +77,10 @@ def _drive(chunks, *, show_reasoning=True, capabilities=None):
     lane = ModelLane(
         provider=MagicMock(), client=MagicMock(), model="test-model", capabilities=capabilities
     )
-    consumer = _StreamTurnConsumer(session, lane, 0)
+    consumer = _StreamTurnConsumer(session, 0)
+    # begin_attempt is the consumer's SOLE per-attempt initializer (the
+    # lane-free constructor carries no display state of its own).
+    consumer.begin_attempt(_CancelRef(session, 0), None, lane)
     for chunk in chunks:
         consumer(chunk)
     consumer.finish_stream()

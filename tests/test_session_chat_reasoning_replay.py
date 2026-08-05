@@ -32,8 +32,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from tests._parity_832 import ArmedHandle
-from tests._session_helpers import as_stream, mock_completion_result, think_tag_stream
+from tests._session_helpers import ArmedHandle, as_stream, mock_completion_result, think_tag_stream
 from tests._session_helpers import make_session as _make_session
 from turnstone.core.model_turn import maybe_attach_vllm_chat_reasoning
 from turnstone.core.providers._anthropic import AnthropicProvider

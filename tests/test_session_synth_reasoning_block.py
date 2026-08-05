@@ -28,9 +28,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from tests._parity_832 import scripted_provider
 from tests._session_helpers import make_session as _make_session
-from turnstone.core.model_turn import _server_type_of, synth_reasoning_block
+from tests._session_helpers import scripted_provider
+from turnstone.core.model_turn import (
+    _server_type_of,
+    finalize_provider_blocks,
+    synth_reasoning_block,
+)
 from turnstone.core.providers._anthropic import (
     ANTHROPIC_VALID_BLOCK_TYPES,
     AnthropicProvider,
@@ -339,7 +343,9 @@ class TestServerTypeOf:
 
 class TestFinalizeProviderBlocks:
     """Direct unit tests for the shared native-lane builder
-    ``ChatSession._finalize_provider_blocks`` — in particular the
+    ``model_turn.finalize_provider_blocks`` (the session's streaming
+    wrapper calls it with the session registry/alias, which these tests
+    pass explicitly) — in particular the
     ``had_blank_ids`` gate (a uuid back-fill reaches only the tool_calls
     mirror, so blocks that would replay the blank id must be dropped while
     the reasoning lane survives)."""
@@ -350,7 +356,13 @@ class TestFinalizeProviderBlocks:
             {"type": "thinking", "thinking": "x", "signature": "s"},
             {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert out is blocks
 
     def test_no_tool_calls_strips_orphan_client_blocks(self) -> None:
@@ -359,7 +371,13 @@ class TestFinalizeProviderBlocks:
             {"type": "thinking", "thinking": "x", "signature": "s"},
             {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=False)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=False,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert [b["type"] for b in out] == ["thinking"]
 
     def test_blank_ids_drop_messages_shaped_lane_entirely(self) -> None:
@@ -374,7 +392,14 @@ class TestFinalizeProviderBlocks:
             {"type": "text", "text": "using f"},
             {"type": "tool_use", "id": "", "name": "f", "input": {}},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert out == []
 
     def test_blank_ids_drop_asymmetric_thinking_lane_without_tool_blocks(self) -> None:
@@ -386,7 +411,14 @@ class TestFinalizeProviderBlocks:
             {"type": "thinking", "thinking": "x", "signature": "s"},
             {"type": "text", "text": "t"},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert out == []
 
     def test_blank_ids_drop_responses_reasoning_items(self) -> None:
@@ -398,7 +430,14 @@ class TestFinalizeProviderBlocks:
             {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc"},
             {"type": "function_call", "call_id": "", "name": "f", "arguments": "{}"},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert out == []
 
     def test_blank_ids_keep_only_reasoning_text(self) -> None:
@@ -411,8 +450,13 @@ class TestFinalizeProviderBlocks:
         blocks = [
             {"id": "", "type": "function", "function": {"name": "f", "arguments": "{}"}},
         ]
-        out = session._finalize_provider_blocks(
-            blocks, ["thinking text"], has_tool_calls=True, had_blank_ids=True
+        out = finalize_provider_blocks(
+            blocks,
+            ["thinking text"],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
         )
         assert [b["type"] for b in out] == ["reasoning_text"]
         assert out[0]["text"] == "thinking text"
@@ -422,7 +466,12 @@ class TestFinalizeProviderBlocks:
         # but no client tool blocks at all — nothing can desync, so the
         # synthesized reasoning lane must be kept (the over-drop case).
         session = _make_session()
-        out = session._finalize_provider_blocks(
-            [], ["step by step"], has_tool_calls=True, had_blank_ids=True
+        out = finalize_provider_blocks(
+            [],
+            ["step by step"],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
         )
         assert [b["type"] for b in out] == ["reasoning_text"]

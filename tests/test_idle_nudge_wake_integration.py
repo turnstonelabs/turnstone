@@ -29,7 +29,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._helpers import wait_until as _wait_until
-from tests._parity_832 import make_result
+from tests._session_helpers import make_result
 from tests.test_session_manager import FakeStorage
 from turnstone.core import session_worker
 from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher, wake_workstream_if_pending

@@ -1301,15 +1301,15 @@ def _normalize_finish_reason(reason: str) -> str:
         return "stop"
     if reason == "refusal":
         # A safety classifier declined the request.  This arrives as a
-        # SUCCESSFUL HTTP 200 with content empty (declined before any output)
-        # or partial (declined mid-stream), so nothing upstream raises — the
-        # drain gate only errors on an ABSENT finish reason.  "content_filter"
-        # is the
-        # OpenAI-vocabulary equivalent this function normalizes onto, and both
-        # consumers already handle it: the interactive wrapper's
-        # _finalize_stream_result warns the user, and the sub-agent loop
-        # stops early instead of flailing on an empty turn.  Falling through to the raw "refusal" string instead
-        # would land a truncated answer as a complete result.
+        # SUCCESSFUL HTTP 200 with content empty (declined before any
+        # output) or partial (declined mid-stream), so nothing upstream
+        # raises — the drain gate only errors on an ABSENT finish reason.
+        # "content_filter" is the OpenAI-vocabulary equivalent this
+        # function normalizes onto, and both consumers already handle it:
+        # the interactive wrapper's _finalize_stream_result warns the
+        # user, and the sub-agent loop stops early instead of flailing on
+        # an empty turn.  Falling through to the raw "refusal" string
+        # instead would land a truncated answer as a complete result.
         return "content_filter"
     return reason
 

@@ -23,13 +23,13 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from tests._parity_832 import arm_session
-from tests._session_helpers import NullUI, RecordingUI, make_session
+from tests._session_helpers import NullUI, RecordingUI, arm_session, make_session
 from turnstone.core.memory import load_last_error
+from turnstone.core.model_turn import WirePreparationError
 from turnstone.core.providers import IncompleteStreamError, StreamChunk, UsageInfo
-from turnstone.core.session import GenerationCancelled
+from turnstone.core.session import BackendAuthUnavailableError, GenerationCancelled
 from turnstone.core.streaming_text import ThinkTagSplitter
-from turnstone.core.trajectory import dicts_from_turns
+from turnstone.core.trajectory import Turn, dicts_from_turns
 
 
 def _make_session(ui=None, **kwargs):
@@ -85,7 +85,6 @@ class TestMidStreamRetry:
         ]
         create = arm_session(session, *streams).create_streaming
         with (
-            patch.object(session, "_full_messages", return_value=[]),
             caplog.at_level(logging.WARNING, logger="turnstone.core.session"),
         ):
             session.send("test")
@@ -137,7 +136,6 @@ class TestMidStreamRetry:
         ]
         create = arm_session(session, *streams).create_streaming
         with (
-            patch.object(session, "_full_messages", return_value=[]),
             caplog.at_level(logging.INFO, logger="turnstone.core.session"),
             pytest.raises(IncompleteStreamError, match="ReadError"),
         ):
@@ -179,7 +177,6 @@ class TestMidStreamRetry:
         ).create_streaming
         with (
             patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
-            patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
 
@@ -211,7 +208,6 @@ class TestMidStreamRetry:
         create = arm_session(session, *streams).create_streaming
         with (
             patch.object(session, "_refresh_model_from_registry", side_effect=swap_binding),
-            patch.object(session, "_full_messages", return_value=[]),
             patch.object(
                 session, "_prepare_wire_messages", wraps=session._prepare_wire_messages
             ) as prep,
@@ -234,7 +230,6 @@ class TestMidStreamRetry:
         ]
         create = arm_session(session, *streams).create_streaming
         with (
-            patch.object(session, "_full_messages", return_value=[]),
             patch.object(
                 session,
                 "_refresh_model_from_registry",
@@ -258,10 +253,7 @@ class TestMidStreamRetry:
             _good_stream("ok"),
         ]
         arm_session(session, *streams)
-        with (
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        session.send("test")
 
         # A pre-first-token death leaves the spinner RUNNING; the CLI's
         # on_thinking_start is idempotent at the callee (it stops a live
@@ -285,7 +277,6 @@ class TestMidStreamRetry:
         arm_session(session, _dying_stream(exc=httpx.ReadError("died before first token")))
         with (
             patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
-            patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
 
@@ -313,10 +304,7 @@ class TestMidStreamRetry:
             second_stream(),
         ]
         arm_session(session, *streams)
-        with (
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        session.send("test")
 
         # The replacement attempt recorded an EMPTY partial; the wrapper
         # backfills it with the previous attempt's text — the user saw it,
@@ -337,10 +325,7 @@ class TestMidStreamRetry:
             session.cancel()
 
         arm_session(session, gen())
-        with (
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        session.send("test")
 
         # The post-loop cancel re-check converts the Stop — the turn must
         # NOT commit as complete (its tool calls would execute despite the
@@ -356,7 +341,6 @@ class TestMidStreamRetry:
         session = _make_session(ui)
         arm_session(session, _dying_stream("Hel", exc=KeyboardInterrupt()))
         with (
-            patch.object(session, "_full_messages", return_value=[]),
             caplog.at_level(logging.INFO, logger="turnstone.core.session"),
             pytest.raises(KeyboardInterrupt),
         ):
@@ -406,7 +390,6 @@ class TestMidStreamRetry:
         )
         with (
             patch.object(session, "_compact_messages") as compact,
-            patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
 
@@ -426,7 +409,6 @@ class TestMidStreamRetry:
         )
         with (
             patch.object(session, "_compact_messages"),
-            patch.object(session, "_full_messages", return_value=[]),
             pytest.raises(ValueError, match="backend exploded"),
         ):
             session.send("test")
@@ -459,7 +441,6 @@ class TestMidStreamRetry:
         arm_session(session, *streams)
         with (
             patch.object(session, "_refresh_model_from_registry", side_effect=swap_model),
-            patch.object(session, "_full_messages", return_value=[]),
             patch.object(
                 session, "_prepare_wire_messages", wraps=session._prepare_wire_messages
             ) as prep,
@@ -498,7 +479,6 @@ class TestMidStreamRetry:
         arm_session(session, _dying_stream("Hel", exc=httpx.ReadError("wire died")))
         with (
             patch.object(session, "_backoff_or_cancelled", side_effect=supersede_then_cancel),
-            patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")  # the orphaned turn returns silently
 
@@ -526,10 +506,7 @@ class TestMidStreamRetry:
             _good_stream("final answer"),
         ]
         arm_session(session, *streams)
-        with (
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        session.send("test")
 
         # The dead segment was truncated at the watermark; only the
         # retried attempt's text reaches the IDLE payload.
@@ -558,7 +535,6 @@ class TestMidStreamRetry:
         arm_session(session, _dying_stream(dead_text, exc=httpx.ReadError("wire died")))
         with (
             patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
-            patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
 
@@ -582,10 +558,7 @@ class TestMidStreamRetry:
             _good_stream("ok"),
         ]
         arm_session(session, *streams)
-        with (
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        session.send("test")
 
         assert _assistant_msgs(session)[-1]["content"] == "ok"
         assert ("state", "idle") in ui.events
@@ -611,7 +584,6 @@ class TestMidStreamRetry:
         )
         with (
             patch.object(session, "_compact_messages"),
-            patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
 
@@ -631,12 +603,11 @@ class TestMidStreamRetry:
             raise ValueError("orphan death")
 
         arm_session(session, dying_superseded())
-        with patch.object(session, "_full_messages", return_value=[]):
-            # Post-fold the orphan's death converts at the ladder's
-            # generation check and send() ends SILENTLY as cancelled — no
-            # arbitrary exception class escapes into the thread runner
-            # (named orphan-exit delta, design D12).
-            session.send("test")
+        # RULED (#832, orphan-exit): a superseded generation's death
+        # converts at the ladder's generation check and send() ends
+        # SILENTLY as cancelled — no arbitrary exception class escapes
+        # into the thread runner.
+        session.send("test")
 
         # The orphan must not flash an error banner over the live
         # successor turn or persist a wrong last_error for the coord.
@@ -652,7 +623,6 @@ class TestMidStreamRetry:
             session, _dying_stream("Hel", exc=ValueError("model exploded"))
         ).create_streaming
         with (
-            patch.object(session, "_full_messages", return_value=[]),
             pytest.raises(ValueError, match="model exploded"),
         ):
             session.send("test")
@@ -676,7 +646,6 @@ class TestMidStreamRetry:
             RuntimeError("Cannot send a request, as the client has been closed."),
         ).create_streaming
         with (
-            patch.object(session, "_full_messages", return_value=[]),
             caplog.at_level(logging.WARNING, logger="turnstone.core.session"),
             pytest.raises(IncompleteStreamError, match="ReadError"),
         ):
@@ -702,10 +671,7 @@ class TestMidStreamRetry:
             raise httpx.ReadError("late blip")  # the usage chunk is lost
 
         arm_session(session, blipping())
-        with (
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        session.send("test")
 
         assistant = _assistant_msgs(session)
         assert len(assistant) == 1
@@ -716,3 +682,195 @@ class TestMidStreamRetry:
         expected = max(1, int(session._msg_char_count(assistant[0]) / session._chars_per_token))
         assert session._msg_tokens[-1] == expected
         assert session._msg_tokens[-1] != 777
+
+
+class TestRecreateWindowClassification:
+    """Between a mid-stream death and the next attempt's ``begin_attempt``
+    there is NO live attempt — ``end_attempt`` pronounces the dead one
+    dead the moment its partial is captured.  These pins hold the two
+    failure modes of reading the dead attempt's armed state in that
+    window (a Stop re-finalizing discarded display state; a walk-preamble
+    error replacing the stream death), the two error classes the
+    re-issue mask must forward verbatim, and the saw-chunk classifier
+    fallback for adapters that never arm."""
+
+    def test_stop_in_recreate_window_emits_no_stale_display_state(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+        arm_session(
+            session,
+            _dying_stream("Half an answer", exc=httpx.ReadError("wire died")),
+            _good_stream("never reached"),
+        )
+        # The Stop lands AFTER backoff+discard, BEFORE the next attempt
+        # arms: _refresh_model_from_registry is the last step of the
+        # re-create sequence, so a cancel fired there raises at the next
+        # walk's loop-top _check_cancelled — the exact window.
+        real_refresh = session._refresh_model_from_registry
+
+        def cancel_in_window():
+            real_refresh()
+            session._cancel_event.set()
+
+        with patch.object(session, "_refresh_model_from_registry", side_effect=cancel_in_window):
+            session.send("test")
+
+        # The dead attempt streamed only its safe-flush prefix ("Ha");
+        # the splitter carry ("lf an answer") must NEVER surface as a
+        # late content token — the stale-armed bug flushed it into the
+        # just-truncated segment behind a duplicate stream_end.
+        assert ui.of("content") == ["Ha"]
+        assert ui.kinds().count("stream_end") == 1
+        # The full partial (flushed + carry) still reaches history via
+        # the promotion path — display suppression must not cost text.
+        assistant = _assistant_msgs(session)
+        assert len(assistant) == 1
+        assert (
+            assistant[0]["content"] == "Half an answer\n\n[generation cancelled before completion]"
+        )
+        assert ("state", "idle") in ui.events
+        assert ("state", "error") not in ui.events
+
+    def test_recreate_preamble_error_surfaces_original_death(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+        arm_session(
+            session,
+            _dying_stream("text", exc=httpx.ReadError("wire died")),
+            _good_stream("never reached"),
+        )
+        # The re-issue walk's PREAMBLE (before any begin_attempt) raises:
+        # with the dead attempt's ref properly retired this classifies as
+        # a creation-phase failure and the ORIGINAL stream death is the
+        # error the operator sees — not the preamble's.
+        real_tracker = session._get_health_tracker
+        calls: list[int] = []
+
+        def tracker_then_boom():
+            calls.append(1)
+            if len(calls) >= 2:
+                raise RuntimeError("registry blew up mid-rebind")
+            return real_tracker()
+
+        with (
+            patch.object(session, "_get_health_tracker", side_effect=tracker_then_boom),
+            pytest.raises(IncompleteStreamError, match="ReadError"),
+        ):
+            session.send("test")
+
+        errors = ui.of("error")
+        assert errors and "Backend stream died mid-response" in errors[-1]
+        assert not any("registry blew up" in e for e in errors)
+
+    def test_auth_refusal_at_reissue_surfaces_as_itself(self, tmp_db):
+        # An OBO mint refusal during the re-create is a config outage
+        # with its own remediation branch — masking it behind the earlier
+        # transport death would misdiagnose it as a network flap.
+        ui = RecordingUI()
+        session = _make_session(ui)
+        arm_session(
+            session,
+            _dying_stream("text", exc=httpx.ReadError("wire died")),
+            BackendAuthUnavailableError("obo mint refused for alias 'gpt': no cached grant"),
+        )
+        with pytest.raises(BackendAuthUnavailableError):
+            session.send("test")
+
+        errors = ui.of("error")
+        assert errors and "configured to mint a credential per call" in errors[-1]
+        assert not any("Backend stream died mid-response" in e for e in errors)
+
+    def test_never_arming_adapter_death_classifies_midstream(self, tmp_db):
+        """An adapter that ignores ``cancel_ref`` (the pre-#832 letter of
+        the contract) forfeits the health/usage hook duties, but its
+        mid-stream death must STILL classify as mid-stream: chunks
+        reached the display, so a creation-classified death would
+        silently re-issue the same lane and double-render them.  The
+        consumer's saw-chunk fallback is that tripwire."""
+        ui = RecordingUI()
+        session = _make_session(ui)
+        provider = arm_session(session)  # install the provider shell only
+        scripts = [
+            _dying_stream("First words from the dying wire", exc=httpx.ReadError("wire died")),
+            _good_stream("Recovered"),
+        ]
+
+        def create_no_arm(**kwargs):
+            assert scripts, "script exhausted"
+            return scripts.pop(0)
+
+        provider.create_streaming = MagicMock(side_effect=create_no_arm)
+        session.send("test")
+
+        # The mid-stream ladder ran its full theater — finalize, notice,
+        # discard — and the retried attempt committed ALONE.
+        assert any("stream died mid-response" in d for d in ui.of("info"))
+        assert ui.kinds().count("stream_discarded") == 1
+        assistant = _assistant_msgs(session)
+        assert len(assistant) == 1
+        assert assistant[0]["content"] == "Recovered"
+        # The dead attempt's flushed prefix rendered exactly once.
+        flushed = "First words from the dying wire"[: -ThinkTagSplitter.MAX_TAG_LEN]
+        assert ui.of("content").count(flushed) == 1
+
+    def test_wire_preparation_failure_never_touches_backend_health(self, tmp_db):
+        """A deterministic lowering failure is a session-data fault: no
+        dispatch, no health record, no fallback walk — the typed
+        ``WirePreparationError`` rides to the fatal formatter's dedicated
+        branch.  (Pre-fold parity: wire prep ran in send() outside the
+        streaming try and could reach none of them.)"""
+        ui = RecordingUI()
+        session = _make_session(ui)
+        provider = arm_session(session, _good_stream("unreached"))
+        tracker = MagicMock()
+        registry = MagicMock()
+        registry.fallback = ["fb1"]
+        session._registry = registry
+        with (
+            patch.object(session, "_get_health_tracker", return_value=tracker),
+            patch.object(session, "_try_fallback_lane") as fb_spy,
+            patch.object(
+                session, "_prepare_wire_messages", side_effect=ValueError("malformed turn 7")
+            ),
+            pytest.raises(WirePreparationError),
+        ):
+            session.send("test")
+
+        tracker.record_failure.assert_not_called()
+        fb_spy.assert_not_called()
+        provider.create_streaming.assert_not_called()
+        errors = ui.of("error")
+        assert errors and "stored history" in errors[-1]
+        assert "malformed turn 7" in errors[-1]
+
+
+class TestDebugDumpLatch:
+    """The debug request dump prints once per ``_stream_response``
+    invocation.  RULED (#832): send()'s overflow-recovery re-invocation
+    prints the RE-PREPARED wire — the dump that diagnoses the recovery —
+    where the pre-fold accident (wire prep hoisted outside the streaming
+    try) printed only the first.  Within one invocation, re-issues and
+    fallback lanes re-run the passes but never re-dump."""
+
+    def test_reissue_never_redumps(self, tmp_db):
+        session = _make_session(RecordingUI())
+        session.debug = True
+        session.messages.append(Turn.user("hi"))
+        arm_session(
+            session,
+            _dying_stream("x" * 20, exc=httpx.ReadError("wire died")),
+            _good_stream("ok"),
+        )
+        with patch.object(session, "_debug_print_request") as dump:
+            session._stream_response(0)
+        assert dump.call_count == 1
+
+    def test_second_invocation_reprints(self, tmp_db):
+        session = _make_session(RecordingUI())
+        session.debug = True
+        session.messages.append(Turn.user("hi"))
+        arm_session(session, _good_stream("a"), _good_stream("b"))
+        with patch.object(session, "_debug_print_request") as dump:
+            session._stream_response(0)
+            session._stream_response(0)
+        assert dump.call_count == 2

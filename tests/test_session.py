@@ -12,10 +12,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._oidc_test_helpers import keyed_app_state
-from tests._parity_832 import make_result
 from tests._session_helpers import (
     FakeAnthropicBlock,
     as_stream,
+    make_result,
     mock_completion_result,
     scripted_anthropic_client,
     scripted_chat_client,

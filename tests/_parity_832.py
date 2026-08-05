@@ -2,166 +2,48 @@
 
 The fold's acceptance is a controller-determinism audit: with the plant's
 chunk sequence held fixed, the streaming phase must produce an identical
-UI event sequence and an identical committed message — modulo the deltas
-the design's D12 table rules (docs/design/832-main-loop-model-turn.md,
-local).  This module is the shared half: the scenario scripts (drawn from
-the dataflow map's V11 chunk-field→UI grid) and the runner that drives one
-scenario through the session's streaming seam, recording everything the
-turn observably produced.
+UI event sequence and an identical committed message — modulo the small
+set of RULED behavior changes restated (in full) on the transforms in
+``test_832_parity.py``.  This module is the shared half: the scenario
+scripts (one row per chunk-field→UI translation the consumer performs)
+and the runner that drives one scenario through the session's streaming
+seam, recording everything the turn observably produced.
 
 Baselines are captured from the PRE-FOLD path (``UPDATE_832_PARITY=1``,
-run at a tree where ``session.py`` is byte-identical to main — the fixture
-commit's history proves it) into ``tests/data/parity_832/``.  The assert
-mode replays the same scripts through the current tree and compares
-against the baseline, applying the D12 transforms where the design ruled
-a behavior change.  A mismatch outside a ruled transform is a fold
-regression.
+run at a tree where ``session.py`` is byte-identical to pre-fold main —
+the fixture commit's history proves it) into ``tests/data/parity_832/``.
+The runner adapts to EITHER world by signature (pre-fold
+``_stream_response(msgs, my_generation)`` took the prepared wire list;
+post-fold ``_stream_response(my_generation)`` prepares inside), so a
+recapture at an old tree records real old-world behavior — and capture
+mode refuses to write a record whose failure is the harness's own call
+shape.  The assert mode replays the same scripts through the current
+tree and compares against the baseline, applying the ruled transforms.
+A mismatch outside a ruled transform is a fold regression.
 
 The provider fake arms ``cancel_ref`` EAGERLY (a closeable sentinel
 appended inside ``create_streaming``, before the iterator is returned),
 mirroring every real adapter — the post-fold wrapper classifies
-creation-vs-midstream failures by that arming, so a fake that skipped it
-would exercise only the creation arm (design gap-check G8).
+creation-vs-midstream failures by that arming, so a fake that skipped
+it would exercise only the creation arm and the parity audit would
+never reach the mid-stream ladder.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
-from tests._session_helpers import RecordingUI, make_session
-from turnstone.core.model_turn import ModelTurnResult
-from turnstone.core.providers._protocol import (
-    ModelCapabilities,
-    StreamChunk,
-    ToolCallDelta,
-    UsageInfo,
-)
-from turnstone.core.trajectory import ProviderNative, ToolCall, Turn
-
-
-def make_result(
-    content: str = "",
-    *,
-    tool_calls: list[dict[str, Any]] | None = None,
-    finish_reason: str = "stop",
-    usage: UsageInfo | None = None,
-    native_blocks: list[dict[str, Any]] | None = None,
-    producer: str = "openai-compatible",
-    wire_msgs: list[dict[str, Any]] | None = None,
-) -> ModelTurnResult:
-    """A ``ModelTurnResult`` shaped like the streaming wrapper's return —
-    triage recipe R1's patched-result form, for tests that only need "a
-    turn happened" and patch ``_stream_response`` wholesale.  The Turn and
-    the ``tool_calls`` mirror are built from the same dicts, preserving
-    the #825 pairing invariant fakes must not break."""
-    calls = list(tool_calls or [])
-    tc_tuple = tuple(
-        ToolCall(
-            id=tc.get("id", ""),
-            name=tc.get("function", {}).get("name", ""),
-            arguments=tc.get("function", {}).get("arguments", ""),
-        )
-        for tc in calls
-    )
-    native = (
-        ProviderNative(producer=producer, blocks=tuple(native_blocks)) if native_blocks else None
-    )
-    return ModelTurnResult(
-        turn=Turn.assistant(content, tool_calls=tc_tuple, native=native),
-        finish_reason=finish_reason,
-        usage=usage,
-        tool_calls=calls,
-        wire_msgs=wire_msgs,
-        producer=producer,
-    )
-
+from tests._session_helpers import RecordingUI, make_session, scripted_provider
+from turnstone.core.providers._protocol import StreamChunk, ToolCallDelta, UsageInfo
+from turnstone.core.trajectory import Turn
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "parity_832"
 UPDATE = os.environ.get("UPDATE_832_PARITY") == "1"
-
-
-class ArmedHandle:
-    """Closeable sentinel standing in for the SDK stream handle."""
-
-    def __init__(self) -> None:
-        self.closed = False
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def arm_session(
-    session: Any,
-    *streams: Any,
-    retryable: frozenset[str] = frozenset({"IncompleteStreamError"}),
-    name: str = "openai-compatible",
-) -> MagicMock:
-    """Install a sequential multi-turn armed provider fake on *session*.
-
-    Each ``create_streaming`` call serves the next element of *streams*:
-    an iterable/generator is armed (a closeable sentinel appended to
-    ``cancel_ref`` — the eager append every real adapter performs, which
-    the fold's creation-vs-midstream classifier keys on) and returned to
-    be consumed once; an EXCEPTION instance is raised at create time
-    WITHOUT arming — a creation-phase failure the per-lane ladder owns.
-    Calls beyond the script fail loudly (the pre-fold lax consumer used
-    to absorb an exhausted iterator as a silent empty turn; the strict
-    finish gate rejects that now, so an under-scripted test must say so).
-
-    Title generation is latched off — with a provider-LEVEL fake the
-    best-effort title lane would otherwise consume the first script
-    before the main loop ran.
-    """
-    session._title_generated = True
-    provider = MagicMock()
-    provider.provider_name = name
-    provider.get_capabilities.return_value = ModelCapabilities()
-    provider.retryable_error_names = retryable
-    provider._armed_handle = MagicMock()
-    remaining = list(streams)
-
-    def _create(**kwargs: Any):
-        assert remaining, "arm_session: script exhausted — send looped for more turns than scripted"
-        nxt = remaining.pop(0)
-        if isinstance(nxt, BaseException):
-            raise nxt
-        ref = kwargs.get("cancel_ref")
-        if ref is not None:
-            ref.append(provider._armed_handle)
-        return iter(nxt) if not hasattr(nxt, "__next__") else nxt
-
-    provider.create_streaming = MagicMock(side_effect=_create)
-    session._provider = provider
-    return provider
-
-
-def scripted_provider(chunks: list[StreamChunk]) -> MagicMock:
-    """Provider fake replaying *chunks*, arming ``cancel_ref`` eagerly.
-
-    Assign to ``session._provider`` (never mutate a resolved provider —
-    the create_provider singleton rule in ``_session_helpers``).  Each
-    call returns a FRESH iterator over the same script so ladder tests
-    re-drive it; the armed handle is appended per call, matching the
-    one-handle-per-create behavior of every real adapter.
-    """
-    provider = MagicMock()
-    provider.provider_name = "openai-compatible"
-    provider.get_capabilities.return_value = ModelCapabilities()
-    provider.retryable_error_names = frozenset({"IncompleteStreamError"})
-
-    def _create(**kwargs: Any):
-        ref = kwargs.get("cancel_ref")
-        if ref is not None:
-            ref.append(ArmedHandle())
-        return iter(chunks)
-
-    provider.create_streaming = MagicMock(side_effect=_create)
-    return provider
 
 
 def _tc(index: int, call_id: str, name: str = "", args: str = "") -> ToolCallDelta:
@@ -279,22 +161,40 @@ def run_scenario(name: str) -> dict[str, Any]:
     Deliberately seam-level (the ``_stream_response`` boundary pre-fold,
     its wrapper successor post-fold) — full ``send()`` scenarios ride the
     ported ladder suites instead.
+
+    Signature-adaptive so ``UPDATE_832_PARITY=1`` at a PRE-fold tree
+    records real old-world behavior: the pre-fold seam was
+    ``_stream_response(msgs, my_generation) -> dict`` (wire list built
+    by the caller), the post-fold seam is
+    ``_stream_response(my_generation) -> ModelTurnResult`` (wire
+    prepared inside).  A harness-shape failure must never be recorded
+    as behavior — ``write_fixture`` refuses one.
     """
     ui = RecordingUI()
     session = make_session(ui=ui)
     session._provider = scripted_provider(SCENARIOS[name])
-    session.messages.append(Turn.user("hi"))
 
+    pre_fold = "msgs" in inspect.signature(type(session)._stream_response).parameters
     record: dict[str, Any] = {"scenario": name}
     try:
-        result = session._stream_response(0)
-        record["result"] = {
-            "content": result.content,
-            "tool_calls": result.tool_calls or None,
-            "provider_content": (
-                [dict(b) for b in result.turn.native.blocks] if result.turn.native else None
-            ),
-        }
+        if pre_fold:
+            msg = session._stream_response([{"role": "user", "content": "hi"}], 0)
+            msg.pop("_wire_msgs", None)
+            record["result"] = {
+                "content": msg.get("content", ""),
+                "tool_calls": msg.get("tool_calls"),
+                "provider_content": msg.get("_provider_content"),
+            }
+        else:
+            session.messages.append(Turn.user("hi"))
+            result = session._stream_response(0)
+            record["result"] = {
+                "content": result.content,
+                "tool_calls": result.tool_calls or None,
+                "provider_content": (
+                    [dict(b) for b in result.turn.native.blocks] if result.turn.native else None
+                ),
+            }
         record["raised"] = None
     except BaseException as exc:  # noqa: BLE001 — the record IS the observation
         record["result"] = None
@@ -314,5 +214,14 @@ def load_fixture(name: str) -> dict[str, Any]:
 
 
 def write_fixture(name: str, record: dict[str, Any]) -> None:
+    # A TypeError before ANY UI event is the harness's own call-shape
+    # failure (run_scenario's signature adapter no longer matches this
+    # tree's seam), not old-world behavior — refuse to destroy the
+    # baseline with it.
+    if record.get("raised") == "TypeError" and not record.get("ui_events"):
+        raise AssertionError(
+            f"parity capture for {name!r} died calling the seam (TypeError before "
+            f"any UI event) — fix run_scenario's signature adapter; do not record"
+        )
     FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
     fixture_path(name).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")

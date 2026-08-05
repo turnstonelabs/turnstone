@@ -27,8 +27,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from tests._parity_832 import scripted_provider
-from tests._session_helpers import make_session
+from tests._session_helpers import make_session, scripted_provider
 from turnstone.core.history_decoration import (
     extract_reasoning_for_history,
     extract_reasoning_text_from_provider_content,

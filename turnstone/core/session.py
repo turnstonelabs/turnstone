@@ -139,11 +139,14 @@ from turnstone.core.model_registry import (
     ModelClientConstructionError,
 )
 from turnstone.core.model_turn import (
+    TRAILING_INFO_SEPARATOR,
     ModelLane,
     ModelTurnResult,
+    WirePreparationError,
     create_provider,
-    ensure_tool_call_ids,
     finalize_provider_blocks,
+    folds_trailing_info,
+    lane_scans_inline_reasoning,
     lane_thinking_suppressed,
     lane_without_thinking,
     merge_usage,
@@ -324,8 +327,11 @@ class _CompactionIrreducibleError(Exception):
 
 
 class _CancelRef(list[Any]):
-    """List proxy used for ``ChatSession._cancel_ref``.
+    """List proxy handed to ``create_streaming`` as its ``cancel_ref``.
 
+    One FRESH instance per attempt, frame-local to the model-call wrapper
+    that built it — #832 retired the session-level shared slot
+    (``test_cancel`` pins ``not hasattr(session, "_cancel_ref")``).
     Providers call ``cancel_ref.append(stream_handle)`` eagerly — the HTTP
     call and registration happen before the iterator is returned to the
     caller.  By overriding ``append`` we update ``ChatSession._cancel_stream``
@@ -463,25 +469,34 @@ class _StreamTurnConsumer:
     info line exactly as before.
     """
 
-    def __init__(self, session: ChatSession, lane: ModelLane, my_generation: int) -> None:
+    def __init__(self, session: ChatSession, my_generation: int) -> None:
         self._session = session
         self._my_generation = my_generation
-        self.lane = lane
+        # No lane until the walk's first begin_attempt resolves one — the
+        # per-attempt state has exactly ONE initializer (``_reset_attempt``),
+        # so a first attempt and a re-issue cannot drift, and construction
+        # costs no resolve_lane walk.
+        self.lane: ModelLane | None = None
         self.ref: _CancelRef | None = None
         self.tracker: BackendHealthTracker | None = None
+        self._reset_attempt()
+
+    # -- attempt lifecycle ---------------------------------------------------
+
+    def _reset_attempt(self) -> None:
+        """THE per-attempt display reset — sole initializer of this state."""
         self._content_parts: list[str] = []
         self._first_token = True
         self._path1_reasoning = False
         self._finish_seen = False
+        self._saw_chunk = False
+        # Per-attempt: a re-issued attempt's usage must never max-merge
+        # onto the dead attempt's (the accumulator was attempt-local in
+        # the pre-fold consumer too).
         self._usage_acc: UsageInfo | None = None
         self._splitter = ThinkTagSplitter(
-            self._flush_text,
-            scan_tags=not (
-                lane.capabilities.server_parses_reasoning if lane.capabilities else False
-            ),
+            self._flush_text, scan_tags=lane_scans_inline_reasoning(self.lane)
         )
-
-    # -- attempt lifecycle ---------------------------------------------------
 
     def begin_attempt(
         self,
@@ -489,7 +504,7 @@ class _StreamTurnConsumer:
         tracker: BackendHealthTracker | None,
         lane: ModelLane,
     ) -> None:
-        """Reset display state for one creation attempt on *lane*.
+        """Arm display state for one creation attempt on *lane*.
 
         The usage-slot resets do NOT happen here — they ride
         :meth:`on_stream_armed` (the request-accepted instant), so a long
@@ -499,25 +514,39 @@ class _StreamTurnConsumer:
         self.ref = ref
         self.tracker = tracker
         self.lane = lane
-        self._content_parts = []
-        self._first_token = True
-        self._path1_reasoning = False
-        self._finish_seen = False
-        # Per-attempt: a re-issued attempt's usage must never max-merge
-        # onto the dead attempt's (the accumulator was attempt-local in
-        # the pre-fold consumer too).
-        self._usage_acc = None
-        self._splitter = ThinkTagSplitter(
-            self._flush_text,
-            scan_tags=not (
-                lane.capabilities.server_parses_reasoning if lane.capabilities else False
-            ),
-        )
+        self._reset_attempt()
+
+    def end_attempt(self) -> None:
+        """Pronounce the current attempt dead: nothing about it may leak.
+
+        The re-issue ladder calls this once a mid-stream death's partial
+        is captured — from here until the next ``begin_attempt`` there is
+        NO live attempt, so ``attempt_armed`` reads False.  Without it, a
+        Stop (or a walk-preamble failure) landing in the re-create window
+        would read the DEAD attempt's armed ref: the cancel arm would
+        re-finalize discarded display state — the stale splitter carry
+        emitted as a fresh content token into the just-truncated segment,
+        with a duplicate ``stream_end`` behind it — and a preamble error
+        would be classified as another armed death, replacing the
+        operator-actionable stream-death error.  The lane survives: the
+        ladder's terminal predicate is judged by the lane that actually
+        armed the dead stream.
+        """
+        self.ref = None
+        self._reset_attempt()
 
     @property
     def attempt_armed(self) -> bool:
-        """Whether this attempt's request was accepted (handle registered)."""
-        return self.ref is not None and self.ref.armed
+        """Whether this attempt streamed: handle registered, or any chunk
+        actually surfaced.  The chunk fallback is the tripwire for an
+        adapter that skips the eager ``cancel_ref`` append (an out-of-tree
+        adapter written to the pre-#832 letter of the contract): its
+        mid-stream death must still classify as mid-stream — a
+        creation-classified death would silently re-issue the same lane
+        and double-render everything already on screen.  Such an adapter
+        still forfeits ``on_stream_armed``'s duties (health success,
+        usage-slot resets); the in-tree tripwires pin eager arming."""
+        return (self.ref is not None and self.ref.armed) or self._saw_chunk
 
     def on_stream_armed(self) -> None:
         """`_CancelRef.on_first_append` — the request-accepted instant.
@@ -554,6 +583,10 @@ class _StreamTurnConsumer:
             self._first_token = False
 
     def __call__(self, chunk: StreamChunk) -> None:
+        # Before the cancel check: the chunk DID arrive, so the attempt
+        # streamed — the classifier fallback must see that even when this
+        # very chunk's cancel check aborts the turn.
+        self._saw_chunk = True
         s = self._session
         s._check_cancelled(self._my_generation)
         if chunk.finish_reason:
@@ -604,17 +637,18 @@ class _StreamTurnConsumer:
             self._stop_spinner_once()
             if self._finish_seen:
                 # Trailing citations footer → CONTENT, per the drain's
-                # conditional fold: only onto a non-blank answer, with the
-                # same separator.  The generation is over (finish seen), so
-                # the splitter's carry is final answer text, never a
-                # partial tag — flush it FIRST or the footer renders
-                # spliced into the middle of the answer's last characters.
-                # Appended via the accumulator too, so the partial rule and
-                # the blankness test stay consistent with the committed
-                # content.
+                # conditional fold — gate and separator are the SHARED
+                # module-level pair beside ``drain_stream``, so the two
+                # mirrors cannot drift.  The generation is over (finish
+                # seen), so the splitter's carry is final answer text,
+                # never a partial tag — flush it FIRST or the footer
+                # renders spliced into the middle of the answer's last
+                # characters.  Appended via the accumulator too, so the
+                # partial rule and the blankness test stay consistent
+                # with the committed content.
                 self._splitter.flush_pending()
-                if "".join(self._content_parts).strip():
-                    self._flush_text("\n\n" + chunk.info_delta, False)
+                if folds_trailing_info("".join(self._content_parts)):
+                    self._flush_text(TRAILING_INFO_SEPARATOR + chunk.info_delta, False)
             else:
                 s.ui.on_info(f"{GRAY}{chunk.info_delta}{RESET}")
 
@@ -2695,32 +2729,6 @@ class ChatSession:
                 self._cached_capabilities = self._resolve_capabilities(p, m, self._model_alias)
             return self._cached_capabilities
         return self._resolve_capabilities(p, m, "")
-
-    def _finalize_provider_blocks(
-        self,
-        provider_blocks: list[dict[str, Any]],
-        reasoning_parts: list[str],
-        *,
-        has_tool_calls: bool,
-        had_blank_ids: bool = False,
-        alias: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Delegate to :func:`turnstone.core.model_turn.finalize_provider_blocks`
-        — the ONE native-lane builder every harness shares (main-loop stream
-        accumulator here; sub-agent loop and judges via ``model_turn``).
-
-        ``None`` *alias* (the main-loop caller) resolves to the session's
-        primary alias; the blank-id mirror gate and orphan-strip semantics
-        are documented on the module function.
-        """
-        return finalize_provider_blocks(
-            provider_blocks,
-            reasoning_parts,
-            has_tool_calls=has_tool_calls,
-            had_blank_ids=had_blank_ids,
-            registry=self._registry,
-            alias=alias or self._model_alias or "",
-        )
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
@@ -5710,6 +5718,22 @@ class ChatSession:
 
         name = type(exc).__name__
 
+        # A wire-preparation failure is the session's own data at fault —
+        # ``model_turn`` typed it so no ladder recorded health or walked
+        # fallbacks.  Checked FIRST: it is the most specific classification,
+        # and the overflow text-match below must not claim a lowering error
+        # whose message happens to mention token limits.
+        if isinstance(exc, WirePreparationError):
+            prep_cause = exc.__cause__
+            detail = f"{type(prep_cause).__name__}: {prep_cause}" if prep_cause else raw_msg
+            return (
+                f"Preparing the request from this conversation's history failed: "
+                f"{detail}. This is a fault in the session's stored history, not "
+                f"in the {model_label} backend (no fallback was tried and backend "
+                f"health is unaffected). /compact may clear a malformed turn; "
+                f"please report this."
+            )
+
         # Context overflow — matched by text, because it arrives as BadRequestError
         # (OpenAI 400) OR InternalServerError (Anthropic-compat 500), which would
         # otherwise render as an opaque class name with no hint that the prompt was
@@ -6158,8 +6182,12 @@ class ChatSession:
         ``self.reasoning_effort`` to the wire verbatim and never consulted
         the per-alias config rungs, and a resumed workstream with unset
         knobs must keep OMITTING rather than newly picking up alias
-        config.  Whether the lane rungs should apply to the main loop is a
-        live question — but not this fold's (wire parity first).
+        config.  ``config_store`` is deliberately NOT passed: its only
+        consumers inside ``resolve_lane`` are the two sampling-knob
+        resolvers this method overrides, and a dead store read per lane
+        build would misread as the rungs reaching the main loop.  Whether
+        they SHOULD is a live question — but not this fold's (wire parity
+        first).
         """
         lane = resolve_lane(
             provider,
@@ -6168,7 +6196,6 @@ class ChatSession:
             alias=alias or "",
             registry=self._registry,
             capabilities=capabilities,
-            config_store=self._config_store,
             backend_auth_resolver=self._model_backend_auth_token,
         )
         return dataclasses.replace(
@@ -6210,6 +6237,13 @@ class ChatSession:
         except BackendAuthUnavailableError:
             # Explicit fail-closed policy: never reinterpret an authentication
             # refusal as backend health and never route it to a static fallback.
+            raise
+        except WirePreparationError:
+            # Session-data fault, typed by ``model_turn``: the caller's own
+            # lowering raised.  No health record and no fallback walk —
+            # every lane would re-run the same deterministic passes, and
+            # N recorded failures would paint a cluster-wide outage over
+            # a malformed turn in ONE session's history.
             raise
         except Exception as primary_err:
             if consumer.attempt_armed:
@@ -6283,7 +6317,11 @@ class ChatSession:
             return self._model_turn_with_retry(
                 fb_lane, fb_tracker, consumer, prepare_wire, my_generation
             )
-        except BackendAuthUnavailableError:
+        except (BackendAuthUnavailableError, WirePreparationError):
+            # Same two verbatim-forward classes as the primary walk: an
+            # auth refusal is fail-closed policy, a wire-preparation
+            # failure is the caller's data bug — neither is this
+            # fallback's health signal.
             raise
         except Exception as fb_err:
             if consumer.attempt_armed:
@@ -8189,26 +8227,20 @@ class ChatSession:
         # phase fails with an unarmed error, the original death is the one
         # the operator needs to see, not the re-create's.
         last_stream_death: Exception | None = None
-        consumer = _StreamTurnConsumer(
-            self,
-            self._build_main_lane(
-                provider=self._provider,
-                client=self.client,
-                model=self.model,
-                alias=self._model_alias,
-                capabilities=self._get_capabilities(),
-            ),
-            my_generation,
-        )
+        consumer = _StreamTurnConsumer(self, my_generation)
 
         debug_printed = False
 
         def _prepare(lowered: list[dict[str, Any]]) -> list[dict[str, Any]]:
             """The main loop's ``prepare_wire``: system prepend + the
             session lowering passes, plus the debug request dump behind a
-            once-per-turn latch (matching the old once-per-send-iteration
-            print; re-issues and fallback lanes re-run the passes but not
-            the dump)."""
+            once-per-invocation latch — re-issues and fallback lanes
+            re-run the passes but not the dump.  send()'s overflow
+            recovery calls ``_stream_response`` again and prints again:
+            post-compaction the wire CHANGED, and the re-prepared dump is
+            the one that diagnoses the recovery (a named #832 delta — the
+            pre-fold print-once-per-send was an accident of wire prep
+            living outside the streaming try)."""
             nonlocal debug_printed
             wire = self._prepare_wire_messages([*self.system_messages, *lowered])
             if self.debug and not debug_printed:
@@ -8271,6 +8303,14 @@ class ChatSession:
                 armed = consumer.attempt_armed
                 new_dead = consumer.partial_content() if armed else ""
                 dead_partial = new_dead or dead_partial
+                if armed:
+                    # The attempt is dead and its partial captured — from
+                    # here until the next ``begin_attempt`` there is no
+                    # live attempt.  Without this, a Stop or a
+                    # walk-preamble failure landing in the re-create
+                    # window reads the DEAD attempt's armed state (see
+                    # ``end_attempt``).
+                    consumer.end_attempt()
                 if self._generation != my_generation:
                     # Superseded (force-cancel started a newer generation):
                     # an orphaned thread must not touch the UI — a finalize
@@ -8282,12 +8322,22 @@ class ChatSession:
                     # ladder + fallbacks.  Mid re-issue it must not MASK the
                     # original stream death (a closed-client re-create
                     # surfaces as a retryable APIConnectionError and would
-                    # replace the operator-actionable wording) — except a
-                    # deterministic overflow, which surfaces as ITSELF so
-                    # send()'s compact-and-retry arm can recover the turn.
+                    # replace the operator-actionable wording) — EXCEPT the
+                    # classes that carry their own remediation: a
+                    # deterministic overflow surfaces as ITSELF so send()'s
+                    # compact-and-retry arm can recover the turn, and an
+                    # auth refusal / wire-preparation fault surfaces as
+                    # ITSELF so the fatal formatter's dedicated branch
+                    # renders (an OBO mint dying mid-turn is a config
+                    # outage, not a network flap — the walk forwards both
+                    # verbatim for exactly that reason).
                     # Class name only in the log — a ConnectError's text can
                     # carry a credential-bearing base_url verbatim.
-                    if last_stream_death is None or _is_ctx_overflow(e):
+                    if (
+                        last_stream_death is None
+                        or isinstance(e, (BackendAuthUnavailableError, WirePreparationError))
+                        or _is_ctx_overflow(e)
+                    ):
                         raise
                     log.warning(
                         "stream.retry.recreate_failed",
@@ -8302,8 +8352,10 @@ class ChatSession:
                 # mid-consumption (error-frame lanes), and it must fall
                 # through to send()'s compact-and-retry arm rather than
                 # burn re-issues on a deterministic failure.
+                serving_lane = consumer.lane
+                assert serving_lane is not None  # an armed death implies begin_attempt ran
                 if self._stop_retrying(
-                    e, attempt, consumer.lane.provider, max_retries=self._MID_STREAM_RETRIES
+                    e, attempt, serving_lane.provider, max_retries=self._MID_STREAM_RETRIES
                 ):
                     # Terminal: finalize AND discard, exactly like the
                     # retry arm.  Keeping the buffers bought nothing — the
@@ -8326,7 +8378,7 @@ class ChatSession:
                     "stream.retry",
                     error_type=cause,
                     attempt=attempt,
-                    model=consumer.lane.model,
+                    model=serving_lane.model,
                     retry_in=delay,
                     # Spend trace for the abandoned generation: the wire
                     # reports usage only at stream end, so a dead attempt's
@@ -11289,15 +11341,6 @@ class ChatSession:
                     results = list(pool.map(run_one, items))
 
         return results, user_feedback
-
-    @staticmethod
-    def _ensure_tool_call_ids(tool_calls: list[dict[str, Any]] | dict[int, dict[str, Any]]) -> None:
-        """Fill in missing tool call IDs with synthetic UUIDs.
-
-        Delegates to :func:`turnstone.core.model_turn.ensure_tool_call_ids`
-        (the re-ingest half of the shared plant-call seam).
-        """
-        ensure_tool_call_ids(tool_calls)
 
     def _safe_prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Wrap :meth:`_prepare_tool` so a single failing preparer is

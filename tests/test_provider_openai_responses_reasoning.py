@@ -187,7 +187,7 @@ class TestReasoningItemForInput:
 class TestBuildKwargsInclude:
     """``_build_kwargs`` adds ``include=["reasoning.encrypted_content"]``
     when the resolved operator flag is True.  The capability AND-gate
-    lives upstream in ``ChatSession._resolve_replay_reasoning_to_model``
+    lives upstream in ``model_turn.resolve_replay_reasoning_to_model``
     (single source of truth across providers); the provider trusts the
     bool it receives.  See
     ``test_session_replay_reasoning.py::TestSessionToOpenAIResponsesBoundaryIntegration``

@@ -1,10 +1,12 @@
 """Shared session-test helpers.
 
-Two reasoning-test modules (``test_session_replay_reasoning.py`` and
-``test_session_synth_reasoning_block.py``) need the same minimal
-``ChatSession`` factory + a ``SessionUIBase`` no-op subclass.  Hoisting
-keeps a future third caller from drifting on the defaults — the third
-existing ``_make_session`` (``test_model_registry.py``) deliberately
+The minimal ``ChatSession`` factory, the ``SessionUIBase`` no-op/recording
+subclasses, and — since #832 — the tree's standard streaming provider
+fakes (``make_result`` / ``arm_session`` / ``scripted_provider`` /
+``ArmedHandle``, at the bottom): every suite that drives the streaming
+seam imports them from here so the eager-arming contract lives in one
+place.  Hoisting keeps callers from drifting on the defaults — the one
+deliberate exception, ``test_model_registry.py``'s ``_make_session``,
 takes a different signature (registry / model_alias / reasoning_effort
 + ``_FakeUI``) and is NOT a candidate for sharing this helper.
 
@@ -19,9 +21,11 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-from turnstone.core.providers import ModelCapabilities, StreamChunk, ToolCallDelta
+from turnstone.core.model_turn import ModelTurnResult
+from turnstone.core.providers import ModelCapabilities, StreamChunk, ToolCallDelta, UsageInfo
 from turnstone.core.session import ChatSession
 from turnstone.core.session_ui_base import SessionUIBase
+from turnstone.core.trajectory import ProviderNative, ToolCall, Turn
 
 
 class NullUI(SessionUIBase):
@@ -464,3 +468,124 @@ class RecordingUI:
 
     def of(self, kind):
         return [d for k, d in self.events if k == kind]
+
+
+# ---------------------------------------------------------------------------
+# Streaming provider fakes — the #832 seam contract
+# ---------------------------------------------------------------------------
+
+
+def make_result(
+    content: str = "",
+    *,
+    tool_calls: list[dict[str, Any]] | None = None,
+    finish_reason: str = "stop",
+    usage: UsageInfo | None = None,
+    native_blocks: list[dict[str, Any]] | None = None,
+    producer: str = "openai-compatible",
+    wire_msgs: list[dict[str, Any]] | None = None,
+) -> ModelTurnResult:
+    """A ``ModelTurnResult`` shaped like the streaming wrapper's return —
+    for tests that only need "a turn happened" and patch
+    ``_stream_response`` wholesale.  The Turn and the ``tool_calls``
+    mirror are built from the same dicts, preserving the #825 pairing
+    invariant fakes must not break."""
+    calls = list(tool_calls or [])
+    tc_tuple = tuple(
+        ToolCall(
+            id=tc.get("id", ""),
+            name=tc.get("function", {}).get("name", ""),
+            arguments=tc.get("function", {}).get("arguments", ""),
+        )
+        for tc in calls
+    )
+    native = (
+        ProviderNative(producer=producer, blocks=tuple(native_blocks)) if native_blocks else None
+    )
+    return ModelTurnResult(
+        turn=Turn.assistant(content, tool_calls=tc_tuple, native=native),
+        finish_reason=finish_reason,
+        usage=usage,
+        tool_calls=calls,
+        wire_msgs=wire_msgs,
+        producer=producer,
+    )
+
+
+class ArmedHandle:
+    """Closeable sentinel standing in for the SDK stream handle."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def arm_session(
+    session: Any,
+    *streams: Any,
+    retryable: frozenset[str] = frozenset({"IncompleteStreamError"}),
+    name: str = "openai-compatible",
+) -> MagicMock:
+    """Install a sequential multi-turn armed provider fake on *session*.
+
+    Each ``create_streaming`` call serves the next element of *streams*:
+    an iterable/generator is armed (a closeable sentinel appended to
+    ``cancel_ref`` — the eager append every real adapter performs, which
+    the fold's creation-vs-midstream classifier keys on) and returned to
+    be consumed once; an EXCEPTION instance is raised at create time
+    WITHOUT arming — a creation-phase failure the per-lane ladder owns.
+    Calls beyond the script fail loudly (the pre-fold lax consumer used
+    to absorb an exhausted iterator as a silent empty turn; the strict
+    finish gate rejects that now, so an under-scripted test must say so).
+
+    Title generation is latched off — with a provider-LEVEL fake the
+    best-effort title lane would otherwise consume the first script
+    before the main loop ran.
+    """
+    session._title_generated = True
+    provider = MagicMock()
+    provider.provider_name = name
+    provider.get_capabilities.return_value = ModelCapabilities()
+    provider.retryable_error_names = retryable
+    provider._armed_handle = MagicMock()
+    remaining = list(streams)
+
+    def _create(**kwargs: Any):
+        assert remaining, "arm_session: script exhausted — send looped for more turns than scripted"
+        nxt = remaining.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        ref = kwargs.get("cancel_ref")
+        if ref is not None:
+            ref.append(provider._armed_handle)
+        return iter(nxt) if not hasattr(nxt, "__next__") else nxt
+
+    provider.create_streaming = MagicMock(side_effect=_create)
+    session._provider = provider
+    return provider
+
+
+def scripted_provider(chunks: list[StreamChunk]) -> MagicMock:
+    """Provider fake replaying *chunks*, arming ``cancel_ref`` eagerly.
+
+    Assign to ``session._provider`` (never mutate a resolved provider —
+    the create_provider singleton rule above).  Each call returns a FRESH
+    iterator over the same script so ladder tests re-drive it; the armed
+    handle is appended per call, matching the one-handle-per-create
+    behavior of every real adapter.
+    """
+    provider = MagicMock()
+    provider.provider_name = "openai-compatible"
+    provider.get_capabilities.return_value = ModelCapabilities()
+    provider.retryable_error_names = frozenset({"IncompleteStreamError"})
+
+    def _create(**kwargs: Any):
+        ref = kwargs.get("cancel_ref")
+        if ref is not None:
+            ref.append(ArmedHandle())
+        return iter(chunks)
+
+    provider.create_streaming = MagicMock(side_effect=_create)
+    return provider

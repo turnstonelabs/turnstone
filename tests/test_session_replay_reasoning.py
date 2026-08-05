@@ -31,12 +31,13 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from tests._parity_832 import SCENARIOS, scripted_provider
+from tests._parity_832 import SCENARIOS
 from tests._session_helpers import (
     FakeAnthropicBlock,
     as_stream,
     fake_anthropic_stream,
     mock_completion_result,
+    scripted_provider,
 )
 from tests._session_helpers import make_session as _make_session
 from turnstone.core.model_turn import resolve_replay_reasoning_to_model

@@ -253,6 +253,20 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
         yield sc
 
 
+# The trailing-citations fold rule, shared spelling: post-finish info
+# (web-search source footers) folds into committed content only onto a
+# non-blank answer, joined by this separator.  The interactive display
+# consumer mirrors the drain's fold with these same two pieces — one
+# constant and one predicate — so the streamed and committed renderings
+# of a footer cannot drift.
+TRAILING_INFO_SEPARATOR = "\n\n"
+
+
+def folds_trailing_info(content: str) -> bool:
+    """Whether a trailing info footer folds onto *content* (non-blank)."""
+    return bool(content.strip())
+
+
 def drain_stream(
     chunks: Iterator[StreamChunk], *, scan_inline_reasoning: bool = True
 ) -> CompletionResult:
@@ -423,10 +437,12 @@ def drain_stream(
     # not exist, folded on, would hand every downstream emptiness check a
     # truthy footer-only "answer".  Blankness, not truthiness; checked
     # only when a footer exists (footers ride web-search turns only, and
-    # the strip scan shouldn't tax every drained completion).
-    if trailing_info_parts and content.strip():
+    # the strip scan shouldn't tax every drained completion).  The gate
+    # and separator are the shared module-level pair above — the display
+    # consumer's mirror uses the same two.
+    if trailing_info_parts and folds_trailing_info(content):
         for info in trailing_info_parts:
-            content += "\n\n" + info
+            content += TRAILING_INFO_SEPARATOR + info
 
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
     return CompletionResult(
@@ -875,14 +891,15 @@ class LLMProvider(Protocol):
         the model registry (e.g. ``thinking_mode``, ``token_param``)
         are respected.
 
-        If *cancel_ref* is provided the provider appends the underlying SDK
-        stream object (which has a ``.close()`` method) EAGERLY — inside
-        this call's body, at HTTP-response time, before the iterator is
-        even returned (not merely before the first chunk; a lazily-issued
-        generator adapter would violate this).  The append instant is
-        load-bearing: the caller's creation-vs-midstream classifier and
-        health recording key on it (#832), and the eager-append tripwires
-        in ``test_sdk_stream_boundary`` pin it per adapter.  The caller can then close it from another thread to
+        If *cancel_ref* is provided the provider appends the underlying
+        SDK stream object (which has a ``.close()`` method) EAGERLY —
+        inside this call's body, at HTTP-response time, before the
+        iterator is even returned (not merely before the first chunk; a
+        lazily-issued generator adapter would violate this).  The append
+        instant is load-bearing: the caller's creation-vs-midstream
+        classifier and health recording key on it (#832), and the
+        eager-append tripwires in ``test_sdk_stream_boundary`` pin it per
+        adapter.  The caller can then close it from another thread to
         abort a blocked HTTP read immediately.
 
         This is the ONLY transport — single-shot callers drain it through

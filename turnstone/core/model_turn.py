@@ -64,6 +64,9 @@ from turnstone.core.lowering import (
 # left outside the registry, and routing it through here keeps the
 # provider package a plant-layer-only import.
 from turnstone.core.providers import create_provider as create_provider
+from turnstone.core.providers._protocol import (
+    TRAILING_INFO_SEPARATOR as TRAILING_INFO_SEPARATOR,
+)
 
 # Protocol names imported at runtime (not TYPE_CHECKING) and re-exported with
 # the explicit ``as`` idiom: post-#832 ``ChatSession`` types its provider
@@ -85,6 +88,9 @@ from turnstone.core.providers._protocol import (
     drain_stream,
     has_reasoning_bearing_block,
     thinking_off_template_kwargs,
+)
+from turnstone.core.providers._protocol import (
+    folds_trailing_info as folds_trailing_info,
 )
 from turnstone.core.providers._protocol import (
     merge_usage as merge_usage,
@@ -113,6 +119,18 @@ _DRAIN_RETRY_BASE_DELAY = 0.5
 # (REASONING_BEARING_BLOCK_TYPES + has_reasoning_bearing_block, beside the
 # drain's double-reasoning check); this layer consumes the shared
 # predicate in :func:`synth_reasoning_block`.
+
+
+class WirePreparationError(RuntimeError):
+    """The caller's ``prepare_wire`` hook raised — a session-data fault.
+
+    ``prepare_wire`` is deterministic caller-supplied lowering over the
+    caller's own history; its failure says nothing about the backend, so
+    ``model_turn`` types it here to keep retry/fallback ladders from
+    classifying it as one (recording backend-health failures and walking
+    every fallback alias over a bug that will fail identically on each).
+    The original exception rides ``__cause__``.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -474,6 +492,21 @@ def lane_thinking_suppressed(lane: ModelLane) -> bool:
         caps is not None
         and not caps.server_parses_reasoning
         and lane.provider.provider_name in EXTRA_BODY_PROVIDERS
+    )
+
+
+def lane_scans_inline_reasoning(lane: ModelLane | None) -> bool:
+    """THE inline tag-scan gate — the single spelling of the #978 rule.
+
+    Scan ``<think>`` tags out of the content stream unless the lane's
+    capabilities declare the server already segregates reasoning
+    (``server_parses_reasoning``).  A lane with no declared capabilities —
+    or no lane yet — keeps the passthrough-server default: scan.  Shared
+    by the drain seam and the interactive display splitter so the two
+    interpretations of one stream cannot disagree.
+    """
+    return (
+        lane is None or lane.capabilities is None or not lane.capabilities.server_parses_reasoning
     )
 
 
@@ -968,11 +1001,15 @@ def model_turn(
     is the caller's — EXCEPT transient mid-stream deaths: a failure the
     provider's own ``retryable_error_names`` recognizes, raised while
     DRAINING (``IncompleteStreamError`` and friends), is re-issued in
-    place up to ``_DRAIN_RETRIES`` times (zero with *on_chunk*, above).  The retired non-streaming
-    transport read the whole body inside the SDK's retried request, so
-    single-shot callers never saw a mid-body wire blip; this loop is
-    that retry's new home (request-time failures still get the SDK's own
-    policy inside ``create_streaming`` and propagate unchanged).  An
+    place up to ``_DRAIN_RETRIES`` times (zero with *on_chunk*, above).
+    The retired non-streaming transport read the whole body inside the
+    SDK's retried request, so single-shot callers never saw a mid-body
+    wire blip; this loop is that retry's new home (request-time failures
+    still get the SDK's own policy inside ``create_streaming`` and
+    propagate unchanged).  A *prepare_wire* raise is the one re-typed
+    exception: it surfaces as :class:`WirePreparationError` (original as
+    ``__cause__``) so ladders can keep a caller-data fault out of backend
+    health and fallback walks.  An
     aborted *cancel_ref* suppresses retries — a deadline that closed the
     stream must not have the request resurrected behind its back — and,
     read before each dispatch, raises
@@ -1006,7 +1043,14 @@ def model_turn(
         wire_id_map if wire_id_map is not None else {},
     )
     if prepare_wire is not None:
-        wire = prepare_wire(wire)
+        try:
+            wire = prepare_wire(wire)
+        except Exception as prep_err:
+            # Deterministic caller-side lowering over the caller's own
+            # history — never a backend signal.  Typed so the retry and
+            # fallback ladders can refuse to record health or walk aliases
+            # over it (each lane would re-run the same failing passes).
+            raise WirePreparationError(str(prep_err)) from prep_err
     wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
     # The effort assignment scheme's lower rungs: explicit relay → lane
     # (operator) → in-code model definition → None.  None/unset knobs are
@@ -1067,11 +1111,7 @@ def model_turn(
         try:
             result = drain_stream(
                 _tee_chunks(chunks, on_chunk) if on_chunk else chunks,
-                # A lane with no declared capabilities keeps the
-                # passthrough-server default: scan.
-                scan_inline_reasoning=not (
-                    lane.capabilities.server_parses_reasoning if lane.capabilities else False
-                ),
+                scan_inline_reasoning=lane_scans_inline_reasoning(lane),
             )
             break
         except Exception as exc:

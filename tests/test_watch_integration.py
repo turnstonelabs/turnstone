@@ -30,7 +30,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._helpers import patch_session_storage
-from tests._parity_832 import make_result
+from tests._session_helpers import make_result
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import dicts_from_turns
