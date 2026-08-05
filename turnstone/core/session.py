@@ -525,7 +525,9 @@ class _StreamTurnConsumer:
         Carries three duties at exactly the old create-return timing:
         the health success record for the serving lane, and the two
         per-turn usage-slot resets whose placement guards both the
-        stale-usage leak (the old ``_stream_attempt``-entry comment) and
+        stale-usage leak (a post-finish blip can lose the trailing usage
+        chunk, and a stale completion count would be recycled as the next
+        turn's estimate) and
         the reconnect status-bar blackout.
         """
         s = self._session
@@ -3046,7 +3048,7 @@ class ChatSession:
 
         Thread safety: each assignment creates a new object (copy-on-write).
         Under CPython's GIL, individual reference assignments are atomic.
-        ``_try_stream`` captures tools at call time, so a concurrent refresh
+        Each attempt captures tools at call time, so a concurrent refresh
         between turns is safe; mid-stream the LLM request already holds
         the old snapshot.
         """
@@ -4941,7 +4943,7 @@ class ChatSession:
         fires on a history render."""
         if not ids:
             return {}
-        # caps is the ACTIVE attempt's capabilities, threaded from _try_stream so
+        # caps is the ACTIVE attempt's capabilities, threaded from its lane so
         # a fallback to a model with different media support converts on the
         # right caps; default to the primary only when called without one.
         if caps is None:
@@ -7787,7 +7789,7 @@ class ChatSession:
             # flagged ("…cannot simultaneously guarantee Consistency,"
             # surfaced as if it were a complete sentence).
             if self._cancelled_partial_msg:
-                # _stream_attempt was interrupted — save partial
+                # the streaming attempt was interrupted — save partial
                 # assistant msg.  Two shapes:
                 #
                 # - Some text streamed before cancel: append the

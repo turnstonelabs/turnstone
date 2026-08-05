@@ -554,8 +554,8 @@ class AnthropicProvider:
         intentionally preserved.  The kwarg defaults to ``True`` here
         purely for back-compat with any direct caller that hasn't been
         updated to thread the resolver — production call sites
-        (``ChatSession._try_stream`` / ``_utility_completion``) always
-        pass the resolved flag explicitly.
+        (``model_turn`` — every lane, the interactive loop included)
+        always pass the resolved flag explicitly.
 
         ``supports_mid_conversation_system`` (claude-opus-4-8,
         claude-fable-5) makes the
@@ -1306,9 +1306,9 @@ def _normalize_finish_reason(reason: str) -> str:
         # drain gate only errors on an ABSENT finish reason.  "content_filter"
         # is the
         # OpenAI-vocabulary equivalent this function normalizes onto, and both
-        # consumers already handle it: ChatSession._stream_attempt warns the
-        # user, and the sub-agent loop stops early instead of flailing on an
-        # empty turn.  Falling through to the raw "refusal" string instead
+        # consumers already handle it: the interactive wrapper's
+        # _finalize_stream_result warns the user, and the sub-agent loop
+        # stops early instead of flailing on an empty turn.  Falling through to the raw "refusal" string instead
         # would land a truncated answer as a complete result.
         return "content_filter"
     return reason

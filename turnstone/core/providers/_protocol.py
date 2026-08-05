@@ -98,10 +98,11 @@ def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
     recomputed from the merged parts.  Returns a fresh ``UsageInfo`` and
     never mutates ``new`` (the provider's object).
 
-    Serves :func:`drain_stream` and ``ChatSession``'s inline chunk
-    consumer alike — the interactive loop re-projects the merged
-    accumulator into its ``_last_usage`` dict on every usage chunk (that
-    dict has mid-stream readers), so the two lanes cannot drift on the
+    Serves :func:`drain_stream` (the one assembler) and the interactive
+    ``on_chunk`` consumer's live re-projection alike — the streaming
+    callback re-projects the merged accumulator into the session's
+    ``_last_usage`` dict on every usage chunk (that dict has mid-stream
+    readers), so the display lane cannot drift from the assembly on the
     merge rule.
     """
     if acc is None:
@@ -146,8 +147,9 @@ def accumulate_tool_call_delta(
     fragment), ``arguments_delta`` concatenates.  Returns the (possibly
     fresh) accumulator entry so callers can hang provider extras off it.
 
-    Serves :func:`drain_stream`, ``GoogleProvider``'s raw-fidelity
-    capture, and ``ChatSession``'s inline chunk consumer — every
+    Serves :func:`drain_stream` (the one assembler — post-#832 the
+    interactive loop assembles here too) and ``GoogleProvider``'s
+    raw-fidelity capture — every
     accumulator in the tree, so the chat loop and the drained lanes
     cannot assemble different calls from the same wire stream.
     """
@@ -874,8 +876,13 @@ class LLMProvider(Protocol):
         are respected.
 
         If *cancel_ref* is provided the provider appends the underlying SDK
-        stream object (which has a ``.close()`` method) before yielding the
-        first chunk.  The caller can then close it from another thread to
+        stream object (which has a ``.close()`` method) EAGERLY — inside
+        this call's body, at HTTP-response time, before the iterator is
+        even returned (not merely before the first chunk; a lazily-issued
+        generator adapter would violate this).  The append instant is
+        load-bearing: the caller's creation-vs-midstream classifier and
+        health recording key on it (#832), and the eager-append tripwires
+        in ``test_sdk_stream_boundary`` pin it per adapter.  The caller can then close it from another thread to
         abort a blocked HTTP read immediately.
 
         This is the ONLY transport — single-shot callers drain it through

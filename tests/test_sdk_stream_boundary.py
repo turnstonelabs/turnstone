@@ -207,3 +207,62 @@ def test_cross_thread_client_close_surfaces_transport_error_to_blocked_read():
             client.close()
     assert not closer_thread.is_alive()
     assert not server_thread.is_alive()
+
+
+class TestEagerAppendContract:
+    """Every adapter arms ``cancel_ref`` INSIDE ``create_streaming``'s body —
+    at HTTP-response time, before the iterator is returned (the Protocol
+    contract, strengthened on #832): the interactive wrapper's
+    creation-vs-midstream classifier and its health recording key on that
+    instant, and a lazily-issued generator adapter would silently move the
+    arming to first ``next()``, misclassifying every pre-first-chunk death
+    as a creation failure.  Real SDK clients over mock transports; the
+    assertion deliberately runs BEFORE any iteration.
+    """
+
+    def _armed_at_return(self, provider, client, **extra):
+        ref: list = []
+        stream = provider.create_streaming(
+            client=client,
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            cancel_ref=ref,
+            **extra,
+        )
+        assert len(ref) == 1, "cancel_ref not armed before create_streaming returned"
+        assert hasattr(ref[0], "close")
+        with contextlib.suppress(Exception):
+            stream.close()
+
+    def test_openai_chat_arms_eagerly(self):
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        requests: list = []
+        client = openai.OpenAI(
+            api_key="probe",
+            http_client=httpx.Client(transport=_dying_transport(CHAT_CHUNK, requests)),
+        )
+        self._armed_at_return(OpenAIChatCompletionsProvider(), client)
+        assert len(requests) == 1  # the HTTP call happened inside create
+
+    def test_openai_responses_arms_eagerly(self):
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        requests: list = []
+        client = openai.OpenAI(
+            api_key="probe",
+            http_client=httpx.Client(transport=_dying_transport(CHAT_CHUNK, requests)),
+        )
+        self._armed_at_return(OpenAIResponsesProvider(), client)
+        assert len(requests) == 1
+
+    def test_anthropic_arms_eagerly(self):
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        requests: list = []
+        client = anthropic.Anthropic(
+            api_key="probe",
+            http_client=httpx.Client(transport=_dying_transport(ANTHROPIC_EVENTS, requests)),
+        )
+        self._armed_at_return(AnthropicProvider(), client)
+        assert len(requests) == 1

@@ -128,10 +128,11 @@ A user message flows through the system as follows:
  _emit_state("thinking")
      |
      v
- _create_stream_with_retry()  ---->  provider.create_streaming(client, model, messages, ...)
+ _stream_response()  ------------->  model_turn(lane, turns, on_chunk=...) per attempt
+     |                                  lane-swap fallback walk; per-lane ladder:
      |                                  up to 3 retries (4 total attempts), exponential backoff
      v
- _stream_response(stream)  -------->  dispatch tokens to UI:
+ the on_chunk consumer  ----------->  dispatch tokens to UI:
      |                                  on_reasoning_token() / on_content_token()
      |                                  accumulate tool_calls from deltas
      |                                  track finish_reason
@@ -243,7 +244,9 @@ class SessionUI(Protocol):
     def on_content_token(self, text: str) -> None: ...
     def on_stream_end(self) -> None: ...
     def approve_tools(self, items: list[dict]) -> tuple[bool, str | None]: ...
-    def on_tool_result(self, call_id: str, name: str, output: str, *, is_error: bool = False) -> None: ...
+    def on_tool_result(
+        self, call_id: str, name: str, output: str, *, is_error: bool = False
+    ) -> None: ...
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict, context_window: int, effort: str) -> None: ...
     def on_info(self, message: str) -> None: ...
@@ -313,15 +316,15 @@ ERROR      last operation failed
 ```python
 @dataclass
 class Workstream:
-    id: str                              # uuid hex, 8 chars
-    name: str                            # user-visible label
-    state: WorkstreamState               # current state
-    session: ChatSession | None          # the conversation engine
-    ui: SessionUI | None                 # frontend adapter
+    id: str  # uuid hex, 8 chars
+    name: str  # user-visible label
+    state: WorkstreamState  # current state
+    session: ChatSession | None  # the conversation engine
+    ui: SessionUI | None  # frontend adapter
     worker_thread: threading.Thread | None
     error_message: str
-    last_active: float                   # time.monotonic() timestamp, updated on every state change
-    _lock: threading.Lock                # per-workstream state lock
+    last_active: float  # time.monotonic() timestamp, updated on every state change
+    _lock: threading.Lock  # per-workstream state lock
 ```
 
 ### WorkstreamManager
@@ -333,7 +336,9 @@ class WorkstreamManager:
     def __init__(self, session_factory: Callable[[SessionUI], ChatSession]): ...
     def create(self, name="", ui_factory=None) -> Workstream: ...
     def close(self, ws_id: str) -> bool: ...
-    def close_idle(self, max_age_seconds: float) -> list[str]: ...  # auto-close stale IDLE workstreams
+    def close_idle(
+        self, max_age_seconds: float
+    ) -> list[str]: ...  # auto-close stale IDLE workstreams
     def get(self, ws_id: str) -> Workstream | None: ...
     def get_active(self) -> Workstream | None: ...
     def list_all(self) -> list[Workstream]: ...
@@ -508,7 +513,7 @@ then returns the final content as the tool result.
   response without tools. When unlimited, the loop only exits when the model
   stops calling tools or hits `finish_reason: "length"`.
 - **Retry**: each API call in the agent loop uses the same retry+backoff logic
-  as the main `_create_stream_with_retry()`.
+  as the main loop's per-lane ladder (`_model_turn_with_retry`).
 - **Finish reason handling**: `finish_reason: "length"` stops the agent early
   and returns whatever content was generated. `finish_reason: "content_filter"`
   returns a placeholder.
@@ -941,8 +946,8 @@ with the same alias in-memory (the DB rows are never modified).
 5. `/model` command shows available models; `/model <alias>` switches the
    active workstream's client, model, context window, and per-model sampling
    parameters
-6. `_create_stream_with_retry()` tries the primary model, then each fallback
-   alias in order if the primary is unreachable
+6. `_model_turn_with_fallback()` tries the primary lane, then each fallback
+   alias's lane in order if the primary is unreachable
 7. `_run_agent()` resolves `registry.agent_model` (if set) for task
    sub-agents, allowing a cheaper model for autonomous loops
 
@@ -1178,9 +1183,9 @@ Named (aliased) workstreams are never age-pruned. Configure with
 
 Every model call streams (#831); retry lives at two stacked layers:
 
-- **Caller ladders** — `ChatSession._create_stream_with_retry()` (chat
-  loop) and the agent `_api_call()` (drained via `model_turn`) use the
-  same pattern: 4 total attempts (1 initial + 3 retries,
+- **Caller ladders** — `ChatSession._model_turn_with_retry()` (chat
+  loop, one ladder per lane) and the agent `_api_call()` (drained via
+  `model_turn`) use the same pattern: 4 total attempts (1 initial + 3 retries,
   `_MAX_RETRIES = 3`), exponential backoff base 1 second
   (`delay = 1s * 2^attempt`), `ui.on_info()` on retry, exception
   propagates on final failure. `_compact_messages()` wraps its drained
@@ -1274,7 +1279,7 @@ HALF_OPEN ──(probe fails)──────────>  OPEN
   transition the `_state` (`CircuitState` enum: `CLOSED`, `OPEN`, `HALF_OPEN`).
 - `acquire_request_permit()` returns `False` when the circuit is `OPEN` or when
   in `HALF_OPEN` and the single probe permit has already been consumed. Causes
-  `ChatSession._create_stream_with_retry` to skip the backend and surface an
+  `ChatSession._model_turn_with_fallback` to skip the backend and surface an
   error immediately.
 - The `/health` endpoint reads the monitor's state: `"status": "ok"` when the
   circuit is closed, `"status": "degraded"` when open or half-open.
