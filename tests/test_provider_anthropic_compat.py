@@ -493,11 +493,16 @@ class TestCompatSessionPlumbing:
         assert caps.supports_vision is False
 
     def test_session_extra_params_gate(self, tmp_db: Any) -> None:
-        """server_compat extra_body forwards for the compat lane, not real Anthropic."""
+        """server_compat extra_body forwards for the compat lane, not real Anthropic.
+
+        The gate lives in ``model_turn.provider_extra_params`` (the session's
+        delegate wrapper retired with the #832 fold — the lane resolver is the
+        one caller now, so the pin asserts the module function directly).
+        """
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
+        from turnstone.core.model_turn import provider_extra_params
         from turnstone.core.providers import create_provider
 
-        session = _make_session(reasoning_effort="medium")
         cfg = ModelConfig(
             alias="vllm-messages",
             base_url="http://localhost:8000",
@@ -506,14 +511,15 @@ class TestCompatSessionPlumbing:
             provider="anthropic-compatible",
             server_compat={"extra_body": {"chat_template_kwargs": {"thinking": False}}},
         )
-        session._registry = ModelRegistry(models={"vllm-messages": cfg}, default="vllm-messages")
-        session._model_alias = "vllm-messages"
+        registry = ModelRegistry(models={"vllm-messages": cfg}, default="vllm-messages")
 
-        session._provider = create_provider("anthropic-compatible")
-        assert session._provider_extra_params() == {"chat_template_kwargs": {"thinking": False}}
+        compat = create_provider("anthropic-compatible")
+        assert provider_extra_params(compat, registry, "vllm-messages") == {
+            "chat_template_kwargs": {"thinking": False}
+        }
 
-        session._provider = create_provider("anthropic")
-        assert session._provider_extra_params() is None
+        real = create_provider("anthropic")
+        assert provider_extra_params(real, registry, "vllm-messages") is None
 
 
 # ===========================================================================
