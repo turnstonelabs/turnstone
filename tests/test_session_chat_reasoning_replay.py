@@ -3,17 +3,23 @@
 
 Phase 5 is the only reasoning-replay path that does NOT use the static
 ``supports_reasoning_replay`` capability gate.  It's a parallel path to
-Paths 1+2, gated entirely at the session level on three conditions:
+Paths 1+2, gated on three conditions and nothing else:
 
 1. Provider is ``OpenAIChatCompletionsProvider``.
 2. ``server_compat.server_type == "vllm"``.
 3. Operator-set ``ModelConfig.replay_reasoning_to_model`` is True.
 
-These tests drive through ``ChatSession._maybe_attach_vllm_chat_reasoning``
+These tests drive through ``model_turn.maybe_attach_vllm_chat_reasoning``
 to pin each gate independently, then one round-trip test through the real
 OpenAI Python SDK + httpx MockTransport confirms the ``reasoning`` field
 actually reaches the wire bytes (the SDK-boundary guarantee that the
-session-level attach approach hinges on).
+attach approach hinges on).
+
+The gate ran behind a ``ChatSession`` wrapper until #832 folded the main
+loop onto ``model_turn``; the attach is now one of the seam's own lowering
+passes, reading the lane's registry + alias.  Same three gates, one
+indirection down — and both session funnels (the streaming turn and
+``_utility_completion``) reach it through that one seam.
 """
 
 from __future__ import annotations
@@ -21,13 +27,15 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
 
-from tests._session_helpers import as_stream, mock_completion_result
+from tests._parity_832 import ArmedHandle
+from tests._session_helpers import as_stream, mock_completion_result, think_tag_stream
 from tests._session_helpers import make_session as _make_session
+from turnstone.core.model_turn import maybe_attach_vllm_chat_reasoning
 from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
@@ -90,34 +98,33 @@ def _assistant_msg_with_thinking(text: str = "let me think") -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Gate tests via ``_maybe_attach_vllm_chat_reasoning`` directly
+# Gate tests via ``maybe_attach_vllm_chat_reasoning`` directly
 # ---------------------------------------------------------------------------
 
 
 class TestMaybeAttachVllmChatReasoningGates:
-    """The session-level method that combines all three Phase 5 gates."""
+    """The seam pass that combines all three Phase 5 gates.
+
+    Reads the registry + alias the LANE carries — what the session
+    wrapper used to hand it, resolved per call inside ``model_turn`` so a
+    mid-session admin toggle keeps applying.
+    """
 
     def test_all_gates_pass_attaches_reasoning(self) -> None:
-        session = _make_session()
-        session._registry = _vllm_registry(replay=True)
-        session._model_alias = "qwen3"
         provider = OpenAIChatCompletionsProvider()
 
         msgs = [{"role": "user", "content": "q"}, _assistant_msg_with_thinking("CoT")]
-        out = session._maybe_attach_vllm_chat_reasoning(msgs, provider)
+        out = maybe_attach_vllm_chat_reasoning(msgs, provider, _vllm_registry(replay=True), "qwen3")
         assert out[1]["reasoning"] == "CoT"
 
     def test_non_chat_completions_provider_is_no_op(self) -> None:
         # Provider isinstance gate: Anthropic / Responses / Google all
         # have their own reasoning-replay paths (Paths 1 / 2) — Phase 5
         # must not double-attach.
-        session = _make_session()
-        session._registry = _vllm_registry(replay=True)
-        session._model_alias = "qwen3"
         provider = AnthropicProvider()
 
         msgs = [_assistant_msg_with_thinking()]
-        out = session._maybe_attach_vllm_chat_reasoning(msgs, provider)
+        out = maybe_attach_vllm_chat_reasoning(msgs, provider, _vllm_registry(replay=True), "qwen3")
         assert "reasoning" not in out[0]
         # Same reference — no copy made.
         assert out[0] is msgs[0]
@@ -127,13 +134,10 @@ class TestMaybeAttachVllmChatReasoningGates:
         # OpenAIChatCompletionsProvider) — the isinstance gate rejects
         # it cleanly.  This is the load-bearing distinction; an
         # accidental inheritance refactor would break the gate.
-        session = _make_session()
-        session._registry = _vllm_registry(replay=True)
-        session._model_alias = "qwen3"
         provider = OpenAIResponsesProvider()
 
         msgs = [_assistant_msg_with_thinking()]
-        out = session._maybe_attach_vllm_chat_reasoning(msgs, provider)
+        out = maybe_attach_vllm_chat_reasoning(msgs, provider, _vllm_registry(replay=True), "qwen3")
         assert "reasoning" not in out[0]
 
     @pytest.mark.parametrize("server_type", ["", "llama.cpp", "sglang", "openai", "unknown"])
@@ -141,43 +145,34 @@ class TestMaybeAttachVllmChatReasoningGates:
         # Server-type pin bounds blast radius — canonical OpenAI Chat
         # Completions, llama.cpp, sglang, and any unrecognised server
         # never receive the non-standard ``reasoning`` field.
-        session = _make_session()
-        session._registry = _registry_with_server_type(server_type, replay=True)
-        session._model_alias = "some-model"
+        registry = _registry_with_server_type(server_type, replay=True)
         provider = OpenAIChatCompletionsProvider()
 
         msgs = [_assistant_msg_with_thinking()]
-        out = session._maybe_attach_vllm_chat_reasoning(msgs, provider)
+        out = maybe_attach_vllm_chat_reasoning(msgs, provider, registry, "some-model")
         assert "reasoning" not in out[0]
 
     def test_operator_flag_off_is_no_op(self) -> None:
-        session = _make_session()
-        session._registry = _vllm_registry(replay=False)  # operator flag OFF
-        session._model_alias = "qwen3"
+        registry = _vllm_registry(replay=False)  # operator flag OFF
         provider = OpenAIChatCompletionsProvider()
 
         msgs = [_assistant_msg_with_thinking()]
-        out = session._maybe_attach_vllm_chat_reasoning(msgs, provider)
+        out = maybe_attach_vllm_chat_reasoning(msgs, provider, registry, "qwen3")
         assert "reasoning" not in out[0]
 
     def test_missing_registry_is_no_op(self) -> None:
-        session = _make_session()
-        session._registry = None
-        session._model_alias = "qwen3"
         provider = OpenAIChatCompletionsProvider()
 
         msgs = [_assistant_msg_with_thinking()]
-        out = session._maybe_attach_vllm_chat_reasoning(msgs, provider)
+        out = maybe_attach_vllm_chat_reasoning(msgs, provider, None, "qwen3")
         assert "reasoning" not in out[0]
 
     def test_missing_alias_is_no_op(self) -> None:
-        session = _make_session()
-        session._registry = _vllm_registry(replay=True)
-        session._model_alias = ""
+        # A lane outside the registry carries ``alias=""``.
         provider = OpenAIChatCompletionsProvider()
 
         msgs = [_assistant_msg_with_thinking()]
-        out = session._maybe_attach_vllm_chat_reasoning(msgs, provider)
+        out = maybe_attach_vllm_chat_reasoning(msgs, provider, _vllm_registry(replay=True), "")
         assert "reasoning" not in out[0]
 
     def test_registry_exception_is_no_op(self) -> None:
@@ -187,20 +182,17 @@ class TestMaybeAttachVllmChatReasoningGates:
         def boom(_alias: str) -> Any:
             raise KeyError("missing")
 
-        session = _make_session()
-        session._registry = SimpleNamespace(get_config=boom)
-        session._model_alias = "qwen3"
+        registry = SimpleNamespace(get_config=boom)
         provider = OpenAIChatCompletionsProvider()
 
         msgs = [_assistant_msg_with_thinking()]
-        out = session._maybe_attach_vllm_chat_reasoning(msgs, provider)
+        out = maybe_attach_vllm_chat_reasoning(msgs, provider, registry, "qwen3")
         assert "reasoning" not in out[0]
 
-    def test_explicit_alias_arg_overrides_session_default(self) -> None:
-        # When _try_stream forwards an explicit ``model_alias`` (different
-        # from the session's primary), the helper must read THAT alias'
-        # config — not the session's primary.  Mirrors the per-alias
-        # behaviour pinned for _resolve_replay_reasoning_to_model.
+    def test_alias_selects_its_own_config(self) -> None:
+        # The gate reads the config of the alias the LANE resolved — a
+        # fallback lane's alias, not the session's primary.  Mirrors the
+        # per-alias behaviour pinned for resolve_replay_reasoning_to_model.
         def per_alias(alias: str) -> Any:
             return SimpleNamespace(
                 replay_reasoning_to_model=(alias == "wants-replay"),
@@ -208,18 +200,16 @@ class TestMaybeAttachVllmChatReasoningGates:
                 server_compat={"server_type": "vllm"},
             )
 
-        session = _make_session()
-        session._registry = SimpleNamespace(get_config=per_alias)
-        session._model_alias = "primary"
+        registry = SimpleNamespace(get_config=per_alias)
         provider = OpenAIChatCompletionsProvider()
 
         msgs = [_assistant_msg_with_thinking()]
-        # Default alias → flag off → no attach.
-        out_default = session._maybe_attach_vllm_chat_reasoning(msgs, provider)
-        assert "reasoning" not in out_default[0]
-        # Explicit alias arg → flag on → attached.
-        out_explicit = session._maybe_attach_vllm_chat_reasoning(msgs, provider, "wants-replay")
-        assert out_explicit[0]["reasoning"] == "let me think"
+        # Flag off for this alias → no attach.
+        out_primary = maybe_attach_vllm_chat_reasoning(msgs, provider, registry, "primary")
+        assert "reasoning" not in out_primary[0]
+        # Flag on for this one → attached.
+        out_replay = maybe_attach_vllm_chat_reasoning(msgs, provider, registry, "wants-replay")
+        assert out_replay[0]["reasoning"] == "let me think"
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +268,7 @@ class TestReasoningFieldReachesWireBytes:
         provider = OpenAIChatCompletionsProvider()
 
         # Mimic the post-attach message shape that
-        # ``_maybe_attach_vllm_chat_reasoning`` produces, then sanitize.
+        # ``maybe_attach_vllm_chat_reasoning`` produces, then sanitize.
         # ``sanitize_messages`` runs inside provider._prepare_messages
         # and must preserve the non-``_``-prefixed ``reasoning`` field.
         messages = [
@@ -348,58 +338,55 @@ class TestReasoningFieldReachesWireBytes:
 
 
 # ---------------------------------------------------------------------------
-# Call-site integration: confirm _try_stream and _utility_completion both
-# invoke the helper.  Pins that the 2 hoist points stay in sync; a missed
-# call site is exactly the kind of regression this catches.  The agent
-# _run_agent path is deliberately NOT a Phase 5 hoist — see the NOTE
-# comment inside _run_agent's nested _api_call closure (grep session.py
-# for "Phase 5 vLLM ``reasoning`` field replay is intentionally NOT
-# wired here"): agent assistant messages don't carry
-# ``_provider_content`` so the helper would no-op every turn anyway.
+# Call-site integration: confirm the streaming turn and _utility_completion
+# both reach the attach.  Post-#832 both funnel through ``model_turn``,
+# which runs the pass itself — so these pin that each funnel still goes
+# through that seam (a call site that grew a private wire path would skip
+# it).  The sub-agent loop rides the same seam via ``_run_agent``'s
+# ``_api_call``; its assistant turns carry no ``_provider_content`` in
+# practice, so the pass no-ops there rather than being wired around.
 # ---------------------------------------------------------------------------
 
 
 class TestCallSitesInvokeMaybeAttach:
-    """The helper does nothing unless one of the 2 call sites calls it.
-    Verify the wiring at each — without this, a refactor that drops a
-    call site would silently regress Phase 5 on that path."""
+    """The pass does nothing for a call site that doesn't reach it.
+    Verify the wiring at each — without this, a refactor that gives one
+    funnel its own wire build would silently regress Phase 5 there."""
 
-    def test_try_stream_call_site_attaches(self) -> None:
+    def test_streaming_call_site_attaches(self) -> None:
         session = _make_session()
         session._registry = _vllm_registry(replay=True)
         session._model_alias = "qwen3"
+        session.model = "qwen3"
 
         captured: dict[str, Any] = {}
 
         def capture_streaming(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return iter([])
+            # The armed/creation classifier reads the cancel_ref, so the
+            # fake arms it eagerly like every real adapter.
+            ref = kwargs.get("cancel_ref")
+            if ref is not None:
+                ref.append(ArmedHandle())
+            return think_tag_stream("ok")
 
         provider = OpenAIChatCompletionsProvider()
         # Patch only the network-facing method so we don't actually call
         # an LLM, but keep the real provider instance (so the isinstance
         # gate sees the right type).
         provider.create_streaming = capture_streaming  # type: ignore[method-assign]
+        session._provider = provider
+        session.messages = turns_from_dicts([_assistant_msg_with_thinking("from the main loop")])
 
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            session._try_stream(
-                client=MagicMock(),
-                model="qwen3",
-                msgs=[_assistant_msg_with_thinking("from try_stream")],
-                provider=provider,
-                model_alias="qwen3",
-            )
+        session._stream_response(0)
 
         # The messages handed to the provider include the attached
-        # reasoning field — proves _try_stream invoked
-        # _maybe_attach_vllm_chat_reasoning before the call.
+        # reasoning field — proves the streaming turn reached the attach.
+        # The wire list carries the session's system messages now, so the
+        # assistant turn is found by role, not by index.
         msgs_sent = captured["messages"]
-        assert msgs_sent[0]["reasoning"] == "from try_stream"
+        assistant = next(m for m in msgs_sent if m["role"] == "assistant")
+        assert assistant["reasoning"] == "from the main loop"
 
     def test_utility_completion_call_site_attaches(self) -> None:
         session = _make_session()
@@ -416,11 +403,11 @@ class TestCallSitesInvokeMaybeAttach:
         provider.create_streaming = capture_streaming  # type: ignore[method-assign]
         session._provider = provider
 
-        with (
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(
-                session, "_get_capabilities", return_value=provider.get_capabilities("qwen3")
-            ),
+        # No extra_params patch: _utility_completion resolves them inside
+        # resolve_lane (a module seam reading the registry config), which
+        # a session-attribute patch cannot intercept.
+        with patch.object(
+            session, "_get_capabilities", return_value=provider.get_capabilities("qwen3")
         ):
             session._utility_completion(
                 turns_from_dicts([_assistant_msg_with_thinking("from utility")]),

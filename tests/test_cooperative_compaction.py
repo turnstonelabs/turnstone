@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._parity_832 import make_result
 from tests._session_helpers import make_session
 from turnstone.core.session import (
     COMPACTION_SOURCE,
@@ -204,10 +205,7 @@ class TestCompactionLatch:
         session._compaction_advised = True  # stale latch from a prior turn
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session, "_stream_response", return_value={"role": "assistant", "content": "done"}
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("done")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -249,11 +247,10 @@ class TestEndOfTurnAutoResume:
             calls["n"] += 1
             if calls["n"] == 1:
                 session._compaction_advised = True  # advisory fired this turn
-                return {"role": "assistant", "content": "paused; plan recorded"}
-            return {"role": "assistant", "content": "done"}
+                return make_result("paused; plan recorded")
+            return make_result("done")
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(session, "_stream_response", side_effect=stream),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
@@ -282,10 +279,7 @@ class TestEndOfTurnAutoResume:
         session._compaction_advised = False
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session, "_stream_response", return_value={"role": "assistant", "content": "done"}
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("done")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -321,11 +315,10 @@ class TestEndOfTurnAutoResume:
             calls["n"] += 1
             if calls["n"] == 1:
                 session._compaction_advised = True  # advised stop
-                return {"role": "assistant", "content": "paused"}
-            return {"role": "assistant", "content": "done"}
+                return make_result("paused")
+            return make_result("done")
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(session, "_stream_response", side_effect=stream),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
@@ -365,14 +358,13 @@ class TestEndOfTurnAutoResume:
             n["i"] += 1
             if n["i"] == 1:
                 session._compaction_advised = True  # advisory fired this turn
-                return {"role": "assistant", "content": "pausing to compact"}
-            return {"role": "assistant", "content": "all done"}
+                return make_result("pausing to compact")
+            return make_result("all done")
 
         def est(*_a, **_k):
             return 9_999 if n["i"] <= 1 else 10  # over threshold only on the stop turn
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(session, "_stream_response", side_effect=stream),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
@@ -454,11 +446,10 @@ class TestCompactBeforeTruncate:
         def stream(*_a, **_k):
             n["i"] += 1
             if n["i"] == 1:
-                return {"role": "assistant", "content": "", "tool_calls": [tc]}
-            return {"role": "assistant", "content": "done"}
+                return make_result("", tool_calls=[tc])
+            return make_result("done")
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(session, "_stream_response", side_effect=stream),
             patch.object(session, "_execute_tools", return_value=([("call_1", "out")], "")),
             patch.object(session, "_full_messages", return_value=[]),
@@ -493,11 +484,10 @@ class TestCompactBeforeTruncate:
         def stream(*_a, **_k):
             n["i"] += 1
             if n["i"] == 1:
-                return {"role": "assistant", "content": "", "tool_calls": [tc]}
-            return {"role": "assistant", "content": "done"}
+                return make_result("", tool_calls=[tc])
+            return make_result("done")
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(session, "_stream_response", side_effect=stream),
             patch.object(session, "_execute_tools", return_value=([("call_1", "out")], "")),
             patch.object(session, "_full_messages", return_value=[]),
@@ -534,11 +524,10 @@ class TestCompactBeforeTruncate:
         def stream(*_a, **_k):
             n["i"] += 1
             if n["i"] == 1:
-                return {"role": "assistant", "content": "", "tool_calls": [tc]}
-            return {"role": "assistant", "content": "done"}
+                return make_result("", tool_calls=[tc])
+            return make_result("done")
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(session, "_stream_response", side_effect=stream),
             patch.object(session, "_execute_tools", return_value=([("call_1", "out")], "")),
             patch.object(session, "_full_messages", return_value=[]),
@@ -1095,7 +1084,7 @@ class TestProactivePreSend:
 
         def fake_stream_response(*_args, **_kwargs):
             order.append("stream")
-            return {"role": "assistant", "content": "done"}
+            return make_result("done")
 
         with (
             # 9999 > hard (9000) → compaction is owed at send time.
@@ -1475,7 +1464,7 @@ class TestChunkerOverflowSplit:
         with (
             patch.object(session, "_estimated_prompt_tokens", return_value=10),  # under hard
             patch.object(session, "_check_metacognitive_nudge", return_value=None),
-            patch.object(session, "_create_stream_with_retry", side_effect=cancel_midstream),
+            patch.object(session, "_stream_response", side_effect=cancel_midstream),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -2330,7 +2319,12 @@ class TestOrphanedCompactionRetirement:
     def test_summary_call_registers_abortable_stream(self, session):
         """Each summary attempt passes a fresh _CancelRef so cancel() can
         close the in-flight summary HTTP stream — Stop during compaction
-        aborts the blocked read instead of waiting out a model call."""
+        aborts the blocked read instead of waiting out a model call.
+
+        Freshness is pinned per CALL rather than against a session-wide
+        register: #832 retired the shared ``_cancel_ref`` slot outright, so
+        "not the shared ref" is no longer a statement anything can violate —
+        "every call mints its own, and no session-wide slot exists" is."""
         from turnstone.core.session import _CancelRef
 
         seen: list[object] = []
@@ -2344,9 +2338,11 @@ class TestOrphanedCompactionRetirement:
 
         with patch.object(session, "_utility_completion", side_effect=fake_uc):
             assert session._summarize_once("sys", "body") == "dense"
-        assert len(seen) == 1
-        assert isinstance(seen[0], _CancelRef)
-        assert seen[0] is not session._cancel_ref  # scoped, never the shared ref
+            assert session._summarize_once("sys", "body") == "dense"
+        assert len(seen) == 2
+        assert all(isinstance(ref, _CancelRef) for ref in seen)
+        assert seen[0] is not seen[1]  # scoped to its call, never reused
+        assert not hasattr(session, "_cancel_ref")  # and no shared register
 
     def test_cancel_ref_aborted_property_tracks_event(self, session):
         """model_turn consults cancel_ref.aborted to suppress drain retries

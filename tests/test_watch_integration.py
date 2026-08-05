@@ -3,8 +3,9 @@
 Drives a real :class:`ChatSession` + a real :class:`WatchRunner` (with
 its daemon thread skipped — we call ``_dispatch_result`` directly to
 avoid the timer dependency) end-to-end through the chat-loop drain
-seam.  The only stub is the LLM provider (patched
-``_create_stream_with_retry``); every other layer is production code:
+seam.  The only stub is the model turn (patched ``_stream_response``,
+returning a canned ``ModelTurnResult``); every other layer is
+production code:
 
 * ``WatchRunner._dispatch_result`` releasing the dispatch lock before
   fan-out
@@ -29,6 +30,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._helpers import patch_session_storage
+from tests._parity_832 import make_result
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import dicts_from_turns
@@ -117,16 +119,11 @@ def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
     pending = session._nudge_queue.pending(channel="any")
     assert pending == [("watch_triggered", "watch payload body")]
 
-    # 3. Run the chat loop with the LLM patched.  We don't care about
-    # the assistant turn's content; only the wire payload sent to the
-    # provider matters.
+    # 3. Run the chat loop with the model turn patched.  We don't care
+    # about the assistant turn's content; only what the drain seam put
+    # into history alongside it matters.
     with (
-        patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-        patch.object(
-            session,
-            "_stream_response",
-            return_value={"role": "assistant", "content": "ok"},
-        ),
+        patch.object(session, "_stream_response", return_value=make_result(content="ok")),
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
         patch.object(session, "_visible_memory_count", return_value=0),
@@ -182,12 +179,7 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
     assert len(session._nudge_queue) == 3
 
     with (
-        patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-        patch.object(
-            session,
-            "_stream_response",
-            return_value={"role": "assistant", "content": "got it"},
-        ),
+        patch.object(session, "_stream_response", return_value=make_result(content="got it")),
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
         patch.object(session, "_visible_memory_count", return_value=0),

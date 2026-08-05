@@ -1518,66 +1518,61 @@ class TestModelOboToken:
         )
         session._mcp_mint_client.mint_app_token_sync.assert_not_called()
 
-    def test_primary_stream_binds_backend_token_once_before_retry_loop(self) -> None:
-        """The main streaming path mirrors model_turn's SDK binding."""
+    def test_main_lane_carries_backend_auth_resolver(self) -> None:
+        """The main loop's lane wires the session's mint resolver — the
+        credential then resolves and binds INSIDE model_turn per attempt,
+        after its entry abort read (the #972/#832 ordering: a pre-set Stop
+        mints nothing, pinned in test_cancel; the with_options SDK binding
+        itself is model_turn's own pinned behavior).  This replaces the
+        retired pin on _try_stream's hoisted once-per-ladder resolve."""
         sess = MagicMock()
-        sess._MAX_RETRIES = 2
-        sess._provider = MagicMock()
-        sess._provider.create_streaming.return_value = iter(())
-        sess._get_capabilities.return_value = SimpleNamespace(default_reasoning_effort=None)
-        sess._maybe_attach_vllm_chat_reasoning.side_effect = lambda messages, _provider, _alias: (
-            messages
-        )
-        sess._model_backend_auth_token.return_value = "minted-jwt"
-        sess._cancel_ref = []
-        sess._get_active_tools.return_value = []
-        sess.max_tokens = 1024
-        sess.temperature = None
+        sess._registry = None
+        sess._config_store = None
+        sess.temperature = 0.5
         sess.reasoning_effort = None
-        sess._provider_extra_params.return_value = None
-        sess._get_deferred_names.return_value = frozenset()
-        sess._resolve_replay_reasoning_to_model.return_value = False
-        base_client = MagicMock()
-        base_client.base_url = "https://gateway.example.com"
-        bound_client = object()
-        base_client.with_options.return_value = bound_client
 
-        stream = ChatSession._try_stream(
+        lane = ChatSession._build_main_lane(
             sess,
-            base_client,
-            "vmg/opus",
-            [{"role": "user", "content": "hi"}],
-            model_alias="tf",
+            provider=MagicMock(provider_name="openai-compatible"),
+            client=MagicMock(),
+            model="vmg/opus",
+            alias="tf",
+            capabilities=SimpleNamespace(),
         )
 
-        assert list(stream) == []
-        sess._model_backend_auth_token.assert_called_once_with("tf")
-        base_client.with_options.assert_called_once_with(api_key="minted-jwt")
-        assert sess._provider.create_streaming.call_args.kwargs["client"] is bound_client
+        assert lane.backend_auth_resolver is sess._model_backend_auth_token
+        assert lane.alias == "tf"
+        # The session's own sampling knobs override the lane's operator
+        # rungs (wire parity with the pre-fold loop).
+        assert lane.temperature == 0.5
+        assert lane.reasoning_effort is None
 
-    def test_primary_stream_forwards_alias_for_obo(self) -> None:
-        # Regression: the primary _create_stream_with_retry call must pass
-        # model_alias, or the backend-auth resolver can't resolve the OBO token and an
-        # entra_obo main turn goes out on the static client key. The fallback
-        # path and utility (title) completions always passed the alias; the
-        # primary path silently didn't.
+    def test_primary_lane_built_with_session_alias_for_obo(self) -> None:
+        # Regression: the primary lane must carry the session alias, or the
+        # backend-auth resolver can't resolve the OBO token and an
+        # entra_obo main turn goes out on the static client key. (The
+        # pre-fold bug lived in _try_stream's missing model_alias kwarg;
+        # the lane build is the one place the alias enters now.)
         sess = MagicMock()
         sess._model_alias = "oboagent"
-        ChatSession._create_stream_with_retry(sess, [{"role": "user", "content": "hi"}])
-        sess._try_stream.assert_called_once()
-        assert sess._try_stream.call_args.kwargs.get("model_alias") == "oboagent"
+        ChatSession._model_turn_with_fallback(sess, MagicMock(), lambda wire: wire)
+        sess._build_main_lane.assert_called_once()
+        assert sess._build_main_lane.call_args.kwargs["alias"] == "oboagent"
 
     def test_fail_closed_refusal_never_enters_model_fallback_chain(self) -> None:
         sess = MagicMock()
         sess._model_alias = "oboagent"
-        sess._try_stream.side_effect = BackendAuthUnavailableError("mint failed")
+        sess._model_turn_with_retry.side_effect = BackendAuthUnavailableError("mint failed")
         sess._registry.fallback = ["static-backup"]
-        sess._get_health_tracker.return_value = None
+        tracker = MagicMock()
+        sess._get_health_tracker.return_value = tracker
 
         with pytest.raises(BackendAuthUnavailableError):
-            ChatSession._create_stream_with_retry(sess, [{"role": "user", "content": "hi"}])
+            ChatSession._model_turn_with_fallback(sess, MagicMock(), lambda wire: wire)
 
-        sess._try_fallback.assert_not_called()
+        sess._try_fallback_lane.assert_not_called()
+        # An auth refusal is never reinterpreted as backend health.
+        tracker.record_failure.assert_not_called()
 
     def test_static_alias_returns_none_and_never_mints(self) -> None:
         static_cfg = ModelConfig(

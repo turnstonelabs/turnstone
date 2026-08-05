@@ -2185,41 +2185,44 @@ class TestSessionConstructionFailureLatch:
 
 class TestSessionFallback:
     def test_fallback_on_primary_failure(self) -> None:
+        # provider="openai-compatible" pins the Chat Completions surface, the
+        # one the patched ``chat.completions.create`` stubs below speak (see
+        # TestSessionRemovedAliasDegradedTurns._registry for the precedent).
         reg = ModelRegistry(
             models={
-                "primary": ModelConfig("primary", "http://p/v1", "k", "p-model"),
-                "fallback": ModelConfig("fallback", "http://f/v1", "k", "f-model"),
+                "primary": ModelConfig(
+                    "primary", "http://p/v1", "k", "p-model", provider="openai-compatible"
+                ),
+                "fallback": ModelConfig(
+                    "fallback", "http://f/v1", "k", "f-model", provider="openai-compatible"
+                ),
             },
             default="primary",
             fallback=["fallback"],
         )
         session = _make_session(registry=reg, model_alias="primary")
+        # Primary: an unarmed creation failure (raises before any chunk, so
+        # cancel_ref is never appended) — a non-retryable class, so the
+        # per-lane ladder gives up after one attempt and the fallback walk
+        # takes over.
+        session.client.chat.completions.create = MagicMock(
+            side_effect=ConnectionError("Primary down")
+        )
+        # Fallback: resolved through the REAL registry binding, so the fake
+        # goes on the registry's own client for that alias, not the session's.
+        fb_client = reg.get_client("fallback")
+        fb_client.chat.completions.create = scripted_chat_client({"content": "fallback_response"})
 
-        # _try_stream: first call (primary) raises, second call (fallback) succeeds
-        call_count = 0
+        session.send("hi")
 
-        def fake_try_stream(client: Any, model: str, msgs: Any, **kwargs: Any) -> str:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise ConnectionError("Primary down")
-            return "fallback_response"
-
-        session._try_stream = fake_try_stream  # type: ignore[assignment]
-        result = session._create_stream_with_retry([{"role": "user", "content": "hi"}])
-        assert result == "fallback_response"
-        assert call_count == 2
+        assert session.messages[-1].text == "fallback_response"
         assert any("falling back" in i for i in session.ui.infos)
 
     def test_no_fallback_without_registry(self) -> None:
         session = _make_session()
-
-        def fake_try_stream(client: Any, model: str, msgs: Any, **kwargs: Any) -> str:
-            raise ConnectionError("Down")
-
-        session._try_stream = fake_try_stream  # type: ignore[assignment]
+        session.client.chat.completions.create = MagicMock(side_effect=ConnectionError("Down"))
         with pytest.raises(ConnectionError):
-            session._create_stream_with_retry([{"role": "user", "content": "hi"}])
+            session.send("hi")
 
 
 class TestSessionAgentModel:

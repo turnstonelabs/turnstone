@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+from tests._parity_832 import scripted_provider
 from tests._session_helpers import make_session
 from turnstone.core.history_decoration import (
     extract_reasoning_for_history,
@@ -36,6 +37,7 @@ from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
 from turnstone.core.providers._protocol import StreamChunk, UsageInfo
+from turnstone.core.trajectory import Turn
 
 _MARKER = "SECRET_REASONING_MARKER_xyz123_unlikely_collision"
 
@@ -226,30 +228,34 @@ class TestReasoningAuditLogDiscipline:
             f"reasoning text into INFO+ logs: {offending}"
         )
 
-    def test_synth_reasoning_block_via_stream_attempt_does_not_log_reasoning(
+    def test_synth_reasoning_block_via_stream_response_does_not_log_reasoning(
         self,
     ) -> None:
-        """Drives ChatSession._stream_attempt (which invokes
-        model_turn.synth_reasoning_block at end-of-stream via
-        _finalize_provider_blocks) with a fake
-        ``reasoning_delta=_MARKER`` chunk; asserts no log call carried
-        the marker text."""
+        """Drives session._stream_response (the real drain seam —
+        _stream_attempt no longer exists post-#832; invokes
+        model_turn.synth_reasoning_block at end-of-turn via
+        finalize_provider_blocks) with a fake ``reasoning_delta=_MARKER``
+        chunk; asserts no log call carried the marker text."""
         session = make_session()
-        chunks = [
-            StreamChunk(reasoning_delta=_MARKER, is_first=True),
-            StreamChunk(content_delta="answer"),
-            StreamChunk(
-                finish_reason="stop",
-                usage=UsageInfo(prompt_tokens=10, completion_tokens=20, total_tokens=30),
-            ),
-        ]
+        session._provider = scripted_provider(
+            [
+                StreamChunk(reasoning_delta=_MARKER, is_first=True),
+                StreamChunk(content_delta="answer"),
+                StreamChunk(
+                    finish_reason="stop",
+                    usage=UsageInfo(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+                ),
+            ]
+        )
+        session.messages.append(Turn.user("hi"))
         captured, patchers = _capture_log_calls()
         for p in patchers:
             p.start()
         try:
-            msg = session._stream_attempt(iter(chunks))
-            # Synth block stamped onto _provider_content with the marker.
-            assert msg["_provider_content"][0]["text"] == _MARKER
+            result = session._stream_response(0)
+            # Synth block stamped onto the native lane with the marker.
+            assert result.turn.native is not None
+            assert result.turn.native.blocks[0]["text"] == _MARKER
         finally:
             for p in patchers:
                 p.stop()
@@ -259,7 +265,7 @@ class TestReasoningAuditLogDiscipline:
             if _payload_contains_marker(args, kwargs)
         ]
         assert offending == [], (
-            f"_stream_attempt + synth_reasoning_block leaked reasoning "
+            f"_stream_response + synth_reasoning_block leaked reasoning "
             f"text into INFO+ logs: {offending}"
         )
 
@@ -332,31 +338,34 @@ class TestReasoningAuditLogDiscipline:
         )
 
     def test_maybe_attach_vllm_chat_reasoning_does_not_log_reasoning(self) -> None:
-        """Phase 5 gate method on ChatSession — the session-level
-        composite gate calls ``attach_vllm_chat_reasoning_field`` when
-        all 3 conditions pass.  Pin that the gate path itself doesn't
-        log reasoning text (the registry / capability lookups happen
-        adjacent to the reasoning bytes; a defensive ``log.warning``
-        showing the message dict on an error path would silently
-        violate the contract)."""
+        """Phase 5 gate — ``model_turn.maybe_attach_vllm_chat_reasoning``.
+
+        Post-#832 this composite gate is a plain module function (no
+        ``ChatSession`` delegate survives; ``model_turn.model_turn`` calls
+        it directly with the lane's own registry/alias). Pin that the
+        gate path itself doesn't log reasoning text (the registry /
+        capability lookups happen adjacent to the reasoning bytes; a
+        defensive ``log.warning`` showing the message dict on an error
+        path would silently violate the contract)."""
+        from turnstone.core.model_turn import maybe_attach_vllm_chat_reasoning
         from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
-        session = make_session()
-        session._registry = SimpleNamespace(
+        registry = SimpleNamespace(
             get_config=lambda _alias: SimpleNamespace(
                 replay_reasoning_to_model=True,
                 capabilities={},
                 server_compat={"server_type": "vllm"},
             )
         )
-        session._model_alias = "qwen3"
         provider = OpenAIChatCompletionsProvider()
 
         captured, patchers = _capture_log_calls()
         for p in patchers:
             p.start()
         try:
-            out = session._maybe_attach_vllm_chat_reasoning([self._thinking_msg(_MARKER)], provider)
+            out = maybe_attach_vllm_chat_reasoning(
+                [self._thinking_msg(_MARKER)], provider, registry, "qwen3"
+            )
             assert out[0]["reasoning"] == _MARKER
         finally:
             for p in patchers:
@@ -367,6 +376,6 @@ class TestReasoningAuditLogDiscipline:
             if _payload_contains_marker(args, kwargs)
         ]
         assert offending == [], (
-            f"ChatSession._maybe_attach_vllm_chat_reasoning leaked reasoning "
+            f"model_turn.maybe_attach_vllm_chat_reasoning leaked reasoning "
             f"text into INFO+ logs: {offending}"
         )

@@ -2,8 +2,8 @@
 
 Drives a *real* :class:`SessionManager` + a *real* :class:`ChatSession`
 + a *real* :class:`IdleNudgeWatcher` end-to-end.  The only stub is the
-LLM provider (patched ``_create_stream_with_retry``); every other layer
-is production code:
+model turn (patched ``_stream_response``, returning a canned
+``ModelTurnResult``); every other layer is production code:
 
 * ``SessionManager.set_state`` snapshotting + iterating subscribers
 * ``IdleNudgeWatcher._on_state`` peeking the queue
@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._helpers import wait_until as _wait_until
+from tests._parity_832 import make_result
 from tests.test_session_manager import FakeStorage
 from turnstone.core import session_worker
 from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher, wake_workstream_if_pending
@@ -234,12 +235,7 @@ def test_idle_event_through_real_session_manager_drives_wake_send(real_mgr, tmp_
         # without any real provider.  We patch on the just-built ChatSession;
         # the patches are reverted by the `with` block.
         with (
-            patch.object(ws.session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                ws.session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(ws.session, "_stream_response", return_value=make_result(content="ok")),
             patch.object(ws.session, "_update_token_table"),
             patch.object(ws.session, "_print_status_line"),
             patch.object(ws.session, "_visible_memory_count", return_value=0),
@@ -341,12 +337,7 @@ def test_watch_fire_on_already_idle_session_drives_wake_send(real_mgr, tmp_db):
     )
 
     with (
-        patch.object(ws.session, "_create_stream_with_retry", return_value=iter([])),
-        patch.object(
-            ws.session,
-            "_stream_response",
-            return_value={"role": "assistant", "content": "ok"},
-        ),
+        patch.object(ws.session, "_stream_response", return_value=make_result(content="ok")),
         patch.object(ws.session, "_update_token_table"),
         patch.object(ws.session, "_print_status_line"),
         patch.object(ws.session, "_visible_memory_count", return_value=0),
@@ -450,11 +441,8 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
         coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
 
         with (
-            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(
-                coord.session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ack"},
+                coord.session, "_stream_response", return_value=make_result(content="ack")
             ),
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
@@ -542,11 +530,8 @@ def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db
         coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
 
         with (
-            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(
-                coord.session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ack"},
+                coord.session, "_stream_response", return_value=make_result(content="ack")
             ),
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
@@ -647,11 +632,8 @@ def test_coord_idle_with_open_tasks_and_no_children_omits_children_content(coord
         coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
 
         with (
-            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(
-                coord.session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ack"},
+                coord.session, "_stream_response", return_value=make_result(content="ack")
             ),
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
@@ -757,11 +739,8 @@ def test_stop_latch_survives_the_liveness_wake(coord_mgr, tmp_db):
         assert coord.session._metacog_state.get("idle_tasks") is None
 
         with (
-            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(
-                coord.session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ack"},
+                coord.session, "_stream_response", return_value=make_result(content="ack")
             ),
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
@@ -860,11 +839,8 @@ def test_coord_idle_emitted_from_worker_thread_still_wakes(coord_mgr, tmp_db):
         coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
 
         with (
-            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(
-                coord.session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ack"},
+                coord.session, "_stream_response", return_value=make_result(content="ack")
             ),
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
@@ -943,10 +919,7 @@ def test_wake_delivery_contains_generation_cancelled(tmp_db):
 def _patch_llm_surface(session: Any) -> tuple[Any, ...]:
     """The file's standard LLM-stub patch set, for make_chat_session tests."""
     return (
-        patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-        patch.object(
-            session, "_stream_response", return_value={"role": "assistant", "content": "ok"}
-        ),
+        patch.object(session, "_stream_response", return_value=make_result(content="ok")),
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
         patch.object(session, "_visible_memory_count", return_value=0),
@@ -967,7 +940,7 @@ def test_wake_channel_survives_real_seam_drains_and_delivers_via_wake(tmp_db):
     session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
 
     p = _patch_llm_surface(session)
-    with p[0], p[1], p[2], p[3], p[4], p[5]:
+    with p[0], p[1], p[2], p[3], p[4]:
         # Real user-seam drain: appends any drained entry as a system
         # turn — a wake-channel entry must neither drain nor render.
         session._emit_pending_user_nudges()
@@ -1053,7 +1026,7 @@ def test_quiet_ride_along_still_delivers_when_wake_proceeds(tmp_db):
     session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
 
     p = _patch_llm_surface(session)
-    with p[0], p[1], p[2], p[3], p[4], p[5]:
+    with p[0], p[1], p[2], p[3], p[4]:
         session.deliver_wake_nudge_from_queue()
 
     msgs = dicts_from_turns(session.messages)
@@ -1089,7 +1062,7 @@ def test_interjection_handoff_delivers_externals_and_drops_only_idle_nudges(tmp_
     session.queue_message("pivot: focus on the flaky login test")
 
     p = _patch_llm_surface(session)
-    with p[0], p[1], p[2], p[3], p[4], p[5]:
+    with p[0], p[1], p[2], p[3], p[4]:
         session.deliver_wake_nudge_from_queue()
 
     msgs = dicts_from_turns(session.messages)
@@ -1160,11 +1133,8 @@ def test_queued_interjection_owns_the_idle_seam(coord_mgr, tmp_db):
         coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
 
         with (
-            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(
-                coord.session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ack"},
+                coord.session, "_stream_response", return_value=make_result(content="ack")
             ),
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),

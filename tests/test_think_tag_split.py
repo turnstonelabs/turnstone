@@ -1,10 +1,12 @@
 """Behavior pins for the interactive think-tag splitting layer.
 
-``ChatSession._stream_attempt`` splits streamed content into content vs
-reasoning around ``<think>``/``<reasoning>`` tags, buffering potential
-partial tags across chunk boundaries.  These tables pin the CURRENT
-emission behavior — exact UI token sequence and final message content —
-so the logic can move into a standalone ``ThinkTagSplitter`` class with
+``turnstone.core.session._StreamTurnConsumer`` (the main loop's
+chunk→UI translation, ``model_turn``'s ``on_chunk`` body post-#832)
+splits streamed content into content vs reasoning around
+``<think>``/``<reasoning>`` tags, buffering potential partial tags
+across chunk boundaries.  These tables pin the CURRENT emission
+behavior — exact UI token sequence and final displayed content — so
+the logic can move into a standalone ``ThinkTagSplitter`` class with
 byte-identical output.  Every case drives the real chunk consumer end to
 end; none reaches into the implementation, so the same rows must stay
 green across the extraction.
@@ -23,18 +25,23 @@ Pinned rules:
 """
 
 import random
+from unittest.mock import MagicMock
 
 import pytest
 
+from tests._parity_832 import scripted_provider
 from tests._reasoning_dialect import CASES as DIALECT_CASES
 from tests._session_helpers import make_session
+from turnstone.core.model_turn import ModelLane
 from turnstone.core.providers import StreamChunk, ToolCallDelta
+from turnstone.core.session import _StreamTurnConsumer
 from turnstone.core.streaming_text import ThinkTagSplitter, split_inline_reasoning
+from turnstone.core.trajectory import Turn
 
 
 class _TokenRecorderUI:
     """Records dispatched token events; stubs the rest of the surface
-    ``_stream_attempt`` touches."""
+    ``_StreamTurnConsumer`` touches."""
 
     def __init__(self):
         self.tokens = []
@@ -58,13 +65,24 @@ class _TokenRecorderUI:
         pass
 
 
-def _drive(chunks, *, show_reasoning=True):
+def _drive(chunks, *, show_reasoning=True, capabilities=None):
+    """Drive *chunks* through a bare ``_StreamTurnConsumer`` — the
+    display-grid seam post-#832 (``_stream_attempt`` is gone; tool_calls
+    assembly is the drain's job now, so this helper is for display-only
+    pins — content emission order plus the accumulated displayed text).
+    """
     session = make_session()
     session.show_reasoning = show_reasoning
     ui = _TokenRecorderUI()
     session.ui = ui
-    msg = session._stream_attempt(iter(chunks))
-    return msg, ui.tokens
+    lane = ModelLane(
+        provider=MagicMock(), client=MagicMock(), model="test-model", capabilities=capabilities
+    )
+    consumer = _StreamTurnConsumer(session, lane, 0)
+    for chunk in chunks:
+        consumer(chunk)
+    consumer.finish_stream()
+    return "".join(consumer._content_parts), ui.tokens
 
 
 def _c(text):
@@ -150,15 +168,15 @@ CASES = [
     ids=[c[0] for c in CASES],
 )
 def test_tag_splitting_emissions(chunks, expected_events, expected_content):
-    msg, tokens = _drive(chunks)
+    content, tokens = _drive(chunks)
     assert tokens == expected_events
-    assert msg["content"] == expected_content
+    assert content == expected_content
 
 
 def test_show_reasoning_off_suppresses_reasoning_dispatch_only():
-    msg, tokens = _drive([_c("<think>deep</think>answer"), _FINISH], show_reasoning=False)
+    content, tokens = _drive([_c("<think>deep</think>answer"), _FINISH], show_reasoning=False)
     assert tokens == [("content", "answer")]
-    assert msg["content"] == "answer"
+    assert content == "answer"
 
 
 def test_splitter_standalone_contract():
@@ -213,19 +231,19 @@ def test_scan_tags_off_returns_every_utterance_byte_identical(case):
 
 def test_session_consumer_scan_follows_server_parses_reasoning():
     """The interactive consumer wires ``scan_tags`` from the SAME capability
-    the drain seam reads (``server_parses_reasoning``), so the two lanes
-    cannot disagree.  With the flag declared, streamed tag text reaches the
-    UI verbatim as content — it is prose on such a backend, not a
-    boundary."""
+    the drain seam reads (``server_parses_reasoning``), taken off the
+    ACTIVE lane post-#832 (no more session-level ``_cached_capabilities``
+    read at the consumer).  With the flag declared, streamed tag text
+    reaches the UI verbatim as content — it is prose on such a backend,
+    not a boundary."""
     from turnstone.core.providers._protocol import ModelCapabilities
 
-    session = make_session()
-    session._cached_capabilities = ModelCapabilities(server_parses_reasoning=True)
-    ui = _TokenRecorderUI()
-    session.ui = ui
-    msg = session._stream_attempt(iter([_c("<think>quoted</think>answer"), _FINISH]))
-    assert msg["content"] == "<think>quoted</think>answer"
-    assert all(kind == "content" for kind, _ in ui.tokens)
+    content, tokens = _drive(
+        [_c("<think>quoted</think>answer"), _FINISH],
+        capabilities=ModelCapabilities(server_parses_reasoning=True),
+    )
+    assert content == "<think>quoted</think>answer"
+    assert all(kind == "content" for kind, _ in tokens)
 
 
 def test_scan_tags_off_holds_no_carry_and_honors_out_of_band_state():
@@ -268,7 +286,12 @@ def test_one_shot_equivalent_to_streaming_over_random_chunkings(case):
 
 def test_tool_calls_flush_pending_raw_at_current_state():
     # Once tool calls begin, buffered text cannot be a partial tag: it
-    # flushes RAW (no tag scan) at the current in_think state.
+    # flushes RAW (no tag scan) at the current in_think state.  Tool_calls
+    # assembly is the drain's job post-#832 (the display consumer only
+    # flushes the splitter at the boundary), so this one needs the real
+    # seam — session._stream_response over scripted_provider — to pin the
+    # display order and the assembled call together, as the fused
+    # pre-fold consumer did.
     chunks = [
         _c("part<thi"),
         StreamChunk(tool_call_deltas=[ToolCallDelta(index=0, id="tc1", name="bash")]),
@@ -277,9 +300,14 @@ def test_tool_calls_flush_pending_raw_at_current_state():
             finish_reason="tool_calls",
         ),
     ]
-    msg, tokens = _drive(chunks)
-    assert tokens == [("content", "part<thi")]
-    assert msg["content"] == "part<thi"
-    assert msg["tool_calls"] == [
+    session = make_session()
+    ui = _TokenRecorderUI()
+    session.ui = ui
+    session._provider = scripted_provider(chunks)
+    session.messages.append(Turn.user("hi"))
+    result = session._stream_response(0)
+    assert ui.tokens == [("content", "part<thi")]
+    assert result.content == "part<thi"
+    assert result.tool_calls == [
         {"id": "tc1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
     ]

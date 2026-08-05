@@ -9,9 +9,9 @@ transports (no network, no live backend):
 2. The Anthropic ``messages.stream()`` helper propagates the same shape.
 3. Closing an httpx-backed SDK client from another thread while a read is
    blocked (the ``ModelRegistry.reload()`` shape) surfaces as an
-   ``httpx.TransportError`` on the blocked ``next()`` — which is why the
-   resilient ``_stream_response`` re-resolves the registry binding before
-   re-creating.
+   ``httpx.TransportError`` on the blocked ``next()`` — which is why
+   ``_stream_response``'s mid-stream re-issue ladder re-resolves the
+   registry binding before re-creating.
 
 If an SDK/httpx upgrade changes any of these, the ``transport_guarded``
 conversion (and the retry gate consuming it) must be re-verified — these

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._parity_832 import make_result
 from turnstone.core.session import ChatSession
 from turnstone.core.trajectory import Role, turns_from_dicts
 
@@ -205,12 +206,12 @@ class TestContextOverflowRecovery:
 
         call_count = 0
 
-        def mock_stream_response(msgs, my_generation=0):
+        def mock_stream_response(my_generation=0):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise Exception("maximum context length exceeded")
-            return {"role": "assistant", "content": "ok"}
+            return make_result(content="ok")
 
         compact_mock = MagicMock()
         with (
@@ -235,12 +236,12 @@ class TestContextOverflowRecovery:
 
         call_count = 0
 
-        def mock_stream_response(msgs, my_generation=0):
+        def mock_stream_response(my_generation=0):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise Exception("prompt is too long: 250000 tokens > 200000 maximum")
-            return {"role": "assistant", "content": "ok"}
+            return make_result(content="ok")
 
         compact_mock = MagicMock()
         with (
@@ -263,7 +264,7 @@ class TestContextOverflowRecovery:
         with (
             patch.object(
                 session,
-                "_create_stream_with_retry",
+                "_stream_response",
                 side_effect=Exception("authentication failed"),
             ),
             patch.object(session, "_full_messages", return_value=[]),
@@ -280,7 +281,7 @@ class TestContextOverflowRecovery:
         with (
             patch.object(
                 session,
-                "_create_stream_with_retry",
+                "_stream_response",
                 side_effect=Exception("maximum context length exceeded"),
             ),
             patch.object(session, "_compact_messages", side_effect=RuntimeError("compact failed")),
@@ -302,13 +303,13 @@ def _send_with_tool_batches(session, batches, **extra_patches):
     """Drive one ``send()`` through the tool-execution drain with canned results.
 
     *batches* is a list of ``(tool_calls, results)`` pairs, one send-loop
-    iteration each: ``_stream_response`` returns an assistant turn carrying
-    each batch's *tool_calls* in order, then a plain reply ends the loop.
-    Each *results* is what ``_execute_tools`` hands the drain — the
-    truncation/floor/compact path under test runs REAL code between the
-    mocked boundaries.  Mirrors ``tests/test_session.py::_send_with_mocks``;
-    kept local because these tests patch the budget/compaction seam
-    differently per scenario.
+    iteration each: ``_stream_response`` returns a ``ModelTurnResult`` whose
+    ``.tool_calls`` carries each batch's *tool_calls* in order, then a plain
+    reply ends the loop.  Each *results* is what ``_execute_tools`` hands the
+    drain — the truncation/floor/compact path under test runs REAL code
+    between the mocked boundaries.  Mirrors
+    ``tests/test_session.py::_send_with_mocks``; kept local because these
+    tests patch the budget/compaction seam differently per scenario.
 
     ``_estimated_prompt_tokens`` is pinned LOW so the end-of-turn/owed
     compaction paths stay quiet — every compaction observed by these tests
@@ -317,12 +318,12 @@ def _send_with_tool_batches(session, batches, **extra_patches):
     no background utility-completion thread churns against the mock client.
     """
     session._title_generated = True
-    responses = [
-        {"role": "assistant", "content": "", "tool_calls": tool_calls} for tool_calls, _ in batches
-    ] + [{"role": "assistant", "content": "done"}]
+    responses = [make_result(content="", tool_calls=tool_calls) for tool_calls, _ in batches] + [
+        make_result(content="done")
+    ]
     exec_results = [(results, []) for _, results in batches]
 
-    def mock_response(_msgs, _gen):
+    def mock_response(_gen):
         return responses.pop(0)
 
     with contextlib.ExitStack() as stack:

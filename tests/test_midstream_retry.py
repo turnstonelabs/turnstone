@@ -2,7 +2,7 @@
 
 A wire death DURING body iteration surfaces after the request already
 returned its stream handle, so neither the SDK's ``max_retries`` nor the
-creation-time ``_try_stream`` ladder ever sees it.  These tests drive
+creation-time per-lane ladder (``_model_turn_with_retry``) ever sees it.  These tests drive
 ``ChatSession.send()`` with scripted provider streams and pin the retry
 loop's contract: bounded re-issue on the normalized retryable shape, the
 dead attempt finalized client-side before the retry notice
@@ -18,12 +18,12 @@ retry pays real exponential backoff).
 """
 
 import logging
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
+from tests._parity_832 import arm_session
 from tests._session_helpers import NullUI, RecordingUI, make_session
 from turnstone.core.memory import load_last_error
 from turnstone.core.providers import IncompleteStreamError, StreamChunk, UsageInfo
@@ -83,8 +83,8 @@ class TestMidStreamRetry:
             _dying_stream(first_text, exc=httpx.ReadError("[SSL] record layer failure")),
             _good_stream("Hello world"),
         ]
+        create = arm_session(session, *streams).create_streaming
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=streams) as create,
             patch.object(session, "_full_messages", return_value=[]),
             caplog.at_level(logging.WARNING, logger="turnstone.core.session"),
         ):
@@ -135,8 +135,8 @@ class TestMidStreamRetry:
         streams = [
             _dying_stream("a", exc=httpx.ReadError("[SSL] record layer failure")) for _ in range(3)
         ]
+        create = arm_session(session, *streams).create_streaming
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=streams) as create,
             patch.object(session, "_full_messages", return_value=[]),
             caplog.at_level(logging.INFO, logger="turnstone.core.session"),
             pytest.raises(IncompleteStreamError, match="ReadError"),
@@ -174,12 +174,10 @@ class TestMidStreamRetry:
             session.cancel()
             real_backoff(delay, my_generation)
 
+        create = arm_session(
+            session, _dying_stream("Hel", exc=httpx.ReadError("wire died"))
+        ).create_streaming
         with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=[_dying_stream("Hel", exc=httpx.ReadError("wire died"))],
-            ) as create,
             patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
             patch.object(session, "_full_messages", return_value=[]),
         ):
@@ -210,8 +208,8 @@ class TestMidStreamRetry:
             # object (the identity signal the wrapper keys on).
             session.client = MagicMock()
 
+        create = arm_session(session, *streams).create_streaming
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=streams) as create,
             patch.object(session, "_refresh_model_from_registry", side_effect=swap_binding),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(
@@ -234,8 +232,8 @@ class TestMidStreamRetry:
             _dying_stream("y", exc=httpx.ReadError("wire died again")),
             _good_stream("ok"),
         ]
+        create = arm_session(session, *streams).create_streaming
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=streams) as create,
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(
                 session,
@@ -259,8 +257,8 @@ class TestMidStreamRetry:
             _dying_stream(exc=httpx.ReadError("pre-token wire death")),
             _good_stream("ok"),
         ]
+        arm_session(session, *streams)
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=streams),
             patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
@@ -284,12 +282,8 @@ class TestMidStreamRetry:
             session.cancel()
             real_backoff(delay, my_generation)
 
+        arm_session(session, _dying_stream(exc=httpx.ReadError("died before first token")))
         with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=[_dying_stream(exc=httpx.ReadError("died before first token"))],
-            ),
             patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
             patch.object(session, "_full_messages", return_value=[]),
         ):
@@ -318,8 +312,8 @@ class TestMidStreamRetry:
             _dying_stream("Hel", exc=httpx.ReadError("wire died")),
             second_stream(),
         ]
+        arm_session(session, *streams)
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=streams),
             patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
@@ -342,8 +336,8 @@ class TestMidStreamRetry:
             # ends cleanly under transport_guarded's post-finish tolerance.
             session.cancel()
 
+        arm_session(session, gen())
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=[gen()]),
             patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
@@ -360,12 +354,8 @@ class TestMidStreamRetry:
     def test_keyboard_interrupt_finalizes_dead_attempt(self, tmp_db, caplog):
         ui = RecordingUI()
         session = _make_session(ui)
+        arm_session(session, _dying_stream("Hel", exc=KeyboardInterrupt()))
         with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=[_dying_stream("Hel", exc=KeyboardInterrupt())],
-            ),
             patch.object(session, "_full_messages", return_value=[]),
             caplog.at_level(logging.INFO, logger="turnstone.core.session"),
             pytest.raises(KeyboardInterrupt),
@@ -378,53 +368,43 @@ class TestMidStreamRetry:
         assert ui.kinds().count("stream_end") == 1
         assert ("state", "error") in ui.events
 
-    def test_gate_consults_live_stream_provider_not_primary(self, tmp_db):
+    def test_gate_consults_serving_lane_provider(self, tmp_db):
         class FlakyError(Exception):
             pass
 
         ui = RecordingUI()
         session = _make_session(ui)
-        live = SimpleNamespace(retryable_error_names=frozenset({"FlakyError"}))
-        calls = {"n": 0}
+        # Post-fold the retry gate reads the SERVING lane's provider off
+        # the frame's consumer (the creation-time handoff register is
+        # gone).  FlakyError is retryable only per THIS provider's set —
+        # the re-issue proves the gate consulted the lane that armed the
+        # stream, not some global default.  (The distinct-fallback-lane
+        # variant of this contract is exercised through the real fallback
+        # walk in test_model_registry's TestSessionFallback.)
+        provider = arm_session(
+            session,
+            _dying_stream("x", exc=FlakyError("in-band transient")),
+            _good_stream("ok"),
+            retryable=frozenset({"FlakyError"}),
+        )
+        session.send("test")
 
-        def create(msgs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                # What _try_stream records at creation: the provider that
-                # owns the live stream (a fallback here — its retryable
-                # set differs from the primary's).
-                session._active_stream_provider = live
-                return _dying_stream("x", exc=FlakyError("in-band transient"))
-            return _good_stream("ok")
-
-        with (
-            patch.object(session, "_create_stream_with_retry", side_effect=create),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
-
-        # FlakyError is NOT in the primary provider's retryable set — the
-        # re-issue proves the gate consulted the live stream's provider.
-        assert calls["n"] == 2
+        assert provider.create_streaming.call_count == 2
         assert _assistant_msgs(session)[-1]["content"] == "ok"
 
     def test_recreate_overflow_falls_through_to_compact_retry(self, tmp_db):
         ui = RecordingUI()
         session = _make_session(ui)
-        calls = {"n": 0}
-
-        def create(msgs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return _dying_stream("x", exc=httpx.ReadError("wire died"))
-            if calls["n"] == 2:
-                # A mid-retry rebind landed on a smaller-window model: the
-                # re-create overflows deterministically.
-                raise RuntimeError("maximum context length exceeded")
-            return _good_stream("recovered")
-
+        provider = arm_session(
+            session,
+            _dying_stream("x", exc=httpx.ReadError("wire died")),
+            # A mid-retry rebind landed on a smaller-window model: the
+            # re-create overflows deterministically (a creation-phase
+            # raise — unarmed).
+            RuntimeError("maximum context length exceeded"),
+            _good_stream("recovered"),
+        )
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=create),
             patch.object(session, "_compact_messages") as compact,
             patch.object(session, "_full_messages", return_value=[]),
         ):
@@ -432,23 +412,19 @@ class TestMidStreamRetry:
 
         # The overflow surfaced as ITSELF (not masked behind the stream
         # death), so send()'s compact-and-retry arm recovered the turn.
-        assert calls["n"] == 3
+        assert provider.create_streaming.call_count == 3
         compact.assert_called_once()
         assert _assistant_msgs(session)[-1]["content"] == "recovered"
 
     def test_postcompaction_failure_surfaces_as_itself(self, tmp_db):
         ui = RecordingUI()
         session = _make_session(ui)
-        calls = {"n": 0}
-
-        def create(msgs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise RuntimeError("maximum context length exceeded")
-            raise ValueError("backend exploded")
-
+        arm_session(
+            session,
+            RuntimeError("maximum context length exceeded"),
+            ValueError("backend exploded"),
+        )
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=create),
             patch.object(session, "_compact_messages"),
             patch.object(session, "_full_messages", return_value=[]),
             pytest.raises(ValueError, match="backend exploded"),
@@ -480,8 +456,8 @@ class TestMidStreamRetry:
             if refreshes["n"] == 2:
                 session.model = "swapped-model"
 
+        arm_session(session, *streams)
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=streams),
             patch.object(session, "_refresh_model_from_registry", side_effect=swap_model),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(
@@ -501,8 +477,9 @@ class TestMidStreamRetry:
             yield StreamChunk(content_delta="orphan text")
             yield StreamChunk(content_delta="more")
 
+        arm_session(session, chunks())
         with pytest.raises(GenerationCancelled):
-            session._stream_attempt(iter(chunks()), my_generation=3)
+            session._stream_response(3)
 
         # The superseded thread's cancel arm must touch neither the UI
         # (its stream_end would reset the successor's inflight buffers)
@@ -518,12 +495,8 @@ class TestMidStreamRetry:
             session._generation += 1  # force-cancel claimed a successor
             raise GenerationCancelled()
 
+        arm_session(session, _dying_stream("Hel", exc=httpx.ReadError("wire died")))
         with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=[_dying_stream("Hel", exc=httpx.ReadError("wire died"))],
-            ),
             patch.object(session, "_backoff_or_cancelled", side_effect=supersede_then_cancel),
             patch.object(session, "_full_messages", return_value=[]),
         ):
@@ -552,8 +525,8 @@ class TestMidStreamRetry:
             ),
             _good_stream("final answer"),
         ]
+        arm_session(session, *streams)
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=streams),
             patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
@@ -582,12 +555,8 @@ class TestMidStreamRetry:
             real_backoff(delay, my_generation)
 
         dead_text = "a dead attempt long enough to flush past the carry window"
+        arm_session(session, _dying_stream(dead_text, exc=httpx.ReadError("wire died")))
         with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=[_dying_stream(dead_text, exc=httpx.ReadError("wire died"))],
-            ),
             patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
             patch.object(session, "_full_messages", return_value=[]),
         ):
@@ -612,8 +581,8 @@ class TestMidStreamRetry:
             _dying_stream("x", exc=httpx.ReadError("wire died")),
             _good_stream("ok"),
         ]
+        arm_session(session, *streams)
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=streams),
             patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
@@ -632,25 +601,21 @@ class TestMidStreamRetry:
 
         ui = _BufferUI()
         session = _make_session(ui)
-        calls = {"n": 0}
-
-        def create(msgs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return _dying_stream(
-                    "dead overflow text",
-                    exc=RuntimeError("maximum context length exceeded"),
-                )
-            return _good_stream("recovered")
-
+        provider = arm_session(
+            session,
+            _dying_stream(
+                "dead overflow text",
+                exc=RuntimeError("maximum context length exceeded"),
+            ),
+            _good_stream("recovered"),
+        )
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=create),
             patch.object(session, "_compact_messages"),
             patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")
 
-        assert calls["n"] == 2
+        assert provider.create_streaming.call_count == 2
         assert "".join(ui._ws_turn_content) == "recovered"
 
     def test_orphan_death_records_no_fatal_over_successor(self, tmp_db):
@@ -665,11 +630,12 @@ class TestMidStreamRetry:
             session._generation += 1
             raise ValueError("orphan death")
 
-        with (
-            patch.object(session, "_create_stream_with_retry", side_effect=[dying_superseded()]),
-            patch.object(session, "_full_messages", return_value=[]),
-            pytest.raises(ValueError, match="orphan death"),
-        ):
+        arm_session(session, dying_superseded())
+        with patch.object(session, "_full_messages", return_value=[]):
+            # Post-fold the orphan's death converts at the ladder's
+            # generation check and send() ends SILENTLY as cancelled — no
+            # arbitrary exception class escapes into the thread runner
+            # (named orphan-exit delta, design D12).
             session.send("test")
 
         # The orphan must not flash an error banner over the live
@@ -677,16 +643,15 @@ class TestMidStreamRetry:
         assert ("state", "error") not in ui.events
         assert not ui.of("error")
         assert not load_last_error(session._ws_id)
+        assert not _assistant_msgs(session)
 
     def test_non_retryable_error_is_immediately_fatal(self, tmp_db):
         ui = RecordingUI()
         session = _make_session(ui)
+        create = arm_session(
+            session, _dying_stream("Hel", exc=ValueError("model exploded"))
+        ).create_streaming
         with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=[_dying_stream("Hel", exc=ValueError("model exploded"))],
-            ) as create,
             patch.object(session, "_full_messages", return_value=[]),
             pytest.raises(ValueError, match="model exploded"),
         ):
@@ -705,15 +670,12 @@ class TestMidStreamRetry:
         replace the operator-actionable stream-death error with its own."""
         ui = RecordingUI()
         session = _make_session(ui)
+        create = arm_session(
+            session,
+            _dying_stream("He", exc=httpx.ReadError("[SSL] record layer failure")),
+            RuntimeError("Cannot send a request, as the client has been closed."),
+        ).create_streaming
         with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=[
-                    _dying_stream("He", exc=httpx.ReadError("[SSL] record layer failure")),
-                    RuntimeError("Cannot send a request, as the client has been closed."),
-                ],
-            ) as create,
             patch.object(session, "_full_messages", return_value=[]),
             caplog.at_level(logging.WARNING, logger="turnstone.core.session"),
             pytest.raises(IncompleteStreamError, match="ReadError"),
@@ -739,8 +701,8 @@ class TestMidStreamRetry:
             yield StreamChunk(finish_reason="stop")
             raise httpx.ReadError("late blip")  # the usage chunk is lost
 
+        arm_session(session, blipping())
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=blipping()),
             patch.object(session, "_full_messages", return_value=[]),
         ):
             session.send("test")

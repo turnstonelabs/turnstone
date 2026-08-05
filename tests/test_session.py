@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._oidc_test_helpers import keyed_app_state
+from tests._parity_832 import make_result
 from tests._session_helpers import (
     FakeAnthropicBlock,
     as_stream,
@@ -20,6 +21,7 @@ from tests._session_helpers import (
     scripted_chat_client,
     seam_provider,
 )
+from turnstone.core.model_turn import ModelTurnResult, provider_extra_params
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 from turnstone.core.trajectory import (
     Turn,
@@ -133,10 +135,17 @@ def _send_with_mocks(session, responses, mock_execute, **extra_patches):
     Extra per-test patches (e.g. wrapping ``_collect_advisories``) ride
     via ``**extra_patches`` — keyword name maps to attribute on the
     session, value is the ``side_effect`` to inject.
+
+    ``responses`` are ``ModelTurnResult``s (build them with
+    ``tests._parity_832.make_result``) — the streaming seam's return
+    type since #832 folded creation and drain into ``model_turn``.  None
+    of these tests care HOW the turn was produced, only that one
+    happened, so they patch the whole ``_stream_response`` seam rather
+    than script a provider.
     """
     from unittest.mock import patch as _patch
 
-    def mock_response(_msgs, _gen):
+    def mock_response(_gen):
         return responses.pop(0)
 
     with contextlib.ExitStack() as stack:
@@ -2050,18 +2059,17 @@ class TestTitleRetry:
         # The assistant's opening turn is ALL tool calls — under the old
         # trigger no title would generate until a later text-only turn.
         responses = [
-            {
-                "role": "assistant",
-                "content": "working",
-                "tool_calls": [
+            make_result(
+                "working",
+                tool_calls=[
                     {
                         "id": "c1",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "done"},
+            ),
+            make_result("done"),
         ]
         capture_cls, started = _capturing_thread_cls()
 
@@ -2091,7 +2099,7 @@ class TestTitleRetry:
         for user_input, kwargs in (("   ", {}), ("a real message", {"from_wake": True})):
             session = _make_session()
             with (
-                _send_with_mocks(session, [{"role": "assistant", "content": "ok"}], mock_execute),
+                _send_with_mocks(session, [make_result("ok")], mock_execute),
                 patch("turnstone.core.session.threading.Thread", capture_cls),
             ):
                 session.send(user_input, **kwargs)
@@ -2923,7 +2931,6 @@ class TestAgentChildRegistration:
         with (
             patch.object(session, "_prepare_tool", side_effect=fake_prepare),
             patch.object(session, "_resolve_capabilities", return_value=OPENAI_COMPAT_DEFAULT),
-            patch.object(session, "_provider_extra_params", return_value={}),
         ):
             session._run_agent(
                 turns,
@@ -2983,7 +2990,6 @@ class TestAgentChildRegistration:
         with (
             patch.object(session, "_prepare_tool", side_effect=fake_prepare),
             patch.object(session, "_resolve_capabilities", return_value=OPENAI_COMPAT_DEFAULT),
-            patch.object(session, "_provider_extra_params", return_value={}),
         ):
             session._run_agent(
                 turns,
@@ -3929,7 +3935,16 @@ class TestTruncateBeforeJudge:
 
 
 class TestProviderExtraParams:
-    """Tests for _provider_extra_params — server_compat passthrough only."""
+    """Tests for the session lane's extra_params resolution — server_compat
+    passthrough only.
+
+    #832 deleted ``ChatSession._provider_extra_params``: it was a thin
+    delegate whose last caller was the retired stream-creation ladder, and
+    the resolution now happens inside ``resolve_lane``.  These pin the
+    module function every lane goes through,
+    :func:`turnstone.core.model_turn.provider_extra_params`, with the
+    session's own binding supplied explicitly.
+    """
 
     def _session_with_provider(self, provider_name: str, tmp_db) -> ChatSession:
         from turnstone.core.providers import create_provider
@@ -3938,19 +3953,29 @@ class TestProviderExtraParams:
         session._provider = create_provider(provider_name)
         return session
 
+    @staticmethod
+    def _extra(session: ChatSession, alias: str | None = None):
+        """The session binding's extra_params, as ``resolve_lane`` resolves
+        them (*alias* overrides the primary — the fallback-lane case)."""
+        return provider_extra_params(
+            session._provider,
+            session._registry,
+            alias if alias is not None else (session._model_alias or ""),
+        )
+
     def test_openai_compatible_no_compat_returns_none(self, tmp_db):
         """No server_compat → no extra_body needed (no auto-injection)."""
         session = self._session_with_provider("openai-compatible", tmp_db)
-        assert session._provider_extra_params() is None
+        assert self._extra(session) is None
 
     def test_openai_commercial_no_compat_returns_none(self, tmp_db):
         """Cloud OpenAI without server_compat → None."""
         session = self._session_with_provider("openai", tmp_db)
-        assert session._provider_extra_params() is None
+        assert self._extra(session) is None
 
     def test_anthropic_returns_none(self, tmp_db):
         session = self._session_with_provider("anthropic", tmp_db)
-        assert session._provider_extra_params() is None
+        assert self._extra(session) is None
 
     def test_no_reasoning_effort_kwarg(self, tmp_db):
         """reasoning_effort is not part of the surface; passing it should TypeError.
@@ -3964,7 +3989,7 @@ class TestProviderExtraParams:
         bad_kwargs = {"reasoning_effort": "high"}
         session = self._session_with_provider("openai-compatible", tmp_db)
         with pytest.raises(TypeError):
-            session._provider_extra_params(**bad_kwargs)
+            provider_extra_params(session._provider, session._registry, "", **bad_kwargs)
 
     def test_server_compat_extra_body_passes_through(self, tmp_db):
         """server_compat.extra_body workarounds forward as extra_params."""
@@ -3980,8 +4005,7 @@ class TestProviderExtraParams:
         )
         session._registry = ModelRegistry(models={"test": cfg}, default="test")
         session._model_alias = "test"
-        result = session._provider_extra_params()
-        assert result == {"skip_special_tokens": False}
+        assert self._extra(session) == {"skip_special_tokens": False}
 
     def test_operator_chat_template_kwargs_pass_through(self, tmp_db):
         """Operator-set chat_template_kwargs (e.g. for gpt-oss) forwards verbatim."""
@@ -3997,11 +4021,11 @@ class TestProviderExtraParams:
         )
         session._registry = ModelRegistry(models={"test": cfg}, default="test")
         session._model_alias = "test"
-        result = session._provider_extra_params()
-        assert result == {"chat_template_kwargs": {"reasoning_effort": "high"}}
+        assert self._extra(session) == {"chat_template_kwargs": {"reasoning_effort": "high"}}
 
     def test_model_alias_resolves_target_compat(self, tmp_db):
-        """model_alias parameter selects compat from the target, not the primary."""
+        """The alias argument selects compat from the target, not the primary
+        — the fallback lane's own extra_params, resolved per lane swap."""
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
         session = self._session_with_provider("openai-compatible", tmp_db)
@@ -4027,9 +4051,9 @@ class TestProviderExtraParams:
         session._model_alias = "primary"
 
         # Primary alias → gets Gemma workaround
-        assert session._provider_extra_params() == {"skip_special_tokens": False}
+        assert self._extra(session) == {"skip_special_tokens": False}
         # Fallback alias → no compat at all
-        assert session._provider_extra_params(model_alias="fallback") is None
+        assert self._extra(session, "fallback") is None
 
 
 class TestSafePrepareTool:
@@ -5007,7 +5031,7 @@ class TestMemoryCompositionDeferral:
             seen_queries.append(extract_recent_context(dicts_from_turns(session.messages)))
             real_init()
 
-        responses = [{"role": "assistant", "content": "ok"}]
+        responses = [make_result("ok")]
         with _send_with_mocks(
             session, responses, lambda _tc: ([], None), _init_system_messages=spy_init
         ):
@@ -5030,7 +5054,7 @@ class TestMemoryCompositionDeferral:
             nonlocal init_calls
             init_calls += 1
 
-        responses = [{"role": "assistant", "content": "ok"}]
+        responses = [make_result("ok")]
         with _send_with_mocks(
             session, responses, lambda _tc: ([], None), _init_system_messages=spy_init
         ):
@@ -5601,18 +5625,17 @@ class TestMetacognitiveBuffers:
         full ``send`` loop, not just ``_collect_advisories`` in isolation."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5703,18 +5726,17 @@ class TestMetacognitiveBuffers:
         """
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5764,18 +5786,17 @@ class TestMetacognitiveBuffers:
         a prefix-only call."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5819,18 +5840,17 @@ class TestMetacognitiveBuffers:
         breaks this test."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5913,18 +5933,17 @@ class TestMetacognitiveBuffers:
         ``system`` DB row appended after the tool row."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5953,18 +5972,17 @@ class TestMetacognitiveBuffers:
         is never spliced into tool content anymore."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5990,18 +6008,17 @@ class TestMetacognitiveBuffers:
         interjection rides its own ``system`` row."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "view_image", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -6039,18 +6056,17 @@ class TestMetacognitiveBuffers:
         carries the interjection — both replay from their own rows."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "view_image", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -6103,11 +6119,7 @@ class TestMetacognitiveBuffers:
         # gate passes — content of the memories doesn't matter here.
         with (
             patch.object(session, "_visible_memory_count", return_value=3),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=GenerationCancelled(),
-            ),
+            patch.object(session, "_stream_response", side_effect=GenerationCancelled()),
         ):
             session.send("first user message")
 
@@ -6191,11 +6203,7 @@ class TestMetacognitiveBuffers:
         session._queue_tool_advisory("tool_error", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=GenerationCancelled(),
-            ),
+            patch.object(session, "_stream_response", side_effect=GenerationCancelled()),
         ):
             session.send("user input")
 
@@ -6426,7 +6434,12 @@ class TestUpdateTokenTableMsgsParam:
     """``_update_token_table(msgs=...)`` reuses the wire-bound message
     list already built for the stream call instead of re-folding the
     system turns (perf-2), so the calibration char count matches the
-    bytes the provider counted."""
+    bytes the provider counted.
+
+    Post-#832 the main loop feeds it ``ModelTurnResult.wire_msgs``, and
+    the on-the-fly re-fold fallback survives for callers (fake results,
+    direct calls) that have no wire list.  The old leading
+    ``assistant_msg`` argument is gone — the body never read it."""
 
     def test_uses_provided_msgs_skips_re_application(self, tmp_db):
         session = _make_session()
@@ -6440,13 +6453,15 @@ class TestUpdateTokenTableMsgsParam:
         ) as m_prep:
             pre_built = session._prepare_wire_messages(session._full_messages())
             calls_after_prebuild = m_prep.call_count
-            session._update_token_table({"role": "assistant", "content": "ok"}, msgs=pre_built)
+            session._update_token_table(msgs=pre_built)
             # Calibration must not have re-folded.
             assert m_prep.call_count == calls_after_prebuild
 
     def test_falls_back_to_apply_when_msgs_missing(self, tmp_db):
         """The optional kwarg has a fallback so callers that don't (or
-        can't) pre-build the wire copy still get a sane calibration."""
+        can't) pre-build the wire copy still get a sane calibration —
+        a ``ModelTurnResult`` with ``wire_msgs=None`` (the fake-result
+        shape send() passes straight through) takes this path."""
         session = _make_session()
         session._last_usage = {"prompt_tokens": 100, "completion_tokens": 50}
         session.messages.append(turn_from_dict({"role": "user", "content": "hi"}))
@@ -6455,7 +6470,7 @@ class TestUpdateTokenTableMsgsParam:
             "_prepare_wire_messages",
             wraps=session._prepare_wire_messages,
         ) as m_prep:
-            session._update_token_table({"role": "assistant", "content": "ok"})
+            session._update_token_table(msgs=make_result("ok").wire_msgs)
             # Fallback path folds on the fly.
             assert m_prep.call_count == 1
 
@@ -6475,11 +6490,7 @@ class TestUserAdvisoryCancelClear:
         session._queue_user_advisory("denial", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=GenerationCancelled(),
-            ),
+            patch.object(session, "_stream_response", side_effect=GenerationCancelled()),
         ):
             session.send("user input")
         assert _user_pending(session) == []
@@ -6489,11 +6500,7 @@ class TestUserAdvisoryCancelClear:
         session._queue_user_advisory("correction", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=KeyboardInterrupt(),
-            ),
+            patch.object(session, "_stream_response", side_effect=KeyboardInterrupt()),
             contextlib.suppress(KeyboardInterrupt),
         ):
             session.send("user input")
@@ -6504,11 +6511,7 @@ class TestUserAdvisoryCancelClear:
         session._queue_user_advisory("resume", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=RuntimeError("boom"),
-            ),
+            patch.object(session, "_stream_response", side_effect=RuntimeError("boom")),
             contextlib.suppress(RuntimeError),
         ):
             session.send("user input")
@@ -6535,7 +6538,7 @@ class TestUserAdvisoryCancelClear:
         session._title_generated = True
         stream_calls = 0
 
-        def mock_stream_response(msgs, my_generation=0):
+        def mock_stream_response(my_generation=0):
             nonlocal stream_calls
             stream_calls += 1
             if stream_calls == 1:
@@ -6543,7 +6546,7 @@ class TestUserAdvisoryCancelClear:
                 # time the no-tool branch runs ``_flush_queued_messages``,
                 # this item is in the queue waiting to be drained.
                 session.queue_message("late arrival", queue_msg_id="q-late")
-            return {"role": "assistant", "content": "ok"}
+            return make_result("ok")
 
         with (
             patch.object(session, "_stream_response", side_effect=mock_stream_response),
@@ -6591,11 +6594,11 @@ class TestDeliverWakeNudge:
         # won't match.  Bail before synthesizing an empty user turn.
         session._queue_tool_advisory("tool_error", "stale")
         before_len = len(session.messages)
-        with patch.object(session, "_create_stream_with_retry") as stream:
+        with patch.object(session, "_stream_response") as turn:
             session.deliver_wake_nudge_from_queue()
-        # No send → no message appended → stream untouched.
+        # No send → no message appended → the streaming seam untouched.
         assert len(session.messages) == before_len
-        assert stream.call_count == 0
+        assert turn.call_count == 0
         # Tool entry still queued (would orphan in production today; the
         # bail just protects against the empty-envelope failure mode).
         assert _tool_pending(session) == [("tool_error", "stale")]
@@ -6605,10 +6608,10 @@ class TestDeliverWakeNudge:
     def test_no_op_when_queue_is_empty(self, tmp_db):
         session = _make_session()
         before_len = len(session.messages)
-        with patch.object(session, "_create_stream_with_retry") as stream:
+        with patch.object(session, "_stream_response") as turn:
             session.deliver_wake_nudge_from_queue()
         assert len(session.messages) == before_len
-        assert stream.call_count == 0
+        assert turn.call_count == 0
         assert session._wake_source_tag == ""
 
     def test_drains_any_channel_onto_synthetic_empty_user_turn(self, tmp_db):
@@ -6620,12 +6623,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True  # suppress auto-title thread
         session._nudge_queue.enqueue("idle_children", "your kids", "any")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6652,12 +6650,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True
         session._queue_user_advisory("denial", "leftover")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6675,12 +6668,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True
         session._queue_user_advisory("denial", "x")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6711,12 +6699,7 @@ class TestDeliverWakeNudge:
         # otherwise fire a fresh correction nudge.
         session.messages.append(turn_from_dict({"role": "user", "content": "earlier"}))
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6758,22 +6741,17 @@ class TestDeliverWakeNudge:
         session._title_generated = True
         session._nudge_queue.enqueue("idle_children", "kids", "any")
 
-        def _queue_then_reply(*_a: Any, **_k: Any) -> dict[str, Any]:
+        def _queue_then_reply(*_a: Any, **_k: Any) -> ModelTurnResult:
             # First stream call: a real user message lands mid-wake-turn.
             # Subsequent calls: plain replies until the flush seam empties.
             if not session._queued_messages and not any(
                 "real user input" in str(m.content) for m in session.messages
             ):
                 session.queue_message("real user input", queue_msg_id="q-1")
-            return {"role": "assistant", "content": "ok"}
+            return make_result("ok")
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                side_effect=_queue_then_reply,
-            ),
+            patch.object(session, "_stream_response", side_effect=_queue_then_reply),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6803,11 +6781,7 @@ class TestDeliverWakeNudge:
         session._queue_user_advisory("denial", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=RuntimeError("boom"),
-            ),
+            patch.object(session, "_stream_response", side_effect=RuntimeError("boom")),
             contextlib.suppress(RuntimeError),
         ):
             session.deliver_wake_nudge_from_queue()
@@ -6832,12 +6806,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True
         session._queue_user_advisory("denial", "leftover")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6863,12 +6832,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True
         session._queue_user_advisory("denial", "do not do that")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),

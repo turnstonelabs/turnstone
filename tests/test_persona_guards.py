@@ -9,17 +9,21 @@ stamped-at-create isolation from later persona edits.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._parity_832 import make_result
 from turnstone.core.personas import PersonaSnapshot, snapshot_from_persona
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
 from turnstone.core.storage._utils import PERSONA_MUTABLE
 from turnstone.core.tools import TASK_AGENT_TOOLS
 from turnstone.core.workstream import WorkstreamKind
+
+if TYPE_CHECKING:
+    from turnstone.core.model_turn import ModelTurnResult
 
 
 def _snap(
@@ -333,18 +337,17 @@ class TestMemoryOff:
         summary = SimpleNamespace(content="## Open tasks\nfinish it", finish_reason="stop")
         n = {"i": 0}
 
-        def stream(*_a: Any, **_k: Any) -> dict[str, str]:
+        def stream(*_a: Any, **_k: Any) -> ModelTurnResult:
             n["i"] += 1
             if n["i"] == 1:
                 session._compaction_advised = True  # advisory fired this turn
-                return {"role": "assistant", "content": "pausing to compact"}
-            return {"role": "assistant", "content": "all done"}
+                return make_result(content="pausing to compact")
+            return make_result(content="all done")
 
         def est(*_a: Any, **_k: Any) -> int:
             return 9_999 if n["i"] <= 1 else 10  # over threshold only on the stop turn
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(session, "_stream_response", side_effect=stream),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),

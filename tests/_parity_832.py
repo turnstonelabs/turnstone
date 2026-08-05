@@ -95,6 +95,51 @@ class ArmedHandle:
         self.closed = True
 
 
+def arm_session(
+    session: Any,
+    *streams: Any,
+    retryable: frozenset[str] = frozenset({"IncompleteStreamError"}),
+    name: str = "openai-compatible",
+) -> MagicMock:
+    """Install a sequential multi-turn armed provider fake on *session*.
+
+    Each ``create_streaming`` call serves the next element of *streams*:
+    an iterable/generator is armed (a closeable sentinel appended to
+    ``cancel_ref`` — the eager append every real adapter performs, which
+    the fold's creation-vs-midstream classifier keys on) and returned to
+    be consumed once; an EXCEPTION instance is raised at create time
+    WITHOUT arming — a creation-phase failure the per-lane ladder owns.
+    Calls beyond the script fail loudly (the pre-fold lax consumer used
+    to absorb an exhausted iterator as a silent empty turn; the strict
+    finish gate rejects that now, so an under-scripted test must say so).
+
+    Title generation is latched off — with a provider-LEVEL fake the
+    best-effort title lane would otherwise consume the first script
+    before the main loop ran.
+    """
+    session._title_generated = True
+    provider = MagicMock()
+    provider.provider_name = name
+    provider.get_capabilities.return_value = ModelCapabilities()
+    provider.retryable_error_names = retryable
+    provider._armed_handle = MagicMock()
+    remaining = list(streams)
+
+    def _create(**kwargs: Any):
+        assert remaining, "arm_session: script exhausted — send looped for more turns than scripted"
+        nxt = remaining.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        ref = kwargs.get("cancel_ref")
+        if ref is not None:
+            ref.append(provider._armed_handle)
+        return iter(nxt) if not hasattr(nxt, "__next__") else nxt
+
+    provider.create_streaming = MagicMock(side_effect=_create)
+    session._provider = provider
+    return provider
+
+
 def scripted_provider(chunks: list[StreamChunk]) -> MagicMock:
     """Provider fake replaying *chunks*, arming ``cancel_ref`` eagerly.
 

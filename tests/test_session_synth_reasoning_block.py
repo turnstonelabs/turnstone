@@ -8,9 +8,8 @@ provider_blocks shape on the wire, so the captured reasoning text is
 stamped onto ``_provider_content`` as a synthetic
 ``{type: "reasoning_text"}`` block at the end of the turn by
 ``model_turn.synth_reasoning_block`` — the one synthesizer every lane
-runs (the main loop reaches it through ``ChatSession._stream_attempt``
-→ ``_finalize_provider_blocks``; agents and judges through
-``model_turn``).
+runs (every lane — main loop, agents, judges — reaches it through
+``model_turn.model_turn``'s ``finalize_provider_blocks`` call).
 
 These tests pin:
 1. The synthesizer fires only when no native blocks were emitted AND
@@ -29,6 +28,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+from tests._parity_832 import scripted_provider
 from tests._session_helpers import make_session as _make_session
 from turnstone.core.model_turn import _server_type_of, synth_reasoning_block
 from turnstone.core.providers._anthropic import (
@@ -36,6 +36,8 @@ from turnstone.core.providers._anthropic import (
     AnthropicProvider,
 )
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+from turnstone.core.providers._protocol import StreamChunk, UsageInfo
+from turnstone.core.trajectory import Turn
 
 
 class TestSynthReasoningBlock:
@@ -210,25 +212,24 @@ class TestOpenAIChatExtractReasoningText:
         assert provider.extract_reasoning_text(blocks) == ""
 
 
-class TestStreamAttemptSynthBlockIntegration:
+class TestStreamResponseSynthBlockIntegration:
     """Integration test: drives a fake reasoning-emitting stream
-    through ``ChatSession._stream_attempt`` and asserts the
-    synthesizer wires up correctly.  Pins the call site at
-    ``session.py`` (where ``model_turn.synth_reasoning_block`` is
-    invoked — via ``_finalize_provider_blocks`` — on the assembled
-    provider_blocks before stamping ``_provider_content``) — without
+    through ``session._stream_response`` (the real drain seam —
+    ``_stream_attempt`` no longer exists post-#832) and asserts the
+    synthesizer wires up correctly.  Pins the call site inside
+    ``model_turn.model_turn`` (where ``model_turn.synth_reasoning_block``
+    is invoked — via ``finalize_provider_blocks`` — on the assembled
+    provider_blocks before the result's native lane is built) — without
     this, a future refactor that drops the synthesizer call would
     silently break path-3 capture (vLLM/llama.cpp/Gemini-compat
     reasoning would be visible live but invisible on history reload).
     """
 
-    def _make_stream(self, content: str, reasoning: str) -> Any:
-        """Build an iterator of StreamChunks that mimic a path-3
-        capture (reasoning_delta chunks, content chunks, no
-        provider_blocks emitted).
+    def _make_chunks(self, content: str, reasoning: str) -> list[StreamChunk]:
+        """Build a chunk script that mimics a path-3 capture
+        (reasoning_delta chunks, content chunks, no provider_blocks
+        emitted).
         """
-        from turnstone.core.providers._protocol import StreamChunk, UsageInfo
-
         chunks = []
         # Reasoning first (matches live SSE order).
         if reasoning:
@@ -248,39 +249,44 @@ class TestStreamAttemptSynthBlockIntegration:
                 usage=UsageInfo(prompt_tokens=10, completion_tokens=20, total_tokens=30),
             )
         )
-        return iter(chunks)
+        return chunks
 
-    def test_stream_attempt_stamps_synth_block_when_path3_reasoning_captured(
+    def test_stream_response_stamps_synth_block_when_path3_reasoning_captured(
         self,
     ) -> None:
         """Drive a fake stream emitting reasoning_delta chunks (no
-        native provider_blocks) through ``_stream_attempt``; assert
-        the resulting assistant_msg carries a synthetic reasoning_text
-        block stamped onto ``_provider_content``."""
+        native provider_blocks) through ``_stream_response``; assert
+        the resulting turn carries a synthetic reasoning_text block on
+        its native lane."""
         session = _make_session()
         # No registry → source field omitted from synth block.
-        stream = self._make_stream(content="Final answer.", reasoning="path-3 reasoning")
-        msg = session._stream_attempt(stream)
-        assert msg["role"] == "assistant"
-        assert msg["content"] == "Final answer."
-        # Synthetic block should be stamped onto _provider_content.
-        provider_content = msg.get("_provider_content")
-        assert isinstance(provider_content, list)
-        assert len(provider_content) == 1
-        assert provider_content[0]["type"] == "reasoning_text"
-        assert provider_content[0]["text"] == "path-3 reasoning"
+        session._provider = scripted_provider(
+            self._make_chunks(content="Final answer.", reasoning="path-3 reasoning")
+        )
+        session.messages.append(Turn.user("hi"))
+        result = session._stream_response(0)
+        assert result.content == "Final answer."
+        # Synthetic block should be stamped onto the native lane.
+        assert result.turn.native is not None
+        blocks = list(result.turn.native.blocks)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "reasoning_text"
+        assert blocks[0]["text"] == "path-3 reasoning"
 
-    def test_stream_attempt_no_synth_when_no_reasoning_captured(self) -> None:
+    def test_stream_response_no_synth_when_no_reasoning_captured(self) -> None:
         """Stream emits only content (no reasoning_delta).  No synth
-        block stamped — _provider_content key absent on assistant_msg."""
+        block stamped — the result's native lane is absent."""
         session = _make_session()
-        stream = self._make_stream(content="just content", reasoning="")
-        msg = session._stream_attempt(stream)
-        assert msg["content"] == "just content"
-        # No synth block (and no native blocks either) → key absent.
-        assert "_provider_content" not in msg
+        session._provider = scripted_provider(
+            self._make_chunks(content="just content", reasoning="")
+        )
+        session.messages.append(Turn.user("hi"))
+        result = session._stream_response(0)
+        assert result.content == "just content"
+        # No synth block (and no native blocks either) → native absent.
+        assert result.turn.native is None
 
-    def test_stream_attempt_synth_block_carries_source_when_server_type_resolvable(
+    def test_stream_response_synth_block_carries_source_when_server_type_resolvable(
         self,
     ) -> None:
         """When the active model has server_compat.server_type set,
@@ -293,11 +299,14 @@ class TestStreamAttemptSynthBlockIntegration:
             )
         )
         session._model_alias = "qwen3-32b"
-        stream = self._make_stream(content="answer", reasoning="reasoning text")
-        msg = session._stream_attempt(stream)
-        provider_content = msg.get("_provider_content")
-        assert isinstance(provider_content, list)
-        assert provider_content[0]["source"] == "vllm"
+        session._provider = scripted_provider(
+            self._make_chunks(content="answer", reasoning="reasoning text")
+        )
+        session.messages.append(Turn.user("hi"))
+        result = session._stream_response(0)
+        assert result.turn.native is not None
+        blocks = list(result.turn.native.blocks)
+        assert blocks[0]["source"] == "vllm"
 
 
 class TestServerTypeOf:

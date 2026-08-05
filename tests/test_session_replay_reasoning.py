@@ -5,19 +5,24 @@ Phase 2 of optional reasoning persistence reads the per-model
 site and threads it through ``provider.create_streaming`` (the one
 transport post-#831).  These tests pin:
 
-1. The resolver helper (``ChatSession._resolve_replay_reasoning_to_model``)
-   walks the registry correctly and falls back to ``False`` (the
-   conservative default matching the migration server_default) when
-   the lookup fails.
-2. The streaming wire-build call site at ``session.py:_try_stream``
-   actually passes the resolved flag down — without this, the Phase
-   2 work is dead code (the strip-when-False predicate never fires).
-3. The non-streaming wire-build call site at
-   ``session.py:_utility_completion`` does the same.
+1. The resolver (``model_turn.resolve_replay_reasoning_to_model``) walks
+   the registry correctly and falls back to ``False`` (the conservative
+   default matching the migration server_default) when the lookup fails.
+2. The streaming wire-build call site actually passes the resolved flag
+   down — post-#832 that call site is ``model_turn``, reached through
+   ``session._stream_response`` and its lane-swap fallback walk.  Without
+   this the Phase 2 work is dead code (the strip-when-False predicate
+   never fires).
+3. The non-streaming call site at ``session.py:_utility_completion``
+   does the same, through the same ``model_turn`` seam.
 
-Drives through the real ``ChatSession._resolve_replay_reasoning_to_model``
-with a stub registry, then captures the kwarg passed to a mock provider
-to verify the flow end-to-end.
+Drives the real resolver against a stub registry, then reads the kwarg a
+fake provider captured — the same assertion surface as before the fold,
+one caller down.  The capability half of the resolver's AND-gate now
+reaches it as the LANE's capabilities (provider static table + the
+registry's operator overrides) instead of a ``capabilities=`` argument at
+the call site, so tests that supplied their own ``ModelCapabilities``
+state it through the stub registry's ``capabilities`` dict.
 """
 
 from __future__ import annotations
@@ -26,179 +31,165 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from tests._session_helpers import as_stream, mock_completion_result
+from tests._parity_832 import SCENARIOS, scripted_provider
+from tests._session_helpers import (
+    FakeAnthropicBlock,
+    as_stream,
+    fake_anthropic_stream,
+    mock_completion_result,
+)
 from tests._session_helpers import make_session as _make_session
-from turnstone.core.trajectory import Turn
+from turnstone.core.model_turn import resolve_replay_reasoning_to_model
+from turnstone.core.providers._protocol import ModelCapabilities
+from turnstone.core.trajectory import Turn, turns_from_dicts
 
 
-def _registry_with_flag(persist: bool = True, replay: bool = False) -> Any:
+def _registry_with_flag(
+    persist: bool = True,
+    replay: bool = False,
+    caps_overrides: dict[str, Any] | None = None,
+) -> Any:
     """Stub registry returning a ModelConfig-shaped object with the
-    flags under test."""
+    flags under test.  *caps_overrides* rides the config's
+    ``capabilities`` dict, which is how an operator states a model
+    capability the lane must resolve."""
     return SimpleNamespace(
         get_config=lambda alias: SimpleNamespace(
             surface_persisted_reasoning=persist,
             replay_reasoning_to_model=replay,
+            capabilities=dict(caps_overrides or {}),
         )
     )
 
 
+def _flag_capture_provider(*, supports_replay: bool = True) -> MagicMock:
+    """Provider fake recording the kwargs ``model_turn`` built, then
+    replaying a finished stream.
+
+    The eager ``cancel_ref`` arming is mandatory at this seam (the
+    creation-vs-midstream classifier reads it), so the shape comes from
+    ``tests._parity_832.scripted_provider`` verbatim; only the advertised
+    reasoning-replay capability is per-test.
+    """
+    provider = scripted_provider(SCENARIOS["content_only"])
+    provider.get_capabilities.return_value = ModelCapabilities(
+        supports_reasoning_replay=supports_replay
+    )
+    return provider
+
+
+def _drive_stream(session: Any, provider: MagicMock) -> dict[str, Any]:
+    """Run ONE real streaming turn against *provider* and return the
+    kwargs that reached ``create_streaming``."""
+    session._provider = provider
+    session.messages.append(Turn.user("hi"))
+    session._stream_response(0)
+    kwargs: dict[str, Any] = provider.create_streaming.call_args.kwargs
+    return kwargs
+
+
 class TestResolveReplayReasoningToModel:
-    """Direct unit tests for the resolver."""
+    """Direct unit tests for the resolver.
+
+    The session wrapper this class used to call was deleted with the
+    ``_try_stream`` seam (#832): the lane carries the registry and the
+    alias, and ``model_turn`` reads the flag off them per call.  Same
+    resolver, one indirection down — so the case table is unchanged.
+    """
 
     def test_returns_false_when_no_registry(self) -> None:
-        session = _make_session()
-        session._registry = None
-        session._model_alias = "anything"
-        assert session._resolve_replay_reasoning_to_model() is False
+        assert resolve_replay_reasoning_to_model(None, "anything") is False
 
     def test_returns_false_when_no_alias(self) -> None:
-        session = _make_session()
-        session._registry = _registry_with_flag(replay=True)
-        session._model_alias = ""
-        assert session._resolve_replay_reasoning_to_model() is False
+        # A lane outside the registry carries ``alias=""``.
+        assert resolve_replay_reasoning_to_model(_registry_with_flag(replay=True), "") is False
 
     def test_returns_false_default(self) -> None:
-        session = _make_session()
-        session._registry = _registry_with_flag(replay=False)
-        session._model_alias = "claude-opus-4-7"
-        assert session._resolve_replay_reasoning_to_model() is False
+        registry = _registry_with_flag(replay=False)
+        assert resolve_replay_reasoning_to_model(registry, "claude-opus-4-7") is False
 
     def test_returns_true_when_flag_set(self) -> None:
-        session = _make_session()
-        session._registry = _registry_with_flag(replay=True)
-        session._model_alias = "claude-opus-4-7"
-        assert session._resolve_replay_reasoning_to_model() is True
+        registry = _registry_with_flag(replay=True)
+        assert resolve_replay_reasoning_to_model(registry, "claude-opus-4-7") is True
 
-    def test_explicit_alias_arg_overrides_default(self) -> None:
-        session = _make_session()
-
+    def test_alias_selects_its_own_config(self) -> None:
+        # The flag tracks the alias the LANE resolved, not any session
+        # default — the property the fallback walk depends on (pinned
+        # end-to-end by test_fallback_alias_uses_its_own_flag below).
         def per_alias(alias: str) -> Any:
             return SimpleNamespace(
                 replay_reasoning_to_model=(alias == "needs-replay"),
             )
 
-        session._registry = SimpleNamespace(get_config=per_alias)
-        session._model_alias = "primary"
-        # Default reads session._model_alias → False.
-        assert session._resolve_replay_reasoning_to_model() is False
-        # Explicit alias arg → True for "needs-replay".
-        assert session._resolve_replay_reasoning_to_model("needs-replay") is True
+        registry = SimpleNamespace(get_config=per_alias)
+        assert resolve_replay_reasoning_to_model(registry, "primary") is False
+        assert resolve_replay_reasoning_to_model(registry, "needs-replay") is True
 
     def test_returns_false_on_registry_exception(self) -> None:
-        session = _make_session()
-
         def boom(alias: str) -> Any:
             raise KeyError(alias)
 
-        session._registry = SimpleNamespace(get_config=boom)
-        session._model_alias = "missing"
+        registry = SimpleNamespace(get_config=boom)
         # Conservative fallback — losing the strip is a UX nuisance,
         # but accepting wire-side reasoning replay against an unknown
         # operator preference is a worse default.
-        assert session._resolve_replay_reasoning_to_model() is False
+        assert resolve_replay_reasoning_to_model(registry, "missing") is False
 
     def test_caps_none_preserves_back_compat(self) -> None:
         # When ``caps`` is omitted, the resolver returns the operator
         # flag unchanged — matching pre-PR behaviour for any caller
         # that hasn't been updated to thread caps yet.
-        session = _make_session()
-        session._registry = _registry_with_flag(replay=True)
-        session._model_alias = "claude-opus-4-7"
-        assert session._resolve_replay_reasoning_to_model() is True
-        assert session._resolve_replay_reasoning_to_model(caps=None) is True
+        registry = _registry_with_flag(replay=True)
+        assert resolve_replay_reasoning_to_model(registry, "claude-opus-4-7") is True
+        assert resolve_replay_reasoning_to_model(registry, "claude-opus-4-7", caps=None) is True
 
     def test_caps_supports_replay_true_passes_through(self) -> None:
-        from turnstone.core.providers._protocol import ModelCapabilities
-
-        session = _make_session()
-        session._registry = _registry_with_flag(replay=True)
-        session._model_alias = "claude-opus-4-7"
+        registry = _registry_with_flag(replay=True)
         caps = ModelCapabilities(supports_reasoning_replay=True)
-        assert session._resolve_replay_reasoning_to_model(caps=caps) is True
+        assert resolve_replay_reasoning_to_model(registry, "claude-opus-4-7", caps=caps) is True
 
     def test_caps_supports_replay_false_blocks_replay(self) -> None:
-        from turnstone.core.providers._protocol import ModelCapabilities
-
         # Operator flipped replay=True but the model's capability
         # advertises supports_reasoning_replay=False — AND-gate blocks
         # replay so the strip predicate runs at the wire build.
-        session = _make_session()
-        session._registry = _registry_with_flag(replay=True)
-        session._model_alias = "hypothetical-no-replay-claude"
+        registry = _registry_with_flag(replay=True)
         caps = ModelCapabilities(supports_reasoning_replay=False)
-        assert session._resolve_replay_reasoning_to_model(caps=caps) is False
+        alias = "hypothetical-no-replay-claude"
+        assert resolve_replay_reasoning_to_model(registry, alias, caps=caps) is False
 
     def test_caps_supports_replay_true_does_not_force_replay(self) -> None:
-        from turnstone.core.providers._protocol import ModelCapabilities
-
         # Capability True but operator flag False — result must be
         # False (the AND has to be False on either side).
-        session = _make_session()
-        session._registry = _registry_with_flag(replay=False)
-        session._model_alias = "claude-opus-4-7"
+        registry = _registry_with_flag(replay=False)
         caps = ModelCapabilities(supports_reasoning_replay=True)
-        assert session._resolve_replay_reasoning_to_model(caps=caps) is False
+        assert resolve_replay_reasoning_to_model(registry, "claude-opus-4-7", caps=caps) is False
 
 
 class TestStreamingCallSitePassesFlag:
-    """Pin that ``_try_stream`` actually passes the resolved flag to
+    """Pin that the streaming turn actually passes the resolved flag to
     ``provider.create_streaming`` — without this the Phase 2 work is
-    dead code at the call site."""
+    dead code at the call site.
+
+    The call site is ``model_turn`` now, driven through the real
+    ``_stream_response`` wrapper (creation walk → drain → finalize), so
+    the flag rides the lane the walk actually served the turn on.
+    """
 
     def test_replay_true_propagates_to_provider(self) -> None:
         session = _make_session()
         session._registry = _registry_with_flag(replay=True)
         session._model_alias = "claude-opus-4-7"
-        # Stub provider: capture the kwargs passed to create_streaming.
-        captured: dict[str, Any] = {}
-
-        def capture_streaming(**kwargs: Any) -> Any:
-            captured.update(kwargs)
-            return iter([])
-
-        mock_provider = MagicMock()
-        mock_provider.create_streaming = capture_streaming
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            session._try_stream(
-                client=MagicMock(),
-                model="claude-opus-4-7",
-                msgs=[{"role": "user", "content": "hi"}],
-                provider=mock_provider,
-                model_alias="claude-opus-4-7",
-            )
-        assert captured["replay_reasoning_to_model"] is True
+        kwargs = _drive_stream(session, _flag_capture_provider(supports_replay=True))
+        assert kwargs["replay_reasoning_to_model"] is True
 
     def test_replay_false_propagates_to_provider(self) -> None:
         session = _make_session()
         session._registry = _registry_with_flag(replay=False)
         session._model_alias = "claude-opus-4-7"
-        captured: dict[str, Any] = {}
-
-        def capture_streaming(**kwargs: Any) -> Any:
-            captured.update(kwargs)
-            return iter([])
-
-        mock_provider = MagicMock()
-        mock_provider.create_streaming = capture_streaming
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            session._try_stream(
-                client=MagicMock(),
-                model="claude-opus-4-7",
-                msgs=[{"role": "user", "content": "hi"}],
-                provider=mock_provider,
-                model_alias="claude-opus-4-7",
-            )
-        assert captured["replay_reasoning_to_model"] is False
+        # Capability advertises replay support: the False comes from the
+        # operator flag alone, not from the AND-gate's other half.
+        kwargs = _drive_stream(session, _flag_capture_provider(supports_replay=True))
+        assert kwargs["replay_reasoning_to_model"] is False
 
     def test_fallback_alias_uses_its_own_flag(self) -> None:
         # When the primary fails and we fall back to an alias with a
@@ -209,52 +200,45 @@ class TestStreamingCallSitePassesFlag:
         def per_alias(alias: str) -> Any:
             return SimpleNamespace(
                 replay_reasoning_to_model=(alias == "fallback-with-replay"),
+                capabilities={},
             )
 
-        session._registry = SimpleNamespace(get_config=per_alias)
+        fb_provider = _flag_capture_provider(supports_replay=True)
+        session._registry = SimpleNamespace(
+            get_config=per_alias,
+            fallback=["fallback-with-replay"],
+            resolve_binding=lambda alias: (MagicMock(), "fallback-model", None, fb_provider, None),
+        )
         session._model_alias = "primary"  # primary has replay=False
-        captured: dict[str, Any] = {}
-
-        def capture_streaming(**kwargs: Any) -> Any:
-            captured.update(kwargs)
-            return iter([])
-
-        mock_provider = MagicMock()
-        mock_provider.create_streaming = capture_streaming
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            session._try_stream(
-                client=MagicMock(),
-                model="fallback-model",
-                msgs=[{"role": "user", "content": "hi"}],
-                provider=mock_provider,
-                model_alias="fallback-with-replay",
-            )
+        # The primary lane dies at CREATION (raises without arming its
+        # cancel_ref), which is what sends the walk to the next alias; a
+        # non-retryable class keeps the ladder from burning backoff.
+        primary = _flag_capture_provider(supports_replay=True)
+        primary.create_streaming = MagicMock(side_effect=RuntimeError("primary is down"))
+        _drive_stream(session, primary)
         # Resolved against the FALLBACK alias, not the session's primary.
-        assert captured["replay_reasoning_to_model"] is True
+        assert fb_provider.create_streaming.call_args.kwargs["replay_reasoning_to_model"] is True
+        # ...and the primary's own attempt resolved its own alias' flag.
+        assert primary.create_streaming.call_args.kwargs["replay_reasoning_to_model"] is False
 
 
 class TestSessionToWireBoundaryIntegration:
-    """End-to-end integration: session._try_stream -> real
-    AnthropicProvider.create_streaming -> captured Anthropic SDK
+    """End-to-end integration: session._stream_response -> model_turn ->
+    real AnthropicProvider.create_streaming -> captured Anthropic SDK
     boundary call.  Verifies the strip-when-False predicate actually
     fires at the wire payload, not just at the captured kwarg.
 
-    The bare-function-stub tests above (TestStreamingCallSitePassesFlag)
-    pin that ``_try_stream`` PASSES the flag; this test pins that the
-    real provider USES it.  Together they catch:
-      - kwarg renamed at provider boundary -> stub-tests still pass,
-        this one fails on its real-provider assertion.
-      - _convert_messages stops reading the kwarg -> stub-tests still
-        pass, this one fails because the wire payload still carries
+    The provider-fake tests above (TestStreamingCallSitePassesFlag) pin
+    that the streaming turn PASSES the flag; this test pins that the real
+    provider USES it.  Together they catch:
+      - kwarg renamed at provider boundary -> fake-provider tests still
+        pass, this one fails on its real-provider assertion.
+      - _convert_messages stops reading the kwarg -> fake-provider tests
+        still pass, this one fails because the wire payload still carries
         the thinking block.
-      - _try_stream stops calling create_streaming -> stub-tests fail
-        on the captured kwarg, this one fails because the SDK boundary
-        was never reached.
+      - the streaming turn stops calling create_streaming -> fake-provider
+        tests fail on the captured kwarg, this one fails because the SDK
+        boundary was never reached.
 
     Drives through the real ``AnthropicProvider`` with a mock client
     whose ``client.messages.stream`` is captured — the smallest possible
@@ -273,19 +257,16 @@ class TestSessionToWireBoundaryIntegration:
     def _stub_anthropic_client(self) -> tuple[MagicMock, dict[str, object]]:
         """Build a mock Anthropic client + captured-kwargs dict.
 
-        ``client.messages.stream(**kwargs)`` returns a context manager
-        whose ``__enter__`` yields an iterable of zero events — enough
-        to satisfy the ``_iter_with_cleanup`` shape without exercising
-        actual streaming protocol.
+        ``client.messages.stream(**kwargs)`` returns the real event
+        grammar for a one-block reply, so the fused create+drain reaches
+        a finish reason instead of exhausting finish-less (which the
+        post-#832 seam re-issues as an ``IncompleteStreamError``).
         """
         captured: dict[str, object] = {}
 
         def stream(**kwargs: object) -> object:
             captured.update(kwargs)
-            cm = MagicMock()
-            cm.__enter__ = MagicMock(return_value=iter([]))
-            cm.__exit__ = MagicMock(return_value=False)
-            return cm
+            return fake_anthropic_stream([FakeAnthropicBlock(type="text", text="ok")])
 
         client = MagicMock()
         client.messages.stream = stream
@@ -295,38 +276,31 @@ class TestSessionToWireBoundaryIntegration:
         self,
         replay_flag: bool,
         msgs: list[dict[str, object]],
+        caps_overrides: dict[str, Any] | None = None,
     ) -> dict[str, object]:
-        """Run session._try_stream against a real AnthropicProvider with
-        the resolver pre-set to *replay_flag*.  Returns the kwargs
+        """Run one real streaming turn against a real AnthropicProvider
+        with the resolver pre-set to *replay_flag*.  Returns the kwargs
         dict that reached the (mocked) Anthropic SDK boundary.
+
+        *msgs* seeds the session trajectory (the wire list is built from
+        it inside ``model_turn`` now — lowering plus the session's own
+        ``prepare_wire`` passes — instead of being handed to the seam).
         """
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         session = _make_session()
-        session._registry = _registry_with_flag(replay=replay_flag)
+        session._registry = _registry_with_flag(replay=replay_flag, caps_overrides=caps_overrides)
         session._model_alias = "claude-opus-4-7"
+        session.model = "claude-opus-4-7"
         client, captured = self._stub_anthropic_client()
-        real_provider = AnthropicProvider()
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            stream = session._try_stream(
-                client=client,
-                model="claude-opus-4-7",
-                msgs=msgs,
-                provider=real_provider,
-                model_alias="claude-opus-4-7",
-            )
-            # Iterate the stream to drain the (empty) generator and ensure
-            # convert / build_kwargs all ran.
-            list(stream)
+        session.client = client
+        session._provider = AnthropicProvider()
+        session.messages = turns_from_dicts(msgs)
+        session._stream_response(0)
         return captured
 
     def test_replay_false_strips_thinking_at_wire(self) -> None:
-        msgs: list[dict[str, object]] = [
+        msgs: list[dict[str, Any]] = [
             {"role": "user", "content": "hello"},
             {
                 "role": "assistant",
@@ -357,7 +331,7 @@ class TestSessionToWireBoundaryIntegration:
         assert "secret reasoning" not in flat, "Reasoning text leaked into the SDK boundary payload"
 
     def test_replay_true_preserves_thinking_at_wire(self) -> None:
-        msgs: list[dict[str, object]] = [
+        msgs: list[dict[str, Any]] = [
             {"role": "user", "content": "hello"},
             {
                 "role": "assistant",
@@ -384,11 +358,11 @@ class TestSessionToWireBoundaryIntegration:
         # replay=True but the model's capability advertises
         # supports_reasoning_replay=False.  AND-gate at the resolver
         # blocks replay, so the strip predicate fires at the wire and
-        # the thinking block does NOT reach the SDK boundary.
-        from turnstone.core.providers._anthropic import AnthropicProvider
-        from turnstone.core.providers._protocol import ModelCapabilities
-
-        msgs: list[dict[str, object]] = [
+        # the thinking block does NOT reach the SDK boundary.  The
+        # capability reaches the resolver as the LANE's — an operator
+        # override on the alias, since the lane resolves its own caps
+        # rather than taking them from the caller.
+        msgs: list[dict[str, Any]] = [
             {"role": "user", "content": "hello"},
             {
                 "role": "assistant",
@@ -401,27 +375,11 @@ class TestSessionToWireBoundaryIntegration:
             {"role": "user", "content": "ack"},
         ]
 
-        session = _make_session()
-        session._registry = _registry_with_flag(replay=True)  # operator opted in
-        session._model_alias = "hypothetical-no-replay-claude"
-        caps = ModelCapabilities(supports_reasoning_replay=False)
-        client, captured = self._stub_anthropic_client()
-        real_provider = AnthropicProvider()
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            stream = session._try_stream(
-                client=client,
-                model="hypothetical-no-replay-claude",
-                msgs=msgs,
-                provider=real_provider,
-                capabilities=caps,
-                model_alias="hypothetical-no-replay-claude",
-            )
-            list(stream)
+        captured = self._drive_session_through_anthropic(
+            True,  # operator opted in
+            msgs,
+            caps_overrides={"supports_reasoning_replay": False},
+        )
 
         wire_msgs = captured.get("messages")
         assert isinstance(wire_msgs, list), (
@@ -440,8 +398,8 @@ class TestSessionToWireBoundaryIntegration:
 
 
 class TestSessionToOpenAIResponsesBoundaryIntegration:
-    """End-to-end integration: session._try_stream -> real
-    OpenAIResponsesProvider.create_streaming -> captured Responses
+    """End-to-end integration: session._stream_response -> model_turn ->
+    real OpenAIResponsesProvider.create_streaming -> captured Responses
     SDK boundary call.  Mirrors the AnthropicProvider test above
     but for the path-2 (Responses API) replay flow.
 
@@ -452,12 +410,14 @@ class TestSessionToOpenAIResponsesBoundaryIntegration:
 
     def _stub_responses_client(self) -> tuple[MagicMock, dict[str, object]]:
         """Mock OpenAI Responses client.  ``client.responses.create``
-        captures kwargs and returns an empty stream iterator."""
+        captures kwargs and returns a stream carrying only the terminal
+        event — the fused create+drain needs a finish reason (a
+        finish-less exhaust is an ``IncompleteStreamError`` post-#832)."""
         captured: dict[str, object] = {}
 
         def create(**kwargs: object) -> object:
             captured.update(kwargs)
-            return iter([])
+            return iter([SimpleNamespace(type="response.completed", response=None)])
 
         client = MagicMock()
         client.responses.create = create
@@ -466,114 +426,71 @@ class TestSessionToOpenAIResponsesBoundaryIntegration:
     def _registry_with_reasoning_capability(
         self, replay: bool = True, supports_replay: bool = True
     ) -> Any:
-        from turnstone.core.providers._protocol import ModelCapabilities
-
+        """Stub registry stating both halves of the gate: the operator
+        flag and — as an alias capability override, the operator's way to
+        state one — the model's reasoning-replay support.  The lane
+        resolves its own capabilities now, so this is where a test says
+        what the model can do."""
         return SimpleNamespace(
             get_config=lambda alias: SimpleNamespace(
                 replay_reasoning_to_model=replay,
-                capabilities={},  # no overrides
-            ),
-            _caps=ModelCapabilities(
-                context_window=400000,
-                supports_temperature=False,
-                reasoning_effort_values=("low", "medium", "high"),
-                default_reasoning_effort="medium",
-                supports_reasoning_replay=supports_replay,
+                capabilities={"supports_reasoning_replay": supports_replay},
             ),
         )
 
-    def test_replay_true_adds_include_to_responses_request(self) -> None:
+    def _drive(self, session: Any, msgs: list[dict[str, Any]]) -> dict[str, object]:
+        """One real streaming turn through the real Responses provider."""
         from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
 
-        registry = self._registry_with_reasoning_capability(replay=True, supports_replay=True)
-        session = _make_session()
-        session._registry = registry
-        session._model_alias = "gpt-5"
         client, captured = self._stub_responses_client()
-        real_provider = OpenAIResponsesProvider()
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            stream = session._try_stream(
-                client=client,
-                model="gpt-5",
-                msgs=[{"role": "user", "content": "hi"}],
-                provider=real_provider,
-                capabilities=registry._caps,
-                model_alias="gpt-5",
-            )
-            list(stream)
+        session.client = client
+        session._provider = OpenAIResponsesProvider()
+        session.messages = turns_from_dicts(msgs)
+        session._stream_response(0)
+        return captured
+
+    def test_replay_true_adds_include_to_responses_request(self) -> None:
+        session = _make_session()
+        session._registry = self._registry_with_reasoning_capability(
+            replay=True, supports_replay=True
+        )
+        session._model_alias = "gpt-5"
+        session.model = "gpt-5"
+        captured = self._drive(session, [{"role": "user", "content": "hi"}])
         assert captured.get("include") == ["reasoning.encrypted_content"]
 
     def test_replay_false_omits_include(self) -> None:
-        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
-
-        registry = self._registry_with_reasoning_capability(replay=False, supports_replay=True)
         session = _make_session()
-        session._registry = registry
+        session._registry = self._registry_with_reasoning_capability(
+            replay=False, supports_replay=True
+        )
         session._model_alias = "gpt-5"
-        client, captured = self._stub_responses_client()
-        real_provider = OpenAIResponsesProvider()
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            stream = session._try_stream(
-                client=client,
-                model="gpt-5",
-                msgs=[{"role": "user", "content": "hi"}],
-                provider=real_provider,
-                capabilities=registry._caps,
-                model_alias="gpt-5",
-            )
-            list(stream)
+        session.model = "gpt-5"
+        captured = self._drive(session, [{"role": "user", "content": "hi"}])
         assert "include" not in captured
 
     def test_capability_false_omits_include_even_when_flag_true(self) -> None:
-        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
-
         # Operator flips replay=True but the model has
         # supports_reasoning_replay=False (e.g. gpt-4o via Responses).
         # Capability gate prevents the include= from being sent.
-        registry = self._registry_with_reasoning_capability(replay=True, supports_replay=False)
         session = _make_session()
-        session._registry = registry
+        session._registry = self._registry_with_reasoning_capability(
+            replay=True, supports_replay=False
+        )
         session._model_alias = "gpt-4o"
-        client, captured = self._stub_responses_client()
-        real_provider = OpenAIResponsesProvider()
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            stream = session._try_stream(
-                client=client,
-                model="gpt-4o",
-                msgs=[{"role": "user", "content": "hi"}],
-                provider=real_provider,
-                capabilities=registry._caps,
-                model_alias="gpt-4o",
-            )
-            list(stream)
+        session.model = "gpt-4o"
+        captured = self._drive(session, [{"role": "user", "content": "hi"}])
         assert "include" not in captured
 
     def test_replay_true_emits_reasoning_input_item(self) -> None:
-        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
-
-        registry = self._registry_with_reasoning_capability(replay=True, supports_replay=True)
         session = _make_session()
-        session._registry = registry
+        session._registry = self._registry_with_reasoning_capability(
+            replay=True, supports_replay=True
+        )
         session._model_alias = "gpt-5"
-        client, captured = self._stub_responses_client()
-        real_provider = OpenAIResponsesProvider()
+        session.model = "gpt-5"
         # Multi-turn conversation with stored reasoning on assistant turn.
-        msgs: list[dict[str, object]] = [
+        msgs: list[dict[str, Any]] = [
             {"role": "user", "content": "explain"},
             {
                 "role": "assistant",
@@ -589,21 +506,7 @@ class TestSessionToOpenAIResponsesBoundaryIntegration:
             },
             {"role": "user", "content": "follow-up"},
         ]
-        with (
-            patch.object(session, "_get_active_tools", return_value=None),
-            patch.object(session, "_provider_extra_params", return_value=None),
-            patch.object(session, "_get_deferred_names", return_value=frozenset()),
-            patch.object(session, "_check_cancelled"),
-        ):
-            stream = session._try_stream(
-                client=client,
-                model="gpt-5",
-                msgs=msgs,
-                provider=real_provider,
-                capabilities=registry._caps,
-                model_alias="gpt-5",
-            )
-            list(stream)
+        captured = self._drive(session, msgs)
         # Walk the wire input items — one of them must be the reasoning
         # round-trip (id matches what we stored).
         wire_input = captured.get("input")
@@ -619,8 +522,6 @@ class TestUtilityCompletionPassesFlag:
     same plumbing requirement as streaming."""
 
     def test_utility_completion_passes_resolved_flag(self) -> None:
-        from turnstone.core.providers._protocol import ModelCapabilities
-
         session = _make_session()
         session._registry = _registry_with_flag(replay=True)
         session._model_alias = "claude-opus-4-7"
@@ -634,9 +535,9 @@ class TestUtilityCompletionPassesFlag:
         mock_provider.create_streaming = capture_streaming
         session._provider = mock_provider
         caps = ModelCapabilities(max_output_tokens=0, supports_reasoning_replay=True)
-        # No _provider_extra_params patch: _utility_completion resolves
-        # extra_params inside resolve_lane (module seam), which a
-        # session-attribute patch cannot intercept.
+        # No extra_params patch: _utility_completion resolves them inside
+        # resolve_lane (a module seam reading the registry config), which
+        # a session-attribute patch cannot intercept.
         with patch.object(session, "_get_capabilities", return_value=caps):
             session._utility_completion(
                 [Turn.user("summarize")],
