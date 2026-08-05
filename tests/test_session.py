@@ -1860,7 +1860,15 @@ class TestTitleRetry:
         """Reasoning reaches ``content`` in several shapes the title pass must
         survive: an opener-absent ``…</think>`` (templates that pre-inject the
         opening tag), a paired ``<reasoning>`` block, and a trailing
-        explanation after the title (only the first non-empty line is kept)."""
+        explanation after the title (only the first non-empty line is kept).
+
+        The last two cases pin the BOTH-VOCABULARY shape in either order.
+        The peel walks the close-tag vocabularies in sequence, which is
+        equivalent to one cut after whichever close occurs last: the
+        remainder of the first cut begins after the last ``</think>``, so a
+        ``</reasoning>`` still found in it is necessarily the later tag.
+        Title text after the last stray close always survives; only
+        reasoning between the tags is dropped."""
         from turnstone.core.providers._protocol import ModelCapabilities
 
         cases = [
@@ -1870,6 +1878,14 @@ class TestTitleRetry:
                 "Cluster Health Digest",
             ),
             ("Auth Layer Refactor\n\nThis title captures the request well.", "Auth Layer Refactor"),
+            (
+                "weighing</reasoning>still weighing</think>\n\nRendezvous Routing",
+                "Rendezvous Routing",
+            ),
+            (
+                "weighing</think>still weighing</reasoning>\n\nCluster Health Digest",
+                "Cluster Health Digest",
+            ),
         ]
         for content, expected in cases:
             session = _make_session()
