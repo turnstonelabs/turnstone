@@ -968,9 +968,9 @@ def model_turn(
     *prepare_wire* is the caller's OWN deterministic lowering, called
     with the serving lane so per-lane capability posture is available,
     composed after the seam passes and before the Phase-5 attach: the
-    main loop's
-    system-message prepend, sender labels, capability-sensitive
-    system-turn fold, empty-user drop, and orphan repair live here, each
+    main loop's system-message prepend, sender labels,
+    capability-sensitive system-turn fold, empty-user drop, and orphan
+    repair live here, each
     a ``lowering.py``-composed pass.  It must be pure lowering — no
     learned selection, no provider calls, no side effects (the session's
     debug request dump, a read-only latch, is the tolerated exception).

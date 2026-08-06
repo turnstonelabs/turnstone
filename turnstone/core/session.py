@@ -537,6 +537,15 @@ class _StreamTurnConsumer:
         duties (health success, usage-slot resets)."""
         return (self.ref is not None and self.ref.armed) or self._saw_chunk
 
+    def _superseded(self) -> bool:
+        """Whether a newer generation has claimed this session — the
+        consumer's copy of :meth:`_CancelRef._superseded`, scoped the same
+        way (generation 0 is unscoped, so a direct seam caller is never
+        superseded).  The two must agree: the ref decides whether to fire
+        the arm hook, and the hook's own gate decides whether to act."""
+        gen = self._my_generation
+        return bool(gen and self._session._generation != gen)
+
     def on_stream_armed(self) -> None:
         """`_CancelRef.on_first_append` — the request-accepted instant.
 
@@ -550,10 +559,13 @@ class _StreamTurnConsumer:
         two lockless steps, so a force-cancel can claim a new generation
         between them — an orphan's late-arriving registration must not
         null the SUCCESSOR's usage slots or record health for an
-        abandoned lane.
+        abandoned lane.  Scoping matches the ref's own ``_superseded``
+        and ``_check_cancelled``: generation 0 is UNSCOPED (a direct
+        seam caller), and the ref fires the hook for it, so the gate
+        must not refuse it.
         """
         s = self._session
-        if s._generation != self._my_generation:
+        if self._superseded():
             return
         s._last_usage = None
         s._assistant_pending_tokens = 0
@@ -706,7 +718,7 @@ class _StreamTurnConsumer:
         ``tool_calls`` and the native lane are DELIBERATELY omitted —
         incomplete calls would orphan their results, and the
         marker-as-message contract needs plain content."""
-        if self._session._generation != self._my_generation:
+        if self._superseded():
             return
         content = self.partial_content()
         self._flush_terminal_carries()
@@ -1826,6 +1838,18 @@ _SELF_SURFACING_ERRORS: tuple[type[Exception], ...] = (
     BackendAuthUnavailableError,
     WirePreparationError,
 )
+
+# Creation failures that say nothing about the BACKEND: the caller's own
+# lowering raised.  Recording them would paint a cluster-wide outage over
+# one session's malformed history.
+_NON_BACKEND_ERRORS: tuple[type[Exception], ...] = (WirePreparationError,)
+
+
+def _speaks_for_backend(err: BaseException) -> bool:
+    """Whether a creation failure is a health signal for its lane — THE
+    predicate both walk arms use, so primary and fallback can never
+    classify the same error differently."""
+    return not isinstance(err, _NON_BACKEND_ERRORS)
 
 
 def _mint_refusal_cause(
@@ -6276,7 +6300,7 @@ class ChatSession:
             # health — but it DOES enter the walk: prepare runs per lane
             # (fold posture follows lane.capabilities), so another lane's
             # posture may serve a turn the primary's could not.
-            if tracker and not isinstance(primary_err, WirePreparationError):
+            if tracker and _speaks_for_backend(primary_err):
                 tracker.record_failure()
             if not self._registry or not self._registry.fallback:
                 raise
@@ -6352,7 +6376,7 @@ class ChatSession:
             # This lane's wire-preparation fault is not its health signal,
             # and it must not abort the walk: prepare is lane-variant, so
             # the next alias may still serve the turn.
-            if fb_tracker and not isinstance(fb_err, WirePreparationError):
+            if fb_tracker and _speaks_for_backend(fb_err):
                 fb_tracker.record_failure()
             # Class name only in the UI line: a ConnectError's text can
             # carry a credential-bearing base_url, and this string lands in
@@ -8499,16 +8523,13 @@ class ChatSession:
                     count=len(dropped),
                 )
                 old_native = result.turn.native
-                blocks = finalize_provider_blocks(
-                    list(old_native.blocks) if old_native else [],
-                    [],
-                    has_tool_calls=False,
-                )
-                native = (
-                    ProviderNative(producer=old_native.producer, blocks=tuple(blocks))
-                    if blocks and old_native
-                    else None
-                )
+                native = None
+                if old_native:
+                    blocks = finalize_provider_blocks(
+                        list(old_native.blocks), [], has_tool_calls=False
+                    )
+                    if blocks:
+                        native = ProviderNative(producer=old_native.producer, blocks=tuple(blocks))
                 result = dataclasses.replace(
                     result,
                     turn=Turn.assistant(result.turn.text, native=native),

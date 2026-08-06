@@ -4,12 +4,13 @@ import contextlib
 import json
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tests._session_helpers import arm_session, make_session
+from turnstone.core.providers import StreamChunk
 from turnstone.core.session import (
     GenerationCancelled,
     _CancelRef,
@@ -137,17 +138,7 @@ class TestCancelEvent:
         session = _make_session(ui=ui)
         session.cancel()  # Set stale flag
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
-        fake_stream = iter([FakeChunk(content_delta="Hello", finish_reason="stop")])
+        fake_stream = iter([StreamChunk(content_delta="Hello", finish_reason="stop")])
 
         arm_session(session, fake_stream)
         session.send("test")
@@ -164,22 +155,12 @@ class TestCancelDuringStreaming:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         def cancelling_stream():
             """Yield a few chunks then cancel."""
-            yield FakeChunk(content_delta="Hello ")
-            yield FakeChunk(content_delta="world")
+            yield StreamChunk(content_delta="Hello ")
+            yield StreamChunk(content_delta="world")
             session.cancel()
-            yield FakeChunk(content_delta=" — this should not appear")
+            yield StreamChunk(content_delta=" — this should not appear")
 
         arm_session(session, cancelling_stream())
         session.send("test")
@@ -213,16 +194,6 @@ class TestCancelDuringToolExecution:
         session = _make_session(ui=ui)
 
         @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
-        @dataclass
         class FakeToolDelta:
             index: int = 0
             id: str = ""
@@ -231,11 +202,11 @@ class TestCancelDuringToolExecution:
 
         # First call: return content with a tool call
         def stream_with_tool():
-            yield FakeChunk(
+            yield StreamChunk(
                 tool_call_deltas=[FakeToolDelta(index=0, id="tc_1", name="bash")],
                 finish_reason="",
             )
-            yield FakeChunk(
+            yield StreamChunk(
                 tool_call_deltas=[FakeToolDelta(index=0, arguments_delta='{"command":"echo hi"}')],
                 finish_reason="tool_calls",
             )
@@ -274,17 +245,7 @@ class TestCancelWhenIdle:
         session.cancel()
         # Next send should work normally (cancel cleared at start)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
-        fake_stream = iter([FakeChunk(content_delta="ok", finish_reason="stop")])
+        fake_stream = iter([StreamChunk(content_delta="ok", finish_reason="stop")])
         arm_session(session, fake_stream)
         session.send("hello")
 
@@ -301,23 +262,13 @@ class TestCancelThreadSafety:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         barrier = threading.Event()
 
         def slow_stream():
-            yield FakeChunk(content_delta="Start")
+            yield StreamChunk(content_delta="Start")
             barrier.set()  # Signal that streaming has started
             time.sleep(2)  # Simulate slow streaming
-            yield FakeChunk(content_delta=" end", finish_reason="stop")
+            yield StreamChunk(content_delta=" end", finish_reason="stop")
 
         arm_session(session, slow_stream())
         # Run send() in a thread
@@ -375,16 +326,6 @@ class TestStreamFlushBeforeToolCalls:
         session = _make_session(ui=ui)
 
         @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
-        @dataclass
         class FakeToolDelta:
             index: int = 0
             id: str = ""
@@ -395,11 +336,11 @@ class TestStreamFlushBeforeToolCalls:
             # Content long enough to leave chars in the tag-scan carry
             # buffer (ThinkTagSplitter retains the last MAX_TAG_LEN = 12
             # chars until a flush)
-            yield FakeChunk(content_delta="Hello world, this is a test message")
-            yield FakeChunk(
+            yield StreamChunk(content_delta="Hello world, this is a test message")
+            yield StreamChunk(
                 tool_call_deltas=[FakeToolDelta(index=0, id="tc_1", name="bash")],
             )
-            yield FakeChunk(
+            yield StreamChunk(
                 tool_call_deltas=[FakeToolDelta(index=0, arguments_delta='{"command":"echo hi"}')],
                 finish_reason="tool_calls",
             )
@@ -411,7 +352,7 @@ class TestStreamFlushBeforeToolCalls:
         arm_session(
             session,
             stream_content_then_tool(),
-            iter([FakeChunk(finish_reason="stop")]),
+            iter([StreamChunk(finish_reason="stop")]),
         )
         with (
             # Prevent real tool execution (e.g., bash) during this test.
@@ -465,16 +406,6 @@ class TestStreamAbort:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         seen: dict = {}
 
         def observing_stream():
@@ -482,7 +413,7 @@ class TestStreamAbort:
             # registered (append happens inside create_streaming, before
             # the iterator is handed back).
             seen["handle_at_first_chunk"] = session._cancel_stream
-            yield FakeChunk(content_delta="hi", finish_reason="stop")
+            yield StreamChunk(content_delta="hi", finish_reason="stop")
 
         provider = arm_session(session, observing_stream())
         session.send("test")
@@ -497,18 +428,8 @@ class TestStreamAbort:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         def stream_that_errors():
-            yield FakeChunk(content_delta="Hello")
+            yield StreamChunk(content_delta="Hello")
             session._cancel_event.set()
             raise ConnectionError("stream closed")
 
@@ -532,18 +453,8 @@ class TestStreamAbort:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         def stream_that_errors():
-            yield FakeChunk(content_delta="Hello")
+            yield StreamChunk(content_delta="Hello")
             raise ValueError("unexpected error")
 
         arm_session(session, stream_that_errors())
@@ -633,17 +544,7 @@ class TestCancelRef:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
-        arm_session(session, iter([FakeChunk(content_delta="hi", finish_reason="stop")]))
+        arm_session(session, iter([StreamChunk(content_delta="hi", finish_reason="stop")]))
         session.send("test")
 
         # During the stream the armed handle was registered; after send()
@@ -694,18 +595,8 @@ class TestForceCancelOrphanNoReissue:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         def dying_orphan_stream():
-            yield FakeChunk(content_delta="old ")
+            yield StreamChunk(content_delta="old ")
             # Force-cancel: a successor claims the generation (bumped
             # counter + fresh UNSET event) while this stream is mid-body.
             session._claim_generation()
@@ -760,19 +651,9 @@ class TestForceCancelGeneration:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         original_event = session._cancel_event
 
-        arm_session(session, iter([FakeChunk(content_delta="hi", finish_reason="stop")]))
+        arm_session(session, iter([StreamChunk(content_delta="hi", finish_reason="stop")]))
         session.send("test")
 
         # After send() completes, _cancel_event should be a NEW Event
@@ -790,24 +671,14 @@ class TestForceCancelThreaded:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         barrier = threading.Event()
         old_done = threading.Event()
 
         def slow_stream():
-            yield FakeChunk(content_delta="Old content")
+            yield StreamChunk(content_delta="Old content")
             barrier.set()  # signal: first chunk delivered
             time.sleep(2)  # simulate stuck stream
-            yield FakeChunk(content_delta=" more", finish_reason="stop")
+            yield StreamChunk(content_delta=" more", finish_reason="stop")
 
         # Start generation 1 (will get stuck)
         arm_session(session, slow_stream())
@@ -843,23 +714,13 @@ class TestForceCancelThreaded:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         barrier = threading.Event()
 
         def stuck_stream():
-            yield FakeChunk(content_delta="stuck")
+            yield StreamChunk(content_delta="stuck", finish_reason="stop")
             barrier.set()
             time.sleep(2)
-            yield FakeChunk(content_delta=" end", finish_reason="stop")
+            yield StreamChunk(content_delta=" end", finish_reason="stop")
 
         # Start stuck generation
         arm_session(session, stuck_stream())
@@ -871,7 +732,9 @@ class TestForceCancelThreaded:
         session.cancel()
 
         # New generation should work
-        arm_session(session, iter([FakeChunk(content_delta="Fresh response")]))
+        arm_session(
+            session, iter([StreamChunk(content_delta="Fresh response", finish_reason="stop")])
+        )
         session.send("new message")
 
         # The new generation should have completed successfully
@@ -1320,3 +1183,28 @@ class TestOrphanArmDutiesGate:
         assert session._last_usage is sentinel
         assert session._assistant_pending_tokens == 42
         tracker.record_success.assert_not_called()
+
+    def test_unscoped_generation_still_runs_arm_duties(self, tmp_db):
+        """Generation 0 means UNSCOPED, the convention ``_check_cancelled``
+        and ``_CancelRef._superseded`` share: the ref fires the hook for a
+        direct seam caller, so the hook's own gate must not refuse it.  A
+        bare ``!=`` compare skips the duties on any session whose
+        generation was ever claimed, silently recycling the previous
+        turn's usage into this turn's estimate and losing the lane's
+        health success."""
+        from turnstone.core.session import _StreamTurnConsumer
+
+        session = _make_session()
+        session._generation = 3  # a prior send claimed generations
+        consumer = _StreamTurnConsumer(session, my_generation=0)
+        tracker = MagicMock()
+        ref = _CancelRef(session, 0, on_first_append=consumer.on_stream_armed)
+        consumer.begin_attempt(ref, tracker, MagicMock())
+
+        session._last_usage = {"prompt_tokens": 99}
+        session._assistant_pending_tokens = 42
+        ref.append(MagicMock())
+
+        assert session._last_usage is None
+        assert session._assistant_pending_tokens == 0
+        tracker.record_success.assert_called_once()
