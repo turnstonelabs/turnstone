@@ -7574,6 +7574,12 @@ class ChatSession:
                 # through (largely) untruncated instead of snipping them only to
                 # summarise them moments later.  Generation-guarded so an
                 # orphaned thread can't replace history under the active one.
+                # Positive equality, not ``_generation_superseded``: inside
+                # ``send`` my_generation is always a CLAIMED one (>= 1), and
+                # the two spellings agree there.  They part at generation 0,
+                # which the helper reads as unscoped-and-live — so if this
+                # guard is ever converted, keep the "am I still the active
+                # generation" reading rather than "was I superseded".
                 pre_attempted_compact = False
                 if self._generation == my_generation and self._compaction_owed():
                     self._do_auto_compact("mid-turn", preserve_tail=1, my_generation=my_generation)

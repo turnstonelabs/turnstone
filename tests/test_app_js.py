@@ -708,6 +708,76 @@ def test_audio_roles_gated_to_openai_sdk_providers() -> None:
     assert '_providerCarriesAudio((md && md.provider) || "openai")' in body
 
 
+# Tile keys that are deliberately NOT ``ModelCapabilities`` fields.
+# ``supports_rerank`` is a registry-level flag read off the model row.
+_NON_DATACLASS_TILES = {"supports_rerank"}
+
+
+def test_capability_bool_lift_agrees_with_the_backend_coercion() -> None:
+    """The tile lift coerces a stored capability the way the backend does.
+
+    The capabilities dict is hand-edited JSON, so a stored string
+    ``"false"`` is TRUTHY to JS while ``apply_capability_overrides`` reads
+    it as ``False``.  Lifting it into a tile with bare ``!!`` renders the
+    row checked and then persists boolean ``true`` on the next save —
+    inverting the capability without the operator touching it.  For
+    ``server_parses_reasoning`` that silently disables the inline tag scan,
+    which is the leak model_turn's own comment names.
+
+    Cases are generated FROM the Python table, so a spelling added on one
+    side and not the other fails here rather than in the field.
+    """
+    import tempfile
+
+    from turnstone.core.model_turn import _CAPABILITY_BOOL_STRINGS
+
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    table = re.search(r"const _CAP_BOOL_STRINGS = \{.*?\n\};", admin, re.S)
+    fn = re.search(r"function _capBool\(value\) \{.*?\n\}", admin, re.S)
+    assert table and fn, "capability bool coercion not found in admin.js"
+
+    checks: list[str] = []
+    for spelling, expected in _CAPABILITY_BOOL_STRINGS.items():
+        # Same spelling, uppercased, and padded — the Python arm strips and
+        # lowercases before lookup, so the JS must too.
+        for variant in (spelling, spelling.upper(), f"  {spelling}  "):
+            lit = json.dumps(variant)
+            checks.append(
+                f"if (_capBool({lit}) !== {json.dumps(expected)}) "
+                f"throw new Error('spelling ' + {lit} + ' -> ' + _capBool({lit}));"
+            )
+    checks += [
+        "if (_capBool(true) !== true) throw new Error('boolean true');",
+        "if (_capBool(false) !== false) throw new Error('boolean false');",
+        "if (_capBool(1) !== true) throw new Error('number 1');",
+        "if (_capBool(0) !== false) throw new Error('number 0');",
+        # Unrecognized values must NOT coerce — the caller leaves them in the
+        # raw JSON instead of rewriting them (the thinking_mode policy).
+        "if (_capBool('maybe') !== undefined) throw new Error('garbage string');",
+        "if (_capBool(null) !== undefined) throw new Error('null');",
+        "if (_capBool({}) !== undefined) throw new Error('object');",
+    ]
+    harness = table.group(0) + chr(10) + fn.group(0) + chr(10) + chr(10).join(checks)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
+        f.write(harness)
+        tmp = f.name
+    try:
+        proc = subprocess.run(["node", tmp], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    finally:
+        os.unlink(tmp)
+    assert proc.returncode == 0, (
+        f"_capBool disagrees with the backend coercion.  stderr={proc.stderr!r}"
+    )
+
+    # The lift must actually USE it — a reverted call site would leave the
+    # helper in place and every case above still passing.
+    assert "_modelCapsExplicit[k] = !!capsObj[k]" not in admin
+    assert "const asBool = _capBool(capsObj[k]);" in admin
+
+
 def test_capability_tiles_agree_with_the_capabilities_dataclass() -> None:
     """Every tile is a real capability, rendered, and defaulted like Python.
 
@@ -715,9 +785,10 @@ def test_capability_tiles_agree_with_the_capabilities_dataclass() -> None:
     :class:`ModelCapabilities`, so it drifts silently: a renamed field
     leaves a tile that writes a key nothing reads, and a JS default that
     disagrees with the dataclass shows the operator a state the backend
-    would not apply.  Tiles whose key is NOT a dataclass field are
-    allowed (``supports_rerank`` is a registry-level flag) — they just
-    have no default to agree with.
+    would not apply.  A tile whose key is not a capability field is
+    allowed only by NAME (``_NON_DATACLASS_TILES``) — a blanket
+    "skip what the dataclass lacks" would exempt exactly the rename this
+    test exists to catch.
     """
     from turnstone.core.providers._protocol import ModelCapabilities
 
@@ -733,10 +804,22 @@ def test_capability_tiles_agree_with_the_capabilities_dataclass() -> None:
     }
     assert keys, "no capability tile keys parsed"
 
+    # The tile is only reachable if it renders INSIDE the container
+    # ``_modelTileEl`` queries; outside it, ``_modelGetTile`` silently falls
+    # back to the default and a saved ``true`` is rewritten as ``false``.
+    grid_start = html.index('id="model-capgrid"')
+    grid = html[grid_start : html.index("</div>", grid_start)]
+
     caps = ModelCapabilities()
     for key in keys:
-        assert f'data-cap="{key}"' in html, f"tile {key} has no checkbox in index.html"
+        assert f'data-cap="{key}"' in grid, f"tile {key} renders outside #model-capgrid"
         assert key in defaults, f"tile {key} has no entry in _MODEL_CAP_DEFAULTS"
+        # No hasattr escape hatch: a tile whose key is neither a capability
+        # field nor a known registry flag writes a key nothing reads, which
+        # is the first drift this test exists to catch.
+        assert hasattr(caps, key) or key in _NON_DATACLASS_TILES, (
+            f"tile {key} is neither a ModelCapabilities field nor a known registry flag"
+        )
         if hasattr(caps, key):
             assert defaults[key] == getattr(caps, key), (
                 f"tile default for {key} disagrees with ModelCapabilities"

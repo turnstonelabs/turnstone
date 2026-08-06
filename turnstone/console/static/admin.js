@@ -6457,6 +6457,37 @@ const _MODEL_CAP_DEFAULTS = {
   supports_audio_input: false,
   supports_rerank: false,
 };
+// Mirrors ``_CAPABILITY_BOOL_STRINGS`` / ``apply_capability_overrides`` in
+// core/model_turn.py.  The capabilities dict is hand-edited JSON, so a stored
+// string "false" is TRUTHY to JS while the backend reads it as False — lifting
+// it into a tile with bare ``!!`` would render the row checked and then persist
+// boolean true, inverting the capability on a routine save.  Returns undefined
+// for anything the backend would not coerce; such a value stays in the raw JSON
+// rather than being silently rewritten (the thinking_mode policy below).
+const _CAP_BOOL_STRINGS = {
+  true: true,
+  yes: true,
+  on: true,
+  1: true,
+  false: false,
+  no: false,
+  off: false,
+  0: false,
+  "": false,
+};
+function _capBool(value) {
+  if (typeof value === "boolean") return value;
+  // bool-before-int, like the Python arm: JS has no bool/int overlap, but
+  // 0/1 rows must coerce the same way the backend coerces them.
+  if (typeof value === "number") return !!value;
+  if (typeof value === "string") {
+    const spelling = value.trim().toLowerCase();
+    return spelling in _CAP_BOOL_STRINGS
+      ? _CAP_BOOL_STRINGS[spelling]
+      : undefined;
+  }
+  return undefined;
+}
 let _modelCapsBaseline = {}; // known-model table values (display + delta base)
 let _modelCapsExplicit = {}; // keys that persist: saved-in-JSON + user-toggled
 
@@ -7914,7 +7945,9 @@ function showEditModelModal(definitionId) {
       _modelCapsExplicit = {};
       _MODEL_CAP_KEYS.forEach(function (k) {
         if (k in capsObj) {
-          _modelCapsExplicit[k] = !!capsObj[k];
+          const asBool = _capBool(capsObj[k]);
+          if (asBool === undefined) return; // unrepresentable — leave it raw
+          _modelCapsExplicit[k] = asBool;
           delete capsObj[k];
         }
       });
