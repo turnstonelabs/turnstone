@@ -4,13 +4,12 @@ import contextlib
 import json
 import threading
 import time
-from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tests._session_helpers import arm_session, make_session
-from turnstone.core.providers import StreamChunk
+from turnstone.core.providers import StreamChunk, ToolCallDelta
 from turnstone.core.session import (
     GenerationCancelled,
     _CancelRef,
@@ -193,21 +192,13 @@ class TestCancelDuringToolExecution:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeToolDelta:
-            index: int = 0
-            id: str = ""
-            name: str = ""
-            arguments_delta: str = ""
-
         # First call: return content with a tool call
         def stream_with_tool():
             yield StreamChunk(
-                tool_call_deltas=[FakeToolDelta(index=0, id="tc_1", name="bash")],
-                finish_reason="",
+                tool_call_deltas=[ToolCallDelta(index=0, id="tc_1", name="bash")],
             )
             yield StreamChunk(
-                tool_call_deltas=[FakeToolDelta(index=0, arguments_delta='{"command":"echo hi"}')],
+                tool_call_deltas=[ToolCallDelta(index=0, arguments_delta='{"command":"echo hi"}')],
                 finish_reason="tool_calls",
             )
 
@@ -325,23 +316,16 @@ class TestStreamFlushBeforeToolCalls:
         ui = TrackingUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeToolDelta:
-            index: int = 0
-            id: str = ""
-            name: str = ""
-            arguments_delta: str = ""
-
         def stream_content_then_tool():
             # Content long enough to leave chars in the tag-scan carry
             # buffer (ThinkTagSplitter retains the last MAX_TAG_LEN = 12
             # chars until a flush)
             yield StreamChunk(content_delta="Hello world, this is a test message")
             yield StreamChunk(
-                tool_call_deltas=[FakeToolDelta(index=0, id="tc_1", name="bash")],
+                tool_call_deltas=[ToolCallDelta(index=0, id="tc_1", name="bash")],
             )
             yield StreamChunk(
-                tool_call_deltas=[FakeToolDelta(index=0, arguments_delta='{"command":"echo hi"}')],
+                tool_call_deltas=[ToolCallDelta(index=0, arguments_delta='{"command":"echo hi"}')],
                 finish_reason="tool_calls",
             )
 
@@ -1208,3 +1192,83 @@ class TestOrphanArmDutiesGate:
         assert session._last_usage is None
         assert session._assistant_pending_tokens == 0
         tracker.record_success.assert_called_once()
+
+
+class TestSupersessionVerdictAgreement:
+    """Every arm of one streaming turn must reach the SAME supersession
+    verdict for the same generation shape.  Generation 0 is unscoped, so
+    on a session whose generation was claimed earlier a Stop and a Ctrl-C
+    must both finalize the display — a per-arm spelling once split them,
+    finalizing on one path and not the other."""
+
+    def _session_at_generation(self, gen, ui):
+        session = _make_session(ui=ui)
+        session._generation = gen
+        session.messages.append(Turn.user("hi"))
+        return session
+
+    def _drive(self, gen, kind):
+        ui = NullUI()
+        session = self._session_at_generation(gen, ui)
+
+        def stream():
+            yield StreamChunk(content_delta="partial answer")
+            if kind == "stop":
+                session.cancel()
+                yield StreamChunk(content_delta=" unreachable")
+            else:
+                raise KeyboardInterrupt
+
+        provider = arm_session(session, stream())
+        assert provider is session._provider
+        raised = None
+        try:
+            session._stream_response(0)
+        except BaseException as exc:  # noqa: BLE001 — the class IS the observation
+            raised = type(exc).__name__
+        return raised, ui.stream_ends, session._cancelled_partial_msg
+
+    def test_stop_and_ctrl_c_agree_on_an_unscoped_generation(self, tmp_db):
+        stop_raised, stop_ends, partial = self._drive(3, "stop")
+        kb_raised, kb_ends, _ = self._drive(3, "ctrl_c")
+
+        assert stop_raised == "GenerationCancelled"
+        assert kb_raised == "KeyboardInterrupt"
+        # The verdict is "live" on BOTH arms: each finalizes the display.
+        assert stop_ends == 1
+        assert kb_ends == 1
+        assert partial and partial["content"] == "partial answer"
+
+    def test_superseded_generation_finalizes_on_neither_arm(self, tmp_db):
+        # The scoped counterpart: a real orphan (its generation lost the
+        # claim) must touch the UI on no arm at all.  It never reaches
+        # one: the ref reads superseded, so ``model_turn`` refuses to
+        # dispatch and the ladder converts that to a cancel — an orphan
+        # issues no request and finalizes nothing.
+        ui = NullUI()
+        session = self._session_at_generation(5, ui)
+
+        def stream():
+            raise KeyboardInterrupt
+            yield  # unreachable; makes this a generator
+
+        provider = arm_session(session, stream())
+        with pytest.raises(GenerationCancelled):
+            session._stream_response(2)  # generation 2 lost the claim to 5
+        assert ui.stream_ends == 0
+        provider.create_streaming.assert_not_called()
+
+    def test_unscoped_generation_finalizes_on_the_ctrl_c_arm(self, tmp_db):
+        # Same arm, unscoped generation: the verdict flips to "live", so
+        # the display IS finalized — the agreement this class pins.
+        ui = NullUI()
+        session = self._session_at_generation(5, ui)
+
+        def stream():
+            raise KeyboardInterrupt
+            yield
+
+        arm_session(session, stream())
+        with pytest.raises(KeyboardInterrupt):
+            session._stream_response(0)
+        assert ui.stream_ends == 1

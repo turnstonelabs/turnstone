@@ -327,6 +327,20 @@ class _CompactionIrreducibleError(Exception):
     """
 
 
+def _generation_superseded(session: ChatSession, my_generation: int) -> bool:
+    """Whether a newer generation has claimed *session* — THE supersession
+    predicate, one spelling for every site that asks.
+
+    Generation 0 is UNSCOPED (a direct seam caller, no ``send()`` above
+    it): it is never superseded, matching :meth:`ChatSession._check_cancelled`.
+    Callers read through this rather than sharing a cached answer — each
+    read is its own, which is what makes the streaming consumer's read a
+    real second look after the cancel ref's (the two-step supersession
+    window a force-cancel can land inside).
+    """
+    return bool(my_generation and session._generation != my_generation)
+
+
 class _CancelRef(list[Any]):
     """List proxy handed to ``create_streaming`` as its ``cancel_ref``.
 
@@ -379,8 +393,7 @@ class _CancelRef(list[Any]):
         self._armed = False
 
     def _superseded(self) -> bool:
-        gen = self._my_generation
-        return bool(gen and self._session._generation != gen)
+        return _generation_superseded(self._session, self._my_generation)
 
     @property
     def armed(self) -> bool:
@@ -543,8 +556,7 @@ class _StreamTurnConsumer:
         way (generation 0 is unscoped, so a direct seam caller is never
         superseded).  The two must agree: the ref decides whether to fire
         the arm hook, and the hook's own gate decides whether to act."""
-        gen = self._my_generation
-        return bool(gen and self._session._generation != gen)
+        return _generation_superseded(self._session, self._my_generation)
 
     def on_stream_armed(self) -> None:
         """`_CancelRef.on_first_append` — the request-accepted instant.
@@ -8306,7 +8318,7 @@ class ChatSession:
             text the user actually saw.  Never writes for a superseded
             generation — an orphan must not touch the successor's slot.
             """
-            if self._generation != my_generation:
+            if _generation_superseded(self, my_generation):
                 return
             if (
                 self._cancelled_partial_msg is None
@@ -8351,7 +8363,7 @@ class ChatSession:
                 # but send() treats Ctrl-C as a survivable, recorded path,
                 # so the dead attempt still needs its client-side finalize
                 # (the CLI's markdown fence resets only in on_stream_end).
-                if self._generation == my_generation:
+                if not _generation_superseded(self, my_generation):
                     self.ui.on_stream_end()
                 raise
             except Exception as e:
@@ -8365,7 +8377,7 @@ class ChatSession:
                     # re-create window reads the DEAD attempt's armed
                     # state (see ``end_attempt``).
                     consumer.end_attempt()
-                if self._generation != my_generation:
+                if _generation_superseded(self, my_generation):
                     # Superseded (force-cancel started a newer generation):
                     # an orphaned thread must not touch the UI — a finalize
                     # emitted here would clobber the NEW generation's
