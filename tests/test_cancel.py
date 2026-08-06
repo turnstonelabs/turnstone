@@ -9,9 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests._session_helpers import arm_session
+from tests._session_helpers import arm_session, make_session
 from turnstone.core.session import (
-    ChatSession,
     GenerationCancelled,
     _CancelRef,
     _tool_turn_meta,
@@ -100,18 +99,11 @@ class NullUI:
 
 
 def _make_session(ui=None, **kwargs):
-    """Helper to construct a ChatSession with minimal setup."""
-    defaults = dict(
-        client=MagicMock(),
-        model="test-model",
-        ui=ui or NullUI(),
-        instructions=None,
-        temperature=0.5,
-        max_tokens=4096,
-        tool_timeout=30,
-    )
-    defaults.update(kwargs)
-    return ChatSession(**defaults)
+    """Wrap the shared session factory; this suite defaults to its
+    recording NullUI.  The defaults live in
+    tests/_session_helpers.make_session — duplicating them here is
+    exactly the drift its docstring warns about."""
+    return make_session(ui=ui or NullUI(), **kwargs)
 
 
 class TestCancelEvent:
@@ -1272,3 +1264,29 @@ class TestEffectStatusPersistence:
         turns = reconstruct_turns([sys_row], "ws1")
         assert turns[0].meta.extra.get("source_meta") == {"watch_name": "x"}
         assert turns[0].effect_status is None
+
+
+class TestNeverArmedStopLeavesNoRow:
+    def test_stop_during_creation_persists_nothing(self, tmp_db):
+        """A Stop landing while creation is still connecting — nothing
+        armed, zero tokens streamed — must not write an assistant row:
+        pre-fold no row existed for a turn that never streamed, and a
+        marker-only row would replay to the model as context on every
+        later turn.  (An ARMED zero-token Stop still records its marker
+        via record_cancelled_partial — TestCancelDuringStreaming pins
+        that side.)"""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+        provider = arm_session(session)  # provider shell; create scripted below
+
+        def create_cancel_then_fail(**kwargs):
+            session._cancel_event.set()
+            raise ConnectionError("connect blew up mid-dial")
+
+        provider.create_streaming = MagicMock(side_effect=create_cancel_then_fail)
+        session.send("test")
+
+        assert ui.states[-1] == "idle"
+        assert any("cancelled" in i.lower() for i in ui.infos)
+        assistant = [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
+        assert assistant == []

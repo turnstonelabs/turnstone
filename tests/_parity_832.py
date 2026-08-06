@@ -172,6 +172,11 @@ def run_scenario(name: str) -> dict[str, Any]:
     """
     ui = RecordingUI()
     session = make_session(ui=ui)
+    # Zero the ladder backoff: a scenario that reaches the mid-stream
+    # re-issue ladder (no_finish_clean_exhaust) must not sleep real
+    # exponential delays in a unit run.  The retry-notice transform in
+    # test_832_parity hardcodes the matching "0s" wording.
+    session._RETRY_BASE_DELAY = 0
     session._provider = scripted_provider(SCENARIOS[name])
 
     pre_fold = "msgs" in inspect.signature(type(session)._stream_response).parameters

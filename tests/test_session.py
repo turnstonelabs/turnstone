@@ -16,6 +16,7 @@ from tests._session_helpers import (
     FakeAnthropicBlock,
     as_stream,
     make_result,
+    make_session,
     mock_completion_result,
     scripted_anthropic_client,
     scripted_chat_client,
@@ -105,19 +106,14 @@ def _make_session(
     instructions=None,
     **kwargs,
 ):
-    """Helper to construct a ChatSession with minimal setup."""
-    client = mock_openai_client or MagicMock()
-    defaults = dict(
-        client=client,
-        model="test-model",
-        ui=NullUI(),
-        instructions=instructions,
-        temperature=0.5,
-        max_tokens=4096,
-        tool_timeout=30,
+    """Wrap the shared session factory with this suite's conveniences
+    (positional mock client; local recording NullUI default).  The
+    defaults live in tests/_session_helpers.make_session — duplicating
+    them here is exactly the drift its docstring warns about."""
+    kwargs.setdefault("ui", NullUI())
+    return make_session(
+        client=mock_openai_client or MagicMock(), instructions=instructions, **kwargs
     )
-    defaults.update(kwargs)
-    return ChatSession(**defaults)
 
 
 @contextlib.contextmanager
@@ -137,7 +133,7 @@ def _send_with_mocks(session, responses, mock_execute, **extra_patches):
     session, value is the ``side_effect`` to inject.
 
     ``responses`` are ``ModelTurnResult``s (build them with
-    ``tests._parity_832.make_result``) — the streaming seam's return
+    ``tests._session_helpers.make_result``) — the streaming seam's return
     type since #832 folded creation and drain into ``model_turn``.  None
     of these tests care HOW the turn was produced, only that one
     happened, so they patch the whole ``_stream_response`` seam rather

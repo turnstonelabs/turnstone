@@ -874,3 +874,27 @@ class TestDebugDumpLatch:
             session._stream_response(0)
             session._stream_response(0)
         assert dump.call_count == 2
+
+
+class TestFallbackFailureRedaction:
+    def test_fallback_ui_line_carries_class_name_only(self, tmp_db):
+        """The fallback-failure info line lands in the browser transcript
+        and persisted event stream — it carries the exception CLASS, never
+        its text (a ConnectError's str can embed a credential-bearing
+        base_url; same rule as the re-issue log arm)."""
+        ui = RecordingUI()
+        session = _make_session(ui)
+        registry = MagicMock()
+        registry.resolve_binding.side_effect = httpx.ConnectError(
+            "dial http://user:SECRETKEY@gw.example/v1 failed"
+        )
+        session._registry = registry
+        from turnstone.core.session import _StreamTurnConsumer
+
+        consumer = _StreamTurnConsumer(session, 0)
+        result = session._try_fallback_lane("fb", consumer, lambda w: w, 0)
+
+        assert result is None
+        infos = ui.of("info")
+        assert any("Fallback fb also failed: ConnectError" in i for i in infos)
+        assert not any("SECRETKEY" in i for i in infos)

@@ -72,27 +72,34 @@ class ThinkTagSplitter:
             self._emit(self.pending, self.in_think)
             self.pending = ""
 
-    def close_run(self) -> None:
+    def close_run(self) -> str:
         """Close the current run at an out-of-band interleave signal.
 
         For the boundary where a provider-parsed ``reasoning_delta``
         arrives mid-stream: everything decided emits at the CURRENT
-        state, and only a possible partial-tag tail
-        (:func:`partial_tag_tail`) is held for the next run — the drain
+        state, and a possible partial-tag tail
+        (:func:`partial_tag_tail`) is RETURNED to the caller — the drain
         closes its per-run split at the same boundary with the same
         rule, which is what keeps the displayed and committed
-        interpretations of one stream identical there.  A consumer that
-        instead flipped :attr:`in_think` with the tail still pending
-        would relabel buffered content as reasoning at the next flush
-        (the live-caught #832 display/commit divergence).
+        interpretations of one stream identical there.  The carry's
+        lifetime belongs to the run owner, NOT to :attr:`pending`: the
+        tail was cut in the closing run's state, while ``pending`` is
+        read under whatever state later flushes hit (``in_think`` flips
+        across the reasoning block), which would relabel a content-state
+        carry as reasoning — both halves of the live-caught #832
+        display/commit divergence.  The caller re-feeds the carry when
+        content resumes (reassembling a tag the server split across the
+        block) or flushes it at its original state at a terminal
+        boundary, mirroring the drain's separate carry variable.
         """
         if not self.pending:
-            return
+            return ""
         tail = partial_tag_tail(self.pending)
         closeable = self.pending[: len(self.pending) - len(tail)] if tail else self.pending
         if closeable:
             self._emit(closeable, self.in_think)
-        self.pending = tail
+        self.pending = ""
+        return tail
 
     def _drain(self) -> None:
         if not self._scan_tags:

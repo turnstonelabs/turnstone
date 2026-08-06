@@ -77,7 +77,7 @@ def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
                 [
                     "info",
                     f"[stream died mid-response (IncompleteStreamError) — retrying in "
-                    f"{2 ** (attempt - 1)}s ({attempt}/2)]",
+                    f"0s ({attempt}/2)]",
                 ],
                 ["stream_discarded", ""],
                 ["thinking_start", ""],
@@ -132,6 +132,7 @@ class TestDisplayCommitMirror:
     def _mirror(self, chunks: list[StreamChunk]) -> tuple[str, str]:
         ui = RecordingUI()
         session = make_session(ui=ui)
+        session._RETRY_BASE_DELAY = 0
         session._provider = scripted_provider(chunks)
         session.messages.append(Turn.user("hi"))
         result = session._stream_response(0)
@@ -191,6 +192,65 @@ class TestDisplayCommitMirror:
                     StreamChunk(reasoning_delta="(r)"),
                     StreamChunk(content_delta=" resumed"),
                     StreamChunk(finish_reason="stop"),
+                ],
+            ),
+            # Round-2 classes: the boundary close must run while an
+            # INLINE think block is open (the CoT-leak half), and the
+            # cross-boundary carry must survive state flips (the
+            # relabel half).
+            (
+                "open_inline_think_at_reasoning_boundary",
+                [
+                    StreamChunk(content_delta="pre<think>secret"),
+                    StreamChunk(reasoning_delta="R"),
+                    StreamChunk(content_delta="answer"),
+                    StreamChunk(finish_reason="stop"),
+                ],
+            ),
+            (
+                "split_close_tag_across_reasoning_boundary",
+                [
+                    StreamChunk(content_delta="pre<think>body</thi"),
+                    StreamChunk(reasoning_delta="R"),
+                    StreamChunk(content_delta="nk>post"),
+                    StreamChunk(finish_reason="stop"),
+                ],
+            ),
+            (
+                "unresolved_partial_tag_at_finish",
+                [
+                    StreamChunk(content_delta="Ans<thi"),
+                    StreamChunk(reasoning_delta="R"),
+                    StreamChunk(finish_reason="stop"),
+                ],
+            ),
+            (
+                "partial_tag_only_with_footer",
+                [
+                    StreamChunk(content_delta="<thi"),
+                    StreamChunk(reasoning_delta="R"),
+                    StreamChunk(finish_reason="stop"),
+                    StreamChunk(info_delta="Sources:\n- example.com"),
+                ],
+            ),
+            # Lax-gateway shape: content AFTER a post-finish footer —
+            # the fold must run once at stream end over the FULL answer
+            # (the drain's post-loop fold), never at footer arrival.
+            (
+                "late_content_after_footer",
+                [
+                    StreamChunk(content_delta="ans"),
+                    StreamChunk(finish_reason="stop"),
+                    StreamChunk(info_delta="Sources: s"),
+                    StreamChunk(content_delta="LATE"),
+                ],
+            ),
+            (
+                "footer_arrives_before_any_content",
+                [
+                    StreamChunk(finish_reason="stop"),
+                    StreamChunk(info_delta="Sources: s"),
+                    StreamChunk(content_delta="LATE"),
                 ],
             ),
         ],

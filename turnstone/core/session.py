@@ -490,6 +490,12 @@ class _StreamTurnConsumer:
         self._path1_reasoning = False
         self._finish_seen = False
         self._saw_chunk = False
+        # Content-state text held across a reasoning block (the run-close
+        # carry) and post-finish footer parts held for the end-of-stream
+        # fold — both owned HERE, outside the splitter, so in_think flips
+        # cannot relabel them (mirrors the drain's separate carry).
+        self._boundary_carry = ""
+        self._trailing_info: list[str] = []
         # Per-attempt: a re-issued attempt's usage must never max-merge
         # onto the dead attempt's (the accumulator was attempt-local in
         # the pre-fold consumer too).
@@ -613,17 +619,19 @@ class _StreamTurnConsumer:
         # Path 1: provider-normalized reasoning_delta.
         if chunk.reasoning_delta:
             self._stop_spinner_once()
-            if not self._splitter.in_think:
-                # Entering the native-reasoning phase closes the content
-                # run EXACTLY as the drain does: the non-tag tail is
-                # content, and only a partial tag prefix carries across
-                # the reasoning block.  Flipping in_think with the tail
-                # still pending relabels buffered content as reasoning at
-                # the next flush — the displayed stream then loses text
-                # the committed turn keeps (live-caught fold divergence;
-                # worst case a short answer displays as NOTHING while the
-                # commit carries it plus a citations footer).
-                self._splitter.close_run()
+            # Entering the native-reasoning phase closes the current run
+            # UNCONDITIONALLY, exactly as the drain does: decided text
+            # emits at its own state (content-state tail as content,
+            # in-think tail as reasoning — gating this on in_think left
+            # an open inline think block's carry to be relabeled as
+            # displayed ANSWER text by the later state flip, the CoT-leak
+            # half of the round-2 findings), and only a partial tag
+            # prefix carries across the block.  The carry lives on the
+            # CONSUMER, not in the splitter's pending — pending is read
+            # under whatever state later flushes hit, and the in_think
+            # flip below would relabel a content-state carry as
+            # reasoning (the other half).
+            self._boundary_carry += self._splitter.close_run()
             self._splitter.in_think = True
             self._path1_reasoning = True
             if s.show_reasoning:
@@ -635,55 +643,84 @@ class _StreamTurnConsumer:
             if self._path1_reasoning:
                 self._path1_reasoning = False
                 self._splitter.in_think = False
+            if self._boundary_carry:
+                # Content resumed after the reasoning block: the carry
+                # prefixes the new text so a tag the server split across
+                # the block reassembles (the drain prefixes its carried
+                # tail onto the next run the same way).
+                self._splitter.feed(self._boundary_carry)
+                self._boundary_carry = ""
             self._splitter.feed(chunk.content_delta)
 
         # Tool-call deltas: display-side this is only a run boundary —
         # accumulation lives in the drain.
         if chunk.tool_call_deltas:
             self._stop_spinner_once()
+            if self._boundary_carry:
+                # A partial tag never spans a TOOL boundary (the drain's
+                # rule): the carry is content-state text — flush it as
+                # content, whatever in_think says now.
+                self._flush_text(self._boundary_carry, False)
+                self._boundary_carry = ""
             self._splitter.flush_pending()
             self._splitter.in_think = False
 
         if chunk.info_delta:
             self._stop_spinner_once()
             if self._finish_seen:
-                # Trailing citations footer → CONTENT, per the drain's
-                # conditional fold — gate and separator are the SHARED
-                # module-level pair beside ``drain_stream``, so the two
-                # mirrors cannot drift.  The generation is over (finish
-                # seen), so the splitter's carry is final answer text,
-                # never a partial tag — flush it FIRST or the footer
-                # renders spliced into the middle of the answer's last
-                # characters.  Appended via the accumulator too, so the
-                # partial rule and the blankness test stay consistent
-                # with the committed content.
-                self._splitter.flush_pending()
-                if folds_trailing_info("".join(self._content_parts)):
-                    self._flush_text(TRAILING_INFO_SEPARATOR + chunk.info_delta, False)
+                # Post-finish info is the trailing citations footer: HELD
+                # and folded once at stream end after ALL content
+                # (:meth:`finish_stream`), exactly the drain's post-loop
+                # fold.  Folding at arrival diverges from the commit when
+                # a lax gateway emits content after finish — the fold
+                # gate must judge the FULL answer, and the footer must
+                # follow it.
+                self._trailing_info.append(chunk.info_delta)
             else:
                 s.ui.on_info(f"{GRAY}{chunk.info_delta}{RESET}")
 
     # -- partial preservation --------------------------------------------------
 
     def partial_content(self) -> str:
-        """THE partial-content rule: flushed content plus the splitter's
-        carry tail when it is content-state (an in-think tail is reasoning
-        and stays out) — one closure serving the cancel arms and the
-        re-issue ladder's dead-partial promotion alike."""
-        return "".join(self._content_parts) + (
-            self._splitter.pending if not self._splitter.in_think else ""
+        """THE partial-content rule: flushed content, plus the boundary
+        carry (content-state by construction), plus the splitter's carry
+        tail when it is content-state (an in-think tail is reasoning and
+        stays out) — one closure serving the cancel arms and the re-issue
+        ladder's dead-partial promotion alike."""
+        return (
+            "".join(self._content_parts)
+            + self._boundary_carry
+            + (self._splitter.pending if not self._splitter.in_think else "")
         )
 
+    def _flush_terminal_carries(self) -> None:
+        """Terminal display flush shared by the finish and cancel arms:
+        the boundary carry emits as CONTENT (its state was fixed when the
+        run closed — the drain appends its dangling carry to content the
+        same way), then the splitter's own pending at the current state."""
+        if self._boundary_carry:
+            self._flush_text(self._boundary_carry, False)
+            self._boundary_carry = ""
+        self._splitter.flush_pending()
+
     def finish_stream(self) -> None:
-        """End-of-stream display flush: emit the splitter's held carry.
+        """End-of-stream display flush: the held carries, then the
+        trailing citations footer.
 
         The drain assembled the canonical content already; without this
         the DISPLAYED stream is missing its last ≤MAX_TAG_LEN characters
-        (the partial-tag carry).  Success-path only, after the trailing
-        Stop re-check — the cancel arms flush via
-        :meth:`record_cancelled_partial`, and a dead attempt deliberately
-        does not flush (the partial rule reads the carry directly)."""
-        self._splitter.flush_pending()
+        (the carries), and the footer fold must run AFTER them — once,
+        over the full answer, with the shared gate and separator — or
+        the displayed fold diverges from the drain's post-loop fold.
+        Success-path only, after the trailing Stop re-check — the cancel
+        arms flush via :meth:`record_cancelled_partial` and drop the
+        footer (a cancelled turn commits no drained content to fold
+        onto)."""
+        self._flush_terminal_carries()
+        if self._trailing_info and folds_trailing_info("".join(self._content_parts)):
+            for info in self._trailing_info:
+                self._flush_text(TRAILING_INFO_SEPARATOR + info, False)
+        self._trailing_info = []
 
     def record_cancelled_partial(self) -> None:
         """Flush, finalize the stream in the UI, and stash the partial for
@@ -695,7 +732,7 @@ class _StreamTurnConsumer:
         if self._session._generation != self._my_generation:
             return
         content = self.partial_content()
-        self._splitter.flush_pending()
+        self._flush_terminal_carries()
         self._session.ui.on_stream_end()
         self._session._cancelled_partial_msg = {"role": "assistant", "content": content}
 
@@ -6339,7 +6376,18 @@ class ChatSession:
                 raise
             if fb_tracker:
                 fb_tracker.record_failure()
-            self.ui.on_info(f"[Fallback {alias} also failed: {fb_err}]")
+            # Class name only in the UI line — the same rule as the
+            # re-issue log arm: a ConnectError's text can carry a
+            # credential-bearing base_url verbatim, and this string lands
+            # in the browser transcript and persisted event stream.  The
+            # full detail goes to the server log.
+            log.warning(
+                "fallback.failed",
+                alias=alias,
+                error_type=type(fb_err).__name__,
+            )
+            log.debug("fallback failure detail", exc_info=True)
+            self.ui.on_info(f"[Fallback {alias} also failed: {type(fb_err).__name__}]")
             return None
 
     def _stop_retrying(
@@ -7402,13 +7450,16 @@ class ChatSession:
                     )
                 )
 
-                # Log assistant message to conversation history
+                # Log assistant message to conversation history.  ONE
+                # binding for the call list: the persisted mirror and the
+                # executed set below must be the same value by
+                # construction, not by coincidence.
                 content = result.content
-                tc = result.tool_calls or None
+                tool_calls = result.tool_calls or None
                 native = result.turn.native
                 provider_data = json.dumps(list(native.blocks)) if native else None
 
-                tool_calls_json: str | None = json.dumps(tc) if tc else None
+                tool_calls_json: str | None = json.dumps(tool_calls) if tool_calls else None
 
                 # Save assistant message atomically (content + tool_calls in one row)
                 if content or provider_data is not None or tool_calls_json:
@@ -7422,7 +7473,6 @@ class ChatSession:
                         producer=result.producer or None,
                     )
 
-                tool_calls = result.tool_calls or None
                 if not tool_calls:
                     # Did the model stop because we asked it to wind down for a
                     # compaction (cooperative), or because the task is actually
@@ -8274,6 +8324,20 @@ class ChatSession:
             generation — an orphan must not touch the successor's slot.
             """
             if self._generation != my_generation:
+                return
+            if (
+                self._cancelled_partial_msg is None
+                and last_stream_death is None
+                and not dead_partial
+            ):
+                # Nothing ever streamed this send: a Stop in the
+                # creation/walk window with no prior armed death.
+                # Pre-fold, the first creation ran OUTSIDE the promote
+                # arm and no assistant row was written for a turn that
+                # never streamed — keep that: a marker-only row would
+                # replay to the model as context on every later turn
+                # (round-2 finding; an ARMED zero-token Stop still
+                # records its marker via record_cancelled_partial).
                 return
             cur = self._cancelled_partial_msg
             if cur is None or (not cur.get("content") and dead_partial):

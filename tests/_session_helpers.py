@@ -549,7 +549,7 @@ def arm_session(
     provider.provider_name = name
     provider.get_capabilities.return_value = ModelCapabilities()
     provider.retryable_error_names = retryable
-    provider._armed_handle = MagicMock()
+    provider._armed_handle = ArmedHandle()
     remaining = list(streams)
 
     def _create(**kwargs: Any):

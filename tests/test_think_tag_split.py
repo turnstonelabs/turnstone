@@ -391,26 +391,30 @@ class TestCloseRun:
     def test_plain_tail_emits_as_content(self):
         sp, events = self._splitter()
         sp.feed("Short")
-        sp.close_run()
+        assert sp.close_run() == ""
         assert events == [("Short", False)]
         assert sp.pending == ""
 
-    def test_partial_tag_tail_is_held(self):
+    def test_partial_tag_tail_is_returned_not_held(self):
+        # The carry's lifetime belongs to the RUN OWNER: the splitter's
+        # own pending would be re-read under a flipped in_think (the
+        # round-2 relabel defect), so close_run hands the tail back and
+        # clears its buffer.
         sp, events = self._splitter()
         sp.feed("Ans<thi")
-        sp.close_run()
+        assert sp.close_run() == "<thi"
         assert events == [("Ans", False)]
-        assert sp.pending == "<thi"
+        assert sp.pending == ""
 
     def test_reasoning_state_tail_emits_as_reasoning(self):
         sp, events = self._splitter()
         sp.in_think = True
         sp.feed("held thought")
-        sp.close_run()
+        assert sp.close_run() == ""
         assert events == [("held thought", True)]
         assert sp.pending == ""
 
     def test_empty_pending_is_noop(self):
         sp, events = self._splitter()
-        sp.close_run()
+        assert sp.close_run() == ""
         assert events == []
