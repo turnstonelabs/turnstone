@@ -613,6 +613,17 @@ class _StreamTurnConsumer:
         # Path 1: provider-normalized reasoning_delta.
         if chunk.reasoning_delta:
             self._stop_spinner_once()
+            if not self._splitter.in_think:
+                # Entering the native-reasoning phase closes the content
+                # run EXACTLY as the drain does: the non-tag tail is
+                # content, and only a partial tag prefix carries across
+                # the reasoning block.  Flipping in_think with the tail
+                # still pending relabels buffered content as reasoning at
+                # the next flush — the displayed stream then loses text
+                # the committed turn keeps (live-caught fold divergence;
+                # worst case a short answer displays as NOTHING while the
+                # commit carries it plus a citations footer).
+                self._splitter.close_run()
             self._splitter.in_think = True
             self._path1_reasoning = True
             if s.show_reasoning:

@@ -72,6 +72,28 @@ class ThinkTagSplitter:
             self._emit(self.pending, self.in_think)
             self.pending = ""
 
+    def close_run(self) -> None:
+        """Close the current run at an out-of-band interleave signal.
+
+        For the boundary where a provider-parsed ``reasoning_delta``
+        arrives mid-stream: everything decided emits at the CURRENT
+        state, and only a possible partial-tag tail
+        (:func:`partial_tag_tail`) is held for the next run — the drain
+        closes its per-run split at the same boundary with the same
+        rule, which is what keeps the displayed and committed
+        interpretations of one stream identical there.  A consumer that
+        instead flipped :attr:`in_think` with the tail still pending
+        would relabel buffered content as reasoning at the next flush
+        (the live-caught #832 display/commit divergence).
+        """
+        if not self.pending:
+            return
+        tail = partial_tag_tail(self.pending)
+        closeable = self.pending[: len(self.pending) - len(tail)] if tail else self.pending
+        if closeable:
+            self._emit(closeable, self.in_think)
+        self.pending = tail
+
     def _drain(self) -> None:
         if not self._scan_tags:
             # Nothing to resolve, so nothing to hold: a tag-free contract
@@ -119,7 +141,12 @@ def partial_tag_tail(text: str) -> str:
     limit = min(len(text), ThinkTagSplitter.MAX_TAG_LEN - 1)
     for size in range(limit, 0, -1):
         suffix = text[-size:]
-        if any(tag.startswith(suffix) for tag in ThinkTagSplitter.ALL_TAGS):
+        # Proper prefix only: without the length check a COMPLETE tag
+        # shorter than the longest one self-matches via startswith and
+        # gets carried as a "partial", violating the contract above.
+        if any(
+            len(suffix) < len(tag) and tag.startswith(suffix) for tag in ThinkTagSplitter.ALL_TAGS
+        ):
             return suffix
     return ""
 

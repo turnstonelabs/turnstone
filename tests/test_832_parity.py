@@ -31,6 +31,9 @@ from tests._parity_832 import (
     run_scenario,
     write_fixture,
 )
+from tests._session_helpers import RecordingUI, make_session, scripted_provider
+from turnstone.core.providers._protocol import StreamChunk, UsageInfo
+from turnstone.core.trajectory import Turn
 
 
 def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
@@ -107,3 +110,96 @@ def test_parity(name: str) -> None:
     )
     expected = _apply_ruled_deltas(name, load_fixture(name))
     assert record == expected
+
+
+class TestDisplayCommitMirror:
+    """The mirror LAW (no old-world baselines): with one chunk script,
+    the DISPLAYED content stream and the COMMITTED content must agree.
+
+    Post-fold the drain assembles the committed turn while the consumer
+    drives the display; these scenarios interleave provider-parsed
+    ``reasoning_delta`` with buffered content — the combination the
+    replay-parity grid never scripted, where a live review caught the
+    two lanes disagreeing (display dropped or relabeled the buffered
+    tail the commit kept; with a footer the display showed NOTHING
+    while the commit carried answer + sources).  The consumer's
+    ``close_run`` at the reasoning boundary and ``partial_tag_tail``'s
+    proper-prefix contract are what hold these together.
+    """
+
+    _USAGE = UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+
+    def _mirror(self, chunks: list[StreamChunk]) -> tuple[str, str]:
+        ui = RecordingUI()
+        session = make_session(ui=ui)
+        session._provider = scripted_provider(chunks)
+        session.messages.append(Turn.user("hi"))
+        result = session._stream_response(0)
+        displayed = "".join(d for k, d in ui.events if k == "content")
+        return displayed, result.content
+
+    @pytest.mark.parametrize(
+        ("name", "chunks"),
+        [
+            (
+                "short_content_then_reasoning",
+                [
+                    StreamChunk(content_delta="Short"),
+                    StreamChunk(reasoning_delta="(r)"),
+                    StreamChunk(finish_reason="stop"),
+                ],
+            ),
+            (
+                "short_content_then_reasoning_with_footer",
+                [
+                    StreamChunk(content_delta="Short"),
+                    StreamChunk(reasoning_delta="(r)"),
+                    StreamChunk(finish_reason="stop"),
+                    StreamChunk(info_delta="Sources:\n- example.com"),
+                ],
+            ),
+            (
+                "long_content_then_reasoning",
+                [
+                    StreamChunk(content_delta="A much longer content run here"),
+                    StreamChunk(reasoning_delta="(r)"),
+                    StreamChunk(finish_reason="stop"),
+                ],
+            ),
+            (
+                "content_reasoning_content",
+                [
+                    StreamChunk(content_delta="Before "),
+                    StreamChunk(reasoning_delta="(r)"),
+                    StreamChunk(content_delta="after"),
+                    StreamChunk(finish_reason="stop"),
+                ],
+            ),
+            (
+                "partial_tag_spans_reasoning_boundary",
+                [
+                    StreamChunk(content_delta="Ans<thi"),
+                    StreamChunk(reasoning_delta="(r)"),
+                    StreamChunk(content_delta="nk>hidden</think>done"),
+                    StreamChunk(finish_reason="stop"),
+                ],
+            ),
+            (
+                "complete_tag_before_reasoning_boundary",
+                [
+                    StreamChunk(content_delta="Answer<reasoning>"),
+                    StreamChunk(reasoning_delta="(r)"),
+                    StreamChunk(content_delta=" resumed"),
+                    StreamChunk(finish_reason="stop"),
+                ],
+            ),
+        ],
+    )
+    def test_mirror(self, name: str, chunks: list[StreamChunk]) -> None:
+        stamped = [*chunks]
+        # Ride usage on the finish chunk so the strict gate passes.
+        for i, c in enumerate(stamped):
+            if c.finish_reason:
+                stamped[i] = StreamChunk(finish_reason=c.finish_reason, usage=self._USAGE)
+        displayed, committed = self._mirror(stamped)
+        assert displayed == committed

@@ -34,7 +34,11 @@ from tests._session_helpers import make_session, scripted_provider
 from turnstone.core.model_turn import ModelLane
 from turnstone.core.providers import StreamChunk, ToolCallDelta
 from turnstone.core.session import _CancelRef, _StreamTurnConsumer
-from turnstone.core.streaming_text import ThinkTagSplitter, split_inline_reasoning
+from turnstone.core.streaming_text import (
+    ThinkTagSplitter,
+    partial_tag_tail,
+    split_inline_reasoning,
+)
 from turnstone.core.trajectory import Turn
 
 
@@ -160,6 +164,41 @@ CASES = [
         [_c("<think>" + "y" * 20), _c("</think>ok"), _FINISH],
         [("reasoning", "y" * 8), ("reasoning", "y" * 12), ("content", "ok")],
         "ok",
+    ),
+    # Reasoning-boundary run close (live-caught #832 divergence): a
+    # buffered content tail must emit as CONTENT when a reasoning_delta
+    # arrives, exactly as the drain closes its per-run split there.
+    (
+        "reasoning_boundary_closes_short_content_run",
+        [_c("Short"), StreamChunk(reasoning_delta="(r)"), _FINISH],
+        [("content", "Short"), ("reasoning", "(r)")],
+        "Short",
+    ),
+    (
+        "reasoning_boundary_closes_long_run_tail",
+        [_c("A much longer content run here"), StreamChunk(reasoning_delta="(r)"), _FINISH],
+        [
+            ("content", "A much longer cont"),
+            ("content", "ent run here"),
+            ("reasoning", "(r)"),
+        ],
+        "A much longer content run here",
+    ),
+    (
+        "partial_tag_carries_across_reasoning_boundary",
+        [
+            _c("Ans<thi"),
+            StreamChunk(reasoning_delta="(r)"),
+            _c("nk>hidden</think>done"),
+            _FINISH,
+        ],
+        [
+            ("content", "Ans"),
+            ("reasoning", "(r)"),
+            ("reasoning", "hidden"),
+            ("content", "done"),
+        ],
+        "Ansdone",
     ),
 ]
 
@@ -313,3 +352,65 @@ def test_tool_calls_flush_pending_raw_at_current_state():
     assert result.tool_calls == [
         {"id": "tc1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
     ]
+
+
+class TestPartialTagTail:
+    """Boundary-contract rows for ``partial_tag_tail``: only a PROPER
+    prefix of a tag is a partial tag.  A complete tag self-matching via
+    ``startswith`` was the live-caught latent bug — the drain then
+    carried a finished ``<reasoning>`` across a run boundary as if it
+    might still grow, relabeling the next run."""
+
+    @pytest.mark.parametrize(
+        ("text", "tail"),
+        [
+            ("Answer<reasoning>", ""),  # complete tag is NOT partial
+            ("Answer<think>", ""),
+            ("orphan</think>", ""),
+            ("Answer</reasoning>", ""),
+            ("Answer<reasonin", "<reasonin"),
+            ("Ans<thi", "<thi"),
+            ("trailing<", "<"),
+            ("no tags here", ""),
+            ("", ""),
+        ],
+    )
+    def test_contract(self, text, tail):
+        assert partial_tag_tail(text) == tail
+
+
+class TestCloseRun:
+    """``close_run`` — the reasoning-boundary run close, mirroring the
+    drain's per-run rule: decided text emits at the current state, only
+    a partial tag prefix carries."""
+
+    def _splitter(self):
+        events = []
+        return ThinkTagSplitter(lambda t, r: events.append((t, r))), events
+
+    def test_plain_tail_emits_as_content(self):
+        sp, events = self._splitter()
+        sp.feed("Short")
+        sp.close_run()
+        assert events == [("Short", False)]
+        assert sp.pending == ""
+
+    def test_partial_tag_tail_is_held(self):
+        sp, events = self._splitter()
+        sp.feed("Ans<thi")
+        sp.close_run()
+        assert events == [("Ans", False)]
+        assert sp.pending == "<thi"
+
+    def test_reasoning_state_tail_emits_as_reasoning(self):
+        sp, events = self._splitter()
+        sp.in_think = True
+        sp.feed("held thought")
+        sp.close_run()
+        assert events == [("held thought", True)]
+        assert sp.pending == ""
+
+    def test_empty_pending_is_noop(self):
+        sp, events = self._splitter()
+        sp.close_run()
+        assert events == []
