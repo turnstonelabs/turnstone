@@ -177,7 +177,11 @@ def run_scenario(name: str) -> dict[str, Any]:
     record: dict[str, Any] = {"scenario": name}
     try:
         if pre_fold:
-            msg = session._stream_response([{"role": "user", "content": "hi"}], 0)
+            # Splatted: the pre-fold seam took (msgs, my_generation), and a
+            # literal two-argument call reads as an arity error against the
+            # signature this tree actually has.
+            pre_fold_args: tuple[Any, ...] = ([{"role": "user", "content": "hi"}], 0)
+            msg = session._stream_response(*pre_fold_args)
             msg.pop("_wire_msgs", None)
             record["result"] = {
                 "content": msg.get("content", ""),

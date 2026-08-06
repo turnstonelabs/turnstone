@@ -666,16 +666,15 @@ class TestForceCancelThreaded:
 
         # Start generation 1 (will get stuck)
         arm_session(session, slow_stream())
-        if True:
 
-            def run_old():
-                with contextlib.suppress(Exception):
-                    session.send("old message")
-                old_done.set()
+        def run_old():
+            with contextlib.suppress(Exception):
+                session.send("old message")
+            old_done.set()
 
-            t1 = threading.Thread(target=run_old, daemon=True)
-            t1.start()
-            assert barrier.wait(timeout=5), "stream did not start"
+        t1 = threading.Thread(target=run_old, daemon=True)
+        t1.start()
+        assert barrier.wait(timeout=5), "stream did not start"
 
         # Force cancel: simulate what the server does
         session.cancel()
