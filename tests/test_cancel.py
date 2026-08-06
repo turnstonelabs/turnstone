@@ -1193,6 +1193,49 @@ class TestOrphanArmDutiesGate:
         tracker.record_success.assert_called_once()
 
 
+class TestOlderSitesAskTheSharedPredicate:
+    """The two supersession sites that PREDATE the shared predicate ask it
+    too, so generation 0 stays unscoped at both.
+
+    Each carried its own inline copy of the formula, so the drift the
+    helper exists to prevent had two live places to start from.  A bare
+    ``!=`` in either reads a direct seam caller (generation 0) as an
+    orphan: ``_check_cancelled`` would raise a cancel on a live turn, and
+    ``_compaction_event`` would stamp a live compaction ``superseded`` —
+    which suppresses its end notice, so the operator watching a real
+    compaction fail would be told nothing at all.
+    """
+
+    def test_check_cancelled_leaves_an_unscoped_generation_alone(self, tmp_db):
+        session = _make_session()
+        session._generation = 7
+        session._check_cancelled(0)  # unscoped — a direct seam caller
+        session._check_cancelled(7)  # the live generation
+        with pytest.raises(GenerationCancelled):
+            session._check_cancelled(2)  # a real orphan
+
+    def test_compaction_event_calls_an_unscoped_generation_live(self, tmp_db):
+        class _Recorder(NullUI):
+            def __init__(self):
+                super().__init__()
+                self.events = []
+
+            def on_compaction(self, event):
+                self.events.append(event)
+
+        ui = _Recorder()
+        session = _make_session(ui=ui)
+        session._generation = 7
+        failed_end = {"phase": "end", "ok": False, "reason": "cancelled", "trigger": "manual"}
+        session._compaction_event(0, dict(failed_end))
+        session._compaction_event(2, dict(failed_end))
+
+        assert ui.events[0]["superseded"] is False
+        assert ui.events[0]["notice"] is True  # the operator is told
+        assert ui.events[1]["superseded"] is True
+        assert ui.events[1]["notice"] is False
+
+
 class TestSupersessionVerdictAgreement:
     """Every arm of one streaming turn must reach the SAME supersession
     verdict for the same generation shape.  Generation 0 is unscoped, so
