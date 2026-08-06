@@ -17,13 +17,12 @@ Contract, held deliberately narrow:
   different organs (a judge is not a sub-agent is not a title generator);
   the plant call is the one thing they share.  Three carve-outs, each
   about a call that is already dead rather than about policy: the
-  drain-retry loop re-issues a mid-stream death; an aborted ``cancel_ref``
-  raises ``DeadlineCancelledError`` rather than dispatch — the caller
-  still owns the deadline, this only refuses to spend on a call already
-  abandoned; and ``on_chunk`` DISABLES that drain retry — a
-  partially-surfaced stream is dead to silent re-issue, because a UI
-  already rendered its tokens and only the streaming caller can finalize
-  a display per attempt (see ``Raises`` on :func:`model_turn`).
+  drain-retry loop re-issues a mid-stream death; an aborted
+  ``cancel_ref`` raises ``DeadlineCancelledError`` rather than dispatch,
+  refusing to spend on an abandoned call while the caller keeps the
+  deadline; and ``on_chunk`` DISABLES that drain retry, because only the
+  streaming caller can finalize a display per attempt (see ``Raises`` on
+  :func:`model_turn`).
 * **Providers stay codegen.**  The provider boundary keeps taking lowered
   wire dicts; Turn IR does not enter the provider Protocol, and
   ``lowering.py`` remains the only wire-mutation owner.  This module
@@ -59,19 +58,18 @@ from turnstone.core.lowering import (
     sanitize_tool_call_arguments,
 )
 
-# The provider FACTORY rides the same re-export seam: the session's
-# no-registry default construction is the one provider-construction site
-# left outside the registry, and routing it through here keeps the
-# provider package a plant-layer-only import.
+# The provider FACTORY rides the same seam — the session's no-registry
+# default construction is the only provider-construction site outside the
+# registry — so the provider package stays a plant-layer-only import.
 from turnstone.core.providers import create_provider as create_provider
 from turnstone.core.providers._protocol import (
     TRAILING_INFO_SEPARATOR as TRAILING_INFO_SEPARATOR,
 )
 
-# Protocol names imported at runtime (not TYPE_CHECKING) and re-exported with
-# the explicit ``as`` idiom: post-#832 ``ChatSession`` types its provider
-# handles, chunk callback, and capabilities against THIS module, so the
-# provider package stays a single-import-site dependency of the plant layer.
+# Runtime (not TYPE_CHECKING) re-exports via the explicit ``as`` idiom —
+# ``ChatSession`` types its provider handles, chunk callback, and
+# capabilities against THIS module, so the provider package has one
+# import site.
 from turnstone.core.providers._protocol import (
     LLMProvider as LLMProvider,
 )
@@ -125,11 +123,10 @@ class WirePreparationError(RuntimeError):
     """The caller's ``prepare_wire`` hook raised — a session-data fault.
 
     ``prepare_wire`` is deterministic caller-supplied lowering over the
-    caller's own history; its failure says nothing about the backend, so
-    ``model_turn`` types it here to keep retry/fallback ladders from
-    classifying it as one (recording backend-health failures and walking
-    every fallback alias over a bug that will fail identically on each).
-    The original exception rides ``__cause__``.
+    caller's own history, so its failure says nothing about the backend.
+    Typing it here keeps retry/fallback ladders from recording backend
+    health or walking every alias over a bug that fails identically on
+    each.  The original exception rides ``__cause__``.
     """
 
 
@@ -499,11 +496,11 @@ def lane_scans_inline_reasoning(lane: ModelLane | None) -> bool:
     """THE inline tag-scan gate — the single spelling of the #978 rule.
 
     Scan ``<think>`` tags out of the content stream unless the lane's
-    capabilities declare the server already segregates reasoning
-    (``server_parses_reasoning``).  A lane with no declared capabilities —
-    or no lane yet — keeps the passthrough-server default: scan.  Shared
-    by the drain seam and the interactive display splitter so the two
-    interpretations of one stream cannot disagree.
+    capabilities declare that the server segregates reasoning itself
+    (``server_parses_reasoning``); no capabilities, or no lane yet, keeps
+    the passthrough-server default: scan.  Shared by the drain seam and
+    the interactive display splitter so the two readings of one stream
+    cannot disagree.
     """
     return (
         lane is None or lane.capabilities is None or not lane.capabilities.server_parses_reasoning
@@ -792,18 +789,17 @@ class ModelTurnResult:
     *finish_reason* / *usage* are transport facts, not trajectory content
     — which is why they ride the result, not the Turn.
 
-    *wire_msgs* is the exact lowered list handed to ``create_streaming``
-    (post every pass, including the caller's ``prepare_wire``) — the
-    main loop's token-table calibration reads it so the chars-per-token
-    estimate is computed against what the provider actually counted,
-    surviving lowerings the caller cannot see (#832; the successor of
-    the session's ``_wire_msgs`` message-dict carrier).
+    *wire_msgs* is the exact lowered list handed to ``create_streaming``,
+    after every pass including the caller's ``prepare_wire`` — the main
+    loop's token-table calibration reads it so chars-per-token is
+    computed against what the provider actually counted, lowerings the
+    caller cannot see included.
 
-    *producer* is the SERVING lane's provider name — the same identity
-    stamped on ``turn.native`` when a native lane exists, carried
-    separately so a native-less turn still records who produced it (the
-    storage row's ``producer`` column; pre-fold this read the session's
-    PRIMARY binding and mislabeled fallback-served turns).
+    *producer* is the SERVING lane's provider name (the storage row's
+    ``producer`` column) — the identity stamped on ``turn.native`` when a
+    native lane exists, carried separately so a native-less turn still
+    records who produced it and a fallback-served turn is not labeled
+    with the primary binding.
     """
 
     turn: Turn
@@ -840,14 +836,13 @@ def _tee_chunks(
 ) -> Iterator[StreamChunk]:
     """Surface each chunk to *on_chunk* before the drain accumulates it.
 
-    Sits UPSTREAM of ``drain_stream``'s own ``transport_guarded`` wrapper, so
-    the callback observes exactly the chunk sequence the assembler consumes —
-    no more (transport deaths raise at ``next()`` and never reach the
-    callback) and no fewer (a callback raise at chunk N, the cancellation
-    path, discards N from display and assembly alike, matching the
-    interactive loop's check-before-dispatch ordering).  The callback's
-    exceptions propagate untouched: ``GenerationCancelled`` is a
-    ``BaseException``, invisible to the drain-retry arm by design.
+    Sits UPSTREAM of ``drain_stream``'s ``transport_guarded`` wrapper, so
+    the callback sees exactly the sequence the assembler consumes: no
+    more (a transport death raises at ``next()`` and never reaches the
+    callback) and no fewer (a callback raise at chunk N — the
+    cancellation path — discards N from display and assembly alike).
+    Callback exceptions propagate untouched; ``GenerationCancelled`` is a
+    ``BaseException`` and so invisible to the drain-retry arm.
     """
     for sc in chunks:
         on_chunk(sc)
@@ -968,34 +963,33 @@ def model_turn(
     the red-error path.
 
     *prepare_wire* is the caller's OWN deterministic lowering, composed
-    after the seam passes and before the Phase-5 attach — the main loop's
-    system-message prepend, sender labels, capability-sensitive system-turn
-    fold, empty-user drop, and orphan repair live here (#832), each a
-    ``lowering.py``-composed pass.  It must be pure lowering: no learned
-    selection, no provider calls, no side effects (the session's debug
-    request dump, a read-only latch, is the tolerated exception).  The
-    exact post-``prepare_wire``, post-attach list that went to the wire is
-    returned as ``ModelTurnResult.wire_msgs`` for caller-side calibration.
+    after the seam passes and before the Phase-5 attach: the main loop's
+    system-message prepend, sender labels, capability-sensitive
+    system-turn fold, empty-user drop, and orphan repair live here, each
+    a ``lowering.py``-composed pass.  It must be pure lowering — no
+    learned selection, no provider calls, no side effects (the session's
+    debug request dump, a read-only latch, is the tolerated exception).
+    The list that went to the wire comes back as
+    ``ModelTurnResult.wire_msgs``.
 
-    *deferred_names* passes through to ``create_streaming`` — the
+    *deferred_names* passes through to ``create_streaming``: the
     tool-search deferred-loading set is per-call state (it grows as the
-    session discovers tools), which is why it is a parameter here and not
-    a ``ModelLane`` field.
+    session discovers tools), so it is a parameter and not a
+    ``ModelLane`` field.
 
     *on_chunk* is the streaming surface (#832): each normalized
-    :class:`StreamChunk` is surfaced to the caller as it arrives — via a
-    tee UPSTREAM of the drain, so the callback sees exactly the sequence
-    the assembler consumes — and the fully assembled result is returned as
-    usual.  Chunk→UI translation is entirely the caller's business; the
-    canonical Turn always comes from the drain's assembly, never from
-    anything the callback accumulated.  A callback raise aborts the call
-    with that exception (the interactive cancellation path rides this:
-    ``GenerationCancelled`` is a ``BaseException`` and passes the retry
-    arm untouched).  **With *on_chunk* present the mid-stream drain retry
-    below is DISABLED** — the third and final policy carve-out: a
-    partially-surfaced stream must never be silently re-issued behind a
-    UI that already rendered its tokens; the streaming caller owns
-    re-issue, finalizing its display per attempt.
+    :class:`StreamChunk` reaches the caller as it arrives — via a tee
+    UPSTREAM of the drain, so the callback sees exactly the sequence the
+    assembler consumes — and the assembled result is returned as usual.
+    Chunk→UI translation is the caller's business; the canonical Turn
+    always comes from the drain's assembly, never from anything the
+    callback accumulated.  A callback raise aborts the call with that
+    exception; ``GenerationCancelled``, being a ``BaseException``, passes
+    the retry arm untouched.  **With *on_chunk* present the mid-stream
+    drain retry below is DISABLED** — the third policy carve-out: a
+    partially-surfaced stream must not be silently re-issued behind a UI
+    that already rendered its tokens, so the streaming caller owns
+    re-issue.
 
     Raises whatever the provider raises — retry/deadline/fallback policy
     is the caller's — EXCEPT transient mid-stream deaths: a failure the
@@ -1007,12 +1001,10 @@ def model_turn(
     wire blip; this loop is that retry's new home (request-time failures
     still get the SDK's own policy inside ``create_streaming`` and
     propagate unchanged).  A *prepare_wire* raise is the one re-typed
-    exception: it surfaces as :class:`WirePreparationError` (original as
-    ``__cause__``) so ladders can keep a caller-data fault out of backend
-    health and fallback walks.  An
-    aborted *cancel_ref* suppresses retries — a deadline that closed the
-    stream must not have the request resurrected behind its back — and,
-    read before each dispatch, raises
+    exception, surfacing as :class:`WirePreparationError` with the
+    original as ``__cause__``.  An aborted *cancel_ref* suppresses
+    retries — a deadline that closed the stream must not have the request
+    resurrected behind its back — and, read before each dispatch, raises
     :class:`~turnstone.core.deadline.DeadlineCancelledError` instead of
     issuing the request at all (see *cancel_ref* above).
 
@@ -1046,10 +1038,8 @@ def model_turn(
         try:
             wire = prepare_wire(wire)
         except Exception as prep_err:
-            # Deterministic caller-side lowering over the caller's own
-            # history — never a backend signal.  Typed so the retry and
-            # fallback ladders can refuse to record health or walk aliases
-            # over it (each lane would re-run the same failing passes).
+            # A caller-data fault, never a backend signal — typed so the
+            # retry and fallback ladders cannot treat it as one.
             raise WirePreparationError(str(prep_err)) from prep_err
     wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
     # The effort assignment scheme's lower rungs: explicit relay → lane
@@ -1074,8 +1064,8 @@ def model_turn(
         if resolved_backend_auth
         else lane.client
     )
-    # A partially-surfaced stream is never silently re-issued (see the
-    # on_chunk docstring section) — the streaming caller owns re-issue.
+    # A partially-surfaced stream is never silently re-issued — the
+    # streaming caller owns re-issue.
     drain_retries = 0 if on_chunk is not None else _DRAIN_RETRIES
     attempt = 0
     while True:

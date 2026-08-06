@@ -1,19 +1,18 @@
 """#832 replay-parity pins: fixed chunk scripts ⇒ identical observable turn.
 
 Baseline fixtures under ``tests/data/parity_832/`` were captured from the
-pre-fold streaming path (``UPDATE_832_PARITY=1``; the capturing commit's
-``session.py`` is byte-identical to pre-fold main, which is what makes
-them THE old-world record).  Each test replays a scenario on the current
+pre-fold streaming path (``UPDATE_832_PARITY=1`` at a tree whose
+``session.py`` is byte-identical to pre-fold main), which is what makes
+them THE old-world record.  Each test replays a scenario on the current
 tree and compares the full record — UI event sequence, committed-message
-projection, mid-stream usage — against the baseline, after applying the
+projection, mid-stream usage — against the baseline after applying the
 transforms below.  Each transform IS a ruled #832 behavior change,
 restated in full where it is applied, so the pin is auditable from this
-file alone.  A difference outside a ruled transform is a fold regression.
+file alone; a difference outside one is a regression.
 
 Do not regenerate baselines casually: they encode the old world.  A
-legitimate regeneration (a ruled delta superseding capture) updates the
-matching transform below in the same commit, or the pin loses its
-meaning.
+legitimate regeneration updates the matching transform below in the same
+commit, or the pin loses its meaning.
 """
 
 from __future__ import annotations
@@ -49,11 +48,11 @@ def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
     if name == "info_postfinish_footer":
         # RULED (#832): the trailing citations footer enters the COMMITTED
         # content (conditional fold: non-blank answer, "\n\n" separator —
-        # the shared drain-side spelling) and streams as content —
-        # post-carry-flush, so displayed ordering matches committed —
+        # the shared drain-side spelling) and streams as content
+        # post-carry-flush, so displayed ordering matches committed,
         # instead of an ephemeral info bubble that never survived reload.
         # Consequence accepted with the ruling: web-controlled footer text
-        # now reaches storage/search/context/export (release-noted).
+        # reaches storage/search/context/export (release-noted).
         footer = "Sources:\n- example.com/page"
         expected["result"]["content"] += "\n\n" + footer
         events = [e for e in expected["ui_events"] if e != ["info", footer]]
@@ -63,9 +62,8 @@ def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
 
     elif name == "no_finish_clean_exhaust":
         # RULED (#832): a stream that exhausts with no finish reason no
-        # longer commits its partial silently (the pre-fold lax consumer's
-        # behavior) — it is a mid-stream death: the re-issue ladder
-        # finalizes the display and re-drives the turn
+        # longer commits its partial silently — it is a mid-stream death.
+        # The re-issue ladder finalizes the display and re-drives the turn
         # (_MID_STREAM_RETRIES times), then the terminal arm
         # finalizes+discards and the retryable error surfaces.
         expected["raised"] = "IncompleteStreamError"
@@ -116,15 +114,13 @@ class TestDisplayCommitMirror:
     """The mirror LAW (no old-world baselines): with one chunk script,
     the DISPLAYED content stream and the COMMITTED content must agree.
 
-    Post-fold the drain assembles the committed turn while the consumer
-    drives the display; these scenarios interleave provider-parsed
-    ``reasoning_delta`` with buffered content — the combination the
-    replay-parity grid never scripted, where a live review caught the
-    two lanes disagreeing (display dropped or relabeled the buffered
-    tail the commit kept; with a footer the display showed NOTHING
-    while the commit carried answer + sources).  The consumer's
-    ``close_run`` at the reasoning boundary and ``partial_tag_tail``'s
-    proper-prefix contract are what hold these together.
+    The drain assembles the committed turn while the consumer drives the
+    display; these scenarios interleave provider-parsed
+    ``reasoning_delta`` with buffered content, where the two lanes can
+    disagree (display dropping or relabeling the buffered tail the commit
+    kept, or showing nothing while the commit carries answer + sources).
+    The consumer's ``close_run`` at the reasoning boundary and
+    ``partial_tag_tail``'s proper-prefix contract hold them together.
     """
 
     _USAGE = UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2)
@@ -194,10 +190,8 @@ class TestDisplayCommitMirror:
                     StreamChunk(finish_reason="stop"),
                 ],
             ),
-            # Round-2 classes: the boundary close must run while an
-            # INLINE think block is open (the CoT-leak half), and the
-            # cross-boundary carry must survive state flips (the
-            # relabel half).
+            # The boundary close must run while an INLINE think block is
+            # open, and the cross-boundary carry must survive state flips.
             (
                 "open_inline_think_at_reasoning_boundary",
                 [

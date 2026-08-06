@@ -1,15 +1,14 @@
 """Behavior pins for the interactive think-tag splitting layer.
 
-``turnstone.core.session._StreamTurnConsumer`` (the main loop's
-chunk→UI translation, ``model_turn``'s ``on_chunk`` body post-#832)
-splits streamed content into content vs reasoning around
-``<think>``/``<reasoning>`` tags, buffering potential partial tags
-across chunk boundaries.  These tables pin the CURRENT emission
-behavior — exact UI token sequence and final displayed content — so
-the logic can move into a standalone ``ThinkTagSplitter`` class with
-byte-identical output.  Every case drives the real chunk consumer end to
-end; none reaches into the implementation, so the same rows must stay
-green across the extraction.
+``turnstone.core.session._StreamTurnConsumer`` (the main loop's chunk→UI
+translation, ``model_turn``'s ``on_chunk`` body) splits streamed content
+into content vs reasoning around ``<think>``/``<reasoning>`` tags,
+buffering potential partial tags across chunk boundaries.  These tables
+pin the CURRENT emission behavior — exact UI token sequence and final
+displayed content — so the logic can move into a standalone
+``ThinkTagSplitter`` class with byte-identical output.  Every case drives
+the real chunk consumer end to end; none reaches into the
+implementation, so the same rows must stay green across the extraction.
 
 Pinned rules:
 
@@ -70,9 +69,9 @@ class _TokenRecorderUI:
 
 def _drive(chunks, *, show_reasoning=True, capabilities=None):
     """Drive *chunks* through a bare ``_StreamTurnConsumer`` — the
-    display-grid seam post-#832 (``_stream_attempt`` is gone; tool_calls
-    assembly is the drain's job now, so this helper is for display-only
-    pins — content emission order plus the accumulated displayed text).
+    display-grid seam.  Tool-call assembly is the drain's job, so this
+    helper serves display-only pins: content emission order plus the
+    accumulated displayed text.
     """
     session = make_session()
     session.show_reasoning = show_reasoning
@@ -165,9 +164,9 @@ CASES = [
         [("reasoning", "y" * 8), ("reasoning", "y" * 12), ("content", "ok")],
         "ok",
     ),
-    # Reasoning-boundary run close (live-caught #832 divergence): a
-    # buffered content tail must emit as CONTENT when a reasoning_delta
-    # arrives, exactly as the drain closes its per-run split there.
+    # Reasoning-boundary run close: a buffered content tail must emit as
+    # CONTENT when a reasoning_delta arrives, exactly as the drain closes
+    # its per-run split there.
     (
         "reasoning_boundary_closes_short_content_run",
         [_c("Short"), StreamChunk(reasoning_delta="(r)"), _FINISH],
@@ -273,10 +272,9 @@ def test_scan_tags_off_returns_every_utterance_byte_identical(case):
 def test_session_consumer_scan_follows_server_parses_reasoning():
     """The interactive consumer wires ``scan_tags`` from the SAME capability
     the drain seam reads (``server_parses_reasoning``), taken off the
-    ACTIVE lane post-#832 (no more session-level ``_cached_capabilities``
-    read at the consumer).  With the flag declared, streamed tag text
-    reaches the UI verbatim as content — it is prose on such a backend,
-    not a boundary."""
+    ACTIVE lane.  With the flag declared, streamed tag text reaches the UI
+    verbatim as content — it is prose on such a backend, not a
+    boundary."""
     from turnstone.core.providers._protocol import ModelCapabilities
 
     content, tokens = _drive(
@@ -327,12 +325,10 @@ def test_one_shot_equivalent_to_streaming_over_random_chunkings(case):
 
 def test_tool_calls_flush_pending_raw_at_current_state():
     # Once tool calls begin, buffered text cannot be a partial tag: it
-    # flushes RAW (no tag scan) at the current in_think state.  Tool_calls
-    # assembly is the drain's job post-#832 (the display consumer only
-    # flushes the splitter at the boundary), so this one needs the real
-    # seam — session._stream_response over scripted_provider — to pin the
-    # display order and the assembled call together, as the fused
-    # pre-fold consumer did.
+    # flushes RAW (no tag scan) at the current in_think state.  Assembly
+    # is the drain's job while the consumer only flushes the splitter, so
+    # this pin drives the real seam to hold the display order and the
+    # assembled call together.
     chunks = [
         _c("part<thi"),
         StreamChunk(tool_call_deltas=[ToolCallDelta(index=0, id="tc1", name="bash")]),
@@ -357,9 +353,8 @@ def test_tool_calls_flush_pending_raw_at_current_state():
 class TestPartialTagTail:
     """Boundary-contract rows for ``partial_tag_tail``: only a PROPER
     prefix of a tag is a partial tag.  A complete tag self-matching via
-    ``startswith`` was the live-caught latent bug — the drain then
-    carried a finished ``<reasoning>`` across a run boundary as if it
-    might still grow, relabeling the next run."""
+    ``startswith`` makes the drain carry a finished ``<reasoning>`` across
+    a run boundary as if it might still grow, relabeling the next run."""
 
     @pytest.mark.parametrize(
         ("text", "tail"),
@@ -397,9 +392,9 @@ class TestCloseRun:
 
     def test_partial_tag_tail_is_returned_not_held(self):
         # The carry's lifetime belongs to the RUN OWNER: the splitter's
-        # own pending would be re-read under a flipped in_think (the
-        # round-2 relabel defect), so close_run hands the tail back and
-        # clears its buffer.
+        # own pending would be re-read under a flipped in_think and
+        # relabeled, so close_run hands the tail back and clears its
+        # buffer.
         sp, events = self._splitter()
         sp.feed("Ans<thi")
         assert sp.close_run() == "<thi"

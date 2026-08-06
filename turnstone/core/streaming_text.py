@@ -75,22 +75,20 @@ class ThinkTagSplitter:
     def close_run(self) -> str:
         """Close the current run at an out-of-band interleave signal.
 
-        For the boundary where a provider-parsed ``reasoning_delta``
-        arrives mid-stream: everything decided emits at the CURRENT
-        state, and a possible partial-tag tail
-        (:func:`partial_tag_tail`) is RETURNED to the caller — the drain
-        closes its per-run split at the same boundary with the same
-        rule, which is what keeps the displayed and committed
-        interpretations of one stream identical there.  The carry's
-        lifetime belongs to the run owner, NOT to :attr:`pending`: the
+        For a provider-parsed ``reasoning_delta`` arriving mid-stream:
+        everything decided emits at the CURRENT state, and a possible
+        partial-tag tail (:func:`partial_tag_tail`) is RETURNED to the
+        caller.  The drain splits its runs at the same boundary by the
+        same rule, so the displayed and committed readings of one stream
+        agree.
+
+        The carry belongs to the run owner, not to :attr:`pending`: the
         tail was cut in the closing run's state, while ``pending`` is
         read under whatever state later flushes hit (``in_think`` flips
         across the reasoning block), which would relabel a content-state
-        carry as reasoning — both halves of the live-caught #832
-        display/commit divergence.  The caller re-feeds the carry when
-        content resumes (reassembling a tag the server split across the
-        block) or flushes it at its original state at a terminal
-        boundary, mirroring the drain's separate carry variable.
+        carry as reasoning.  The caller re-feeds it when content resumes
+        — reassembling a tag the server split across the block — or
+        flushes it at its original state at a terminal boundary.
         """
         if not self.pending:
             return ""
@@ -148,9 +146,9 @@ def partial_tag_tail(text: str) -> str:
     limit = min(len(text), ThinkTagSplitter.MAX_TAG_LEN - 1)
     for size in range(limit, 0, -1):
         suffix = text[-size:]
-        # Proper prefix only: without the length check a COMPLETE tag
-        # shorter than the longest one self-matches via startswith and
-        # gets carried as a "partial", violating the contract above.
+        # Proper prefix only: without the length check a complete tag
+        # shorter than the longest one self-matches and gets carried as
+        # a "partial".
         if any(
             len(suffix) < len(tag) and tag.startswith(suffix) for tag in ThinkTagSplitter.ALL_TAGS
         ):

@@ -1,14 +1,13 @@
 """Shared session-test helpers.
 
 The minimal ``ChatSession`` factory, the ``SessionUIBase`` no-op/recording
-subclasses, and — since #832 — the tree's standard streaming provider
-fakes (``make_result`` / ``arm_session`` / ``scripted_provider`` /
-``ArmedHandle``, at the bottom): every suite that drives the streaming
-seam imports them from here so the eager-arming contract lives in one
-place.  Hoisting keeps callers from drifting on the defaults — the one
-deliberate exception, ``test_model_registry.py``'s ``_make_session``,
-takes a different signature (registry / model_alias / reasoning_effort
-+ ``_FakeUI``) and is NOT a candidate for sharing this helper.
+subclasses, and the tree's standard streaming provider fakes
+(``make_result`` / ``arm_session`` / ``scripted_provider`` /
+``ArmedHandle``, at the bottom): every suite driving the streaming seam
+imports them from here, so the eager-arming contract lives in one place.
+The one deliberate exception, ``test_model_registry.py``'s
+``_make_session``, takes a different signature (registry / model_alias /
+reasoning_effort + ``_FakeUI``) and is NOT a candidate for sharing.
 
 Module is named with a leading underscore so pytest doesn't try to
 collect it as a test file — it's an importable utility, not a test.
@@ -485,11 +484,10 @@ def make_result(
     producer: str = "openai-compatible",
     wire_msgs: list[dict[str, Any]] | None = None,
 ) -> ModelTurnResult:
-    """A ``ModelTurnResult`` shaped like the streaming wrapper's return —
+    """A ``ModelTurnResult`` shaped like the streaming wrapper's return,
     for tests that only need "a turn happened" and patch
-    ``_stream_response`` wholesale.  The Turn and the ``tool_calls``
-    mirror are built from the same dicts, preserving the #825 pairing
-    invariant fakes must not break."""
+    ``_stream_response`` wholesale.  Turn and ``tool_calls`` mirror are
+    built from the same dicts, preserving the #825 pairing invariant."""
     calls = list(tool_calls or [])
     tc_tuple = tuple(
         ToolCall(
@@ -533,12 +531,12 @@ def arm_session(
     Each ``create_streaming`` call serves the next element of *streams*:
     an iterable/generator is armed (a closeable sentinel appended to
     ``cancel_ref`` — the eager append every real adapter performs, which
-    the fold's creation-vs-midstream classifier keys on) and returned to
-    be consumed once; an EXCEPTION instance is raised at create time
-    WITHOUT arming — a creation-phase failure the per-lane ladder owns.
-    Calls beyond the script fail loudly (the pre-fold lax consumer used
-    to absorb an exhausted iterator as a silent empty turn; the strict
-    finish gate rejects that now, so an under-scripted test must say so).
+    the creation-vs-midstream classifier keys on) and returned to be
+    consumed once; an EXCEPTION instance is raised at create time WITHOUT
+    arming, a creation-phase failure the per-lane ladder owns.  Calls
+    beyond the script fail loudly: the strict finish gate rejects an
+    exhausted iterator rather than absorbing it as a silent empty turn,
+    so an under-scripted test must say so.
 
     Title generation is latched off — with a provider-LEVEL fake the
     best-effort title lane would otherwise consume the first script

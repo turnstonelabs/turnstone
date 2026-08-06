@@ -1,32 +1,28 @@
 """#832 replay-parity harness: scenario table + runner.
 
-The fold's acceptance is a controller-determinism audit: with the plant's
-chunk sequence held fixed, the streaming phase must produce an identical
-UI event sequence and an identical committed message — modulo the small
-set of RULED behavior changes restated (in full) on the transforms in
-``test_832_parity.py``.  This module is the shared half: the scenario
-scripts (one row per chunk-field→UI translation the consumer performs)
-and the runner that drives one scenario through the session's streaming
-seam, recording everything the turn observably produced.
+The audit is controller determinism: with the plant's chunk sequence held
+fixed, the streaming phase must produce an identical UI event sequence
+and an identical committed message — modulo the RULED behavior changes
+restated in full on the transforms in ``test_832_parity.py``.  This
+module is the shared half: the scenario scripts (one row per
+chunk-field→UI translation the consumer performs) and the runner that
+drives one through the streaming seam, recording everything the turn
+observably produced.
 
 Baselines are captured from the PRE-FOLD path (``UPDATE_832_PARITY=1``,
-run at a tree where ``session.py`` is byte-identical to pre-fold main —
-the fixture commit's history proves it) into ``tests/data/parity_832/``.
-The runner adapts to EITHER world by signature (pre-fold
-``_stream_response(msgs, my_generation)`` took the prepared wire list;
-post-fold ``_stream_response(my_generation)`` prepares inside), so a
-recapture at an old tree records real old-world behavior — and capture
-mode refuses to write a record whose failure is the harness's own call
-shape.  The assert mode replays the same scripts through the current
-tree and compares against the baseline, applying the ruled transforms.
-A mismatch outside a ruled transform is a fold regression.
+run at a tree where ``session.py`` is byte-identical to pre-fold main)
+into ``tests/data/parity_832/``.  The runner adapts to EITHER world by
+signature, so a recapture at an old tree records real old-world
+behavior, and capture mode refuses to write a record whose failure is
+the harness's own call shape.  Assert mode replays the same scripts
+through the current tree and compares against the baseline, applying the
+ruled transforms; a mismatch outside a ruled transform is a regression.
 
 The provider fake arms ``cancel_ref`` EAGERLY (a closeable sentinel
 appended inside ``create_streaming``, before the iterator is returned),
-mirroring every real adapter — the post-fold wrapper classifies
-creation-vs-midstream failures by that arming, so a fake that skipped
-it would exercise only the creation arm and the parity audit would
-never reach the mid-stream ladder.
+mirroring every real adapter: the wrapper classifies
+creation-vs-midstream failures by that arming, so a fake that skipped it
+would exercise only the creation arm.
 """
 
 from __future__ import annotations
@@ -155,20 +151,18 @@ def _mask_synth_ids(record: dict[str, Any]) -> dict[str, Any]:
 def run_scenario(name: str) -> dict[str, Any]:
     """Drive one scenario through the streaming seam; return the record.
 
-    The record is everything the streaming phase observably produced:
-    the ordered UI events, the committed-message projection, the
-    mid-stream usage slot, and the exception class if the seam raised.
-    Deliberately seam-level (the ``_stream_response`` boundary pre-fold,
-    its wrapper successor post-fold) — full ``send()`` scenarios ride the
-    ported ladder suites instead.
+    The record is everything the streaming phase observably produced: the
+    ordered UI events, the committed-message projection, the mid-stream
+    usage slot, and the exception class if the seam raised.  Deliberately
+    seam-level at ``_stream_response`` — full ``send()`` scenarios ride
+    the ported ladder suites instead.
 
     Signature-adaptive so ``UPDATE_832_PARITY=1`` at a PRE-fold tree
     records real old-world behavior: the pre-fold seam was
-    ``_stream_response(msgs, my_generation) -> dict`` (wire list built
-    by the caller), the post-fold seam is
-    ``_stream_response(my_generation) -> ModelTurnResult`` (wire
-    prepared inside).  A harness-shape failure must never be recorded
-    as behavior — ``write_fixture`` refuses one.
+    ``_stream_response(msgs, my_generation) -> dict``, the post-fold one
+    is ``_stream_response(my_generation) -> ModelTurnResult`` (wire
+    prepared inside).  A harness-shape failure must never be recorded as
+    behavior — ``write_fixture`` refuses one.
     """
     ui = RecordingUI()
     session = make_session(ui=ui)

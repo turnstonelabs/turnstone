@@ -405,10 +405,9 @@ class TestStreamFlushBeforeToolCalls:
             )
 
         # Two scripted turns: the tool round-trip makes send() loop, and
-        # the follow-up turn must carry a real finish reason — the old
-        # exhausted-iterator path was silently committed as an empty turn
-        # by the pre-fold lax consumer; the strict finish gate (ruled,
-        # #832) rejects it now.
+        # the follow-up turn must carry a real finish reason — the strict
+        # finish gate (RULED, #832) rejects an exhausted iterator that
+        # used to commit as an empty turn.
         arm_session(
             session,
             stream_content_then_tool(),
@@ -462,8 +461,7 @@ class TestStreamAbort:
         """The per-attempt ref's eager append registers the SDK handle in
         ``_cancel_stream`` before the first chunk is consumed — the handle
         ``cancel()`` closes to unblock a stuck read — and send()'s finally
-        clears it (#832: the shared ref list is gone; the handle slot is
-        the surviving cancel surface)."""
+        clears it."""
         ui = NullUI()
         session = _make_session(ui=ui)
 
@@ -555,13 +553,12 @@ class TestStreamAbort:
     def test_pre_set_cancel_no_mint_no_dispatch(self, tmp_db):
         """A Stop already set when the streaming phase is entered issues NO
         request and — on a dynamically authenticated alias — mints NO
-        credential (#832; the #972 pre-dispatch rule extended to the
-        interactive path).  Pre-fold, ``_try_stream`` resolved the backend
-        token BEFORE its first cancel check, so an abandoned turn still
-        paid a mint (on a cache miss: a network round trip under the
-        cluster-wide advisory lock).  Post-fold the resolver runs inside
-        ``model_turn`` after its entry abort read, and the ladder's own
-        loop-top check precedes even the lane build."""
+        credential (the #972 pre-dispatch rule on the interactive path).
+        A mint on a cache miss is a network round trip under the
+        cluster-wide advisory lock, so an abandoned turn must not pay one:
+        the resolver runs inside ``model_turn`` after its entry abort
+        read, and the ladder's loop-top check precedes even the lane
+        build."""
         session = _make_session()
         session._cancel_event.set()
         resolver = MagicMock(return_value=None)
@@ -624,8 +621,7 @@ class TestCancelRef:
         """The long-lived shared ref is GONE (#832): every model-call site
         builds a fresh per-attempt, generation-scoped _CancelRef, so a
         force-cancelled generation's ref reads aborted via supersession.
-        This pin holds the line against the gen-0 shared instance coming
-        back through a fixture or a convenience refactor."""
+        The pin holds the line against a gen-0 shared instance returning."""
         session = _make_session()
         assert not hasattr(session, "_cancel_ref")
 
@@ -689,10 +685,10 @@ class TestOnFirstAppendHook:
 
 class TestForceCancelOrphanNoReissue:
     """A force-cancelled generation's mid-stream death is never re-issued
-    on the orphan's behalf (#832 regression pin: the old shared gen-0 ref
-    read ``aborted`` False after a force-cancel — the successor installs a
-    fresh unset event and gen 0 never reads superseded — so the retry
-    machinery would have spent tokens for a generation nobody owns)."""
+    on the orphan's behalf.  A gen-0 ref would read ``aborted`` False
+    after a force-cancel (the successor installs a fresh unset event and
+    gen 0 never reads superseded), and the retry machinery would spend
+    tokens for a generation nobody owns."""
 
     def test_orphan_death_not_reissued_no_ui_finalize(self, tmp_db):
         ui = NullUI()
@@ -711,8 +707,7 @@ class TestForceCancelOrphanNoReissue:
         def dying_orphan_stream():
             yield FakeChunk(content_delta="old ")
             # Force-cancel: a successor claims the generation (bumped
-            # counter + fresh UNSET event) while this stream is mid-body —
-            # exactly the state where the old shared ref read aborted=False.
+            # counter + fresh UNSET event) while this stream is mid-body.
             session._claim_generation()
             raise ConnectionError("connection reset")
 
@@ -1269,8 +1264,7 @@ class TestEffectStatusPersistence:
 class TestNeverArmedStopLeavesNoRow:
     def test_stop_during_creation_persists_nothing(self, tmp_db):
         """A Stop landing while creation is still connecting — nothing
-        armed, zero tokens streamed — must not write an assistant row:
-        pre-fold no row existed for a turn that never streamed, and a
+        armed, zero tokens streamed — must not write an assistant row: a
         marker-only row would replay to the model as context on every
         later turn.  (An ARMED zero-token Stop still records its marker
         via record_cancelled_partial — TestCancelDuringStreaming pins

@@ -1519,12 +1519,10 @@ class TestModelOboToken:
         session._mcp_mint_client.mint_app_token_sync.assert_not_called()
 
     def test_main_lane_carries_backend_auth_resolver(self) -> None:
-        """The main loop's lane wires the session's mint resolver — the
+        """The main loop's lane wires the session's mint resolver; the
         credential then resolves and binds INSIDE model_turn per attempt,
-        after its entry abort read (the #972/#832 ordering: a pre-set Stop
-        mints nothing, pinned in test_cancel; the with_options SDK binding
-        itself is model_turn's own pinned behavior).  This replaces the
-        retired pin on _try_stream's hoisted once-per-ladder resolve."""
+        after its entry abort read (the #972 ordering — a pre-set Stop
+        mints nothing, pinned in test_cancel)."""
         sess = MagicMock()
         sess._registry = None
         sess._config_store = None
@@ -1543,16 +1541,15 @@ class TestModelOboToken:
         assert lane.backend_auth_resolver is sess._model_backend_auth_token
         assert lane.alias == "tf"
         # The session's own sampling knobs override the lane's operator
-        # rungs (wire parity with the pre-fold loop).
+        # rungs.
         assert lane.temperature == 0.5
         assert lane.reasoning_effort is None
 
     def test_main_lane_never_consults_config_store(self) -> None:
         """The alias/global sampling rungs must not reach the main loop:
-        the session's own knobs replace both values ``config_store``
-        would feed, so ``_build_main_lane`` omits the store entirely —
-        a store with configured rungs contributes nothing to the lane
-        (wire parity with the pre-fold loop, which never consulted it)."""
+        the session's own knobs replace both values ``config_store`` would
+        feed, so ``_build_main_lane`` omits the store entirely and a store
+        with configured rungs contributes nothing to the lane."""
         sess = MagicMock()
         sess._registry = None
         store = MagicMock()
@@ -1576,9 +1573,8 @@ class TestModelOboToken:
     def test_primary_lane_built_with_session_alias_for_obo(self) -> None:
         # Regression: the primary lane must carry the session alias, or the
         # backend-auth resolver can't resolve the OBO token and an
-        # entra_obo main turn goes out on the static client key. (The
-        # pre-fold bug lived in _try_stream's missing model_alias kwarg;
-        # the lane build is the one place the alias enters now.)
+        # entra_obo main turn goes out on the static client key.  The lane
+        # build is the one place the alias enters.
         sess = MagicMock()
         sess._model_alias = "oboagent"
         ChatSession._model_turn_with_fallback(sess, MagicMock(), lambda wire: wire)

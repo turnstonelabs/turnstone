@@ -2,16 +2,16 @@
 
 A wire death DURING body iteration surfaces after the request already
 returned its stream handle, so neither the SDK's ``max_retries`` nor the
-creation-time per-lane ladder (``_model_turn_with_retry``) ever sees it.  These tests drive
-``ChatSession.send()`` with scripted provider streams and pin the retry
-loop's contract: bounded re-issue on the normalized retryable shape, the
-dead attempt finalized client-side before the retry notice
-(``stream_end``) and discarded from the server buffers once the backoff
-survives the Stop window (``stream_discarded`` — never
-``turn_committed``, whose semantics keep the turn buffer), cancel-in-
-retry-window abort, exhaustion surfacing the stream-death wording, and the
-``_assistant_pending_tokens`` reset that keeps a post-finish blip from
-recycling the prior turn's token count.
+creation-time per-lane ladder (``_model_turn_with_retry``) ever sees it.
+These tests drive ``ChatSession.send()`` with scripted provider streams
+and pin the retry loop's contract: bounded re-issue on the normalized
+retryable shape, the dead attempt finalized client-side before the retry
+notice (``stream_end``) and discarded from the server buffers once the
+backoff survives the Stop window (``stream_discarded`` — never
+``turn_committed``, whose semantics keep the turn buffer),
+cancel-in-retry-window abort, exhaustion surfacing the stream-death
+wording, and the ``_assistant_pending_tokens`` reset that keeps a
+post-finish blip from recycling the prior turn's token count.
 
 Fixture note: tests zero ``_RETRY_BASE_DELAY`` per instance (else each
 retry pays real exponential backoff).
@@ -358,12 +358,10 @@ class TestMidStreamRetry:
 
         ui = RecordingUI()
         session = _make_session(ui)
-        # Post-fold the retry gate reads the SERVING lane's provider off
-        # the frame's consumer (the creation-time handoff register is
-        # gone).  FlakyError is retryable only per THIS provider's set —
-        # the re-issue proves the gate consulted the lane that armed the
-        # stream, not some global default.  (The distinct-fallback-lane
-        # variant of this contract is exercised through the real fallback
+        # The retry gate reads the SERVING lane's provider.  FlakyError is
+        # retryable only per THIS provider's set, so the re-issue proves
+        # the gate consulted the lane that armed the stream, not a global
+        # default.  (The distinct-fallback-lane variant rides the real
         # walk in test_model_registry's TestSessionFallback.)
         provider = arm_session(
             session,
@@ -716,9 +714,8 @@ class TestRecreateWindowClassification:
             session.send("test")
 
         # The dead attempt streamed only its safe-flush prefix ("Ha");
-        # the splitter carry ("lf an answer") must NEVER surface as a
-        # late content token — the stale-armed bug flushed it into the
-        # just-truncated segment behind a duplicate stream_end.
+        # the splitter carry ("lf an answer") must NEVER surface as a late
+        # content token behind a duplicate stream_end.
         assert ui.of("content") == ["Ha"]
         assert ui.kinds().count("stream_end") == 1
         # The full partial (flushed + carry) still reaches history via
@@ -740,9 +737,9 @@ class TestRecreateWindowClassification:
             _good_stream("never reached"),
         )
         # The re-issue walk's PREAMBLE (before any begin_attempt) raises:
-        # with the dead attempt's ref properly retired this classifies as
-        # a creation-phase failure and the ORIGINAL stream death is the
-        # error the operator sees — not the preamble's.
+        # with the dead attempt's ref retired this is a creation-phase
+        # failure, so the ORIGINAL stream death is the error the operator
+        # sees — not the preamble's.
         real_tracker = session._get_health_tracker
         calls: list[int] = []
 
@@ -781,12 +778,11 @@ class TestRecreateWindowClassification:
         assert not any("Backend stream died mid-response" in e for e in errors)
 
     def test_never_arming_adapter_death_classifies_midstream(self, tmp_db):
-        """An adapter that ignores ``cancel_ref`` (the pre-#832 letter of
-        the contract) forfeits the health/usage hook duties, but its
-        mid-stream death must STILL classify as mid-stream: chunks
-        reached the display, so a creation-classified death would
-        silently re-issue the same lane and double-render them.  The
-        consumer's saw-chunk fallback is that tripwire."""
+        """An adapter that ignores ``cancel_ref`` forfeits the
+        health/usage hook duties, but its mid-stream death must STILL
+        classify as mid-stream: chunks reached the display, so a
+        creation-classified death would silently re-issue the same lane
+        and double-render them."""
         ui = RecordingUI()
         session = _make_session(ui)
         provider = arm_session(session)  # install the provider shell only
@@ -817,8 +813,7 @@ class TestRecreateWindowClassification:
         """A deterministic lowering failure is a session-data fault: no
         dispatch, no health record, no fallback walk — the typed
         ``WirePreparationError`` rides to the fatal formatter's dedicated
-        branch.  (Pre-fold parity: wire prep ran in send() outside the
-        streaming try and could reach none of them.)"""
+        branch."""
         ui = RecordingUI()
         session = _make_session(ui)
         provider = arm_session(session, _good_stream("unreached"))
@@ -848,9 +843,9 @@ class TestDebugDumpLatch:
     """The debug request dump prints once per ``_stream_response``
     invocation.  RULED (#832): send()'s overflow-recovery re-invocation
     prints the RE-PREPARED wire — the dump that diagnoses the recovery —
-    where the pre-fold accident (wire prep hoisted outside the streaming
-    try) printed only the first.  Within one invocation, re-issues and
-    fallback lanes re-run the passes but never re-dump."""
+    where the pre-fold behavior printed only the first.  Within one
+    invocation, re-issues and fallback lanes re-run the passes but never
+    re-dump."""
 
     def test_reissue_never_redumps(self, tmp_db):
         session = _make_session(RecordingUI())
@@ -881,7 +876,7 @@ class TestFallbackFailureRedaction:
         """The fallback-failure info line lands in the browser transcript
         and persisted event stream — it carries the exception CLASS, never
         its text (a ConnectError's str can embed a credential-bearing
-        base_url; same rule as the re-issue log arm)."""
+        base_url)."""
         ui = RecordingUI()
         session = _make_session(ui)
         registry = MagicMock()

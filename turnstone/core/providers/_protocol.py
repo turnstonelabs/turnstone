@@ -99,11 +99,9 @@ def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
     never mutates ``new`` (the provider's object).
 
     Serves :func:`drain_stream` (the one assembler) and the interactive
-    ``on_chunk`` consumer's live re-projection alike — the streaming
-    callback re-projects the merged accumulator into the session's
-    ``_last_usage`` dict on every usage chunk (that dict has mid-stream
-    readers), so the display lane cannot drift from the assembly on the
-    merge rule.
+    ``on_chunk`` consumer, which re-projects the merged accumulator into
+    the session's ``_last_usage`` dict (read mid-stream) on every usage
+    chunk — so the display lane cannot drift from the assembly.
     """
     if acc is None:
         return replace(new)
@@ -147,11 +145,10 @@ def accumulate_tool_call_delta(
     fragment), ``arguments_delta`` concatenates.  Returns the (possibly
     fresh) accumulator entry so callers can hang provider extras off it.
 
-    Serves :func:`drain_stream` (the one assembler — post-#832 the
-    interactive loop assembles here too) and ``GoogleProvider``'s
-    raw-fidelity capture — every
-    accumulator in the tree, so the chat loop and the drained lanes
-    cannot assemble different calls from the same wire stream.
+    Serves :func:`drain_stream` — the one assembler since #832 folded the
+    interactive loop into it — and ``GoogleProvider``'s raw-fidelity
+    capture: every accumulator in the tree, so no two lanes can assemble
+    different calls from the same wire stream.
     """
     tc = acc.setdefault(
         tcd.index,
@@ -253,12 +250,10 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
         yield sc
 
 
-# The trailing-citations fold rule, shared spelling: post-finish info
-# (web-search source footers) folds into committed content only onto a
-# non-blank answer, joined by this separator.  The interactive display
-# consumer mirrors the drain's fold with these same two pieces — one
-# constant and one predicate — so the streamed and committed renderings
-# of a footer cannot drift.
+# The trailing-citations fold rule in one place: post-finish info
+# (web-search source footers) folds onto a non-blank answer only, joined
+# by this separator.  The interactive display consumer and the drain
+# share both pieces, so a footer cannot render two ways.
 TRAILING_INFO_SEPARATOR = "\n\n"
 
 
@@ -437,9 +432,7 @@ def drain_stream(
     # not exist, folded on, would hand every downstream emptiness check a
     # truthy footer-only "answer".  Blankness, not truthiness; checked
     # only when a footer exists (footers ride web-search turns only, and
-    # the strip scan shouldn't tax every drained completion).  The gate
-    # and separator are the shared module-level pair above — the display
-    # consumer's mirror uses the same two.
+    # the strip scan shouldn't tax every drained completion).
     if trailing_info_parts and folds_trailing_info(content):
         for info in trailing_info_parts:
             content += TRAILING_INFO_SEPARATOR + info
@@ -892,15 +885,14 @@ class LLMProvider(Protocol):
         are respected.
 
         If *cancel_ref* is provided the provider appends the underlying
-        SDK stream object (which has a ``.close()`` method) EAGERLY —
+        SDK stream object (which has a ``.close()`` method) EAGERLY:
         inside this call's body, at HTTP-response time, before the
-        iterator is even returned (not merely before the first chunk; a
-        lazily-issued generator adapter would violate this).  The append
-        instant is load-bearing: the caller's creation-vs-midstream
-        classifier and health recording key on it (#832), and the
-        eager-append tripwires in ``test_sdk_stream_boundary`` pin it per
-        adapter.  The caller can then close it from another thread to
-        abort a blocked HTTP read immediately.
+        iterator is returned — not merely before the first chunk (a
+        lazily-issued generator adapter would violate this).  The
+        caller's creation-vs-midstream classifier and health recording
+        key on that instant (#832); ``test_sdk_stream_boundary`` pins it
+        per adapter.  The caller can then close the stream from another
+        thread to abort a blocked HTTP read immediately.
 
         This is the ONLY transport — single-shot callers drain it through
         :func:`drain_stream` instead of a separate non-streaming entry
