@@ -1272,3 +1272,91 @@ class TestSupersessionVerdictAgreement:
         with pytest.raises(KeyboardInterrupt):
             session._stream_response(0)
         assert ui.stream_ends == 1
+
+
+class TestOrphanGuardsBelowTheLadder:
+    """The two supersession guards in ``_stream_response``'s own arms.
+
+    They fire only when a force-cancel lands in the window BELOW the
+    ladder's conversion: ``_model_turn_with_retry`` re-checks the
+    generation before it classifies a death, so on every deterministic
+    path an orphan's failure has already become ``GenerationCancelled``
+    by the time it leaves the ladder.  These arms cover the sub-statement
+    race where supersession arrives after that check — the same
+    accepted-width window ``_CancelRef`` documents.  Reaching them means
+    simulating the race at the seam directly; a scripted stream cannot,
+    which is why the suite left both branches unexercised.
+
+    What they protect: an orphaned thread must emit NOTHING, because the
+    successor generation is already streaming into the same UI.
+    """
+
+    def _armed_death(self, session, exc):
+        """A death observed as if supersession landed after the ladder's
+        own generation check: the attempt streamed, a newer generation
+        claimed the session, and only then does the failure surface."""
+
+        def _seam(consumer, prepare_wire, my_generation):
+            consumer.begin_attempt(_CancelRef(session, my_generation), None, MagicMock())
+            consumer._saw_chunk = True  # the attempt reached the display
+            session._generation = my_generation + 1  # force-cancel lands
+            raise exc
+
+        return _seam
+
+    def test_superseded_stream_death_emits_nothing(self, tmp_db):
+        from turnstone.core.providers import IncompleteStreamError
+
+        ui = NullUI()
+        session = _make_session(ui=ui)
+        session._generation = 1
+        with (
+            patch.object(
+                session,
+                "_model_turn_with_fallback",
+                side_effect=self._armed_death(session, IncompleteStreamError("wire died")),
+            ),
+            pytest.raises(IncompleteStreamError),
+        ):
+            session._stream_response(1)
+
+        # No retry theater, no finalize, no partial stashed: the live
+        # successor owns the UI now.
+        assert ui.stream_ends == 0
+        assert ui.infos == []
+        assert session._cancelled_partial_msg is None
+
+    def test_superseded_keyboard_interrupt_emits_nothing(self, tmp_db):
+        ui = NullUI()
+        session = _make_session(ui=ui)
+        session._generation = 1
+        with (
+            patch.object(
+                session,
+                "_model_turn_with_fallback",
+                side_effect=self._armed_death(session, KeyboardInterrupt()),
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            session._stream_response(1)
+
+        assert ui.stream_ends == 0
+
+    def test_live_generation_still_finalizes_on_ctrl_c(self, tmp_db):
+        # The other side of the same branch, without the supersession.
+        ui = NullUI()
+        session = _make_session(ui=ui)
+        session._generation = 1
+
+        def _seam(consumer, prepare_wire, my_generation):
+            consumer.begin_attempt(_CancelRef(session, my_generation), None, MagicMock())
+            consumer._saw_chunk = True
+            raise KeyboardInterrupt
+
+        with (
+            patch.object(session, "_model_turn_with_fallback", side_effect=_seam),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            session._stream_response(1)
+
+        assert ui.stream_ends == 1
