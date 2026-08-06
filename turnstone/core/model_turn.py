@@ -1046,8 +1046,14 @@ def model_turn(
             wire = prepare_wire(wire, lane)
         except Exception as prep_err:
             # A caller-data fault, never a backend signal — typed so the
-            # retry and fallback ladders cannot treat it as one.
-            raise WirePreparationError(str(prep_err)) from prep_err
+            # retry and fallback ladders cannot treat it as one.  The
+            # wrapper carries the cause's CLASS, not its message: this is
+            # our lowering over the caller's stored history, so the
+            # message can quote that history, and callers render
+            # ``str(exc)`` on surfaces that reach the operator and the
+            # persisted error row.  The message rides ``__cause__``, which
+            # tracebacks and debug logs still have.
+            raise WirePreparationError(type(prep_err).__name__) from prep_err
     wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
     # The effort assignment scheme's lower rungs: explicit relay → lane
     # (operator) → in-code model definition → None.  None/unset knobs are

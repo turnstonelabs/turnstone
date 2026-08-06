@@ -828,9 +828,17 @@ class TestRecreateWindowClassification:
             patch.object(
                 session, "_prepare_wire_messages", side_effect=ValueError("malformed turn 7")
             ),
-            pytest.raises(WirePreparationError),
+            pytest.raises(WirePreparationError) as excinfo,
         ):
             session.send("test")
+
+        # The wrapper carries the cause's CLASS, not its text.  Callers that
+        # render ``str(exc)`` directly — the interactive retry arm's dashboard
+        # line — would otherwise re-emit the stored-history text the fatal
+        # formatter just withheld, on a surface that reaches the operator and
+        # the persisted error row.
+        assert str(excinfo.value) == "ValueError"
+        assert "malformed turn 7" not in str(excinfo.value)
 
         tracker.record_failure.assert_not_called()
         fb_spy.assert_called_once()
