@@ -547,7 +547,10 @@ def arm_session(
     provider.provider_name = name
     provider.get_capabilities.return_value = ModelCapabilities()
     provider.retryable_error_names = retryable
-    provider._armed_handle = ArmedHandle()
+    # One handle PER CREATE (the real adapters' rule): `handles` records
+    # them all, `_armed_handle` is the latest.
+    provider._armed_handle = None
+    provider.handles = []
     remaining = list(streams)
 
     def _create(**kwargs: Any):
@@ -557,7 +560,10 @@ def arm_session(
             raise nxt
         ref = kwargs.get("cancel_ref")
         if ref is not None:
-            ref.append(provider._armed_handle)
+            handle = ArmedHandle()
+            provider.handles.append(handle)
+            provider._armed_handle = handle
+            ref.append(handle)
         return iter(nxt) if not hasattr(nxt, "__next__") else nxt
 
     provider.create_streaming = MagicMock(side_effect=_create)

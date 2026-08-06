@@ -200,7 +200,14 @@ class TestRemainingTokenBudget:
 class TestContextOverflowRecovery:
     """Test that context-length errors trigger compact-and-retry."""
 
-    def test_openai_context_length_error_triggers_compact(self, session):
+    @pytest.mark.parametrize(
+        "overflow_text",
+        [
+            pytest.param("maximum context length exceeded", id="openai"),
+            pytest.param("prompt is too long: 250000 tokens > 200000 maximum", id="anthropic"),
+        ],
+    )
+    def test_context_overflow_triggers_compact(self, session, overflow_text):
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         session._msg_tokens = [1]
 
@@ -210,7 +217,7 @@ class TestContextOverflowRecovery:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise Exception("maximum context length exceeded")
+                raise Exception(overflow_text)
             return make_result(content="ok")
 
         compact_mock = MagicMock()
@@ -229,33 +236,6 @@ class TestContextOverflowRecovery:
         # hits overflow must not compact-and-swap a newer generation's history.
         compact_mock.assert_called_once_with(auto=True, my_generation=session._generation)
         assert call_count == 2
-
-    def test_anthropic_prompt_too_long_triggers_compact(self, session):
-        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-        session._msg_tokens = [1]
-
-        call_count = 0
-
-        def mock_stream_response(my_generation=0):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise Exception("prompt is too long: 250000 tokens > 200000 maximum")
-            return make_result(content="ok")
-
-        compact_mock = MagicMock()
-        with (
-            patch.object(session, "_stream_response", side_effect=mock_stream_response),
-            patch.object(session, "_compact_messages", compact_mock),
-            patch.object(session, "_full_messages", return_value=[]),
-            patch.object(session, "_update_token_table"),
-            patch.object(session, "_print_status_line"),
-            patch.object(session, "_emit_state"),
-            patch("turnstone.core.session.save_message"),
-        ):
-            session.send("hello")
-
-        compact_mock.assert_called_once_with(auto=True, my_generation=session._generation)
 
     def test_non_context_error_propagates(self, session):
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])

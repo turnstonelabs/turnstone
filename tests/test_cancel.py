@@ -1284,3 +1284,39 @@ class TestNeverArmedStopLeavesNoRow:
         assert any("cancelled" in i.lower() for i in ui.infos)
         assistant = [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
         assert assistant == []
+
+
+class TestOrphanArmDutiesGate:
+    def test_superseded_arrival_in_toctou_window_fires_no_duties(self, tmp_db):
+        """The ref's supersession read and the arm hook are two lockless
+        steps; a force-cancel can claim a new generation between them.
+        The duties self-gate on the generation, so even an append whose
+        supersession read went stale cannot null the successor's usage
+        slots or record health for the abandoned lane."""
+        from turnstone.core.session import _StreamTurnConsumer
+
+        session = _make_session()
+        consumer = _StreamTurnConsumer(session, my_generation=1)
+        tracker = MagicMock()
+
+        class _StaleReadRef(_CancelRef):
+            # The stale supersession read the accepted bytecode-width
+            # window produces — the hook itself must hold the line.
+            def _superseded(self) -> bool:
+                return False
+
+        ref = _StaleReadRef(session, 1, on_first_append=consumer.on_stream_armed)
+        consumer.begin_attempt(ref, tracker, MagicMock())
+
+        session._generation = 1
+        sentinel = {"prompt_tokens": 7}
+        session._last_usage = sentinel
+        session._assistant_pending_tokens = 42
+
+        # The force-cancel claims a newer generation before the append.
+        session._generation = 2
+        ref.append(MagicMock())
+
+        assert session._last_usage is sentinel
+        assert session._assistant_pending_tokens == 42
+        tracker.record_success.assert_not_called()

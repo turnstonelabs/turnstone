@@ -1577,7 +1577,7 @@ class TestModelOboToken:
         # build is the one place the alias enters.
         sess = MagicMock()
         sess._model_alias = "oboagent"
-        ChatSession._model_turn_with_fallback(sess, MagicMock(), lambda wire: wire)
+        ChatSession._model_turn_with_fallback(sess, MagicMock(), lambda wire, lane: wire)
         sess._build_main_lane.assert_called_once()
         assert sess._build_main_lane.call_args.kwargs["alias"] == "oboagent"
 
@@ -1590,7 +1590,7 @@ class TestModelOboToken:
         sess._get_health_tracker.return_value = tracker
 
         with pytest.raises(BackendAuthUnavailableError):
-            ChatSession._model_turn_with_fallback(sess, MagicMock(), lambda wire: wire)
+            ChatSession._model_turn_with_fallback(sess, MagicMock(), lambda wire, lane: wire)
 
         sess._try_fallback_lane.assert_not_called()
         # An auth refusal is never reinterpreted as backend health.

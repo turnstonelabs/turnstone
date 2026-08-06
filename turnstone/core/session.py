@@ -544,8 +544,16 @@ class _StreamTurnConsumer:
         stale-usage leak (a post-finish blip can lose the trailing usage
         chunk, and a stale completion count would be recycled as the next
         turn's estimate) and the reconnect status-bar blackout.
+
+        Generation-gated: the ref's supersession read and this hook are
+        two lockless steps, so a force-cancel can claim a new generation
+        between them — an orphan's late-arriving registration must not
+        null the SUCCESSOR's usage slots or record health for an
+        abandoned lane.
         """
         s = self._session
+        if s._generation != self._my_generation:
+            return
         s._last_usage = None
         s._assistant_pending_tokens = 0
         if self.tracker:
@@ -5492,6 +5500,8 @@ class ChatSession:
     def _prepare_wire_messages(
         self,
         messages: list[dict[str, Any]],
+        *,
+        caps: ModelCapabilities | None = None,
     ) -> list[dict[str, Any]]:
         """Return a transient copy of *messages* prepared for the provider wire.
 
@@ -5543,11 +5553,16 @@ class ChatSession:
         messages = self._inject_sender_labels(messages)
         folded = messages
         if self._provider is not None:
+            # *caps* is the SERVING lane's capabilities when the streaming
+            # wrapper prepares per attempt — a fallback whose template
+            # rejects mid-conversation system roles must get the folded
+            # shape even when the primary keeps them inline.  Callers
+            # without a lane in hand (the token-table re-fold) default to
+            # the primary binding.
+            fold_caps = caps if caps is not None else self._get_capabilities()
             folded = fold_system_turns(
                 messages,
-                supports_mid_conversation_system=(
-                    self._get_capabilities().supports_mid_conversation_system
-                ),
+                supports_mid_conversation_system=fold_caps.supports_mid_conversation_system,
                 nonce=self._envelope_nonce,
             )
         dropped = drop_empty_user_turns(folded)
@@ -6212,7 +6227,7 @@ class ChatSession:
     def _model_turn_with_fallback(
         self,
         consumer: _StreamTurnConsumer,
-        prepare_wire: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+        prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]],
         my_generation: int = 0,
     ) -> ModelTurnResult:
         """Run one plant call with lane-swap fallback: one ``model_turn``
@@ -6284,7 +6299,7 @@ class ChatSession:
         self,
         alias: str,
         consumer: _StreamTurnConsumer,
-        prepare_wire: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+        prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]],
         my_generation: int,
     ) -> ModelTurnResult | None:
         """Attempt a single fallback lane.  Returns the result or ``None``.
@@ -6367,7 +6382,7 @@ class ChatSession:
         lane: ModelLane,
         tracker: BackendHealthTracker | None,
         consumer: _StreamTurnConsumer,
-        prepare_wire: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+        prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]],
         my_generation: int = 0,
     ) -> ModelTurnResult:
         """One lane's creation ladder around ``model_turn``.
@@ -8227,7 +8242,7 @@ class ChatSession:
 
         debug_printed = False
 
-        def _prepare(lowered: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        def _prepare(lowered: list[dict[str, Any]], lane: ModelLane) -> list[dict[str, Any]]:
             """The main loop's ``prepare_wire``: system prepend + the
             session lowering passes, plus the debug request dump behind a
             once-per-invocation latch, so re-issues and fallback lanes
@@ -8236,7 +8251,9 @@ class ChatSession:
             post-compaction the wire CHANGED, and the re-prepared dump is
             the one that diagnoses the recovery (a named #832 delta)."""
             nonlocal debug_printed
-            wire = self._prepare_wire_messages([*self.system_messages, *lowered])
+            wire = self._prepare_wire_messages(
+                [*self.system_messages, *lowered], caps=lane.capabilities
+            )
             if self.debug and not debug_printed:
                 debug_printed = True
                 self._debug_print_request(wire)

@@ -886,7 +886,7 @@ def model_turn(
     cancel_ref: list[Any] | None = None,
     backend_auth_token: str | None = None,
     deferred_names: frozenset[str] | None = None,
-    prepare_wire: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+    prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
@@ -962,7 +962,9 @@ def model_turn(
     reads the error at all, which is what keeps a Stop mid-summary off
     the red-error path.
 
-    *prepare_wire* is the caller's OWN deterministic lowering, composed
+    *prepare_wire* is the caller's OWN deterministic lowering (called
+    with the serving lane, so per-lane capability posture is available),
+    composed
     after the seam passes and before the Phase-5 attach: the main loop's
     system-message prepend, sender labels, capability-sensitive
     system-turn fold, empty-user drop, and orphan repair live here, each
@@ -1036,7 +1038,10 @@ def model_turn(
     )
     if prepare_wire is not None:
         try:
-            wire = prepare_wire(wire)
+            # The serving lane rides along so caller lowering can be
+            # capability-correct per attempt — a fallback's fold posture
+            # is its own, not the primary's.
+            wire = prepare_wire(wire, lane)
         except Exception as prep_err:
             # A caller-data fault, never a backend signal — typed so the
             # retry and fallback ladders cannot treat it as one.

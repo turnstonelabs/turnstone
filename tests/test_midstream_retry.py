@@ -887,9 +887,44 @@ class TestFallbackFailureRedaction:
         from turnstone.core.session import _StreamTurnConsumer
 
         consumer = _StreamTurnConsumer(session, 0)
-        result = session._try_fallback_lane("fb", consumer, lambda w: w, 0)
+        result = session._try_fallback_lane("fb", consumer, lambda w, lane: w, 0)
 
         assert result is None
         infos = ui.of("info")
         assert any("Fallback fb also failed: ConnectError" in i for i in infos)
         assert not any("SECRETKEY" in i for i in infos)
+
+
+class TestPrepareWireLaneCaps:
+    """The per-attempt wire prep folds with the SERVING lane's
+    capabilities — a fallback whose template rejects mid-conversation
+    system roles gets the folded shape even when the primary keeps them
+    inline."""
+
+    def test_caps_override_controls_fold_posture(self, tmp_db):
+        from turnstone.core.providers import ModelCapabilities
+
+        session = _make_session(RecordingUI())
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "yo"},
+            {"role": "system", "content": "nudge", "_source": "idle_nudge"},
+            {"role": "user", "content": "next"},
+        ]
+        native = session._prepare_wire_messages(
+            list(msgs), caps=ModelCapabilities(supports_mid_conversation_system=True)
+        )
+        folded = session._prepare_wire_messages(
+            list(msgs), caps=ModelCapabilities(supports_mid_conversation_system=False)
+        )
+        assert any(m["role"] == "system" for m in native[1:])
+        assert not any(m["role"] == "system" for m in folded[1:])
+
+    def test_stream_prepare_passes_serving_lane_caps(self, tmp_db):
+        session = _make_session(RecordingUI())
+        arm_session(session, _good_stream("ok"))
+        with patch.object(
+            session, "_prepare_wire_messages", wraps=session._prepare_wire_messages
+        ) as prep:
+            session.send("test")
+        assert prep.call_args.kwargs["caps"] is session._get_capabilities()
