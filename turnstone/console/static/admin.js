@@ -6465,11 +6465,11 @@ const _MODEL_CAP_DEFAULTS = {
 // for anything the backend would not coerce; such a value stays in the raw JSON
 // rather than being silently rewritten (the thinking_mode policy below).
 const _CAP_BOOL_STRINGS = {
-  true: true,
+  "true": true,
   yes: true,
   on: true,
   1: true,
-  false: false,
+  "false": false,
   no: false,
   off: false,
   0: false,
@@ -6482,7 +6482,7 @@ function _capBool(value) {
   if (typeof value === "number") return !!value;
   if (typeof value === "string") {
     const spelling = value.trim().toLowerCase();
-    return spelling in _CAP_BOOL_STRINGS
+    return Object.prototype.hasOwnProperty.call(_CAP_BOOL_STRINGS, spelling)
       ? _CAP_BOOL_STRINGS[spelling]
       : undefined;
   }
