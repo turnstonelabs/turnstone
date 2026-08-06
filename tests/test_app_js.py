@@ -708,6 +708,48 @@ def test_audio_roles_gated_to_openai_sdk_providers() -> None:
     assert '_providerCarriesAudio((md && md.provider) || "openai")' in body
 
 
+def test_capability_tiles_agree_with_the_capabilities_dataclass() -> None:
+    """Every tile is a real capability, rendered, and defaulted like Python.
+
+    The tile matrix is a hand-maintained mirror of
+    :class:`ModelCapabilities`, so it drifts silently: a renamed field
+    leaves a tile that writes a key nothing reads, and a JS default that
+    disagrees with the dataclass shows the operator a state the backend
+    would not apply.  Tiles whose key is NOT a dataclass field are
+    allowed (``supports_rerank`` is a registry-level flag) — they just
+    have no default to agree with.
+    """
+    from turnstone.core.providers._protocol import ModelCapabilities
+
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+
+    keys_block = re.search(r"const _MODEL_CAP_KEYS = \[(.*?)\];", admin, re.S)
+    defaults_block = re.search(r"const _MODEL_CAP_DEFAULTS = \{(.*?)\};", admin, re.S)
+    assert keys_block and defaults_block, "capability tile matrix not found in admin.js"
+    keys = re.findall(r'"(\w+)"', keys_block.group(1))
+    defaults = {
+        k: v == "true" for k, v in re.findall(r"(\w+):\s*(true|false)", defaults_block.group(1))
+    }
+    assert keys, "no capability tile keys parsed"
+
+    caps = ModelCapabilities()
+    for key in keys:
+        assert f'data-cap="{key}"' in html, f"tile {key} has no checkbox in index.html"
+        assert key in defaults, f"tile {key} has no entry in _MODEL_CAP_DEFAULTS"
+        if hasattr(caps, key):
+            assert defaults[key] == getattr(caps, key), (
+                f"tile default for {key} disagrees with ModelCapabilities"
+            )
+    assert set(defaults) == set(keys), "_MODEL_CAP_DEFAULTS and _MODEL_CAP_KEYS disagree"
+
+    # The inline-tag scan is a FALLBACK for servers with no reasoning parser
+    # (and for misconfigured ones).  An operator running vLLM/llama.cpp with a
+    # parser configured needs a discoverable way to say so — without it the
+    # only route is hand-editing the raw capabilities JSON.
+    assert "server_parses_reasoning" in keys
+
+
 def test_model_response_controls_are_capability_driven_and_sparse() -> None:
     """The model shelf surfaces Responses-only scalar controls without
     hard-coding GPT-5.6 IDs or pinning inherited capability-table values."""
