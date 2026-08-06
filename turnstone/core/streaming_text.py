@@ -93,7 +93,7 @@ class ThinkTagSplitter:
         if not self.pending:
             return ""
         tail = partial_tag_tail(self.pending)
-        closeable = self.pending[: len(self.pending) - len(tail)] if tail else self.pending
+        closeable = self.pending.removesuffix(tail)
         if closeable:
             self._emit(closeable, self.in_think)
         self.pending = ""

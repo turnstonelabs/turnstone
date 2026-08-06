@@ -492,19 +492,22 @@ def lane_thinking_suppressed(lane: ModelLane) -> bool:
     )
 
 
-def lane_scans_inline_reasoning(lane: ModelLane | None) -> bool:
+def caps_scan_inline_reasoning(caps: ModelCapabilities | None) -> bool:
     """THE inline tag-scan gate — the single spelling of the #978 rule.
 
-    Scan ``<think>`` tags out of the content stream unless the lane's
+    Scan ``<think>`` tags out of the content stream unless the
     capabilities declare that the server segregates reasoning itself
-    (``server_parses_reasoning``); no capabilities, or no lane yet, keeps
-    the passthrough-server default: scan.  Shared by the drain seam and
-    the interactive display splitter so the two readings of one stream
-    cannot disagree.
+    (``server_parses_reasoning``); no declaration keeps the
+    passthrough-server default: scan.  Shared by the drain seam, the
+    interactive display splitter, and the title peel, so no two
+    consumers can read one stream differently.
     """
-    return (
-        lane is None or lane.capabilities is None or not lane.capabilities.server_parses_reasoning
-    )
+    return caps is None or not caps.server_parses_reasoning
+
+
+def lane_scans_inline_reasoning(lane: ModelLane | None) -> bool:
+    """:func:`caps_scan_inline_reasoning` over a lane (no lane yet = scan)."""
+    return caps_scan_inline_reasoning(lane.capabilities if lane is not None else None)
 
 
 def lane_without_thinking(lane: ModelLane) -> ModelLane:
@@ -962,10 +965,10 @@ def model_turn(
     reads the error at all, which is what keeps a Stop mid-summary off
     the red-error path.
 
-    *prepare_wire* is the caller's OWN deterministic lowering (called
-    with the serving lane, so per-lane capability posture is available),
-    composed
-    after the seam passes and before the Phase-5 attach: the main loop's
+    *prepare_wire* is the caller's OWN deterministic lowering, called
+    with the serving lane so per-lane capability posture is available,
+    composed after the seam passes and before the Phase-5 attach: the
+    main loop's
     system-message prepend, sender labels, capability-sensitive
     system-turn fold, empty-user drop, and orphan repair live here, each
     a ``lowering.py``-composed pass.  It must be pure lowering — no

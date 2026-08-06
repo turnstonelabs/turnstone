@@ -382,9 +382,7 @@ def seam_provider(utterance: str, *, provider_name: str = "openai-compatible") -
     later session in the test run (the SSE-recovery e2e servers resolve
     the same instance).
     """
-    provider = MagicMock()
-    provider.provider_name = provider_name
-    provider.get_capabilities.return_value = ModelCapabilities()
+    provider = provider_shell(provider_name)
     provider.create_streaming = MagicMock(return_value=think_tag_stream(utterance))
     return provider
 
@@ -520,6 +518,20 @@ class ArmedHandle:
         self.closed = True
 
 
+def provider_shell(
+    name: str = "openai-compatible",
+    retryable: frozenset[str] = frozenset({"IncompleteStreamError"}),
+) -> MagicMock:
+    """The armed-provider fake skeleton every streaming fake builds on:
+    provider_name / capabilities / retryable set.  ONE spelling, so a new
+    attribute the seam starts probing lands in every fake at once."""
+    provider = MagicMock()
+    provider.provider_name = name
+    provider.get_capabilities.return_value = ModelCapabilities()
+    provider.retryable_error_names = retryable
+    return provider
+
+
 def arm_session(
     session: Any,
     *streams: Any,
@@ -543,10 +555,7 @@ def arm_session(
     before the main loop ran.
     """
     session._title_generated = True
-    provider = MagicMock()
-    provider.provider_name = name
-    provider.get_capabilities.return_value = ModelCapabilities()
-    provider.retryable_error_names = retryable
+    provider = provider_shell(name, retryable)
     # One handle PER CREATE (the real adapters' rule): `handles` records
     # them all, `_armed_handle` is the latest.
     provider._armed_handle = None
@@ -580,10 +589,7 @@ def scripted_provider(chunks: list[StreamChunk]) -> MagicMock:
     handle is appended per call, matching the one-handle-per-create
     behavior of every real adapter.
     """
-    provider = MagicMock()
-    provider.provider_name = "openai-compatible"
-    provider.get_capabilities.return_value = ModelCapabilities()
-    provider.retryable_error_names = frozenset({"IncompleteStreamError"})
+    provider = provider_shell()
 
     def _create(**kwargs: Any):
         ref = kwargs.get("cancel_ref")

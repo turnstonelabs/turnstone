@@ -810,10 +810,11 @@ class TestRecreateWindowClassification:
         assert ui.of("content").count(flushed) == 1
 
     def test_wire_preparation_failure_never_touches_backend_health(self, tmp_db):
-        """A deterministic lowering failure is a session-data fault: no
-        dispatch, no health record, no fallback walk — the typed
-        ``WirePreparationError`` rides to the fatal formatter's dedicated
-        branch."""
+        """A lowering failure is a session-data fault: no dispatch and no
+        health record on ANY lane — but it DOES walk the fallbacks, since
+        prepare is lane-variant and another lane's posture may serve the
+        turn.  When none does, the typed ``WirePreparationError`` rides to
+        the fatal formatter's dedicated branch."""
         ui = RecordingUI()
         session = _make_session(ui)
         provider = arm_session(session, _good_stream("unreached"))
@@ -823,7 +824,7 @@ class TestRecreateWindowClassification:
         session._registry = registry
         with (
             patch.object(session, "_get_health_tracker", return_value=tracker),
-            patch.object(session, "_try_fallback_lane") as fb_spy,
+            patch.object(session, "_try_fallback_lane", return_value=None) as fb_spy,
             patch.object(
                 session, "_prepare_wire_messages", side_effect=ValueError("malformed turn 7")
             ),
@@ -832,11 +833,66 @@ class TestRecreateWindowClassification:
             session.send("test")
 
         tracker.record_failure.assert_not_called()
-        fb_spy.assert_not_called()
+        fb_spy.assert_called_once()
         provider.create_streaming.assert_not_called()
         errors = ui.of("error")
         assert errors and "stored history" in errors[-1]
         assert "malformed turn 7" in errors[-1]
+
+    def test_fallback_prep_fault_continues_walk(self, tmp_db):
+        """A prep fault on one lane must not abort the walk: the next
+        alias may still serve the turn (prepare is lane-variant)."""
+        from tests._session_helpers import make_result
+
+        session = _make_session(RecordingUI())
+        registry = MagicMock()
+        registry.fallback = ["a", "b"]
+        session._registry = registry
+        served = make_result(content="ok")
+        tracker = MagicMock()
+        with (
+            patch.object(session, "_get_health_tracker", return_value=tracker),
+            patch.object(
+                session,
+                "_model_turn_with_retry",
+                side_effect=WirePreparationError("primary prep fault"),
+            ),
+            patch.object(session, "_try_fallback_lane", side_effect=[None, served]) as fb,
+        ):
+            from turnstone.core.session import _StreamTurnConsumer
+
+            consumer = _StreamTurnConsumer(session, 0)
+            result = session._model_turn_with_fallback(consumer, lambda w, lane: w, 0)
+
+        assert result is served
+        assert fb.call_count == 2
+        tracker.record_failure.assert_not_called()
+
+    def test_fallback_prep_fault_records_no_health(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+        registry = MagicMock()
+        registry.resolve_binding.return_value = (MagicMock(), "m", None, MagicMock(), None)
+        fb_tracker = MagicMock()
+        session._registry = registry
+        session._health_registry = MagicMock()
+        session._health_registry.get_tracker_for_alias.return_value = fb_tracker
+        with (
+            patch.object(session, "_build_main_lane", return_value=MagicMock()),
+            patch.object(
+                session,
+                "_model_turn_with_retry",
+                side_effect=WirePreparationError("fold blew up"),
+            ),
+        ):
+            from turnstone.core.session import _StreamTurnConsumer
+
+            consumer = _StreamTurnConsumer(session, 0)
+            out = session._try_fallback_lane("fb", consumer, lambda w, lane: w, 0)
+
+        assert out is None
+        fb_tracker.record_failure.assert_not_called()
+        assert any("Fallback fb also failed: WirePreparationError" in i for i in ui.of("info"))
 
 
 class TestDebugDumpLatch:

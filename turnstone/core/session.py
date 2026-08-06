@@ -143,6 +143,7 @@ from turnstone.core.model_turn import (
     ModelLane,
     ModelTurnResult,
     WirePreparationError,
+    caps_scan_inline_reasoning,
     create_provider,
     finalize_provider_blocks,
     folds_trailing_info,
@@ -1815,6 +1816,16 @@ def _tool_turn_meta(
 
 class BackendAuthUnavailableError(RuntimeError):
     """A fail-closed dynamic model credential could not be resolved."""
+
+
+# Errors that carry their own remediation and must surface AS THEMSELVES:
+# the re-issue ladder never masks them behind an earlier stream death.
+# (Walk policy stays per-class — an auth refusal aborts the walk, a
+# wire-preparation fault continues it — only the mask reads this set.)
+_SELF_SURFACING_ERRORS: tuple[type[Exception], ...] = (
+    BackendAuthUnavailableError,
+    WirePreparationError,
+)
 
 
 def _mint_refusal_cause(
@@ -4258,7 +4269,7 @@ class ChatSession:
             # (``server_parses_reasoning``): there a close tag in content
             # IS quoted prose, and cutting would eat a title that mentions
             # it.  See ``_TITLE_*``.
-            if not self._get_capabilities().server_parses_reasoning:
+            if caps_scan_inline_reasoning(self._get_capabilities()):
                 _cut = max(
                     (raw.rfind(_t) + len(_t) for _t in ThinkTagSplitter.CLOSE_TAGS if _t in raw),
                     default=0,
@@ -5753,9 +5764,8 @@ class ChatSession:
             return (
                 f"Preparing the request from this conversation's history failed: "
                 f"{detail}. This is a fault in the session's stored history, not "
-                f"in the {model_label} backend (no fallback was tried and backend "
-                f"health is unaffected). /compact may clear a malformed turn; "
-                f"please report this."
+                f"in the {model_label} backend (backend health is unaffected). "
+                f"/compact may clear a malformed turn; please report this."
             )
 
         # Context overflow — matched by text, because it arrives as BadRequestError
@@ -6257,18 +6267,16 @@ class ChatSession:
             # Explicit fail-closed policy: never reinterpret an authentication
             # refusal as backend health and never route it to a static fallback.
             raise
-        except WirePreparationError:
-            # No health record and no fallback walk: every lane would
-            # re-run the same deterministic passes, and N recorded
-            # failures would paint a cluster-wide outage over one
-            # session's malformed history.
-            raise
         except Exception as primary_err:
             if consumer.attempt_armed:
                 # Mid-stream death: the re-issue ladder owns it (UI finalize,
                 # backoff, discard, full re-create) — not the fallback walk.
                 raise
-            if tracker:
+            # A wire-preparation fault is the session's data, never backend
+            # health — but it DOES enter the walk: prepare runs per lane
+            # (fold posture follows lane.capabilities), so another lane's
+            # posture may serve a turn the primary's could not.
+            if tracker and not isinstance(primary_err, WirePreparationError):
                 tracker.record_failure()
             if not self._registry or not self._registry.fallback:
                 raise
@@ -6335,15 +6343,16 @@ class ChatSession:
             return self._model_turn_with_retry(
                 fb_lane, fb_tracker, consumer, prepare_wire, my_generation
             )
-        except (BackendAuthUnavailableError, WirePreparationError):
-            # An auth refusal is fail-closed policy and a wire-preparation
-            # failure is the caller's data bug: neither is this fallback's
-            # health signal.
+        except BackendAuthUnavailableError:
+            # Fail-closed policy — never another lane's business.
             raise
         except Exception as fb_err:
             if consumer.attempt_armed:
                 raise
-            if fb_tracker:
+            # This lane's wire-preparation fault is not its health signal,
+            # and it must not abort the walk: prepare is lane-variant, so
+            # the next alias may still serve the turn.
+            if fb_tracker and not isinstance(fb_err, WirePreparationError):
                 fb_tracker.record_failure()
             # Class name only in the UI line: a ConnectError's text can
             # carry a credential-bearing base_url, and this string lands in
@@ -8354,7 +8363,7 @@ class ChatSession:
                     # base_url verbatim.
                     if (
                         last_stream_death is None
-                        or isinstance(e, (BackendAuthUnavailableError, WirePreparationError))
+                        or isinstance(e, _SELF_SURFACING_ERRORS)
                         or _is_ctx_overflow(e)
                     ):
                         raise

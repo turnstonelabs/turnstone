@@ -2122,7 +2122,7 @@ class SessionUIBase:
         #     sibling or the ``__budget_override__`` pseudo-tool makes
         #     candidates < pending, AND
         #   - call_ids must be unique — some local models emit duplicate
-        #     non-empty tool-call ids (``_ensure_tool_call_ids`` only fills
+        #     non-empty tool-call ids (``model_turn.ensure_tool_call_ids`` only fills
         #     MISSING ones), which collapse in the ``needed`` set and would let
         #     one verdict clear two distinct calls (their args differ).
         # Either mismatch → hold the whole batch for a human.  Checked
