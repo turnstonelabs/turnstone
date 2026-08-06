@@ -837,7 +837,12 @@ class TestRecreateWindowClassification:
         provider.create_streaming.assert_not_called()
         errors = ui.of("error")
         assert errors and "stored history" in errors[-1]
-        assert "malformed turn 7" in errors[-1]
+        # Reached the dedicated branch — identified by the cause's CLASS.
+        # Its message is withheld all the way through the live send path:
+        # it is our lowering's text over stored history, and this string
+        # is persisted (see TestWirePrepFaultRedaction).
+        assert "ValueError" in errors[-1]
+        assert "malformed turn 7" not in errors[-1]
 
     def test_fallback_prep_fault_continues_walk(self, tmp_db):
         """A prep fault on one lane must not abort the walk: the next
@@ -949,6 +954,37 @@ class TestFallbackFailureRedaction:
         infos = ui.of("info")
         assert any("Fallback fb also failed: ConnectError" in i for i in infos)
         assert not any("SECRETKEY" in i for i in infos)
+
+
+class TestWirePrepFaultRedaction:
+    def test_operator_text_carries_the_cause_class_only(self, tmp_db):
+        """A wire-prep fault renders its cause's CLASS, never its message.
+
+        Every other branch of the formatter tails the backend's own
+        diagnostic text, which is what the operator needs.  This one is
+        different in kind: ``prepare_wire`` is our lowering over the
+        session's STORED HISTORY, so its exception message can quote that
+        history — and this string is both shown to the operator and
+        persisted to ``last_error``, which a coordinating agent reads.
+        ``redact_credentials`` is a best-effort regex by its own
+        docstring, so it is no floor for arbitrary conversation text.
+        """
+        from turnstone.core.model_turn import WirePreparationError
+
+        session = _make_session(RecordingUI())
+        cause = ValueError("malformed block in turn 4: {'text': 'the user's private notes'}")
+        exc = WirePreparationError(str(cause))
+        exc.__cause__ = cause
+
+        rendered = session._format_backend_error(exc)
+
+        assert rendered is not None
+        assert "ValueError" in rendered
+        assert "private notes" not in rendered
+        assert "malformed block" not in rendered
+        # Still actionable: the operator learns what failed and what to try.
+        assert "stored history" in rendered
+        assert "/compact" in rendered
 
 
 class TestPrepareWireLaneCaps:
