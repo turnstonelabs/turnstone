@@ -29,4 +29,13 @@ tools/skill_audit_analysis/output/
 design_ideas/
 .claude/
 docs/design/
+
+override.compose.yaml
+deploy/auto-deployment/compose.yaml
+deploy/auto-deployment/tls.compose.yaml
+deploy/auto-deployment/Caddyfile
+deploy/auto-deployment/caddy/
+deploy/auto-deployment/config/
+deploy/auto-deployment/searxng/
+deploy/auto-deployment/setup-production.env
 /.idea
