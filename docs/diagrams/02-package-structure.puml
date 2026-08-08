@@ -18,6 +18,7 @@ skinparam component {
 package "Entry Points" <<Rectangle>> {
     component [cli.py\nturnstone] as cli <<entry>>
     component [server.py\nturnstone-server] as server <<entry>>
+    component [console/server.py\nturnstone-console] as consoleentry <<entry>>
     component [eval.py\nturnstone-eval] as eval <<entry>>
     component [admin.py\nturnstone-admin] as admin <<entry>>
     component [bootstrap.py\nturnstone-bootstrap] as bootstrap <<entry>>
@@ -25,9 +26,16 @@ package "Entry Points" <<Rectangle>> {
 
 ' Core engine
 package "turnstone/core/" <<Rectangle>> {
-    component [session.py\nChatSession, SessionUI] as session <<core>>
+    component [session.py\nChatSession, SessionUI\ngeneration-fenced turn loop] as session <<core>>
+    component [session_manager.py\nSessionManager\nshared lifecycle invariants] as sessionmanager <<core>>
+    component [adapters/\ninteractive + coordinator\nconstruction/event policies] as adapters <<core>>
+    component [model_turn.py\nModelLane, model_turn()\nlower / sample / re-ingest] as modelturn <<core>>
+    component [trajectory.py\ncanonical Turn IR] as trajectory <<core>>
+    component [lowering.py\nprovider-wire lowering] as lowering <<core>>
+    component [state_writer.py\nordered durable state tail] as statewriter <<core>>
+    component [model_backend_auth.py\nper-call backend credentials] as modelauth <<core>>
     component [providers/\nLLMProvider, OpenAI, Anthropic, Google] as providers <<core>>
-    component [workstream.py\nWorkstreamManager] as workstream <<core>>
+    component [workstream.py\nWorkstream types + state] as workstream <<core>>
     component [tools.py\nTool loader] as tools <<core>>
     component [memory.py\nPersistence facade] as memory <<core>>
     component [storage/\nStorageBackend protocol\nSQLite + PostgreSQL] as storage <<core>>
@@ -79,18 +87,18 @@ package "turnstone/api/" <<Rectangle>> {
 package "turnstone/sdk/" <<Rectangle>> {
     component [server.py\nTurnstoneServer (sync+async)] as sdkserver <<sdk>>
     component [console.py\nTurnstoneConsole (sync+async)] as sdkconsole <<sdk>>
-    component [events.py\n27 SSE event types] as sdkevents <<sdk>>
+    component [events.py\nTyped SSE event stream] as sdkevents <<sdk>>
     component [_base.py\nhttpx client base] as sdkbase <<sdk>>
 }
 
 ' Tool schemas
 package "turnstone/tools/" <<Rectangle>> {
-    component [*.json\n19 tool schemas] as schemas <<artifact>>
+    component [*.json\nBuilt-in tool schemas] as schemas <<artifact>>
 }
 
 ' Entry point dependencies
 cli --> session
-cli --> workstream
+cli --> sessionmanager
 cli --> config
 cli --> memory
 cli --> colors
@@ -99,7 +107,8 @@ cli --> spinner
 cli --> tools
 
 server --> session
-server --> workstream
+server --> sessionmanager
+server --> adapters
 server --> config
 server --> memory
 server --> metrics
@@ -113,11 +122,26 @@ eval --> memory
 eval --> config
 eval --> tools
 
+consoleentry --> sessionmanager
+consoleentry --> adapters
+consoleentry --> consoleserver
+
 admin --> auth
 bootstrap --> providers
 
 ' Core internal deps
-session --> providers
+sessionmanager --> workstream
+sessionmanager --> adapters
+sessionmanager --> storage
+adapters --> session : constructs
+session --> modelturn
+session --> trajectory
+session --> lowering
+session --> statewriter
+session --> modelauth
+modelturn --> providers
+modelturn --> trajectory
+modelturn --> lowering
 session --> tools
 session --> memory
 memory --> storage
@@ -129,6 +153,7 @@ session --> mcp : optional
 session --> toolsearch : optional
 session --> registry : optional
 registry --> providers
+modelturn --> registry : coherent snapshot
 healthcheck --> metrics
 mcp --> config
 registry --> config
@@ -138,15 +163,17 @@ tools --> schemas
 gateway --> discordbot
 gateway --> slackbot
 gateway --> router
-discordbot --> sdkserver : HTTP + SSE
-slackbot --> sdkserver : HTTP + SSE
+discordbot --> sdkserver : direct HTTP + node SSE
+slackbot --> sdkserver : direct HTTP + node SSE
+router --> sdkserver : single-node/direct mode
+router --> sdkconsole : multi-node route/create/live
 router --> storage : channel_routes
 
 ' Console dependencies
 consoleserver --> collector
 consoleserver --> config
 consoleserver --> auth
-collector --> server : HTTP polling
+collector --> server : discovery HTTP + cluster SSE aggregation
 
 ' API dependencies
 serverspec --> openapi

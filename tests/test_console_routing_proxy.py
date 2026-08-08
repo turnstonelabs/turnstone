@@ -31,6 +31,9 @@ def _test_jwt() -> str:
 
 
 _TEST_AUTH_HEADERS: dict[str, str] = {"Authorization": f"Bearer {_test_jwt()}"}
+_DEST_WS_ID = "a" * 32
+_FORK_DEST_WS_ID = "b" * 32
+_RETRY_DEST_WS_ID = "c" * 32
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -59,6 +62,7 @@ def _make_mock_router(ready: bool = True) -> MagicMock:
 def _make_app(
     collector: Any = None,
     router: Any = None,
+    auth_storage: Any = None,
 ) -> Any:
     from turnstone.console.server import _load_static, create_app
 
@@ -67,6 +71,7 @@ def _make_app(
         collector=collector or _make_mock_collector(),
         jwt_secret=_TEST_JWT_SECRET,
         router=router,
+        auth_storage=auth_storage,
     )
 
 
@@ -106,6 +111,28 @@ def _wire_proxy(app: Any, mock_post: MagicMock | None = None) -> None:
     app.state.proxy_client = mock_proxy
 
 
+def _wire_proxy_get(
+    app: Any,
+    *,
+    status_code: int = 200,
+    json_data: dict[str, Any] | None = None,
+    raw_content: bytes | None = None,
+) -> MagicMock:
+    """Attach a proxy client whose GET returns one deterministic response."""
+
+    async def _mock_get(*args: Any, **kwargs: Any) -> httpx.Response:
+        request = httpx.Request("GET", args[0] if args else "http://test")
+        if raw_content is not None:
+            return httpx.Response(status_code, content=raw_content, request=request)
+        return httpx.Response(status_code, json=json_data or {}, request=request)
+
+    mock_get = MagicMock(side_effect=_mock_get)
+    mock_proxy = MagicMock(spec=httpx.AsyncClient)
+    mock_proxy.get = mock_get
+    app.state.proxy_client = mock_proxy
+    return mock_get
+
+
 # ---------------------------------------------------------------------------
 # Tests — route_create
 # ---------------------------------------------------------------------------
@@ -118,7 +145,7 @@ class TestRouteCreate:
     def client(self):
         router = _make_mock_router()
         app = _make_app(router=router)
-        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": "abc123", "name": "test"}))
+        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": _DEST_WS_ID, "name": "test"}))
         client = TestClient(app, raise_server_exceptions=False)
         yield client
         client.close()
@@ -131,7 +158,7 @@ class TestRouteCreate:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["ws_id"] == "abc123"
+        assert data["ws_id"] == _DEST_WS_ID
 
     def test_route_create_injects_node_url(self, client):
         resp = client.post(
@@ -148,21 +175,31 @@ class TestRouteCreate:
         """resume_ws should route to the node that owns the old workstream."""
         router = _make_mock_router()
         router.route.return_value = NodeRef("node-b", "http://b:8080")
-        app = _make_app(router=router)
-        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": "old_ws_resumed", "name": "resumed"}))
+        storage = MagicMock()
+        storage.resolve_workstream.return_value = "d" * 32
+        app = _make_app(router=router, auth_storage=storage)
+        _wire_proxy(
+            app,
+            _make_proxy_post(json_data={"ws_id": _FORK_DEST_WS_ID, "name": "resumed"}),
+        )
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.post(
             "/v1/api/route/workstreams/new",
-            json={"resume_ws": "old_ws_id"},
+            json={"resume_ws": "saved-alias"},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
         data = resp.json()
         assert data["node_url"] == "http://b:8080"
         assert data["node_id"] == "node-b"
-        # route() should have been called with the old ws_id
-        router.route.assert_called_with("old_ws_id")
+        storage.resolve_workstream.assert_called_once_with("saved-alias")
+        router.route.assert_called_with("d" * 32)
+        router.remember_override.assert_called_once_with(
+            _FORK_DEST_WS_ID,
+            NodeRef("node-b", "http://b:8080"),
+        )
+        assert app.state.proxy_client.post.call_args.kwargs["json"]["resume_ws"] == "d" * 32
         client.close()
 
     def test_route_create_target_node(self):
@@ -219,17 +256,230 @@ class TestRouteCreate:
     def test_route_create_routing_strategy_resume(self):
         router = _make_mock_router()
         router.route.return_value = NodeRef("node-b", "http://b:8080")
-        app = _make_app(router=router)
-        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": "old_ws_resumed", "name": "resumed"}))
+        storage = MagicMock()
+        storage.resolve_workstream.return_value = "d" * 32
+        app = _make_app(router=router, auth_storage=storage)
+        _wire_proxy(
+            app,
+            _make_proxy_post(json_data={"ws_id": _FORK_DEST_WS_ID, "name": "resumed"}),
+        )
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post(
             "/v1/api/route/workstreams/new",
-            json={"resume_ws": "old_ws_id"},
+            json={"resume_ws": "source-alias"},
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
         assert resp.json()["routing_strategy"] == "resume"
         client.close()
+
+    @pytest.mark.anyio
+    async def test_python_sdk_decodes_live_route_create_response(self):
+        """Exercise the SDK against the actual ASGI route, not a mock transport."""
+        from turnstone.sdk.console import AsyncTurnstoneConsole
+
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": _DEST_WS_ID, "name": "sdk"}))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers=_TEST_AUTH_HEADERS,
+        ) as http_client:
+            sdk = AsyncTurnstoneConsole(httpx_client=http_client)
+            result = await sdk.route_create_workstream(name="sdk")
+
+        assert result.ws_id == _DEST_WS_ID
+        assert result.node_id == "node-a"
+        assert result.node_url == "http://a:8080"
+        assert result.routing_strategy == "rendezvous"
+
+    @pytest.mark.parametrize("payload", [[], "text", 7])
+    def test_route_create_rejects_non_object_json(self, client, payload):
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json=payload,
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Request body must be a JSON object"}
+
+    def test_route_create_rejects_json_null(self, client):
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            content=b"null",
+            headers={**_TEST_AUTH_HEADERS, "Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Request body must be a JSON object"}
+
+    @pytest.mark.parametrize(
+        ("field", "value", "error"),
+        [
+            ("resume_ws", 3, "resume_ws must be a string"),
+            ("resume_ws", "x" * 257, "resume_ws must be at most 256 characters"),
+            ("target_node", ["node-a"], "target_node must be a string"),
+            ("target_node", "bad/node", "invalid target_node format"),
+            ("ws_id", None, "ws_id must be a string"),
+            ("ws_id", "abc", "invalid ws_id format"),
+        ],
+    )
+    def test_route_create_validates_placement_field_shapes(self, client, field, value, error):
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={field: value},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 400
+        assert resp.json() == {"error": error}
+
+    def test_explicit_json_ws_id_is_preserved_and_routed_by_rendezvous(self):
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        post = _make_proxy_post(json_data={"ws_id": _DEST_WS_ID, "name": "fixed"})
+        _wire_proxy(app, post)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"ws_id": _DEST_WS_ID, "target_node": "node-a"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json()["routing_strategy"] == "rendezvous"
+        router.route.assert_called_once_with(_DEST_WS_ID)
+        router.generate_ws_id_for_node.assert_not_called()
+        assert post.call_args.kwargs["json"]["ws_id"] == _DEST_WS_ID
+
+    def test_resume_alias_missing_and_storage_uncertainty_are_bounded(self):
+        router = _make_mock_router()
+        storage = MagicMock()
+        storage.resolve_workstream.return_value = None
+        app = _make_app(router=router, auth_storage=storage)
+        _wire_proxy(app)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        missing = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"resume_ws": "missing-alias"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert missing.status_code == 404
+        assert missing.json() == {"error": "Workstream not found"}
+
+        storage.resolve_workstream.side_effect = RuntimeError("database details")
+        unavailable = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"resume_ws": "source-alias"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+        assert unavailable.status_code == 503
+        assert unavailable.json() == {"error": "Storage not available"}
+
+    def test_full_resume_id_wins_over_alias_shadow(self):
+        source_id = "a" * 32
+        shadow_id = "b" * 32
+        router = _make_mock_router()
+        storage = MagicMock()
+        storage.get_workstream.return_value = {"ws_id": source_id, "state": "idle"}
+        storage.resolve_workstream.return_value = shadow_id
+        app = _make_app(router=router, auth_storage=storage)
+        post = _make_proxy_post(json_data={"ws_id": _FORK_DEST_WS_ID, "name": "fork"})
+        _wire_proxy(app, post)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"resume_ws": source_id},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200, resp.text
+        storage.get_workstream.assert_any_call(source_id)
+        storage.resolve_workstream.assert_not_called()
+        router.route.assert_called_once_with(source_id)
+        assert post.call_args.kwargs["json"]["resume_ws"] == source_id
+
+    @pytest.mark.parametrize(
+        "upstream",
+        [
+            httpx.Response(200, content=b"not json"),
+            httpx.Response(200, json=[]),
+            httpx.Response(200, json={"name": "missing id"}),
+            httpx.Response(200, json={"ws_id": "not-a-workstream-id"}),
+            httpx.Response(200, json={"ws_id": _DEST_WS_ID}),
+            httpx.Response(200, json={"ws_id": _DEST_WS_ID, "name": 42}),
+        ],
+    )
+    def test_malformed_upstream_success_returns_bounded_502(self, upstream):
+        router = _make_mock_router()
+        app = _make_app(router=router)
+
+        async def _post(*args: Any, **kwargs: Any) -> httpx.Response:
+            upstream.request = httpx.Request("POST", args[0])
+            return upstream
+
+        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy.post = MagicMock(side_effect=_post)
+        app.state.proxy_client = mock_proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "Dispatch to node node-a failed"}
+
+    def test_returned_destination_is_binding_and_audit_authority(self, monkeypatch):
+        router = _make_mock_router()
+        storage = MagicMock()
+        storage.resolve_workstream.return_value = "d" * 32
+        storage.get_workstream.return_value = {"node_id": "stored-node"}
+        app = _make_app(router=router, auth_storage=storage)
+        _wire_proxy(
+            app,
+            _make_proxy_post(json_data={"ws_id": _FORK_DEST_WS_ID, "name": "fork"}),
+        )
+        audit = MagicMock()
+        monkeypatch.setattr("turnstone.console.server._emit_route_audit", audit)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"resume_ws": "source-alias"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json()["node_id"] == "stored-node"
+        storage.get_workstream.assert_called_once_with(_FORK_DEST_WS_ID)
+        audit.assert_called_once()
+        assert audit.call_args.args[2] == _FORK_DEST_WS_ID
+
+    def test_multipart_preallocated_id_reports_rendezvous(self):
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": _DEST_WS_ID, "name": "upload"}))
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            f"/v1/api/route/workstreams/new?ws_id={_DEST_WS_ID}",
+            data={"meta": json.dumps({"ws_id": _DEST_WS_ID})},
+            files={"file": ("a.txt", b"hello", "text/plain")},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json()["routing_strategy"] == "rendezvous"
+        router.route.assert_called_once_with(_DEST_WS_ID)
 
 
 class TestRouteCreate503Retry:
@@ -265,7 +515,7 @@ class TestRouteCreate503Retry:
                 )
             return httpx.Response(
                 200,
-                json={"ws_id": "retry_ws", "name": "retry"},
+                json={"ws_id": _RETRY_DEST_WS_ID, "name": "retry"},
                 request=httpx.Request("POST", args[0] if args else "http://test"),
             )
 
@@ -281,10 +531,29 @@ class TestRouteCreate503Retry:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["ws_id"] == "retry_ws"
+        assert data["ws_id"] == _RETRY_DEST_WS_ID
         assert data["node_id"] == "node-b"
         assert post_count == 2
         client.close()
+
+    def test_explicit_ws_id_is_not_replaced_or_retried_on_503(self):
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        post = _make_proxy_post(status_code=503, json_data={"error": "overloaded"})
+        _wire_proxy(app, post)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"ws_id": _DEST_WS_ID},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 503
+        assert post.call_count == 1
+        assert post.call_args.kwargs["json"]["ws_id"] == _DEST_WS_ID
+        router.route.assert_called_once_with(_DEST_WS_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +648,32 @@ class TestClusterCreate:
         assert mock_post.call_args.kwargs["json"]["persona"] == "scribe"
         client.close()
 
+    @pytest.mark.anyio
+    async def test_python_sdk_forwards_schema_contract_fields(self) -> None:
+        """Run the SDK through the live handler and inspect its upstream request."""
+        from turnstone.sdk.console import AsyncTurnstoneConsole
+
+        mock_post = _make_proxy_post(json_data={"ws_id": "contract-ws"})
+        app = self._app_with_node(mock_post)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers=_TEST_AUTH_HEADERS,
+        ) as http_client:
+            sdk = AsyncTurnstoneConsole(httpx_client=http_client)
+            result = await sdk.create_workstream(
+                node_id="node-a",
+                name="contract",
+                project_id="project-42",
+                judge_model="judge-fast",
+            )
+
+        assert result.correlation_id == "contract-ws"
+        forwarded = mock_post.call_args.kwargs["json"]
+        assert forwarded["project_id"] == "project-42"
+        assert forwarded["judge_model"] == "judge-fast"
+
 
 # ---------------------------------------------------------------------------
 # Tests — route_proxy
@@ -430,6 +725,38 @@ class TestRouteProxy:
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
+
+    @pytest.mark.parametrize(
+        ("content", "content_type"),
+        [
+            (b"", None),
+            (b"{", "application/json"),
+            (b"[]", "application/json"),
+        ],
+        ids=["empty", "malformed", "non-object"],
+    )
+    def test_route_proxy_cancel_normalizes_unusable_body(self, client, content, content_type):
+        headers = dict(_TEST_AUTH_HEADERS)
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        resp = client.post(
+            "/v1/api/route/workstreams/abc123/cancel",
+            content=content,
+            headers=headers,
+        )
+
+        assert resp.status_code == 200
+        assert client.app.state.proxy_client.request.call_args.kwargs["json"] == {}
+
+    def test_route_proxy_non_cancel_rejects_non_object_json(self, client):
+        resp = client.post(
+            "/v1/api/route/workstreams/abc123/send",
+            json=[],
+            headers=_TEST_AUTH_HEADERS,
+        )
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Request body must be a JSON object"}
 
     def test_route_proxy_command(self, client):
         resp = client.post(
@@ -562,6 +889,124 @@ class TestRouteLookup:
 
 
 # ---------------------------------------------------------------------------
+# Tests — route_workstream_live
+# ---------------------------------------------------------------------------
+
+
+class TestRouteWorkstreamLive:
+    """GET routed live probe reads the owner node's active manager list."""
+
+    def test_reports_exact_visible_active_row(self):
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        mock_get = _wire_proxy_get(
+            app,
+            json_data={
+                "workstreams": [
+                    {"ws_id": "other", "state": "idle"},
+                    {"ws_id": "ws-live", "state": "running"},
+                ]
+            },
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get(
+            "/v1/api/route/workstreams/ws-live/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ws_id": "ws-live", "live": True}
+        router.route.assert_called_once_with("ws-live")
+        assert mock_get.call_args.args[0] == "http://a:8080/v1/api/workstreams"
+
+    def test_false_miss_refreshes_stale_override_and_reprobes_new_owner(self):
+        router = _make_mock_router()
+        stale_ref = NodeRef("node-b", "http://b:8080")
+        owner_ref = NodeRef("node-a", "http://a:8080")
+        router.route.side_effect = [stale_ref, owner_ref]
+        app = _make_app(router=router)
+
+        async def _get(url: str, **_kwargs: Any) -> httpx.Response:
+            payload = (
+                {"workstreams": []}
+                if url.startswith(stale_ref.url)
+                else {"workstreams": [{"ws_id": "ws-live", "state": "idle"}]}
+            )
+            return httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+
+        proxy = MagicMock(spec=httpx.AsyncClient)
+        proxy.get = MagicMock(side_effect=_get)
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get(
+            "/v1/api/route/workstreams/ws-live/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ws_id": "ws-live", "live": True}
+        router.force_refresh.assert_called_once_with()
+        assert [call.args[0] for call in proxy.get.call_args_list] == [
+            "http://b:8080/v1/api/workstreams",
+            "http://a:8080/v1/api/workstreams",
+        ]
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            [],
+            [{"ws_id": "other", "state": "idle"}],
+            [{"ws_id": "ws-live", "state": "creating"}],
+        ],
+        ids=["missing-or-private", "different-row", "creating"],
+    )
+    def test_reports_false_without_exposing_non_live_rows(self, rows):
+        app = _make_app(router=_make_mock_router())
+        _wire_proxy_get(app, json_data={"workstreams": rows})
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get(
+            "/v1/api/route/workstreams/ws-live/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ws_id": "ws-live", "live": False}
+
+    def test_propagates_upstream_acl_failure(self):
+        app = _make_app(router=_make_mock_router())
+        _wire_proxy_get(
+            app,
+            status_code=403,
+            json_data={"error": "Forbidden"},
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get(
+            "/v1/api/route/workstreams/ws-live/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 403
+        assert resp.json() == {"error": "Forbidden"}
+
+    def test_malformed_active_list_fails_closed(self):
+        app = _make_app(router=_make_mock_router())
+        _wire_proxy_get(app, json_data={"unexpected": []})
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get(
+            "/v1/api/route/workstreams/ws-live/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 502
+        assert "invalid active list" in resp.json()["error"]
+
+
+# ---------------------------------------------------------------------------
 # Tests — not ready / no router -> 503
 # ---------------------------------------------------------------------------
 
@@ -614,6 +1059,13 @@ class TestRouteNotReady:
         resp = client_no_router.get("/v1/api/route?ws_id=abc", headers=_TEST_AUTH_HEADERS)
         assert resp.status_code == 503
 
+    def test_route_live_no_router_503(self, client_no_router):
+        resp = client_no_router.get(
+            "/v1/api/route/workstreams/abc/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 503
+
     def test_route_proxy_empty_cache_503(self, client_empty_cache):
         resp = client_empty_cache.post(
             "/v1/api/route/workstreams/abc/send",
@@ -624,6 +1076,13 @@ class TestRouteNotReady:
 
     def test_route_lookup_empty_cache_503(self, client_empty_cache):
         resp = client_empty_cache.get("/v1/api/route?ws_id=abc", headers=_TEST_AUTH_HEADERS)
+        assert resp.status_code == 503
+
+    def test_route_live_empty_cache_503(self, client_empty_cache):
+        resp = client_empty_cache.get(
+            "/v1/api/route/workstreams/abc/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
         assert resp.status_code == 503
 
 
@@ -664,4 +1123,11 @@ class TestRouteNoNode:
 
     def test_route_lookup_no_node_503(self, client):
         resp = client.get("/v1/api/route?ws_id=abc", headers=_TEST_AUTH_HEADERS)
+        assert resp.status_code == 503
+
+    def test_route_live_no_node_503(self, client):
+        resp = client.get(
+            "/v1/api/route/workstreams/abc/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
         assert resp.status_code == 503

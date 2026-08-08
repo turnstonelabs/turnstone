@@ -416,14 +416,28 @@ class TestDeleteWorkstream:
         """500 response should not leak exception internals."""
         client, _ = delete_client
         storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
-        with patch(
-            "turnstone.core.memory.delete_workstream",
+        with patch.object(
+            storage,
+            "delete_workstream_if_fork_reserved",
             side_effect=RuntimeError("secret internal detail"),
         ):
             r = client.post("/v1/api/workstreams/ws-abc/delete")
         assert r.status_code == 500
         assert "Delete failed" in r.json()["error"]
         assert "secret" not in r.json()["error"]
+
+    def test_delete_snapshot_error_redacted(self, delete_client, storage):
+        client, _ = delete_client
+        storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
+        with patch.object(
+            storage,
+            "ensure_workstream_incarnation_snapshot",
+            side_effect=RuntimeError("secret snapshot detail"),
+        ):
+            response = client.post("/v1/api/workstreams/ws-abc/delete")
+
+        assert response.status_code == 500
+        assert response.json() == {"error": "Delete failed"}
 
     def test_delete_fires_lifecycle_event_with_snapshotted_name(self, delete_client, storage):
         """The endpoint must call ``mgr.delete(ws_id, name=...)`` after a
@@ -457,6 +471,157 @@ class TestDeleteWorkstream:
         r = client.post("/v1/api/workstreams/ws-flaky/delete")
         assert r.status_code == 200
         assert r.json()["deleted"] == "ws-flaky"
+
+    def test_delete_does_not_erase_same_id_replacement_after_authorization(
+        self,
+        delete_client,
+        storage,
+        monkeypatch,
+    ):
+        """The authorized row's private token, not just its ID, fences delete."""
+        client, _ = delete_client
+        ws_id = "ws-delete-aba"
+        original_token = "original-incarnation"
+        replacement_token = "replacement-incarnation"
+        storage.register_workstream(
+            ws_id,
+            "node-1",
+            name="authorized-original",
+            user_id="test-user",
+            fork_reservation_token=original_token,
+        )
+
+        delete_admitted = threading.Event()
+        release_delete = threading.Event()
+        original_delete = storage.delete_workstream_if_fork_reserved
+
+        def _blocked_exact_delete(candidate_id: str, token: str) -> bool:
+            assert candidate_id == ws_id
+            assert token == original_token
+            delete_admitted.set()
+            assert release_delete.wait(timeout=10), "test did not install replacement"
+            return original_delete(candidate_id, token)
+
+        monkeypatch.setattr(
+            storage,
+            "delete_workstream_if_fork_reserved",
+            _blocked_exact_delete,
+        )
+        responses: list[httpx.Response] = []
+
+        request_thread = threading.Thread(
+            target=lambda: responses.append(client.post(f"/v1/api/workstreams/{ws_id}/delete")),
+            daemon=True,
+        )
+        request_thread.start()
+        assert delete_admitted.wait(timeout=5), "request never reached exact delete"
+        try:
+            # The request authorized the original snapshot. Replace it with a
+            # different owner + incarnation before the conditional delete.
+            storage.delete_workstream(ws_id)
+            assert storage.register_workstream(
+                ws_id,
+                "node-2",
+                name="replacement",
+                user_id="other-user",
+                fork_reservation_token=replacement_token,
+            )
+        finally:
+            release_delete.set()
+        request_thread.join(timeout=5)
+
+        assert not request_thread.is_alive()
+        assert len(responses) == 1
+        assert responses[0].status_code == 404
+        replacement = storage.get_workstream(ws_id)
+        assert replacement is not None
+        assert replacement["name"] == "replacement"
+        assert replacement["user_id"] == "other-user"
+        assert storage.get_workstream_reservation_token(ws_id) == replacement_token
+
+    @pytest.mark.parametrize("loaded", [False, True])
+    def test_delete_claims_legacy_incarnation_before_replacement_race(
+        self,
+        delete_client,
+        storage,
+        monkeypatch,
+        loaded: bool,
+    ):
+        """Tokenless legacy rows gain a fence before ACL and exact delete."""
+        from tests.test_session_manager import _make_manager
+
+        client, app = delete_client
+        ws_id = f"ws-delete-legacy-{'loaded' if loaded else 'saved'}"
+        replacement_token = "replacement-incarnation"
+        storage.register_workstream(
+            ws_id,
+            "node-1",
+            name="authorized-legacy",
+            user_id="test-user",
+        )
+        mgr = None
+        if loaded:
+            mgr, _adapter, _storage = _make_manager(storage=storage)
+            incumbent = mgr.open(ws_id)
+            assert incumbent is not None
+            app.state.workstreams = mgr
+
+        delete_admitted = threading.Event()
+        release_delete = threading.Event()
+        captured_tokens: list[str] = []
+        original_delete = storage.delete_workstream_if_fork_reserved
+
+        def _blocked_exact_delete(candidate_id: str, token: str) -> bool:
+            assert candidate_id == ws_id
+            assert token
+            assert token != replacement_token
+            captured_tokens.append(token)
+            delete_admitted.set()
+            assert release_delete.wait(timeout=10), "test did not install replacement"
+            return original_delete(candidate_id, token)
+
+        monkeypatch.setattr(
+            storage,
+            "delete_workstream_if_fork_reserved",
+            _blocked_exact_delete,
+        )
+        responses: list[httpx.Response] = []
+        request_thread = threading.Thread(
+            target=lambda: responses.append(client.post(f"/v1/api/workstreams/{ws_id}/delete")),
+            daemon=True,
+        )
+        request_thread.start()
+        assert delete_admitted.wait(timeout=5), "request never reached exact delete"
+        try:
+            # The endpoint has atomically installed a private token and
+            # authorized that snapshot. Replacing the row now must only make
+            # its conditional delete lose.
+            assert storage.delete_workstream(ws_id) is True
+            assert storage.register_workstream(
+                ws_id,
+                "node-2",
+                name="replacement",
+                user_id="other-user",
+                fork_reservation_token=replacement_token,
+            )
+        finally:
+            release_delete.set()
+        request_thread.join(timeout=5)
+
+        assert not request_thread.is_alive()
+        assert len(captured_tokens) == 1
+        assert len(responses) == 1
+        assert responses[0].status_code == 404
+        replacement = storage.get_workstream(ws_id)
+        assert replacement is not None
+        assert replacement["name"] == "replacement"
+        assert replacement["user_id"] == "other-user"
+        assert "fork_reservation_token" not in replacement
+        assert storage.get_workstream_reservation_token(ws_id) == replacement_token
+        if mgr is not None:
+            # A failed exact delete proves the loaded object is a predecessor;
+            # retire it silently instead of serving it over the replacement.
+            assert mgr.get(ws_id) is None
 
 
 # ===========================================================================
@@ -545,7 +710,10 @@ class TestRefreshWorkstreamTitle:
         with patch("turnstone.core.memory.get_workstream_display_name", return_value="Old Title"):
             r = client.post("/v1/api/workstreams/ws-abc/refresh-title")
         assert r.status_code == 200
-        mock_ws.session.request_title_refresh.assert_called_once_with("Old Title")
+        mock_ws.session.request_title_refresh.assert_called_once_with(
+            "Old Title",
+            principal_id="test-user",
+        )
 
     def test_refresh_not_found(self, title_client):
         client, mock_mgr = title_client

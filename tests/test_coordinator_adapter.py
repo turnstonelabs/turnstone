@@ -13,7 +13,11 @@ import threading
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from turnstone.console.coordinator_adapter import CoordinatorAdapter
+from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+from turnstone.core.session_manager import SessionManager
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 
@@ -159,6 +163,109 @@ def test_emit_state_calls_collector_state() -> None:
         activity_state="",
         content="",
     )
+
+
+@pytest.mark.parametrize("takeover", ["successor", "close"])
+def test_deferred_stale_state_does_not_consume_coordinator_content(
+    takeover: str,
+) -> None:
+    """Only a still-current state tail may drain the rich content payload."""
+    write_started = threading.Event()
+    release_write = threading.Event()
+    first_idle = True
+    write_lock = threading.Lock()
+    storage = MagicMock()
+    storage.get_workstream.return_value = None
+
+    def update_state(_ws_id: str, state: str) -> None:
+        nonlocal first_idle
+        should_block = False
+        with write_lock:
+            if state == WorkstreamState.IDLE.value and first_idle:
+                first_idle = False
+                should_block = True
+        if should_block:
+            write_started.set()
+            if not release_write.wait(2):
+                raise RuntimeError("test predecessor state write was not released")
+
+    storage.update_workstream_state.side_effect = update_state
+    ui = ConsoleCoordinatorUI(ws_id="coord-content")
+    adapter, collector = _make_adapter(ui_factory=lambda _ws: ui)
+    manager = SessionManager(
+        adapter,
+        storage=storage,
+        max_active=1,
+        event_emitter=adapter,
+    )
+    adapter.attach(manager)
+    ws = manager.create(user_id="u1", ws_id="coord-content")
+    collector.emit_console_ws_state.reset_mock()
+
+    content = "payload belongs to the current state transition"
+    with ui._ws_lock:
+        ui._ws_turn_content = [content]
+        ui._ws_turn_content_size = len(content)
+
+    predecessor_tail: list[Any] = []
+    assert manager.set_state_deferred(
+        ws.id,
+        WorkstreamState.IDLE,
+        deferred_persistence=predecessor_tail,
+    )
+    assert len(predecessor_tail) == 1
+    errors: list[BaseException] = []
+
+    def run_predecessor_tail() -> None:
+        try:
+            predecessor_tail[0]()
+        except BaseException as exc:
+            errors.append(exc)
+
+    predecessor = threading.Thread(target=run_predecessor_tail)
+    predecessor.start()
+    successor_tail: list[Any] = []
+    try:
+        assert write_started.wait(2)
+        if takeover == "successor":
+            assert manager.set_state_deferred(
+                ws.id,
+                WorkstreamState.IDLE,
+                deferred_persistence=successor_tail,
+            )
+            assert len(successor_tail) == 1
+        else:
+            assert manager.close(ws.id) is True
+
+        # Admission/close invalidated the predecessor, but neither path has
+        # consumed the terminal-state payload while its DB write is blocked.
+        with ui._ws_lock:
+            assert ui._ws_turn_content == [content]
+        collector.emit_console_ws_state.assert_not_called()
+        release_write.set()
+    finally:
+        release_write.set()
+        predecessor.join(2)
+
+    assert not predecessor.is_alive()
+    assert errors == []
+    collector.emit_console_ws_state.assert_not_called()
+    with ui._ws_lock:
+        assert ui._ws_turn_content == [content]
+
+    if takeover == "successor":
+        successor_tail[0]()
+        collector.emit_console_ws_state.assert_called_once_with(
+            ws.id,
+            WorkstreamState.IDLE.value,
+            tokens=0,
+            context_ratio=0.0,
+            activity="",
+            activity_state="",
+            content=content,
+        )
+        with ui._ws_lock:
+            assert ui._ws_turn_content == []
 
 
 def test_emit_closed_calls_collector_closed() -> None:

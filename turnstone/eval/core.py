@@ -32,7 +32,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from turnstone.core.model_turn import cap_tool_calls, model_turn, resolve_lane
+from turnstone.core.model_turn import cap_tool_calls, model_turn, require_lane_capabilities
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
@@ -334,17 +334,15 @@ class HeadlessSession(ChatSession):
         """
         self.tool_call_log = []
 
-        # The eval lane — resolved once per run, like the sub-agent seam.
-        # ``temperature`` relays the harness's operator-resolved knob per
-        # call below (house rule: relay, never pin).
-        lane = resolve_lane(
-            self._provider,
-            self.client,
-            self.model,
-            alias=self._model_alias or "",
-            registry=self._registry,
-            capabilities=self._get_capabilities(),
-        )
+        # Pin one immutable semantic primary-lane snapshot for the whole eval
+        # run, like the sub-agent seam.  A concurrent session rebind must not
+        # splice a different provider/model/config into one measured tool loop;
+        # retirement of the old registry client may abort the run instead.  The
+        # same lane's capabilities drive every full-history wire fold below.
+        # ``temperature`` relays the harness's operator-resolved knob per call
+        # (house rule: relay, never pin).
+        lane = self._primary_lane()
+        lane_caps = require_lane_capabilities(lane)
 
         for turn in range(max_turns):
             if self._cancelled.is_set():
@@ -367,7 +365,9 @@ class HeadlessSession(ChatSession):
             # ("System message must be at the beginning") by another,
             # and either way the nudge eval was measuring the wrong
             # stimulus.
-            turns = turns_from_dicts(self._prepare_wire_messages(self._full_messages()))
+            turns = turns_from_dicts(
+                self._prepare_wire_messages(self._full_messages(), caps=lane_caps)
+            )
 
             if self._cancelled.is_set():
                 break

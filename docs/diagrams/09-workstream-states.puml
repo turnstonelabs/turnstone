@@ -3,6 +3,7 @@
 title Turnstone — Workstream State Machine
 
 skinparam state {
+    BackgroundColor<<lifecycle>> #ECEFF1
     BackgroundColor<<idle>> #E8F5E9
     BackgroundColor<<thinking>> #E3F2FD
     BackgroundColor<<running>> #FFF3E0
@@ -10,13 +11,18 @@ skinparam state {
     BackgroundColor<<error>> #FFCDD2
 }
 
+state "CREATING (persisted only)" as creating <<lifecycle>> : Hidden durable reservation.\nNot returned by ordinary list/open/history.
 state "IDLE" as idle <<idle>> : Waiting for user input.\nNo active LLM call or tool execution.
 state "THINKING" as thinking <<thinking>> : LLM streaming response.\nTokens flowing (reasoning + content).
 state "RUNNING" as running <<running>> : Tools executing.\nThreadPoolExecutor active.
 state "ATTENTION" as attention <<attention>> : Blocked on user action.\nTool approval needed.
 state "ERROR" as error <<error>> : Exception occurred.\nRecoverable on next send().
+state "CLOSED (persisted only)" as closed <<lifecycle>> : Unloaded, explicitly reopenable row.\nNot a live WorkstreamState member.
 
-[*] --> idle : Session created
+[*] --> creating : register exact incarnation\nstate="creating"
+creating --> idle : finalize + publish create\nemit ws_created
+creating --> [*] : immediate exact-token rollback\n(no lifecycle birth emitted)
+creating --> [*] : stale >2h recovery\natomic hard delete; no close event
 
 idle --> thinking : send() called\n_emit_state("thinking")
 
@@ -38,6 +44,14 @@ running --> error : Exception during\ntool execution
 
 error --> thinking : New send() call\n_emit_state("thinking")
 
+idle --> closed : close / eviction
+error --> closed : close
+thinking --> closed : close
+running --> closed : close
+attention --> closed : close
+closed --> [*] : hard delete
+closed --> idle : open / rehydrate
+
 thinking --> idle : cancel() called\nstream aborted\n_emit_state("idle")
 
 running --> idle : cancel() called\n_emit_state("idle")
@@ -45,33 +59,75 @@ running --> idle : cancel() called\n_emit_state("idle")
 attention --> idle : cancel() unblocks\napproval wait\n_emit_state("idle")
 
 note left of idle
-  **Cancel escalation:**
-  1. **Cooperative**: cancel() sets event + closes
-     SDK stream → worker exits at next checkpoint
-  2. **Force**: force=true abandons the worker
-     thread, emits stream_end immediately.
-     Orphaned thread still kills subprocesses
-     but skips message mutations (generation
-     counter prevents stale writes).
+  **Generation-scoped Stop:**
+  • Sets the active generation event.
+  • Closes its SDK stream; aborts child model
+    scopes and judges; kills subprocess groups.
+  • Sweeps every approval cycle owned by the
+    cancelled workstream operation.
+  • Every later send/model live or durable commit
+    re-checks generation ownership.
+
+  **force=true:** also abandons the stuck worker
+  slot and emits stream_end + IDLE immediately.
+  An orphaned send/model generation may unwind
+  but cannot publish into a successor generation.
+  Quick slash-command workers are a best-effort
+  escape hatch: without generation checkpoints,
+  one may finish an in-place mutation concurrently.
+
+  **Capacity eviction:** an IDLE candidate is only
+  a hint. Per-ID + object lifecycle lanes and the
+  workstream lock revalidate it as worker- and
+  send-barrier-free,
+  then install a terminal claim before slot swap.
 end note
 
 note right of thinking
   **Emitted via:**
   session._emit_state(state)
     → ui.on_state_change(state)
+    → SessionManager state tail
 
   **Propagation:**
   • WebUI → global SSE queue (ws_state)
-  • Console → HTTP polling picks up state
-  • CLI → WorkstreamManager.set_state()
+  • Console → cluster event / HTTP state
+  • CLI → SessionManager.set_state()
+
+  Non-terminal persistence may use StateWriter;
+  a per-id tail orders storage + subscribers and
+  prevents a late state from overwriting CLOSED.
 end note
 
 note left of attention
   **Blocking mechanisms:**
   • TerminalUI: input() prompt
-  • WebUI: threading.Event.wait()
+  • WebUI: one Event per ApprovalCycle
   • ChannelBot: SSE event + Discord button
   • NullUI: auto-approve (never reaches)
+end note
+
+note right of creating
+  CREATING and CLOSED are storage lifecycle
+  values, not members of WorkstreamState. The
+  live enum remains IDLE / THINKING / RUNNING /
+  ATTENTION / ERROR.
+
+  **Crash-abandoned CREATING recovery:**
+  • Boot pass, then every 5 min even when idle
+    eviction is disabled.
+  • Only rows >2h old; manager loaded/pending
+    IDs and live remote owners are protected.
+  • The current stable node ID is not a live-owner
+    exemption, allowing restart recovery.
+  • Unknown liveness/storage fails closed. Deletion
+    is atomic across dependents and attachment refs.
+  • Tokenless legacy/corrupt rows are locked,
+    reaped, and logged with a warning.
+
+  A loaded hard delete closes publication, drains
+  admitted session durability + state tails, then
+  conditionally removes the exact durable token.
 end note
 
 @enduml

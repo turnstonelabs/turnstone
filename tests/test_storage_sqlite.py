@@ -363,6 +363,124 @@ class TestSaveMessagesBulk:
         updated_after = rows_after[0][5]
         assert updated_after >= updated_before
 
+    def test_bulk_missing_attachment_rolls_back_rows_and_refcount(self, backend):
+        backend.register_workstream("s1")
+        existing_id = "a" * 64
+        missing_id = "b" * 64
+        backend.save_attachment(existing_id, "known.txt", "text/plain", 5, "text", b"known")
+
+        with pytest.raises(ValueError, match="cannot retain missing attachment blobs"):
+            backend.save_messages_bulk(
+                [
+                    {
+                        "ws_id": "s1",
+                        "role": "user",
+                        "content": "known attachment",
+                        "attachment_ids": [existing_id],
+                    },
+                    {
+                        "ws_id": "s1",
+                        "role": "user",
+                        "content": "missing attachment",
+                        "attachment_ids": [missing_id],
+                    },
+                ]
+            )
+
+        assert backend.load_messages("s1") == []
+        existing = backend.get_attachment(existing_id)
+        assert existing is not None
+        assert existing["refcount"] == 1
+
+    def test_bulk_insert_failure_rolls_back_retained_refcount(self, backend):
+        """A failure after retention rolls back the increment with the rows."""
+        backend.register_workstream("s1")
+        attachment_id = "c" * 64
+        backend.save_attachment(
+            attachment_id,
+            "known.txt",
+            "text/plain",
+            5,
+            "text",
+            b"known",
+        )
+
+        with pytest.raises(sa.exc.IntegrityError):
+            backend.save_messages_bulk(
+                [
+                    {
+                        "ws_id": "s1",
+                        "role": None,
+                        "content": "invalid role",
+                        "attachment_ids": [attachment_id],
+                    }
+                ]
+            )
+
+        assert backend.load_messages("s1") == []
+        existing = backend.get_attachment(attachment_id)
+        assert existing is not None
+        assert existing["refcount"] == 1
+
+    def test_bulk_attachment_ownership_and_refcount_balance(self, backend):
+        import json
+
+        from turnstone.core.storage._schema import conversations
+
+        source_ws = "source"
+        fork_ws = "fork"
+        attachment_id = "c" * 64
+        backend.register_workstream(source_ws)
+        backend.register_workstream(fork_ws)
+        source_message_id = backend.save_message(source_ws, "user", "original")
+        backend.save_attachment(
+            attachment_id,
+            "shared.txt",
+            "text/plain",
+            6,
+            "text",
+            b"shared",
+        )
+        backend.set_message_attachments(source_ws, source_message_id, [attachment_id])
+
+        backend.save_messages_bulk(
+            [
+                {
+                    "ws_id": fork_ws,
+                    "role": "user",
+                    "content": "first copy",
+                    "attachment_ids": [attachment_id],
+                },
+                {
+                    "ws_id": fork_ws,
+                    "role": "user",
+                    "content": "second copy",
+                    "attachment_ids": [attachment_id],
+                },
+            ]
+        )
+
+        attachment = backend.get_attachment(attachment_id)
+        assert attachment is not None
+        assert attachment["refcount"] == 3
+        with backend._conn() as conn:
+            copied_rows = conn.execute(
+                sa.select(conversations.c.content, conversations.c.attachments)
+                .where(conversations.c.ws_id == fork_ws)
+                .order_by(conversations.c.id)
+            ).all()
+        assert [(content, json.loads(refs)) for content, refs in copied_rows] == [
+            ("first copy", [attachment_id]),
+            ("second copy", [attachment_id]),
+        ]
+
+        assert backend.delete_workstream(source_ws) is True
+        attachment = backend.get_attachment(attachment_id)
+        assert attachment is not None
+        assert attachment["refcount"] == 2
+        assert backend.delete_workstream(fork_ws) is True
+        assert backend.get_attachment(attachment_id) is None
+
 
 class TestListWorkstreamsWithHistory:
     def test_lists_workstreams_with_messages(self, backend):

@@ -34,7 +34,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from tests._session_helpers import RecordingUI, make_session, scripted_provider
+from tests._session_helpers import (
+    RecordingUI,
+    make_session,
+    replace_session_lane,
+    scripted_provider,
+)
 from turnstone.core.providers._protocol import StreamChunk, ToolCallDelta, UsageInfo
 from turnstone.core.trajectory import Turn
 
@@ -171,7 +176,7 @@ def run_scenario(name: str) -> dict[str, Any]:
     # exponential delays in a unit run.  The retry-notice transform in
     # test_832_parity hardcodes the matching "0s" wording.
     session._RETRY_BASE_DELAY = 0
-    session._provider = scripted_provider(SCENARIOS[name])
+    replace_session_lane(session, provider=scripted_provider(SCENARIOS[name]))
 
     pre_fold = "msgs" in inspect.signature(type(session)._stream_response).parameters
     record: dict[str, Any] = {"scenario": name}

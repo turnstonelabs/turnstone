@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
@@ -22,6 +23,13 @@ if TYPE_CHECKING:
 #: it) agree on ONE set that cannot drift.
 USER_SCOPED_AUTH_TYPES: frozenset[str] = frozenset({"oauth_user", "oauth_obo"})
 
+# Internal durable-incarnation fence. New manager rows receive it at
+# registration; legacy rows receive one atomically when an exact delete/fork
+# snapshot is claimed. It lives in ``workstream_config`` so row + fence can be
+# installed without a schema change. Clone and publication retain it for ABA
+# protection; public config reads/writes and fork snapshots always exclude it.
+FORK_RESERVATION_CONFIG_KEY = "__fork_destination_reservation"
+
 
 class StorageConflictError(Exception):
     """Raised by storage methods when a unique-constraint violation occurs.
@@ -31,6 +39,57 @@ class StorageConflictError(Exception):
     conflicted (e.g. ``"users.username"`` vs ``"oidc_identities.PRIMARY"``)
     when the backend can distinguish them.
     """
+
+
+class ForkCloneError(RuntimeError):
+    """Base class for an atomic workstream-clone refusal."""
+
+
+class ForkSourceUnavailableError(ForkCloneError):
+    """The source is missing, inaccessible, or no longer safely cloneable.
+
+    Missing and authorization-denied sources deliberately share one exception
+    so an API caller cannot use the fork path as a private-workstream oracle.
+    """
+
+
+class ForkDestinationConflictError(ForkCloneError):
+    """The destination is missing, belongs to another principal, or is non-empty."""
+
+
+@dataclass(frozen=True, slots=True)
+class ForkCloneExpectation:
+    """Construction-time session envelope a fork transaction must still match.
+
+    Fork creation constructs the destination session before the storage clone
+    runs because persona MCP gating and project-memory wiring happen in the
+    constructor.  The source can change between that preflight and the clone.
+    Carrying this immutable witness into the transaction makes such drift a
+    retryable source refusal instead of committing history under a stale live
+    security envelope. Source and destination incarnation tokens additionally
+    fence delete/re-register reuse of either caller-known id.
+    """
+
+    persona_config: tuple[tuple[str, str], ...]
+    project_id: str
+    project_name: str
+    project_writable: bool
+    destination_reservation_token: str
+    source_reservation_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class ForkCloneSnapshot:
+    """Canonical source state committed by :meth:`StorageBackend.clone_workstream`.
+
+    ``turns`` is the same recovered, checkpoint-bounded trajectory a resume
+    loads. ``config`` and ``project_id`` are the source values installed on the
+    destination in the same transaction.
+    """
+
+    turns: tuple[Turn, ...]
+    config: dict[str, str]
+    project_id: str | None
 
 
 class OIDCIdentity(TypedDict):
@@ -221,8 +280,9 @@ class StorageBackend(Protocol):
         Each dict must include ``ws_id``, ``role``, and ``content``
         (which may be ``None`` for assistant messages with only tool_calls).
         Optional keys: ``tool_name``, ``tool_call_id``, ``provider_data``,
-        ``tool_calls``, ``source``, ``meta``.  Timestamp and workstream
-        updated-at are handled internally.
+        ``tool_calls``, ``source``, ``meta``, and ``attachment_ids`` (an
+        ordered list of existing content-addressed ids). Attachment refcounts,
+        timestamp, and workstream updated-at are handled in the same transaction.
         """
         ...
 
@@ -279,6 +339,45 @@ class StorageBackend(Protocol):
         marker and returns the bounded ``[summary] + [tail]`` view;
         ``checkpointed=False`` returns the full transcript (markers dropped) for
         export/audit consumers that must not lose pre-compaction history.
+        """
+        ...
+
+    def clone_workstream(
+        self,
+        source_ws_id: str,
+        destination_ws_id: str,
+        *,
+        principal_id: str,
+        trusted_internal: bool = False,
+        expected_session: ForkCloneExpectation | None = None,
+    ) -> ForkCloneSnapshot:
+        """Atomically authorize and snapshot-copy one workstream into another.
+
+        The transaction re-evaluates the source's current project visibility
+        and attachability for ``principal_id``, snapshots its canonical
+        checkpoint-bounded history and configuration, retains every referenced
+        attachment blob, replaces the destination configuration, and binds the
+        destination to the source's effective project (or no project when the
+        source link is absent/dangling).
+
+        The destination must already exist, belong to ``principal_id``, contain
+        no conversation rows, and carry the same normalized project binding the
+        source resolves to inside the transaction. A mismatch means source
+        project context changed after destination construction and refuses the
+        clone. When ``expected_session`` is supplied, the transaction also
+        requires both durable incarnation tokens, the source persona stamp, and
+        the principal's effective active project-memory context to equal the
+        values used to construct the live destination session.
+        ``state='creating'`` sources are never cloneable. ``trusted_internal``
+        is reserved for non-user
+        service/CLI callers and bypasses the principal/ACL checks; it does not
+        relax source or destination existence, project coherence, envelope
+        coherence, emptiness, or attachment integrity checks.
+
+        Raises :class:`ForkSourceUnavailableError` for a missing, inaccessible,
+        or corrupt source and :class:`ForkDestinationConflictError` when the
+        destination preconditions do not hold. No partial history, config, or
+        attachment-refcount changes survive either failure.
         """
         ...
 
@@ -489,6 +588,45 @@ class StorageBackend(Protocol):
         """Load workstream configuration. Returns empty dict if none stored."""
         ...
 
+    def finalize_deferred_create(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+        *,
+        alias: str | None = None,
+        config: dict[str, str] | None = None,
+        node_id: str | None = None,
+        override_reason: str = "local",
+    ) -> bool:
+        """Atomically apply prepublication writes to one reserved incarnation.
+
+        The durable workstream row and private fork reservation must both
+        match. Alias conflict or ownership loss returns ``False`` with no
+        mutation. The private reservation is retained for exact cancellation
+        rollback until lifecycle publication succeeds.
+        """
+        ...
+
+    def publish_deferred_create(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        """Publish exactly one reserved ``creating`` workstream.
+
+        The state transition is an incarnation-checked compare-and-swap.  A
+        missing row, mismatched token, or already-published row returns
+        ``False`` without mutation.  The private token remains as the durable
+        incarnation fence used by exact hard-delete; clone admission also
+        requires ``state='creating'`` so the token is not a reusable fork
+        capability after publication.
+        """
+        ...
+
+    def get_workstream_reservation_token(self, ws_id: str) -> str:
+        """Return the private durable incarnation token, or ``""``."""
+        ...
+
     # -- Workstream metadata ---------------------------------------------------
 
     def set_workstream_alias(self, ws_id: str, alias: str) -> bool:
@@ -519,7 +657,22 @@ class StorageBackend(Protocol):
         Richer than :meth:`get_workstream_metadata` — includes ``state``,
         ``user_id``, ``kind``, ``parent_ws_id``, and timestamps.  Used by
         coordinator ``inspect_workstream`` and any caller that needs the
-        authoritative row.
+        authoritative row. This is a raw internal read: it deliberately
+        returns provisional ``state='creating'`` reservations. User-visible,
+        open, export, and mutation surfaces must apply their lifecycle and
+        authorization gates rather than treating every returned row as
+        published.
+        """
+        ...
+
+    def ensure_workstream_incarnation_snapshot(self, ws_id: str) -> dict[str, Any] | None:
+        """Return the row plus a stable private incarnation token.
+
+        The authoritative row read and creation of a token for legacy rows are
+        one transaction.  Callers can therefore authorize this immutable
+        snapshot and use its token for a later conditional mutation without a
+        delete/re-register ABA becoming authorized by the old decision.
+        Ordinary row/config reads must not expose the private token.
         """
         ...
 
@@ -680,8 +833,13 @@ class StorageBackend(Protocol):
         parent_ws_id: str | None = None,
         project_id: str | None = None,
         persona: str | None = None,
-    ) -> None:
-        """Create a workstreams row (no-op if already exists).
+        fork_reservation_token: str = "",
+    ) -> bool:
+        """Create a workstreams row and report whether it was inserted.
+
+        Existing ids remain an idempotent no-op for compatibility, but return
+        ``False`` so create flows can distinguish their own durable reservation
+        from a caller-chosen id that already belongs to another workstream.
 
         ``kind`` accepts a ``WorkstreamKind`` member or its raw string value
         (``"interactive"`` / ``"coordinator"``); the storage edge validates
@@ -691,6 +849,11 @@ class StorageBackend(Protocol):
         workstream was created with (display carrier — the snapshot lives in
         ``workstream_config``) — all normalized from the empty string to
         ``None`` at the storage edge.
+
+        ``fork_reservation_token`` is private create-path plumbing.  When
+        non-empty, the backend stores it with the new row in the same
+        transaction under :data:`FORK_RESERVATION_CONFIG_KEY`; an ignored
+        duplicate insert must not alter the incumbent row's token.
         """
         ...
 
@@ -742,6 +905,42 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def delete_stale_creating_reservations(
+        self,
+        kind: WorkstreamKind | str,
+        cutoff: str,
+        exclude_ws_ids: list[str],
+        *,
+        live_node_ids: list[str],
+        local_node_id: str | None,
+    ) -> list[str]:
+        """Hard-delete abandoned provisional creates of *kind*.
+
+        Eligible rows must still be ``state='creating'``, have
+        ``updated < cutoff``, and not appear in ``exclude_ws_ids``. State, age
+        and deletion are checked under one backend transaction/row lock. When
+        the private incarnation token exists it is rechecked under that same
+        lock. Legacy/corrupt tokenless reservations are also recoverable: the
+        locked durable row itself is the incarnation fence, and backends emit
+        a warning when reclaiming one. Implementations must use the ordinary
+        complete-delete machinery so conversations, config, overrides and
+        attachment refcounts are cleaned together.
+
+        ``live_node_ids`` is required rather than optional: callers must skip
+        this operation when service liveness cannot be established. Rows owned
+        by a live peer are protected. ``local_node_id`` is the current
+        process's service id and is deliberately exempt from that protection;
+        after a restart the predecessor's rows carry the same stable id, while
+        the current process's live reservations are protected by
+        ``exclude_ws_ids`` plus the age cutoff.
+
+        This is intentionally separate from
+        :meth:`bulk_close_stale_orphans`. A provisional create was never
+        advertised and must be deleted, never made reopenable as ``closed``.
+        Returns the ids actually deleted.
+        """
+        ...
+
     def touch_workstream(self, ws_id: str) -> None:
         """Bump a workstream row's ``updated`` timestamp without touching its
         state.
@@ -766,6 +965,19 @@ class StorageBackend(Protocol):
 
     def delete_workstream(self, ws_id: str) -> bool:
         """Delete a workstream and all its conversations + config."""
+        ...
+
+    def delete_workstream_if_fork_reserved(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        """Delete only the durable incarnation carrying ``token``.
+
+        The token check and complete workstream deletion are one transaction.
+        It applies to provisional and published manager-created rows; a missing
+        or replaced row returns ``False`` without mutation.
+        """
         ...
 
     def list_orphan_conversations(self) -> list[dict[str, Any]]:
@@ -847,7 +1059,8 @@ class StorageBackend(Protocol):
 
         ``since`` is an ISO-8601 string matching the storage format
         (``YYYY-MM-DDTHH:MM:SS`` in UTC).  Lex compare is safe for the
-        same-offset timestamps storage writes.
+        same-offset timestamps storage writes.  Provisional
+        ``state='creating'`` rows are excluded until lifecycle publication.
         """
         ...
 
@@ -864,6 +1077,9 @@ class StorageBackend(Protocol):
         exclude_after: int | None = None,
     ) -> list[Any]:
         """Search conversation history. Returns (timestamp, ws_id, role, content, tool_name).
+
+        Conversation rows belonging to a provisional ``state='creating'``
+        workstream are excluded until lifecycle publication.
 
         ``user_id`` scopes results by project tenancy: rows are dropped when
         their workstream sits in an existing PRIVATE project and *user_id* is
@@ -889,7 +1105,8 @@ class StorageBackend(Protocol):
         """Return most recent conversation messages.
 
         ``user_id`` scopes rows by project tenancy exactly as in
-        :meth:`search_history`; ``None`` applies no scoping.
+        :meth:`search_history`; ``None`` applies no tenancy scoping.  Creating
+        workstreams remain excluded for every caller.
         """
         ...
 
@@ -1823,7 +2040,8 @@ class StorageBackend(Protocol):
 
         Pairs with ``sum_workstream_tokens_batch`` to give the
         coordinator wait-loop one query per tick instead of two-per-id.
-        Row shape matches ``get_workstream`` (same projection).
+        Row shape and raw lifecycle semantics match ``get_workstream`` (same
+        projection), including provisional ``state='creating'`` rows.
 
         SECURITY: same caveat as ``sum_workstream_tokens_batch`` —
         no ownership / authorization check inside the batch result.

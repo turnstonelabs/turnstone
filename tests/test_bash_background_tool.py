@@ -21,6 +21,7 @@ import pytest
 from tests._proc_helpers import pid_alive as _pid_alive
 from tests._proc_helpers import poll_until as _wait_until
 from tests._session_helpers import make_session
+from turnstone.core.session import _active_shell_owner
 
 
 @pytest.fixture
@@ -751,9 +752,11 @@ def test_task_agent_shells_are_owner_scoped_and_reaped(session, monkeypatch):
     seen = {}
 
     def fake_run_agent(agent_turns, label="task", **kwargs):
+        owner = _active_shell_owner.get()
+        seen["owner"] = owner
         out = _start_background(session, "sleep 60", call_id="sub-bash")
         seen["start_output"] = out
-        agent_shells = session._background_shells.shells(owner="task-1")
+        agent_shells = session._background_shells.shells(owner=owner)
         seen["agent_shells"] = list(agent_shells)
         seen["pid"] = agent_shells[0].pid if agent_shells else None
         # The sub-agent's shell is invisible to the main scope.
@@ -763,6 +766,8 @@ def test_task_agent_shells_are_owner_scoped_and_reaped(session, monkeypatch):
     monkeypatch.setattr(session, "_run_agent", fake_run_agent)
     call_id, result = session._exec_task({"call_id": "task-1", "prompt": "start a server"})
     assert "agent done" in result
+    assert seen["owner"].startswith("task_agent:task-1:")
+    assert seen["owner"] != "task-1"
     assert seen["agent_shells"], "shell spawned inside the agent must carry its owner"
     # Scope honesty in the start message: the sub-agent must not promise its
     # caller a server that dies the moment it returns.

@@ -1,9 +1,10 @@
 # Tools Reference
 
-turnstone exposes 17 built-in tools plus any number of external MCP tools to the
-LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
-files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
-MCP tools are discovered from configured MCP servers at startup by
+Turnstone exposes a role-specific built-in tool surface plus any configured MCP
+tools through provider-native or OpenAI-compatible function calling. Built-in
+schemas live under `turnstone/tools/` and are loaded by
+`turnstone/core/tools.py`; metadata selects the interactive, coordinator, and
+task-agent subsets. MCP tools are discovered from configured servers by
 `turnstone/core/mcp_client.py`.
 
 ---
@@ -50,10 +51,10 @@ set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 29 loaded built-in tool definitions (interactive + coordinator union). Sessions send a kind-specific subset (`INTERACTIVE_TOOLS` or `COORDINATOR_TOOLS`). |
+| `TOOLS`             | The complete loaded built-in union. Sessions send a kind-specific subset (`INTERACTIVE_TOOLS` or `COORDINATOR_TOOLS`). |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `TASK_AUTO_TOOLS`   | Set of all tool names with `auto_approve: true` -- used by task-agent sub-sessions to skip confirmation for matching available tools. |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 29 built-in tool names (interactive + coordinator union). Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of the built-in union. Used by tool search to distinguish built-ins from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -62,7 +63,10 @@ set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 
 > See also: [Tool Pipeline diagram](diagrams/png/05-tool-pipeline.png)
 
-Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools()`:
+Tool handling spans a four-phase pipeline. `ChatSession._execute_tools()` owns
+prepare, approval, and execution (phases 1–3); after it returns, the owning
+conversation loop guards the observed results and folds them into the
+trajectory (phase 4).
 
 ### Phase 1: Prepare
 
@@ -71,9 +75,8 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 17
-  built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
-  the generic `_prepare_mcp_tool()` handler for MCP tools.
+- Dispatches to the matching `_prepare_{func_name}()` handler, the synthetic
+  `tool_search` fallback, or the generic `_prepare_mcp_tool()` handler.
 - Validates arguments and builds a preview dict containing:
   - `call_id`, `func_name`, `header`, `preview` (for display)
   - `needs_approval` (bool)
@@ -82,7 +85,10 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 
 ### Phase 2: Approve
 
-All prepared items are sent to the UI via `ui.approve_tools(items)`.
+Prepared items are sent to the UI via `ui.approve_tools(items)`. Several
+parallel task agents may leave independent `ApprovalCycle` objects pending on
+one workstream; each round owns a `cycle_id`, event, result, and verdict set.
+Remote clients resolve the exact round by `cycle_id` (or a member `call_id`).
 
 - The UI displays each tool's header and preview to the user.
 - Items where `needs_approval` is `False` (auto-approved tools) are shown
@@ -94,6 +100,10 @@ All prepared items are sent to the UI via `ui.approve_tools(items)`.
   prompt). This is per-tool, not blanket.
 - If `auto_approve` is `True` on the session (via `--skip-permissions` or workstream
   template), all tools are approved automatically.
+- When Smart Approvals are enabled, one immutable judge/settings snapshot is
+  stamped onto the whole batch. The batch auto-approves only when every gated
+  item has a qualifying verdict; partial or mixed qualification fails closed to
+  the human prompt. Stop is linearized against that terminal decision.
 
 ### Phase 3: Execute
 
@@ -113,6 +123,28 @@ Each item's `execute` callable is invoked:
   denials are tracked separately. This removes the need for text-prefix heuristics.
   Other tools deliver results atomically via
   `ui.on_tool_result(call_id, name, output, is_error=...)` only.
+
+Stop propagates to child model scopes, judges, tracked subprocess groups, and
+the approval cycles owned by the cancelled operation. Calls that definitely
+never started receive `EffectStatus.none`; an interrupted call whose external
+outcome was not observed receives `unknown`, `partial`, or `rolled_back` as
+appropriate. These typed receipts preserve effect truth across storage/replay
+without exposing unreviewed model output as a tool result.
+
+### Phase 4: Guard and atomic fold
+
+After `_execute_tools()` returns, the main `send()` loop compacts/truncates
+completed results to the remaining shared budget and then runs the heuristic
+and optional LLM output guard. The task-agent loop deliberately guards the
+observed raw output before applying its size cap, so truncation cannot hide a
+sensitive result from that check.
+
+After guard work, the owning loop rechecks generation ownership. On the main
+conversation path, one generation-fenced commit appends the complete
+tool-result block, advisories, feedback, and queued user turns; its durable
+records run in FIFO order outside the lifecycle lock. A force-cancelled
+predecessor can therefore finish external cleanup, but cannot fold late results
+into its successor's trajectory.
 ---
 
 ## Tool Approval Flow
@@ -577,7 +609,11 @@ pre-configure skills at workstream creation.
 
 ---
 
-## Summary Table
+## Interactive Tool Summary
+
+This table describes the ordinary interactive surface. Coordinator sessions
+receive their delegation/lifecycle tools instead, and task agents receive the
+metadata-selected `TASK_AGENT_TOOLS` subset.
 
 | Tool         | Category   | Auto-approve | task_agent | primary_key |
 |--------------|------------|--------------|------------|-------------|
@@ -698,7 +734,7 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 17 built-in tools via
+4. **Merging**: MCP tools are appended after the role's built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
    When dynamic tool search is active, MCP tools are deferred rather than directly
    visible -- the model discovers them via search as needed (see

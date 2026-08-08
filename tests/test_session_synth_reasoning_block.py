@@ -25,14 +25,16 @@ These tests pin:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 from tests._session_helpers import make_session as _make_session
-from tests._session_helpers import scripted_provider
+from tests._session_helpers import replace_session_lane, scripted_provider
 from turnstone.core.model_turn import (
     _server_type_of,
     finalize_provider_blocks,
+    resolve_lane,
     synth_reasoning_block,
 )
 from turnstone.core.providers._anthropic import (
@@ -264,8 +266,11 @@ class TestStreamResponseSynthBlockIntegration:
         its native lane."""
         session = _make_session()
         # No registry → source field omitted from synth block.
-        session._provider = scripted_provider(
-            self._make_chunks(content="Final answer.", reasoning="path-3 reasoning")
+        replace_session_lane(
+            session,
+            provider=scripted_provider(
+                self._make_chunks(content="Final answer.", reasoning="path-3 reasoning")
+            ),
         )
         session.messages.append(Turn.user("hi"))
         result = session._stream_response(0)
@@ -281,8 +286,9 @@ class TestStreamResponseSynthBlockIntegration:
         """Stream emits only content (no reasoning_delta).  No synth
         block stamped — the result's native lane is absent."""
         session = _make_session()
-        session._provider = scripted_provider(
-            self._make_chunks(content="just content", reasoning="")
+        replace_session_lane(
+            session,
+            provider=scripted_provider(self._make_chunks(content="just content", reasoning="")),
         )
         session.messages.append(Turn.user("hi"))
         result = session._stream_response(0)
@@ -296,16 +302,25 @@ class TestStreamResponseSynthBlockIntegration:
         """When the active model has server_compat.server_type set,
         the synth block carries it as the ``source`` field."""
         session = _make_session()
-        session._registry = SimpleNamespace(
+        registry = SimpleNamespace(
             get_config=lambda alias: SimpleNamespace(
                 capabilities={},
                 server_compat={"server_type": "vllm"},
             )
         )
-        session._model_alias = "qwen3-32b"
-        session._provider = scripted_provider(
+        session._registry = registry
+        provider = scripted_provider(
             self._make_chunks(content="answer", reasoning="reasoning text")
         )
+        current_lane = session._model_binding.lane
+        lane = resolve_lane(
+            provider,
+            current_lane.client,
+            current_lane.model,
+            alias="qwen3-32b",
+            registry=registry,
+        )
+        session._model_binding = replace(session._model_binding, lane=lane)
         session.messages.append(Turn.user("hi"))
         result = session._stream_response(0)
         assert result.turn.native is not None

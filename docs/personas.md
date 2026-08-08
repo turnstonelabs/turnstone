@@ -46,8 +46,8 @@ reads only the stamp:
   `creative_mode` set are converted by migration `063` into full
   `writer` stamps, so they resume as writing sessions rather than as
   legacy defaults.
-- Forking (`resume_ws` on create) resumes the source's stamped persona; the
-  fork does not re-resolve.
+- Forking (`resume_ws` on create) clones the source's stamped persona into the
+  new workstream; the fork does not re-resolve it.
 
 ## Seed personas
 

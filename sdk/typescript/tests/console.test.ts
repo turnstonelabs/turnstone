@@ -62,6 +62,58 @@ describe("TurnstoneConsole", () => {
     expect(url).toContain("page=2");
   });
 
+  it("createWorkstream sends the live cluster-create contract", async () => {
+    const fetchFn = mockFetch({
+      status: "ok",
+      correlation_id: "ws-new",
+      target_node: "node-a",
+    });
+    const client = new TurnstoneConsole({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+    await client.createWorkstream({
+      node_id: "node-a",
+      project_id: "project-42",
+      judge_model: "judge-fast",
+    });
+
+    const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({
+      node_id: "node-a",
+      project_id: "project-42",
+      judge_model: "judge-fast",
+    });
+  });
+
+  it("routeCreateWorkstream returns placement metadata", async () => {
+    const fetchFn = mockFetch({
+      ws_id: "ws-new",
+      name: "routed",
+      node_url: "http://node-a:8080",
+      node_id: "node-a",
+      routing_strategy: "target_node",
+    });
+    const client = new TurnstoneConsole({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+    const response = await client.routeCreateWorkstream({
+      name: "routed",
+      target_node: "node-a",
+      client_type: "scheduled",
+      notify_targets: [{ channel_type: "slack", channel_id: "C123" }],
+    });
+
+    expect(response.node_id).toBe("node-a");
+    expect(response.routing_strategy).toBe("target_node");
+    const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toMatchObject({
+      client_type: "scheduled",
+      notify_targets: [{ channel_type: "slack", channel_id: "C123" }],
+    });
+  });
+
   it("routeCreateWorkstream rejects attachments + target_node", async () => {
     const fetchFn = vi.fn().mockResolvedValue(
       new Response("{}", {
@@ -82,6 +134,21 @@ describe("TurnstoneConsole", () => {
       }),
     ).rejects.toThrow(/target_node/);
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("routeWorkstreamLive returns the non-mutating liveness probe", async () => {
+    const fetchFn = mockFetch({ ws_id: "saved/ws", live: true });
+    const client = new TurnstoneConsole({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    const response = await client.routeWorkstreamLive("saved/ws");
+
+    expect(response).toEqual({ ws_id: "saved/ws", live: true });
+    const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toContain("/v1/api/route/workstreams/saved%2Fws/live");
+    expect(init.method).toBe("GET");
   });
 
   it("health returns parsed response", async () => {

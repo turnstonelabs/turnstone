@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from turnstone.core.config_store import ConfigStore
@@ -145,6 +147,143 @@ class TestReload:
         store.reload()
         assert store.get("tools.timeout") == 99
 
+    def test_reload_cannot_overwrite_a_concurrent_set(self, storage, store, monkeypatch):
+        store.set("tools.timeout", 30)
+        reload_captured = threading.Event()
+        release_reload = threading.Event()
+        setter_waiting = threading.Event()
+        setter_done = threading.Event()
+        errors: list[BaseException] = []
+
+        real_bulk = storage.get_system_settings_bulk
+
+        def blocked_bulk(*, node_id=""):
+            raw = real_bulk(node_id=node_id)
+            if threading.current_thread().name == "stale-reload":
+                reload_captured.set()
+                if not release_reload.wait(2):
+                    raise TimeoutError("reload/set test did not release the stale read")
+            return raw
+
+        monkeypatch.setattr(storage, "get_system_settings_bulk", blocked_bulk)
+        real_mutation_lock = store._mutation_lock
+
+        class _ObservedMutationLock:
+            def __enter__(self):
+                if threading.current_thread().name == "new-set":
+                    setter_waiting.set()
+                real_mutation_lock.acquire()
+                return self
+
+            def __exit__(self, *_exc_info):
+                real_mutation_lock.release()
+
+        store._mutation_lock = _ObservedMutationLock()
+
+        def reload_worker() -> None:
+            try:
+                store.reload()
+            except BaseException as exc:
+                errors.append(exc)
+
+        def set_worker() -> None:
+            try:
+                store.set("tools.timeout", 60)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                setter_done.set()
+
+        reload_thread = threading.Thread(target=reload_worker, name="stale-reload")
+        setter_thread = threading.Thread(target=set_worker, name="new-set")
+        reload_thread.start()
+        assert reload_captured.wait(2)
+        setter_thread.start()
+        assert setter_waiting.wait(2)
+        assert not setter_done.is_set()
+        release_reload.set()
+        reload_thread.join(timeout=2)
+        setter_thread.join(timeout=2)
+
+        assert not reload_thread.is_alive()
+        assert not setter_thread.is_alive()
+        assert errors == []
+        assert store.get("tools.timeout") == 60
+        assert ConfigStore(storage).get("tools.timeout") == 60
+
+    @pytest.mark.parametrize("later_operation", ["set", "delete"])
+    def test_mutations_publish_in_storage_order(
+        self,
+        storage,
+        store,
+        monkeypatch,
+        later_operation,
+    ):
+        first_committed = threading.Event()
+        release_first = threading.Event()
+        later_waiting = threading.Event()
+        later_done = threading.Event()
+        errors: list[BaseException] = []
+
+        real_upsert = storage.upsert_system_setting
+
+        def blocked_upsert(**kwargs):
+            real_upsert(**kwargs)
+            if threading.current_thread().name == "first-set":
+                first_committed.set()
+                if not release_first.wait(2):
+                    raise TimeoutError("mutation-order test did not release the first write")
+
+        monkeypatch.setattr(storage, "upsert_system_setting", blocked_upsert)
+        real_mutation_lock = store._mutation_lock
+
+        class _ObservedMutationLock:
+            def __enter__(self):
+                if threading.current_thread().name == "later-mutation":
+                    later_waiting.set()
+                real_mutation_lock.acquire()
+                return self
+
+            def __exit__(self, *_exc_info):
+                real_mutation_lock.release()
+
+        store._mutation_lock = _ObservedMutationLock()
+
+        def first_worker() -> None:
+            try:
+                store.set("tools.timeout", 30)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def later_worker() -> None:
+            try:
+                if later_operation == "set":
+                    store.set("tools.timeout", 60)
+                else:
+                    store.delete("tools.timeout")
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                later_done.set()
+
+        first_thread = threading.Thread(target=first_worker, name="first-set")
+        later_thread = threading.Thread(target=later_worker, name="later-mutation")
+        first_thread.start()
+        assert first_committed.wait(2)
+        later_thread.start()
+        assert later_waiting.wait(2)
+        assert not later_done.is_set()
+        release_first.set()
+        first_thread.join(timeout=2)
+        later_thread.join(timeout=2)
+
+        assert not first_thread.is_alive()
+        assert not later_thread.is_alive()
+        assert errors == []
+        expected = 60 if later_operation == "set" else SETTINGS["tools.timeout"].default
+        assert store.get("tools.timeout") == expected
+        assert ConfigStore(storage).get("tools.timeout") == expected
+
 
 # ---------------------------------------------------------------------------
 # all_effective()
@@ -161,6 +300,79 @@ class TestAllEffective:
         assert effective["memory.relevance_k"] == SETTINGS["memory.relevance_k"].default
         # All registry keys present
         assert set(effective.keys()) == set(SETTINGS.keys())
+
+    def test_effective_snapshot_closes_cache_swap_version_window(self, store):
+        store.set("judge.smart_approvals", False)
+        store.set("judge.confidence_threshold", 0.95)
+        old_version = store.version
+        old_first_key = store.get("judge.smart_approvals")
+        new_cache = {
+            **store._cache,
+            "judge.smart_approvals": True,
+            "judge.confidence_threshold": 0.4,
+        }
+        swapped = threading.Event()
+        release = threading.Event()
+        snapshot_waiting = threading.Event()
+        errors: list[BaseException] = []
+        real_lock = store._lock
+
+        class _ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "snapshot-reader":
+                    snapshot_waiting.set()
+                real_lock.acquire()
+                return self
+
+            def __exit__(self, *_exc_info):
+                real_lock.release()
+
+        store._lock = _ObservedLock()
+
+        def writer() -> None:
+            try:
+                with store._lock:
+                    store._cache = new_cache
+                    swapped.set()
+                    if not release.wait(2):
+                        raise TimeoutError("snapshot test did not release writer")
+                    store._version += 1
+            except BaseException as exc:
+                errors.append(exc)
+
+        writer_thread = threading.Thread(target=writer, name="snapshot-writer")
+        writer_thread.start()
+        assert swapped.wait(2)
+
+        # This is the exact impossible pair the old per-key/version bracket
+        # accepted while a writer paused between its two assignments.
+        assert store._version == old_version
+        new_second_key = store.get("judge.confidence_threshold")
+        assert (old_first_key, new_second_key) == (False, 0.4)
+
+        result: list[tuple[int, dict[str, object]]] = []
+
+        def reader() -> None:
+            try:
+                result.append(store.effective_snapshot())
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader_thread = threading.Thread(target=reader, name="snapshot-reader")
+        reader_thread.start()
+        assert snapshot_waiting.wait(2)
+        assert result == []
+        release.set()
+        writer_thread.join(timeout=2)
+        reader_thread.join(timeout=2)
+
+        assert not writer_thread.is_alive()
+        assert not reader_thread.is_alive()
+        assert errors == []
+        version, values = result[0]
+        assert version == old_version + 1
+        assert values["judge.smart_approvals"] is True
+        assert values["judge.confidence_threshold"] == 0.4
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +397,70 @@ class TestStoredKeys:
 
 
 class TestVersion:
+    def test_waits_for_in_progress_cache_publication(self, store):
+        old_version = store.version
+        new_cache = {**store._cache, "tools.timeout": 31}
+        cache_swapped = threading.Event()
+        release_writer = threading.Event()
+        reader_observed = threading.Event()
+        reader_lock_attempted = threading.Event()
+        errors: list[BaseException] = []
+        result: list[int] = []
+        real_lock = store._lock
+
+        class _ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "version-reader":
+                    reader_lock_attempted.set()
+                    reader_observed.set()
+                real_lock.acquire()
+                return self
+
+            def __exit__(self, *_exc_info):
+                real_lock.release()
+
+        store._lock = _ObservedLock()
+
+        def writer() -> None:
+            try:
+                with store._lock:
+                    store._cache = new_cache
+                    cache_swapped.set()
+                    if not release_writer.wait(2):
+                        raise TimeoutError("version test did not release the writer")
+                    store._version += 1
+            except BaseException as exc:
+                errors.append(exc)
+
+        def reader() -> None:
+            try:
+                result.append(store.version)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                reader_observed.set()
+
+        writer_thread = threading.Thread(target=writer, name="version-writer")
+        reader_thread = threading.Thread(target=reader, name="version-reader")
+        writer_thread.start()
+        cache_swapped_seen = cache_swapped.wait(2)
+        reader_thread.start()
+        reader_reached_accessor = reader_observed.wait(2)
+        result_before_release = list(result)
+        release_writer.set()
+        writer_thread.join(timeout=2)
+        reader_thread.join(timeout=2)
+
+        assert cache_swapped_seen
+        assert reader_reached_accessor
+        assert not writer_thread.is_alive()
+        assert not reader_thread.is_alive()
+        assert errors == []
+        assert reader_lock_attempted.is_set()
+        assert result_before_release == []
+        assert result == [old_version + 1]
+        assert store.get("tools.timeout") == 31
+
     def test_increments_on_set(self, store):
         v0 = store.version
         store.set("tools.timeout", 30)

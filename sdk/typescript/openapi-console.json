@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.8.0a5",
+    "version": "1.8.0a6",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -4797,6 +4797,28 @@
         "tags": [
           "Routing"
         ],
+        "description": "The documented JSON form accepts RouteCreateRequest. The endpoint also accepts multipart/form-data with a JSON `meta` field and file parts; multipart callers must supply `ws_id` as a query parameter; the console requires the cached `meta.ws_id` to match before forwarding the original body. A JSON body may instead carry an explicit `ws_id`; the console preserves it and uses it as the rendezvous placement key. `resume_ws` accepts an id or saved alias and is resolved to the canonical source id before an atomic fork is routed.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "32-hex rendezvous key required for multipart creates. JSON callers put an optional destination ws_id in the request body."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RouteCreateRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Success",
@@ -4818,6 +4840,76 @@
               }
             }
           },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Error 503",
             "content": {
@@ -4831,16 +4923,224 @@
         }
       }
     },
-    "/v1/api/route/send": {
+    "/v1/api/route/workstreams/{ws_id}/live": {
+      "get": {
+        "summary": "Probe whether a routed workstream is loaded without rehydrating it",
+        "operationId": "v1_api_route_workstreams_{ws_id}_live_get",
+        "tags": [
+          "Routing"
+        ],
+        "description": "Routes to the workstream's rendezvous owner and checks its manager-authoritative active list. The response does not expose workstream metadata; missing, unloaded, creating, and caller-invisible rows all report ``live=false``. Routing and upstream uncertainty fail with an error rather than reporting a false miss.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteLiveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route/workstreams/{ws_id}/send": {
       "post": {
         "summary": "Proxy send to routed node",
-        "operationId": "v1_api_route_send_post",
+        "operationId": "v1_api_route_workstreams_{ws_id}_send_post",
         "tags": [
           "Routing"
         ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Proxy queued-message cancellation to routed node",
+        "operationId": "v1_api_route_workstreams_{ws_id}_send_delete",
+        "tags": [
+          "Routing"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DequeueRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "503": {
             "description": "Error 503",
@@ -4855,16 +5155,93 @@
         }
       }
     },
-    "/v1/api/route/approve": {
+    "/v1/api/route/workstreams/{ws_id}/approve": {
       "post": {
         "summary": "Proxy approve to routed node",
-        "operationId": "v1_api_route_approve_post",
+        "operationId": "v1_api_route_workstreams_{ws_id}_approve_post",
         "tags": [
           "Routing"
         ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApproveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "503": {
             "description": "Error 503",
@@ -4879,16 +5256,73 @@
         }
       }
     },
-    "/v1/api/route/cancel": {
+    "/v1/api/route/workstreams/{ws_id}/cancel": {
       "post": {
         "summary": "Proxy cancel to routed node",
-        "operationId": "v1_api_route_cancel_post",
+        "operationId": "v1_api_route_workstreams_{ws_id}_cancel_post",
         "tags": [
           "Routing"
         ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "503": {
             "description": "Error 503",
@@ -4910,9 +5344,66 @@
         "tags": [
           "Routing"
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "503": {
             "description": "Error 503",
@@ -4927,16 +5418,235 @@
         }
       }
     },
-    "/v1/api/route/workstreams/close": {
+    "/v1/api/route/workstreams/{ws_id}/close": {
       "post": {
         "summary": "Proxy workstream close to routed node",
-        "operationId": "v1_api_route_workstreams_close_post",
+        "operationId": "v1_api_route_workstreams_{ws_id}_close_post",
         "tags": [
           "Routing"
         ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseWorkstreamRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route/workstreams/{ws_id}/rewind": {
+      "post": {
+        "summary": "Proxy conversation rewind to routed node",
+        "operationId": "v1_api_route_workstreams_{ws_id}_rewind_post",
+        "tags": [
+          "Routing"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RewindRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route/workstreams/{ws_id}/retry": {
+      "post": {
+        "summary": "Proxy last-turn retry to routed node",
+        "operationId": "v1_api_route_workstreams_{ws_id}_retry_post",
+        "tags": [
+          "Routing"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "503": {
             "description": "Error 503",
@@ -5801,7 +6511,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/ApproveResponse"
                 }
               }
             }
@@ -5866,7 +6576,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Drops the in-flight LLM call and unblocks any pending approval or plan review.  The coordinator state moves to idle; storage is preserved.",
+        "description": "Cooperatively stops the active generation and resolves every pending approval cycle. Set ``force=true`` to retire a stuck worker immediately. The response includes a redacted snapshot of work dropped by the cancellation.",
         "parameters": [
           {
             "name": "ws_id",
@@ -5877,13 +6587,23 @@
             }
           }
         ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Success",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/CancelResponse"
                 }
               }
             }
@@ -7897,7 +8617,7 @@
           },
           "resume_ws": {
             "default": "",
-            "description": "Workstream ID to resume (loads previous conversation)",
+            "description": "Source workstream ID or alias to fork atomically into the new workstream",
             "title": "Resume Ws",
             "type": "string"
           },
@@ -8000,12 +8720,306 @@
             "description": "When approved=True, also adds the pending tool name(s) to the session's auto-approve set so subsequent calls of the same tool skip the prompt.",
             "title": "Always",
             "type": "boolean"
+          },
+          "cycle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Resolve this exact approval cycle",
+            "title": "Cycle Id"
+          },
+          "call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Resolve the approval cycle containing this tool call",
+            "title": "Call Id"
           }
         },
         "required": [
           "approved"
         ],
         "title": "CoordinatorApproveRequest",
+        "type": "object"
+      },
+      "ApproveRequest": {
+        "properties": {
+          "approved": {
+            "description": "True to approve, false to deny",
+            "title": "Approved",
+            "type": "boolean"
+          },
+          "feedback": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional denial reason",
+            "title": "Feedback"
+          },
+          "always": {
+            "default": false,
+            "description": "Auto-approve the tools in this batch going forward",
+            "title": "Always",
+            "type": "boolean"
+          },
+          "cycle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Resolve this exact approval cycle",
+            "title": "Cycle Id"
+          },
+          "call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Resolve the approval cycle containing this tool call",
+            "title": "Call Id"
+          }
+        },
+        "required": [
+          "approved"
+        ],
+        "title": "ApproveRequest",
+        "type": "object"
+      },
+      "ApproveResponse": {
+        "properties": {
+          "status": {
+            "default": "ok",
+            "description": "Request outcome",
+            "title": "Status",
+            "type": "string"
+          },
+          "cycle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Approval cycle that was resolved, or null when none was pending",
+            "title": "Cycle Id"
+          }
+        },
+        "title": "ApproveResponse",
+        "type": "object"
+      },
+      "CancelRequest": {
+        "properties": {
+          "force": {
+            "default": false,
+            "description": "Force cancel: abandon the stuck worker thread immediately. Use when cooperative cancel has not resolved within a few seconds.",
+            "title": "Force",
+            "type": "boolean"
+          }
+        },
+        "title": "CancelRequest",
+        "type": "object"
+      },
+      "CancelResponse": {
+        "properties": {
+          "status": {
+            "default": "ok",
+            "description": "Request outcome",
+            "title": "Status",
+            "type": "string"
+          },
+          "dropped": {
+            "additionalProperties": true,
+            "description": "Best-effort, credential-redacted snapshot of pending work affected by cancellation; keys are omitted when not observable",
+            "title": "Dropped",
+            "type": "object"
+          }
+        },
+        "title": "CancelResponse",
+        "type": "object"
+      },
+      "CloseWorkstreamRequest": {
+        "description": "Body for ``POST /v1/api/workstreams/{ws_id}/close``.\n\nThe body must be valid JSON; send ``{}`` when omitting all\nfields. Pre-1.5 the model also carried a body-keyed ``ws_id``;\n1.5 moved that to the path so the body shrinks to the optional\n``reason``. Coord ignores the body entirely (its close handler\nis wired ``supports_close_reason=False``).",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional close reason persisted to ``workstream_config`` for postmortem. Capped at 512 UTF-8 bytes server-side; credential-redaction is applied via the output guard.",
+            "title": "Reason"
+          }
+        },
+        "title": "CloseWorkstreamRequest",
+        "type": "object"
+      },
+      "CommandRequest": {
+        "properties": {
+          "command": {
+            "description": "Workstream-local slash command (for example /clear or /instructions). Lifecycle commands such as /new and /resume are local-CLI-only; remote clients use the dedicated workstream endpoints.",
+            "title": "Command",
+            "type": "string"
+          },
+          "ws_id": {
+            "description": "Target workstream ID",
+            "title": "Ws Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "ws_id"
+        ],
+        "title": "CommandRequest",
+        "type": "object"
+      },
+      "DequeueRequest": {
+        "description": "Body for ``DELETE /v1/api/workstreams/{ws_id}/send``.\n\nRemoves a previously-queued message from the workstream's pending\nqueue. ``msg_id`` is the id returned in a prior ``send`` response\nwhen the workstream was busy and the message was queued.",
+        "properties": {
+          "msg_id": {
+            "description": "Id of the queued message to remove",
+            "title": "Msg Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "msg_id"
+        ],
+        "title": "DequeueRequest",
+        "type": "object"
+      },
+      "SendRequest": {
+        "properties": {
+          "message": {
+            "description": "User message text",
+            "title": "Message",
+            "type": "string"
+          },
+          "attachment_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Explicit list of attachment ids to inject into this turn. When omitted, any pending attachments for the caller on this workstream are auto-consumed. An empty list disables auto-consumption for this send.",
+            "title": "Attachment Ids"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "SendRequest",
+        "type": "object"
+      },
+      "SendResponse": {
+        "properties": {
+          "status": {
+            "description": "'ok' (fresh turn dispatched), 'queued' (folded into the live turn's interjection queue, or \u2014 when `deferred` is true \u2014 parked for dispatch after the current command window), 'queue_full', 'attachments_busy' (attachments can't ride a queued turn; retry when idle), or 'cross_user_interjection' (another participant's turn is in flight; carried on the 409 body).",
+            "examples": [
+              "ok",
+              "queued",
+              "queue_full",
+              "attachments_busy",
+              "cross_user_interjection"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "deferred": {
+            "default": false,
+            "description": "Set on `queued` responses: the message is parked on the workstream's deferred-send list (a slash-command window holds the worker slot, or earlier deferred sends are still pending) and dispatches as an ordinary full-fidelity send afterwards \u2014 it is NOT in a live turn's interjection queue. `DELETE .../send` retracts it until dispatch. Node-local and in-memory: a node restart before dispatch drops it (at-most-once intake).",
+            "title": "Deferred",
+            "type": "boolean"
+          },
+          "attached_ids": {
+            "description": "Attachment ids actually attached to this turn. Subset of the request's `attachment_ids` (or the auto-consumed pending set). Empty when the send carries no attachments.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Attached Ids",
+            "type": "array"
+          },
+          "dropped_attachment_ids": {
+            "description": "Attachment ids the caller requested that the server could not reserve (lost a race, already consumed, or cross-scope). The request still proceeds with whatever was reserved; the client can retry uploads or surface a partial-attach warning.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Dropped Attachment Ids",
+            "type": "array"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Set on `queued` responses: relative priority of the queued message.",
+            "title": "Priority"
+          },
+          "msg_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Set on `queued` responses: id used to dequeue the message.",
+            "title": "Msg Id"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "SendResponse",
         "type": "object"
       },
       "CoordinatorChildInfo": {
@@ -13639,25 +14653,247 @@
         "title": "RouteResponse",
         "type": "object"
       },
+      "RouteLiveResponse": {
+        "description": "Non-mutating live-session probe for one routed workstream.",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "live": {
+            "title": "Live",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ws_id",
+          "live"
+        ],
+        "title": "RouteLiveResponse",
+        "type": "object"
+      },
+      "RouteCreateRequest": {
+        "description": "JSON workstream creation through the routing proxy.",
+        "properties": {
+          "name": {
+            "default": "",
+            "description": "Workstream display name (auto-generated if empty)",
+            "title": "Name",
+            "type": "string"
+          },
+          "model": {
+            "default": "",
+            "description": "Model alias from registry",
+            "title": "Model",
+            "type": "string"
+          },
+          "judge_model": {
+            "default": "",
+            "description": "Optional judge model alias for this workstream. Empty uses the server's configured judge model.",
+            "title": "Judge Model",
+            "type": "string"
+          },
+          "auto_approve": {
+            "default": false,
+            "description": "Auto-approve all tool calls",
+            "title": "Auto Approve",
+            "type": "boolean"
+          },
+          "auto_approve_tools": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ],
+            "default": "",
+            "description": "Tool names to auto-approve even when auto_approve is false, accepted as either a comma-separated string or an array of strings.",
+            "title": "Auto Approve Tools"
+          },
+          "user_id": {
+            "default": "",
+            "description": "Optional workstream owner override. Honored only for trusted service identities (currently the console); ordinary callers remain bound to their authenticated user id.",
+            "title": "User Id",
+            "type": "string"
+          },
+          "resume_ws": {
+            "default": "",
+            "description": "Source workstream ID or alias to fork atomically into the new workstream (empty = fresh start)",
+            "title": "Resume Ws",
+            "type": "string"
+          },
+          "skill": {
+            "default": "",
+            "description": "Skill name (replaces default skills)",
+            "title": "Skill",
+            "type": "string"
+          },
+          "persona": {
+            "default": "",
+            "description": "Persona name (slug) to create the workstream with. Resolved and snapshotted at creation \u2014 later persona edits never affect this workstream. Empty selects the kind's default persona; on a database with no personas seeded the workstream is created with legacy (unrestricted) behavior.",
+            "title": "Persona",
+            "type": "string"
+          },
+          "notify_targets": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ],
+            "default": "[]",
+            "description": "Notification targets, accepted as either a JSON string or a structured array of objects containing channel_type + channel_id/user_id",
+            "title": "Notify Targets"
+          },
+          "client_type": {
+            "default": "",
+            "description": "Client surface type (web, cli, chat, scheduled). Defaults to web for server-created sessions.",
+            "title": "Client Type",
+            "type": "string"
+          },
+          "initial_message": {
+            "default": "",
+            "description": "Optional first user message dispatched as a background turn after the workstream is created. When attachments are also provided (via the multipart variant), they are attached to this turn.",
+            "title": "Initial Message",
+            "type": "string"
+          },
+          "ws_id": {
+            "default": "",
+            "description": "Optional caller-supplied workstream id (32-hex). Required when creating with attachments via the cluster routing layer so the console can hash to the owning node before the multipart body lands. Auto-generated when omitted.",
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive",
+            "description": "Workstream kind \u2014 'interactive' (default) or 'coordinator'. Coordinator workstreams are created by the console's own /v1/api/workstreams/new endpoint; clients hitting /v1/api/workstreams/new should leave this at the default."
+          },
+          "parent_ws_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional parent workstream id. Populated on children spawned by a coordinator so the parent/child relationship survives restart and appears in audit / list views.",
+            "title": "Parent Ws Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional project to attach this workstream to. Drives the shared 'project' memory scope; coordinator children inherit the parent's project.",
+            "title": "Project Id"
+          },
+          "target_node": {
+            "default": "",
+            "description": "Optional node id to pin placement to. The console generates a workstream id whose rendezvous owner is that node.",
+            "title": "Target Node",
+            "type": "string"
+          }
+        },
+        "title": "RouteCreateRequest",
+        "type": "object"
+      },
+      "WorkstreamKind": {
+        "description": "Classifier for which manager hosts a workstream.\n\nStrEnum so members are drop-in ``str`` replacements for the DB column,\nJSON payloads, and existing ``==`` comparisons against raw strings.\nNarrow internal annotations to this type; wide boundaries (HTTP body,\nDB row) stay ``str`` and parse via ``WorkstreamKind(raw)`` / ``from_raw``\nat the edge.",
+        "enum": [
+          "interactive",
+          "coordinator"
+        ],
+        "title": "WorkstreamKind",
+        "type": "string"
+      },
       "RouteCreateResponse": {
         "description": "Workstream creation via the routing proxy.",
         "properties": {
           "ws_id": {
-            "default": "",
+            "description": "Unique ID of the new workstream",
             "title": "Ws Id",
             "type": "string"
           },
+          "name": {
+            "description": "Assigned workstream name",
+            "title": "Name",
+            "type": "string"
+          },
+          "resumed": {
+            "default": false,
+            "description": "Whether the requested source was successfully forked",
+            "title": "Resumed",
+            "type": "boolean"
+          },
+          "message_count": {
+            "default": 0,
+            "description": "Number of messages cloned into the new workstream",
+            "title": "Message Count",
+            "type": "integer"
+          },
+          "attachment_ids": {
+            "description": "Ids of attachments saved by this request (multipart variant only). Already attached to the initial_message turn when one was provided; otherwise left pending for a follow-up POST /v1/api/workstreams/{ws_id}/send.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Attachment Ids",
+            "type": "array"
+          },
+          "initial_message_status": {
+            "description": "Present ONLY when the workstream was created but its initial_message could not be delivered: 'queue_full' (a raced live worker's interjection queue was at capacity \u2014 resend via /send; any uploads stay staged) or 'refused_closed' (the workstream was closed mid-create). Absent whenever the message was dispatched.",
+            "enum": [
+              "queue_full",
+              "refused_closed"
+            ],
+            "title": "Initial Message Status",
+            "type": "string"
+          },
           "node_url": {
-            "default": "",
             "title": "Node Url",
             "type": "string"
           },
           "node_id": {
-            "default": "",
             "title": "Node Id",
+            "type": "string"
+          },
+          "routing_strategy": {
+            "description": "Placement reason: rendezvous for a destination id, target_node for a generated pinned id, or resume when an atomic fork is routed by its canonical source id",
+            "enum": [
+              "rendezvous",
+              "target_node",
+              "resume"
+            ],
+            "title": "Routing Strategy",
             "type": "string"
           }
         },
+        "required": [
+          "ws_id",
+          "name",
+          "node_url",
+          "node_id",
+          "routing_strategy"
+        ],
         "title": "RouteCreateResponse",
         "type": "object"
       },
@@ -13894,15 +15130,6 @@
         },
         "title": "PendingApprovalItem",
         "type": "object"
-      },
-      "WorkstreamKind": {
-        "description": "Classifier for which manager hosts a workstream.\n\nStrEnum so members are drop-in ``str`` replacements for the DB column,\nJSON payloads, and existing ``==`` comparisons against raw strings.\nNarrow internal annotations to this type; wide boundaries (HTTP body,\nDB row) stay ``str`` and parse via ``WorkstreamKind(raw)`` / ``from_raw``\nat the edge.",
-        "enum": [
-          "interactive",
-          "coordinator"
-        ],
-        "title": "WorkstreamKind",
-        "type": "string"
       },
       "WorkstreamHistoryResponse": {
         "description": "Response body for ``GET /v1/api/workstreams/{ws_id}/history``.\n\nRenamed and relocated from ``CoordinatorHistoryResponse`` in the\nStage 2 history/detail verb lift. Same projected render shape on\nboth kinds; the lift adds the endpoint to interactive as a feature\ngain (pre-lift interactive only exposed history through the SSE\nreplay on ``/events``).",

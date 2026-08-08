@@ -16,6 +16,7 @@ from turnstone.core.attachments import safe_attachment_label
 from turnstone.core.providers._protocol import (
     EFFORT_TEMPLATE_FALLBACK_PARAM,
     ModelCapabilities,
+    ProviderRequestMetrics,
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
@@ -23,6 +24,8 @@ from turnstone.core.providers._protocol import (
     _lookup_capabilities,
     finish_shim_due,
     merge_reasoning_template_kwargs,
+    refuse_aborted_request,
+    serialized_tool_chars,
     snap_reasoning_effort,
 )
 from turnstone.core.trajectory import materialize_attachments
@@ -917,6 +920,7 @@ class AnthropicProvider:
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
+        request_metrics_ref: list[ProviderRequestMetrics] | None = None,
     ) -> Iterator[StreamChunk]:
         messages = materialize_attachments(messages, resolve_attachments)
         caps = capabilities or self.get_capabilities(model)
@@ -940,7 +944,16 @@ class AnthropicProvider:
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
 
+        refuse_aborted_request(cancel_ref)
+        if request_metrics_ref is not None:
+            request_metrics_ref.append(
+                ProviderRequestMetrics(
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools"))
+                )
+            )
+
         manager = client.messages.stream(**kwargs)
+        refuse_aborted_request(cancel_ref)
         try:
             stream = manager.__enter__()
         except BaseException:

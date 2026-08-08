@@ -251,7 +251,10 @@ not recognized.
 
 #### Connection lifecycle
 
-1. **`connected`** -- sent immediately on connect.
+1. **`connected`** -- sent in the synthetic replay for a fresh connection (and
+   after an announced replay gap). A cursor reconnect whose buffered gap is
+   fully covered receives only the missing buffered events, so this preamble is
+   not duplicated.
 
 ```json
 {
@@ -262,23 +265,33 @@ not recognized.
 }
 ```
 
-`skip_permissions` reflects the workstream's current auto-approve state. It is
-`true` if the server was started with `--skip-permissions` or if the user chose
-"Always approve" via the approval prompt during the session.
+`skip_permissions` reflects the workstream's blanket auto-approve state. It is
+`true` if the server was started with `--skip-permissions` or the workstream was
+created with blanket approval. "Approve + Always" now remembers only the tool
+names from the resolved cycle and does not flip this field.
 
-2. **`history`** -- replays the full conversation history so the client can
-   rebuild its UI.
+2. **REST history bootstrap** -- the SSE stream does not carry the full
+   transcript. Before opening a pane's initial event stream, fetch
+   `GET /v1/api/workstreams/{ws_id}/history?limit=100` (limit is clamped to
+   1--500). This also works for a saved workstream that is not loaded in the
+   manager.
 
 ```json
 {
-  "type": "history",
+  "ws_id": "abc123",
   "messages": [
     {"role": "user", "content": "Hello"},
     {"role": "assistant", "content": "Hi there!", "tool_calls": null},
     {"role": "tool", "content": "..."}
-  ]
+  ],
+  "cursor": null
 }
 ```
+
+`cursor` is normally `null`. When history intentionally trims a still-running
+trailing turn that the event ring can reconstruct, open the SSE URL with
+`?last_event_id=<cursor>` (or send `Last-Event-ID`) so the buffered delta fills
+that turn without double-rendering it.
 
 Each message in the `messages` array has:
 
@@ -298,8 +311,8 @@ Each entry in `tool_calls`:
 
 #### Streaming events
 
-After the initial `connected` and `history` frames, the server streams
-real-time events as the model generates a response:
+After the synthetic replay or cursor delta, the server streams real-time events
+as the model generates a response:
 
 **`thinking_start`** -- the model has begun generating (shown as a spinner).
 
@@ -350,7 +363,7 @@ state without waiting for the next live transition).
 content + reasoning text-so-far when this client connects mid-stream.
 Lets a refreshing browser tab restore partial assistant text immediately
 instead of waiting for the response to complete. Yielded once after the
-kind-specific replay phase (history + pending), only when at least one
+kind-specific replay preamble and pending-cycle snapshot, only when at least one
 of `content` / `reasoning` is non-empty. Both halves render into the same
 assistant bubble the live `content` / `reasoning` events would target;
 clients should treat the snapshot as idempotent (skip overwrite if the
@@ -391,11 +404,15 @@ action required).
 ```
 
 **`approve_request`** -- one or more tool calls that require user approval. The
-client must respond via `POST /v1/api/workstreams/{ws_id}/approve`.
+client must respond via `POST /v1/api/workstreams/{ws_id}/approve`. Parallel
+task agents can leave several approval rounds pending on one workstream at the
+same time, so clients should echo the event's `cycle_id` (or one member
+`call_id`) when resolving it.
 
 ```json
 {
   "type": "approve_request",
+  "cycle_id": "cycle_789",
   "items": [
     {
       "call_id": "call_def456",
@@ -407,6 +424,24 @@ client must respond via `POST /v1/api/workstreams/{ws_id}/approve`.
       "error": null
     }
   ]
+}
+```
+
+`cycle_id` identifies this approval round. It is stable across reconnect
+replay and is also carried by the corresponding `approval_resolved` event.
+
+**`approval_resolved`** -- one identified approval cycle was answered. Clients
+use `cycle_id` (or `call_ids`) to dismiss only that prompt when several remain
+live.
+
+```json
+{
+  "type": "approval_resolved",
+  "cycle_id": "cycle_789",
+  "call_ids": ["call_def456"],
+  "approved": true,
+  "feedback": "",
+  "always": false
 }
 ```
 
@@ -520,19 +555,22 @@ processing.
 {"type": "busy_error", "message": "Already processing a request. Please wait."}
 ```
 
-**`clear_ui`** -- instructs the client to clear all displayed messages (sent
-after `/clear` or `/new` commands).
+**`clear_ui`** -- instructs the client to clear displayed messages and re-fetch
+history after an identity or transcript-boundary change, including `/clear`,
+dedicated rewind/retry, successful fork publication, and opening saved history.
 
 ```json
 {"type": "clear_ui"}
 ```
 
 **`cancelled`** -- a cancel request was acknowledged (via the Stop button or
-`POST /v1/api/workstreams/{ws_id}/cancel`). This signals that cancellation is in progress, not
-that it is complete. The worker thread may still be finishing — wait for
-`stream_end` before transitioning to a ready state. The client should clear
-any in-progress assistant rendering but not re-enable the send button until
-`stream_end` arrives.
+`POST /v1/api/workstreams/{ws_id}/cancel`). This signals that cancellation is in
+progress, not that it is complete. The worker thread may still be finishing.
+Clear any in-progress assistant rendering, but keep the composer disabled until
+the workstream emits a terminal `state_change` (`idle` in the normal cancel
+path, or `error`). `stream_end` only closes assistant rendering: it may already
+have arrived before Stop reaches an approval or tool phase, so it is not a
+cancellation-completion signal.
 
 ```json
 {"type": "cancelled"}
@@ -600,13 +638,30 @@ Each SSE connection to a workstream receives its own delivery queue.  Events
 produced by the worker thread are fanned out to all registered listener queues,
 so multiple consumers (browser, console proxy, SDK) can connect
 simultaneously and each receives every event.  On reconnect the client receives
-the kind-specific replay (`connected` + `status` + `history` + pending
-approval / plan for interactive; `connected` + `status` + pending for coord)
-followed by a `state_change` carrying the current worker state and an
-optional `in_progress_snapshot` carrying any partial content / reasoning
-buffered for the in-progress turn — so a mid-stream refresh restores both
-the busy-mode UI and the partial assistant text without waiting for the
-response to complete.
+either the event-ring delta after its cursor or a synthetic recovery replay.
+The synthetic replay includes `connected`, cached `status`, every pending
+approval cycle, the current `state_change`, and an optional
+`in_progress_snapshot` with partial content/reasoning. Conversation history
+stays on the REST `/history` endpoint.
+
+---
+
+### `GET /v1/api/workstreams/{ws_id}/history`
+
+Returns the tail of the reconstructed conversation without opening the
+workstream. The endpoint works for a live session and for a saved workstream
+that is not loaded in the manager. Cross-kind, tenant, and private-project
+visibility checks run before storage reconstruction.
+
+| Query parameter | Type | Default | Description |
+|-----------------|------|---------|-------------|
+| `limit` | integer | `100` | Tail row limit, clamped to 1--500 |
+
+The response is `{"ws_id": ..., "messages": [...], "cursor": ...}` using the
+message shape documented in the event-stream bootstrap above. `cursor` is
+normally `null`; when non-null, open `/events?last_event_id=<cursor>` so the
+ring replays the deliberately trimmed in-progress tail. A missing, invisible,
+or wrong-kind workstream returns the endpoint's ordinary `404` shape.
 
 ---
 
@@ -840,26 +895,41 @@ an `approve_request` event for the given workstream.
 **Request body:**
 
 ```json
-{"approved": true, "feedback": null, "always": false}
+{
+  "approved": true,
+  "feedback": null,
+  "always": false,
+  "cycle_id": "cycle_789"
+}
 ```
 
-| Field      | Type        | Required | Description                                      |
-|------------|-------------|----------|--------------------------------------------------|
-| `approved` | bool        | yes      | `true` to approve, `false` to deny               |
-| `feedback` | string/null | no       | Optional feedback text (sent as denial reason)    |
-| `always`   | bool        | no       | If `true` and `approved`, enables auto-approve    |
+| Field      | Type        | Required | Description                                                   |
+|------------|-------------|----------|---------------------------------------------------------------|
+| `approved` | bool        | yes      | `true` to approve, `false` to deny                            |
+| `feedback` | string/null | no       | Optional feedback text (sent as denial reason)                 |
+| `always`   | bool        | no       | If approved, remember this round's tool names for this session |
+| `cycle_id` | string      | no       | Resolve this exact approval round                              |
+| `call_id`  | string      | no       | Resolve the round containing this tool call                    |
 
 When `always` is `true` and `approved` is `true`, the workstream's WebUI
-instance sets `auto_approve = True`, causing all subsequent tool calls to be
-automatically approved without prompting.
+adds the tool names from the resolved round to its per-tool auto-approve set.
+It does not enable blanket approval for unrelated tools.
+
+Use `cycle_id` when possible. `call_id` is useful for a UI organized around
+individual tool rows. If neither selector is supplied, the oldest unresolved
+round is selected for compatibility with older clients. A selector that no
+longer matches returns `409` with the current oldest `current_cycle_id` and
+`current_call_id`; the server never silently redirects a stale click to another
+round.
 
 **Response:**
 
 ```json
-{"status": "ok"}
+{"status": "ok", "cycle_id": "cycle_789"}
 ```
 
-**Error:** `404` with `{"error": "Unknown workstream"}` if `ws_id` is invalid.
+`cycle_id` is `null` if no pending round was resolved. An invalid workstream
+returns `404`; a stale `cycle_id` or `call_id` returns `409`.
 
 ---
 
@@ -927,12 +997,18 @@ SSE stream / in `/history`).
 | `command` | string | yes      | The slash command (e.g. `/clear`)  |
 | `ws_id`   | string | yes      | Target workstream ID               |
 
-If the command is `/clear`, `/new`, or `/resume`, the server pushes a
-`clear_ui` SSE event to instruct the client to reset its message display and
-re-fetch the transcript via `GET .../history` (there is no SSE event that
-carries the messages themselves). These follow-ups are emitted by the
-command worker itself, so they fire even when the endpoint already answered
+`/clear` pushes a `clear_ui` SSE event to instruct the client to reset its
+message display and re-fetch the transcript via `GET .../history` (there is no
+SSE event that carries the messages themselves). The follow-up is emitted by
+the command worker itself, so it fires even when the endpoint already answered
 `{"status": "running"}`.
+
+The remote command surface deliberately rejects lifecycle helpers
+`/new`, `/workstreams`, `/resume`, and `/delete`; those commands are local-CLI
+only because their legacy implementations enumerate or mutate storage without
+the HTTP tenancy gates. Remote callers must use the dedicated create, open,
+fork (`resume_ws` on create), close, and delete endpoints. `/rewind` and
+`/retry` likewise use their path-keyed endpoints rather than `/command`.
 
 **Response:**
 
@@ -955,26 +1031,32 @@ or `{"status": "running"}` as above.
 
 ### `POST /v1/api/workstreams/{ws_id}/cancel`
 
-Cancels the active generation in a workstream. Sets a cooperative cancellation
-flag that is checked at multiple points in the generation loop (per streaming
-chunk, before tool execution, inside bash commands). Also closes the underlying
-HTTP stream to the LLM provider, unblocking any pending read immediately.
-The session transitions to `idle` state and preserves any partial content
-already streamed.
+Cancels the workstream's current generation. Stop propagates to the primary or
+fallback model stream, model-backed attachment processing, parallel task-agent
+and foreground tool model calls, intent and output-guard judges, tracked bash
+subprocesses, and every approval cycle owned by that generation. Pending plan
+review is rejected as well. The worker preserves any assistant content already
+streamed and synthesizes honest cancelled tool results where needed so the
+saved conversation remains replayable.
 
-If the workstream is waiting for tool approval or plan review, the pending
-prompt is automatically denied/rejected to unblock the worker thread.
+The cooperative response is immediate: `status: ok` acknowledges the request,
+not completion. A running workstream emits `cancelled`, then transitions to
+`idle` after its worker unwinds. Depending on where Stop arrived,
+`stream_end` may have been emitted before the cancel request or may arrive while
+the worker is unwinding; clients use the terminal `state_change`, not
+`stream_end`, to become ready. An idle cancel is a harmless no-op and emits no
+misleading cancellation event. Detached background shells and watches are
+independent resources and are not stopped by this endpoint.
 
-Calling this endpoint when the workstream is already idle is a harmless no-op.
-
-**Force cancel:** When `force` is `true`, the server abandons the stuck worker
-thread immediately and transitions the workstream to `idle`. The abandoned
-thread continues to wind down in the background (killing any running
-subprocesses and exiting at the next cancellation checkpoint). During this
-wind-down it may emit a final `stream_end` event which the server suppresses
-for the orphaned thread. Use force cancel when cooperative cancel has not
-resolved within a few seconds — the web UI offers this as a "Force Stop"
-button automatically.
+**Force cancel:** When `force` is `true`, the server releases the stuck worker
+slot immediately, emits `stream_end`/`idle`, and lets a successor turn start.
+The abandoned daemon still owns its already-started external effects until it
+reaches a cancellation checkpoint. Send/model generations are fenced from late
+history and UI publication, but quick slash-command workers do not yet have
+generation checkpoints and may finish an in-place mutation concurrently with a
+successor. Use force cancel only when cooperative cancellation has not resolved
+within a few seconds — it is recovery from a wedged worker, not confirmation
+that every in-flight external side effect was rolled back.
 
 **Path parameters:**
 
@@ -992,11 +1074,25 @@ button automatically.
 |--------|--------|----------|----------------------|
 | `force`| bool   | no       | Abandon stuck worker immediately (default: `false`) |
 
+The body is optional. Because cancel is a recovery verb, an empty or malformed
+JSON body is treated as `force: false` rather than blocking Stop.
+
 **Response:**
 
 ```json
-{"status": "ok"}
+{
+  "status": "ok",
+  "dropped": {
+    "was_running": true,
+    "pending_approval": {"tool_names": ["bash"], "call_id": "call_abc123"},
+    "queued_messages": {"count": 1, "first_preview": "follow up after the build"}
+  }
+}
 ```
+
+`dropped` is a best-effort, credential-redacted snapshot of affected pending
+work. Fields are omitted when they were not observable. Coordinator sessions
+currently return an empty object.
 
 **Error responses:**
 
@@ -1009,7 +1105,8 @@ button automatically.
 
 ### `POST /v1/api/workstreams/new`
 
-Creates a new workstream. The server supports up to 10 concurrent workstreams.
+Creates a new workstream, subject to the configured
+`server.max_workstreams` capacity.
 
 The endpoint accepts **either** `application/json` (legacy shape) **or**
 `multipart/form-data` when you want to upload attachments at creation
@@ -1017,50 +1114,118 @@ time.  Multipart requests carry one `meta` field containing the JSON body
 shown below plus zero-or-more `file` parts; each file is validated and
 reserved onto the new workstream's first turn before the dispatch worker
 runs, so queued multimodal turns cannot lose files to racing sends.  If
-validation fails the fresh workstream is rolled back so no orphan rows
-leak.
+validation fails the fresh workstream is rolled back so no published row or
+phantom create/close event leaks.
 
 **Request body:**
 
 ```json
-{"name": "my-ws", "model": "openai"}
+{"name": "my-ws", "model": "openai", "initial_message": "Start the review"}
 ```
 
-All fields are optional. The body can be empty or an empty JSON object.
+All fields are optional; send an empty JSON object for a defaults-only create.
+An absent or malformed JSON body returns `400`.
 
-| Field            | Type   | Default | Description                                                    |
-|------------------|--------|---------|----------------------------------------------------------------|
-| `name`           | string | auto    | Workstream display name                                        |
-| `model`          | string | default | Model alias from the registry (`[models.*]`)                   |
-| `auto_approve`   | bool   | false   | Auto-approve all tool calls for this workstream                |
-| `resume_ws`      | string | ""      | Workstream ID to resume atomically during creation (empty = fresh)|
-| `skill`          | string | ""      | Skill name. Applies content (system prompt), model, temperature, reasoning effort, max tokens, auto-approve policy, token budget, and other session config from the skill. Returns 400 if not found or disabled. Ignored when `resume_ws` is set (resumed sessions restore their own skill). |
-| `persona`        | string | ""      | Persona slug. Resolved and snapshotted into the workstream at creation; empty selects the kind's default. |
-| `judge_model`    | string | ""      | Optional model alias for the judge (overrides default judge model for this workstream) |
+| Field             | Type          | Default | Description                                                    |
+|-------------------|---------------|---------|----------------------------------------------------------------|
+| `name`            | string        | auto    | Workstream display name                                        |
+| `model`           | string        | default | Model alias from the registry                                  |
+| `auto_approve`    | bool          | false   | Auto-approve all tool calls for this workstream                |
+| `auto_approve_tools` | string/array | `""` | Tool names to auto-approve even when `auto_approve` is false; accepts comma-separated text or an array |
+| `user_id`         | string        | `""`  | Owner override honored only for a trusted `console` service identity carrying the `service` scope; ordinary callers remain bound to their authenticated identity |
+| `resume_ws`       | string        | `""`    | Source workstream ID or alias to fork atomically into this new ID |
+| `skill`           | string        | `""`    | Skill name. Applies its system prompt and session configuration. Returns 400 if missing/disabled; ignored for a fork because the source configuration is cloned. |
+| `persona`         | string        | `""`    | Persona slug; empty selects the kind's default. A fork keeps the source persona. |
+| `judge_model`     | string        | `""`    | Optional judge model alias                                     |
+| `initial_message` | string        | `""`    | First user message to dispatch after publication               |
+| `ws_id`           | 32-hex string | generated | Caller-selected destination ID; required by the cluster multipart routing path |
+| `project_id`      | string/null   | none    | Project to attach. A fork always inherits the source's effective project. |
+| `notify_targets`  | string/array  | `[]`    | Completion-notification targets                                |
+| `client_type`     | string        | `web`   | Client surface label (`web`, `cli`, `chat`, or `scheduled`)    |
+| `parent_ws_id`    | string/null   | none    | Owning coordinator ID for a coordinator-spawned child          |
 
 > **Skill behavior:** When `skill` is specified, the skill's content is injected as a system message and its session config fields (model, temperature, auto-approve, token budget, etc.) override system defaults for the new workstream.
+
+#### Fork behavior (`resume_ws`)
+
+Despite the compatibility field name, `resume_ws` does not reopen or move the
+source workstream. It creates a distinct destination ID and atomically clones
+the source's checkpoint-bounded conversation, saved session configuration,
+persona, effective project, and attachment references. The source remains
+unchanged. Use `POST .../{ws_id}/open` when you want to rehydrate the original
+ID instead.
+
+The clone transaction rechecks source visibility, private-project membership
+and attachability, persona/project construction context, destination ownership
+and emptiness, and attachment integrity. A caller cannot use `project_id` to
+re-file or declassify the fork. Uploads cannot be combined with `resume_ws`;
+fork first, then use the ordinary attachment endpoint. Concurrent source-history
+writes serialize wholly before or after the clone snapshot; access,
+construction-context, or destination conflicts fail the whole fork rather than
+publishing a mixed result.
+
+#### Publication and rollback
+
+Creation first reserves the ID durably with internal state `creating`. That
+reservation is hidden from list, saved, resolve, open, and cluster-event
+surfaces while the session is constructed, uploads are validated, and an
+optional fork transaction commits. The final durable `creating` to `idle`
+compare-and-set happens before `ws_created`, audit, initial-message dispatch,
+or any state event. A normal pre-publication failure immediately and
+conditionally deletes the exact token-bearing reservation and emits no
+lifecycle event; if cleanup itself fails, the original HTTP error is retained
+and `ws.create.rollback_failed` is logged, leaving the row hidden rather than
+advertising a half-create.
+
+Long-lived server and console processes also run hidden-reservation recovery at
+boot and every five minutes, independently of ordinary idle eviction. It only
+considers rows still in internal `state='creating'` and older than two hours,
+excluding IDs currently loaded or pending in the manager. A live remote owner
+protects its rows; the current process's stable node ID does not self-protect,
+so a restart can recover its predecessor's residue. Failure to establish
+service liveness, or a storage failure, deletes nothing. Eligible rows are
+atomically hard-deleted with their dependent records and attachment refcounts;
+an eligible tokenless legacy or corrupt reservation is locked, recovered, and
+logged as a warning. Retention pruning leaves `creating` rows to this path. The
+value is not a live `WorkstreamState`, and recovery neither publishes nor
+closes it.
 
 **Response (success):**
 
 ```json
-{"ws_id": "ghi789", "name": "ws-3", "resumed": false, "message_count": 0}
+{
+  "ws_id": "ghi789",
+  "name": "ws-3",
+  "resumed": false,
+  "message_count": 0,
+  "attachment_ids": []
+}
 ```
 
 | Field           | Type   | Description                                         |
 |-----------------|--------|-----------------------------------------------------|
 | `ws_id`         | string | Unique ID of the new workstream                     |
-| `name`          | string | Auto-generated workstream name                      |
-| `resumed`       | bool   | Whether a previous session was successfully resumed |
-| `message_count` | int    | Number of messages in the resumed session (0 if fresh) |
+| `name`          | string | Assigned workstream display name                    |
+| `resumed`       | bool   | Whether the requested source was successfully forked |
+| `message_count` | int    | Messages cloned into the destination (0 if fresh/empty) |
+| `attachment_ids` | string[] | Attachments saved by this create request          |
 | `initial_message_status` | string | Present ONLY when the workstream was created but its `initial_message` could not be delivered: `"queue_full"` (a raced live worker's interjection queue was at capacity — resend via `/send`; any uploads stay staged) or `"refused_closed"` (the workstream was closed mid-create). Absent whenever the message was dispatched. |
 
-**Error (limit reached):**
+For compatibility, `resumed: true` means the requested fork completed; the
+source was not resumed in place.
 
-```json
-{"error": "Maximum of 10 workstreams reached"}
-```
+**Selected errors:**
 
-Status code: `400`
+| Status | Condition |
+|--------|-----------|
+| 400 | Invalid body/upload/persona/skill, attachments combined with `resume_ws`, or required project missing |
+| 403 | Destination project attach denied |
+| 404 | Fork source missing or not visible (same shape prevents an existence oracle) |
+| 409 | Caller-selected ID collision, source availability/construction context changed during fork, or destination reservation was superseded |
+| 413 | Upload exceeds the configured request/file cap |
+| 429 | Workstream manager is at capacity; retry after capacity frees |
+| 503 | Storage/factory/model configuration unavailable, or the fork transaction failed operationally |
+| 500 | Unexpected create failure; response includes a correlation ID for server logs |
 
 ---
 
@@ -1229,6 +1394,8 @@ Permanently delete a saved workstream and all its messages from storage.
 
 Load a saved workstream into memory with its original `ws_id`. If the
 workstream is already loaded, returns immediately with `already_loaded: true`.
+An internal `creating` reservation is not openable and returns the ordinary
+not-found shape until publication completes.
 
 **Path parameters:**
 
@@ -2132,7 +2299,7 @@ Status code: `200` with an empty body.
 
 | Condition                          | Behavior                                                   |
 |------------------------------------|------------------------------------------------------------|
-| Malformed or unparseable JSON body | Treated as an empty dict `{}`; missing fields use defaults |
+| Malformed, absent, or non-object body on an endpoint that requires a JSON object | `400`; cancel is the deliberate recovery-verb exception and treats it as `force: false` |
 | Unknown `ws_id`                    | `404` with `{"error": "Unknown workstream"}`               |
 | Unknown path (GET or POST)         | `404` with plain-text body `Not found`                     |
 | Empty `message` on `/v1/api/workstreams/{ws_id}/send` | `400` with `{"error": "Empty message"}`            |
@@ -2175,10 +2342,26 @@ reconnection:
 | Maximum delay      | 30 seconds                                |
 | Reset              | Delay resets to 1 second on first success |
 
-On reconnect, the server replays the full conversation history via the
-`history` event, so the client can rebuild its UI state without data loss. The
-same reconnection strategy applies to both the per-workstream SSE stream
-(`/v1/api/workstreams/{ws_id}/events`) and the global state stream (`/v1/api/events/global`).
+Per-workstream events carry monotonic SSE IDs and are retained in a bounded
+ring. Native `Last-Event-ID` and the `?last_event_id=N` query fallback both
+resume after the last applied event. If the ring covers the gap, only missing
+events are replayed. If it does not, the server emits:
+
+```json
+{
+  "type": "replay_truncated",
+  "ws_id": "abc123",
+  "lost_count": 4,
+  "earliest_available_id": 91
+}
+```
+
+The clients then refetch `/history`, adopt its optional resume cursor, and
+reconnect; an in-progress snapshot covers partial text on the synthetic path.
+This REST snapshot plus cursor/delta split prevents both missing turns and
+double-rendering across refreshes, ring eviction, and process restart. The
+global state stream has its own snapshot/replay floor rather than conversation
+history.
 
 ---
 
@@ -2310,33 +2493,83 @@ gateway) talk to the console instead of individual server nodes.
 
 ### `POST /v1/api/route/workstreams/new`
 
-Create a workstream via rendezvous routing. The console generates the `ws_id`,
-routes to the rendezvous-selected node, and includes `node_url` in the
-response for direct SSE connections.
+Create a workstream through the console routing layer. The JSON body accepts
+the ordinary create fields plus `target_node`:
 
-### `POST /v1/api/route/send`
+| Field | Routing behavior |
+|-------|------------------|
+| `ws_id` | Optional 32-hex destination. When present, it is preserved and used as the rendezvous key, including on a fork. A 503 never replaces a caller-selected ID. |
+| `resume_ws` | Optional source ID or saved alias for an atomic fork. The console resolves aliases to the canonical source ID before routing and forwards that canonical value. When no destination `ws_id` is supplied, the source is the placement key. |
+| `target_node` | Optional node ID hint. When neither `ws_id` nor `resume_ws` selects placement, the console generates a destination whose rendezvous owner is this live node. |
 
-Proxy a message to the workstream's assigned server node.
+Without any placement field, the console generates a destination ID and routes
+it by rendezvous. Multipart callers must pre-allocate the destination and put
+the **same** 32-hex value in both `?ws_id=<32-hex>` and the multipart
+`meta.ws_id` field. The query value selects the target node; the console
+buffers the body, parses only `meta` to require the same destination ID, then
+forwards the original bytes and boundary unchanged. The node uses `meta.ws_id`
+as the destination identity.
 
-### `POST /v1/api/route/approve`
+The response extends the node create response with three required fields:
+`node_url`, authoritative `node_id`, and `routing_strategy`.
+`routing_strategy` is `rendezvous` for generated, explicit JSON, and multipart
+destination IDs; `target_node` when the console generated an ID for a requested
+node; or `resume` only when an atomic fork was placed by its canonical source
+ID. The node-returned destination `ws_id` is authoritative for the response,
+storage binding lookup, and audit record; the fork source is never reported as
+the created destination.
 
-Proxy an approval response to the workstream's assigned server node.
+The JSON body must be an object. `ws_id`, `resume_ws`, and `target_node` must be
+strings when supplied; malformed placement fields return `400`. A missing fork
+source returns the same generic `404` as other missing workstreams. If a node
+returns `200` without an object containing a valid destination `ws_id`, the
+console returns a bounded `502` instead of exposing or trusting the malformed
+payload.
 
-### `POST /v1/api/route/cancel`
+### `GET /v1/api/route/workstreams/{ws_id}/live`
 
-Cancel generation on a workstream.
+Probe the rendezvous-selected owner without opening or rehydrating the
+workstream. The console asks that node's manager-authoritative active list and
+returns only:
+
+```json
+{"ws_id": "abc123", "live": true}
+```
+
+Missing, unloaded, still-`creating`, and caller-invisible workstreams all
+produce `live: false`. Routing, upstream, and authorization uncertainty returns
+an error instead of a false miss, so callers can preserve an existing route.
+
+### `POST /v1/api/route/workstreams/{ws_id}/send`
+
+Proxy a message to the workstream's assigned server node. `DELETE` on the same
+path dequeues a queued send.
+
+### `POST /v1/api/route/workstreams/{ws_id}/approve`
+
+Proxy an approval response, including optional `cycle_id` / `call_id`, to the
+workstream's assigned server node.
+
+### `POST /v1/api/route/workstreams/{ws_id}/cancel`
+
+Cancel generation on a workstream. The request and response have the same
+`force` / `dropped` shape as the node endpoint.
 
 ### `POST /v1/api/route/command`
 
-Send a slash command to a workstream.
+Send a conversation-local slash command. This legacy route still takes
+`ws_id` in the JSON body.
 
-### `POST /v1/api/route/plan`
+### `POST /v1/api/route/workstreams/{ws_id}/{rewind|retry}`
 
-Send plan review feedback to a workstream.
+Proxy a dedicated conversation-modification request.
 
-### `POST /v1/api/route/workstreams/close`
+### `POST /v1/api/route/workstreams/{ws_id}/close`
 
 Close a workstream.
+
+The console also exposes path-keyed routed attachment endpoints and
+`POST /v1/api/route/workstreams/delete` for coordinator-driven hard deletion.
 
 ### `GET /v1/api/route?ws_id=X`
 

@@ -73,7 +73,7 @@ from turnstone.core.model_registry import (
     strip_control_characters,
 )
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
-from turnstone.core.rendezvous import NoAvailableNodeError
+from turnstone.core.rendezvous import NoAvailableNodeError, NodeRef
 from turnstone.core.rerank_calibrate import canonical_caps_value
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
@@ -121,6 +121,12 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = logging.getLogger("turnstone.console.server")
+
+# A model-definition write and its follow-up refresh are separate operations.
+# Serialize the whole strict snapshot load + in-place install so a slow reader
+# that captured an older DB snapshot cannot land after a newer CRUD request's
+# refresh and roll the live coordinator registry backward.
+_COORD_REGISTRY_REFRESH_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Static assets — loaded once at startup
@@ -230,6 +236,8 @@ _JS_PROXY_SHIM = """\
 
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
+_VALID_CREATE_WS_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+_MAX_ROUTE_RESUME_LEN = 256
 
 # Client timeout for the REST proxy pool (BOTH constructions: startup and
 # the mTLS re-create).  Node endpoints that answer degraded-but-in-time
@@ -310,11 +318,12 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
     scope narrowing.  Falls back to the ServiceTokenManager when no user
     context is available.
 
-    When the inbound request authenticated with a coordinator-minted JWT
-    (``auth_result.token_source == "coordinator"``), the re-mint
-    preserves that source AND the ``coord_ws_id`` custom claim so
-    upstream audit rows retain coordinator-origin visibility.  For all
-    other inbound sources the re-mint uses ``"console-proxy"`` as before.
+    Coordinator-minted JWTs preserve their source and ``coord_ws_id`` custom
+    claim.  The console service identity also preserves ``source="console"``,
+    but only when the inbound token carries the unassignable ``service``
+    scope; that is the node create handler's signal that a body ``user_id``
+    override is trusted.  Every ordinary principal is re-minted as
+    ``"console-proxy"`` even if its untrusted ``src`` claim says ``console``.
     """
     auth_result = getattr(getattr(request, "state", None), "auth_result", None)
     jwt_secret: str = getattr(request.app.state, "jwt_secret", "")
@@ -324,7 +333,10 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
         # every upstream call from a coordinator session would be
         # indistinguishable from a human-originated console proxy call.
         is_coord = auth_result.token_source == "coordinator"
-        source = "coordinator" if is_coord else "console-proxy"
+        is_console_service = (
+            auth_result.token_source == "console" and "service" in auth_result.scopes
+        )
+        source = "coordinator" if is_coord else "console" if is_console_service else "console-proxy"
         extra: dict[str, Any] = {}
         if is_coord:
             coord_ws_id = auth_result.extra_claims.get("coord_ws_id")
@@ -1952,8 +1964,9 @@ async def route_create(request: Request) -> Response:
 
     Accepts both `application/json` and `multipart/form-data`. Multipart
     callers must include ``?ws_id=<hex>`` in the URL query string so the
-    console can hash to the owning node before the multipart body lands —
-    we do not parse the body just to peek at the metadata.
+    console can hash to the owning node. The console parses only the cached
+    ``meta`` field to require the same destination id, then forwards the
+    original body and boundary unchanged.
     """
     from turnstone.core.auth import require_any_permission
 
@@ -1994,25 +2007,57 @@ async def route_create(request: Request) -> Response:
     headers = _proxy_auth_headers(request)
     pin = False
     body: dict[str, Any] = {}
-    raw_body: bytes = b""
     # Routing strategy is surfaced on the response so callers (the
     # coordinator's spawn_workstream tool especially) can explain why a
     # given node was chosen.  Set on every branch below.
     routing_strategy = "rendezvous"
 
     if is_multipart:
-        # Multipart: caller must pass ws_id as a query param so we can
-        # route without parsing the body.  Stream the raw bytes through
-        # to the upstream so we don't lose the multipart framing.
-        ws_id = request.query_params.get("ws_id", "").strip()
-        if not ws_id:
+        # Multipart: caller must pass ws_id as a query param. Parse only the
+        # cached metadata to verify identity, then stream the original bytes
+        # through so we do not lose the multipart framing.
+        ws_id = request.query_params.get("ws_id", "")
+        if not _VALID_CREATE_WS_ID_RE.fullmatch(ws_id):
             return _record_route(
                 request,
                 "create",
                 400,
                 t0,
                 JSONResponse(
-                    {"error": "ws_id query parameter required for multipart create"},
+                    {
+                        "error": (
+                            "ws_id query parameter must be a 32-character "
+                            "lowercase hexadecimal string for multipart create"
+                        )
+                    },
+                    status_code=400,
+                ),
+            )
+        # Placement and durable identity must be the same value.  The node
+        # reads ``meta.ws_id`` from the multipart body, while the console uses
+        # the query value for rendezvous; forwarding a mismatch would create
+        # the row on a node that follow-up requests do not select.  Buffering
+        # is already part of this proxy path, so parse only the metadata here
+        # and still forward the original bytes and boundary verbatim.
+        raw_body = await request.body()
+        form = None
+        try:
+            form = await request.form()
+            meta_raw = form.get("meta")
+            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else None
+        except Exception:
+            meta = None
+        finally:
+            if form is not None:
+                await form.close()
+        if not isinstance(meta, dict) or meta.get("ws_id") != ws_id:
+            return _record_route(
+                request,
+                "create",
+                400,
+                t0,
+                JSONResponse(
+                    {"error": "multipart meta.ws_id must match the ws_id query parameter"},
                     status_code=400,
                 ),
             )
@@ -2029,11 +2074,10 @@ async def route_create(request: Request) -> Response:
                     status_code=503,
                 ),
             )
-        # Multipart callers pre-allocate ws_id (typically an attachment
-        # follow-up against an existing workstream) — same hash-of-known-id
-        # path resume_ws takes on the JSON branch.
-        routing_strategy = "resume"
-        raw_body = await request.body()
+        # Multipart callers pre-allocate a fresh destination id. Placement is
+        # ordinary rendezvous over that id; ``resume`` is reserved for the JSON
+        # atomic-fork path keyed by its source workstream.
+        routing_strategy = "rendezvous"
         # Forward the raw header verbatim — the multipart `boundary=` parameter
         # is case-sensitive and must match the bytes in the body exactly.
         upstream_headers = {**headers, "Content-Type": raw_content_type}
@@ -2055,27 +2099,122 @@ async def route_create(request: Request) -> Response:
                 ),
             )
     else:
-        try:
-            body = await request.json()
-        except Exception:
+        parsed_body = await read_json_or_400(request)
+        if isinstance(parsed_body, JSONResponse):
+            return _record_route(request, "create", parsed_body.status_code, t0, parsed_body)
+        body = parsed_body
+
+        for field in ("resume_ws", "target_node", "ws_id"):
+            if field in body and not isinstance(body[field], str):
+                return _record_route(
+                    request,
+                    "create",
+                    400,
+                    t0,
+                    JSONResponse({"error": f"{field} must be a string"}, status_code=400),
+                )
+
+        resume_ws = body.get("resume_ws", "")
+        target_node = body.get("target_node", "")
+        requested_ws_id = body.get("ws_id", "")
+        if resume_ws and len(resume_ws) > _MAX_ROUTE_RESUME_LEN:
             return _record_route(
                 request,
                 "create",
                 400,
                 t0,
                 JSONResponse(
-                    {"error": "Invalid JSON body"},
+                    {"error": f"resume_ws must be at most {_MAX_ROUTE_RESUME_LEN} characters"},
                     status_code=400,
                 ),
             )
+        if target_node and (
+            len(target_node) > 256 or _VALID_NODE_ID.fullmatch(target_node) is None
+        ):
+            return _record_route(
+                request,
+                "create",
+                400,
+                t0,
+                JSONResponse({"error": "invalid target_node format"}, status_code=400),
+            )
+        if requested_ws_id and _VALID_CREATE_WS_ID_RE.fullmatch(requested_ws_id) is None:
+            return _record_route(
+                request,
+                "create",
+                400,
+                t0,
+                JSONResponse({"error": "invalid ws_id format"}, status_code=400),
+            )
+
+        # ``resume_ws`` supports saved aliases, but rendezvous placement needs
+        # the canonical source id. Resolve before choosing a node and forward
+        # the canonical value so the router and node operate on one identity.
+        if resume_ws:
+            storage, storage_err = require_storage_or_503(request)
+            if storage_err is not None:
+                return _record_route(
+                    request,
+                    "create",
+                    storage_err.status_code,
+                    t0,
+                    storage_err,
+                )
+            try:
+                # Keep the node and console on one precedence rule. A full
+                # workstream id is already canonical when that exact row
+                # exists; only fall back to alias-first resolution when it
+                # does not. Otherwise an alias equal to another row's 32-hex
+                # id can redirect the routed fork before it reaches the node.
+                exact_row = (
+                    await asyncio.to_thread(storage.get_workstream, resume_ws)
+                    if _VALID_CREATE_WS_ID_RE.fullmatch(resume_ws)
+                    else None
+                )
+                canonical_resume = (
+                    resume_ws
+                    if exact_row is not None
+                    else await asyncio.to_thread(storage.resolve_workstream, resume_ws)
+                )
+            except Exception:
+                log.warning(
+                    "route_create.resume_lookup_failed source=%s",
+                    resume_ws[:32],
+                    exc_info=True,
+                )
+                return _record_route(
+                    request,
+                    "create",
+                    503,
+                    t0,
+                    JSONResponse({"error": "Storage not available"}, status_code=503),
+                )
+            if not canonical_resume:
+                return _record_route(
+                    request,
+                    "create",
+                    404,
+                    t0,
+                    JSONResponse({"error": "Workstream not found"}, status_code=404),
+                )
+            body["resume_ws"] = canonical_resume
+            resume_ws = canonical_resume
+
+        fixed_ws_id = bool(requested_ws_id)
         try:
-            if body.get("resume_ws"):
-                ref = router.route(body["resume_ws"])
+            if requested_ws_id:
+                # A caller-selected destination is authoritative. Do not
+                # overwrite it for a target hint or a fork; place it through
+                # the same rendezvous path used for generated destinations.
+                ref = router.route(requested_ws_id)
+                routing_strategy = "rendezvous"
+            elif resume_ws:
+                ref = router.route(resume_ws)
                 routing_strategy = "resume"
-            elif body.get("target_node"):
+            elif target_node:
                 # Brute-force HRW search can take up to _GENERATE_ATTEMPT_CAP
                 # iterations for skewed weights; off the event loop.
-                ws_id = await asyncio.to_thread(router.generate_ws_id_for_node, body["target_node"])
+                ws_id = await asyncio.to_thread(router.generate_ws_id_for_node, target_node)
                 body["ws_id"] = ws_id
                 ref = router.route(ws_id)
                 pin = True
@@ -2115,7 +2254,7 @@ async def route_create(request: Request) -> Response:
         # 503 retry with a new ws_id that hashes to a different node.
         # Multipart variant skips this branch — the body is bound to the
         # ws_id the caller chose, so re-routing would mean re-uploading.
-        if resp.status_code == 503 and not pin and not body.get("resume_ws"):
+        if resp.status_code == 503 and not pin and not resume_ws and not fixed_ws_id:
             failed_node = ref.node_id
             found_alt = False
             for _ in range(10):
@@ -2157,16 +2296,34 @@ async def route_create(request: Request) -> Response:
                 )
 
     if resp.status_code == 200:
-        data = resp.json()
+        try:
+            raw_data = resp.json()
+        except Exception:
+            raw_data = None
+        if not isinstance(raw_data, dict):
+            log.warning(
+                "route_create.invalid_success_body node=%s body=%s",
+                ref.node_id,
+                _bounded_body_preview(resp.content),
+            )
+            return _record_route(request, "create", 502, t0, _dispatch_failed(ref.node_id))
+        destination_ws_id = raw_data.get("ws_id")
+        destination_name = raw_data.get("name")
+        if (
+            not isinstance(destination_ws_id, str)
+            or _VALID_CREATE_WS_ID_RE.fullmatch(destination_ws_id) is None
+            or not isinstance(destination_name, str)
+        ):
+            log.warning(
+                "route_create.invalid_success_shape node=%s ws_id_type=%s name_type=%s",
+                ref.node_id,
+                type(destination_ws_id).__name__,
+                type(destination_name).__name__,
+            )
+            return _record_route(request, "create", 502, t0, _dispatch_failed(ref.node_id))
+
+        data = dict(raw_data)
         data["node_url"] = ref.url
-        # Audit attribution — multipart sets ``ws_id`` from the query
-        # string; JSON sets it on the body (or carries ``resume_ws``
-        # for a rehydrate).  Either way, this is the workstream the
-        # caller actually landed on.
-        if is_multipart:
-            audit_ws_id = ws_id
-        else:
-            audit_ws_id = body.get("ws_id") or body.get("resume_ws", "") or ""
         # Return the storage-authoritative node_id so subsequent
         # inspect / list calls agree on the binding.  ``ref.node_id`` is
         # the rendezvous target AT SPAWN TIME — stale once membership
@@ -2177,21 +2334,32 @@ async def route_create(request: Request) -> Response:
         # additive.
         bound_node_id = ref.node_id
         storage = getattr(request.app.state, "auth_storage", None)
-        if storage is not None and audit_ws_id:
+        if storage is not None:
             try:
-                row = storage.get_workstream(audit_ws_id)
+                row = storage.get_workstream(destination_ws_id)
                 stored_node = row.get("node_id") if isinstance(row, dict) else None
                 if isinstance(stored_node, str) and stored_node:
                     bound_node_id = stored_node
             except Exception:
                 log.debug(
                     "route_create.node_id_lookup_failed ws=%s",
-                    audit_ws_id[:8] if audit_ws_id else "",
+                    destination_ws_id[:8],
                     exc_info=True,
                 )
         data["node_id"] = bound_node_id
         data["routing_strategy"] = routing_strategy
-        _emit_route_audit(request, "route.workstream.create", audit_ws_id, bound_node_id)
+        # The node transaction has already persisted destination -> serving
+        # node as a durable override.  Publish the same confirmed placement to
+        # this console's cache before returning so an immediate follow-up does
+        # not rendezvous the fresh id to another node while the collector is
+        # still between refresh ticks.
+        await asyncio.to_thread(router.remember_override, destination_ws_id, ref)
+        _emit_route_audit(
+            request,
+            "route.workstream.create",
+            destination_ws_id,
+            bound_node_id,
+        )
         return _record_route(request, "create", 200, t0, JSONResponse(data))
     return _record_route(
         request,
@@ -2388,16 +2556,35 @@ async def route_proxy(request: Request) -> Response:
     try:
         body = await request.json()
     except Exception:
-        return _record_route(
-            request,
-            verb,
-            400,
-            t0,
-            JSONResponse(
-                {"error": "Invalid JSON body"},
-                status_code=400,
-            ),
-        )
+        if verb == "cancel":
+            # Match the node endpoint: cancel is a recovery verb, so an
+            # absent or malformed body remains cooperative ``force=false``.
+            body = {}
+        else:
+            return _record_route(
+                request,
+                verb,
+                400,
+                t0,
+                JSONResponse(
+                    {"error": "Invalid JSON body"},
+                    status_code=400,
+                ),
+            )
+    if not isinstance(body, dict):
+        if verb == "cancel":
+            body = {}
+        else:
+            return _record_route(
+                request,
+                verb,
+                400,
+                t0,
+                JSONResponse(
+                    {"error": "Request body must be a JSON object"},
+                    status_code=400,
+                ),
+            )
 
     # Path-keyed shape (post-1.5) carries ws_id in the URL; the
     # legacy command route still mounts at a body-keyed URL and
@@ -2655,6 +2842,137 @@ async def route_lookup(request: Request) -> JSONResponse:
             {"node_url": ref.url, "node_id": ref.node_id},
         ),
     )  # type: ignore[return-value]
+
+
+async def route_workstream_live(request: Request) -> Response:
+    """Read-only probe for live membership on a workstream's routed node.
+
+    The console deliberately asks the rendezvous owner instead of its
+    eventually-consistent collector. The upstream active-list handler is
+    manager-authoritative, excludes deferred ``creating`` rows, and applies
+    the caller's normal project visibility rules. Only a boolean returns, so
+    an unloaded, missing, or caller-invisible workstream has the same shape.
+    """
+    t0 = time.monotonic()
+    router: ConsoleRouter | None = request.app.state.router
+    ring_ready = router is not None and router.is_ready()
+    if not ring_ready:
+        if router is not None:
+            await asyncio.to_thread(router.refresh_cache)
+            ring_ready = router.is_ready()
+        if not ring_ready:
+            return _record_route(
+                request,
+                "live",
+                503,
+                t0,
+                JSONResponse(
+                    {"error": "Cluster routing not initialized"},
+                    status_code=503,
+                ),
+            )
+    assert router is not None
+
+    ws_id = request.path_params.get("ws_id", "").strip()
+    if not ws_id:
+        return _record_route(
+            request,
+            "live",
+            400,
+            t0,
+            JSONResponse({"error": "ws_id required"}, status_code=400),
+        )
+
+    try:
+        ref = router.route(ws_id)
+    except (NoAvailableNodeError, ValueError):
+        return _record_route(
+            request,
+            "live",
+            503,
+            t0,
+            JSONResponse({"error": "routing failed"}, status_code=503),
+        )
+
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+
+    async def _active_rows(route_ref: NodeRef) -> tuple[list[Any] | None, Response | None]:
+        try:
+            resp = await client.get(
+                f"{route_ref.url}/v1/api/workstreams",
+                headers=headers,
+            )
+        except httpx.HTTPError:
+            return None, JSONResponse(
+                {"error": f"upstream node {route_ref.node_id} unreachable"},
+                status_code=502,
+            )
+
+        if not 200 <= resp.status_code < 300:
+            return None, Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers={"Content-Type": resp.headers.get("content-type", "application/json")},
+            )
+
+        try:
+            payload = resp.json()
+        except (ValueError, httpx.HTTPError):
+            payload = None
+        rows = payload.get("workstreams") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            return None, JSONResponse(
+                {"error": f"upstream node {route_ref.node_id} returned an invalid active list"},
+                status_code=502,
+            )
+        return rows, None
+
+    rows, probe_error = await _active_rows(ref)
+    if probe_error is not None:
+        return _record_route(request, "live", probe_error.status_code, t0, probe_error)
+    assert rows is not None
+
+    live = any(
+        isinstance(row, dict) and row.get("ws_id") == ws_id and row.get("state") != "creating"
+        for row in rows
+    )
+    if not live:
+        # A clean miss is ambiguous while the collector cache may predate a
+        # freshly committed destination override.  Refresh the shared-storage
+        # view and re-probe exactly once only when placement changed.  ACL and
+        # upstream errors remain fail-closed; a stable owner can safely report
+        # the original miss without another round trip.
+        try:
+            await asyncio.to_thread(router.force_refresh)
+            refreshed_ref = router.route(ws_id)
+        except Exception:
+            log.warning("route_workstream_live.refresh_failed ws=%s", ws_id[:8], exc_info=True)
+            return _record_route(
+                request,
+                "live",
+                503,
+                t0,
+                JSONResponse({"error": "routing refresh failed"}, status_code=503),
+            )
+        if (refreshed_ref.node_id, refreshed_ref.url) != (ref.node_id, ref.url):
+            rows, probe_error = await _active_rows(refreshed_ref)
+            if probe_error is not None:
+                return _record_route(request, "live", probe_error.status_code, t0, probe_error)
+            assert rows is not None
+            live = any(
+                isinstance(row, dict)
+                and row.get("ws_id") == ws_id
+                and row.get("state") != "creating"
+                for row in rows
+            )
+    return _record_route(
+        request,
+        "live",
+        200,
+        t0,
+        JSONResponse({"ws_id": ws_id, "live": live}),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3167,7 +3485,11 @@ async def _resolve_coordinator_or_404(
         except Exception:
             log.debug("resolve_coordinator.storage_failed ws=%s", ws_id[:8], exc_info=True)
             return None, miss
-        if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
+        if (
+            row is None
+            or row.get("state") == "creating"
+            or row.get("kind") != WorkstreamKind.COORDINATOR
+        ):
             return None, miss
         # Project tenancy — the predicate may resolve a project row +
         # membership, so judge it off the event loop.
@@ -3220,7 +3542,11 @@ def _coordinator_tenant_check(request: Request, ws_id: str, mgr: Any) -> JSONRes
         owner = ws.user_id or ""
     else:
         row = storage.get_workstream(ws_id)
-        if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
+        if (
+            row is None
+            or row.get("state") == "creating"
+            or row.get("kind") != WorkstreamKind.COORDINATOR
+        ):
             return miss
         project_id = row.get("project_id") or ""
         owner = row.get("user_id") or ""
@@ -4610,8 +4936,9 @@ def _coord_idle_cleanup_thread(
     timeout_sec: float,
     stop_event: threading.Event | None = None,
     min_sweep_interval: float = 5.0,
+    wake_event: threading.Event | None = None,
 ) -> None:
-    """Periodically reap idle + DB-orphan coordinator workstreams.
+    """Run coordinator idle eviction plus hidden-create recovery.
 
     Mirrors the regular server's ``_idle_cleanup_thread`` (turnstone/server.py)
     but skips the rate-limiter / global-queue arms — the console doesn't have
@@ -4621,19 +4948,14 @@ def _coord_idle_cleanup_thread(
     behind by prior console process incarnations.
 
     Runs an initial sweep BEFORE the first wait so cold-start orphans are
-    reaped immediately rather than waiting one ``check_every`` interval (~30
-    min on default 2h timeout).  This intentionally diverges from the regular
-    server pattern, which has no initial sweep — the regular server runs
-    inside a normal request-handling lifecycle, the console-side coord pool
-    is a small fixed-size cache where orphans dominate the row count after
-    a cold boot.
+    reaped immediately. ``timeout_sec == 0`` disables ordinary idle eviction,
+    but the independent provisional-create recovery still runs with its fixed
+    conservative grace and cadence.
 
-    Wait shape: subscribes a callback to ``mgr._state_subscribers`` that
-    sets a ``tick_now`` event; the loop blocks on ``tick_now.wait(check_every)``
-    so any workstream state-change wakes the sweeper without waiting a
-    full check interval, AND the timeout still fires the periodic sweep
-    even when no activity happens (catching the DB-orphan-only case).
-    Net: blocked most of the time instead of repeating storage scans.
+    When idle eviction is enabled, the wait subscribes to manager state and a
+    transition can wake the next sweep early. With idle eviction disabled, the
+    thread uses only the fixed provisional-create cadence so ordinary turn
+    transitions do not cause redundant storage scans.
 
     ``min_sweep_interval`` is the hard floor between successive
     ``close_idle`` calls (default 5 s) — without it, sustained
@@ -4654,12 +4976,22 @@ def _coord_idle_cleanup_thread(
     feels prompt to a human watching the sidebar.  Tunable post-merge
     if profiling shows close_idle latency dominates the cadence.
 
-    ``stop_event`` is for tests — when set, the thread exits cleanly after
-    the next loop check.  Production callers pass ``None`` (the daemon is
-    process-lifetime).
+    ``stop_event`` is the lifecycle shutdown signal and ``wake_event`` is the
+    shared state-change/shutdown wake path. Lifecycle owners set both so an
+    idle-enabled thread cannot remain blocked in its long heartbeat wait.
     """
-    check_every = min(300.0, timeout_sec / 4)
-    tick_now = threading.Event()
+    from turnstone.core.session_manager import (
+        STALE_CREATE_GRACE_SECONDS,
+        STALE_CREATE_SWEEP_INTERVAL_SECONDS,
+    )
+
+    idle_enabled = timeout_sec > 0
+    check_every = (
+        min(STALE_CREATE_SWEEP_INTERVAL_SECONDS, timeout_sec / 4)
+        if idle_enabled
+        else float(STALE_CREATE_SWEEP_INTERVAL_SECONDS)
+    )
+    tick_now = wake_event if wake_event is not None else threading.Event()
 
     def _on_state_change(_ws_id: str, _state: Any) -> None:
         # Any workstream state-change resets the idle clock for that
@@ -4668,22 +5000,49 @@ def _coord_idle_cleanup_thread(
         # re-evaluation deferred to the next loop iteration.
         tick_now.set()
 
-    mgr.subscribe_to_state(_on_state_change)
+    if idle_enabled:
+        mgr.subscribe_to_state(_on_state_change)
+
+    last_create_sweep_at: float | None = None
+
+    def _sweep(*, initial: bool = False) -> None:
+        nonlocal last_create_sweep_at
+        if idle_enabled:
+            try:
+                mgr.close_idle(timeout_sec)
+            except Exception:
+                log.debug("console.coord_idle_cleanup_failed", exc_info=True)
+        now = time.monotonic()
+        if (
+            initial
+            or last_create_sweep_at is None
+            or now - last_create_sweep_at >= STALE_CREATE_SWEEP_INTERVAL_SECONDS
+        ):
+            # State changes may wake ordinary idle eviction every few seconds;
+            # hidden-create GC retains its independent five-minute cadence.
+            last_create_sweep_at = now
+            try:
+                mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
+            except Exception:
+                log.debug("console.coord_stale_create_cleanup_failed", exc_info=True)
+
     try:
         # Initial sweep — runs once before entering the wait loop.
         # ``tick_now`` is intentionally not cleared here: any
         # state-change event that arrives between subscribe and the
         # first ``wait`` should fire close_idle immediately, not be
         # discarded.
-        try:
-            mgr.close_idle(timeout_sec)
-        except Exception:
-            log.debug("console.coord_idle_cleanup_initial_failed", exc_info=True)
+        _sweep(initial=True)
         last_sweep_at = time.monotonic()
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
-            tick_now.wait(check_every)
+            if idle_enabled:
+                tick_now.wait(check_every)
+            elif stop_event is not None:
+                stop_event.wait(check_every)
+            else:
+                time.sleep(check_every)
             if stop_event is not None and stop_event.is_set():
                 return
             # Clear BEFORE the cadence floor so any state-change event
@@ -4705,13 +5064,11 @@ def _coord_idle_cleanup_thread(
                         return
                 else:
                     time.sleep(gap)
-            try:
-                mgr.close_idle(timeout_sec)
-            except Exception:
-                log.debug("console.coord_idle_cleanup_failed", exc_info=True)
+            _sweep()
             last_sweep_at = time.monotonic()
     finally:
-        mgr.unsubscribe_from_state(_on_state_change)
+        if idle_enabled:
+            mgr.unsubscribe_from_state(_on_state_change)
 
 
 # Guards concurrent attempts to bootstrap the coord subsystem from the
@@ -4850,6 +5207,8 @@ def _bootstrap_coord_subsystem(
     coord_adapter.attach(coord_mgr)
     coord_idle_observer = CoordinatorIdleObserver(coord_mgr, storage)
     cleanup_thread: threading.Thread | None = None
+    cleanup_stop = threading.Event()
+    cleanup_wake = threading.Event()
 
     # Side-effect phase: start threads + register subscriptions.  Any
     # failure here rolls back via locally-held handles BEFORE the
@@ -4888,15 +5247,15 @@ def _bootstrap_coord_subsystem(
         # ``server.workstream_idle_timeout`` setting — same cadence
         # makes sense for both kinds and avoids a redundant config
         # knob.
-        if idle_minutes > 0:
-            timeout_sec = float(idle_minutes * 60)
-            cleanup_thread = threading.Thread(
-                target=_coord_idle_cleanup_thread,
-                args=(coord_mgr, timeout_sec),
-                name="coord-idle-cleanup",
-                daemon=True,
-            )
-            cleanup_thread.start()
+        timeout_sec = float(idle_minutes * 60) if idle_minutes > 0 else 0.0
+        cleanup_thread = threading.Thread(
+            target=_coord_idle_cleanup_thread,
+            args=(coord_mgr, timeout_sec, cleanup_stop),
+            kwargs={"wake_event": cleanup_wake},
+            name="coord-idle-cleanup",
+            daemon=True,
+        )
+        cleanup_thread.start()
     except Exception:
         # Roll back partial side-effects from locals (no app.state
         # writes have happened yet, so the cleanup is local-ref-driven).
@@ -4904,6 +5263,10 @@ def _bootstrap_coord_subsystem(
         # doesn't block the next; the whole rollback is best-effort.
         from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
 
+        cleanup_stop.set()
+        cleanup_wake.set()
+        if cleanup_thread is not None and cleanup_thread.ident is not None:
+            cleanup_thread.join(timeout=2.0)
         try:
             coord_state_writer.shutdown(timeout=2.0)
         except Exception:
@@ -4920,10 +5283,6 @@ def _bootstrap_coord_subsystem(
             shutdown_idle_nudge_watchers(app)
         except Exception:
             log.warning("console.coord_bootstrap_rollback_idle_nudge_failed", exc_info=True)
-        # cleanup_thread is the last side-effect started; if it ran
-        # successfully, the surrounding try block had already exited
-        # successfully — so a partial-failure path will not have a
-        # cleanup_thread to roll back.  No-op for symmetry.
         raise
 
     # Atomic commit phase: stamp ``app.state`` and class attrs.  Order
@@ -4938,6 +5297,8 @@ def _bootstrap_coord_subsystem(
     app.state.coord_idle_observer = coord_idle_observer
     if cleanup_thread is not None:
         app.state.coord_idle_cleanup_thread = cleanup_thread
+        app.state.coord_idle_cleanup_stop = cleanup_stop
+        app.state.coord_idle_cleanup_wake = cleanup_wake
     # Shared refs so ConsoleCoordinatorUI.on_state_change flows state
     # transitions through the unified manager, on_rename fans out to
     # the cluster dashboard, and _record_judge_metric /
@@ -5052,6 +5413,21 @@ def _teardown_partial_coord_subsystem(app: Any) -> None:
     from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
 
     state = app.state
+    cleanup_stop = getattr(state, "coord_idle_cleanup_stop", None)
+    cleanup_wake = getattr(state, "coord_idle_cleanup_wake", None)
+    cleanup_thread = getattr(state, "coord_idle_cleanup_thread", None)
+    if cleanup_stop is not None:
+        cleanup_stop.set()
+    if cleanup_wake is not None:
+        cleanup_wake.set()
+    if cleanup_thread is not None and cleanup_thread is not threading.current_thread():
+        cleanup_thread.join(timeout=2.0)
+        if cleanup_thread.is_alive():
+            log.warning("console.coord_partial_idle_cleanup_join_timed_out")
+    state.coord_idle_cleanup_stop = None
+    state.coord_idle_cleanup_wake = None
+    state.coord_idle_cleanup_thread = None
+
     sw = getattr(state, "coord_state_writer", None)
     if sw is not None:
         try:
@@ -5089,10 +5465,6 @@ def _teardown_partial_coord_subsystem(app: Any) -> None:
     state.coord_mgr = None
     state.coord_adapter = None
     state.coord_registry = None
-    # The cleanup thread is the LAST step of a successful bootstrap, so
-    # a partial failure can't have started one.  Clear the attr defensively
-    # against future code-shape drift.
-    state.coord_idle_cleanup_thread = None
     # Match the lifespan shutdown's cleanup of these class-level refs
     # (server.py ~line 4629) so a failed bootstrap doesn't leave stale
     # process-global pointers at a half-built coord_mgr / collector /
@@ -5314,6 +5686,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     app.state.coord_adapter = None
     app.state.coord_registry = None
     app.state.coord_registry_error = ""
+    app.state.coord_idle_cleanup_stop = None
+    app.state.coord_idle_cleanup_wake = None
+    app.state.coord_idle_cleanup_thread = None
     if storage and config_store:
         # Run the whole load-and-bootstrap synchronously on a worker
         # thread so a slow ``StateWriter.shutdown(timeout=2.0)`` on the
@@ -5371,6 +5746,20 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
 
     shutdown_idle_nudge_watchers(app)
+    coord_cleanup_stop = getattr(app.state, "coord_idle_cleanup_stop", None)
+    coord_cleanup_wake = getattr(app.state, "coord_idle_cleanup_wake", None)
+    coord_cleanup_thread = getattr(app.state, "coord_idle_cleanup_thread", None)
+    if coord_cleanup_stop is not None:
+        coord_cleanup_stop.set()
+    if coord_cleanup_wake is not None:
+        coord_cleanup_wake.set()
+    if coord_cleanup_thread is not None:
+        await asyncio.to_thread(coord_cleanup_thread.join, 2.0)
+        if coord_cleanup_thread.is_alive():
+            log.warning("console.coord_idle_cleanup_join_timed_out")
+    app.state.coord_idle_cleanup_stop = None
+    app.state.coord_idle_cleanup_wake = None
+    app.state.coord_idle_cleanup_thread = None
     coord_idle_observer_shutdown = getattr(app.state, "coord_idle_observer", None)
     if coord_idle_observer_shutdown is not None:
         try:
@@ -12073,7 +12462,18 @@ async def _collect_model_status(
 
 
 def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
+    """Serialize one strict DB snapshot load and live-registry install."""
+    with _COORD_REGISTRY_REFRESH_LOCK:
+        _refresh_coord_registry_locked(app_state, storage)
+
+
+def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
     """Rebuild ``app_state.coord_registry`` in place from DB model definitions.
+
+    Caller holds :data:`_COORD_REGISTRY_REFRESH_LOCK` across both the strict
+    snapshot load and ``ModelRegistry.reload``.  Keeping the lock outside the
+    registry's own client lock is intentional: that lock protects one reload's
+    mutation, but cannot order the database snapshots feeding two reloads.
 
     The console-side coordinator session factory closes over the
     ``coord_registry`` instance built at lifespan startup
@@ -15439,6 +15839,11 @@ def create_app(
                     Route("/api/cluster/events", cluster_events_sse),
                     # Workstream routing (rendezvous proxy to server nodes)
                     Route("/api/route/workstreams/new", route_create, methods=["POST"]),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/live",
+                        route_workstream_live,
+                        methods=["GET"],
+                    ),
                     Route(
                         "/api/route/workstreams/{ws_id}/send",
                         route_proxy,

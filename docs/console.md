@@ -174,17 +174,32 @@ Request:
 {
   "node_id": "db-west-04",
   "name": "perf-analysis",
-  "model": "gpt-5"
+  "model": "gpt-5",
+  "project_id": "proj_analytics",
+  "initial_message": "Profile the slow query"
 }
 ```
 
 All fields are optional:
 - `node_id` — targeting mode:
   - **omitted or `"auto"`** — console picks the reachable node with the most available capacity (max_ws - ws_total) and proxies the request to it.
-  - **`"pool"`** — console picks a reachable node with available capacity using round-robin selection.
+  - **`"pool"`** — compatibility alias for automatic placement on the reachable node with the most headroom.
   - **specific node ID** — proxies the request to that node directly.
 - `name` — workstream display name. Auto-generated if omitted.
 - `model` — model alias from the target node's registry. Uses the node's default model if omitted.
+- `judge_model` — optional judge-model alias for this workstream.
+- `initial_message` — first message dispatched after the workstream is published.
+- `skill` — enabled profile/skill to snapshot onto a fresh workstream.
+- `persona` — enabled persona slug; empty uses the interactive default.
+- `project_id` — project to attach, subject to the target node's membership gate.
+- `resume_ws` — source ID to **fork** atomically into a new workstream. The
+  source remains unchanged; its checkpoint-bounded history, configuration,
+  persona, project, and attachment references are copied transactionally.
+
+The endpoint also accepts the same multipart create shape as a node: one
+JSON-encoded `meta` field plus up to ten `file` parts. Files require an
+`initial_message` in the dashboard launcher. Files cannot be combined with
+`resume_ws`; fork first and upload on the new workstream.
 
 Response:
 
@@ -196,7 +211,19 @@ Response:
 }
 ```
 
-The response confirms the workstream creation request was proxied to the target node. A `ws_created` event on the cluster SSE stream confirms the workstream was actually created.
+The response is returned only after the target node has durably published the
+workstream. Its hidden `creating` reservation has already crossed to `idle`,
+and the node emitted `ws_created` before any initial-message state event. The
+cluster SSE event may therefore arrive before or after the HTTP response;
+clients should reconcile both by the returned `correlation_id`/workstream ID
+rather than treating them as two creates.
+
+For safety, the console masks most target-node failures as the opaque `502`
+shape `{"error":"Dispatch to node <node_id> failed"}` instead of reflecting
+arbitrary node text or retry-triggering 401/429 responses. The coded
+`server.require_project` refusal is the exception and remains a `400` with
+actionable wording. Consult the target node's logs for the underlying create
+correlation when a reachable node returns a masked 502.
 
 ### `GET /v1/api/cluster/events`
 
@@ -310,8 +337,8 @@ The auth system uses three scopes instead of the earlier read/full role model:
 | Scope | Grants |
 |-------|--------|
 | `read` | Read-only access: dashboards, workstream lists, SSE streams, health |
-| `write` | Send messages, create/close workstreams, approve tool calls |
-| `approve` | Admin operations: manage users and API tokens |
+| `write` | Non-approval mutations: send, create/open/close/delete, cancel, attachments, rewind, and retry |
+| `approve` | Tool-approval and admin HTTP surfaces (with their additional RBAC permission checks) |
 
 Scopes are cumulative — a user with `approve` scope can also perform `write` and `read` operations.
 
@@ -348,52 +375,73 @@ SSE streams (`/v1/api/workstreams/{ws_id}/events`, `/v1/api/events/global`) are 
 
 ### Authentication
 
-The proxy mints a short-lived (5-minute) JWT per request carrying the real user's `user_id`, `scopes`, and `permissions` with `aud: turnstone-server`.  The user's console JWT (`aud: turnstone-console`) cannot be forwarded directly — it would be rejected by the server's audience validation — so the console re-signs a new server-audience JWT from the validated `AuthResult`.  This preserves audit attribution (the upstream server sees the real user, not a service identity) and enforces scope narrowing as defense in depth (a read-only console user's proxied request carries only `read` scope).  The JWT `src` claim is set to `"console-proxy"` for audit traceability.  When no user context is available (auth disabled), the proxy falls back to a `ServiceTokenManager` with service identity `console-proxy`.  The static `--auth-token` / `proxy_auth_token` is used as a final fallback.
+The proxy mints a short-lived (5-minute) JWT per request carrying the real user's `user_id`, `scopes`, and `permissions` with `aud: turnstone-server`.  The user's console JWT (`aud: turnstone-console`) cannot be forwarded directly — it would be rejected by the server's audience validation — so the console re-signs a new server-audience JWT from the validated `AuthResult`.  This preserves audit attribution (the upstream server sees the real user, not a service identity) and enforces scope narrowing as defense in depth (a read-only console user's proxied request carries only `read` scope). Ordinary users are re-minted with `src="console-proxy"`; coordinator tokens retain `src="coordinator"` plus `coord_ws_id`, and only the validated console service identity with `service` scope retains `src="console"` for trusted owner forwarding. When no user context is available, the proxy falls back to a `ServiceTokenManager` identity `console-proxy` carrying `src="console"` and `{read, write, approve, service}` scopes.  The static `--auth-token` / `proxy_auth_token` is used as a final fallback.
 
 ---
 
 ## Browser Dashboard
 
-The web UI has five views, toggled client-side:
+The console uses an L-shaped application shell: a collapsible navigation rail,
+a tab bar, and a pane host. On mobile the rail becomes an off-canvas drawer.
+The rail is fed by the cluster SSE snapshot and shows:
 
-### 1. Cluster Overview (landing)
+- state/count filters and the live compute-node list, including version drift;
+- active coordinator and interactive workstreams, nested under their
+  coordinator parent and grouped by project when project metadata is visible;
+- permission-filtered Manage groups that open the singleton Admin pane.
 
-- **State cards** — 5 clickable cards (running, thinking, attention, idle, error) with count and colored top border. Clicking filters to that state.
-- **Aggregate bar** — total tokens and tool calls across the cluster.
-- **Node table** — columns: NODE, WS, RUN, ATTN, TOKENS, VER, LOAD. Sorted by activity. Clickable rows drill down to node detail. Version column shows per-node version; hidden on mobile.
-- **Version drift indicator** — when nodes report different versions, the status bar shows a yellow "DRIFT" warning with a tooltip listing all versions. Node groups show "mixed" with a yellow badge when their members disagree.
-- **"+ new" button** — opens the workstream creation modal (see below).
+Coordinator and interactive conversations open as tabs inside the same shell.
+Interactive panes use the owning node's console proxy, so users do not need
+direct network access to compute-node ports. Split-right and split-down actions
+can display several panes at once. Closing a pane removes only that tab; use the
+pane menu's explicit close or delete action to change the workstream lifecycle.
 
-### 2. Node Drill-down
+### Dashboard pane
 
-Breadcrumb: `Cluster > db-west-04`. Shows the node's workstreams in a table matching the per-node dashboard layout (STATE, NAME, MODEL, NODE, TASK, TOKENS, CTX) with activity sub-lines. Includes a link to the node's proxied server UI.
+The home view is coordinator-first. It contains the persistent workstream
+launcher plus the saved-sessions list. Selecting a state count opens the
+filtered workstream table inside the same Dashboard pane; selecting a compute
+node opens its proxied node surface. Cluster SSE updates keep rail state,
+workstream rows, and tab state glyphs synchronized.
 
-**Proxy deep-linking:** Clicking a workstream row opens the node's server UI in a new tab via the proxy at `/node/{node_id}/?ws_id=<id>`, which auto-selects that workstream. Users do not need direct network access to the server node.
+### Workstream launcher
 
-### 3. Filtered Workstreams
+The landing-page composer starts a workstream with an optional initial task and
+attachments. When the caller can create both kinds, a Coordinator / Interactive
+toggle selects the target kind. Its options include:
 
-Breadcrumb: `Cluster > Running` or `Cluster > db-west-04`. Server-side paginated workstream table. NODE column values are clickable to filter further. Pagination controls at bottom. Workstream rows use proxy deep-links.
-
-### 4. Workstream Creation Modal
-
-Triggered by the "+ new" header button. A modal dialog with:
-
-- **Node selector** — dropdown with three targeting modes: "Auto (best available)" picks the node with the most headroom, "General pool (any node)" picks a node with available capacity using round-robin, or a specific node from the list (showing capacity).
+- **Node placement** — "Least loaded" picks the reachable node with the most
+  headroom, or "Specific node" pins the create to a node from the live list.
 - **Persona** — optional dropdown listing the enabled personas for the workstream kind. Sets the system-message composition and capability envelope at creation, snapshotted server-side; empty uses the kind's default. Picking one requires no `persona.*` permission.
-- **Profile** — optional dropdown listing enabled skills. Applies the skill's model, auto-approve policy, token budget, and other behavioral settings at creation time.
+- **Skill** — optional dropdown listing enabled skills. Applies the skill's model, auto-approve policy, token budget, and other behavioral settings at creation time.
+- **Project** — optional project filing. Private projects require owner/member access. A coordinator child inherits its parent's project unless explicitly routed to another attachable project.
 - **Name** — optional text input. Auto-generated if left empty.
-- **Model** — optional text input for a model alias from the target node's registry.
-- **Judge Model** — optional text input for the judge model alias (overrides the default judge model for this workstream).
+- **Model** — optional selector populated from the target model registry.
+- **Judge Model** — optional selector for the judge alias (overrides the default
+  judge model for this workstream).
 
-Keyboard shortcuts: Ctrl+Shift+R (refresh title), Ctrl+Shift+E (edit title), Ctrl+Shift+F (fork), Ctrl+Shift+X (delete). Press ? for full shortcut help.
+Interactive launches additionally expose node strategy / node selection.
+Submitting uses `POST /v1/api/cluster/workstreams/new`; coordinator launches use
+the console's coordinator create surface. A toast confirms the committed
+create, while SSE updates the dashboard and opens the resulting pane.
 
-On submit, `POST /v1/api/cluster/workstreams/new` dispatches the creation request. A toast confirms success; the SSE stream delivers the `ws_created` event to update the dashboard.
+Files require a non-empty initial task so the first turn consumes the staged
+attachments. The console shell does not currently expose a fork action; use the
+node's standalone workstream UI or the create API's `resume_ws` field.
 
-All five views receive live updates via SSE — state cards update counts, node rows update metrics, workstream rows update state indicators.
+### Saved and filtered sessions
 
-The browser maintains a local `clusterState` object that mirrors the cluster snapshot. It is initialized from the SSE `snapshot` event on connect (or via `GET /v1/api/cluster/snapshot` on initial page load) and updated incrementally by SSE events. View navigation reads from local state — no API round-trips needed after the initial snapshot.
+Saved coordinator and interactive sessions share one list with kind and persona
+labels, filtering, pagination, and multi-select deletion. Opening a saved
+coordinator rehydrates it in the console; opening a saved interactive session
+resolves its node, calls `open`, and then connects the node-proxied pane.
 
-### 5. Admin Panel
+The filtered live table carries STATE, NAME, MODEL, NODE, TASK, TOKENS, and CTX
+columns. The browser maintains a local `clusterState` initialized from the
+cluster snapshot and updated incrementally by SSE; the filtered view normally
+renders from that state without another API round trip.
+
+### Admin pane
 
 Accessed via the "admin" button in the header (visible when authenticated
 with `approve` scope). Provides user, API token, channel link, MCP server,
@@ -405,8 +453,11 @@ Audit tabs, and [Settings](settings.md) for the database-backed
 configuration editor.
 
 The **Channels** tab links users to either a Discord or Slack account
-via a per-row channel-type selector.  The **Models** tab is a CRUD
-editor for `model_definitions`, the **Nodes** tab edits per-node
+via a per-row channel-type selector. The **Models** tab is a CRUD
+editor for `model_definitions`, including static and dynamic backend-auth
+modes. Model edits rebind existing workstreams at their next send while
+in-flight requests keep their original definition snapshot; see
+[Settings](settings.md#model-definition-reloads) for the full contract. The **Nodes** tab edits per-node
 metadata, and the **TLS** tab manages CA and leaf certificates for the
 internal mTLS fabric.  The **Settings** tab edits ConfigStore values
 live; edits apply without restart.
@@ -504,7 +555,7 @@ Run history is automatically pruned (runs older than 90 days) approximately once
 | Mode | Behavior |
 |------|----------|
 | `auto` | Picks the reachable node with the most available capacity |
-| `pool` | Picks a reachable node with available capacity using round-robin |
+| `pool` | Compatibility alias for the reachable node with the most headroom |
 | `all` | Fan-out to all reachable nodes (capped at `max_fan_out`, default 20) |
 | `<node_id>` | Targets a specific node by ID |
 
@@ -664,4 +715,7 @@ turnstone-server --port 8080
 turnstone-console --port 8090
 ```
 
-Open `http://localhost:8090` for the cluster dashboard. Create workstreams via the "+ new" button. Click any workstream to open the proxied server UI — no direct access to server ports required.
+Open `http://localhost:8090` for the cluster dashboard. Create workstreams from
+the persistent Dashboard launcher. Selecting a workstream opens a coordinator
+or node-proxied interactive pane in the console shell — no direct access to
+server ports is required.

@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import time
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 from turnstone.core.storage import is_storage_initialized, reset_storage
 
@@ -24,6 +25,84 @@ class _Params:
 
     base_url = "http://eval.invalid/v1"
     api_key = "eval-key"
+
+
+class TestHeadlessLaneOwnership:
+    def test_one_primary_lane_and_its_capabilities_serve_the_whole_run(self, tmp_db):
+        """A headless tool loop pins one session-owned lane snapshot.
+
+        Full wire preparation must use that same lane's capabilities on every
+        iteration; rebuilding from raw session handles could either tear a
+        binding or silently change the fold posture midway through one measured
+        run.  A malformed historical call also proves this remains the FULL
+        raw-history composition, not the interactive post-model-turn suffix.
+        """
+        from turnstone.core.model_turn import ModelTurnResult
+        from turnstone.core.trajectory import ToolCall, Turn
+        from turnstone.eval.core import HeadlessSession
+
+        session = HeadlessSession(client=MagicMock(), model="eval-model")
+        session.messages.extend(
+            [
+                Turn.user("old request"),
+                Turn.assistant(
+                    "",
+                    tool_calls=(ToolCall(id="old", name="bash", arguments="{bad"),),
+                ),
+                Turn.tool("old", "retry with valid JSON"),
+            ]
+        )
+        lane = session._primary_lane()
+        first_call = {
+            "id": "new",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"},
+        }
+        results = [
+            ModelTurnResult(
+                turn=Turn.assistant(
+                    "",
+                    tool_calls=(ToolCall(id="new", name="bash", arguments="{}"),),
+                ),
+                finish_reason="tool_calls",
+                usage=None,
+                tool_calls=[first_call],
+            ),
+            ModelTurnResult(
+                turn=Turn.assistant("done"),
+                finish_reason="stop",
+                usage=None,
+                tool_calls=[],
+            ),
+        ]
+
+        try:
+            with (
+                patch.object(session, "_primary_lane", return_value=lane) as primary_lane,
+                patch.object(
+                    session,
+                    "_prepare_wire_messages",
+                    wraps=session._prepare_wire_messages,
+                ) as prepare_wire,
+                patch.object(
+                    session,
+                    "_execute_tools",
+                    return_value=([("new", "ok")], ""),
+                ),
+                patch("turnstone.eval.core.model_turn", side_effect=results) as sample,
+            ):
+                session._run_headless_loop(max_turns=2)
+        finally:
+            session.close()
+
+        primary_lane.assert_called_once_with()
+        assert sample.call_count == 2
+        assert all(call.args[0] is lane for call in sample.call_args_list)
+        assert prepare_wire.call_count == 2
+        assert all(call.kwargs["caps"] is lane.capabilities for call in prepare_wire.call_args_list)
+        first_wire_turns = sample.call_args_list[0].args[1]
+        historical_call = next(turn.tool_calls[0] for turn in first_wire_turns if turn.tool_calls)
+        assert historical_call.arguments == "{}"
 
 
 class TestRunResourceLifecycle:

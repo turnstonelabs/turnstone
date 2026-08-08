@@ -183,6 +183,14 @@ class CoordinatorAdapter:
         case we still broadcast the state-change with empty rich
         fields so the dashboard's coord row still flips state.
         """
+        self.prepare_state_event(ws, state)()
+
+    def prepare_state_event(
+        self,
+        ws: Workstream,
+        state: WorkstreamState,
+    ) -> Callable[[], None]:
+        """Freeze the rich payload before deferred durability can block."""
         ui = ws.ui
         if ui is not None and hasattr(ui, "snapshot_and_consume_state_payload"):
             payload = ui.snapshot_and_consume_state_payload(state.value)
@@ -194,18 +202,24 @@ class CoordinatorAdapter:
                 "activity_state": "",
                 "content": "",
             }
-        try:
-            self._collector.emit_console_ws_state(
-                ws.id,
-                state.value,
-                tokens=payload["tokens"],
-                context_ratio=payload["context_ratio"],
-                activity=payload["activity"],
-                activity_state=payload["activity_state"],
-                content=payload["content"],
-            )
-        except Exception:
-            log.debug("coord_adapter.state_fanout_failed ws=%s", ws.id[:8], exc_info=True)
+        ws_id = ws.id
+        state_value = state.value
+
+        def _emit() -> None:
+            try:
+                self._collector.emit_console_ws_state(
+                    ws_id,
+                    state_value,
+                    tokens=payload["tokens"],
+                    context_ratio=payload["context_ratio"],
+                    activity=payload["activity"],
+                    activity_state=payload["activity_state"],
+                    content=payload["content"],
+                )
+            except Exception:
+                log.debug("coord_adapter.state_fanout_failed ws=%s", ws_id[:8], exc_info=True)
+
+        return _emit
 
     def emit_closed(
         self,

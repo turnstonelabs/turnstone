@@ -116,7 +116,26 @@ export interface ApproveRequest {
   approved: boolean;
   feedback?: string | null;
   always?: boolean;
-  ws_id: string;
+  /** Resolve exactly this approval cycle. */
+  cycle_id?: string | null;
+  /** Resolve the approval cycle containing this tool call. */
+  call_id?: string | null;
+}
+
+export interface ApproveResponse {
+  status: string;
+  /** The cycle resolved by the request, or null when none was pending. */
+  cycle_id: string | null;
+}
+
+export interface CancelRequest {
+  force?: boolean;
+}
+
+export interface CancelResponse {
+  status: string;
+  /** Credential-redacted snapshot of pending work affected by cancellation. */
+  dropped: Record<string, unknown>;
 }
 
 export interface CommandRequest {
@@ -128,7 +147,20 @@ export interface CreateWorkstreamRequest {
   name?: string;
   model?: string;
   auto_approve?: boolean;
+  /** Tool names accepted as a CSV string or array; blanks are removed server-side. */
+  auto_approve_tools?: string | string[];
+  /** Override judge model alias for this workstream. */
+  judge_model?: string;
+  /**
+   * Owner override for trusted service identities. Ordinary callers remain
+   * bound to their authenticated principal.
+   */
+  user_id?: string;
   resume_ws?: string;
+  /** Completion-notification targets as JSON text or structured target objects. */
+  notify_targets?: string | Array<Record<string, string>>;
+  /** Client surface label such as web, cli, chat, or scheduled. */
+  client_type?: string;
   skill?: string;
   /**
    * Persona name (slug) to create the workstream with. Resolved and
@@ -541,13 +573,33 @@ export interface ConsoleCreateWsRequest {
   skill?: string;
   /** Persona slug — resolved and snapshotted at creation. */
   persona?: string;
+  /** Project to attach the workstream to. */
+  project_id?: string;
   resume_ws?: string;
+  /** Override judge model alias for this workstream. */
+  judge_model?: string;
 }
 
 export interface ConsoleCreateWsResponse {
   status: string;
   correlation_id: string;
   target_node: string;
+}
+
+export interface RouteCreateRequest extends CreateWorkstreamRequest {
+  /** Pin placement to this node by generating a matching rendezvous key. */
+  target_node?: string;
+}
+
+export interface RouteCreateResponse extends CreateWorkstreamResponse {
+  node_url: string;
+  node_id: string;
+  routing_strategy: "rendezvous" | "target_node" | "resume";
+}
+
+export interface RouteLiveResponse {
+  ws_id: string;
+  live: boolean;
 }
 
 export interface ConsoleHealthResponse {

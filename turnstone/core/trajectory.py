@@ -99,8 +99,10 @@ class ProviderNative:
     """The one opaque provider-native lane (reasoning, server-tool results, …).
 
     Replayed verbatim to the producing provider and dropped (rebuilt from the neutral
-    fields) for any other.  ``blocks`` are opaque on the wire path and never inspected
-    there; the UI display projection is the only reader that looks inside.
+    fields) for any other.  Signed, encrypted, and structured blocks are opaque on the
+    wire path.  Trust-boundary lowering may copy and defang editable top-level
+    ``type=text`` blocks so a native replay cannot resurrect forged session markers;
+    the UI display projection also reads selected blocks.
     """
 
     producer: str
@@ -116,7 +118,10 @@ class TurnMeta:
     ``system`` turn's structured per-kind fields, e.g. ``watch_triggered``'s
     ``watch_name`` / ``command`` / poll counters; persisted in the
     ``conversations.meta`` column, surfaced to the FE for per-kind rendering) and
-    ``"attachments_meta"`` (display metadata for by-reference attachments)."""
+    ``"attachments_meta"`` (display metadata for by-reference attachments).
+    Storage-backed canonical loads also carry ``"storage_attachment_ids"``:
+    the raw ordered row ref-list used only to make fork retention fail-closed;
+    dict/wire projection deliberately ignores it."""
 
     event_id: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)

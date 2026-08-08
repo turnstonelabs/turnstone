@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from turnstone.api.console_schemas import RouteCreateResponse
 from turnstone.channels._routing import ChannelRouter
 from turnstone.sdk._types import TurnstoneAPIError
 
@@ -17,6 +18,7 @@ def mock_storage() -> MagicMock:
     storage.get_channel_user = MagicMock(return_value=None)
     storage.get_channel_route = MagicMock(return_value=None)
     storage.get_channel_route_by_ws = MagicMock(return_value=None)
+    storage.resolve_workstream = MagicMock(side_effect=lambda ws_id: ws_id)
     storage.create_channel_route = MagicMock()
     storage.delete_channel_route = MagicMock(return_value=True)
     return storage
@@ -124,6 +126,45 @@ class TestDeleteRoute:
         mock_storage.delete_channel_route.assert_called_once_with("discord", "ch-123")
 
 
+class TestWorkstreamLiveness:
+    @pytest.mark.anyio
+    async def test_direct_mode_uses_manager_authoritative_active_list(
+        self,
+        router: ChannelRouter,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        assert router._server is not None
+        mock_list = AsyncMock(
+            return_value=MagicMock(
+                workstreams=[
+                    MagicMock(ws_id="other", state="idle"),
+                    MagicMock(ws_id="ws-live", state="running"),
+                    MagicMock(ws_id="ws-creating", state="creating"),
+                ]
+            )
+        )
+        monkeypatch.setattr(router._server, "list_workstreams", mock_list)
+
+        assert await router._is_ws_live("ws-live") is True
+        assert await router._is_ws_live("ws-cold") is False
+        assert await router._is_ws_live("ws-creating") is False
+        assert mock_list.await_count == 3
+
+    @pytest.mark.anyio
+    async def test_console_mode_uses_routed_live_probe(
+        self,
+        console_router: ChannelRouter,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        assert console_router._console is not None
+        mock_live = AsyncMock(side_effect=[MagicMock(live=True), MagicMock(live=False)])
+        monkeypatch.setattr(console_router._console, "route_workstream_live", mock_live)
+
+        assert await console_router._is_ws_live("ws-live") is True
+        assert await console_router._is_ws_live("ws-cold") is False
+        assert [item.args[0] for item in mock_live.await_args_list] == ["ws-live", "ws-cold"]
+
+
 class TestGetOrCreateWorkstream:
     @pytest.mark.anyio
     async def test_creates_new_workstream_via_server(
@@ -151,7 +192,13 @@ class TestGetOrCreateWorkstream:
     ) -> None:
         assert console_router._console is not None
         mock_create = AsyncMock(
-            return_value={"ws_id": "ws-new", "name": "test", "node_url": "http://node1:8080/v1"}
+            return_value=RouteCreateResponse(
+                ws_id="ws-new",
+                name="test",
+                node_url="http://node1:8080/v1",
+                node_id="node-1",
+                routing_strategy="rendezvous",
+            )
         )
         monkeypatch.setattr(console_router._console, "route_create_workstream", mock_create)
         ws_id, is_new = await console_router.get_or_create_workstream(
@@ -175,7 +222,7 @@ class TestGetOrCreateWorkstream:
             "channel_type": "discord",
             "channel_id": "ch-1",
         }
-        monkeypatch.setattr(router, "_is_ws_alive", AsyncMock(return_value=True))
+        monkeypatch.setattr(router, "_is_ws_live", AsyncMock(return_value=True))
         ws_id, is_new = await router.get_or_create_workstream("discord", "ch-1")
         assert ws_id == "ws-old"
         assert is_new is False
@@ -192,8 +239,8 @@ class TestGetOrCreateWorkstream:
             "channel_type": "discord",
             "channel_id": "ch-1",
         }
-        # Alive check returns False — ws is not alive.
-        monkeypatch.setattr(router, "_is_ws_alive", AsyncMock(return_value=False))
+        # The durable source exists but is no longer loaded on the node.
+        monkeypatch.setattr(router, "_is_ws_live", AsyncMock(return_value=False))
         # Server create returns a resumed workstream.
         assert router._server is not None
         mock_create = AsyncMock()
@@ -210,6 +257,221 @@ class TestGetOrCreateWorkstream:
         mock_create.assert_awaited_once()
         call_kwargs = mock_create.call_args[1]
         assert call_kwargs["resume_ws"] == "ws-stale"
+
+    @pytest.mark.anyio
+    async def test_missing_stale_source_retries_fresh_via_server(
+        self,
+        router: ChannelRouter,
+        mock_storage: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_storage.get_channel_route.return_value = {
+            "ws_id": "ws-pruned",
+            "channel_type": "discord",
+            "channel_id": "ch-1",
+        }
+        mock_storage.resolve_workstream.side_effect = None
+        mock_storage.resolve_workstream.return_value = None
+        assert router._server is not None
+        mock_create = AsyncMock(
+            side_effect=[
+                TurnstoneAPIError(404, "Workstream not found"),
+                MagicMock(ws_id="ws-fresh", name="test"),
+            ]
+        )
+        mock_send = AsyncMock()
+        monkeypatch.setattr(router._server, "create_workstream", mock_create)
+        monkeypatch.setattr(router._server, "send", mock_send)
+
+        ws_id, is_new = await router.get_or_create_workstream(
+            "discord",
+            "ch-1",
+            name="test",
+            initial_message="hello",
+        )
+
+        assert (ws_id, is_new) == ("ws-fresh", True)
+        assert [item.kwargs["resume_ws"] for item in mock_create.await_args_list] == [
+            "ws-pruned",
+            "",
+        ]
+        mock_send.assert_awaited_once_with("hello", "ws-fresh")
+        mock_storage.create_channel_route.assert_called_once_with("discord", "ch-1", "ws-fresh")
+
+    @pytest.mark.anyio
+    async def test_missing_stale_source_retries_fresh_via_console(
+        self,
+        console_router: ChannelRouter,
+        mock_storage: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_storage.get_channel_route.return_value = {
+            "ws_id": "ws-pruned",
+            "channel_type": "slack",
+            "channel_id": "ch-1",
+        }
+        mock_storage.resolve_workstream.side_effect = None
+        mock_storage.resolve_workstream.return_value = None
+        assert console_router._console is not None
+        mock_create = AsyncMock(
+            side_effect=[
+                TurnstoneAPIError(404, "Workstream not found"),
+                RouteCreateResponse(
+                    ws_id="ws-fresh",
+                    name="test",
+                    node_url="http://node2:8080/v1",
+                    node_id="node-2",
+                    routing_strategy="rendezvous",
+                ),
+            ]
+        )
+        mock_send = AsyncMock()
+        monkeypatch.setattr(console_router._console, "route_create_workstream", mock_create)
+        monkeypatch.setattr(console_router._console, "route_send", mock_send)
+
+        ws_id, is_new = await console_router.get_or_create_workstream(
+            "slack",
+            "ch-1",
+            name="test",
+            initial_message="hello",
+        )
+
+        assert (ws_id, is_new) == ("ws-fresh", True)
+        assert [item.kwargs["resume_ws"] for item in mock_create.await_args_list] == [
+            "ws-pruned",
+            "",
+        ]
+        mock_send.assert_awaited_once_with("hello", "ws-fresh")
+        assert console_router._node_urls["ws-fresh"] == "http://node2:8080/v1"
+        mock_storage.create_channel_route.assert_called_once_with("slack", "ch-1", "ws-fresh")
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("status_code", "message"),
+        [
+            (404, "Workstream not found"),
+            (403, "Forbidden"),
+            (503, "Storage unavailable"),
+            (409, "Fork source is no longer available"),
+            (404, "Project not found"),
+        ],
+        ids=["masked-acl", "forbidden", "operational", "conflict", "other-not-found"],
+    )
+    @pytest.mark.parametrize("via_console", [False, True], ids=["server", "console"])
+    async def test_stale_source_does_not_retry_other_failures(
+        self,
+        router: ChannelRouter,
+        console_router: ChannelRouter,
+        mock_storage: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        status_code: int,
+        message: str,
+        via_console: bool,
+    ) -> None:
+        selected = console_router if via_console else router
+        mock_storage.get_channel_route.return_value = {
+            "ws_id": "ws-stale",
+            "channel_type": "discord",
+            "channel_id": "ch-1",
+        }
+        monkeypatch.setattr(selected, "_is_ws_live", AsyncMock(return_value=False))
+        mock_create = AsyncMock(side_effect=TurnstoneAPIError(status_code, message))
+        if selected._console is not None:
+            monkeypatch.setattr(selected._console, "route_create_workstream", mock_create)
+        else:
+            assert selected._server is not None
+            monkeypatch.setattr(selected._server, "create_workstream", mock_create)
+
+        with pytest.raises(TurnstoneAPIError) as exc_info:
+            await selected.get_or_create_workstream("discord", "ch-1")
+
+        assert exc_info.value.status_code == status_code
+        assert exc_info.value.message == message
+        mock_create.assert_awaited_once()
+        mock_storage.delete_channel_route.assert_not_called()
+        mock_storage.create_channel_route.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_fresh_retry_is_attempted_only_once(
+        self,
+        router: ChannelRouter,
+        mock_storage: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_storage.get_channel_route.return_value = {
+            "ws_id": "ws-pruned",
+            "channel_type": "discord",
+            "channel_id": "ch-1",
+        }
+        mock_storage.resolve_workstream.side_effect = None
+        mock_storage.resolve_workstream.return_value = None
+        assert router._server is not None
+        error = TurnstoneAPIError(404, "Workstream not found")
+        mock_create = AsyncMock(side_effect=[error, error])
+        monkeypatch.setattr(router._server, "create_workstream", mock_create)
+
+        with pytest.raises(TurnstoneAPIError, match="Workstream not found"):
+            await router.get_or_create_workstream("discord", "ch-1")
+
+        assert [item.kwargs["resume_ws"] for item in mock_create.await_args_list] == [
+            "ws-pruned",
+            "",
+        ]
+        mock_storage.create_channel_route.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_storage_lookup_failure_preserves_route(
+        self,
+        router: ChannelRouter,
+        mock_storage: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_storage.get_channel_route.return_value = {
+            "ws_id": "ws-existing",
+            "channel_type": "discord",
+            "channel_id": "ch-1",
+        }
+        mock_storage.resolve_workstream.side_effect = RuntimeError("storage offline")
+        assert router._server is not None
+        mock_create = AsyncMock()
+        monkeypatch.setattr(router._server, "create_workstream", mock_create)
+
+        with pytest.raises(RuntimeError, match="storage offline"):
+            await router.get_or_create_workstream("discord", "ch-1")
+
+        mock_storage.delete_channel_route.assert_not_called()
+        mock_create.assert_not_awaited()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("via_console", [False, True], ids=["server", "console"])
+    async def test_live_probe_failure_preserves_route_without_creating(
+        self,
+        router: ChannelRouter,
+        console_router: ChannelRouter,
+        mock_storage: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        via_console: bool,
+    ) -> None:
+        selected = console_router if via_console else router
+        mock_storage.get_channel_route.return_value = {
+            "ws_id": "ws-existing",
+            "channel_type": "discord",
+            "channel_id": "ch-1",
+        }
+        probe_error = TurnstoneAPIError(503, "route uncertain")
+        monkeypatch.setattr(selected, "_is_ws_live", AsyncMock(side_effect=probe_error))
+        mock_create = AsyncMock()
+        if selected._console is not None:
+            monkeypatch.setattr(selected._console, "route_create_workstream", mock_create)
+        else:
+            assert selected._server is not None
+            monkeypatch.setattr(selected._server, "create_workstream", mock_create)
+
+        with pytest.raises(TurnstoneAPIError, match="route uncertain"):
+            await selected.get_or_create_workstream("discord", "ch-1")
+
+        mock_storage.delete_channel_route.assert_not_called()
+        mock_create.assert_not_awaited()
 
     @pytest.mark.anyio
     async def test_sends_initial_message_for_new_workstream(

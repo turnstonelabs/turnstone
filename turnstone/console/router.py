@@ -172,6 +172,24 @@ class ConsoleRouter:
             raise NoAvailableNodeError("invalid ws_id: empty")
         return select(ws_id, nodes)
 
+    def remember_override(self, ws_id: str, ref: NodeRef) -> None:
+        """Publish one just-confirmed durable placement into this cache.
+
+        Routed creation returns only after the node transaction has persisted
+        its workstream override.  Publishing that successful route here closes
+        the collector-delay window for immediate lookup, attachment, delete,
+        and liveness requests handled by the same console process.  A later
+        full refresh remains authoritative and replaces the whole map.
+        """
+        if not ws_id:
+            raise ValueError("ws_id required")
+        # Serialize with the storage snapshot + wholesale publish in
+        # ``_refresh_locked``.  Taking only ``_lock`` here would let a refresh
+        # that queried before the node commit overwrite this newer placement
+        # after we returned it to the caller.
+        with self._refresh_lock, self._lock:
+            self._overrides[ws_id] = ref
+
     def route_url(self, ws_id: str) -> str:
         """Convenience — return just the URL for the target node."""
         return self.route(ws_id).url

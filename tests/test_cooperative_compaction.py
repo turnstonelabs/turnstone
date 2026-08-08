@@ -27,6 +27,7 @@ from turnstone.core.session import (
     GenerationCancelled,
     _CompactionIrreducibleError,
     _is_ctx_overflow,
+    _SummaryResult,
 )
 from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
 
@@ -130,6 +131,7 @@ class TestMidturnCompactionPolicy:
 
     def test_continue_after_advisory_compacts(self, session):
         """Already advised + still over soft → the model kept working, compact."""
+        session._generation = 7
         session._compaction_advised = True
         with (
             patch.object(session, "_estimated_prompt_tokens", return_value=8_500),
@@ -144,6 +146,7 @@ class TestMidturnCompactionPolicy:
     def test_hard_ceiling_compacts_without_advisory(self, session):
         """Over the hard ceiling → no turn to spare, compact even if never
         advised."""
+        session._generation = 7
         session._compaction_advised = False
         with (
             patch.object(session, "_estimated_prompt_tokens", return_value=9_500),
@@ -153,6 +156,19 @@ class TestMidturnCompactionPolicy:
             session._maybe_compact_midturn(my_generation=7)
         compact.assert_called_once_with("mid-turn", my_generation=7)
         advise.assert_not_called()
+
+    def test_cancel_before_midturn_advisory_refuses_publication(self, session):
+        """A Stop after the tool fold must not append a stale compaction nudge."""
+        session._generation = 7
+        session._cancel_event.set()
+        with (
+            patch.object(session, "_estimated_prompt_tokens", return_value=8_500),
+            patch.object(session, "_append_system_turn") as advise,
+            pytest.raises(GenerationCancelled),
+        ):
+            session._maybe_compact_midturn(my_generation=7)
+        advise.assert_not_called()
+        assert session._compaction_advised is False
 
     def test_do_auto_compact_rounds_percentage(self, session):
         """The start event's pct uses round(), not int() — 0.58 must render 58,
@@ -177,6 +193,7 @@ class TestMidturnCompactionPolicy:
         evaluated the percentage threshold — its start event must not claim
         one (the CLI would print a fabricated 'prompt exceeds N%' notice
         contradicting the overflow notice above it)."""
+        session._generation = 3
         with (
             patch.object(session, "_compact_messages_impl", return_value=True),
             patch.object(session.ui, "on_compaction") as on_compaction,
@@ -186,6 +203,18 @@ class TestMidturnCompactionPolicy:
         assert start["phase"] == "start"
         assert start["trigger"] == "auto"
         assert "pct" not in start
+
+    def test_cancel_before_compaction_start_emits_no_lifecycle_event(self, session):
+        session._generation = 3
+        session._cancel_event.set()
+        with (
+            patch.object(session.ui, "on_compaction") as on_compaction,
+            patch.object(session, "_compact_messages_impl") as impl,
+            pytest.raises(GenerationCancelled),
+        ):
+            session._compact_messages(auto=True, my_generation=3)
+        on_compaction.assert_not_called()
+        impl.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +328,7 @@ class TestEndOfTurnAutoResume:
         assert not [
             c for c in resume.call_args_list if c.kwargs.get("source") == "compaction_resume"
         ]
-        emit_state.assert_any_call("idle")
+        assert any(call.args == ("idle",) for call in emit_state.call_args_list)
 
     def test_no_resume_when_compaction_bails(self, session):
         """q-1 regression: if compaction bails (returns False — summary error /
@@ -334,6 +363,60 @@ class TestEndOfTurnAutoResume:
             c for c in resume.call_args_list if c.kwargs.get("source") == "compaction_resume"
         ]
 
+    @pytest.mark.parametrize("terminal", ["successor", "stop"])
+    def test_terminal_after_compaction_refuses_resume_turn_and_save(self, session, terminal):
+        """A completed compaction does not authorize a stale synthetic turn.
+
+        The terminal edge lands as ``_do_auto_compact`` returns — after the
+        successful end-of-turn compaction, before the raw
+        ``compaction_resume`` publication.  A force successor and Stop must
+        both refuse the in-memory append and its matching persistence write;
+        otherwise the abandoned frame can inject a user turn into the next
+        generation (or resurrect work the operator stopped).
+        """
+        session.messages = turns_from_dicts([{"role": "user", "content": "task"}])
+        session._msg_tokens = [1]
+        session._title_generated = True
+
+        def stream(*_args, **_kwargs):
+            session._compaction_advised = True
+            return make_result("paused; plan recorded")
+
+        def compact_then_terminal(*_args, **_kwargs):
+            if terminal == "successor":
+                session._claim_generation()
+            else:
+                session.cancel()
+            return True
+
+        append_user_turn = session._append_user_turn
+        with (
+            patch.object(session, "_stream_response", side_effect=stream) as stream_response,
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            # Over soft, under hard: the only compaction is the end-of-turn
+            # cooperative one whose resume tail this test targets.
+            patch.object(session, "_estimated_prompt_tokens", return_value=8_500),
+            patch.object(session, "_do_auto_compact", side_effect=compact_then_terminal) as compact,
+            patch.object(session, "_append_user_turn", wraps=append_user_turn) as append,
+            patch("turnstone.core.session.save_message") as save,
+        ):
+            session.send("go")
+
+        stream_response.assert_called_once()
+        compact.assert_called_once()
+        assert compact.call_args.kwargs["carry_spill"] is True
+        assert not [
+            call
+            for call in append.call_args_list
+            if call.kwargs.get("source") == "compaction_resume"
+        ]
+        assert not [
+            call for call in save.call_args_list if call.kwargs.get("source") == "compaction_resume"
+        ]
+
     def test_resume_preserves_alternation(self, session):
         """The auto-resume must not produce two consecutive user turns — some
         providers require strict user/assistant alternation.  Compaction leaves
@@ -350,7 +433,11 @@ class TestEndOfTurnAutoResume:
         session.compact_max_tokens = 100  # positive summary budget at ctx=10k
         session._system_tokens = 0
 
-        summary = SimpleNamespace(content="## Open tasks\nfinish it", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="## Open tasks\nfinish it",
+            finish_reason="stop",
+            producer="summary-producer",
+        )
         n = {"i": 0}
 
         def stream(*_a, **_k):
@@ -403,7 +490,9 @@ class TestCompactBeforeTruncate:
             ]
         )
         session._msg_tokens = [5, 5, 5, 5]
-        summary = SimpleNamespace(content="dense summary", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="dense summary", finish_reason="stop", producer="summary-producer"
+        )
 
         with patch.object(session, "_utility_completion", return_value=summary):
             session._compact_messages(auto=True, preserve_tail=1)
@@ -548,6 +637,65 @@ class TestCompactBeforeTruncate:
         # ...so the post-truncation mid-turn compaction runs once for the tool turn.
         midturn.assert_called_once()
 
+    @pytest.mark.parametrize("terminal", ["successor", "close"])
+    def test_zero_budget_raw_status_tail_refuses_stale_continuation(self, session, terminal):
+        """The zero-budget branch owns its own post-compact status publish.
+
+        Unlike the regular paths it calls ``_compact_messages`` directly, then
+        refreshes status at the raw call site.  Retire the generation as that
+        successful compaction returns: the refresh must be suppressed and the
+        old frame must stop before truncating/folding the tool result or issuing
+        another model request.
+        """
+        session.messages = turns_from_dicts([{"role": "user", "content": "task"}])
+        session._msg_tokens = [1]
+        session._title_generated = True
+        tool_call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "x", "arguments": "{}"},
+        }
+
+        def compact_then_terminal(*_args, **_kwargs):
+            if terminal == "successor":
+                session._claim_generation()
+            else:
+                session.close()
+            return True
+
+        with (
+            patch.object(
+                session,
+                "_stream_response",
+                return_value=make_result("", tool_calls=[tool_call]),
+            ) as stream_response,
+            patch.object(session, "_execute_tools", return_value=([("call_1", "output")], "")),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_estimated_prompt_tokens", return_value=0),
+            patch.object(session, "_compaction_owed", return_value=False),
+            patch.object(session, "_remaining_token_budget", return_value=0),
+            patch.object(
+                session, "_compact_messages", side_effect=compact_then_terminal
+            ) as compact,
+            patch.object(session, "_print_status_line") as status,
+            patch.object(session, "_truncate_output") as truncate,
+            patch.object(session, "_maybe_compact_midturn") as midturn,
+            patch("turnstone.core.session.save_message") as save,
+        ):
+            session.send("go")
+
+        stream_response.assert_called_once()
+        compact.assert_called_once()
+        assert compact.call_args.kwargs["where"] == "mid-turn, tool-result budget exhausted"
+        # One status update belongs to the completed provider response.  The
+        # raw post-compaction refresh is the forbidden second call.
+        assert status.call_count == 1
+        truncate.assert_not_called()
+        midturn.assert_not_called()
+        assert not [call for call in save.call_args_list if call.args[1] == "tool"]
+
 
 # ---------------------------------------------------------------------------
 # Chunked / hierarchical summary compaction
@@ -657,7 +805,11 @@ class TestChunkedCompaction:
             ]
         )
         session._msg_tokens = [5, 5]
-        summary = SimpleNamespace(content="## Decisions\ndense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="## Decisions\ndense",
+            finish_reason="stop",
+            producer="summary-producer",
+        )
 
         with patch.object(session, "_utility_completion", return_value=summary) as uc:
             assert session._compact_messages(auto=True) is True
@@ -695,7 +847,9 @@ class TestChunkedCompaction:
             if body.startswith(prefix):
                 body = body[len(prefix) :]
             recorded.append(len(body))
-            return SimpleNamespace(content="PARTIAL", finish_reason="stop")
+            return SimpleNamespace(
+                content="PARTIAL", finish_reason="stop", producer="summary-producer"
+            )
 
         with patch.object(session, "_utility_completion", side_effect=fake_uc):
             result = session._compact_messages(auto=True)
@@ -704,6 +858,41 @@ class TestChunkedCompaction:
         assert len(session.messages) < 30  # genuinely shrank
         assert len(recorded) > 1  # multi-batch: recursion happened
         assert all(n <= budget for n in recorded)  # never overflow the summary call
+
+    def test_recursive_compaction_pins_one_exact_lane(self, session):
+        """Leaf summaries and the recursive merge share the transaction's lane."""
+        session.messages = turns_from_dicts(
+            [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"message-{i}: " + "x" * 200,
+                }
+                for i in range(6)
+            ]
+        )
+        session._msg_tokens = [1] * len(session.messages)
+        pinned_lane = session._primary_lane()
+        seen_lanes: list[object] = []
+        prompts: list[str] = []
+
+        def fake_once(system_prompt, _body, _my_generation=0, *, lane=None):
+            # Ancillary post-fold accounting may resolve capabilities again, but
+            # recursive summarization itself must not re-resolve its lane.
+            assert primary_lane.call_count == 1
+            seen_lanes.append(lane)
+            prompts.append(system_prompt)
+            return _SummaryResult(text="fold", producer="summary-producer")
+
+        with (
+            patch.object(session, "_primary_lane", return_value=pinned_lane) as primary_lane,
+            patch.object(session, "_summary_input_budget_chars", return_value=450),
+            patch.object(session, "_summarize_once", side_effect=fake_once),
+        ):
+            assert session._compact_messages(auto=False) is True
+
+        assert prompts.count(session._COMPACTOR_SYSTEM_PROMPT) >= 2
+        assert prompts[-1] == session._COMPACTOR_MERGE_SYSTEM_PROMPT
+        assert seen_lanes and all(lane is pinned_lane for lane in seen_lanes)
 
     def test_recursion_depth_ceiling_bails_to_false(self, session):
         """q-3: the ``depth >= _MAX_SUMMARY_DEPTH`` recursion backstop bails to
@@ -737,7 +926,9 @@ class TestChunkedCompaction:
         # Each depth-0 partial is 0.4*budget chars: two pack per batch but not
         # three, so depth 1 still has >1 batch and the depth ceiling bails.
         partial = "P" * ((budget * 2) // 5)
-        summary = SimpleNamespace(content=partial, finish_reason="stop")
+        summary = SimpleNamespace(
+            content=partial, finish_reason="stop", producer="summary-producer"
+        )
 
         with patch.object(session, "_utility_completion", return_value=summary) as uc:
             result = session._compact_messages(auto=True)
@@ -816,7 +1007,11 @@ class TestChunkedCompaction:
 
             def fake_uc(messages, *, max_tokens, **_kwargs):
                 recorded.append(max_tokens)
-                return SimpleNamespace(content="## Decisions\ndense", finish_reason="stop")
+                return SimpleNamespace(
+                    content="## Decisions\ndense",
+                    finish_reason="stop",
+                    producer="summary-producer",
+                )
 
             with patch.object(session, "_utility_completion", side_effect=fake_uc):
                 assert session._compact_messages(auto=True) is True
@@ -844,7 +1039,7 @@ class TestChunkedCompaction:
         )
         session._msg_tokens = [5, 5, 5]
         before = list(session.messages)
-        empty = SimpleNamespace(content="", finish_reason="stop")
+        empty = SimpleNamespace(content="", finish_reason="stop", producer="summary-producer")
 
         with patch.object(session, "_utility_completion", return_value=empty):
             result = session._compact_messages(auto=True)
@@ -878,7 +1073,11 @@ class TestChunkedCompaction:
         )
         session._msg_tokens = [5, 5]
         session._last_usage = {"prompt_tokens": 9_000, "total_tokens": 9_000}
-        summary = SimpleNamespace(content="## Decisions\ndense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="## Decisions\ndense",
+            finish_reason="stop",
+            producer="summary-producer",
+        )
 
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session._compact_messages(auto=True) is True
@@ -910,7 +1109,9 @@ class TestChunkedCompaction:
         def fake_uc(_messages, **_kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                return SimpleNamespace(content="PARTIAL", finish_reason="stop")
+                return SimpleNamespace(
+                    content="PARTIAL", finish_reason="stop", producer="summary-producer"
+                )
             raise RuntimeError("summary backend exploded")  # non-retryable
 
         with patch.object(session, "_utility_completion", side_effect=fake_uc):
@@ -1119,7 +1320,9 @@ class TestProactivePreSend:
             ]
         )
         session._msg_tokens = [1, 1, 1, 1]
-        summary = SimpleNamespace(content="SUMMARY", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="SUMMARY", finish_reason="stop", producer="summary-producer"
+        )
 
         # The real pre-send preserve computation, then the real _compact_messages.
         boundaries = session._find_turn_boundaries()
@@ -1149,7 +1352,9 @@ class TestProactivePreSend:
             ]
         )
         session._msg_tokens = [1, 1, 1, 1]
-        summary = SimpleNamespace(content="DENSE SUMMARY", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="DENSE SUMMARY", finish_reason="stop", producer="summary-producer"
+        )
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session._do_auto_compact("reactive", preserve_tail=0) is True
 
@@ -1171,7 +1376,9 @@ class TestProactivePreSend:
         )
         session._msg_tokens = [1, 1, 1]
         preserve = len(session.messages) - session._find_turn_boundaries()[-1]  # == 1
-        summary = SimpleNamespace(content="DENSE SUMMARY", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="DENSE SUMMARY", finish_reason="stop", producer="summary-producer"
+        )
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session._do_auto_compact("pre-send", preserve_tail=preserve) is True
 
@@ -1196,7 +1403,9 @@ class TestProactivePreSend:
             ]
         )
         session._msg_tokens = [1, 1]
-        summary = SimpleNamespace(content="NEW SUMMARY", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="NEW SUMMARY", finish_reason="stop", producer="summary-producer"
+        )
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session._do_auto_compact("reactive", preserve_tail=0) is True
 
@@ -1218,11 +1427,12 @@ class TestChunkerOverflowSplit:
         blocks = ["A" * 4000, "B" * 4000, "C" * 4000]
         bodies: list[int] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0):
+        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
+            assert lane is not None
             bodies.append(len(body))
             if len(body) > 6_000:  # a multi-block body overflows the token window
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return "S"
+            return _SummaryResult(text="S", producer="summary-producer")
 
         with (
             patch.object(session, "_summary_input_budget_chars", return_value=100_000),
@@ -1230,7 +1440,7 @@ class TestChunkerOverflowSplit:
         ):
             result = session._summarize_blocks(blocks)
 
-        assert result == "S"  # produced a summary, never raised _CompactionIrreducible
+        assert result.text == "S"  # produced a summary, never raised _CompactionIrreducible
         assert any(n > 6_000 for n in bodies)  # the combined batch overflowed…
         # …then it was halved until the pieces fit and merged (no whole-list re-run).
         assert sum(1 for n in bodies if n <= 6_000) >= 3
@@ -1245,11 +1455,12 @@ class TestChunkerOverflowSplit:
         blocks = [f"b{i:02d} " + "z" * 500 for i in range(8)]
         calls: list[str] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0):
+        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
+            assert lane is not None
             calls.append(body)
             if body.count("\n\n") >= 4:  # a body of 5+ blocks overflows the window
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return "S"
+            return _SummaryResult(text="S", producer="summary-producer")
 
         with (
             patch.object(session, "_summary_input_budget_chars", return_value=1_000_000),
@@ -1257,7 +1468,7 @@ class TestChunkerOverflowSplit:
         ):
             result = session._summarize_blocks(blocks)
 
-        assert result == "S"
+        assert result.text == "S"
         # Binary subdivision: [8] → two [4] halves that both fit — a handful of calls,
         # nowhere near 8 (per-block split would be ≥8 leaf calls).
         assert len(calls) <= 5, len(calls)
@@ -1271,11 +1482,12 @@ class TestChunkerOverflowSplit:
         floor = session._MIN_SUMMARY_BUDGET_CHARS
         calls: list[int] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0):
+        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
+            assert lane is not None
             calls.append(len(body))
             if len(body) > floor:
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return "S"
+            return _SummaryResult(text="S", producer="summary-producer")
 
         with (
             patch.object(session, "_summary_input_budget_chars", return_value=50_000),
@@ -1283,7 +1495,7 @@ class TestChunkerOverflowSplit:
         ):
             result = session._summarize_blocks(["Z" * 20_000])
 
-        assert result == "S"  # floored block summarized, not bailed
+        assert result.text == "S"  # floored block summarized, not bailed
         assert any(n > floor for n in calls)  # the over-floor call overflowed…
         assert any(n <= floor for n in calls)  # …then the floored retry fit
 
@@ -1295,11 +1507,12 @@ class TestChunkerOverflowSplit:
         floor = session._MIN_SUMMARY_BUDGET_CHARS
         calls: list[int] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0):
+        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
+            assert lane is not None
             calls.append(len(body))
             if len(body) > 9_000:  # only bodies well above the floor overflow
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return "S"
+            return _SummaryResult(text="S", producer="summary-producer")
 
         with (
             patch.object(session, "_summary_input_budget_chars", return_value=50_000),
@@ -1307,7 +1520,7 @@ class TestChunkerOverflowSplit:
         ):
             result = session._summarize_blocks(["Z" * 16_000])
 
-        assert result == "S"
+        assert result.text == "S"
         # First shrink budget is len//2 == 8 000 (< the 9 000 overflow line), so it
         # fits on the FIRST halving — the surviving body stays far above the floor,
         # which a straight-to-floor jump (~2 000) would have discarded.
@@ -1320,10 +1533,12 @@ class TestChunkerOverflowSplit:
         _CompactionIrreducibleError — NOT an unbounded recurse into RecursionError.
         Regression for the depth-check-only-on-the-multi-batch-path bug."""
 
-        def no_shrink(_system_prompt, body, _my_generation=0):
+        def no_shrink(_system_prompt, body, _my_generation=0, *, lane=None):
+            assert lane is not None
             if "\n\n" in body:  # any multi-block body overflows the window
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return body  # a single-block 'summary' is the block itself — no shrink
+            # A single-block 'summary' is the block itself — no shrink.
+            return _SummaryResult(text=body, producer="summary-producer")
 
         with (
             patch.object(session, "_summary_input_budget_chars", return_value=100_000),
@@ -1340,11 +1555,12 @@ class TestChunkerOverflowSplit:
         blocks = ["A" * 2000, "B" * 2000, "C" * 2000, "D" * 2000]
         bodies: list[str] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0):
+        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
+            assert lane is not None
             bodies.append(body)
             if "CC" in body and "\n\n" in body:  # the multi-block batch holding C
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return "S"
+            return _SummaryResult(text="S", producer="summary-producer")
 
         with (
             patch.object(session, "_summary_input_budget_chars", return_value=4_500),
@@ -1352,7 +1568,7 @@ class TestChunkerOverflowSplit:
         ):
             result = session._summarize_blocks(blocks)
 
-        assert result == "S"
+        assert result.text == "S"
         # The first batch (A+B) was summarized exactly once, never recomputed after
         # the later (C+D) batch overflowed and split.
         assert sum(1 for b in bodies if "AAA" in b and "BBB" in b) == 1
@@ -1374,7 +1590,9 @@ class TestChunkerOverflowSplit:
         def cancel_then_summarize(*_a, **_k):
             # The owner cancels after the first summary call lands.
             session._cancel_event.set()
-            return SimpleNamespace(content="SUMMARY", finish_reason="stop")
+            return SimpleNamespace(
+                content="SUMMARY", finish_reason="stop", producer="summary-producer"
+            )
 
         try:
             with (
@@ -1404,7 +1622,9 @@ class TestChunkerOverflowSplit:
 
         def cancel_during_call(*_a, **_k):
             session._cancel_event.set()  # cancel lands while the single call runs
-            return SimpleNamespace(content="SUMMARY", finish_reason="stop")
+            return SimpleNamespace(
+                content="SUMMARY", finish_reason="stop", producer="summary-producer"
+            )
 
         try:
             with (
@@ -1490,7 +1710,9 @@ class TestChunkerOverflowSplit:
         session._msg_tokens = [1, 1, 1]
         session._generation = 5  # a newer send is the live generation
         before = list(session.messages)
-        summary = SimpleNamespace(content="SUMMARY", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="SUMMARY", finish_reason="stop", producer="summary-producer"
+        )
         with (
             patch.object(session, "_summary_input_budget_chars", return_value=100_000),
             patch.object(session, "_utility_completion", return_value=summary),
@@ -1499,6 +1721,60 @@ class TestChunkerOverflowSplit:
             # This thread belongs to the OLD generation 3 (superseded by 5).
             session._compact_messages(auto=True, my_generation=3)
         assert session.messages == before  # swap skipped — history intact for gen 5
+
+    def test_successor_claim_at_final_commit_refuses_complete_compaction(self, session):
+        """The final ownership check and history/checkpoint publication are one
+        transaction, not a check followed by an exposed swap window."""
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "old user"},
+                {"role": "assistant", "content": "old assistant"},
+            ]
+        )
+        session._msg_tokens = [1, 1]
+        session._generation = 1
+        before = list(session.messages)
+        commit_ready = threading.Event()
+        release = threading.Event()
+        outcomes: list[BaseException | bool] = []
+
+        def block_before_commit(lane):
+            commit_ready.set()
+            if not release.wait(2):
+                raise RuntimeError("test release timed out")
+            return lane.capabilities
+
+        def run() -> None:
+            try:
+                outcomes.append(session._compact_messages(auto=True, my_generation=1))
+            except BaseException as exc:
+                outcomes.append(exc)
+
+        with (
+            patch.object(
+                session,
+                "_summarize_blocks",
+                return_value=_SummaryResult(text="stale summary", producer="stale-producer"),
+            ),
+            patch(
+                "turnstone.core.session.require_lane_capabilities", side_effect=block_before_commit
+            ),
+            patch("turnstone.core.session.save_message") as save,
+        ):
+            worker = threading.Thread(target=run)
+            worker.start()
+            try:
+                assert commit_ready.wait(2)
+                assert session._claim_generation() == 2
+            finally:
+                release.set()
+                worker.join(2)
+
+        assert not worker.is_alive()
+        assert len(outcomes) == 1
+        assert isinstance(outcomes[0], GenerationCancelled)
+        assert session.messages == before
+        save.assert_not_called()
 
 
 class TestRetryRewindSkipSummary:
@@ -1605,6 +1881,122 @@ def _seed_two_messages(session):
     session._system_tokens = 0
 
 
+class _ObservedRLock:
+    """RLock double exposing one outer acquisition as a stable cycle id."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._owner: int | None = None
+        self._depth = 0
+        self._cycle = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        owner = threading.get_ident()
+        if self._owner == owner:
+            self._depth += 1
+        else:
+            assert self._owner is None
+            self._owner = owner
+            self._depth = 1
+            self._cycle += 1
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+        self._lock.release()
+
+    @property
+    def current_cycle(self) -> int | None:
+        if self._owner != threading.get_ident():
+            return None
+        return self._cycle
+
+
+class TestCompactionPublicationFence:
+    @pytest.mark.parametrize("phase", ["start", "progress"])
+    @pytest.mark.parametrize("terminal", ["superseded", "cancelled", "closed"])
+    def test_non_end_event_is_not_emitted_after_terminal_boundary(
+        self,
+        session,
+        phase,
+        terminal,
+    ):
+        """Only END may retire an old card after Stop/force; close emits nothing."""
+        session._generation = 4
+        my_generation = 4
+        if terminal == "superseded":
+            session._generation = 5
+        elif terminal == "cancelled":
+            session._cancel_event.set()
+        else:
+            session._publication_shutdown = True
+        payload = (
+            {"phase": "start", "trigger": "manual"}
+            if phase == "start"
+            else {"phase": "progress", "part": 2, "total": 3, "depth": 0}
+        )
+
+        with patch.object(session.ui, "on_compaction") as on_compaction:
+            assert session._compaction_event(my_generation, payload) is None
+
+        on_compaction.assert_not_called()
+
+    def test_classification_and_emit_share_one_generation_lock_cycle(self, session):
+        """A successor cannot claim between the stale check and live emission."""
+        session._generation = 4
+        observed_lock = _ObservedRLock()
+        session._generation_lock = observed_lock
+        cycles: list[tuple[str, int | None]] = []
+
+        def classify(_session, _generation):
+            cycles.append(("classify", observed_lock.current_cycle))
+            return False
+
+        def emit(_payload):
+            cycles.append(("emit", observed_lock.current_cycle))
+            return 41
+
+        with (
+            patch("turnstone.core.session._generation_superseded", side_effect=classify),
+            patch.object(session.ui, "on_compaction", side_effect=emit),
+        ):
+            assert (
+                session._compaction_event(
+                    4,
+                    {"phase": "progress", "part": 1, "total": 2, "depth": 0},
+                )
+                == 41
+            )
+
+        assert cycles == [("classify", 1), ("emit", 1)]
+
+    def test_superseded_manual_error_only_emits_retirement_end(self, session):
+        session._generation = 9
+        with (
+            patch.object(session.ui, "on_error") as on_error,
+            patch.object(session.ui, "on_compaction") as on_compaction,
+        ):
+            assert (
+                session._compaction_bailed(
+                    "error",
+                    "Compaction failed: stale backend",
+                    trigger="manual",
+                    my_generation=8,
+                )
+                is False
+            )
+
+        on_error.assert_not_called()
+        events = _compaction_events(on_compaction)
+        assert len(events) == 1
+        assert events[0]["phase"] == "end"
+        assert events[0]["reason"] == "error"
+        assert events[0]["superseded"] is True
+
+
 class TestCompactionLifecycleEvents:
     """Every _compact_messages exit emits exactly one start and one end —
     a UI that paints an in-progress card on start must never be left with a
@@ -1612,7 +2004,11 @@ class TestCompactionLifecycleEvents:
 
     def test_manual_success_emits_start_then_ok_end(self, session):
         _seed_two_messages(session)
-        summary = SimpleNamespace(content="## Decisions\ndense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="## Decisions\ndense",
+            finish_reason="stop",
+            producer="summary-producer",
+        )
         with (
             patch.object(session, "_utility_completion", return_value=summary),
             patch.object(session.ui, "on_compaction", return_value=41) as oc,
@@ -1653,6 +2049,59 @@ class TestCompactionLifecycleEvents:
         assert end["reason"] == "error"
         assert "boom" in end["message"]
 
+    def test_raising_thinking_stop_after_handled_bail_emits_one_end(self, session):
+        """A presentation teardown failure cannot re-enter the END backstop."""
+        _seed_two_messages(session)
+        with (
+            patch.object(session, "_summarize_blocks", side_effect=RuntimeError("summary boom")),
+            patch.object(session.ui, "on_thinking_stop", side_effect=RuntimeError("ui boom")),
+            patch.object(session.ui, "on_compaction") as on_compaction,
+        ):
+            assert session._compact_messages() is False
+
+        events = _compaction_events(on_compaction)
+        assert [event["phase"] for event in events] == ["start", "end"]
+        assert events[-1]["reason"] == "error"
+        assert "summary boom" in events[-1]["message"]
+
+    def test_close_during_summary_suppresses_late_thinking_stop(self, session):
+        """Close is terminal even when the summary worker unwinds afterward."""
+        _seed_two_messages(session)
+        session._generation = 3
+        summary_started = threading.Event()
+        release_summary = threading.Event()
+        outcomes: list[BaseException | bool] = []
+
+        def summarize(*_args, **_kwargs):
+            summary_started.set()
+            if not release_summary.wait(2):
+                raise RuntimeError("test release timed out")
+            return _SummaryResult(text="late summary", producer="summary-producer")
+
+        def run_compaction() -> None:
+            try:
+                outcomes.append(session._compact_messages(my_generation=3))
+            except BaseException as exc:
+                outcomes.append(exc)
+
+        with (
+            patch.object(session, "_summarize_blocks", side_effect=summarize),
+            patch.object(session.ui, "on_thinking_stop") as thinking_stop,
+        ):
+            worker = threading.Thread(target=run_compaction)
+            worker.start()
+            try:
+                assert summary_started.wait(2)
+                session.close()
+            finally:
+                release_summary.set()
+                worker.join(2)
+
+        assert not worker.is_alive()
+        assert len(outcomes) == 1
+        assert isinstance(outcomes[0], GenerationCancelled)
+        thinking_stop.assert_not_called()
+
     def test_irreducible_emits_failed_end(self, session):
         _seed_two_messages(session)
         with (
@@ -1665,7 +2114,7 @@ class TestCompactionLifecycleEvents:
 
     def test_empty_summary_emits_failed_end(self, session):
         _seed_two_messages(session)
-        blank = SimpleNamespace(content="   ", finish_reason="stop")
+        blank = SimpleNamespace(content="   ", finish_reason="stop", producer="summary-producer")
         with (
             patch.object(session, "_utility_completion", return_value=blank),
             patch.object(session.ui, "on_compaction") as oc,
@@ -1726,7 +2175,9 @@ class TestCompactionLifecycleEvents:
         session._msg_tokens = [1] * 30
 
         def fake_uc(messages, **_kwargs):
-            return SimpleNamespace(content="PARTIAL", finish_reason="stop")
+            return SimpleNamespace(
+                content="PARTIAL", finish_reason="stop", producer="summary-producer"
+            )
 
         with (
             patch.object(session, "_utility_completion", side_effect=fake_uc),
@@ -1746,7 +2197,9 @@ class TestCompactionLifecycleEvents:
         event's id so repaint and replay dedup against each other."""
         _seed_two_messages(session)
         session._ws_id = "ws-compact-meta"
-        summary = SimpleNamespace(content="dense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="dense", finish_reason="stop", producer="summary-producer"
+        )
         saved: dict = {}
 
         def fake_save(ws_id, role, content, **kwargs):
@@ -1772,6 +2225,46 @@ class TestCompactionLifecycleEvents:
         assert meta["before_tokens"] == end["before_tokens"]
         assert meta["after_tokens"] == end["after_tokens"]
 
+    def test_checkpoint_persists_final_merge_producer(self, session):
+        """A recursive fold attributes the checkpoint to its final merge call."""
+        session.messages = turns_from_dicts(
+            [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"message-{i}: " + "x" * 200,
+                }
+                for i in range(6)
+            ]
+        )
+        session._msg_tokens = [1] * len(session.messages)
+        session._ws_id = "ws-final-merge-producer"
+        saved: dict = {}
+        producers: list[str] = []
+
+        def fake_once(system_prompt, _body, _my_generation=0, *, lane=None):
+            assert lane is not None
+            is_merge = system_prompt == session._COMPACTOR_MERGE_SYSTEM_PROMPT
+            producer = "final-merge-producer" if is_merge else "leaf-producer"
+            producers.append(producer)
+            return _SummaryResult(text="FINAL" if is_merge else "partial", producer=producer)
+
+        def fake_save(ws_id, role, content, **kwargs):
+            saved.update({"ws_id": ws_id, "role": role, "content": content, **kwargs})
+            return 1
+
+        with (
+            patch.object(session, "_summary_input_budget_chars", return_value=450),
+            patch.object(session, "_summarize_once", side_effect=fake_once),
+            patch("turnstone.core.session.get_compaction_watermark", return_value=17),
+            patch("turnstone.core.session.save_message", side_effect=fake_save),
+        ):
+            assert session._compact_messages(auto=False) is True
+
+        assert producers.count("leaf-producer") >= 2
+        assert producers[-1] == "final-merge-producer"
+        assert saved["content"] == "FINAL"
+        assert saved["producer"] == "final-merge-producer"
+
 
 # ---------------------------------------------------------------------------
 # compact_now — the manual path's generation discipline (review fix round)
@@ -1779,13 +2272,33 @@ class TestCompactionLifecycleEvents:
 
 
 class TestCompactNow:
+    def test_request_principal_is_pinned_for_the_summary_and_released(self, session):
+        _seed_two_messages(session)
+        session._acting_user_id = "previous-user"
+        summary = SimpleNamespace(
+            content="dense", finish_reason="stop", producer="summary-producer"
+        )
+        principals: list[str | None] = []
+
+        def summarize(*_args, **kwargs):
+            principals.append(kwargs.get("principal_id"))
+            return summary
+
+        with patch.object(session, "_utility_completion", side_effect=summarize):
+            assert session.compact_now(principal_id="request-user") is True
+
+        assert principals and set(principals) == {"request-user"}
+        assert session._generation_principals == {}
+
     def test_stale_preset_cancel_event_does_not_brick(self, session):
         """A Stop click on an idle session leaves _cancel_event set; the next
         /compact must install a fresh event (send()'s entry discipline) and
         run real work instead of instantly aborting as 'cancelled'."""
         _seed_two_messages(session)
         session._cancel_event.set()  # idle-cancel residue
-        summary = SimpleNamespace(content="dense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="dense", finish_reason="stop", producer="summary-producer"
+        )
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session.compact_now() is True
 
@@ -1808,7 +2321,9 @@ class TestCompactNow:
         assert not session._cancel_event.is_set()
 
         # Retry succeeds without any external reset.
-        summary = SimpleNamespace(content="dense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="dense", finish_reason="stop", producer="summary-producer"
+        )
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session.compact_now() is True
 
@@ -1825,7 +2340,7 @@ class TestCompactNow:
             # while this compaction is inside its summarize call.
             session._generation += 1
             session._cancel_event = threading.Event()
-            return "stale summary"
+            return _SummaryResult(text="stale summary", producer="stale-producer")
 
         with (
             patch.object(session, "_summarize_blocks", side_effect=supersede),
@@ -1836,13 +2351,48 @@ class TestCompactNow:
 
     def test_success_refreshes_status_line(self, session):
         _seed_two_messages(session)
-        summary = SimpleNamespace(content="dense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="dense", finish_reason="stop", producer="summary-producer"
+        )
         with (
             patch.object(session, "_utility_completion", return_value=summary),
             patch.object(session, "_print_status_line") as status,
         ):
             assert session.compact_now() is True
         status.assert_called_once()
+
+    @pytest.mark.parametrize("entrypoint", ["auto", "manual"])
+    @pytest.mark.parametrize("terminal", ["successor", "close"])
+    def test_terminal_boundary_suppresses_post_compaction_status(
+        self,
+        session,
+        entrypoint,
+        terminal,
+    ):
+        """A committed compaction's old frame cannot update a new/closed UI."""
+        origin_generation = session._claim_generation() if entrypoint == "auto" else 0
+
+        def complete_then_retire(*_args, **_kwargs):
+            if terminal == "successor":
+                session._claim_generation()
+            else:
+                session.close()
+            return True
+
+        with (
+            patch.object(session, "_compact_messages", side_effect=complete_then_retire),
+            patch.object(session, "_print_status_line") as status,
+        ):
+            if entrypoint == "auto":
+                with pytest.raises(GenerationCancelled):
+                    session._do_auto_compact(my_generation=origin_generation)
+            elif terminal == "close":
+                with pytest.raises(GenerationCancelled):
+                    session.compact_now()
+            else:
+                assert session.compact_now() is True
+
+        status.assert_not_called()
 
     def test_stop_landing_in_completion_tail_still_raises(self, session):
         """A Stop that lands AFTER the impl's last cancel check (the swap /
@@ -1885,7 +2435,9 @@ class TestPreHookUICompat:
             on_thinking_stop=lambda: None,
             on_error=lambda _m: None,
         )
-        summary = SimpleNamespace(content="dense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="dense", finish_reason="stop", producer="summary-producer"
+        )
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session._compact_messages() is True
 
@@ -2333,11 +2885,13 @@ class TestOrphanedCompactionRetirement:
             stream = SimpleNamespace(closed=False, close=lambda: None)
             cancel_ref.append(stream)
             assert session._cancel_stream is stream  # eager registration
-            return SimpleNamespace(content="dense", finish_reason="stop")
+            return SimpleNamespace(
+                content="dense", finish_reason="stop", producer="summary-producer"
+            )
 
         with patch.object(session, "_utility_completion", side_effect=fake_uc):
-            assert session._summarize_once("sys", "body") == "dense"
-            assert session._summarize_once("sys", "body") == "dense"
+            assert session._summarize_once("sys", "body").text == "dense"
+            assert session._summarize_once("sys", "body").text == "dense"
         assert len(seen) == 2
         assert all(isinstance(ref, _CancelRef) for ref in seen)
         assert seen[0] is not seen[1]  # scoped to its call, never reused
@@ -2398,12 +2952,30 @@ class TestOrphanedCompactionRetirement:
 
         def fake_uc(_turns, *, cancel_ref=None, **_kw):
             seen.append(cancel_ref)
-            return SimpleNamespace(content="dense", finish_reason="stop")
+            return SimpleNamespace(
+                content="dense", finish_reason="stop", producer="summary-producer"
+            )
 
         with patch.object(session, "_utility_completion", side_effect=fake_uc):
             session._summarize_once("sys", "body", my_generation=3)
         assert isinstance(seen[0], _CancelRef)
         assert seen[0]._my_generation == 3
+
+    def test_summarize_once_uses_the_generation_principal(self, session):
+        session._generation = 3
+        session._generation_principals[3] = "user-a"
+        seen: list[str | None] = []
+
+        def fake_uc(_turns, **kwargs):
+            seen.append(kwargs.get("principal_id"))
+            return SimpleNamespace(
+                content="dense", finish_reason="stop", producer="summary-producer"
+            )
+
+        with patch.object(session, "_utility_completion", side_effect=fake_uc):
+            session._summarize_once("sys", "body", my_generation=3)
+
+        assert seen == ["user-a"]
 
     def test_stream_closed_by_cancel_maps_to_cancelled_not_error(self, session):
         """A provider error induced by our own stream close (Stop) must end
@@ -2458,6 +3030,7 @@ class TestCompactionErrorChannel:
         which owns the single on_error — the wrapper emitting a second one
         doubled every pane's red rows and the node's error metric."""
         _seed_two_messages(session)
+        session._generation = 1
         with (
             patch.object(session, "_compact_messages_impl", side_effect=RuntimeError("boom")),
             patch.object(session.ui, "on_error") as on_error,
@@ -2488,7 +3061,9 @@ class TestCompactionErrorChannel:
 
     def test_truncated_summary_warns_via_progress_event(self, session):
         _seed_two_messages(session)
-        clipped = SimpleNamespace(content="partial", finish_reason="length")
+        clipped = SimpleNamespace(
+            content="partial", finish_reason="length", producer="summary-producer"
+        )
         with (
             patch.object(session, "_utility_completion", return_value=clipped),
             patch.object(session.ui, "on_compaction", return_value=5) as oc,
@@ -2691,7 +3266,9 @@ class TestCompactionActivityPill:
         assert ui._ws_current_activity == "Compacting context…"
         # Second /compact: compact_now claims (breaking the stale latch,
         # restoring the idle pair), then runs a real compaction.
-        summary = SimpleNamespace(content="dense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="dense", finish_reason="stop", producer="summary-producer"
+        )
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session.compact_now() is True
         assert not ui._compaction_activity_live

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from tests._session_helpers import fake_anthropic_stream, fake_chat_stream
+from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
@@ -28,10 +29,12 @@ from turnstone.core.providers._protocol import (
     CompletionResult,
     LLMProvider,
     ModelCapabilities,
+    ProviderRequestMetrics,
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
     drain_stream,
+    serialized_tool_chars,
 )
 
 # ---------------------------------------------------------------------------
@@ -164,6 +167,27 @@ class TestOpenAIProvider:
 
     def test_provider_name(self) -> None:
         assert self.provider.provider_name == "openai-compatible"
+
+    def test_abort_during_request_metrics_prevents_dispatch(self) -> None:
+        """The last abort read follows final-native metrics preparation."""
+        client = MagicMock()
+        cancel_ref = StreamAbortRef()
+
+        class _AbortOnAppend(list[ProviderRequestMetrics]):
+            def append(self, item: ProviderRequestMetrics) -> None:
+                super().append(item)
+                cancel_ref.abort()
+
+        with pytest.raises(DeadlineCancelledError):
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+                cancel_ref=cancel_ref,
+                request_metrics_ref=_AbortOnAppend(),
+            )
+
+        client.chat.completions.create.assert_not_called()
 
     # -- reasoning template kwargs (_finalize_extra_body) ---------------------
 
@@ -1072,6 +1096,28 @@ class TestAnthropicProvider:
 
     def test_provider_name(self) -> None:
         assert self.provider.provider_name == "anthropic"
+
+    def test_abort_after_lazy_manager_creation_prevents_dispatch(self) -> None:
+        """Anthropic performs its HTTP request in the manager's enter hook."""
+        client = MagicMock()
+        cancel_ref = StreamAbortRef()
+        manager = MagicMock()
+
+        def _build_manager(**_kwargs: Any) -> MagicMock:
+            cancel_ref.abort()
+            return manager
+
+        client.messages.stream.side_effect = _build_manager
+
+        with pytest.raises(DeadlineCancelledError):
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+                cancel_ref=cancel_ref,
+            )
+
+        manager.__enter__.assert_not_called()
 
     def test_convert_tools(self) -> None:
         openai_tools = [
@@ -3715,6 +3761,7 @@ class TestOpenAIWebSearch:
     def test_streaming_creates_with_web_search_options(self) -> None:
         """Streaming with a search model should pass web_search_options."""
         client = MagicMock()
+        request_metrics: list[ProviderRequestMetrics] = []
         client.chat.completions.create.return_value = iter(
             [
                 _openai_stream_chunk(content="Result text"),
@@ -3735,6 +3782,7 @@ class TestOpenAIWebSearch:
                 # model's capabilities ride in explicitly, as the session
                 # layer would pass them.
                 capabilities=lookup_openai_capabilities("gpt-5-search-api"),
+                request_metrics_ref=request_metrics,
             )
         )
         call_kwargs = client.chat.completions.create.call_args[1]
@@ -3743,6 +3791,12 @@ class TestOpenAIWebSearch:
         assert "tools" not in call_kwargs or not any(
             t.get("function", {}).get("name") == "web_search" for t in call_kwargs.get("tools", [])
         )
+        assert request_metrics == [
+            ProviderRequestMetrics(
+                serialized_tool_chars=serialized_tool_chars(call_kwargs.get("tools"))
+            )
+        ]
+        assert request_metrics[0].serialized_tool_chars == 0
 
     def test_drained_stream_folds_citations_into_content(self) -> None:
         """The trailing citation info chunk folds back into drained content —
@@ -4986,6 +5040,27 @@ class TestOpenAIResponsesProvider:
 
     def test_provider_name(self) -> None:
         assert self.provider.provider_name == "openai"
+
+    def test_abort_during_request_metrics_prevents_dispatch(self) -> None:
+        """Responses rechecks cancellation after final-native metrics."""
+        client = MagicMock()
+        cancel_ref = StreamAbortRef()
+
+        class _AbortOnAppend(list[ProviderRequestMetrics]):
+            def append(self, item: ProviderRequestMetrics) -> None:
+                super().append(item)
+                cancel_ref.abort()
+
+        with pytest.raises(DeadlineCancelledError):
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.4",
+                messages=[{"role": "user", "content": "hi"}],
+                cancel_ref=cancel_ref,
+                request_metrics_ref=_AbortOnAppend(),
+            )
+
+        client.responses.create.assert_not_called()
 
     def test_get_capabilities(self) -> None:
         caps = self.provider.get_capabilities("gpt-5.4")

@@ -64,15 +64,17 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 
 ### Path-to-scope mapping
 
-| Method | Path pattern | Required scope |
-|--------|-------------|----------------|
-| GET | Any protected path | `read` |
-| POST | `/api/command` | `write` |
-| POST | `/api/workstreams/new`, `/api/cluster/workstreams/new` | `write` |
-| POST | `/api/workstreams/{ws_id}/{send,cancel,close,delete,open,refresh-title,title,attachments}` | `write` |
-| DELETE | `/api/workstreams/{ws_id}/send` (dequeue), `/api/workstreams/{ws_id}/attachments/{attachment_id}` | `write` |
-| POST | `/api/workstreams/{ws_id}/approve` | `approve` |
-| Any | `/api/admin/*` | `approve` |
+| Method | Path pattern | Required scope | Additional RBAC gate |
+|--------|-------------|----------------|----------------------|
+| GET | Any protected path | `read` | Endpoint-specific where documented |
+| POST | `/api/command` | `write` | Project tenancy on the target workstream |
+| POST | `/api/workstreams/new`, `/api/cluster/workstreams/new` | `write` | `workstreams.create` or `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/close` | `write` | `workstreams.close` or `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/approve` | `approve` | `tools.approve` or `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/{rewind,retry}` | `write` | `conversation.modify` |
+| POST | Other `/api/workstreams/{ws_id}/...` mutation endpoints | `write` | Project tenancy and endpoint-specific gates |
+| DELETE | `/api/workstreams/{ws_id}/send` (dequeue), `/api/workstreams/{ws_id}/attachments/{attachment_id}` | `write` | Project tenancy on the target workstream |
+| Any | `/api/admin/*` | `approve` | Matching `admin.*` permission |
 
 Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,
 `/static/*`, `/shared/*`, `/docs`, `/openapi.json`, `/api/auth/login`,
@@ -84,7 +86,7 @@ Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,
 > See also: [Governance documentation](governance.md)
 
 Scopes provide coarse endpoint-level access control. For finer-grained
-enforcement, the governance layer adds 15 named permissions checked
+enforcement, the governance layer adds named permissions checked
 per-endpoint by `require_permission()`. Permissions are bundled into
 roles; users are assigned roles via the `user_roles` join table.
 
@@ -98,14 +100,42 @@ Three built-in roles are seeded by migration 008:
 
 | Role | Permissions |
 |------|-------------|
-| admin | All 15 permissions |
-| operator | read, write, workstreams.create, workstreams.close |
+| admin | Admin-default baseline (all ordinary admin and lifecycle permissions; explicitly opt-in capabilities remain ungranted) |
+| operator | read, write, workstreams.create, workstreams.close, conversation.modify |
 | viewer | read |
 
 Custom roles can be created with any subset of the valid permissions.
 Role creation and update validate permissions against a static allowlist.
 Self-assignment is blocked, and assigning a role requires the caller to
 hold a superset of the target role's permissions.
+
+### Workstream lifecycle and project boundaries
+
+The remote `/api/command` endpoint is conversation-local. It refuses
+`/new`, `/workstreams`, `/resume`, and `/delete` because those local-CLI
+helpers enumerate or mutate storage outside the HTTP resource gates. Remote
+clients use the dedicated create, open, close, and delete endpoints instead;
+`/rewind` and `/retry` have their own path-keyed, `conversation.modify`-gated
+endpoints.
+
+Passing `resume_ws` to create is an atomic **fork**, not an in-place resume.
+It requires the ordinary create capability and source visibility. A private
+project source is visible only to its workstream creator, project owner/member,
+or authorized service-to-service cluster plumbing; denials use a not-found
+response so guessed IDs do not become an existence oracle. The caller must also
+be allowed to attach a new workstream to the source's current project. The
+destination always inherits that effective project — a caller-supplied
+`project_id` cannot re-file or declassify the conversation.
+
+The canonical preflight atomically captures (and, for a legacy row, installs) a
+private source-incarnation fence. The storage transaction compares that source
+fence, rejects provisional sources, repeats the ACL/project check, and verifies
+the persona/project construction snapshot, destination ownership and
+incarnation, emptiness, and every referenced attachment before committing. A
+source replacement, membership, project, persona, or destination-incarnation
+race aborts the whole fork. Concurrent source-history writes serialize wholly
+before or after the snapshot; no mixed or partially authorized history or
+attachment reference becomes visible.
 
 ---
 
@@ -441,12 +471,15 @@ Each proxied request gets a fresh JWT (5-minute expiry).  This ensures:
 - **Permission forwarding** — granular RBAC permissions from the
   console JWT are carried through to the server.
 
-The JWT `src` claim is set to `"console-proxy"`, allowing servers to
-distinguish proxied requests from direct logins in audit logs.
+For ordinary users the JWT `src` claim is set to `"console-proxy"`, allowing
+servers to distinguish proxied requests from direct logins in audit logs.
+Coordinator tokens retain `src="coordinator"` and their signed `coord_ws_id`;
+the console service identity retains `src="console"` only when its validated
+token also carries the unassignable `service` scope.
 
 When no user context is available (auth disabled, or internal requests),
-the proxy falls back to a `ServiceTokenManager` with service identity
-`console-proxy` and full scopes.
+the proxy falls back to a `ServiceTokenManager` with identity `console-proxy`,
+`src="console"`, and `{read, write, approve, service}` scopes.
 
 ### Service-to-service authentication
 
@@ -455,8 +488,8 @@ JWTs when communicating with server nodes:
 
 | Service | Identity | Scope | Audience | Purpose |
 |---------|----------|-------|----------|---------|
-| Console collector | `console-collector` | `read` | `turnstone-server` | Node health polling |
-| Console proxy (fallback) | `console-proxy` | `approve` | `turnstone-server` | Proxied API calls when no user context |
+| Console collector | `console-collector` | `read`, `service` | `turnstone-server` | Node health polling and global event collection |
+| Console proxy (fallback) | `console-proxy` | `read`, `write`, `approve`, `service` | `turnstone-server` | Proxied API calls when no user context |
 | Channel notify | `system` | `write` | `turnstone-channel` | Notification delivery to channel gateway |
 
 Service tokens use 1-hour expiry with automatic refresh via
@@ -468,8 +501,8 @@ When the console creates a workstream (the normal path), the
 authenticated user's `user_id` is forwarded in the HTTP payload when
 calling the server's `POST /v1/api/workstreams/new`.  The server
 accepts a `user_id` from the request body **only when the caller is a
-trusted service** — identified by `token_source` matching
-`console-proxy` or `console`.  Regular API callers cannot
+trusted service** — identified by `token_source="console"` together with the
+unassignable `service` scope. `console-proxy`, coordinator, and regular API callers cannot
 override `user_id`; the server always uses their JWT identity.
 
 Note that the channel gateway uses a distinct JWT audience

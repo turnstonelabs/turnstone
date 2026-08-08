@@ -7,6 +7,7 @@ import json
 import queue
 import threading
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -20,7 +21,10 @@ if TYPE_CHECKING:
 
 from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
+    FORK_RESERVATION_CONFIG_KEY,
     USER_SCOPED_AUTH_TYPES,
+    ForkCloneExpectation,
+    ForkCloneSnapshot,
     MCPOAuthPendingState,
     MCPPendingConsentRow,
     MCPUserToken,
@@ -91,6 +95,9 @@ from turnstone.core.storage._utils import (
     HISTORY_CONTEXT_EXCLUSION_SQL as _HISTORY_EXCL_SQL,
 )
 from turnstone.core.storage._utils import (
+    HISTORY_CREATING_EXCLUSION_SQL as _HISTORY_CREATING_EXCL_SQL,
+)
+from turnstone.core.storage._utils import (
     HISTORY_VISIBILITY_SCOPE_SQL as _HISTORY_SCOPE_SQL,
 )
 from turnstone.core.storage._utils import (
@@ -136,16 +143,18 @@ from turnstone.core.storage._utils import (
     build_attachments_by_msg as _build_attachments_by_msg,
 )
 from turnstone.core.storage._utils import (
-    escape_like as _escape_like,
-)
-from turnstone.core.storage._utils import (
+    clone_workstream_transaction,
     find_orphan_conversations,
     parse_checkpoint_watermark,
     prepare_provider_data_for_save,
     purge_orphan_conversations,
     release_attachment_refs,
+    retain_attachment_refs,
     sanitize_text,
     senders_from_user_meta,
+)
+from turnstone.core.storage._utils import (
+    escape_like as _escape_like,
 )
 from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
@@ -452,9 +461,16 @@ class SQLiteBackend:
         # Single timestamp for all rows — ordering is preserved by auto-increment id.
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         insert_rows = []
+        attachment_ids: list[str] = []
         ws_ids: set[str] = set()
         for row in rows:
             ws_ids.add(row["ws_id"])
+            row_attachment_ids = [
+                attachment_id
+                for attachment_id in row.get("attachment_ids", [])
+                if isinstance(attachment_id, str) and attachment_id
+            ]
+            attachment_ids.extend(row_attachment_ids)
             insert_rows.append(
                 {
                     "ws_id": row["ws_id"],
@@ -472,10 +488,12 @@ class SQLiteBackend:
                     "tool_calls": row.get("tool_calls"),
                     "_source": sanitize_text(row.get("source")),
                     "is_error": bool(row.get("is_error", False)),
+                    "attachments": (json.dumps(row_attachment_ids) if row_attachment_ids else None),
                     "meta": row.get("meta"),
                 }
             )
         with self._conn() as conn:
+            retain_attachment_refs(conn, attachment_ids)
             conn.execute(sa.insert(conversations), insert_rows)
             for wid in ws_ids:
                 conn.execute(
@@ -537,7 +555,11 @@ class SQLiteBackend:
                 ).fetchall()
 
         attachments = self._resolve_row_attachments(rows)
-        msg_rows = [tuple(r)[:11] for r in rows]
+        # Keep the trailing raw ref-list on canonical Turn loads. The
+        # reconstruction layer stores it in wire-invisible TurnMeta so a fork
+        # can retain the exact source refs even if source deletion wins before
+        # the separate blob-materialization query.
+        msg_rows = [tuple(r) for r in rows]
         return msg_rows, (attachments or None)
 
     def load_messages(
@@ -571,6 +593,49 @@ class SQLiteBackend:
         return _recover_trajectory(
             _reconstruct_turns_checkpointed(msg_rows, ws_id, attachments, checkpoint=checkpointed)
         )
+
+    def clone_workstream(
+        self,
+        source_ws_id: str,
+        destination_ws_id: str,
+        *,
+        principal_id: str,
+        trusted_internal: bool = False,
+        expected_session: ForkCloneExpectation | None = None,
+    ) -> ForkCloneSnapshot:
+        """Clone source state under SQLite's single-writer transaction."""
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            # Acquire the writer lock before the authorization read. No source
+            # mutation can slip between the ACL decision and the history/config
+            # snapshot, and any failure rolls refcount increments back with it.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            try:
+                snapshot = clone_workstream_transaction(
+                    conn,
+                    source_ws_id,
+                    destination_ws_id,
+                    principal_id=principal_id,
+                    trusted_internal=trusted_internal,
+                    expected_session=expected_session,
+                    now=now,
+                    lock_rows=False,
+                )
+                if self._fts5_available and snapshot.turns:
+                    try:
+                        conn.execute(
+                            sa.text(
+                                "INSERT INTO conversations_fts(conversations_fts) "
+                                "VALUES ('rebuild')"
+                            )
+                        )
+                    except Exception:
+                        self._fts5_available = False
+                conn.commit()
+                return snapshot
+            except Exception:
+                conn.rollback()
+                raise
 
     def _resolve_row_attachments(self, rows: Sequence[Any]) -> dict[int, list[dict[str, Any]]]:
         """Build the ``reconstruct_messages`` attachment map from row ref-lists.
@@ -796,7 +861,8 @@ class SQLiteBackend:
                         "w.node_id, w.state, w.kind, "
                         "wcm.value, wcs.value, "
                         "(SELECT COUNT(*) FROM workstreams ch "
-                        " WHERE ch.parent_ws_id = w.ws_id), "
+                        " WHERE ch.parent_ws_id = w.ws_id "
+                        " AND ch.state != 'creating'), "
                         "(SELECT ue.prompt_tokens FROM usage_events ue "
                         " WHERE ue.ws_id = w.ws_id "
                         " ORDER BY ue.timestamp DESC LIMIT 1), "
@@ -809,6 +875,7 @@ class SQLiteBackend:
                         "LEFT JOIN model_definitions md ON md.alias = wcm.value "
                         "WHERE EXISTS "
                         "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
+                        "AND w.state != 'creating' "
                         f"{kind_clause}"
                         f"{user_clause}"
                         f"{state_clause}"
@@ -827,7 +894,7 @@ class SQLiteBackend:
                 for row in conn.execute(
                     sa.text(
                         "SELECT ws_id FROM workstreams "
-                        "WHERE NOT EXISTS "
+                        "WHERE state != 'creating' AND NOT EXISTS "
                         "  (SELECT 1 FROM conversations c "
                         "   WHERE c.ws_id = workstreams.ws_id)"
                     )
@@ -859,7 +926,8 @@ class SQLiteBackend:
                     for row in conn.execute(
                         sa.text(
                             "SELECT ws_id FROM workstreams "
-                            "WHERE alias IS NULL AND updated < :cutoff"
+                            "WHERE state != 'creating' "
+                            "AND alias IS NULL AND updated < :cutoff"
                         ),
                         {"cutoff": cutoff},
                     ).fetchall()
@@ -893,19 +961,28 @@ class SQLiteBackend:
         with self._conn() as conn:
             # 1. Exact alias match
             row = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias_or_id)
+                sa.select(workstreams.c.ws_id).where(
+                    workstreams.c.alias == alias_or_id,
+                    workstreams.c.state != "creating",
+                )
             ).fetchone()
             if row:
                 return str(row[0])
             # 2. Exact ws_id match
             row = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == alias_or_id)
+                sa.select(workstreams.c.ws_id).where(
+                    workstreams.c.ws_id == alias_or_id,
+                    workstreams.c.state != "creating",
+                )
             ).fetchone()
             if row:
                 return str(row[0])
             # 3. ws_id prefix match
             rows = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id.like(alias_or_id + "%"))
+                sa.select(workstreams.c.ws_id).where(
+                    workstreams.c.ws_id.like(alias_or_id + "%"),
+                    workstreams.c.state != "creating",
+                )
             ).fetchall()
             if len(rows) == 1:
                 return str(rows[0][0])
@@ -914,7 +991,10 @@ class SQLiteBackend:
     # -- Workstream config -----------------------------------------------------
 
     def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
-        if not config:
+        public_config = {
+            key: value for key, value in config.items() if key != FORK_RESERVATION_CONFIG_KEY
+        }
+        if not public_config:
             return
         with self._conn() as conn:
             conn.execute(
@@ -922,7 +1002,10 @@ class SQLiteBackend:
                     "INSERT OR REPLACE INTO workstream_config "
                     "(ws_id, key, value) VALUES (:wid, :key, :value)"
                 ),
-                [{"wid": ws_id, "key": key, "value": value} for key, value in config.items()],
+                [
+                    {"wid": ws_id, "key": key, "value": value}
+                    for key, value in public_config.items()
+                ],
             )
             conn.commit()
 
@@ -930,10 +1013,159 @@ class SQLiteBackend:
         with self._conn() as conn:
             rows = conn.execute(
                 sa.select(workstream_config.c.key, workstream_config.c.value).where(
-                    workstream_config.c.ws_id == ws_id
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key != FORK_RESERVATION_CONFIG_KEY,
                 )
             ).fetchall()
             return {row[0]: row[1] for row in rows}
+
+    def finalize_deferred_create(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+        *,
+        alias: str | None = None,
+        config: dict[str, str] | None = None,
+        node_id: str | None = None,
+        override_reason: str = "local",
+    ) -> bool:
+        """Apply private prepublication writes to exactly one fork row."""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        if not ws_id or not fork_reservation_token:
+            return False
+        public_config = {
+            key: value
+            for key, value in (config or {}).items()
+            if key != FORK_RESERVATION_CONFIG_KEY
+        }
+        with self._conn() as conn:
+            # Reserve the writer before validating the incarnation. No other
+            # writer can delete/re-register or claim the alias mid-finalize.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            row = conn.execute(
+                sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id)
+            ).fetchone()
+            reservation = conn.execute(
+                sa.select(workstream_config.c.value).where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+            ).fetchone()
+            if (
+                row is None
+                or str(row[0] or "") != "creating"
+                or reservation is None
+                or str(reservation[0] or "") != fork_reservation_token
+            ):
+                conn.rollback()
+                return False
+            if alias is not None:
+                incumbent = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias)
+                ).fetchone()
+                if incumbent is not None and str(incumbent[0]) != ws_id:
+                    conn.rollback()
+                    return False
+            try:
+                if alias is not None:
+                    conn.execute(
+                        sa.update(workstreams)
+                        .where(workstreams.c.ws_id == ws_id)
+                        .values(alias=alias)
+                    )
+                if public_config:
+                    config_stmt = sqlite_insert(workstream_config)
+                    conn.execute(
+                        config_stmt.on_conflict_do_update(
+                            index_elements=["ws_id", "key"],
+                            set_={"value": config_stmt.excluded.value},
+                        ),
+                        [
+                            {"ws_id": ws_id, "key": key, "value": value}
+                            for key, value in public_config.items()
+                        ],
+                    )
+                if node_id is not None:
+                    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+                    override_stmt = sqlite_insert(workstream_overrides).values(
+                        ws_id=ws_id,
+                        node_id=node_id,
+                        reason=override_reason,
+                        created=now,
+                        updated=now,
+                    )
+                    conn.execute(
+                        override_stmt.on_conflict_do_update(
+                            index_elements=["ws_id"],
+                            set_={
+                                "node_id": node_id,
+                                "reason": override_reason,
+                                "updated": now,
+                            },
+                        )
+                    )
+                conn.commit()
+                return True
+            except sa.exc.IntegrityError:
+                conn.rollback()
+                if alias is not None:
+                    return False
+                raise
+
+    def publish_deferred_create(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        """CAS one exact durable reservation from creating to idle."""
+        if not ws_id or not fork_reservation_token:
+            return False
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            row = conn.execute(
+                sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id)
+            ).fetchone()
+            reservation = conn.execute(
+                sa.select(workstream_config.c.value).where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+            ).fetchone()
+            if (
+                row is None
+                or str(row[0] or "") != "creating"
+                or reservation is None
+                or str(reservation[0] or "") != fork_reservation_token
+            ):
+                conn.rollback()
+                return False
+            result = conn.execute(
+                sa.update(workstreams)
+                .where(
+                    workstreams.c.ws_id == ws_id,
+                    workstreams.c.state == "creating",
+                )
+                .values(state="idle", updated=now)
+            )
+            if result.rowcount != 1:
+                conn.rollback()
+                return False
+            conn.commit()
+            return True
+
+    def get_workstream_reservation_token(self, ws_id: str) -> str:
+        if not ws_id:
+            return ""
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(workstream_config.c.value).where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+            ).fetchone()
+        return str(row[0] or "") if row is not None else ""
 
     # -- Workstream metadata ---------------------------------------------------
 
@@ -1026,6 +1258,53 @@ class SQLiteBackend:
         """
         return self.get_workstreams_batch([ws_id]).get(ws_id)
 
+    def ensure_workstream_incarnation_snapshot(self, ws_id: str) -> dict[str, Any] | None:
+        """Read one row and install a legacy incarnation fence atomically."""
+        if not ws_id:
+            return None
+        with self._conn() as conn:
+            # Take the writer reservation before the row/token read. A
+            # concurrent delete/re-register cannot replace the authorized row
+            # between snapshot and legacy-token installation.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            row = conn.execute(
+                sa.select(workstreams).where(workstreams.c.ws_id == ws_id)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            token_row = conn.execute(
+                sa.select(workstream_config.c.value).where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+            ).fetchone()
+            token = str(token_row[0] or "") if token_row is not None else ""
+            if not token:
+                token = uuid.uuid4().hex
+                if token_row is None:
+                    conn.execute(
+                        sa.insert(workstream_config),
+                        {
+                            "ws_id": ws_id,
+                            "key": FORK_RESERVATION_CONFIG_KEY,
+                            "value": token,
+                        },
+                    )
+                else:
+                    conn.execute(
+                        sa.update(workstream_config)
+                        .where(
+                            workstream_config.c.ws_id == ws_id,
+                            workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                        )
+                        .values(value=token)
+                    )
+            conn.commit()
+            snapshot = dict(row._mapping)
+            snapshot["fork_reservation_token"] = token
+            return snapshot
+
     def update_workstream_title(self, ws_id: str, title: str) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -1050,7 +1329,8 @@ class SQLiteBackend:
         parent_ws_id: str | None = None,
         project_id: str | None = None,
         persona: str | None = None,
-    ) -> None:
+        fork_reservation_token: str = "",
+    ) -> bool:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         # Kind validation at the storage edge — third of three layers
         # (HTTP handler in server.py returns 400, SessionManager.create
@@ -1065,7 +1345,7 @@ class SQLiteBackend:
         norm_project = project_id if project_id else None
         norm_persona = persona if persona else None
         with self._conn() as conn:
-            conn.execute(
+            result = conn.execute(
                 sa.insert(workstreams).prefix_with("OR IGNORE"),
                 {
                     "ws_id": ws_id,
@@ -1085,7 +1365,31 @@ class SQLiteBackend:
                     "updated": now,
                 },
             )
+            inserted = result.rowcount == 1
+            if inserted:
+                if fork_reservation_token:
+                    # Persist the destination-incarnation fence atomically
+                    # with the row. OR REPLACE overwrites a stale orphan key
+                    # left by an older incarnation of this caller-chosen id.
+                    conn.execute(
+                        sa.insert(workstream_config).prefix_with("OR REPLACE"),
+                        {
+                            "ws_id": ws_id,
+                            "key": FORK_RESERVATION_CONFIG_KEY,
+                            "value": fork_reservation_token,
+                        },
+                    )
+                else:
+                    # A non-fork incarnation must not inherit an orphaned
+                    # token that could authorize deletion by its predecessor.
+                    conn.execute(
+                        sa.delete(workstream_config).where(
+                            workstream_config.c.ws_id == ws_id,
+                            workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                        )
+                    )
             conn.commit()
+            return inserted
 
     def update_workstream_state(self, ws_id: str, state: str) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -1170,6 +1474,92 @@ class SQLiteBackend:
             conn.commit()
             return closed
 
+    def delete_stale_creating_reservations(
+        self,
+        kind: WorkstreamKind | str,
+        cutoff: str,
+        exclude_ws_ids: list[str],
+        *,
+        live_node_ids: list[str],
+        local_node_id: str | None,
+    ) -> list[str]:
+        """Hard-delete stale hidden creates under one SQLite writer lock."""
+        if live_node_ids is None:
+            # Liveness uncertainty is never permission to reap.
+            return []
+        norm_kind = WorkstreamKind(kind).value
+        excluded = set(exclude_ws_ids)
+        local_owner = local_node_id or None
+        protected_live_nodes = {
+            node_id for node_id in live_node_ids if node_id and node_id != local_owner
+        }
+        conditions: list[Any] = [
+            workstreams.c.kind == norm_kind,
+            workstreams.c.state == "creating",
+            workstreams.c.updated < cutoff,
+        ]
+        if excluded:
+            conditions.append(~workstreams.c.ws_id.in_(excluded))
+        if protected_live_nodes:
+            conditions.append(
+                sa.or_(
+                    workstreams.c.node_id.is_(None),
+                    ~workstreams.c.node_id.in_(protected_live_nodes),
+                )
+            )
+
+        deleted: list[str] = []
+        tokenless_deleted = 0
+        with self._conn() as conn:
+            # Serialize the candidate check, private-fence read and full delete.
+            # A concurrent publish therefore either flips creating->idle first
+            # and is not selected, or observes the row gone after this commit.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            candidate_ids = [
+                str(row[0])
+                for row in conn.execute(sa.select(workstreams.c.ws_id).where(*conditions))
+            ]
+            for ws_id in candidate_ids:
+                reservation = conn.execute(
+                    sa.select(workstream_config.c.value).where(
+                        workstream_config.c.ws_id == ws_id,
+                        workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                    )
+                ).fetchone()
+                token = str(reservation[0] or "") if reservation is not None else ""
+                exact_conditions: list[Any] = [
+                    workstreams.c.ws_id == ws_id,
+                    workstreams.c.kind == norm_kind,
+                    workstreams.c.state == "creating",
+                    workstreams.c.updated < cutoff,
+                ]
+                if token:
+                    exact_conditions.append(
+                        sa.exists(
+                            sa.select(workstream_config.c.ws_id).where(
+                                workstream_config.c.ws_id == ws_id,
+                                workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                                workstream_config.c.value == token,
+                            )
+                        )
+                    )
+                exact_incarnation = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(*exact_conditions)
+                ).fetchone()
+                if exact_incarnation is None:
+                    continue
+                if self._delete_workstream_on_connection(conn, ws_id):
+                    deleted.append(ws_id)
+                    if not token:
+                        tokenless_deleted += 1
+            conn.commit()
+        if tokenless_deleted:
+            log.warning(
+                "storage.stale_create_tokenless_reaped backend=sqlite count=%d",
+                tokenless_deleted,
+            )
+        return deleted
+
     def touch_workstream(self, ws_id: str) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
@@ -1188,43 +1578,77 @@ class SQLiteBackend:
             )
             conn.commit()
 
+    def _delete_workstream_on_connection(self, conn: Any, ws_id: str) -> bool:
+        """Delete one row and dependents inside the caller's transaction."""
+        # Refcount GC over every referenced blob (content-addressed ids are
+        # global, so a deduped blob may be shared with another workstream —
+        # decrement, don't blanket-delete by ws_id).  Blobs that hit 0 are
+        # pruned; any still referenced elsewhere survive.
+        referenced = conn.execute(
+            sa.select(conversations.c.attachments).where(
+                sa.and_(
+                    conversations.c.ws_id == ws_id,
+                    conversations.c.attachments.is_not(None),
+                )
+            )
+        ).fetchall()
+        ref_ids: list[str] = []
+        for (refs,) in referenced:
+            ref_ids.extend(_parse_attachment_refs(refs))
+        release_attachment_refs(conn, ref_ids)
+        conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
+        conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
+        conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id))
+        # Null-out parent_ws_id on children before dropping the row —
+        # otherwise a deleted coordinator leaves orphaned pointers and
+        # ``list_workstreams(parent_ws_id=<deleted>)`` keeps returning
+        # ghost-parented rows.  Cheaper than a schema-level FK with
+        # ON DELETE SET NULL and avoids rewriting the workstreams
+        # table on SQLite.
+        conn.execute(
+            sa.update(workstreams)
+            .where(workstreams.c.parent_ws_id == ws_id)
+            .values(parent_ws_id=None)
+        )
+        result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
+        return bool(result.rowcount > 0)
+
     def delete_workstream(self, ws_id: str) -> bool:
         with self._conn() as conn:
-            # Refcount GC over every referenced blob (content-addressed ids are
-            # global, so a deduped blob may be shared with another workstream —
-            # decrement, don't blanket-delete by ws_id).  Blobs that hit 0 are
-            # pruned; any still referenced elsewhere survive.
-            referenced = conn.execute(
-                sa.select(conversations.c.attachments).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.attachments.is_not(None),
-                    )
-                )
-            ).fetchall()
-            ref_ids: list[str] = []
-            for (refs,) in referenced:
-                ref_ids.extend(_parse_attachment_refs(refs))
-            release_attachment_refs(conn, ref_ids)
-            conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
-            conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
-            conn.execute(
-                sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id)
-            )
-            # Null-out parent_ws_id on children before dropping the row —
-            # otherwise a deleted coordinator leaves orphaned pointers and
-            # ``list_workstreams(parent_ws_id=<deleted>)`` keeps returning
-            # ghost-parented rows.  Cheaper than a schema-level FK with
-            # ON DELETE SET NULL and avoids rewriting the workstreams
-            # table on SQLite.
-            conn.execute(
-                sa.update(workstreams)
-                .where(workstreams.c.parent_ws_id == ws_id)
-                .values(parent_ws_id=None)
-            )
-            result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            deleted = self._delete_workstream_on_connection(conn, ws_id)
             conn.commit()
-            return result.rowcount > 0
+            return deleted
+
+    def delete_workstream_if_fork_reserved(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        if not fork_reservation_token:
+            return False
+        with self._conn() as conn:
+            # Acquire SQLite's writer reservation before reading the fence so
+            # no delete/re-register can change the row between check and GC.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            workstream_row = conn.execute(
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
+            ).fetchone()
+            if workstream_row is None:
+                conn.rollback()
+                return False
+            row = conn.execute(
+                sa.select(workstream_config.c.value).where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+            ).fetchone()
+            if row is None or str(row[0] or "") != fork_reservation_token:
+                conn.rollback()
+                return False
+            deleted = self._delete_workstream_on_connection(conn, ws_id)
+            conn.commit()
+            return deleted
 
     def list_orphan_conversations(self) -> list[dict[str, Any]]:
         with self._conn() as conn:
@@ -1404,6 +1828,7 @@ class SQLiteBackend:
                 q = q.where(workstreams.c.kind == WorkstreamKind(kind).value)
             if user_id is not None:
                 q = q.where(workstreams.c.user_id == user_id)
+            q = q.where(workstreams.c.state != "creating")
             return list(conn.execute(q).fetchall())
 
     def count_workstreams_by_state(
@@ -1419,7 +1844,11 @@ class SQLiteBackend:
         (caller must gate on their own authz).
         """
         with self._conn() as conn:
-            q = sa.select(workstreams.c.state, sa.func.count()).group_by(workstreams.c.state)
+            q = (
+                sa.select(workstreams.c.state, sa.func.count())
+                .where(workstreams.c.state != "creating")
+                .group_by(workstreams.c.state)
+            )
             if parent_ws_id is not None:
                 q = q.where(workstreams.c.parent_ws_id == parent_ws_id)
             if user_id is not None:
@@ -1445,6 +1874,7 @@ class SQLiteBackend:
                 sa.select(sa.func.count())
                 .select_from(workstreams)
                 .where(workstreams.c.created >= since)
+                .where(workstreams.c.state != "creating")
             )
             if parent_ws_id is not None:
                 q = q.where(workstreams.c.parent_ws_id == parent_ws_id)
@@ -1474,7 +1904,9 @@ class SQLiteBackend:
         # SQL, not post-filtered in Python, so limit/offset pagination stays
         # honest — a page never silently shrinks because hidden rows were
         # fetched then dropped.
-        scope_sql = _HISTORY_SCOPE_SQL if user_id is not None else ""
+        scope_sql = _HISTORY_CREATING_EXCL_SQL
+        if user_id is not None:
+            scope_sql += _HISTORY_SCOPE_SQL
         scope_params: dict[str, Any] = {"scope_user": user_id} if user_id is not None else {}
         if exclude_ws_id is not None:
             scope_sql += _HISTORY_EXCL_SQL
@@ -1528,7 +1960,9 @@ class SQLiteBackend:
 
     def search_history_recent(self, limit: int = 20, *, user_id: str | None = None) -> list[Any]:
         capped = min(limit, 100)
-        scope_sql = _HISTORY_SCOPE_SQL if user_id is not None else ""
+        scope_sql = _HISTORY_CREATING_EXCL_SQL
+        if user_id is not None:
+            scope_sql += _HISTORY_SCOPE_SQL
         scope_params = {"scope_user": user_id} if user_id is not None else {}
         with self._conn() as conn:
             return list(
@@ -3815,7 +4249,10 @@ class SQLiteBackend:
                 out[r[0]] = int(r[1])
         return out
 
-    def get_workstreams_batch(self, ws_ids: list[str]) -> dict[str, dict[str, Any] | None]:
+    def get_workstreams_batch(
+        self,
+        ws_ids: list[str],
+    ) -> dict[str, dict[str, Any] | None]:
         if not ws_ids:
             return {}
         clean = [w for w in ws_ids if isinstance(w, str) and w]
@@ -3843,7 +4280,7 @@ class SQLiteBackend:
                 ).where(workstreams.c.ws_id.in_(clean))
             ).fetchall()
         for r in rows:
-            out[r[0]] = {
+            item = {
                 "ws_id": r[0],
                 "node_id": r[1],
                 "user_id": r[2],
@@ -3860,6 +4297,7 @@ class SQLiteBackend:
                 "project_id": r[13],
                 "persona": r[14],
             }
+            out[r[0]] = item
         return out
 
     # -- Audit events ----------------------------------------------------------
@@ -5496,7 +5934,10 @@ class SQLiteBackend:
                     workstreams.c.node_id,
                     workstreams.c.user_id,
                 )
-                .where(workstreams.c.project_id == project_id)
+                .where(
+                    workstreams.c.project_id == project_id,
+                    workstreams.c.state != "creating",
+                )
                 .order_by(workstreams.c.updated.desc())
             ).fetchall()
             return [

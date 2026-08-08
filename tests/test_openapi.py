@@ -95,6 +95,31 @@ class TestServerSpec:
         assert "requestBody" in send
         assert "application/json" in send["requestBody"]["content"]
 
+    def test_approval_and_cancel_preserve_extended_response_contracts(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        approve = spec["paths"]["/v1/api/workstreams/{ws_id}/approve"]["post"]
+        cancel = spec["paths"]["/v1/api/workstreams/{ws_id}/cancel"]["post"]
+        assert approve["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ApproveResponse"
+        }
+        assert cancel["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/CancelResponse"
+        }
+        assert cancel["requestBody"]["required"] is False
+        assert "cycle_id" in spec["components"]["schemas"]["ApproveResponse"]["properties"]
+        assert "dropped" in spec["components"]["schemas"]["CancelResponse"]["properties"]
+
+    def test_create_status_is_optional_but_never_advertised_as_null(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        schema = spec["components"]["schemas"]["CreateWorkstreamResponse"]
+        status = schema["properties"]["initial_message_status"]
+        assert status["enum"] == ["queue_full", "refused_closed"]
+        assert "initial_message_status" not in schema.get("required", [])
+
     def test_health_endpoint_not_versioned(self):
         from turnstone.api.server_spec import build_server_spec
 
@@ -172,6 +197,66 @@ class TestConsoleSpec:
             "/v1/api/cluster/ws/{ws_id}/detail",
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
+
+    def test_routing_paths_and_extended_response_contracts(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        paths = spec["paths"]
+        for suffix in ("send", "approve", "cancel", "rewind", "retry", "close"):
+            assert f"/v1/api/route/workstreams/{{ws_id}}/{suffix}" in paths
+        assert "/v1/api/route/send" not in paths
+        assert "/v1/api/route/approve" not in paths
+        assert "/v1/api/route/cancel" not in paths
+        assert "/v1/api/route/workstreams/close" not in paths
+
+        coordinator_approve = paths["/v1/api/workstreams/{ws_id}/approve"]["post"]
+        coordinator_cancel = paths["/v1/api/workstreams/{ws_id}/cancel"]["post"]
+        assert coordinator_approve["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ApproveResponse"
+        }
+        assert coordinator_cancel["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/CancelResponse"
+        }
+        assert coordinator_cancel["requestBody"]["required"] is False
+
+    def test_route_create_and_live_contracts(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        route_create = spec["paths"]["/v1/api/route/workstreams/new"]["post"]
+        assert route_create["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/RouteCreateRequest"
+        }
+        ws_id_param = next(p for p in route_create["parameters"] if p["name"] == "ws_id")
+        assert ws_id_param["required"] is False
+        assert "multipart" in ws_id_param["description"]
+        assert route_create["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/RouteCreateResponse"
+        }
+        route_response = spec["components"]["schemas"]["RouteCreateResponse"]
+        assert "routing_strategy" in route_response["properties"]
+        assert {"node_url", "node_id", "routing_strategy"}.issubset(set(route_response["required"]))
+        assert route_response["properties"]["routing_strategy"]["enum"] == [
+            "rendezvous",
+            "target_node",
+            "resume",
+        ]
+        assert set(route_create["responses"]) == {
+            "200",
+            "400",
+            "403",
+            "404",
+            "409",
+            "413",
+            "429",
+            "500",
+            "502",
+            "503",
+        }
+
+        live = spec["paths"]["/v1/api/route/workstreams/{ws_id}/live"]["get"]
+        assert set(live["responses"]) == {"200", "400", "502", "503"}
 
     def test_coordinator_create_has_request_body_and_200(self):
         """Coordinator create returns 200 and accepts a body.

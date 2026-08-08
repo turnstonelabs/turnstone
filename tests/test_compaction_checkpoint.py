@@ -26,6 +26,7 @@ import json
 import pytest
 
 from tests._session_helpers import make_session
+from turnstone.core.session import _SummaryResult
 from turnstone.core.trajectory import turns_from_dicts
 
 
@@ -247,7 +248,11 @@ def test_compaction_persists_checkpoint_and_resume_is_bounded(tmp_db, mock_opena
     sess._ws_id = ws
     sess.messages = turns_from_dicts(history)
     sess._msg_tokens = [1] * len(history)
-    with patch.object(sess, "_summarize_blocks", return_value="DENSE SUMMARY"):
+    with patch.object(
+        sess,
+        "_summarize_blocks",
+        return_value=_SummaryResult(text="DENSE SUMMARY", producer="summary-producer"),
+    ):
         assert sess._compact_messages(auto=False) is True
 
     # Conversation continues after the compaction.
@@ -261,6 +266,60 @@ def test_compaction_persists_checkpoint_and_resume_is_bounded(tmp_db, mock_opena
     assert texts[:2] == ["[Conversation summary]", "DENSE SUMMARY"]
     assert "after compaction" in texts
     assert not any(t.startswith("turn ") for t in texts)  # full history NOT reloaded
+
+
+def test_compaction_summary_producer_survives_storage_round_trip(
+    storage_backend, mock_openai_client
+):
+    """The final summary producer is durable checkpoint metadata.
+
+    A compaction marker has no provider-native payload, so its producer belongs
+    in the marker's ``summary_producer`` meta field.  Checkpoint reconstruction
+    maps that object to the summary Turn's
+    ``meta.extra["source_meta"]``.  This intentionally pins only the producer;
+    the broader durable model/config/principal provenance tuple is #964 scope.
+    """
+    st = storage_backend
+    ws = _register(st, "ws-summary-producer")
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"} for i in range(6)
+    ]
+    for message in history:
+        st.save_message(ws, message["role"], message["content"])
+
+    sess = make_session(client=mock_openai_client, context_window=10_000, max_tokens=1_000)
+    sess._ws_id = ws
+    sess.messages = turns_from_dicts(history)
+    sess._msg_tokens = [1] * len(history)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            sess,
+            "_summarize_blocks",
+            lambda *_args, **_kwargs: _SummaryResult(
+                text="DENSE SUMMARY", producer="final-summary-producer"
+            ),
+        )
+        assert sess._compact_messages(auto=False) is True
+
+    marker = next(
+        message
+        for message in st.load_messages(ws, include_compaction=True)
+        if message.get("_source") == "compaction"
+    )
+    assert marker["_source_meta"]["summary_producer"] == "final-summary-producer"
+
+    loaded = st.load_message_turns(ws)
+    assert [turn.text for turn in loaded[:2]] == ["[Conversation summary]", "DENSE SUMMARY"]
+    assert "source_meta" not in loaded[0].meta.extra
+    assert loaded[1].meta.extra["source_meta"]["summary_producer"] == "final-summary-producer"
+
+    reopened = make_session(client=mock_openai_client, context_window=10_000, max_tokens=1_000)
+    assert reopened.resume(ws) is True
+    assert reopened.messages[1].text == "DENSE SUMMARY"
+    assert (
+        reopened.messages[1].meta.extra["source_meta"]["summary_producer"]
+        == "final-summary-producer"
+    )
 
 
 # ---------------------------------------------------------------------------

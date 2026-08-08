@@ -104,6 +104,7 @@ class _FakeUI:
         self._user_id = user_id
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
+        self._auto_approve_tools_source: dict[str, str] = {}
         self._enqueued: list[dict[str, Any]] = []
         self.states: list[str] = []
         self.infos: list[str] = []
@@ -223,7 +224,7 @@ class _FakeSession:
         self.model_alias = ""
         self.reasoning_effort = ""
         self.context_window = 100000
-        self.messages: list[dict[str, Any]] = []
+        self.messages: list[Any] = []
         self._last_usage: dict[str, int] | None = None
         self._pending_retry: str | None = None
         # Real sessions always carry one; the /send route's cancel-drain
@@ -232,6 +233,7 @@ class _FakeSession:
         self.sends: list[tuple[str, Any, Any]] = []
         self.commands: list[str] = []
         self.compacts = 0
+        self.compact_principals: list[str | None] = []
         self.compact_raises: BaseException | None = None
         self.send_raises: BaseException | None = None
         self.exit_commands: set[str] = set()
@@ -252,6 +254,7 @@ class _FakeSession:
         # When set, queue_message records the attempt and then raises it
         # (e.g. CrossUserInterjectionError for the drain's re-park arm).
         self.queue_raises: BaseException | None = None
+        self.fork_calls: list[tuple[str, str, bool]] = []
         # DELETE /send fall-through: ids the route asked this session to
         # dequeue (the fake never holds interjections, so it returns
         # False and the route falls through to the deferred-send list).
@@ -288,6 +291,29 @@ class _FakeSession:
     def resume(self, _ws_id: str, *, fork: bool = False) -> bool:
         return False
 
+    def fork_from_storage(
+        self,
+        source_ws_id: str,
+        *,
+        principal_id: str,
+        source_reservation_token: str,
+        trusted_internal: bool = False,
+    ) -> Any:
+        from turnstone.core.storage import get_storage
+
+        self.fork_calls.append((source_ws_id, principal_id, trusted_internal))
+        storage = get_storage()
+        assert storage is not None
+        assert source_reservation_token
+        snapshot = storage.clone_workstream(
+            source_ws_id,
+            self.ws_id,
+            principal_id=principal_id,
+            trusted_internal=trusted_internal,
+        )
+        self.messages = list(snapshot.turns)
+        return snapshot
+
     def cancel(self) -> None:
         pass
 
@@ -302,8 +328,9 @@ class _FakeSession:
             raise self.command_raises
         return cmd in self.exit_commands
 
-    def compact_now(self) -> bool:
+    def compact_now(self, *, principal_id: str | None = None) -> bool:
         self.compacts += 1
+        self.compact_principals.append(principal_id)
         if self.compact_gate is not None:
             self.compact_gate.wait(timeout=10)
         if self.compact_raises is not None:
@@ -315,7 +342,8 @@ class _FakeSession:
         had, self.queued_text = bool(self.queued_text), ""
         return had
 
-    def request_title_refresh(self, _title: str) -> None:
+    def request_title_refresh(self, _title: str, *, principal_id: str = "") -> None:
+        del principal_id
         pass
 
 
@@ -429,6 +457,165 @@ class TestKindValidationOnCreate:
         )
         assert resp.status_code == 403
         assert "coordinator you own" in resp.json()["error"]
+
+    def test_rejects_creating_parent_ws_id(self, app_client):
+        """A child cannot attach to a coordinator before lifecycle birth."""
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        assert storage.register_workstream(
+            "pending-coord",
+            node_id="console",
+            name="pending",
+            state="creating",
+            kind="coordinator",
+            user_id="user-1",
+        )
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "too-early", "parent_ws_id": "pending-coord"},
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 400
+        assert "known workstream" in resp.json()["error"]
+        assert mgr.count == 0
+
+
+class TestAutoApproveToolsOnCreate:
+    """The mounted node handler applies CSV/list per-tool approval policy."""
+
+    @pytest.mark.parametrize(
+        "raw_tools",
+        [
+            " read_file,write_file,read_file,, ",
+            [" read_file ", "write_file", "read_file", ""],
+        ],
+    )
+    def test_accepts_canonicalizes_and_tags_tools_with_blanket_off(
+        self,
+        app_client: Any,
+        raw_tools: Any,
+    ) -> None:
+        from turnstone.core.session_ui_base import AutoApproveReason
+
+        client, mgr = app_client
+        response = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "per-tool", "auto_approve_tools": raw_tools},
+            headers=_auth("user-1"),
+        )
+
+        assert response.status_code == 200, response.text
+        ws = mgr.get(response.json()["ws_id"])
+        assert ws is not None
+        assert ws.ui.auto_approve is False
+        assert ws.ui.auto_approve_tools == {"read_file", "write_file"}
+        assert ws.ui._auto_approve_tools_source == {
+            "read_file": AutoApproveReason.AUTO_APPROVE_TOOLS,
+            "write_file": AutoApproveReason.AUTO_APPROVE_TOOLS,
+        }
+
+    @pytest.mark.parametrize(
+        ("raw_tools", "error"),
+        [
+            ({"read_file": True}, "comma-separated string or array"),
+            (["read_file", 7], "auto_approve_tools[1] must be a string"),
+        ],
+    )
+    def test_rejects_malformed_tools_before_create(
+        self,
+        app_client: Any,
+        raw_tools: Any,
+        error: str,
+    ) -> None:
+        client, mgr = app_client
+
+        response = client.post(
+            "/v1/api/workstreams/new",
+            json={"auto_approve_tools": raw_tools},
+            headers=_auth("user-1"),
+        )
+
+        assert response.status_code == 400
+        assert error in response.json()["error"]
+        assert mgr.count == 0
+
+    def test_schema_exposes_live_create_fields(self) -> None:
+        from turnstone.api.server_schemas import CreateWorkstreamRequest
+
+        request = CreateWorkstreamRequest(
+            auto_approve_tools=["read_file"],
+            judge_model="judge-fast",
+            user_id="forwarded-user",
+        )
+
+        assert request.auto_approve_tools == ["read_file"]
+        assert request.judge_model == "judge-fast"
+        assert request.user_id == "forwarded-user"
+
+
+class TestMountedCreateUserIdOverride:
+    """The real interactive mount trusts only the console service identity."""
+
+    @staticmethod
+    def _service_headers(*, include_service_scope: bool) -> dict[str, str]:
+        from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
+
+        scopes = {"read", "write", "approve"}
+        if include_service_scope:
+            scopes.add("service")
+        token = create_jwt(
+            user_id="console-service",
+            scopes=frozenset(scopes),
+            source="console",
+            secret=_TEST_JWT_SECRET,
+            audience=JWT_AUD_SERVER,
+            permissions=frozenset({"workstreams.create"}),
+        )
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_ordinary_caller_cannot_override_owner(self, app_client: Any) -> None:
+        client, mgr = app_client
+        response = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "ordinary", "user_id": "impersonated"},
+            headers=_auth("ordinary-user"),
+        )
+
+        assert response.status_code == 200, response.text
+        ws = mgr.get(response.json()["ws_id"])
+        assert ws is not None
+        assert ws.user_id == "ordinary-user"
+
+    def test_console_without_service_scope_cannot_override_owner(self, app_client: Any) -> None:
+        client, mgr = app_client
+        response = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "unscoped-console", "user_id": "impersonated"},
+            headers=self._service_headers(include_service_scope=False),
+        )
+
+        assert response.status_code == 200, response.text
+        ws = mgr.get(response.json()["ws_id"])
+        assert ws is not None
+        assert ws.user_id == "console-service"
+
+    def test_console_service_can_forward_owner(self, app_client: Any) -> None:
+        client, mgr = app_client
+        response = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "trusted-console", "user_id": "forwarded-user"},
+            headers=self._service_headers(include_service_scope=True),
+        )
+
+        assert response.status_code == 200, response.text
+        ws = mgr.get(response.json()["ws_id"])
+        assert ws is not None
+        assert ws.user_id == "forwarded-user"
 
 
 class TestOpenKindGate:
@@ -1308,6 +1495,7 @@ class TestCompactCommandDispatch:
         ws.worker_thread.join(timeout=5)
         assert not ws.worker_thread.is_alive()
         assert ws.session.compacts == 1
+        assert ws.session.compact_principals == ["user-1"]
         assert ws._worker_running is False
         # The slot was classified as a command window (what the /send
         # route's defer keys on; stale after exit is harmless — every
@@ -2519,6 +2707,74 @@ class TestCompactCommandDispatch:
         assert ws.session.commands == []
 
 
+class TestRemoteLifecycleCommandBoundary:
+    """The HTTP command bridge never reaches storage-global REPL lifecycle code."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "/workstreams",
+            "/resume secret-alias",
+            "/resume missing-alias",
+            "/delete secret-alias",
+            "/delete missing-alias",
+        ],
+    )
+    def test_cli_only_command_is_rejected_before_dispatch_without_oracle(
+        self,
+        app_client,
+        command: str,
+    ) -> None:
+        """Known/private and missing targets have one inert, non-disclosing result."""
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        storage.create_project("secret-project", "Secret Project", "victim-user")
+        storage.register_workstream(
+            "secret-ws",
+            node_id="node-test",
+            name="secret-name",
+            user_id="victim-user",
+            project_id="secret-project",
+        )
+        assert storage.set_workstream_alias("secret-ws", "secret-alias") is True
+        storage.save_message("secret-ws", "user", "private history")
+
+        created = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "caller-workstream"},
+            headers=_auth("caller-user"),
+        )
+        assert created.status_code == 200
+        caller_ws_id = created.json()["ws_id"]
+        caller_ws = mgr.get(caller_ws_id)
+        assert caller_ws is not None
+        assert caller_ws.session is not None
+        original_session_id = caller_ws.session.ws_id
+        original_messages = list(caller_ws.session.messages)
+
+        response = client.post(
+            "/v1/api/command",
+            json={"command": command, "ws_id": caller_ws_id},
+            headers=_auth("caller-user"),
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "error": "This workstream command is only available in the local CLI."
+        }
+        assert caller_ws.worker_thread is None
+        assert caller_ws.session.commands == []
+        assert caller_ws.session.ws_id == original_session_id
+        assert caller_ws.session.messages == original_messages
+        assert storage.get_workstream("secret-ws") is not None
+        assert [turn.text for turn in storage.load_message_turns("secret-ws")] == [
+            "private history"
+        ]
+
+
 class TestRequireProjectMountWiring:
     """server.require_project is wired on the REAL interactive create mount
     (create_gate_require_project=True on interactive_endpoint_config). Synthetic-
@@ -2546,3 +2802,706 @@ class TestRequireProjectMountWiring:
         )
         body = resp.json()
         assert not (resp.status_code == 400 and body.get("code") == "require_project"), body
+
+    def test_flag_off_forwarded_service_cannot_fork_private_nonmember(
+        self, app_client, make_config_store, monkeypatch
+    ):
+        """The resume read gate runs before persona/history reads or destination create.
+
+        A console service token may forward the real end-user id, but its cross-tenant
+        service scope belongs to the console identity. It must not make that different
+        effective user omniscient.
+        """
+        from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        client.app.state.config_store = make_config_store()  # invariant is flag-independent
+        storage = get_storage()
+        assert storage is not None
+        storage.create_project("private-project", "Secret", "victim-user")
+        source_id = "a" * 32
+        storage.register_workstream(
+            source_id,
+            node_id="node-test",
+            name="secret-source",
+            user_id="victim-user",
+            project_id="private-project",
+        )
+        assert storage.set_workstream_alias(source_id, "secret-alias") is True
+
+        source_config_read = MagicMock(side_effect=AssertionError("private source config read"))
+        monkeypatch.setattr(storage, "load_workstream_config", source_config_read)
+        token = create_jwt(
+            user_id="console-service",
+            scopes=frozenset({"read", "write", "approve", "service"}),
+            source="console",
+            secret=_TEST_JWT_SECRET,
+            audience=JWT_AUD_SERVER,
+            permissions=frozenset({"workstreams.create"}),
+        )
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={
+                "name": "forbidden-fork",
+                "resume_ws": "secret-alias",
+                "user_id": "forwarded-user",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "Workstream not found"}
+        assert mgr.list_all() == []
+        source_config_read.assert_not_called()
+
+
+class TestCreateForkRollback:
+    """A requested fork is one create transaction at the mounted HTTP edge."""
+
+    @staticmethod
+    def _register_source(storage: Any, ws_id: str, *, with_history: bool) -> None:
+        storage.register_workstream(
+            ws_id,
+            node_id="node-test",
+            name="fork-source",
+            user_id="user-1",
+        )
+        if with_history:
+            storage.save_message(ws_id, "user", "durable source history")
+
+    @staticmethod
+    def _global_events(client: Any) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        global_queue = client.app.state.global_queue
+        while True:
+            try:
+                events.append(global_queue.get_nowait())
+            except queue.Empty:
+                return events
+
+    def test_source_disappears_after_validation_rolls_back_destination(
+        self, app_client, monkeypatch
+    ) -> None:
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        source_id = "b" * 32
+        destination_id = "c" * 32
+        self._register_source(storage, source_id, with_history=False)
+
+        original_fork = _FakeSession.fork_from_storage
+
+        def _disappear_at_pre_commit(
+            session: _FakeSession,
+            fork_source_id: str,
+            *,
+            principal_id: str,
+            source_reservation_token: str,
+            trusted_internal: bool = False,
+        ) -> Any:
+            assert fork_source_id == source_id
+            assert storage.delete_workstream(source_id) is True
+            return original_fork(
+                session,
+                fork_source_id,
+                principal_id=principal_id,
+                source_reservation_token=source_reservation_token,
+                trusted_internal=trusted_internal,
+            )
+
+        monkeypatch.setattr(_FakeSession, "fork_from_storage", _disappear_at_pre_commit)
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={
+                "ws_id": destination_id,
+                "name": "vanished-source-fork",
+                "resume_ws": source_id,
+            },
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 409
+        assert resp.json() == {"error": "Fork source is no longer available"}
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert not [
+            event
+            for event in storage.list_audit_events(action="workstream.created")
+            if event["resource_id"] == destination_id
+        ]
+        assert not {
+            event["type"]
+            for event in self._global_events(client)
+            if event.get("type") in {"ws_created", "ws_rename"}
+        }
+
+    def test_source_replacement_after_preflight_cannot_inherit_fork(
+        self,
+        app_client,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core.storage import ForkCloneExpectation, get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        source_id = "8" * 32
+        destination_id = "9" * 32
+        self._register_source(storage, source_id, with_history=True)
+        replacement_token = "replacement-source-incarnation"
+
+        def _replace_at_pre_commit(
+            session: _FakeSession,
+            fork_source_id: str,
+            *,
+            principal_id: str,
+            source_reservation_token: str,
+            trusted_internal: bool = False,
+        ) -> Any:
+            assert fork_source_id == source_id
+            assert source_reservation_token
+            assert storage.get_workstream_reservation_token(source_id) == (source_reservation_token)
+            assert storage.delete_workstream(source_id) is True
+            assert storage.register_workstream(
+                source_id,
+                user_id="user-1",
+                name="replacement-source",
+                state="idle",
+                kind="interactive",
+                fork_reservation_token=replacement_token,
+            )
+            storage.save_message(source_id, "user", "replacement must not fork")
+            destination_token = str(getattr(session, "_fork_reservation_token", ""))
+            assert destination_token
+            return storage.clone_workstream(
+                source_id,
+                session.ws_id,
+                principal_id=principal_id,
+                trusted_internal=trusted_internal,
+                expected_session=ForkCloneExpectation(
+                    persona_config=(),
+                    project_id="",
+                    project_name="",
+                    project_writable=False,
+                    destination_reservation_token=destination_token,
+                    source_reservation_token=source_reservation_token,
+                ),
+            )
+
+        monkeypatch.setattr(_FakeSession, "fork_from_storage", _replace_at_pre_commit)
+        response = client.post(
+            "/v1/api/workstreams/new",
+            json={
+                "ws_id": destination_id,
+                "name": "replaced-source-fork",
+                "resume_ws": source_id,
+            },
+            headers=_auth("user-1"),
+        )
+
+        assert response.status_code == 409
+        assert response.json() == {"error": "Fork source is no longer available"}
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        replacement = storage.get_workstream(source_id)
+        assert replacement is not None
+        assert replacement["name"] == "replacement-source"
+        assert "fork_reservation_token" not in replacement
+        assert storage.get_workstream_reservation_token(source_id) == replacement_token
+        assert [turn.text for turn in storage.load_message_turns(source_id)] == [
+            "replacement must not fork"
+        ]
+
+    def test_destination_storage_failure_rolls_back_destination(
+        self, app_client, monkeypatch
+    ) -> None:
+        from turnstone.core.storage import ForkDestinationConflictError, get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        source_id = "d" * 32
+        destination_id = "e" * 32
+        self._register_source(storage, source_id, with_history=True)
+        assert storage.load_message_turns(source_id)
+
+        fork_calls: list[tuple[str, str, bool]] = []
+
+        def _fail_fork(
+            _session: _FakeSession,
+            fork_source_id: str,
+            *,
+            principal_id: str,
+            source_reservation_token: str,
+            trusted_internal: bool = False,
+        ) -> Any:
+            fork_calls.append((fork_source_id, principal_id, trusted_internal))
+            raise ForkDestinationConflictError("destination raced")
+
+        monkeypatch.setattr(_FakeSession, "fork_from_storage", _fail_fork)
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={
+                "ws_id": destination_id,
+                "name": "failed-history-fork",
+                "resume_ws": source_id,
+            },
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 409
+        assert resp.json() == {"error": "Workstream creation was superseded"}
+        assert fork_calls == [(source_id, "user-1", False)]
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert storage.load_message_turns(source_id)
+        assert not [
+            event
+            for event in storage.list_audit_events(action="workstream.created")
+            if event["resource_id"] == destination_id
+        ]
+        assert not {
+            event["type"]
+            for event in self._global_events(client)
+            if event.get("type") in {"ws_created", "ws_rename"}
+        }
+
+    def test_caller_chosen_destination_collision_preserves_existing_row(self, app_client) -> None:
+        """An unloaded durable row is not a blank reservation for a fork.
+
+        ``register_workstream`` historically ignored a duplicate id.  That
+        made a caller-chosen id collide with an existing empty workstream,
+        after which the clone could replace its config/history and the create
+        rollback could delete it outright.  Reject the collision before either
+        mutation, even when owner and project happen to match.
+        """
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        project_id = "collision-project"
+        source_id = "8" * 32
+        destination_id = "9" * 32
+        storage.create_project(project_id, "Collision", "user-1", visibility="private")
+        storage.register_workstream(
+            source_id,
+            node_id="source-node",
+            name="source",
+            state="idle",
+            user_id="user-1",
+            project_id=project_id,
+        )
+        storage.save_message(source_id, "user", "source history")
+        storage.register_workstream(
+            destination_id,
+            node_id="original-node",
+            name="existing empty destination",
+            state="idle",
+            user_id="user-1",
+            project_id=project_id,
+        )
+        storage.save_workstream_config(destination_id, {"keep": "untouched"})
+        before = storage.get_workstream(destination_id)
+        assert before is not None
+        assert storage.load_message_turns(destination_id) == []
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={
+                "ws_id": destination_id,
+                "name": "colliding fork",
+                "resume_ws": source_id,
+            },
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 409, resp.json()
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) == before
+        assert storage.load_message_turns(destination_id) == []
+        assert storage.load_workstream_config(destination_id) == {"keep": "untouched"}
+        assert [turn.text for turn in storage.load_message_turns(source_id)] == ["source history"]
+        assert not [
+            event
+            for event in storage.list_audit_events(action="workstream.created")
+            if event["resource_id"] == destination_id
+        ]
+        assert not {
+            event["type"]
+            for event in self._global_events(client)
+            if event.get("type") in {"ws_created", "ws_rename"}
+        }
+
+    @pytest.mark.parametrize("lifecycle", ["close", "delete"])
+    def test_destination_retired_while_clone_blocked_cannot_publish_or_resurrect(
+        self,
+        app_client,
+        monkeypatch,
+        lifecycle: str,
+    ) -> None:
+        """A pending create loses ownership when its exact slot is retired."""
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        source_id = "a" * 32
+        destination_id = "b" * 32
+        self._register_source(storage, source_id, with_history=True)
+        entered_clone = threading.Event()
+        release_clone = threading.Event()
+        original_fork = _FakeSession.fork_from_storage
+
+        def _blocked_fork(
+            session: _FakeSession,
+            fork_source_id: str,
+            *,
+            principal_id: str,
+            source_reservation_token: str,
+            trusted_internal: bool = False,
+        ) -> Any:
+            entered_clone.set()
+            assert release_clone.wait(timeout=10), "test did not release clone"
+            return original_fork(
+                session,
+                fork_source_id,
+                principal_id=principal_id,
+                source_reservation_token=source_reservation_token,
+                trusted_internal=trusted_internal,
+            )
+
+        monkeypatch.setattr(_FakeSession, "fork_from_storage", _blocked_fork)
+        responses: list[Any] = []
+        request_errors: list[BaseException] = []
+
+        def _create_fork() -> None:
+            try:
+                responses.append(
+                    client.post(
+                        "/v1/api/workstreams/new",
+                        json={"ws_id": destination_id, "resume_ws": source_id},
+                        headers=_auth("user-1"),
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - diagnostic capture
+                request_errors.append(exc)
+
+        request_thread = threading.Thread(target=_create_fork, daemon=True)
+        request_thread.start()
+        assert entered_clone.wait(timeout=5), "fork request never reached clone"
+        # Deferred creates are deliberately hidden from public manager lookup
+        # until lifecycle birth; inspect the exact internal reservation to
+        # drive the terminal-race seam.
+        pending = mgr._workstreams.get(destination_id)
+        assert pending is not None
+        try:
+            if lifecycle == "close":
+                assert mgr.close(destination_id) is True
+            else:
+                assert storage.delete_workstream(destination_id) is True
+                assert mgr.delete(destination_id) is True
+        finally:
+            release_clone.set()
+        request_thread.join(timeout=10)
+
+        assert not request_thread.is_alive()
+        assert request_errors == []
+        assert len(responses) == 1
+        resp = responses[0]
+        assert resp.status_code == 409, resp.text
+        assert mgr.get(destination_id) is None
+        destination = storage.get_workstream(destination_id)
+        if lifecycle == "delete":
+            assert destination is None
+        else:
+            # The create rollback may delete this never-advertised row. If it
+            # elects to preserve the concurrent close, it must stay retired.
+            assert destination is None or destination["state"] == "closed"
+            if destination is not None:
+                assert storage.load_message_turns(destination_id) == []
+        assert [turn.text for turn in storage.load_message_turns(source_id)] == [
+            "durable source history"
+        ]
+        assert not [
+            event
+            for event in storage.list_audit_events(action="workstream.created")
+            if event["resource_id"] == destination_id
+        ]
+        events = self._global_events(client)
+        assert not {
+            event["type"] for event in events if event.get("type") in {"ws_created", "ws_rename"}
+        }
+        # The reservation never crossed lifecycle birth, so terminal cleanup
+        # is silent: neither a phantom create nor a close-without-create is
+        # observable on the global stream.
+        assert not [event for event in events if event.get("ws_id") == destination_id]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("anyio_backend", ["asyncio"])
+    async def test_cancelled_request_waits_for_clone_then_rolls_back(
+        self,
+        app_client,
+        monkeypatch,
+        anyio_backend: str,
+    ) -> None:
+        """Request cancellation cannot outrun the non-cancellable clone."""
+        import asyncio
+
+        import httpx
+
+        assert anyio_backend == "asyncio"
+        sync_client, mgr = app_client
+        storage = sync_client.app.state.auth_storage
+        assert storage is not None
+        source_id = "c" * 32
+        destination_id = "d" * 32
+        attachment_id = "e" * 64
+        self._register_source(storage, source_id, with_history=False)
+        source_row = storage.save_message(source_id, "user", "attached source")
+        storage.save_attachment(
+            attachment_id,
+            "source.txt",
+            "text/plain",
+            6,
+            "text",
+            b"source",
+        )
+        storage.set_message_attachments(source_id, source_row, [attachment_id])
+        source_attachment = storage.get_attachment(attachment_id)
+        assert source_attachment is not None and source_attachment["refcount"] == 1
+
+        entered_clone = threading.Event()
+        release_clone = threading.Event()
+        clone_finished = threading.Event()
+        original_fork = _FakeSession.fork_from_storage
+
+        def _blocked_fork(
+            session: _FakeSession,
+            fork_source_id: str,
+            *,
+            principal_id: str,
+            source_reservation_token: str,
+            trusted_internal: bool = False,
+        ) -> Any:
+            entered_clone.set()
+            assert release_clone.wait(timeout=10), "test did not release clone"
+            try:
+                return original_fork(
+                    session,
+                    fork_source_id,
+                    principal_id=principal_id,
+                    source_reservation_token=source_reservation_token,
+                    trusted_internal=trusted_internal,
+                )
+            finally:
+                clone_finished.set()
+
+        monkeypatch.setattr(_FakeSession, "fork_from_storage", _blocked_fork)
+        transport = httpx.ASGITransport(app=sync_client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    "/v1/api/workstreams/new",
+                    json={"ws_id": destination_id, "resume_ws": source_id},
+                    headers=_auth("user-1"),
+                )
+            )
+            for _ in range(500):
+                if entered_clone.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert entered_clone.is_set(), "fork request never reached clone"
+            request_task.cancel()
+            try:
+                await asyncio.sleep(0.05)
+                assert not request_task.done()
+                assert not clone_finished.is_set()
+            finally:
+                release_clone.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+
+        assert clone_finished.is_set()
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert [turn.text for turn in storage.load_message_turns(source_id)] == ["attached source"]
+        attachment = storage.get_attachment(attachment_id)
+        assert attachment is not None and attachment["refcount"] == 1
+        assert not [
+            event
+            for event in storage.list_audit_events(action="workstream.created")
+            if event["resource_id"] == destination_id
+        ]
+        assert not {
+            event["type"]
+            for event in self._global_events(sync_client)
+            if event.get("type") in {"ws_created", "ws_rename"}
+        }
+
+    def test_source_project_deleted_after_preflight_is_uniform_409(
+        self, app_client, monkeypatch
+    ) -> None:
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        storage.create_project("fork-project", "Fork", "user-1", visibility="public")
+        source_id = "6" * 32
+        destination_id = "7" * 32
+        storage.register_workstream(
+            source_id,
+            node_id="node-test",
+            name="project-source",
+            user_id="user-1",
+            project_id="fork-project",
+        )
+        original_fork = _FakeSession.fork_from_storage
+
+        def _delete_project_at_pre_commit(
+            session: _FakeSession,
+            fork_source_id: str,
+            *,
+            principal_id: str,
+            source_reservation_token: str,
+            trusted_internal: bool = False,
+        ) -> Any:
+            assert storage.delete_project("fork-project") is True
+            return original_fork(
+                session,
+                fork_source_id,
+                principal_id=principal_id,
+                source_reservation_token=source_reservation_token,
+                trusted_internal=trusted_internal,
+            )
+
+        monkeypatch.setattr(_FakeSession, "fork_from_storage", _delete_project_at_pre_commit)
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"ws_id": destination_id, "resume_ws": source_id},
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 409
+        assert resp.json() == {"error": "Fork source is no longer available"}
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert storage.get_workstream(source_id) is not None
+        assert not [
+            event
+            for event in storage.list_audit_events(action="workstream.created")
+            if event["resource_id"] == destination_id
+        ]
+        assert not {
+            event["type"]
+            for event in self._global_events(client)
+            if event.get("type") in {"ws_created", "ws_rename"}
+        }
+
+    def test_empty_source_is_successful_fork(self, app_client) -> None:
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        source_id = "f" * 32
+        destination_id = "1" * 32
+        self._register_source(storage, source_id, with_history=False)
+        assert storage.load_message_turns(source_id) == []
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={
+                "ws_id": destination_id,
+                "name": "empty-source-fork",
+                "resume_ws": source_id,
+            },
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["resumed"] is True
+        assert resp.json()["message_count"] == 0
+        destination = mgr.get(destination_id)
+        assert destination is not None
+        assert destination.session is not None
+        assert destination.session.fork_calls == [(source_id, "user-1", False)]
+        assert {event["type"] for event in destination.ui._enqueued} >= {"clear_ui"}
+        assert storage.get_workstream(destination_id) is not None
+        events = self._global_events(client)
+        assert [event["type"] for event in events if event.get("type") == "ws_created"] == [
+            "ws_created"
+        ]
+        assert [event["type"] for event in events if event.get("type") == "ws_rename"] == [
+            "ws_rename"
+        ]
+
+    def test_nonempty_source_commits_before_publication(self, app_client) -> None:
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        source_id = "2" * 32
+        destination_id = "3" * 32
+        self._register_source(storage, source_id, with_history=True)
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={
+                "ws_id": destination_id,
+                "name": "copied-history-fork",
+                "resume_ws": source_id,
+            },
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 200, resp.json()
+        assert resp.json()["resumed"] is True
+        assert resp.json()["message_count"] == 1
+        assert [turn.text for turn in storage.load_message_turns(destination_id)] == [
+            "durable source history"
+        ]
+        destination = mgr.get(destination_id)
+        assert destination is not None and destination.session is not None
+        assert [turn.text for turn in destination.session.messages] == ["durable source history"]
+        assert destination.session.fork_calls == [(source_id, "user-1", False)]
+        created = [
+            event
+            for event in storage.list_audit_events(action="workstream.created")
+            if event["resource_id"] == destination_id
+        ]
+        assert len(created) == 1
+
+    def test_successful_fork_still_dispatches_initial_message(self, app_client) -> None:
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        storage = get_storage()
+        assert storage is not None
+        source_id = "4" * 32
+        destination_id = "5" * 32
+        self._register_source(storage, source_id, with_history=False)
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={
+                "ws_id": destination_id,
+                "resume_ws": source_id,
+                "initial_message": "continue from the fork",
+            },
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 200, resp.json()
+        assert resp.json()["resumed"] is True
+        destination = mgr.get(destination_id)
+        assert destination is not None and destination.session is not None
+        assert destination.worker_thread is not None
+        destination.worker_thread.join(timeout=5)
+        assert not destination.worker_thread.is_alive()
+        assert destination.session.sends == [("continue from the fork", None, None)]

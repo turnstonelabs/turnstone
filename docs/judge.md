@@ -17,7 +17,9 @@ evaluation:
    read-only tool access. Runs on a daemon thread and delivers its verdict
    progressively.
 
-The verdict is purely advisory -- the user always makes the final decision.
+The verdict is advisory by default. The opt-in Smart Approvals mode can use a
+completed, high-confidence LLM `approve` verdict to make the decision
+automatically under the fail-closed rules below.
 
 The heuristic verdict is attached to the `approve_request` SSE event immediately.
 The LLM verdict arrives later via an `intent_verdict` SSE event, allowing the
@@ -40,27 +42,41 @@ api_key = ""
 smart_approvals = false       # auto-approve high-confidence "approve" LLM verdicts (opt-in)
 confidence_threshold = 0.95   # Smart Approvals auto-approve bar (LLM recommendation=approve)
 max_context_ratio = 0.5       # max % of judge context window for history
-timeout = 120.0               # seconds (generous for local models)
+timeout = 120.0               # per judge turn; also caps the Smart Approvals wait
 read_only_tools = true        # judge can use read_file/list_directory
 cancel_on_approval = false    # stop judging remaining tool calls once user decides
 ```
 
 ### Smart Approvals
 
-With `smart_approvals = true` (off by default) a tool call is approved
-automatically — no operator prompt — when the intent judge's **LLM** verdict
-recommends `approve` with confidence at or above `confidence_threshold`. Every
-other outcome still reaches a human: `review` / `deny` recommendations,
-confidence below the threshold, judge errors or timeouts (`llm_fallback`), and
-any call the deterministic heuristic rules explicitly flagged `deny` or
-`critical`. That heuristic floor blocks only those explicit danger verdicts — it
-is **not** a general "never lower the heuristic" rule: the heuristic's default
-for an unmatched tool is `review`, and letting a confident LLM `approve` upgrade
-a `review` is exactly what Smart Approvals is for. Only `deny` / `critical`
-findings are off-limits to auto-approval. Requires the judge to be enabled;
-auto-approved calls are tagged `smart_approval` in the dashboard and audit trail.
-Smart Approvals applies to the web and coordinator surfaces, not the interactive
-CLI.
+With `smart_approvals = true` (off by default), a pending batch is approved
+automatically — no operator prompt — only when **every** call has a completed
+LLM verdict recommending `approve` at or above `confidence_threshold`. The
+decision is batch-atomic: one uncertain sibling sends the entire parallel batch
+to a human rather than executing the safe-looking subset piecemeal.
+
+Every other outcome reaches a human: `review` / `deny` recommendations,
+confidence below the threshold, judge errors or timeouts (`llm_fallback`), a
+missing/duplicate call ID, an unjudged sibling, and any call the deterministic
+heuristic rules explicitly flagged `deny` or `critical`. That heuristic floor
+blocks only explicit danger verdicts — it is **not** a general "never lower the
+heuristic" rule. The heuristic's default for an unmatched tool is `review`, and
+letting a confident LLM upgrade that default is the feature's purpose.
+
+The Smart Approvals enabled flag, threshold, and bounded verdict wait are
+captured as one immutable snapshot when each gate batch starts. A settings
+reload takes effect on the next batch, while concurrent main-loop and
+task-agent gates cannot mix fields from different reload generations. Stop
+wakes a batch still waiting for verdicts and is linearized against the final
+auto-approval commit: if Stop wins, no `smart_approval` decision or audit row
+is recorded for tools that did not cross the gate.
+
+The verdict wait is capped by the snapshot's `judge.timeout`; the judge may
+continue evaluating advisory verdicts after that gate falls back to a human.
+
+Requires the judge to be enabled. Auto-approved calls are tagged
+`smart_approval` in the dashboard and audit trail. Smart Approvals applies to
+the web and coordinator surfaces, not the interactive CLI.
 
 All fields are optional. The judge is enabled by default; use `enabled = false`
 (or `--no-judge` on the command line) to disable it.
@@ -235,14 +251,15 @@ calls for approval, it calls `_evaluate_intent()` which:
 The daemon evaluates items sequentially, so a large parallel batch can outlive
 its approval gate. With `cancel_on_approval = false` (the default) the daemon
 runs every item to completion: verdicts that land after the operator decided
-still stream to the UI and persist, stamped with the decision. The daemon is
-aborted only when the next tool batch supersedes it or the session closes —
-then each unfinished item degrades to an `llm_fallback` verdict. With
-`cancel_on_approval = true` the abort additionally fires the moment the gate
-resolves, trading verdict completeness for inference savings — recommended
-when the judge shares a single local inference backend with the session model,
-where a large batch's remaining judge calls would otherwise compete with the
-next turn's completion.
+still stream to the UI and persist, stamped with the decision. A newer main-loop
+batch, session close, or explicit Stop retires the old generation; unfinished
+items degrade to `llm_fallback` verdicts. A judge/model binding edit prevents
+reuse on the next batch, while already-started calls stay pinned to the binding
+they began with. With `cancel_on_approval = true`, an ordinary gate decision
+additionally aborts the remainder immediately, trading verdict completeness
+for inference savings — recommended when the judge shares a single local
+inference backend with the session model. Explicit Stop always cancels every
+live judge generation, regardless of this preference.
 
 Verdicts that arrive after a *newer batch* has replaced the judge generation
 are withheld from the live surfaces (a reused call_id must never ride a stale
@@ -257,6 +274,15 @@ Agent-gate generations never occupy the main loop's supersede slot (parallel
 siblings would otherwise make each other's verdicts look stale); per-cycle
 generation checks enforce staleness instead, and `judge.cancel_on_approval`
 fires per gate exactly like the main loop.
+
+Several parallel task agents can therefore leave several approval cycles live
+on one workstream. Each cycle owns its event, result, verdict set, and
+`cycle_id`; a decision targets exactly one cycle by `cycle_id` or member
+`call_id` (selector-less legacy clients resolve the oldest). Workstream Stop or
+close performs a workstream-wide denial sweep over all cycles belonging to the
+cancelled operation. A force-cancel successor's newly registered cycle carries
+a fresh operation witness and is not accidentally denied by the predecessor's
+late sweep.
 
 ---
 

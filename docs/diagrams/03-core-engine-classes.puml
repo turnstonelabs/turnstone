@@ -32,7 +32,7 @@ class "TerminalUI" as TerminalUI {
 class "WorkstreamTerminalUI" as WsTermUI {
     - _output_buffer: list[tuple]
     - ws_id: str
-    - manager: WorkstreamManager
+    - manager: SessionManager
     + flush_buffer()
     --
     Buffers output when workstream
@@ -41,14 +41,14 @@ class "WorkstreamTerminalUI" as WsTermUI {
 
 class "WebUI" as WebUI {
     - _listeners: list[Queue]
-    - _approval_event: Event
+    - _approval_cycles: dict[str, ApprovalCycle]
     - _ws_prompt_tokens: int
     - _ws_tool_calls: dict
-    + resolve_approval(approved, feedback)
+    + resolve_approval(approved, feedback, cycle_id?, call_id?)
     --
     Enqueues JSON events for SSE.
-    Blocks on threading.Event for
-    approval.
+    Concurrent approval cycles each own
+    a threading.Event and result slot.
     SSE handlers bridge Queue to
     async via run_in_executor().
     --
@@ -126,25 +126,75 @@ class "ModelCapabilities" as ModelCaps <<frozen>> {
     + supports_reasoning_replay: bool
 }
 
+class "ModelLane" as ModelLane <<frozen>> {
+    + provider: LLMProvider
+    + client: Any
+    + model: str
+    + alias: str
+    + capabilities: ModelCapabilities
+    + extra_params: dict | None
+    + registry: ModelRegistry | None
+    + backend_auth_config: ModelConfig | None
+    + backend_auth_resolver: Callable | None
+}
+
+class "ResolvedModelBinding" as ResolvedBinding <<frozen>> {
+    + lane: ModelLane
+    + config: ModelConfig | None
+    + registry_generation: int
+}
+
+class "ModelTurnResult" as ModelTurnResult <<frozen>> {
+    + turn: Turn
+    + tool_calls: list[dict]
+    + finish_reason: str
+    + usage: UsageInfo | None
+    + wire_msgs: list[dict] | None
+    + producer: str
+    + serving_model: str
+}
+
+class "model_turn()" as ModelTurnFn {
+    Turn IR → lower → provider stream
+    → drain → canonical assistant Turn
+    --
+    core/model_turn.py
+}
+
+class "Backend auth resolver" as BackendAuth {
+    + resolve_model_backend_auth_token(...)
+    --
+    Resolves static / Entra OBO /
+    Entra app / RFC 8693 per call.
+    Dynamic failure can fail closed.
+    --
+    core/model_backend_auth.py
+}
+
 ' ChatSession
 class "ChatSession" as ChatSession {
-    - client: Any
-    - provider: LLMProvider
-    - model: str
+    - _model_binding: ResolvedModelBinding
+    - _model_binding_lock: Lock
     - ui: SessionUI
-    - messages: list[dict]
+    - messages: list[Turn]
     - _msg_tokens: list[int]
     - _ws_id: str
     - _mcp_client: MCPClientManager | None
     - _tool_search: ToolSearchManager | None
     - _registry: ModelRegistry | None
+    - _generation: int
+    - _cancel_event: Event
+    - _durability_next_ticket: int
     + model_alias: str | None {property}
     - _tools: list[dict]
     - _task_tools: list[dict]
     - _read_files: set[str]
     - system_messages: list[dict]
     --
-    + send(user_input: str)
+    + send(user_input: str, ..., acting_user_id: str | None)
+    + cancel()
+    + compact_now() → bool
+    + fork_from_storage(source_ws_id, principal_id, ...)
     + handle_command(command: str)
     + resume(ws_id: str)
     - _save_config()
@@ -162,8 +212,10 @@ class "ChatSession" as ChatSession {
     - _rebuild_tool_search()
     + close()
     - _run_agent(messages, tools, ...) → str
-    - _compact_messages(auto: bool)
-    - _full_messages() → list[dict]
+    - _compact_messages(auto: bool, my_generation: int)
+    - _commit_for_generation(generation, commit)
+    - _publish_for_generation(generation, publish)
+    - _full_messages() → list[Turn]
     - _update_token_table(msg)
     - _emit_state(state: str)
     - _generate_title()
@@ -180,15 +232,36 @@ class "HeadlessSession" as HeadlessSession {
     records all tool calls
 }
 
-' WorkstreamManager
-class "WorkstreamManager" as WsMgr {
-    - _session_factory: Callable[[SessionUI], ChatSession]
+' SessionManager
+interface "SessionKindAdapter" as KindAdapter <<Protocol>> {
+    + kind: WorkstreamKind
+    + build_ui(ws) → SessionUI
+    + build_session(ws, ...) → ChatSession
+    + cleanup_ui(ws)
+}
+
+interface "SessionEventEmitter" as EventEmitter <<Protocol>> {
+    + emit_created(ws)
+    + emit_rehydrated(ws)
+    + emit_state(ws, state)
+    + emit_closed(ws_id, reason, name)
+}
+
+class "SessionManager" as SessionMgr {
+    - _adapter: SessionKindAdapter
+    - _storage: StorageBackend
     - _workstreams: dict[str, Workstream]
+    - _pending_creates: dict[str, Workstream]
+    - _retiring_ids: set[str]
+    - _state_writer: StateWriter | None
     - _order: list[str]
     - _active_id: str
-    - _on_state_change: Callable
     --
-    + create(name, ui_factory) → Workstream
+    + create(user_id, name, ..., defer_emit_created) → Workstream
+    + commit_create(ws) → bool
+    + discard(ws, ...) → bool
+    + open(ws_id) → Workstream | None
+    + delete(ws_id) → bool
     + close(ws_id)
     + get(ws_id) → Workstream
     + get_active() → Workstream
@@ -203,11 +276,17 @@ class "Workstream" as Ws <<dataclass>> {
     + id: str
     + name: str
     + state: WorkstreamState
-    + session: ChatSession
-    + ui: SessionUI
-    + worker_thread: Thread
+    + session: ChatSession | None
+    + ui: SessionUI | None
+    + worker_thread: Thread | None
     + error_message: str
     + last_active: float
+    + kind: WorkstreamKind
+    + user_id: str
+    + parent_ws_id: str | None
+    + project_id: str | None
+    - _fork_reservation_token: str
+    - _closed: bool
     - _lock: Lock
 }
 
@@ -283,7 +362,7 @@ class "ModelRegistry" as ModelReg {
     + fallback: list[str]
     + agent_model: str | None
     --
-    + resolve(alias) → (client, model, config)
+    + resolve_binding(alias) → (client, model, config, provider, generation)
     + get_client(alias) → Any
     + get_provider(alias) → LLMProvider
     + has_alias(alias) → bool
@@ -306,6 +385,9 @@ class "ModelConfig" as ModelCfg <<frozen>> {
     + temperature: float | None
     + max_tokens: int | None
     + reasoning_effort: str | None
+    + auth_mode: str
+    + obo_audience: str
+    + obo_scopes: str
 }
 
 ' Circuit breaker state
@@ -375,22 +457,33 @@ LLMProvider <|.. AnthropicProv
 OpenAIProv <|-- GoogleProv
 
 ChatSession --> SessionUI : uses
-ChatSession --> LLMProvider : delegates LLM calls
+ChatSession --> ResolvedBinding : owns coherent snapshot
+ChatSession --> ModelTurnFn : every model-backed role
 ChatSession --> MCPMgr : optional
 ChatSession --o ToolSearchMgr : _tool_search
 ChatSession --> ModelReg : optional
 ChatSession <|-- HeadlessSession
 
-WsMgr --> "*" Ws : manages
+SessionMgr --> "*" Ws : manages
+SessionMgr --> KindAdapter : delegates construction
+SessionMgr --> EventEmitter : lifecycle fan-out
 Ws --> "1" ChatSession : wraps
 Ws --> "1" SessionUI : wraps
 Ws --> "1" WsState : has
 
-WsMgr ..> ChatSession : creates via\nsession_factory(ui, model_alias)
+KindAdapter ..> ChatSession : constructs
 
 ModelReg --> "*" ModelCfg : holds
 ModelReg --> "*" LLMProvider : caches
 LLMProvider --> ModelCaps : returns
+ModelReg --> ResolvedBinding : resolves atomically
+ResolvedBinding --> ModelLane
+ModelLane --> LLMProvider
+ModelLane --> ModelCaps
+ModelLane --> ModelCfg : auth/config snapshot
+ModelTurnFn --> ModelLane
+ModelTurnFn --> ModelTurnResult
+ModelTurnFn ..> BackendAuth : per-call resolver
 
 ChatSession --> HealthMon : checks circuit
 HealthMon --> "1" CircuitState : has
@@ -403,7 +496,9 @@ note bottom of ChatSession
   Provider-agnostic — delegates all LLM
   communication to LLMProvider adapters.
 
-  core/session.py (~2700 lines)
+  Every live/durable publication is fenced by
+  its generation. Model calls use immutable lanes;
+  provider-wire mutation stays at lowering.
 end note
 
 @enduml

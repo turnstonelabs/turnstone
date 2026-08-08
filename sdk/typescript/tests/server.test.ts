@@ -58,11 +58,21 @@ describe("TurnstoneServer", () => {
       baseUrl: "http://test",
       fetch: fetchFn,
     });
-    const resp = await client.createWorkstream({ name: "Analysis" });
+    const resp = await client.createWorkstream({
+      name: "Analysis",
+      judge_model: "judge-fast",
+      client_type: "scheduled",
+      notify_targets: [{ channel_type: "slack", channel_id: "C123" }],
+    });
     expect(resp.ws_id).toBe("ws_new");
 
     const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(JSON.parse(init.body)).toEqual({ name: "Analysis" });
+    expect(JSON.parse(init.body)).toEqual({
+      name: "Analysis",
+      judge_model: "judge-fast",
+      client_type: "scheduled",
+      notify_targets: [{ channel_type: "slack", channel_id: "C123" }],
+    });
   });
 
   it("send posts correct payload", async () => {
@@ -76,6 +86,45 @@ describe("TurnstoneServer", () => {
     const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(url).toBe("http://test/v1/api/workstreams/ws1/send");
     expect(JSON.parse(init.body)).toEqual({ message: "Hello" });
+  });
+
+  it("approve selects a cycle without duplicating ws_id in the body", async () => {
+    const fetchFn = mockFetch({ status: "ok", cycle_id: "cycle-1" });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+    const response = await client.approve({
+      wsId: "ws1",
+      approved: false,
+      cycleId: "cycle-1",
+      callId: "call-1",
+    });
+
+    const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe("http://test/v1/api/workstreams/ws1/approve");
+    expect(JSON.parse(init.body)).toEqual({
+      approved: false,
+      cycle_id: "cycle-1",
+      call_id: "call-1",
+    });
+    expect(response.cycle_id).toBe("cycle-1");
+  });
+
+  it("cancel preserves the dropped-work snapshot", async () => {
+    const fetchFn = mockFetch({
+      status: "cancelled",
+      dropped: { tool_calls: ["call-1"] },
+    });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+    const response = await client.cancel("ws1", { force: true });
+
+    const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ force: true });
+    expect(response.dropped).toEqual({ tool_calls: ["call-1"] });
   });
 
   it("injects auth header when token provided", async () => {

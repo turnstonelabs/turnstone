@@ -176,6 +176,92 @@ def test_helper_preserves_object_identity(storage: SQLiteBackend) -> None:
     assert id(state.coord_registry) == before
 
 
+def test_concurrent_refresh_cannot_install_older_snapshot_last(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The strict load and in-place reload form one serialized operation.
+
+    The first caller captures an older snapshot and pauses inside the loader.
+    The second caller represents a later committed CRUD write.  It must block
+    before loading until the first install completes, then install the newer
+    snapshot last.  Without the outer refresh lock, the second reload wins
+    temporarily and the released first caller rolls the registry backward.
+    """
+    from turnstone.console import server as server_module
+
+    class _TrackingLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._attempt_guard = threading.Lock()
+            self._attempts = 0
+            self.second_attempted = threading.Event()
+
+        def __enter__(self) -> _TrackingLock:
+            with self._attempt_guard:
+                self._attempts += 1
+                if self._attempts == 2:
+                    self.second_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self._lock.release()
+
+    tracking_lock = _TrackingLock()
+    monkeypatch.setattr(server_module, "_COORD_REGISTRY_REFRESH_LOCK", tracking_lock)
+
+    first_load_entered = threading.Event()
+    release_first_load = threading.Event()
+    second_load_entered = threading.Event()
+    call_guard = threading.Lock()
+    call_count = 0
+
+    def _load_snapshot(**_kwargs: Any) -> ModelRegistry:
+        nonlocal call_count
+        with call_guard:
+            call_count += 1
+            call_number = call_count
+        if call_number == 1:
+            first_load_entered.set()
+            assert release_first_load.wait(timeout=5), "test did not release older snapshot"
+            return _make_registry(alias="local", model="older-snapshot")
+        second_load_entered.set()
+        return _make_registry(alias="local", model="newer-snapshot")
+
+    monkeypatch.setattr("turnstone.core.model_registry.load_model_registry", _load_snapshot)
+    state = SimpleNamespace(
+        coord_registry=_make_registry(alias="local", model="initial"),
+        coord_registry_error="",
+    )
+    errors: list[BaseException] = []
+
+    def _run_refresh() -> None:
+        try:
+            server_module._refresh_coord_registry(state, storage)
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            errors.append(exc)
+
+    older = threading.Thread(target=_run_refresh, daemon=True)
+    newer = threading.Thread(target=_run_refresh, daemon=True)
+    older.start()
+    assert first_load_entered.wait(timeout=5), "older refresh never reached loader"
+    newer.start()
+    second_attempted = tracking_lock.second_attempted.wait(timeout=5)
+    loaded_while_older_blocked = second_load_entered.is_set()
+    release_first_load.set()
+    older.join(timeout=5)
+    newer.join(timeout=5)
+
+    assert second_attempted, "newer refresh never attempted the serialization lock"
+    assert not loaded_while_older_blocked
+    assert not older.is_alive()
+    assert not newer.is_alive()
+    assert errors == []
+    assert call_count == 2
+    assert state.coord_registry.get_config("local").model == "newer-snapshot"
+
+
 def test_helper_noop_when_coord_registry_none(storage: SQLiteBackend) -> None:
     """Console boot with no model rows leaves coord_registry = None.
     The helper must not 500 in that state — CRUD that lands the FIRST

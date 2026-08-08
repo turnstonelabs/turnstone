@@ -7,9 +7,11 @@ knowing provider-specific details.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.streaming_text import (
     partial_tag_tail,
     split_inline_reasoning,
@@ -40,6 +42,30 @@ class UsageInfo:
     # Prompt caching metrics (provider-specific; 0 when not available)
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRequestMetrics:
+    """Non-sensitive prompt-shape metrics from one prepared provider request.
+
+    Adapters record these only after their provider-native tool conversion is
+    complete.  Payloads, headers, and credentials never leave the adapter.
+    """
+
+    serialized_tool_chars: int = 0
+
+
+def serialized_tool_chars(tools: Any) -> int:
+    """Deterministic semantic character count for provider-native tools."""
+    if not isinstance(tools, list):
+        return 0
+    return sum(len(json.dumps(tool, ensure_ascii=False, separators=(",", ":"))) for tool in tools)
+
+
+def refuse_aborted_request(cancel_ref: Any) -> None:
+    """Re-check cancellation after provider-side request preparation."""
+    if getattr(cancel_ref, "aborted", False):
+        raise DeadlineCancelledError("cancel_ref aborted before dispatch")
 
 
 @dataclass
@@ -875,6 +901,7 @@ class LLMProvider(Protocol):
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
+        request_metrics_ref: list[ProviderRequestMetrics] | None = None,
     ) -> Iterator[StreamChunk]:
         """Create a streaming request, yielding normalized StreamChunks.
 

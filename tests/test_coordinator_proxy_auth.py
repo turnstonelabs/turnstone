@@ -52,6 +52,31 @@ def test_console_proxy_uses_console_proxy_source_by_default():
     assert "coord_ws_id" not in payload
 
 
+def test_console_service_source_is_preserved_for_trusted_forwarding():
+    """Only the console service identity may retain ``src=console``."""
+    auth = AuthResult(
+        user_id="console-service",
+        scopes=frozenset({"read", "write", "service"}),
+        token_source="console",
+        permissions=frozenset({"workstreams.create"}),
+    )
+    payload = _decode(_proxy_auth_headers(_build_request(auth)))
+    assert payload["src"] == "console"
+    assert set(payload["scopes"].split(",")) == {"read", "write", "service"}
+
+
+def test_unscoped_console_claim_is_demoted_to_console_proxy():
+    """An ordinary principal cannot gain owner-override trust through ``src``."""
+    auth = AuthResult(
+        user_id="ordinary-user",
+        scopes=frozenset({"read", "write"}),
+        token_source="console",
+        permissions=frozenset({"workstreams.create"}),
+    )
+    payload = _decode(_proxy_auth_headers(_build_request(auth)))
+    assert payload["src"] == "console-proxy"
+
+
 def test_coordinator_source_is_preserved_on_remint():
     """Inbound src='coordinator' → outbound src='coordinator'."""
     auth = AuthResult(

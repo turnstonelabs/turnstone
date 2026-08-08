@@ -134,6 +134,15 @@ delegated-mode rows and memo entries. `entra_app` rows belong to the shared
 revocation, an already-minted app bearer remains usable until its recorded
 expiry.
 
+Each model call resolves its dynamic credential against the immutable model
+definition snapshot that supplied that call's provider, client, endpoint, and
+model ID. An admin edit can therefore never pair an old `base_url` with a new
+audience, grant mode, or static-key fallback input. The principal and token
+remain per-call/live; the connection and model-owned auth configuration move
+together as one binding on the next operation. The deployment-wide
+`model.auth_fail_closed` switch is intentionally read live on every mint, so an
+operator can tighten fallback policy immediately without rebuilding sessions.
+
 `obo_audience` and `obo_scopes` are literal and capped at 2048 characters
 each. Environment-variable expansion is deliberately not applied, so the
 allow-list decision cannot vary by node or expand beyond the persisted
@@ -217,7 +226,7 @@ initialization:
 | `mcp` | config_path, registry_url |
 | `ratelimit` | enabled, requests_per_second, burst, trusted_proxies |
 | `health` | backend_probe_interval, backend_probe_timeout, circuit_breaker_threshold, circuit_breaker_cooldown |
-| `judge` | enabled, model, provider, base_url, api_key, confidence_threshold, max_context_ratio, timeout, read_only_tools, output_guard, redact_secrets, cancel_on_approval |
+| `judge` | enabled, model, provider, base_url, api_key, smart_approvals, confidence_threshold, max_context_ratio, timeout, read_only_tools, output_guard, redact_secrets, cancel_on_approval |
 | `interface` | close_tab_action, theme |
 | `skills` | discovery_url |
 | `memory` | relevance_k, fetch_limit, max_content, nudge_cooldown, nudges |
@@ -421,9 +430,36 @@ reload.
 **Behavior after reload:**
 
 - New workstreams pick up updated values immediately (via `session_factory`)
-- Existing sessions keep their frozen configuration (settings are captured at
-  workstream creation time, not read on every turn)
+- Most workstream/session settings remain the snapshot captured at creation or
+  resume. Component docs call out deliberate live-read exceptions; for
+  example, Smart Approval settings are snapshotted coherently at the start of
+  each approval batch.
 - Settings marked `restart_required=True` need a server restart to take effect
+
+### Model-definition reloads
+
+The Models tab has a separate live-reload contract from ordinary ConfigStore
+settings. Existing sessions remember the concrete registry generation that
+supplied their active alias and re-resolve that alias at the start of the next
+send. Endpoint, provider, backend model ID, capabilities, extra parameters, and
+backend-auth configuration are replaced as one immutable binding. In-flight
+turns, judges, and task agents finish or cancel against the binding they
+started with; an admin edit never tears one request across two definitions.
+
+Sampling and other saved workstream configuration remain workstream state. A
+model-definition edit does not silently rewrite a live workstream's chosen
+temperature, reasoning effort, max tokens, skill, or persona. Use
+`/model <alias>` (or create/fork a workstream) when an explicit session-level
+model switch is intended.
+
+If a live workstream's alias is deleted, its next send first attempts the
+configured fallback chain. Without a usable fallback, the operator-facing
+error names the removed alias and points interactive users to `/model`; adding
+the alias back causes the next send to rebind without a process restart. If a
+replacement client cannot be constructed, Turnstone logs one
+`session.model_refresh_client_construction_failed` warning per registry
+generation and retries only after another model reload, avoiding a rebuild
+storm on every send.
 
 ---
 

@@ -10,7 +10,10 @@ from unittest.mock import MagicMock
 from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core import fence
+from turnstone.core.deadline import DeadlineExceededError
 from turnstone.core.judge import JudgeConfig
+from turnstone.core.model_registry import ModelConfig
+from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
 from turnstone.core.output_guard_judge import (
     _SYSTEM_PROMPT,
     OutputGuardJudge,
@@ -18,6 +21,26 @@ from turnstone.core.output_guard_judge import (
     _extract_json,
 )
 from turnstone.core.providers._protocol import ModelCapabilities
+
+
+class _VersionedConfigStore:
+    def __init__(self, temperature: float, reasoning_effort: str) -> None:
+        self.version = 0
+        self._values: dict[str, Any] = {
+            "model.temperature": temperature,
+            "model.reasoning_effort": reasoning_effort,
+        }
+
+    def get(self, key: str) -> Any:
+        return self._values.get(key)
+
+    def set_sampling(self, temperature: float, reasoning_effort: str) -> None:
+        self._values = {
+            **self._values,
+            "model.temperature": temperature,
+            "model.reasoning_effort": reasoning_effort,
+        }
+        self.version += 1
 
 
 def _make_provider(
@@ -44,6 +67,36 @@ def _make_provider(
     return provider
 
 
+def _binding(
+    provider: Any,
+    client: Any,
+    model: str,
+    *,
+    capabilities: ModelCapabilities | None = None,
+    registry: Any | None = None,
+    alias: str = "",
+    config: Any | None = None,
+    generation: int = 0,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
+) -> ResolvedModelBinding:
+    caps = capabilities or provider.get_capabilities(model)
+    return ResolvedModelBinding(
+        lane=ModelLane(
+            provider=provider,
+            client=client,
+            model=model,
+            alias=alias,
+            capabilities=caps,
+            registry=registry,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+        ),
+        config=config,
+        registry_generation=generation,
+    )
+
+
 def _make_judge(
     *,
     content: str = "",
@@ -63,9 +116,7 @@ def _make_judge(
     client.api_key = "test-key"
     judge = OutputGuardJudge(
         config=config,
-        session_provider=provider,
-        session_client=client,
-        session_model="test-model",
+        session_binding=_binding(provider, client, "test-model"),
     )
     judge._create_client = lambda: client  # type: ignore[method-assign]
     return judge
@@ -97,10 +148,7 @@ class TestCapabilityThreading:
         client = MagicMock(base_url="http://s", api_key="k")
         judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True),  # no alias → fallback
-            session_provider=provider,
-            session_client=client,
-            session_model="m",
-            session_capabilities=sess_caps,
+            session_binding=_binding(provider, client, "m", capabilities=sess_caps),
         )
         judge._create_client = lambda: client  # type: ignore[method-assign]
         assert judge._capabilities is sess_caps
@@ -127,13 +175,17 @@ class TestCapabilityThreading:
         # the config itself rather than taking resolve_binding()'s copy.
         registry.get_config.return_value = cfg
         client = MagicMock(base_url="http://s", api_key="k")
+        session_provider = _make_provider()
         judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True, output_guard_model="og"),
-            session_provider=_make_provider(),
-            session_client=client,
-            session_model="m",
-            session_capabilities=ModelCapabilities(context_window=100_000),
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                client,
+                "m",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
         )
         judge._create_client = lambda: client  # type: ignore[method-assign]
         assert judge._capabilities.supports_tools is False  # operator override applied
@@ -301,6 +353,27 @@ class TestEvaluateFailurePaths:
         # Cancel should return promptly, well below the 10s timeout.
         assert elapsed < 2.0, f"cancel returned in {elapsed:.2f}s, expected < 2.0s"
 
+    def test_pre_set_cancel_skips_client_auth_and_provider(self) -> None:
+        """An already-abandoned evaluation spends no connection or credential work."""
+        judge = _make_judge(content='{"risk_level":"medium"}')
+        create_client = MagicMock()
+        judge._create_client = create_client  # type: ignore[method-assign]
+        resolver = MagicMock(return_value="unused-token")
+        cancel = threading.Event()
+        cancel.set()
+
+        verdict = judge.evaluate(
+            "payload",
+            call_id="c1",
+            cancel_event=cancel,
+            backend_auth_resolver=resolver,
+        )
+
+        assert not verdict.succeeded
+        assert verdict.error == "cancelled"
+        create_client.assert_not_called()
+        resolver.assert_not_called()
+
     def test_timeout_leaves_no_nondaemon_straggler(self) -> None:
         # Regression: evaluate() abandons a slow upstream call on timeout, but
         # the worker must be a *daemon* so it can never pin interpreter exit.
@@ -365,12 +438,13 @@ class TestOversizeGuard:
         )
         judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True),  # no output_guard_model
-            session_provider=provider,
-            session_client=MagicMock(base_url="http://test", api_key="k"),
-            session_model="test-model",
-            # The session's real window rides in the resolved caps the caller
-            # passes; the guard must key off it, not provider.get_capabilities().
-            session_capabilities=ModelCapabilities(context_window=40_000),
+            session_binding=_binding(
+                provider,
+                MagicMock(base_url="http://test", api_key="k"),
+                "test-model",
+                # The session's real window rides in its resolved binding.
+                capabilities=ModelCapabilities(context_window=40_000),
+            ),
         )
         assert judge._judge_context_window == 40_000
 
@@ -391,22 +465,30 @@ class TestOversizeGuard:
             _make_provider(),
             0,
         )
+        session_provider = _make_provider()
         alias_judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True, output_guard_model="og"),
-            session_provider=_make_provider(),
-            session_client=MagicMock(base_url="http://s", api_key="s"),
-            session_model="m",
-            model_registry=registry,
-            session_capabilities=ModelCapabilities(context_window=64_000),
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="http://s", api_key="s"),
+                "m",
+                capabilities=ModelCapabilities(context_window=64_000),
+                registry=registry,
+                alias="session",
+            ),
         )
         assert alias_judge._judge_context_window == 64_000
 
         # Fallback path: no context_window passed → conservative default, not 0.
+        fallback_provider = _make_provider()
         fallback_judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True),
-            session_provider=_make_provider(),
-            session_client=MagicMock(base_url="http://s", api_key="s"),
-            session_model="m",
+            session_binding=_binding(
+                fallback_provider,
+                MagicMock(base_url="http://s", api_key="s"),
+                "m",
+                capabilities=ModelCapabilities(context_window=0),
+            ),
         )
         assert fallback_judge._judge_context_window == _DEFAULT_JUDGE_CONTEXT_WINDOW
 
@@ -423,10 +505,13 @@ class TestAliasResolution:
         )
         judge = OutputGuardJudge(
             config=config,
-            session_provider=provider,
-            session_client=MagicMock(base_url="http://x", api_key="y"),
-            session_model="session-model",
-            model_registry=registry,
+            session_binding=_binding(
+                provider,
+                MagicMock(base_url="http://x", api_key="y"),
+                "session-model",
+                registry=registry,
+                alias="session",
+            ),
         )
         assert judge._model == "session-model"
         assert judge._judge_model_alias == ""
@@ -448,15 +533,157 @@ class TestAliasResolution:
             output_guard_llm=True,
             output_guard_model="my-judge",
         )
+        session_provider = _make_provider()
         judge = OutputGuardJudge(
             config=config,
-            session_provider=MagicMock(),
-            session_client=MagicMock(base_url="http://session", api_key="s"),
-            session_model="session-model",
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="http://session", api_key="s"),
+                "session-model",
+                registry=registry,
+                alias="session",
+            ),
         )
         assert judge._model == "claude-haiku-4-5"
         assert judge._judge_model_alias == "my-judge"
+
+
+class TestBindingFreshness:
+    def test_constructor_consumed_timeout_change_invalidates(self) -> None:
+        session_binding = _binding(
+            _make_provider(),
+            MagicMock(base_url="http://session", api_key="s"),
+            "session-model",
+        )
+        config = JudgeConfig(output_guard_llm=True, output_guard_llm_timeout=30.0)
+        judge = OutputGuardJudge(config, session_binding)
+
+        assert judge.binding_is_current(session_binding, config)
+        assert not judge.binding_is_current(
+            session_binding,
+            JudgeConfig(output_guard_llm=True, output_guard_llm_timeout=45.0),
+        )
+
+    def test_explicit_alias_tracks_config_store_sampling_without_registry_reload(self) -> None:
+        store = _VersionedConfigStore(temperature=0.25, reasoning_effort="low")
+        registry = MagicMock()
+        registry.generation = 0
+        alias_provider = _make_provider()
+        alias_client = MagicMock(base_url="http://guard", api_key="g")
+        alias_cfg = ModelConfig("guard", "http://guard", "g", "guard-model")
+        registry.resolve_binding.return_value = (
+            alias_client,
+            alias_cfg.model,
+            alias_cfg,
+            alias_provider,
+            0,
+        )
+        session_binding = _binding(
+            _make_provider(),
+            MagicMock(base_url="http://session", api_key="s"),
+            "session-model",
+            registry=registry,
+            alias="session",
+        )
+        config = JudgeConfig(output_guard_llm=True, output_guard_model="guard")
+        judge = OutputGuardJudge(config, session_binding, config_store=store)
+
+        assert judge._lane.temperature == 0.25
+        assert judge._lane.reasoning_effort == "low"
+
+        store.set_sampling(temperature=0.75, reasoning_effort="high")
+        assert registry.generation == 0
+        assert not judge.binding_is_current(session_binding, config)
+
+        replacement = OutputGuardJudge(config, session_binding, config_store=store)
+        assert replacement._lane.temperature == 0.75
+        assert replacement._lane.reasoning_effort == "high"
+
+    def test_inherited_lane_resamples_config_store_instead_of_session_lane_knobs(self) -> None:
+        store = _VersionedConfigStore(temperature=0.1, reasoning_effort="low")
+        provider = _make_provider()
+        cfg = ModelConfig("session", "http://session", "s", "session-model")
+        session_binding = _binding(
+            provider,
+            MagicMock(base_url="http://session", api_key="s"),
+            cfg.model,
+            alias=cfg.alias,
+            config=cfg,
+            temperature=0.9,
+            reasoning_effort="max",
+        )
+        config = JudgeConfig(output_guard_llm=True)
+        judge = OutputGuardJudge(config, session_binding, config_store=store)
+
+        assert judge._lane.temperature == 0.1
+        assert judge._lane.reasoning_effort == "low"
+
+        store.set_sampling(temperature=0.6, reasoning_effort="high")
+        assert not judge.binding_is_current(session_binding, config)
+
+        replacement = OutputGuardJudge(config, session_binding, config_store=store)
+        assert replacement._lane.temperature == 0.6
+        assert replacement._lane.reasoning_effort == "high"
+
+    def test_live_output_guard_alias_change_invalidates_without_registry_reload(self) -> None:
+        provider = _make_provider()
+        session_binding = _binding(
+            provider,
+            MagicMock(base_url="http://session", api_key="s"),
+            "session-model",
+        )
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True, output_guard_model=""),
+            session_binding=session_binding,
+        )
+
+        assert judge.binding_is_current(
+            session_binding,
+            JudgeConfig(output_guard_llm=True, output_guard_model=""),
+        )
+        assert not judge.binding_is_current(
+            session_binding,
+            JudgeConfig(output_guard_llm=True, output_guard_model="new-guard-alias"),
+        )
+
+    def test_previously_unknown_alias_becoming_resolvable_invalidates_fallback(self) -> None:
+        registry = MagicMock()
+        registry.generation = 0
+        registry.resolve_binding.side_effect = ValueError("unknown alias")
+        session_provider = _make_provider()
+        session_binding = _binding(
+            session_provider,
+            MagicMock(base_url="http://session", api_key="s"),
+            "session-model",
+            registry=registry,
+            alias="session",
+        )
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True, output_guard_model="future-guard"),
+            session_binding=session_binding,
+        )
+        assert judge._judge_model_alias == ""
+
+        alias_provider = _make_provider()
+        alias_client = MagicMock(base_url="http://guard", api_key="g")
+        registry.generation = 1
+        registry.resolve_binding.side_effect = None
+        registry.resolve_binding.return_value = (
+            alias_client,
+            "guard-model",
+            None,
+            alias_provider,
+            1,
+        )
+        session_at_1 = ResolvedModelBinding(
+            lane=session_binding.lane,
+            config=session_binding.config,
+            registry_generation=1,
+        )
+        assert not judge.binding_is_current(
+            session_at_1,
+            JudgeConfig(output_guard_llm=True, output_guard_model="future-guard"),
+        )
 
 
 class TestClientReuse:
@@ -468,11 +695,14 @@ class TestClientReuse:
         from turnstone.core import providers as _providers
 
         config = JudgeConfig(output_guard_llm=True, output_guard_llm_timeout=5.0)
+        provider = _make_provider('{"risk_level": "none"}')
         judge = OutputGuardJudge(
             config=config,
-            session_provider=_make_provider('{"risk_level": "none"}'),
-            session_client=MagicMock(base_url="http://x", api_key="k"),
-            session_model="test-model",
+            session_binding=_binding(
+                provider,
+                MagicMock(base_url="http://x", api_key="k"),
+                "test-model",
+            ),
         )
         sentinel_client = MagicMock(name="sentinel-client")
         factory_calls = [0]
@@ -493,6 +723,125 @@ class TestClientReuse:
             f"create_client should be called once and cached; got {factory_calls[0]}"
         )
         assert judge._client is sentinel_client
+
+    def test_concurrent_first_calls_construct_one_client(self) -> None:
+        from turnstone.core import providers as _providers
+
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True),
+            session_binding=_binding(
+                _make_provider(),
+                MagicMock(base_url="http://x", api_key="k"),
+                "test-model",
+            ),
+        )
+        sentinel_client = MagicMock(name="sentinel-client")
+        factory_calls = [0]
+        start = threading.Barrier(9)
+        clients: list[Any] = []
+
+        def _fake_create(**_kwargs: Any) -> Any:
+            factory_calls[0] += 1
+            time.sleep(0.01)
+            return sentinel_client
+
+        def _get_client() -> None:
+            start.wait()
+            clients.append(judge._create_client())
+
+        orig = _providers.create_client
+        _providers.create_client = _fake_create  # type: ignore[assignment]
+        threads = [threading.Thread(target=_get_client) for _ in range(8)]
+        try:
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join(timeout=2.0)
+        finally:
+            _providers.create_client = orig  # type: ignore[assignment]
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert factory_calls == [1]
+        assert len(clients) == 8
+        assert all(client is sentinel_client for client in clients)
+
+
+class TestRetirementLifecycle:
+    def test_retire_defers_close_until_active_evaluation_releases(self) -> None:
+        judge = _make_judge(content='{"risk_level": "none"}')
+        cached = MagicMock(name="cached-client")
+        judge._client = cached
+
+        assert judge._begin_evaluation()
+        judge.retire()
+
+        cached.close.assert_not_called()
+        assert not judge._begin_evaluation()
+
+        judge._end_evaluation()
+        assert judge._client is None
+        cached.close.assert_called_once()
+
+    def test_retired_judge_rejects_new_evaluation_before_client_creation(self) -> None:
+        judge = _make_judge(content='{"risk_level": "none"}')
+        create_client = MagicMock(name="create-client")
+        judge._create_client = create_client  # type: ignore[method-assign]
+        judge.retire()
+
+        verdict = judge.evaluate("payload", call_id="call-1")
+
+        assert verdict.error == "judge_retired"
+        create_client.assert_not_called()
+
+    def test_retire_keeps_client_until_deadline_worker_releases(self, monkeypatch) -> None:
+        from turnstone.core import output_guard_judge as guard_module
+
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True),
+            session_binding=_binding(
+                _make_provider(),
+                MagicMock(base_url="http://x", api_key="k"),
+                "test-model",
+            ),
+        )
+        cached = MagicMock(name="cached-client")
+        judge._client = cached
+        worker_entered = threading.Event()
+        release_worker = threading.Event()
+        workers: list[threading.Thread] = []
+
+        def _blocked_model_turn(*_args: Any, **_kwargs: Any) -> Any:
+            worker_entered.set()
+            release_worker.wait(timeout=2.0)
+            return MagicMock(content='{"risk_level": "none"}')
+
+        def _abandon_immediately(fn: Any, **_kwargs: Any) -> Any:
+            worker = threading.Thread(target=lambda: fn(MagicMock()), daemon=True)
+            workers.append(worker)
+            worker.start()
+            worker_entered.wait(timeout=1.0)
+            raise DeadlineExceededError
+
+        monkeypatch.setattr(guard_module, "model_turn", _blocked_model_turn)
+        monkeypatch.setattr(
+            guard_module,
+            "run_abortable_with_deadline",
+            _abandon_immediately,
+        )
+
+        verdict = judge.evaluate("payload", call_id="call-1")
+        assert worker_entered.is_set()
+        assert verdict.error == "timeout"
+
+        judge.retire()
+        cached.close.assert_not_called()
+
+        release_worker.set()
+        for worker in workers:
+            worker.join(timeout=2.0)
+        assert all(not worker.is_alive() for worker in workers)
+        cached.close.assert_called_once()
 
 
 class TestCloseTeardown:

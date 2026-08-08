@@ -82,15 +82,27 @@ class "DiscordBot" as Bot <<service>> {
 }
 
 class "ChannelRouter" as Router <<service>> {
-    +resolve_route(platform, channel_id)
-        -> ws_id | None
-    +register_route(channel_id, ws_id)
-    +resolve_identity(platform, platform_user_id)
+    +get_or_create_workstream(channel_type, channel_id)
+    +_is_ws_live(ws_id)
+    +send_message(ws_id, message)
+    +send_approval(ws_id, ...)
+    +lookup_ws_id(channel_type, channel_id)
+    +resolve_user(channel_type, channel_user_id)
         -> user_id | None
     --
     Maps channels -> workstreams
     Maps platform users -> turnstone users
     Caches routes in memory
+}
+
+class "turnstone-console router" as ConsoleRouter <<server>> {
+    POST /v1/api/route/workstreams/new
+    GET  /v1/api/route/workstreams/{ws_id}/live
+    POST /v1/api/route/workstreams/{ws_id}/send
+    POST /v1/api/route/workstreams/{ws_id}/approve
+    GET  /v1/api/route?ws_id=...
+    --
+    Multi-node rendezvous + durable overrides
 }
 
 ' -- Server --
@@ -148,7 +160,9 @@ Bot --> Router : on_message\non_interaction
 Router --> CU : resolve identity
 Router --> CR : resolve / register route
 
-Router --> Server : POST /v1/api/workstreams/{ws_id}/send\nPOST /v1/api/workstreams/{ws_id}/approve\nPOST /v1/api/workstreams/new
+Router --> Server : single-node/direct mode\ncreate + send + approve
+Router --> ConsoleRouter : multi-node mode\nroute create/live/send/approve/lookup
+ConsoleRouter --> Server : routed HTTP to owning node
 Bot --> Server : GET /v1/api/workstreams/{ws_id}/events\n(SSE via httpx-sse)
 Server --> Bot : SSE event stream
 
@@ -156,7 +170,7 @@ Bot --> Discord : reply / embed\nbutton callback
 
 Slack --> SlackBot : socket-mode\nevents
 SlackBot --> Router : on_message / on_action
-SlackBot --> Server : POST /v1/api/workstreams/{ws_id}/send\nGET /v1/api/workstreams/{ws_id}/events
+SlackBot --> Server : owning-node SSE after route lookup
 SlackBot --> Slack : post / update\nBlock Kit button callbacks
 
 Teams .[hidden]. Slack
@@ -175,19 +189,21 @@ note right of Bot
   **Inbound Flow**
   1. Discord message arrives via gateway
   2. Bot.on_message() fires
-  3. ChannelRouter resolves channel -> ws_id
-     (or creates new workstream)
+  3. ChannelRouter gets or creates channel -> ws_id
+     (direct server or multi-node console router)
   4. ChannelRouter resolves platform user -> user_id
      via channel_users table
-  5. Router sends POST /v1/api/workstreams/{ws_id}/send to server
+  5. Router sends through the configured server/console SDK
 
-  **Workstream Resume (evicted workstreams)**
-  1. Stale route detected (no active SSE listener)
-  2. Existing ws_id reused directly from route
+  **Stale-route recovery (evicted workstreams)**
+  1. Route health check reports the old ws unavailable
+  2. Existing ws_id becomes the fork source
   3. POST /v1/api/workstreams/new with
      resume_ws=<ws_id>
-  4. Server resumes atomically during creation
-  5. SSE emits WorkstreamResumedEvent -> thread
+  4. Server atomically clones source history/config/
+     persona/project/attachment refs into a new ws_id
+  5. Router stores the new destination route; source is unchanged
+  6. If the source was pruned, retry one fresh create
 end note
 
 note right of Server

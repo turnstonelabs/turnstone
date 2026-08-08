@@ -32,11 +32,14 @@ from turnstone.core.providers._openai_common import (
 )
 from turnstone.core.providers._protocol import (
     ModelCapabilities,
+    ProviderRequestMetrics,
     StreamChunk,
     ToolCallDelta,
     _join_reasoning_with_cap,
     finish_shim_due,
+    refuse_aborted_request,
     resolve_reasoning_effort,
+    serialized_tool_chars,
 )
 from turnstone.core.trajectory import materialize_attachments
 
@@ -547,6 +550,7 @@ class OpenAIResponsesProvider:
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
+        request_metrics_ref: list[ProviderRequestMetrics] | None = None,
     ) -> Iterator[StreamChunk]:
         messages = materialize_attachments(messages, resolve_attachments)
         if extra_params:
@@ -567,6 +571,14 @@ class OpenAIResponsesProvider:
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
 
+        refuse_aborted_request(cancel_ref)
+        if request_metrics_ref is not None:
+            request_metrics_ref.append(
+                ProviderRequestMetrics(
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools"))
+                )
+            )
+
         log.debug(
             "openai.responses.request",
             model=model,
@@ -576,6 +588,7 @@ class OpenAIResponsesProvider:
             tool_count=len(kwargs.get("tools", [])),
         )
 
+        refuse_aborted_request(cancel_ref)
         stream = client.responses.create(**kwargs)
         if cancel_ref is not None:
             cancel_ref.append(stream)

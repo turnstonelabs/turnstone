@@ -24,6 +24,8 @@ from turnstone.api.schemas import (
     StatusResponse,
 )
 from turnstone.api.server_schemas import (
+    ApproveResponse,
+    CancelResponse,
     CreateWorkstreamResponse,
     DashboardResponse,
     HealthResponse,
@@ -102,16 +104,17 @@ class AsyncTurnstoneServer(_BaseClient):
         *,
         name: str = "",
         model: str = "",
+        judge_model: str = "",
         auto_approve: bool = False,
         resume_ws: str = "",
         skill: str = "",
         persona: str = "",
         initial_message: str = "",
-        auto_approve_tools: str = "",
+        auto_approve_tools: str | list[str] = "",
         user_id: str = "",
         ws_id: str = "",
         client_type: str = "",
-        notify_targets: str = "",
+        notify_targets: str | list[dict[str, str]] = "",
         project_id: str = "",
         attachments: list[AttachmentUpload] | None = None,
     ) -> CreateWorkstreamResponse:
@@ -136,6 +139,8 @@ class AsyncTurnstoneServer(_BaseClient):
             body["name"] = name
         if model:
             body["model"] = model
+        if judge_model:
+            body["judge_model"] = judge_model
         if auto_approve:
             body["auto_approve"] = True
         if resume_ws:
@@ -283,7 +288,7 @@ class AsyncTurnstoneServer(_BaseClient):
         always: bool = False,
         cycle_id: str | None = None,
         call_id: str | None = None,
-    ) -> StatusResponse:
+    ) -> ApproveResponse:
         """Resolve one approval cycle.
 
         ``cycle_id`` (from the ``approve_request`` event) or ``call_id``
@@ -305,7 +310,7 @@ class AsyncTurnstoneServer(_BaseClient):
             "POST",
             f"/v1/api/workstreams/{ws_id}/approve",
             json_body=body,
-            response_model=StatusResponse,
+            response_model=ApproveResponse,
         )
 
     async def command(self, *, ws_id: str, command: str) -> StatusResponse:
@@ -316,7 +321,7 @@ class AsyncTurnstoneServer(_BaseClient):
             response_model=StatusResponse,
         )
 
-    async def cancel(self, ws_id: str, *, force: bool = False) -> StatusResponse:
+    async def cancel(self, ws_id: str, *, force: bool = False) -> CancelResponse:
         body: dict[str, object] = {}
         if force:
             body["force"] = True
@@ -324,7 +329,7 @@ class AsyncTurnstoneServer(_BaseClient):
             "POST",
             f"/v1/api/workstreams/{ws_id}/cancel",
             json_body=body,
-            response_model=StatusResponse,
+            response_model=CancelResponse,
         )
 
     async def rewind(self, ws_id: str, *, turns: int) -> StatusResponse:
@@ -629,16 +634,17 @@ class TurnstoneServer:
         *,
         name: str = "",
         model: str = "",
+        judge_model: str = "",
         auto_approve: bool = False,
         resume_ws: str = "",
         skill: str = "",
         persona: str = "",
         initial_message: str = "",
-        auto_approve_tools: str = "",
+        auto_approve_tools: str | list[str] = "",
         user_id: str = "",
         ws_id: str = "",
         client_type: str = "",
-        notify_targets: str = "",
+        notify_targets: str | list[dict[str, str]] = "",
         project_id: str = "",
         attachments: list[AttachmentUpload] | None = None,
     ) -> CreateWorkstreamResponse:
@@ -646,6 +652,7 @@ class TurnstoneServer:
             self._async.create_workstream(
                 name=name,
                 model=model,
+                judge_model=judge_model,
                 auto_approve=auto_approve,
                 resume_ws=resume_ws,
                 skill=skill,
@@ -707,7 +714,7 @@ class TurnstoneServer:
         always: bool = False,
         cycle_id: str | None = None,
         call_id: str | None = None,
-    ) -> StatusResponse:
+    ) -> ApproveResponse:
         return self._runner.run(
             self._async.approve(
                 ws_id=ws_id,
@@ -722,7 +729,7 @@ class TurnstoneServer:
     def command(self, *, ws_id: str, command: str) -> StatusResponse:
         return self._runner.run(self._async.command(ws_id=ws_id, command=command))
 
-    def cancel(self, ws_id: str, *, force: bool = False) -> StatusResponse:
+    def cancel(self, ws_id: str, *, force: bool = False) -> CancelResponse:
         return self._runner.run(self._async.cancel(ws_id, force=force))
 
     def rewind(self, ws_id: str, *, turns: int) -> StatusResponse:

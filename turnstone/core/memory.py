@@ -88,12 +88,19 @@ def save_message(
         return 0
 
 
-def save_messages_bulk(rows: list[dict[str, Any]]) -> None:
-    """Insert multiple conversation rows in a single transaction."""
+def save_messages_bulk(rows: list[dict[str, Any]]) -> bool:
+    """Insert multiple conversation rows in a single transaction.
+
+    Returns whether the transaction committed. Most single-row persistence is
+    deliberately best-effort, but fork callers need an explicit durability
+    result so a missing attachment cannot be reported as a successful copy.
+    """
     try:
         get_storage().save_messages_bulk(rows)
+        return True
     except Exception:
         log.warning("Failed to bulk-save %d messages", len(rows), exc_info=True)
+        return False
 
 
 def load_messages(ws_id: str, *, repair: bool = True) -> list[dict[str, Any]]:
@@ -361,6 +368,18 @@ def delete_workstream(ws_id: str) -> bool:
         return False
 
 
+def delete_workstream_if_fork_reserved(ws_id: str, fork_reservation_token: str) -> bool:
+    """Delete exactly one uncommitted fork destination incarnation."""
+    try:
+        return get_storage().delete_workstream_if_fork_reserved(
+            ws_id,
+            fork_reservation_token,
+        )
+    except Exception:
+        log.warning("Failed to delete reserved fork ws=%s", ws_id, exc_info=True)
+        return False
+
+
 def prune_workstreams(
     retention_days: int = 90,
     log_fn: Callable[[str], None] | None = None,
@@ -412,6 +431,36 @@ def load_workstream_config(ws_id: str) -> dict[str, str]:
     except Exception:
         log.warning("Failed to load workstream config ws=%s", ws_id, exc_info=True)
         return {}
+
+
+def finalize_deferred_create(
+    ws_id: str,
+    fork_reservation_token: str,
+    *,
+    alias: str | None = None,
+    config: dict[str, str] | None = None,
+    node_id: str | None = None,
+    override_reason: str = "local",
+) -> bool:
+    """Atomically finalize storage writes for one reserved fork create."""
+    return get_storage().finalize_deferred_create(
+        ws_id,
+        fork_reservation_token,
+        alias=alias,
+        config=config,
+        node_id=node_id,
+        override_reason=override_reason,
+    )
+
+
+def publish_deferred_create(ws_id: str, fork_reservation_token: str) -> bool:
+    """Atomically expose one exact reserved workstream incarnation."""
+    return get_storage().publish_deferred_create(ws_id, fork_reservation_token)
+
+
+def get_workstream_reservation_token(ws_id: str) -> str:
+    """Return the private durable incarnation fence for ``ws_id``."""
+    return get_storage().get_workstream_reservation_token(ws_id)
 
 
 # -- Workstream last_error ---------------------------------------------------

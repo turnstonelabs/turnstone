@@ -2041,6 +2041,8 @@ class TestSkillConfigAppliedToWorkstream:
             WebUI,
             _interactive_create_build_kwargs,
             _interactive_create_post_install,
+            _interactive_create_pre_commit,
+            _interactive_create_prepare_install,
             _interactive_create_validate_request,
             _interactive_manager_lookup,
             _interactive_tenant_check,
@@ -2095,7 +2097,9 @@ class TestSkillConfigAppliedToWorkstream:
             create_supports_user_id_override=True,
             create_validate_request=_interactive_create_validate_request,
             create_build_kwargs=_interactive_create_build_kwargs,
+            create_pre_commit=_interactive_create_pre_commit,
             create_post_install=_interactive_create_post_install,
+            create_prepare_install=_interactive_create_prepare_install,
         )
         _test_create_handler = make_create_handler(_test_cfg)
         routes = [

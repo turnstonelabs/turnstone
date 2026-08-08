@@ -12,12 +12,34 @@ from unittest.mock import MagicMock
 from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
+from turnstone.core.model_registry import ModelConfig
+from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
 from turnstone.core.providers._protocol import ModelCapabilities
 from turnstone.core.trajectory import Role
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _VersionedConfigStore:
+    def __init__(self, temperature: float, reasoning_effort: str) -> None:
+        self.version = 0
+        self._values: dict[str, Any] = {
+            "model.temperature": temperature,
+            "model.reasoning_effort": reasoning_effort,
+        }
+
+    def get(self, key: str) -> Any:
+        return self._values.get(key)
+
+    def set_sampling(self, temperature: float, reasoning_effort: str) -> None:
+        self._values = {
+            **self._values,
+            "model.temperature": temperature,
+            "model.reasoning_effort": reasoning_effort,
+        }
+        self.version += 1
 
 
 def _make_mock_provider(
@@ -49,6 +71,36 @@ def _make_mock_provider(
     return provider
 
 
+def _binding(
+    provider: Any,
+    client: Any,
+    model: str,
+    *,
+    capabilities: ModelCapabilities | None = None,
+    registry: Any | None = None,
+    alias: str = "",
+    config: Any | None = None,
+    generation: int = 0,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
+) -> ResolvedModelBinding:
+    caps = capabilities or provider.get_capabilities(model)
+    return ResolvedModelBinding(
+        lane=ModelLane(
+            provider=provider,
+            client=client,
+            model=model,
+            alias=alias,
+            capabilities=caps,
+            registry=registry,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+        ),
+        config=config,
+        registry_generation=generation,
+    )
+
+
 def _make_judge(
     provider: MagicMock | None = None,
     *,
@@ -71,12 +123,12 @@ def _make_judge(
     client.api_key = "test-key"
     return IntentJudge(
         config=config,
-        session_provider=provider,
-        session_client=client,
-        session_model="test-model",
-        # Real caps for the same reason as in ``_make_mock_provider`` —
-        # the judge PREFERS session_capabilities over the provider's.
-        session_capabilities=ModelCapabilities(context_window=100_000),
+        session_binding=_binding(
+            provider,
+            client,
+            "test-model",
+            capabilities=ModelCapabilities(context_window=100_000),
+        ),
     )
 
 
@@ -359,6 +411,54 @@ class TestCancelEventSemantics:
         assert [v.call_id for v in results] == ["tc_0", "tc_1", "tc_2"]
         assert all(v.tier == "llm" for v in results)
         assert provider.create_streaming.call_count == 3
+
+    def test_batch_backend_auth_resolves_once_and_reuses_token(self):
+        """One judge batch owns one delegated credential snapshot."""
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        batch_client = MagicMock()
+        bound_client = object()
+        batch_client.with_options.return_value = bound_client
+        judge._create_client = MagicMock(return_value=batch_client)  # type: ignore[method-assign]
+        resolver = MagicMock(return_value="user-a-token")
+        results: list[IntentVerdict] = []
+        items = [_make_item(call_id=f"tc_{i}") for i in range(2)]
+
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            backend_auth_resolver=resolver,
+        )
+        _wait_for(results, 2)
+
+        resolver.assert_called_once_with("", None)
+        assert batch_client.with_options.call_count == 2
+        assert all(
+            call.kwargs["client"] is bound_client
+            for call in provider.create_streaming.call_args_list
+        )
+        assert [verdict.call_id for verdict in results] == ["tc_0", "tc_1"]
+
+    def test_cancelled_batch_skips_backend_auth_resolution(self):
+        """The daemon checks cancellation before doing a credential mint."""
+        judge = _make_judge(_make_mock_provider(_good_verdict_json()))
+        resolver = MagicMock(return_value="unused")
+        cancel = threading.Event()
+        cancel.set()
+        results: list[IntentVerdict] = []
+
+        judge.evaluate(
+            [_make_item()],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+            backend_auth_resolver=resolver,
+        )
+        _wait_for(results, 1)
+
+        resolver.assert_not_called()
+        assert results[0].tier == "llm_fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -936,13 +1036,17 @@ class TestModelAliasResolution:
             "local-9b",
             capabilities={"supports_tools": False, "effort_passthrough": True},
         )
+        session_provider = _make_mock_provider()
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
-            session_provider=_make_mock_provider(),
-            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
-            session_model="session-model",
-            session_capabilities=ModelCapabilities(context_window=100_000),
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="https://s/v1", api_key="s"),
+                "session-model",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
         )
         # Merged at construction: overrides applied, untouched fields survive.
         assert judge._capabilities.supports_tools is False
@@ -974,13 +1078,17 @@ class TestModelAliasResolution:
             MagicMock(base_url="https://a/v1", api_key="k"),
             "local-9b",
         )
+        session_provider = _make_mock_provider()
         IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
-            session_provider=_make_mock_provider(),
-            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
-            session_model="session-model",
-            session_capabilities=ModelCapabilities(context_window=100_000),
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="https://s/v1", api_key="s"),
+                "session-model",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
         )
         assert registry.get_config.call_count == 0
 
@@ -993,10 +1101,12 @@ class TestModelAliasResolution:
         provider = _make_mock_provider(response_content=_good_verdict_json())
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model=""),  # no alias → fallback
-            session_provider=provider,
-            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
-            session_model="session-model",
-            session_capabilities=sess_caps,
+            session_binding=_binding(
+                provider,
+                MagicMock(base_url="https://s/v1", api_key="s"),
+                "session-model",
+                capabilities=sess_caps,
+            ),
         )
         assert judge._capabilities is sess_caps
         assert judge._judge_context_window == 54_321
@@ -1036,13 +1146,16 @@ class TestModelAliasResolution:
         config = JudgeConfig(enabled=True, model="judge-mini")
         judge = IntentJudge(
             config=config,
-            session_provider=session_provider,
-            session_client=session_client,
-            session_model="session-default-model",
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                session_client,
+                "session-default-model",
+                registry=registry,
+                alias="session",
+            ),
         )
 
-        assert judge._provider is alias_provider
+        assert judge._lane.provider is alias_provider
         assert judge._model == "gpt-5-mini-resolved"
         # Client factory args reflect the alias's client, not the session's.
         assert judge._client_factory_args["base_url"] == "https://alias.example/v1"
@@ -1060,12 +1173,16 @@ class TestModelAliasResolution:
         alias_provider.get_capabilities = MagicMock(return_value=MagicMock(context_window=200_000))
         alias_client = MagicMock(base_url="https://alias/v1", api_key="k")
         registry = self._make_alias_registry("judge-mini", alias_provider, alias_client, "local-9b")
+        session_provider = _make_mock_provider()
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
-            session_provider=_make_mock_provider(),
-            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
-            session_model="session-model",
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="https://s/v1", api_key="s"),
+                "session-model",
+                registry=registry,
+                alias="session",
+            ),
         )
         assert judge._judge_context_window == 50_000
 
@@ -1085,13 +1202,17 @@ class TestModelAliasResolution:
             _make_mock_provider(),
             0,
         )
+        session_provider = _make_mock_provider()
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
-            session_provider=_make_mock_provider(),
-            session_client=MagicMock(base_url="http://s", api_key="s"),
-            session_model="session-model",
-            session_capabilities=ModelCapabilities(context_window=100_000),
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="http://s", api_key="s"),
+                "session-model",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
         )
         assert judge._judge_context_window == 100_000  # session window, not 0
 
@@ -1115,14 +1236,17 @@ class TestModelAliasResolution:
         config = JudgeConfig(enabled=True, model="gpt-5-mini")
         judge = IntentJudge(
             config=config,
-            session_provider=session_provider,
-            session_client=session_client,
-            session_model="session-default-model",
-            session_capabilities=ModelCapabilities(context_window=100_000),
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                session_client,
+                "session-default-model",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
         )
 
-        assert judge._provider is session_provider
+        assert judge._lane.provider is session_provider
         assert judge._model == "session-default-model"
         # Context window mirrors the session, not the (uncalled) caps lookup.
         assert judge._judge_context_window == 100_000
@@ -1141,13 +1265,17 @@ class TestModelAliasResolution:
         )
 
         with caplog.at_level("WARNING", logger="turnstone.core.judge"):
+            session_provider = _make_mock_provider()
             judge = IntentJudge(
                 config=JudgeConfig(enabled=True, model="judge-mini"),
-                session_provider=_make_mock_provider(),
-                session_client=MagicMock(base_url="https://s/v1", api_key="s"),
-                session_model="session-model",
-                session_capabilities=ModelCapabilities(context_window=100_000),
-                model_registry=registry,
+                session_binding=_binding(
+                    session_provider,
+                    MagicMock(base_url="https://s/v1", api_key="s"),
+                    "session-model",
+                    capabilities=ModelCapabilities(context_window=100_000),
+                    registry=registry,
+                    alias="session",
+                ),
             )
 
         assert judge._model == "session-model"  # fallback behavior unchanged
@@ -1166,12 +1294,14 @@ class TestModelAliasResolution:
         config = JudgeConfig(enabled=True, model="")
         judge = IntentJudge(
             config=config,
-            session_provider=session_provider,
-            session_client=session_client,
-            session_model="session-default-model",
+            session_binding=_binding(
+                session_provider,
+                session_client,
+                "session-default-model",
+            ),
         )
 
-        assert judge._provider is session_provider
+        assert judge._lane.provider is session_provider
         assert judge._model == "session-default-model"
 
     def test_coordinator_tool_call_returns_llm_verdict_not_fallback(self):
@@ -1206,6 +1336,213 @@ class TestModelAliasResolution:
         assert callback_results[0].tier == "llm"
         assert callback_results[0].tier != "llm_fallback"
         assert "did not return a verdict" not in callback_results[0].reasoning
+
+
+class TestJudgeBindingFreshness:
+    def test_constructor_consumed_config_change_invalidates(self):
+        session_binding = _binding(
+            _make_mock_provider(),
+            MagicMock(base_url="https://session/v1", api_key="session-key"),
+            "session-model",
+        )
+        config = JudgeConfig(enabled=True, timeout=30.0)
+        judge = IntentJudge(config, session_binding)
+
+        assert judge.binding_is_current(session_binding, config)
+        assert not judge.binding_is_current(
+            session_binding,
+            JudgeConfig(enabled=True, timeout=45.0),
+        )
+
+    def test_explicit_alias_tracks_config_store_sampling_without_registry_reload(self):
+        store = _VersionedConfigStore(temperature=0.2, reasoning_effort="low")
+        registry = MagicMock()
+        registry.generation = 0
+        alias_provider = _make_mock_provider()
+        alias_client = MagicMock(base_url="https://judge/v1", api_key="judge-key")
+        alias_cfg = ModelConfig(
+            "judge-mini",
+            "https://judge/v1",
+            "judge-key",
+            "judge-model",
+        )
+        registry.resolve_binding.return_value = (
+            alias_client,
+            alias_cfg.model,
+            alias_cfg,
+            alias_provider,
+            0,
+        )
+        session_binding = _binding(
+            _make_mock_provider(),
+            MagicMock(base_url="https://session/v1", api_key="session-key"),
+            "session-model",
+            registry=registry,
+            alias="session",
+        )
+        config = JudgeConfig(enabled=True, model="judge-mini")
+        judge = IntentJudge(config, session_binding, config_store=store)
+
+        assert judge._lane.temperature == 0.2
+        assert judge._lane.reasoning_effort == "low"
+
+        store.set_sampling(temperature=0.8, reasoning_effort="high")
+        assert registry.generation == 0
+        assert not judge.binding_is_current(session_binding)
+
+        replacement = IntentJudge(config, session_binding, config_store=store)
+        assert replacement._lane.temperature == 0.8
+        assert replacement._lane.reasoning_effort == "high"
+
+    def test_inherited_lane_resamples_config_store_instead_of_session_lane_knobs(self):
+        store = _VersionedConfigStore(temperature=0.15, reasoning_effort="low")
+        provider = _make_mock_provider()
+        cfg = ModelConfig(
+            "session",
+            "https://session/v1",
+            "session-key",
+            "session-model",
+        )
+        session_binding = _binding(
+            provider,
+            MagicMock(base_url="https://session/v1", api_key="session-key"),
+            cfg.model,
+            alias=cfg.alias,
+            config=cfg,
+            temperature=0.95,
+            reasoning_effort="max",
+        )
+        config = JudgeConfig(enabled=True)
+        judge = IntentJudge(config, session_binding, config_store=store)
+
+        # Pre-refactor judges resolved their own sampling ladder per
+        # evaluation; they did not inherit the session lane's persisted knobs.
+        assert judge._lane.temperature == 0.15
+        assert judge._lane.reasoning_effort == "low"
+
+        store.set_sampling(temperature=0.65, reasoning_effort="high")
+        assert not judge.binding_is_current(session_binding)
+
+        replacement = IntentJudge(config, session_binding, config_store=store)
+        assert replacement._lane.temperature == 0.65
+        assert replacement._lane.reasoning_effort == "high"
+
+    def test_explicit_alias_ignores_unrelated_generation_but_detects_own_config_change(self):
+        registry = MagicMock()
+        registry.generation = 0
+        alias_provider = _make_mock_provider(response_content=_good_verdict_json())
+        alias_client = MagicMock(base_url="https://judge/v1", api_key="judge-key")
+        cfg = ModelConfig(
+            "judge-mini",
+            "https://judge/v1",
+            "judge-key",
+            "judge-model",
+            context_window=50_000,
+            temperature=0.3,
+        )
+        registry.resolve_binding.return_value = (
+            alias_client,
+            cfg.model,
+            cfg,
+            alias_provider,
+            0,
+        )
+        session_provider = _make_mock_provider()
+        session_client = MagicMock(base_url="https://session/v1", api_key="session-key")
+        session_binding = _binding(
+            session_provider,
+            session_client,
+            "session-model",
+            registry=registry,
+            alias="session",
+        )
+        judge = IntentJudge(
+            config=JudgeConfig(enabled=True, model="judge-mini"),
+            session_binding=session_binding,
+        )
+        pinned_lane = judge._lane
+        assert registry.resolve_binding.call_count == 1
+
+        # Another alias changed: resolving judge-mini at generation 1 yields
+        # the same semantic binding.  Keep the exact judge lane and stamp the
+        # generation so subsequent checks are cheap.
+        registry.generation = 1
+        registry.resolve_binding.return_value = (
+            alias_client,
+            cfg.model,
+            cfg,
+            alias_provider,
+            1,
+        )
+        session_at_1 = ResolvedModelBinding(
+            lane=session_binding.lane,
+            config=session_binding.config,
+            registry_generation=1,
+        )
+        assert judge.binding_is_current(session_at_1)
+        assert judge._lane is pinned_lane
+        assert registry.resolve_binding.call_count == 2
+        assert judge.binding_is_current(session_at_1)
+        assert registry.resolve_binding.call_count == 2
+
+        # A value change on the effective judge alias invalidates at the next
+        # evaluation boundary even when provider/client/model identities hold.
+        changed_cfg = ModelConfig(
+            "judge-mini",
+            "https://judge/v1",
+            "judge-key",
+            "judge-model",
+            context_window=64_000,
+            temperature=0.3,
+        )
+        registry.generation = 2
+        registry.resolve_binding.return_value = (
+            alias_client,
+            changed_cfg.model,
+            changed_cfg,
+            alias_provider,
+            2,
+        )
+        assert not judge.binding_is_current(session_at_1)
+        assert judge._lane is pinned_lane  # in-flight users are never mutated
+
+    def test_inherited_judge_tracks_primary_binding_without_generation_noise(self):
+        registry = MagicMock()
+        registry.generation = 0
+        provider = _make_mock_provider()
+        client = MagicMock(base_url="https://session/v1", api_key="key")
+        session_binding = _binding(
+            provider,
+            client,
+            "session-model",
+            registry=registry,
+            alias="session",
+        )
+        judge = IntentJudge(config=JudgeConfig(enabled=True), session_binding=session_binding)
+
+        registry.generation = 1
+        # The registry reload changed an unrelated alias.  The fallback
+        # candidate still carries the primary binding's generation-0 stamp,
+        # but the freshness watermark must advance to the observed registry
+        # generation so this no-op does not trigger perpetual rechecks.
+        assert judge.binding_is_current(session_binding)
+        assert judge._binding_state.checked_registry_generation == 1
+        same_binding = ResolvedModelBinding(
+            lane=session_binding.lane,
+            config=session_binding.config,
+            registry_generation=1,
+        )
+        assert judge.binding_is_current(same_binding)
+
+        changed_primary = _binding(
+            provider,
+            MagicMock(base_url="https://moved/v1", api_key="key"),
+            "session-model",
+            registry=registry,
+            alias="session",
+            generation=1,
+        )
+        assert not judge.binding_is_current(changed_primary)
 
 
 class TestInlineReasoningSeam:

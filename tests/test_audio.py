@@ -13,6 +13,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from turnstone.core import audio
+from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
 
 class _Cfg:
@@ -46,6 +49,10 @@ class _FakeRegistry:
         self._alias = alias
         self._cfg = cfg
         self._client = client
+        self.default = alias
+        self.generation = 0
+        self.resolve_binding_calls = 0
+        self._provider = OpenAIChatCompletionsProvider()
 
     def has_alias(self, alias: str) -> bool:
         return alias == self._alias
@@ -55,10 +62,21 @@ class _FakeRegistry:
             raise ValueError(alias)
         return self._cfg
 
-    def resolve(self, alias: str | None = None):
+    def resolve_binding(self, alias: str | None = None):
         if alias not in (None, self._alias):
             raise ValueError(alias)
-        return self._client, self._cfg.model, self._cfg, 0
+        self.resolve_binding_calls += 1
+        return self._client, self._cfg.model, self._cfg, self._provider, self.generation
+
+
+def _response_manager(*, parsed=None, body: bytes = b""):
+    response = MagicMock()
+    response.parse.return_value = parsed
+    response.read.return_value = body
+    manager = MagicMock()
+    manager.__enter__.return_value = response
+    manager.__exit__.return_value = False
+    return manager, response
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +180,8 @@ class TestResolveRoleAlias:
 class TestTranscribe:
     def test_calls_audio_transcriptions_and_returns_text(self):
         client = MagicMock()
-        client.audio.transcriptions.create.return_value = MagicMock(text="  hello world  ")
+        manager, _response = _response_manager(parsed=MagicMock(text="  hello world  "))
+        client.audio.transcriptions.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-transcribe"), client)
         res = audio.transcribe(
             registry=reg, alias="voice", data=b"RIFFfake", filename="speech.webm"
@@ -170,29 +189,35 @@ class TestTranscribe:
         assert res.transcript == "hello world"
         assert res.model_alias == "voice"
         assert res.model == "gpt-4o-mini-transcribe"
-        kwargs = client.audio.transcriptions.create.call_args.kwargs
+        kwargs = client.audio.transcriptions.with_streaming_response.create.call_args.kwargs
         assert kwargs["model"] == "gpt-4o-mini-transcribe"
         assert kwargs["file"] == ("speech.webm", b"RIFFfake")
 
     def test_prompt_forwarded_when_set(self):
         client = MagicMock()
-        client.audio.transcriptions.create.return_value = MagicMock(text="ok")
+        manager, _response = _response_manager(parsed=MagicMock(text="ok"))
+        client.audio.transcriptions.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("voice", _Cfg("whisper-1"), client)
         audio.transcribe(
             registry=reg, alias="voice", data=b"x", filename="a.wav", prompt="ACME jargon"
         )
-        assert client.audio.transcriptions.create.call_args.kwargs["prompt"] == "ACME jargon"
+        kwargs = client.audio.transcriptions.with_streaming_response.create.call_args.kwargs
+        assert kwargs["prompt"] == "ACME jargon"
 
     def test_prompt_omitted_when_blank(self):
         client = MagicMock()
-        client.audio.transcriptions.create.return_value = MagicMock(text="ok")
+        manager, _response = _response_manager(parsed=MagicMock(text="ok"))
+        client.audio.transcriptions.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("voice", _Cfg("whisper-1"), client)
         audio.transcribe(registry=reg, alias="voice", data=b"x", filename="a.wav")
-        assert "prompt" not in client.audio.transcriptions.create.call_args.kwargs
+        kwargs = client.audio.transcriptions.with_streaming_response.create.call_args.kwargs
+        assert "prompt" not in kwargs
 
     def test_backend_failure_raises_backend_error(self):
         client = MagicMock()
-        client.audio.transcriptions.create.side_effect = RuntimeError("boom")
+        client.audio.transcriptions.with_streaming_response.create.side_effect = RuntimeError(
+            "boom"
+        )
         reg = _FakeRegistry("voice", _Cfg("whisper-1"), client)
         with pytest.raises(audio.AudioBackendError):
             audio.transcribe(registry=reg, alias="voice", data=b"x", filename="a.wav")
@@ -201,15 +226,17 @@ class TestTranscribe:
         monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
         client = MagicMock()
         msg = MagicMock(content="  the transcript  ")
-        client.chat.completions.create.return_value = MagicMock(choices=[MagicMock(message=msg)])
+        manager, _response = _response_manager(parsed=MagicMock(choices=[MagicMock(message=msg)]))
+        client.chat.completions.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("omni", _Cfg("gemma-omni", {"supports_audio_input": True}), client)
         res = audio.transcribe(
             registry=reg, alias="omni", data=b"webmbytes", filename="speech.webm"
         )
         assert res.transcript == "the transcript"
         # The dedicated transcription endpoint is NOT used for an omni model.
-        client.audio.transcriptions.create.assert_not_called()
-        parts = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        kwargs = client.chat.completions.with_streaming_response.create.call_args.kwargs
+        parts = kwargs["messages"][0]["content"]
         # Prompt precedes the audio part — the order Gemma documents for transcription.
         assert [p["type"] for p in parts] == ["text", "input_audio"]
         # The clip is transcoded to wav regardless of the upload container.
@@ -222,14 +249,16 @@ class TestTranscribe:
     def test_omni_prompt_override_used(self, monkeypatch):
         monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
         client = MagicMock()
-        client.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="x"))]
+        manager, _response = _response_manager(
+            parsed=MagicMock(choices=[MagicMock(message=MagicMock(content="x"))])
         )
+        client.chat.completions.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("omni", _Cfg("gemma-omni", {"supports_audio_input": True}), client)
         audio.transcribe(
             registry=reg, alias="omni", data=b"x", filename="a.wav", prompt="custom instruction"
         )
-        parts = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        kwargs = client.chat.completions.with_streaming_response.create.call_args.kwargs
+        parts = kwargs["messages"][0]["content"]
         text_part = next(p for p in parts if p["type"] == "text")
         assert text_part["text"] == "custom instruction"
 
@@ -245,37 +274,210 @@ class TestTranscribe:
         )
         with pytest.raises(audio.AudioUnavailableError, match="OpenAI-compatible provider"):
             audio.transcribe(registry=reg, alias="omni", data=b"x", filename="a.webm")
-        client.chat.completions.create.assert_not_called()
+        client.chat.completions.with_streaming_response.create.assert_not_called()
+
+    def test_dedicated_endpoint_uses_authenticated_clone_and_pinned_config(self):
+        base_client = MagicMock()
+        call_client = MagicMock()
+        base_client.with_options.return_value = call_client
+        manager, _response = _response_manager(parsed=MagicMock(text="hello"))
+        call_client.audio.transcriptions.with_streaming_response.create.return_value = manager
+        cfg = _Cfg("whisper-1")
+        resolver = MagicMock(return_value="minted-token")
+
+        result = audio.transcribe(
+            registry=_FakeRegistry("voice", cfg, base_client),
+            alias="voice",
+            data=b"x",
+            filename="a.wav",
+            backend_auth_resolver=resolver,
+        )
+
+        assert result.transcript == "hello"
+        resolver.assert_called_once_with("voice", cfg)
+        base_client.with_options.assert_called_once_with(api_key="minted-token")
+        base_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        base_client.close.assert_not_called()
+        call_client.close.assert_not_called()
+
+    def test_omni_endpoint_uses_authenticated_clone_and_pinned_config(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        base_client = MagicMock()
+        call_client = MagicMock()
+        base_client.with_options.return_value = call_client
+        manager, _response = _response_manager(
+            parsed=MagicMock(choices=[MagicMock(message=MagicMock(content="hello from omni"))])
+        )
+        call_client.chat.completions.with_streaming_response.create.return_value = manager
+        cfg = _Cfg("omni", {"supports_audio_input": True})
+        resolver = MagicMock(return_value="minted-token")
+
+        result = audio.transcribe(
+            registry=_FakeRegistry("voice", cfg, base_client),
+            alias="voice",
+            data=b"x",
+            filename="a.webm",
+            backend_auth_resolver=resolver,
+        )
+
+        assert result.transcript == "hello from omni"
+        resolver.assert_called_once_with("voice", cfg)
+        base_client.with_options.assert_called_once_with(api_key="minted-token")
+        base_client.chat.completions.with_streaming_response.create.assert_not_called()
+        base_client.close.assert_not_called()
+        call_client.close.assert_not_called()
+
+    def test_abort_during_response_parse_closes_handle_and_propagates(self):
+        client = MagicMock()
+        ref = StreamAbortRef()
+        manager, response = _response_manager()
+
+        def _abort_while_parsing():
+            ref.abort()
+            return MagicMock(text="too late")
+
+        response.parse.side_effect = _abort_while_parsing
+        client.audio.transcriptions.with_streaming_response.create.return_value = manager
+
+        with pytest.raises(DeadlineCancelledError):
+            audio.transcribe(
+                registry=_FakeRegistry("voice", _Cfg("whisper-1"), client),
+                alias="voice",
+                data=b"x",
+                filename="a.wav",
+                cancel_ref=ref,
+            )
+
+        response.close.assert_called()
+
+    def test_abort_after_transcription_manager_creation_prevents_dispatch(self):
+        client = MagicMock()
+        ref = StreamAbortRef()
+        manager, response = _response_manager(parsed=MagicMock(text="too late"))
+
+        def _create_manager(**_kwargs):
+            ref.abort()
+            return manager
+
+        client.audio.transcriptions.with_streaming_response.create.side_effect = _create_manager
+
+        with pytest.raises(DeadlineCancelledError):
+            audio.transcribe(
+                registry=_FakeRegistry("voice", _Cfg("whisper-1"), client),
+                alias="voice",
+                data=b"x",
+                filename="a.wav",
+                cancel_ref=ref,
+            )
+
+        manager.__enter__.assert_not_called()
+        response.parse.assert_not_called()
+
+    def test_abort_after_omni_manager_creation_prevents_dispatch(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        client = MagicMock()
+        ref = StreamAbortRef()
+        manager, response = _response_manager(
+            parsed=MagicMock(choices=[MagicMock(message=MagicMock(content="too late"))])
+        )
+
+        def _create_manager(**_kwargs):
+            ref.abort()
+            return manager
+
+        client.chat.completions.with_streaming_response.create.side_effect = _create_manager
+
+        with pytest.raises(DeadlineCancelledError):
+            audio.transcribe(
+                registry=_FakeRegistry(
+                    "omni", _Cfg("gemma-omni", {"supports_audio_input": True}), client
+                ),
+                alias="omni",
+                data=b"x",
+                filename="a.webm",
+                cancel_ref=ref,
+            )
+
+        manager.__enter__.assert_not_called()
+        response.parse.assert_not_called()
 
 
 class TestSynthesize:
     def test_calls_audio_speech_and_returns_bytes(self):
         client = MagicMock()
-        speech = MagicMock()
-        speech.read.return_value = b"RIFF...wavbytes"
-        client.audio.speech.create.return_value = speech
+        manager, _response = _response_manager(body=b"RIFF...wavbytes")
+        client.audio.speech.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
         res = audio.synthesize(registry=reg, alias="voice", text="hi", voice="nova")
         assert res.audio_bytes == b"RIFF...wavbytes"
         assert res.media_type == "audio/mpeg"
         assert res.model_alias == "voice"
-        kwargs = client.audio.speech.create.call_args.kwargs
+        kwargs = client.audio.speech.with_streaming_response.create.call_args.kwargs
         assert kwargs["voice"] == "nova"
         assert kwargs["input"] == "hi"
 
     def test_default_voice_when_empty(self):
         client = MagicMock()
-        client.audio.speech.create.return_value = MagicMock(read=lambda: b"a")
+        manager, _response = _response_manager(body=b"a")
+        client.audio.speech.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
         audio.synthesize(registry=reg, alias="voice", text="hi", voice="")
-        assert client.audio.speech.create.call_args.kwargs["voice"] == "alloy"
+        kwargs = client.audio.speech.with_streaming_response.create.call_args.kwargs
+        assert kwargs["voice"] == "alloy"
 
     def test_backend_failure_raises_backend_error(self):
         client = MagicMock()
-        client.audio.speech.create.side_effect = RuntimeError("down")
+        client.audio.speech.with_streaming_response.create.side_effect = RuntimeError("down")
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
         with pytest.raises(audio.AudioBackendError):
             audio.synthesize(registry=reg, alias="voice", text="hi", voice="nova")
+
+    def test_uses_authenticated_clone_and_pinned_config(self):
+        base_client = MagicMock()
+        call_client = MagicMock()
+        base_client.with_options.return_value = call_client
+        manager, _response = _response_manager(body=b"voice")
+        call_client.audio.speech.with_streaming_response.create.return_value = manager
+        cfg = _Cfg("gpt-4o-mini-tts")
+        resolver = MagicMock(return_value="minted-token")
+
+        result = audio.synthesize(
+            registry=_FakeRegistry("voice", cfg, base_client),
+            alias="voice",
+            text="hello",
+            voice="alloy",
+            backend_auth_resolver=resolver,
+        )
+
+        assert result.audio_bytes == b"voice"
+        resolver.assert_called_once_with("voice", cfg)
+        base_client.with_options.assert_called_once_with(api_key="minted-token")
+        base_client.audio.speech.with_streaming_response.create.assert_not_called()
+        base_client.close.assert_not_called()
+        call_client.close.assert_not_called()
+
+    def test_abort_after_speech_manager_creation_prevents_dispatch(self):
+        client = MagicMock()
+        ref = StreamAbortRef()
+        manager, response = _response_manager(body=b"too late")
+
+        def _create_manager(**_kwargs):
+            ref.abort()
+            return manager
+
+        client.audio.speech.with_streaming_response.create.side_effect = _create_manager
+
+        with pytest.raises(DeadlineCancelledError):
+            audio.synthesize(
+                registry=_FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client),
+                alias="voice",
+                text="hello",
+                voice="alloy",
+                cancel_ref=ref,
+            )
+
+        manager.__enter__.assert_not_called()
+        response.read.assert_not_called()
 
 
 class TestOpenAIAudioModelsKnown:
@@ -314,9 +516,7 @@ class TestOpenAIAudioModelsKnown:
 
 
 class TestTranscribeCached:
-    """The memoized, non-raising transcribe used by the no-native-audio wire
-    fallback.  Caching an STT result is an audio-domain concern, so it lives here
-    next to ``transcribe`` rather than bundled with PDF text extraction."""
+    """Memoized STT for the no-native-audio wire fallback."""
 
     def _result(self, text: str):
         return audio.TranscriptionResult(transcript=text, model_alias="w", model="m")
@@ -324,13 +524,14 @@ class TestTranscribeCached:
     def test_memoizes_by_alias_and_hash(self, monkeypatch):
         audio._clear_transcript_cache_for_test()
         calls = []
+        reg = _FakeRegistry("w", _Cfg("whisper-1"), MagicMock())
 
-        def fake(*, registry, alias, data, filename):
+        def fake(binding, **kwargs):
             calls.append(1)
             return self._result("hello world")
 
-        monkeypatch.setattr(audio, "transcribe", fake)
-        kw = dict(registry=object(), alias="w", content_hash="h1", data=b"x", filename="a.wav")
+        monkeypatch.setattr(audio, "_transcribe_binding", fake)
+        kw = dict(registry=reg, alias="w", content_hash="h1", data=b"x", filename="a.wav")
         assert audio.transcribe_cached(**kw) == "hello world"
         assert audio.transcribe_cached(**kw) == "hello world"
         assert len(calls) == 1  # second served from cache
@@ -338,16 +539,181 @@ class TestTranscribeCached:
     def test_backend_failure_returns_empty_and_is_not_cached(self, monkeypatch):
         audio._clear_transcript_cache_for_test()
         calls = []
+        reg = _FakeRegistry("w", _Cfg("whisper-1"), MagicMock())
 
-        def boom(*, registry, alias, data, filename):
+        def boom(binding, **kwargs):
             calls.append(1)
             raise audio.AudioBackendError("down")
 
-        monkeypatch.setattr(audio, "transcribe", boom)
-        kw = dict(registry=object(), alias="w", content_hash="h2", data=b"x", filename="a.wav")
+        monkeypatch.setattr(audio, "_transcribe_binding", boom)
+        kw = dict(registry=reg, alias="w", content_hash="h2", data=b"x", filename="a.wav")
         assert audio.transcribe_cached(**kw) == ""
         audio.transcribe_cached(**kw)
         assert len(calls) == 2  # failure not cached -> retried
+
+    @pytest.mark.parametrize("failure_seam", ["resolve", "transcribe"])
+    def test_abort_during_backend_failure_propagates_cancellation(
+        self,
+        monkeypatch,
+        failure_seam,
+    ):
+        audio._clear_transcript_cache_for_test()
+        ref = StreamAbortRef()
+        reg = _FakeRegistry("w", _Cfg("whisper-1"), MagicMock())
+
+        if failure_seam == "resolve":
+
+            def fail_resolve(**_kwargs):
+                ref.abort()
+                raise audio.AudioUnavailableError("gone")
+
+            monkeypatch.setattr(audio, "_resolve_audio_binding", fail_resolve)
+        else:
+
+            def fail_transcribe(_binding, **_kwargs):
+                ref.abort()
+                raise audio.AudioBackendError("down")
+
+            monkeypatch.setattr(audio, "_transcribe_binding", fail_transcribe)
+
+        with pytest.raises(DeadlineCancelledError):
+            audio.transcribe_cached(
+                registry=reg,
+                alias="w",
+                content_hash="cancelled-failure",
+                data=b"x",
+                filename="a.wav",
+                cancel_ref=ref,
+            )
+
+        assert audio._transcript_cache == {}
+
+    def test_disappeared_alias_returns_empty_before_backend_dispatch(self, monkeypatch):
+        audio._clear_transcript_cache_for_test()
+        transcribe = MagicMock()
+        monkeypatch.setattr(audio, "_transcribe_binding", transcribe)
+        reg = _FakeRegistry("live", _Cfg("whisper-1"), MagicMock())
+
+        result = audio.transcribe_cached(
+            registry=reg,
+            alias="removed",
+            content_hash="gone",
+            data=b"x",
+            filename="a.wav",
+        )
+
+        assert result == ""
+        transcribe.assert_not_called()
+        assert audio._transcript_cache == {}
+
+    def test_pre_aborted_unknown_alias_propagates_cancellation(self):
+        audio._clear_transcript_cache_for_test()
+        ref = StreamAbortRef()
+        ref.abort()
+
+        with pytest.raises(DeadlineCancelledError):
+            audio.transcribe_cached(
+                registry=_FakeRegistry("live", _Cfg("whisper-1"), MagicMock()),
+                alias="removed",
+                content_hash="gone",
+                data=b"x",
+                filename="a.wav",
+                cancel_ref=ref,
+            )
+
+        assert audio._transcript_cache == {}
+
+    def test_cache_isolated_by_principal_and_registry_generation(self, monkeypatch):
+        audio._clear_transcript_cache_for_test()
+        calls = []
+        reg = _FakeRegistry("w", _Cfg("whisper-1"), MagicMock())
+
+        def fake(binding, **kwargs):
+            calls.append((binding.registry_generation, kwargs["data"]))
+            return self._result(f"result-{len(calls)}")
+
+        monkeypatch.setattr(audio, "_transcribe_binding", fake)
+        common = dict(
+            registry=reg,
+            alias="w",
+            content_hash="same",
+            data=b"x",
+            filename="a.wav",
+        )
+
+        assert audio.transcribe_cached(**common, principal_id="user-a") == "result-1"
+        assert audio.transcribe_cached(**common, principal_id="user-b") == "result-2"
+        assert audio.transcribe_cached(**common, principal_id="user-a") == "result-1"
+        reg.generation = 1
+        assert audio.transcribe_cached(**common, principal_id="user-a") == "result-3"
+        assert calls == [(0, b"x"), (0, b"x"), (1, b"x")]
+
+    def test_racing_empty_result_never_clobbers_real_transcript(self, monkeypatch):
+        audio._clear_transcript_cache_for_test()
+        reg = _FakeRegistry("w", _Cfg("whisper-1"), MagicMock())
+
+        def racing_empty(binding, **kwargs):
+            key = (
+                "user-a",
+                binding.lane.alias,
+                binding.registry_generation,
+                "race",
+            )
+            with audio._transcript_lock:
+                audio._transcript_cache[key] = "real from racer"
+            return self._result("")
+
+        monkeypatch.setattr(audio, "_transcribe_binding", racing_empty)
+        result = audio.transcribe_cached(
+            registry=reg,
+            alias="w",
+            content_hash="race",
+            data=b"x",
+            filename="a.wav",
+            principal_id="user-a",
+        )
+
+        assert result == "real from racer"
+        assert audio._transcript_cache[("user-a", "w", 0, "race")] == "real from racer"
+
+    def test_pre_aborted_cache_hit_propagates_cancellation(self, monkeypatch):
+        audio._clear_transcript_cache_for_test()
+        reg = _FakeRegistry("w", _Cfg("whisper-1"), MagicMock())
+        monkeypatch.setattr(
+            audio,
+            "_transcribe_binding",
+            lambda binding, **kwargs: self._result("cached"),
+        )
+        common = dict(
+            registry=reg,
+            alias="w",
+            content_hash="same",
+            data=b"x",
+            filename="a.wav",
+            principal_id="user-a",
+        )
+        assert audio.transcribe_cached(**common) == "cached"
+        ref = StreamAbortRef()
+        ref.abort()
+        with pytest.raises(DeadlineCancelledError):
+            audio.transcribe_cached(**common, cancel_ref=ref)
+
+    def test_backend_auth_refusal_is_not_swallowed(self):
+        audio._clear_transcript_cache_for_test()
+
+        def refuse(alias, cfg):
+            raise BackendAuthUnavailableError("unavailable")
+
+        with pytest.raises(BackendAuthUnavailableError):
+            audio.transcribe_cached(
+                registry=_FakeRegistry("w", _Cfg("whisper-1"), MagicMock()),
+                alias="w",
+                content_hash="h",
+                data=b"x",
+                filename="a.wav",
+                principal_id="user-a",
+                backend_auth_resolver=refuse,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -396,9 +762,10 @@ class TestOmniChatCall:
     def test_sends_thinking_off_and_token_cap(self, monkeypatch):
         monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
         client = MagicMock()
-        client.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="hi"))]
+        manager, _response = _response_manager(
+            parsed=MagicMock(choices=[MagicMock(message=MagicMock(content="hi"))])
         )
+        client.chat.completions.with_streaming_response.create.return_value = manager
         cfg = _Cfg(
             "gemma-omni",
             {
@@ -413,7 +780,7 @@ class TestOmniChatCall:
             data=b"webmbytes",
             filename="speech.webm",
         )
-        kwargs = client.chat.completions.create.call_args.kwargs
+        kwargs = client.chat.completions.with_streaming_response.create.call_args.kwargs
         assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
         assert kwargs["max_tokens"] == audio._OMNI_STT_MAX_TOKENS
 
@@ -528,10 +895,64 @@ class TestTranscribeStream:
 
     def test_whisper_alias_emits_single_chunk(self):
         client = MagicMock()
-        client.audio.transcriptions.create.return_value = MagicMock(text="  full transcript  ")
+        manager, _response = _response_manager(parsed=MagicMock(text="  full transcript  "))
+        client.audio.transcriptions.with_streaming_response.create.return_value = manager
         cfg = _Cfg("whisper-1")  # name inference -> dedicated endpoint, no chat stream
-        gen = audio.transcribe_stream(
-            registry=_FakeRegistry("w", cfg, client), alias="w", data=b"x"
-        )
+        registry = _FakeRegistry("w", cfg, client)
+        gen = audio.transcribe_stream(registry=registry, alias="w", data=b"x")
         assert list(gen) == ["full transcript"]
+        assert registry.resolve_binding_calls == 1
+        client.chat.completions.create.assert_not_called()
+
+    def test_omni_stream_uses_authenticated_clone_and_abort_closes_handle(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        base_client = MagicMock()
+        call_client = MagicMock()
+        base_client.with_options.return_value = call_client
+        stream = MagicMock()
+        stream.__iter__.return_value = iter([_stream_chunk("hello")])
+        call_client.chat.completions.create.return_value = stream
+        cfg = _Cfg("omni", {"supports_audio_input": True})
+        resolver = MagicMock(return_value="minted-token")
+        ref = StreamAbortRef()
+
+        deltas = audio.transcribe_stream(
+            registry=_FakeRegistry("omni", cfg, base_client),
+            alias="omni",
+            data=b"x",
+            backend_auth_resolver=resolver,
+            cancel_ref=ref,
+        )
+
+        resolver.assert_called_once_with("omni", cfg)
+        base_client.with_options.assert_called_once_with(api_key="minted-token")
+        base_client.chat.completions.create.assert_not_called()
+        ref.abort()
+        with pytest.raises(DeadlineCancelledError):
+            list(deltas)
+        stream.close.assert_called()
+        base_client.close.assert_not_called()
+        call_client.close.assert_not_called()
+
+    def test_abort_during_final_omni_request_shaping_prevents_dispatch(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        client = MagicMock()
+        ref = StreamAbortRef()
+
+        def _abort_in_final_shaping(_cfg):
+            ref.abort()
+            return {}
+
+        monkeypatch.setattr(audio, "_omni_chat_extra_body", _abort_in_final_shaping)
+
+        with pytest.raises(DeadlineCancelledError):
+            audio.transcribe_stream(
+                registry=_FakeRegistry(
+                    "omni", _Cfg("gemma-omni", {"supports_audio_input": True}), client
+                ),
+                alias="omni",
+                data=b"x",
+                cancel_ref=ref,
+            )
+
         client.chat.completions.create.assert_not_called()

@@ -15,7 +15,7 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -26,15 +26,23 @@ from turnstone.core.deadline import (
 )
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import ModelClientConstructionError
-from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
+from turnstone.core.model_turn import (
+    ModelLane,
+    ResolvedModelBinding,
+    model_turn,
+    require_lane_capabilities,
+    resolve_lane,
+    resolve_model_binding,
+    same_model_lane_binding,
+)
 from turnstone.core.trajectory import Turn
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.model_registry import ModelConfig
     from turnstone.core.model_turn import ModelTurnResult
-    from turnstone.core.providers._protocol import LLMProvider, ModelCapabilities
 
 log = get_logger(__name__)
 
@@ -848,6 +856,174 @@ def _positive_window(*candidates: Any, floor: int = _DEFAULT_JUDGE_CONTEXT_WINDO
     return floor
 
 
+def _model_bindings_match(left: ResolvedModelBinding, right: ResolvedModelBinding) -> bool:
+    """Whether two resolved bindings have the same judge-visible semantics.
+
+    Registry generation is deliberately excluded: an unrelated alias edit bumps
+    it without changing this judge.  Identity-sensitive plant handles retain the
+    same comparison used by the session binding, while the frozen config and
+    resolved lane facets catch capability, extra-parameter, and sampling changes.
+    """
+    return (
+        same_model_lane_binding(left.lane, right.lane)
+        and left.config == right.config
+        and left.lane.capabilities == right.lane.capabilities
+        and left.lane.extra_params == right.lane.extra_params
+        and left.lane.temperature == right.lane.temperature
+        and left.lane.reasoning_effort == right.lane.reasoning_effort
+    )
+
+
+def _config_store_version(config_store: Any | None) -> int | None:
+    """Return a real ConfigStore version, or ``None`` for legacy test doubles.
+
+    Some callers intentionally pass duck-typed stores.  In particular, a bare
+    ``MagicMock`` manufactures a ``.version`` attribute on demand; treating
+    that object as a generation would make every equality check depend on mock
+    truthiness rather than on a monotone integer.
+    """
+    if config_store is None:
+        return None
+    try:
+        version = config_store.version
+    except Exception:
+        log.debug("judge.config_version_read_failed", exc_info=True)
+        return None
+    return version if type(version) is int else None
+
+
+def _judge_binding_from_session(
+    session_binding: ResolvedModelBinding,
+    config_store: Any | None,
+) -> ResolvedModelBinding:
+    """Build the session-model fallback lane with judge sampling semantics.
+
+    Before judges held a frozen :class:`ResolvedModelBinding`, every
+    evaluation called :func:`resolve_lane`: provider/client/model and
+    capabilities stayed pinned to the session, while the operator sampling
+    ladder was read from ConfigStore.  Rebuilding that lane at judge
+    construction keeps those semantics without mutating an in-flight judge.
+    """
+    session_lane = session_binding.lane
+    judge_lane = resolve_lane(
+        session_lane.provider,
+        session_lane.client,
+        session_lane.model,
+        alias=session_lane.alias,
+        registry=session_lane.registry,
+        capabilities=require_lane_capabilities(session_lane),
+        cfg=session_binding.config,
+        config_store=config_store,
+        backend_auth_resolver=session_lane.backend_auth_resolver,
+    )
+    return replace(session_binding, lane=judge_lane)
+
+
+@dataclass
+class _JudgeBindingState:
+    """Pinned judge binding plus mutable no-op generation stamps.
+
+    The binding and lane never mutate.  The checked generations are freshness
+    watermarks: after an unrelated registry or ConfigStore update resolves to
+    the same binding, advancing them avoids repeating that work without
+    replacing the judge or its lane.
+    """
+
+    binding: ResolvedModelBinding
+    requested_alias: str
+    resolved_explicitly: bool
+    config_store: Any | None
+    checked_registry_generation: int
+    checked_config_version: int | None
+
+    def is_current(
+        self,
+        session_binding: ResolvedModelBinding,
+        *,
+        requested_alias: str | None = None,
+    ) -> bool:
+        """Return whether constructing now would select this same binding.
+
+        Explicit judge aliases are checked independently of the primary session
+        alias.  An inherited/failed-alias judge instead follows the supplied
+        session binding.  A generation-only unrelated edit advances only the
+        watermark; a changed effective binding returns ``False`` so the session
+        can replace the whole judge between evaluations.
+        """
+        desired = self.requested_alias if requested_alias is None else requested_alias.strip()
+        if desired != self.requested_alias:
+            return False
+
+        registry = session_binding.lane.registry
+        if registry is not self.binding.lane.registry:
+            return False
+
+        current_config_version = _config_store_version(self.config_store)
+        if registry is None:
+            current_generation = session_binding.registry_generation
+        else:
+            try:
+                current_generation = registry.generation
+            except Exception:
+                log.debug("judge.binding_generation_read_failed", exc_info=True)
+                return False
+
+        # A primary /model switch need not bump the registry generation.  An
+        # explicitly routed judge is independent of it; an inherited judge is
+        # current only while the primary binding (projected through the judge's
+        # sampling ladder) still matches.  ConfigStore has its own generation:
+        # temperature/effort updates do not reload the model registry.
+        generation_changed = current_generation != self.checked_registry_generation
+        config_changed = current_config_version != self.checked_config_version
+        if self.resolved_explicitly and not generation_changed and not config_changed:
+            return True
+
+        candidate = _judge_binding_from_session(session_binding, self.config_store)
+        resolved_explicitly = False
+        if registry is not None and desired and (self.resolved_explicitly or generation_changed):
+            try:
+                candidate = resolve_model_binding(
+                    registry,
+                    desired,
+                    config_store=self.config_store,
+                    backend_auth_resolver=session_binding.lane.backend_auth_resolver,
+                )
+                resolved_explicitly = True
+            except (ModelClientConstructionError, ValueError, KeyError):
+                # Reconstructing at this generation would take the documented
+                # session-model fallback.  Compare that outcome below.
+                candidate = _judge_binding_from_session(session_binding, self.config_store)
+            except Exception:
+                log.debug("judge.binding_refresh_failed", exc_info=True)
+                return False
+
+        if resolved_explicitly != self.resolved_explicitly:
+            return False
+        if not _model_bindings_match(self.binding, candidate):
+            return False
+
+        # Stamp the registry generation actually observed, not the fallback
+        # candidate's session-binding stamp: an unrelated reload can leave the
+        # effective primary binding unchanged while its caller-supplied stamp
+        # still names the previous generation.  Re-read before committing so a
+        # concurrent second reload cannot bless an unchecked generation.
+        observed_registry_generation = current_generation
+        if registry is not None:
+            try:
+                observed_registry_generation = registry.generation
+            except Exception:
+                log.debug("judge.binding_generation_read_failed", exc_info=True)
+                return False
+            if observed_registry_generation != current_generation:
+                return False
+        observed_config_version = _config_store_version(self.config_store)
+        if observed_config_version != current_config_version:
+            return False
+        self.checked_registry_generation = observed_registry_generation
+        self.checked_config_version = observed_config_version
+        return True
+
+
 def honest_truncate(text: str, budget: int) -> str:
     """Return *text* untouched when it fits *budget* characters, otherwise the
     leading ``budget`` characters followed by an explicit note of exactly how
@@ -972,32 +1148,17 @@ class IntentJudge:
     def __init__(
         self,
         config: JudgeConfig,
-        session_provider: LLMProvider,
-        session_client: Any,
-        session_model: str,
-        session_capabilities: ModelCapabilities | None = None,
+        session_binding: ResolvedModelBinding,
         rule_registry: Any | None = None,
-        model_registry: Any | None = None,
-        session_model_alias: str = "",
         config_store: Any | None = None,
-        backend_auth_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._config = config
+        self._config_fingerprint = self._fingerprint_config(config)
         self._rule_registry = rule_registry
-        # Carried into the per-evaluation ModelLane so extra_params, the
-        # live operator flags, and the temperature ladder (per-model value →
-        # global ``model.temperature``) resolve like every other lane.
-        self._model_registry = model_registry
-        self._config_store = config_store
-        self._backend_auth_resolver = backend_auth_resolver
-        # The caller (ChatSession) resolves the session model's real caps from
-        # _get_capabilities (config/registry-aware) and passes them in; they are
-        # this judge's wire capabilities and window when it inherits the session
-        # model.  The window is taken ONLY from these resolved caps (else a
-        # floor) — NEVER provider.get_capabilities(), whose static 200000 for a
-        # local model would blind the budget to overflow.
-        session_window = (
-            session_capabilities.context_window if session_capabilities is not None else None
+        session_caps = require_lane_capabilities(session_binding.lane)
+        session_window = _positive_window(
+            getattr(session_binding.config, "context_window", None),
+            session_caps.context_window,
         )
 
         # Resolve judge model via ModelRegistry alias, otherwise self-
@@ -1011,57 +1172,30 @@ class IntentJudge:
         # returned ``llm_fallback``).  Operators register an alias
         # instead; an unknown value here logs a warning and inherits the
         # session model.
+        requested_alias = str(config.model or "").strip()
+        registry = session_binding.lane.registry
+        config_version_at_start = _config_store_version(config_store)
+        binding = _judge_binding_from_session(session_binding, config_store)
         resolved = False
         construction_error: ModelClientConstructionError | None = None
-        if config.model and model_registry is not None:
+        if requested_alias and registry is not None:
             try:
-                if model_registry.has_alias(config.model):
-                    # One locked snapshot for client + provider — separate
-                    # resolve()/get_provider() calls could pair an old-map
-                    # client with a new-map provider (wrong SDK dialect).
-                    client, model_name, model_cfg, provider, _ = model_registry.resolve_binding(
-                        config.model
-                    )
-                    self._provider = provider
-                    self._client_factory_args = self._extract_client_config(
-                        client,
-                        self._provider.provider_name,
-                    )
-                    self._model = model_name
-                    self._alias = config.model
-                    # The shared lane resolver (model_turn) merges the alias's
-                    # capability overrides; it deliberately does NOT fold in
-                    # ModelConfig.context_window — that is a separate field,
-                    # sized into the judge's window budget right below (the
-                    # static caps table reports 200000 for local models, which
-                    # would silently over-budget them).
-                    # ``cfg=model_cfg`` reuses the config resolve() already
-                    # fetched — one lookup, one generation; a hot-reload
-                    # between two fetches cannot mix client/window with
-                    # foreign capability overrides.
-                    self._capabilities = resolve_capabilities(
-                        self._provider, self._model, config.model, model_registry, cfg=model_cfg
-                    )
-                    # Use the registry's per-model context window, NOT
-                    # ``provider.get_capabilities().context_window``: the static
-                    # capability table returns 200000 for every model absent
-                    # from it (i.e. every local / self-hosted judge), so keying
-                    # the budget off it silently over-budgets a small local
-                    # judge into overflow.  ModelConfig.context_window is the
-                    # operator-configured / auto-detected real window.
-                    # ``_positive_window`` is defensive: a malformed ModelConfig
-                    # (missing attr) or any stray non-positive window degrades to
-                    # the session ``context_window`` then a floor, so it neither
-                    # aborts resolution nor zeroes the budgets.
-                    self._judge_context_window = _positive_window(
-                        getattr(model_cfg, "context_window", None),
-                        session_window,
-                    )
-                    resolved = True
+                # One locked registry snapshot builds provider, client, model,
+                # capabilities, extra params, and sampling facets from the SAME
+                # ModelConfig.  No second config read can mix generations.
+                binding = resolve_model_binding(
+                    registry,
+                    requested_alias,
+                    config_store=config_store,
+                    backend_auth_resolver=session_binding.lane.backend_auth_resolver,
+                )
+                resolved = True
             except ModelClientConstructionError as exc:
                 construction_error = exc
+            except (ValueError, KeyError):
+                pass
             except Exception:
-                log.debug("Model alias resolution failed for %r, falling back", config.model)
+                log.debug("Model alias resolution failed for %r, falling back", requested_alias)
 
         if not resolved:
             if construction_error is not None:
@@ -1072,39 +1206,67 @@ class IntentJudge:
                 log.warning(
                     "judge.model=%r is registered but its client could not be "
                     "constructed (%s) — falling back to session model %r.",
-                    config.model,
+                    requested_alias,
                     construction_error,
-                    session_model,
+                    session_binding.lane.model,
                 )
-            elif config.model:
+            elif requested_alias:
                 log.warning(
                     "judge.model=%r is not a registered alias — falling back to "
                     "session model %r.  Register the model in the Models tab and "
                     "set judge.model to its alias.",
-                    config.model,
-                    session_model,
+                    requested_alias,
+                    session_binding.lane.model,
                 )
-            self._provider = session_provider
-            self._client_factory_args = self._extract_client_config(
-                session_client,
-                session_provider.provider_name,
-            )
-            self._model = session_model
-            # Inherit the session's registry alias so the lane resolves
-            # extra_params / replay flag / vLLM attach exactly like every
-            # other lane on the same model — with alias "" (no registry
-            # alias, or a legacy caller) each registry pass degrades to its
-            # documented miss behavior, matching the pre-#827 judges.
-            self._alias = session_model_alias
-            # Wire caps: the caller's resolved session caps, or the provider's
-            # static table as a last resort for degraded / legacy callers.
-            self._capabilities = (
-                session_capabilities
-                if session_capabilities is not None
-                else session_provider.get_capabilities(session_model)
-            )
-            # Coerce here too, defensively against a non-positive session window.
-            self._judge_context_window = _positive_window(session_window)
+            binding = _judge_binding_from_session(session_binding, config_store)
+
+        self._binding_state = _JudgeBindingState(
+            binding=binding,
+            requested_alias=requested_alias,
+            resolved_explicitly=resolved,
+            config_store=config_store,
+            checked_registry_generation=binding.registry_generation,
+            checked_config_version=config_version_at_start,
+        )
+        # The semantic lane is pinned for the judge object's lifetime.  Intent
+        # evaluations still substitute a fresh client per daemon batch for
+        # thread isolation; no provider/model/config facet is re-resolved.
+        self._lane = binding.lane
+        self._model = self._lane.model
+        self._capabilities = require_lane_capabilities(self._lane)
+        self._client_factory_args = self._extract_client_config(
+            self._lane.client,
+            self._lane.provider.provider_name,
+        )
+        self._judge_context_window = _positive_window(
+            getattr(binding.config, "context_window", None),
+            session_window,
+        )
+
+    @staticmethod
+    def _fingerprint_config(config: JudgeConfig) -> tuple[str, float, float, bool]:
+        """Constructor-consumed behavior that requires a fresh judge object."""
+        return (
+            str(config.model or "").strip(),
+            config.max_context_ratio,
+            config.timeout,
+            config.read_only_tools,
+        )
+
+    def binding_is_current(
+        self,
+        session_binding: ResolvedModelBinding,
+        config: JudgeConfig | None = None,
+    ) -> bool:
+        """Whether this judge can be reused for the next evaluation.
+
+        In-flight daemon work keeps this object's pinned lane.  The session calls
+        this only at the next evaluation boundary and replaces the whole object
+        when it returns ``False``.
+        """
+        if config is not None and self._fingerprint_config(config) != self._config_fingerprint:
+            return False
+        return self._binding_state.is_current(session_binding)
 
     # -- Client lifecycle helpers -------------------------------------------
 
@@ -1128,6 +1290,7 @@ class IntentJudge:
         callback: Callable[[IntentVerdict], None],
         cancel_event: threading.Event | None = None,
         done_callback: Callable[[], None] | None = None,
+        backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     ) -> list[IntentVerdict]:
         """Evaluate tool calls. Returns heuristic verdicts immediately.
 
@@ -1154,6 +1317,10 @@ class IntentJudge:
                 uses it to retire the generation's cancel event from its
                 live set (parallel task agents each spawn a generation;
                 ``close()`` aborts whatever is still live).
+            backend_auth_resolver: Batch-scoped resolver whose closure pins
+                the initiating principal.  It is invoked once by the daemon,
+                after its initial cancellation check, and the resulting token
+                is reused for every item and evidence turn in this batch.
 
         Returns:
             List of heuristic verdicts (one per item), available immediately.
@@ -1179,7 +1346,15 @@ class IntentJudge:
         # Spawn daemon thread for LLM judge
         thread = threading.Thread(
             target=self._run_judge,
-            args=(items, messages, heuristic_verdicts, callback, cancel_event, done_callback),
+            args=(
+                items,
+                messages,
+                heuristic_verdicts,
+                callback,
+                cancel_event,
+                done_callback,
+                backend_auth_resolver,
+            ),
             daemon=True,
             name="intent-judge",
         )
@@ -1195,6 +1370,7 @@ class IntentJudge:
         callback: Callable[[IntentVerdict], None],
         cancel_event: threading.Event | None = None,
         done_callback: Callable[[], None] | None = None,
+        backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     ) -> None:
         """Daemon thread: run LLM judge for each item and invoke callback.
 
@@ -1211,8 +1387,55 @@ class IntentJudge:
         no supersede, every evaluation runs to completion so all
         verdicts are delivered.
         """
-        client = self._create_client()
+        client: Any | None = None
         try:
+            if cancel_event and cancel_event.is_set():
+                self._deliver_fallbacks(
+                    items,
+                    heuristic_verdicts,
+                    callback,
+                    "judge cancelled before evaluating this call",
+                )
+                return
+
+            # Resolve delegated credentials exactly once for the batch.  The
+            # caller-supplied closure has already captured the initiating
+            # principal, so a later shared-workstream handoff cannot mint a
+            # successor user's token for this payload.
+            backend_auth_token: str | None = None
+            batch_lane = self._lane
+            if backend_auth_resolver is not None:
+                try:
+                    backend_auth_token = backend_auth_resolver(
+                        self._lane.alias,
+                        self._lane.backend_auth_config,
+                    )
+                except Exception:
+                    log.exception("Judge backend authentication failed")
+                    self._deliver_fallbacks(
+                        items,
+                        heuristic_verdicts,
+                        callback,
+                        "judge backend authentication failed",
+                    )
+                    return
+                batch_lane = replace(batch_lane, backend_auth_resolver=None)
+
+            if cancel_event and cancel_event.is_set():
+                self._deliver_fallbacks(
+                    items,
+                    heuristic_verdicts,
+                    callback,
+                    "judge cancelled before evaluating this call",
+                )
+                return
+
+            client = self._create_client()
+            # One lane derivative for the whole batch: only the judge-owned
+            # fresh client differs from the immutable constructor binding.
+            # Every item and evidence turn therefore stays on one provider,
+            # model, capability, config, and credential snapshot.
+            batch_lane = replace(batch_lane, client=client)
             for idx, (item, h_verdict) in enumerate(zip(items, heuristic_verdicts, strict=True)):
                 if cancel_event and cancel_event.is_set():
                     log.info("judge.cancelled", remaining=len(items) - idx)
@@ -1229,6 +1452,8 @@ class IntentJudge:
                         messages,
                         cancel_event,
                         client,
+                        lane=batch_lane,
+                        backend_auth_token=backend_auth_token,
                     )
                     if llm_verdict:
                         log.info(
@@ -1280,7 +1505,7 @@ class IntentJudge:
                     self._deliver_fallbacks([item], [h_verdict], callback, "judge evaluation error")
         finally:
             try:
-                if hasattr(client, "close"):
+                if client is not None and hasattr(client, "close"):
                     client.close()
             except Exception:
                 log.debug("judge.client_close_failed", exc_info=True)
@@ -1321,9 +1546,16 @@ class IntentJudge:
         item: dict[str, Any],
         messages: list[dict[str, Any]],
         cancel_event: threading.Event | None,
-        client: Any,
+        client: Any | None,
+        *,
+        lane: ModelLane | None = None,
+        backend_auth_token: str | None = None,
     ) -> IntentVerdict | None:
         """Run LLM judge for a single tool call. Returns verdict or None."""
+        if lane is None:
+            if client is None:
+                raise ValueError("intent judge evaluation requires a client or pinned lane")
+            lane = replace(self._lane, client=client)
         start = time.monotonic()
         func_name = item.get("func_name", item.get("name", ""))
         func_args = item.get("func_args", {})
@@ -1359,25 +1591,10 @@ class IntentJudge:
         if self._config.read_only_tools:
             tools = list(_JUDGE_TOOL_SCHEMAS)
 
-        # The judge's resolved lane for this evaluation: fresh client per run
-        # (thread isolation), extra_params / live flags / temperature ladder
-        # from the registry like every other lane.  Capabilities are
-        # DELIBERATELY the constructor-frozen set (not re-resolved here):
-        # the judge's window budget was sized against them at construction,
-        # and the session swaps the whole judge on model/credential change —
-        # an in-place capabilities edit to the same alias applies on the
-        # next judge swap, keeping caps and window from ever disagreeing
-        # within one judge lifetime.
-        lane = resolve_lane(
-            self._provider,
-            client,
-            self._model,
-            alias=self._alias,
-            registry=self._model_registry,
-            capabilities=self._capabilities,
-            config_store=self._config_store,
-            backend_auth_resolver=self._backend_auth_resolver,
-        )
+        # ``lane`` is the constructor-pinned binding with only the fresh
+        # batch client substituted.  No registry/config facet is re-resolved
+        # inside an evaluation; window sizing and wire capabilities therefore
+        # cannot disagree.
 
         # Multi-turn judge loop
         result = None  # will hold the last ModelTurnResult
@@ -1437,6 +1654,7 @@ class IntentJudge:
                         tools=_tools,
                         max_tokens=2048,
                         cancel_ref=ref,
+                        backend_auth_token=backend_auth_token,
                     )
 
                 result = run_abortable_with_deadline(

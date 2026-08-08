@@ -3,8 +3,8 @@
 Turnstone is an AI orchestration platform with tool use, parallel workstreams, and persistent
 memory. It connects to any OpenAI-compatible API (local vLLM, OpenAI, etc.) or
 Anthropic's native Messages API via pluggable provider adapters, and gives the
-model 16 built-in tools plus external tools via MCP (Model Context Protocol) for
-reading, writing, searching, and executing code.
+model role-specific built-in tools plus external tools via MCP (Model Context
+Protocol) for reading, writing, searching, and executing code.
 
 The core design principle is a **UI-agnostic engine with pluggable frontends**.
 The engine (`ChatSession`) drives the conversation loop -- streaming, tool
@@ -35,7 +35,13 @@ turnstone/
   server.py           Web frontend (WebUI, HTTP handler, static-file serving)
   eval.py             Evaluation harness (HeadlessSession, scoring, prompt optimization)
   core/
-    session.py        ChatSession engine, SessionUI protocol, tool dispatch
+    session.py        ChatSession engine, generation ownership, tool dispatch
+    session_manager.py Workstream lifecycle, deferred create, state publication
+    session_ui_base.py Shared SSE state, concurrent approval cycles, verdict bookkeeping
+    trajectory.py     Canonical provider-neutral Turn trajectory and effect metadata
+    model_turn.py     ModelLane binding + the single lower/sample/re-ingest boundary
+    model_backend_auth.py Per-call static/dynamic model-backend credential policy
+    state_writer.py   Incarnation-fenced write-behind workstream state persistence
     providers/        LLM provider adapters (pluggable backend layer)
       _protocol.py    LLMProvider protocol, ModelCapabilities, StreamChunk, CompletionResult
       _openai.py      OpenAIProvider facade (re-exports Chat/Responses providers)
@@ -45,18 +51,18 @@ turnstone/
       _anthropic.py   AnthropicProvider — Anthropic Messages API, native streaming, thinking
       _google.py      GoogleProvider — Google Gemini via OpenAI-compat endpoint
       __init__.py     create_provider() + create_client() factory functions
-    workstream.py     Parallel workstream manager (WorkstreamState, Workstream, WorkstreamManager)
+    workstream.py     Workstream runtime state and worker ownership (WorkstreamState, Workstream)
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
     mcp_client.py     MCPClientManager — MCP server connections, tool discovery, dynamic refresh
     tool_search.py    Dynamic tool search — BM25 index, session-scoped tool visibility
     watch.py          WatchRunner daemon — periodic command polling, condition DSL, result dispatch
     judge.py          Intent validation — heuristic rules + LLM judge, advisory verdicts
-    model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
+    model_registry.py ModelRegistry — immutable configs, atomic binding snapshots, fallback routing
     memory.py         Persistence facade + structured memory API (delegates to storage backend)
     config.py         Config file loader (config.toml), apply_config(), warn_migrated_settings()
     config_store.py   ConfigStore — database-backed settings with in-memory cache, thread-safe get/set
-    settings_registry.py  SettingDef catalog (~40 settings), validation, type coercion, serialization
-    storage/          Pluggable storage: StorageBackend protocol, SQLite + PostgreSQL
+    settings_registry.py  SettingDef catalog, validation, type coercion, serialization
+    storage/          Pluggable storage, atomic fork/create lifecycle, SQLite + PostgreSQL
     metrics.py        Prometheus-compatible metrics collector (MetricsCollector)
     healthcheck.py    BackendHealthMonitor — periodic probe + circuit breaker
     ratelimit.py      Per-IP token-bucket rate limiter (RateLimiter, TokenBucket)
@@ -74,7 +80,7 @@ turnstone/
   sdk/
     server.py         AsyncTurnstoneServer + TurnstoneServer (HTTP client)
     console.py        AsyncTurnstoneConsole + TurnstoneConsole (HTTP client)
-    events.py         27 SSE event dataclasses with type registry
+    events.py         SSE event dataclasses with type registry
     _base.py          Shared httpx async client, auth, error handling
     _sync.py          Background event loop for sync wrappers
     _types.py         TurnResult + TurnstoneAPIError
@@ -102,7 +108,7 @@ turnstone/
       renderer.js     Markdown + LaTeX renderer (tables, nested lists, blockquotes, KaTeX math)
       app.js          Split-pane UI (Pane class, binary layout tree, SSE, tool approval)
   tools/
-    *.json            16 tool schemas (OpenAI function-calling format + turnstone metadata)
+    *.json            Role-specific tool schemas and synthetic tool surfaces
 ```
 
 Both UIs share a common design system extracted into `turnstone/shared_static/`: design tokens, login overlay, toast notifications, theme toggle, keyboard shortcuts, and utility functions. Each UI imports `base.css` and the shared JS modules at `/shared/`, then adds only page-specific code at `/static/`.
@@ -122,23 +128,34 @@ A user message flows through the system as follows:
  ChatSession.send(user_input)
      |
      v
- _full_messages()  ------------>  system_messages + self.messages
+ _claim_generation()  ---------->  monotonic owner + fresh cancel event
+     |                              initiating principal pinned to the owner
+     v
+ _refresh_model_from_registry() -> atomically replace ResolvedModelBinding
+     |                              when the registry generation changed
+     v
+ _initialize_send_generation() --> append the canonical USER Turn and stage
+     |                              ordered durable writes as one generation commit
+     v
+ _full_messages()  ------------>  system messages + canonical Turn trajectory
      |
      v
  _emit_state("thinking")
      |
      v
- _stream_response()  ------------->  model_turn(lane, turns, on_chunk=...) per attempt
-     |                                  lane-swap fallback walk; per-lane ladder:
-     |                                  up to 3 retries (4 total attempts), exponential backoff
+ _stream_response()  ------------->  model_turn(ModelLane, turns, on_chunk=...)
+     |                                  primary/fallback lane walk; per-lane retry ladder
      v
- the on_chunk consumer  ----------->  display grid ONLY:
+ the on_chunk consumer  ----------->  generation-fenced display projection:
      |                                  on_reasoning_token() / on_content_token()
      |                                  tool-call deltas just flush the splitter
      |                                    (assembly lives in drain_stream, inside
      |                                    model_turn — the consumer never accumulates)
      |                                  track finish_reason (citations-footer gate)
-     |                                  _check_cancelled() per chunk (cooperative cancel)
+     |                                  reject cancelled or superseded publication
+     v
+ ModelTurnResult.turn  ------------>  canonical ASSISTANT Turn, serving-lane
+     |                                  provenance, usage, and wire facts
      v
  finish_reason check:
      +--- "length"  --> warn, discard partial tool_calls
@@ -146,12 +163,12 @@ A user message flows through the system as follows:
      v
  tool_calls present?
      |
-     +--- No ---> _print_status_line() -> _emit_state("idle") -> return
+     +--- No ---> commit assistant/status/idle for this generation -> return
      |
      +--- Yes --> _emit_state("running")
                     |
                     v
-                  _execute_tools(tool_calls)  <--- three-phase pipeline (see below)
+                  _execute_tools(tool_calls)  <--- four-phase pipeline (see below)
                     |
                     v
                   append tool results to self.messages
@@ -160,11 +177,20 @@ A user message flows through the system as follows:
                   loop back to _full_messages()
 ```
 
+Every mutable publication from a worker-owned turn carries its originating
+generation. `_publish_for_generation()` admits short live/UI changes only
+while that generation still owns the session. `_commit_for_generation()`
+atomically changes bounded in-memory state and stages immutable persistence
+closures; those closures run outside the generation lock but through a FIFO
+ticket lane. The caller still waits for durability, while Stop, close, and a
+force successor remain responsive and a newer accepted row cannot overtake an
+older one.
+
 ### Tool Execution Pipeline
 
 > See also: [Tool Pipeline diagram](diagrams/png/05-tool-pipeline.png)
 
-Tool execution is a three-phase process:
+Tool execution is a four-phase process:
 
 ```
 Phase 1: PREPARE (serial)
@@ -175,16 +201,18 @@ Phase 1: PREPARE (serial)
       -> validate inputs, build preview text
       -> return item dict with: header, preview, needs_approval, execute fn
 
-Phase 2: APPROVE (serial, blocking)
+Phase 2: APPROVE (blocking per batch; reentrant across agents)
   _emit_state("attention")
   ui.approve_tools(items)
-    -> display all headers and previews
-    -> if any need approval and not auto_approve: prompt user
-    -> return (approved, feedback)
+    -> apply policy, explicit auto-approval, and Smart Approvals
+    -> register one ApprovalCycle with its own cycle_id/event/result
+    -> publish one complete approve_request card
+    -> resolve by cycle_id/call_id (legacy clients select the oldest cycle)
+    -> return this cycle's (approved, feedback)
   _emit_state("running")
 
 Phase 3: EXECUTE (parallel)
-  _check_cancelled()  <-- cancellation checkpoint before execution starts
+  _check_cancelled(generation)  <-- checkpoint before execution starts
   if len(items) == 1:
     run_one(items[0])
   else:
@@ -192,8 +220,27 @@ Phase 3: EXECUTE (parallel)
   Bash tool streams stdout line-by-line via ui.on_tool_output_chunk(call_id, line)
     (cancel_event also checked per line — kills process group on cancel)
   Final output (stdout + stderr) delivered via ui.on_tool_result(call_id, name, output)
-  call_id links tool_info items → streaming chunks → final result
+
+Phase 4: GUARD + ATOMIC FOLD
+  compact/truncate results against the shared output budget
+  run heuristic + optional LLM output guard
+  re-check exact generation ownership after guard work
+  the complete result batch + advisories + queued feedback folds under one
+    generation commit; durable tool rows retain typed effect metadata
 ```
+
+Parallel task agents can reach independent approval gates at the same time.
+`SessionUIBase` therefore stores an insertion-ordered registry of
+`ApprovalCycle` objects rather than one global pending event. A targeted click
+can resolve only its cycle. Each prepared batch also carries one frozen Smart
+Approval settings snapshot (enabled flag, confidence threshold, and verdict
+wait), so concurrent gates cannot combine fields from different hot-reload
+generations; a partially or inconsistently stamped batch fails closed to human
+review. Workstream-wide Stop/close paths run an admission barrier, deny every
+cycle owned by the cancelled operation, and leave a newly claimed successor's
+cycles alone. Late judge verdicts are matched by both call ID and
+judge-generation identity; stale verdicts remain audit-only and cannot
+smart-approve a reused call ID.
 
 ### State Transitions
 
@@ -221,10 +268,21 @@ The engine emits state changes via `_emit_state()` which calls
       |
   (or "error"  --->  exception or KeyboardInterrupt)
 
-  cancel() may be called from any state. It sets a cooperative flag
-  checked at each streaming chunk, before tool execution, and inside
-  bash commands. The session transitions to "idle" with partial
-  content preserved, emitting on_info("[Generation cancelled]").
+  cancel() may be called from any state. Cooperative Stop sets the current
+  generation's event, closes registered model streams, wakes retry backoff,
+  aborts child model scopes, and denies that operation's approval cycles.
+
+  Force Stop also releases the wedged worker slot so a successor can claim a
+  new generation. The abandoned daemon thread may still unwind. Generation and
+  stream-registration fences prevent abandoned send/model generations from
+  publishing into the successor; quick slash-command workers remain a
+  best-effort operator escape hatch and may finish an in-place mutation because
+  they do not yet carry generation checkpoints.
+
+  A cancelled partial assistant response is persisted with an explicit marker.
+  Every unanswered tool call receives a synthetic TOOL Turn: effect_status is
+  "unknown" when its outcome was not observed, "none" when it definitely never
+  started, or a stronger staged receipt when the executor reported one.
 ```
 
 ---
@@ -233,13 +291,15 @@ The engine emits state changes via `_emit_state()` which calls
 
 > See also: [Core Engine Classes diagram](diagrams/png/03-core-engine-classes.png)
 
-Defined in `turnstone.core.session.SessionUI` as a `typing.Protocol` with 15
-methods. Every frontend must implement all of them.
+Defined in `turnstone.core.session.SessionUI` as a `typing.Protocol`. Its
+callbacks separate turn/stream lifecycle, tool interaction,
+durable operator-context events, and governance results:
 
 ```python
 class SessionUI(Protocol):
     def on_turn_start(self) -> None: ...
     def on_turn_committed(self) -> None: ...
+    def on_stream_discarded(self) -> None: ...
     def on_thinking_start(self) -> None: ...
     def on_thinking_stop(self) -> None: ...
     def on_reasoning_token(self, text: str) -> None: ...
@@ -247,14 +307,25 @@ class SessionUI(Protocol):
     def on_stream_end(self) -> None: ...
     def approve_tools(self, items: list[dict]) -> tuple[bool, str | None]: ...
     def on_tool_result(
-        self, call_id: str, name: str, output: str, *, is_error: bool = False
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+        preview: dict | None = None,
     ) -> None: ...
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict, context_window: int, effort: str) -> None: ...
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
+    def on_system_turn(self, content: str, source: str, meta: dict | None = None) -> int | None: ...
+    def on_compaction(self, payload: dict) -> int | None: ...
     def on_state_change(self, state: str) -> None: ...
-    def on_rename(self, name: str) -> None: ...  # propagate alias to tab/UI label
+    def on_rename(self, name: str) -> None: ...
+    def on_intent_verdict(self, verdict: dict, judge_event: object | None = None) -> None: ...
+    def on_output_warning(self, call_id: str, assessment: dict) -> None: ...
+    def record_output_assessment(self, call_id: str, assessment: dict, **facts) -> None: ...
 ```
 
 `on_turn_start` fires at the top of each iteration of the send-loop;
@@ -265,14 +336,22 @@ that fuel the SSE refresh-resume `in_progress_snapshot` event — see
 the per-workstream events stream in
 [`docs/api-reference.md`](api-reference.md#get-v1apiworkstreamsws_idevents).
 
+`on_stream_discarded` removes a failed attempt's partial projection before a
+mid-stream retry. `on_system_turn` and `on_compaction` return the assigned SSE
+event ID when the frontend has one; persistence stamps the corresponding row
+with that cursor so reconnect replay and `/history` agree. The `judge_event`
+argument is the intent-judge generation identity used to reject stale verdicts
+from a prior approval round.
+
 `on_rename` is called by the `/name` command (on success) and after a successful `/resume` (if the resumed session has an alias or title). `WebUI.on_rename` broadcasts a `ws_rename` event on the global SSE channel and updates the in-memory `Workstream.name`; `TerminalUI.on_rename` is a no-op.
 
-### Three Implementations
+### Implementations
 
 | Class | Module | Notes |
 |-------|--------|-------|
 | `TerminalUI` | `turnstone.cli` | ANSI colors, `MarkdownRenderer`, `Spinner`, readline-based `input()` for approval |
 | `WebUI` | `turnstone.server` | SSE event queue per workstream + global broadcast, `threading.Event` for blocking on approval. `on_state_change` sends to both per-workstream and global SSE (the browser UI uses per-workstream `state_change` events to manage busy/idle transitions; `stream_end` only finalizes markdown rendering). |
+| `ConsoleCoordinatorUI` | `turnstone.console.coordinator_ui` | Reuses `SessionUIBase`; mirrors lifecycle, approval, and verdict events onto the coordinator tree stream. |
 | `NullUI` | `turnstone.eval.core` | Discards all output; `approve_tools` always returns `(True, None)` |
 
 ### WorkstreamTerminalUI
@@ -297,7 +376,10 @@ awareness:
 ## Workstream Architecture
 
 Workstreams are parallel, independent chat sessions. Each has its own
-`ChatSession`, `SessionUI`, message history, and worker thread.
+`ChatSession`, `SessionUI`, canonical trajectory, worker slot, and durable
+lifecycle. Interactive and coordinator workstreams use the same
+`SessionManager`; kind-specific construction, cleanup, and event fan-out live
+behind adapters.
 
 ### WorkstreamState
 
@@ -318,58 +400,164 @@ ERROR      last operation failed
 ```python
 @dataclass
 class Workstream:
-    id: str  # uuid hex, 8 chars
+    id: str  # full UUID hex identity
     name: str  # user-visible label
+    kind: WorkstreamKind
+    user_id: str
+    parent_ws_id: str | None
+    project_id: str | None
     state: WorkstreamState  # current state
     session: ChatSession | None  # the conversation engine
     ui: SessionUI | None  # frontend adapter
     worker_thread: threading.Thread | None
+    worker_kind: str
     error_message: str
     last_active: float  # time.monotonic() timestamp, updated on every state change
-    _lock: threading.Lock  # per-workstream state lock
+    _fork_reservation_token: str  # private durable incarnation fence
+    _state_revision: int
+    _state_incarnation: int
+    _lock: threading.Lock  # short per-workstream state/worker mutations
+    _lifecycle_lock: threading.RLock  # birth versus terminal serialization
+    _state_tail_lock: threading.Lock  # durable state/observer ordering
 ```
 
-### WorkstreamManager
+The durable incarnation token and lifecycle fields are internal and never appear in
+public workstream/config projections. They distinguish successive objects that
+reuse one logical ID. Manager-created rows receive the token at registration;
+legacy rows acquire one atomically when rehydration, delete, or fork preflight
+takes its authoritative snapshot. This prevents an old manager state
+transition, buffered lifecycle-state write, stale delete authorization, or
+fork operation from targeting a replacement incarnation.
+
+### SessionManager
 
 ```python
-class WorkstreamManager:
-    MAX_WORKSTREAMS = 10
-
-    def __init__(self, session_factory: Callable[[SessionUI], ChatSession]): ...
-    def create(self, name="", ui_factory=None) -> Workstream: ...
+class SessionManager:
+    def create(self, *, user_id: str, defer_emit_created: bool = False, ...) -> Workstream: ...
+    def commit_create(self, ws: Workstream) -> bool: ...
+    def discard(self, ws_id: str, *, expected: Workstream | None = None, ...) -> bool: ...
+    def open(self, ws_id: str) -> Workstream | None: ...
     def close(self, ws_id: str) -> bool: ...
+    def delete_persisted(self, ws_id: str, *, delete_fn: Callable[[], bool], ...) -> bool: ...
     def close_idle(
         self, max_age_seconds: float
     ) -> list[str]: ...  # auto-close stale IDLE workstreams
+    def reap_stale_creating_reservations(
+        self, max_age_seconds: float = 2 * 60 * 60
+    ) -> list[str]: ...  # hard-delete crash-abandoned hidden reservations
     def get(self, ws_id: str) -> Workstream | None: ...
-    def get_active(self) -> Workstream | None: ...
     def list_all(self) -> list[Workstream]: ...
     def switch(self, ws_id: str) -> Workstream | None: ...
     def switch_by_index(self, index: int) -> Workstream | None: ...
-    def set_state(self, ws_id, state, error_msg=""): ...  # updates last_active
+    def set_state(self, ws_id, state, error_msg=""): ...
+    def set_state_deferred(self, ws_id, state, *, deferred_persistence, ...): ...
 ```
 
-The `session_factory` pattern decouples session creation from configuration.
-The factory captures shared config (client, model, temperature, etc.) and
-accepts only a `SessionUI`, so the manager can create sessions without knowing
-API details.
+`SessionKindAdapter` decouples kind-specific UI/session construction from lifecycle
+policy. The manager owns exact-object admission, capacity, hidden creates,
+open/close/delete ordering, state durability, and lifecycle events; adapters
+own how an interactive or coordinator session is built and cleaned up.
+
+### Atomic Create and Fork Lifecycle
+
+Every manager create begins as a hidden durable reservation:
+
+```
+reserve exact Workstream object under the per-ID lane
+    -> INSERT workstreams(state="creating") + private token atomically
+    -> build UI and ChatSession outside the manager lock
+    -> token-guard initial workstream configuration
+    -> validate uploads and other fallible prepublication setup
+    -> optional storage.clone_workstream(...) transaction
+    -> prepare remaining alias/UI publication data against the same token
+    -> CAS creating -> idle
+    -> emit ws_created
+    -> expose through get/list/open and allow worker dispatch
+```
+
+The HTTP create handler always uses `defer_emit_created=True`. Normal failure or
+request cancellation before publication immediately calls `discard()` and
+conditionally deletes only the row carrying the returned token; it cannot
+delete a same-ID replacement. A `creating` row is excluded from ordinary
+open/list surfaces, so other nodes cannot observe a half-built session.
+
+Forking is a storage transaction, not a sequence of message copies. The
+transaction reauthorizes the source, validates its current persona/project
+envelope against the destination session's immutable
+`ForkCloneExpectation`, compares the source token captured during canonical
+preflight, verifies the destination token and emptiness, copies
+the checkpoint-bounded canonical Turns and configuration, retains attachment
+blob references, and binds the effective project. Any source drift, corrupt
+attachment reference, or destination race aborts the whole transaction. Only
+after the committed snapshot is adopted in memory does the normal
+`creating -> idle -> ws_created` publication run.
+
+Rehydration binds the private token before constructing the session, then
+rechecks it after configuration and history are loaded; a delete/re-register
+crossing retires the hybrid candidate and retries from a fresh snapshot.
+Loaded hard-delete similarly compares the endpoint's authorized token with
+both the local and current durable incarnations before making any terminal
+mutation. It closes generation publication, drains every already-admitted
+`_commit_for_generation` durability ticket and the state tail, then performs
+the token-conditional delete. A stale request leaves a current successor
+untouched; a stale local object or failed delete is retired without publishing
+a false `ws_closed` event.
+
+That drain covers manager-owned session durability admitted through the ticket
+lane. Direct legacy storage helpers that mutate only by `ws_id` are not made
+token-conditional by this refactor and must not be used as a same-ID reuse
+fence; the incarnation token guarantees exact create/fork/delete target
+selection, not a new transaction contract for every maintenance API.
+
+#### Crash-Abandoned Create Recovery
+
+`creating` is an internal storage lifecycle value, not a live
+`WorkstreamState`. Server and console lifecycle maintenance run a recovery pass
+at boot and then on an independent five-minute cadence, even when ordinary idle
+eviction is disabled; the CLI runs the boot pass once per launch. A pass only
+considers rows still in `state='creating'` whose `updated` timestamp is more than
+two hours old, and excludes every ID in the manager's loaded snapshot, including
+pending creates.
+
+Service liveness is fetched before deletion. A row owned by a live remote node
+is protected, while the current process's stable node ID deliberately does not
+self-protect: after a restart, a predecessor's abandoned row can carry the same
+ID. The manager snapshot and two-hour grace protect the current process's own
+work. If liveness cannot be established, the pass deletes nothing.
+
+For each eligible row, the storage backend atomically locks and rechecks state,
+age, and the private incarnation token before using the complete hard-delete
+path. Conversations, configuration, overrides, and attachment references and
+refcounts are cleaned in the same transaction. An eligible legacy or corrupt
+reservation without a token is still recoverable: the locked durable row is its
+incarnation fence, and the backend logs a warning. Storage uncertainty rolls the
+attempt back and is reported as no reaped IDs. The recovery path emits no
+lifecycle event and never converts an unpublished reservation into a closed,
+reopenable workstream.
 
 ### Idle Workstream Lifecycle
 
-The web server runs a background `_idle_cleanup_thread` (daemon) that calls
-`WorkstreamManager.close_idle()` periodically (every `timeout / 4`, max 5 min).
-Any IDLE workstream whose `last_active` is older than the configured timeout is
-closed; non-IDLE workstreams (THINKING, RUNNING, ATTENTION, ERROR) are never
-touched. The last workstream is always preserved even if expired. On close, a
-`ws_closed` event is broadcast on the global SSE channel so browser clients
-remove the tab immediately. Controlled by `--workstream-idle-timeout` (default:
-120 minutes, 0 = disable).
+The web server's background lifecycle-maintenance thread calls
+`SessionManager.close_idle()` when ordinary idle eviction is enabled (every
+`timeout / 4`, max 5 min). Any loaded IDLE workstream whose `last_active` is
+older than the configured timeout is closed; non-IDLE loaded workstreams are
+not. A second storage pass closes old, unloaded rows left by dead process
+incarnations. It protects rows whose `node_id` belongs to a currently
+heartbeating peer and skips the pass entirely if service-liveness lookup fails.
+On close, a `ws_closed` event is broadcast so browser clients remove the tab.
+`--workstream-idle-timeout` controls this path (default: 120 minutes, 0 =
+disable); the separate stale-create recovery above keeps running when it is 0.
 
-**Workstream eviction at capacity:** When `WorkstreamManager.create()` would
+**Workstream eviction at capacity:** When `SessionManager.create()` would
 exceed `max_workstreams` (configurable via `[server].max_workstreams`, default
-50), the oldest IDLE workstream is automatically evicted to make room. The
-`turnstone_workstreams_evicted_total` counter is incremented on each eviction.
-If no IDLE workstream is available the create request fails as before.
+50), the oldest IDLE, worker-free workstream is considered for eviction. The
+candidate is only a hint: the manager takes its per-ID and object lifecycle
+lanes, rechecks IDLE/worker ownership and `send_barrier_active()` under the
+workstream lock, installs a terminal tombstone, and only then swaps the
+capacity slot. A command, queued send, claimed send drain, or turn admitted
+before that claim makes the candidate ineligible. The
+`turnstone_workstreams_evicted_total` counter increments only after a successful
+claim; if no safe candidate remains, creation fails at capacity.
 
 ### CLI Workstreams
 
@@ -406,9 +594,22 @@ non-idle background workstreams above the input prompt.
 
 ### Thread Safety
 
-- `WorkstreamManager._lock`: guards `_workstreams` dict and `_order` list on
-  all create/close/switch/list operations.
-- `Workstream._lock`: guards per-workstream state mutations in `set_state()`.
+- `SessionManager._lock`: guards registries, visible order, pending creates,
+  capacity accounting, and short manager admission only; storage and callbacks
+  run outside it.
+- `Workstream._lock`: guards one workstream's worker pair and short state
+  mutations.
+- The per-ID lifecycle lane orders create/open/close/hard-delete across object
+  incarnations; `Workstream._lifecycle_lock` orders one object's birth against
+  its terminal paths.
+- `Workstream._state_tail_lock` orders accepted state persistence and observer
+  events. `_state_revision` rejects superseded tails, while
+  `_state_incarnation` and `StateWriter` prevent close/reopen ABA writes.
+- `ChatSession._generation_lock` fences one turn's live mutations;
+  `_durability_cond` tickets its deferred storage batches in admission order.
+- `SessionUIBase._ws_lock` protects concurrent approval cycles, verdict caches,
+  and SSE projection state; approval admission uses a separate condition so
+  Stop never waits on database I/O.
 - `WorkstreamTerminalUI._print_lock`: guards `_output_buffer` access.
 - `WorkstreamTerminalUI._fg_event`: `threading.Event` that blocks background
   approval until the workstream is foregrounded.
@@ -425,9 +626,13 @@ turnstone metadata keys:
 
 | Metadata Key | Type | Meaning |
 |-------------|------|---------|
+| `interactive` | `bool` | Explicitly include a shared tool on the interactive surface |
+| `coordinator` | `bool` | Include the tool on the coordinator surface; without `interactive`, exclude it from interactive sessions |
 | `task_agent` | `bool` | Include this tool when running as a task sub-agent |
-| `auto_approve` | `bool` | Tool is read-only; skip user approval |
+| `auto_approve` | `bool` | Supply the tool-level automatic-approval default; prepare-time policy may refine it per action |
 | `primary_key` | `str` | Fallback argument name for bare-string JSON recovery |
+| `kind_variants` | `object` | Override descriptions or parameter schemas for a workstream kind |
+| `cwd_note` / `workspace_note` | `str` | Append a session-specific path note without mutating the shared schema constants |
 
 Example (`read_file.json`):
 
@@ -454,36 +659,33 @@ At import time, `turnstone.core.tools._load_tools()` strips the metadata keys
 from each schema and builds:
 
 - `TOOLS` -- list of `{"type": "function", "function": {...}}` dicts for the API
+- `INTERACTIVE_TOOLS` / `COORDINATOR_TOOLS` -- kind-filtered schemas with
+  applicable variants already overlaid
 - `TASK_AGENT_TOOLS` -- subset with `task_agent: true`
 - `TASK_AUTO_TOOLS` -- set of tool names with `auto_approve: true`
 - `PRIMARY_KEY_MAP` -- `{name: primary_key}` for JSON fallback recovery
 - `merge_mcp_tools(builtin, mcp_tools)` -- merges built-in + MCP tools at session init
 
-### 16 Tools by Category
+### Role-Specific Tool Surfaces
 
-**Read-only (auto-approve)**:
-- `read_file` -- read file contents with optional offset/limit
-- `diff_file` -- show diff between two files / versions
-- `search` -- ripgrep-based codebase search
-- `recall` -- search conversation history
-- `read_resource` -- read an MCP resource by URI
+`TOOLS` is the union catalog used for introspection and schema documentation;
+it is not handed wholesale to every model. The loader derives narrower,
+immutable bases:
 
-**Write (requires approval)**:
-- `bash` -- execute shell commands (with safety checks via `turnstone.core.safety`)
-- `write_file` -- create or overwrite a file
-- `edit_file` -- string replacement in an existing file (requires prior `read_file`)
-- `web_fetch` -- fetch a URL (with SSRF protection via `turnstone.core.web`)
-- `web_search` -- search the web (provider-native for Anthropic/OpenAI, self-hosted SearxNG fallback for local models)
-- `notify` -- send a user-facing notification (Discord/Slack, optional reply routing)
-- `watch` -- schedule a recurring poll with condition DSL
+- `INTERACTIVE_TOOLS` combines local file/shell/search, web, memory, skills,
+  watch/notification, preview, prompt, and delegated-agent capabilities.
+- `COORDINATOR_TOOLS` focuses on spawning, inspecting, messaging, waiting for,
+  cancelling, and closing workstreams, plus cluster visibility and the shared
+  memory/skills surfaces.
+- `TASK_AGENT_TOOLS` is the explicit metadata-selected subset suitable inside
+  a delegated loop. It cannot recursively expose `task_agent`.
 
-**Agent (delegated sub-sessions)**:
-- `task_agent` -- delegate to a sub-agent with full tool access (`TASK_AGENT_TOOLS`)
-
-**Memory / skills / prompts**:
-- `memory` -- save, search, delete, or list memories (typed and scoped)
-- `skill` -- invoke a skill (governed, versioned procedure)
-- `use_prompt` -- fetch and apply a prompt template
+Kind variants narrow descriptions and enums before a session sees them. MCP
+tools are then appended to the applicable session/task-agent base, and dynamic
+tool search may expose only the relevant subset to the model. Approval is
+decided from the prepared action, not merely its verb: for example, `skills`
+has read, activation, and write actions with different policy gates. The JSON
+schemas in `turnstone/tools/` are the authoritative catalog.
 
 The tool name uses the `_agent` suffix — bare `task` collides with
 chat-template channels on some local models.
@@ -597,15 +799,29 @@ registries.
 
 > See also: [Core Engine Classes diagram](diagrams/png/03-core-engine-classes.png)
 
-`ChatSession` is provider-agnostic — it delegates all LLM communication to an
-`LLMProvider` protocol (`turnstone/core/providers/_protocol.py`). Internally,
-messages use an OpenAI-like format; each provider translates at the API boundary.
+`ChatSession` is provider-agnostic and no longer owns mutable raw
+provider/client/model handles. Its model state is one immutable
+`ResolvedModelBinding`; all LLM communication passes through `model_turn()` and
+the `LLMProvider` protocol (`turnstone/core/providers/_protocol.py`). The
+in-memory history is canonical `Turn` IR. An OpenAI-like dict shape exists only
+as a transient lowering bridge before each provider translates at the API
+boundary.
 
 ```
 ChatSession
     |
+    +-- ResolvedModelBinding
+    |       +-- ModelLane (provider, client, model, capabilities, params)
+    |       +-- immutable ModelConfig snapshot
+    |       +-- registry generation
+    |
     v
-LLMProvider (protocol)
+model_turn(ModelLane, list[Turn])
+    |
+    +-- lowering.py: Turn IR -> repaired provider-neutral wire dicts
+    |
+    v
+LLMProvider.create_streaming()  (the single transport call site)
     |
     +--- OpenAIProvider  --- OpenAI, vLLM, llama.cpp, any /v1/chat/completions API
     +--- AnthropicProvider --- Anthropic Messages API (native streaming, thinking)
@@ -628,8 +844,19 @@ LLMProvider (protocol)
 |------|--------|
 | `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason`, `provider_blocks` |
 | `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage`, `provider_blocks` |
+| `ModelLane` | Frozen per-loop provider/client/model binding, capabilities, sampling knobs, registry reference, and backend-auth seam |
+| `ResolvedModelBinding` | A `ModelLane`, its immutable `ModelConfig`, and the registry generation read in the same snapshot |
+| `ModelTurnResult` | Canonical assistant `Turn`, tool-call dispatch mirror, serving-lane provenance, usage, and exact lowered wire facts |
 | `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision`, `supports_reasoning_replay`, `supports_verbosity`, `verbosity`, `supports_pro_mode`, `reasoning_mode` |
 | `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_creation_tokens`, `cache_read_tokens` |
+
+`ModelLane` is frozen: a fallback, model switch, or registry reload produces a
+replacement lane rather than mutating one in place. A holder of an old lane
+(for example, an in-flight compaction or sub-agent) therefore completes against
+one coherent backend binding or is cancelled; it never observes a mixture of
+old endpoint/client state and new capabilities/configuration. Per-call operator
+toggles that are intentionally live, such as reasoning replay, are re-read by
+`model_turn()` through the lane's registry reference.
 
 **OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
 already in OpenAI format), including multi-part content blocks (text + images)
@@ -720,6 +947,44 @@ agent_model = "claude"
 Each `[models.*]` entry produces a `ModelConfig` with a `provider` field
 (default: `"openai"`). Supported values: `"openai"`, `"anthropic"`, `"google"`,
 `"openai-compatible"`, and `"anthropic-compatible"`.
+
+**Atomic bindings and reloads:** `ModelConfig` is frozen. Registry
+`resolve_binding()` acquires the registry lock once and returns the client,
+model ID, config, provider, and monotonic registry generation from the same
+snapshot. `resolve_model_binding()` turns those values into one frozen
+`ResolvedModelBinding` for `ChatSession`. A completed `reload()` increments the
+registry generation; each new send compares by equality and replaces the whole
+binding on mismatch. Failed reload validation changes neither maps nor
+generation. If only non-transport fields changed, compatible client pools can
+remain warm, but the session still receives a new coherent config/lane.
+
+Primary loops, recursive compaction, judges, title generation, audio, and task
+agents all consume `ModelLane` rather than inspecting provider/client handles.
+Fallback is a lane change, so retry classification and result provenance come
+from the lane that actually served the call. A recursive compaction pins one
+lane for all leaf summaries and the merge; a hot reload never splices two model
+definitions into one summary transaction.
+
+**Model-backend authentication:** A model definition's `auth_mode` is one of
+`static`, `entra_obo`, `entra_app`, or `rfc8693_obo`. Dynamic modes keep only
+authorization parameters (`obo_audience`, and RFC 8693 `obo_scopes`) in the
+immutable `ModelConfig`; access tokens are never stored on the registry client
+or lane. `model_backend_auth.resolve_model_backend_auth_token()` joins that
+pinned config with the initiating generation's principal and the process-owned
+mint client immediately before dispatch. `model_turn()` checks cancellation
+before and after the potentially blocking mint, then installs the credential
+on a per-call `client.with_options(api_key=...)` clone that reuses the cached
+transport.
+
+Delegated modes fail closed without an initiating user. App identity does not
+require one. A keyless dynamic alias always fails if minting is unavailable;
+an alias with an explicit static key may fall back only when the operator has
+not enabled `model.auth_fail_closed`. Registry install/reload refuses dynamic
+auth when the process lacks the protected token store, and grant-profile
+mismatches are surfaced at the swap boundary. The default `static` path does
+not invoke any OIDC/OBO machinery. See
+[Settings](settings.md#model-backend-authentication) and
+[OIDC](oidc.md#model-gateway-credentials) for operator configuration.
 
 **Per-model sampling overrides:** Each model can specify `temperature`,
 `max_tokens`, and `reasoning_effort` to override the global defaults from
@@ -1005,6 +1270,27 @@ backstop for the cases where they bailed or freed too little.
 
 ## Persistence
 
+### Canonical Trajectory
+
+The durable and in-memory conversation shape is the provider-neutral `Turn`
+from `turnstone.core.trajectory`. It is flat and role-discriminated: portable
+text and content-addressed `AttachmentRef` values form `content`; assistant
+turns may carry byte-exact `ToolCall` arguments; tool turns link back by call
+ID; and provenance, SSE cursors, effect records, and display-only facts live in
+wire-invisible `TurnMeta`.
+
+`ProviderNative` is the one opaque lane for reasoning and server-side tool
+blocks that cannot be normalized safely. It replays only to its producing
+provider; another provider rebuilds the request from neutral fields. Signed,
+encrypted, and structured blocks remain opaque, while trust-boundary lowering
+copies and defangs editable top-level text so native replay cannot resurrect a
+forged session marker. Attachment bytes never ride in a `Turn`; each output
+boundary resolves its ordered references from the blob store.
+
+Storage rehydrates canonical Turns, and `model_turn()` is the sole lowering and
+re-ingest boundary. OpenAI-like dict adapters remain a compatibility bridge for
+legacy consumers, not a second source of trajectory truth.
+
 ### Storage Architecture
 
 Persistence is managed by the `turnstone.core.storage` package — a pluggable
@@ -1012,11 +1298,11 @@ backend behind a `StorageBackend` protocol. The `memory.py` facade provides
 backward-compatible module-level functions that delegate to the active backend.
 
 ```
-session.py / server.py / cli.py
-        ↓
-    memory.py  (facade — silent-failure wrappers)
-        ↓
-    storage._registry  (singleton factory)
+ChatSession / SessionManager / HTTP lifecycle
+        |
+        +-- generation FIFO durability / StateWriter incarnation fence
+        v
+    memory.py + storage._registry
         ↓
   ┌─────────────┐    ┌──────────────────┐
   │ SQLiteBackend │    │ PostgreSQLBackend │
@@ -1039,38 +1325,47 @@ at the baseline revision.
 
 ### Tables
 
+The complete schema includes governance, identity, project, attachment, model,
+and operations tables. The lifecycle/trajectory core is:
+
 ```sql
-memories
-  key      TEXT PRIMARY KEY
-  value    TEXT NOT NULL
-  created  TEXT NOT NULL
-  updated  TEXT NOT NULL
+structured_memories
+  memory_id, name, type, scope, scope_id, content, timestamps, access counters
 
 workstreams
-  ws_id       TEXT PRIMARY KEY
-  node_id     TEXT NOT NULL
+  ws_id       TEXT PRIMARY KEY        -- logical workstream identity
+  node_id     TEXT                    -- owning service cache / routing hint
+  user_id     TEXT                    -- owner
+  alias       TEXT UNIQUE
+  title       TEXT
   name        TEXT NOT NULL
-  state       TEXT NOT NULL DEFAULT 'idle'
-  alias       TEXT UNIQUE            -- user-assigned short name (nullable)
-  title       TEXT                   -- LLM-generated title (nullable)
-  created     TEXT NOT NULL
-  updated     TEXT NOT NULL          -- bumped on every save_message()
+  state       TEXT NOT NULL           -- creating | live states | closed/deleted
+  kind        TEXT NOT NULL           -- interactive | coordinator
+  parent_ws_id, project_id, persona, skill_id, skill_version
+  created, updated
 
 conversations
   id            INTEGER PRIMARY KEY AUTOINCREMENT
   ws_id         TEXT NOT NULL
   timestamp     TEXT NOT NULL
-  role          TEXT NOT NULL        -- user | assistant | tool_call | tool_result
+  role          TEXT NOT NULL        -- user | assistant | tool | system
   content       TEXT
   tool_name     TEXT
-  tool_args     TEXT
-  tool_call_id  TEXT                 -- links tool_call ↔ tool_result for resume
-  provider_data TEXT                 -- raw provider content (e.g. Anthropic encrypted)
+  tool_call_id  TEXT                 -- links TOOL Turn to assistant call
+  tool_calls    TEXT                 -- assistant ToolCall tuple as JSON
+  provider_data TEXT                 -- opaque producer-native block lane
+  _source       TEXT                 -- operator/compaction provenance
+  event_id      BIGINT               -- per-workstream SSE resume cursor
+  is_error      BOOLEAN
+  attachments   TEXT                 -- ordered content-addressed refs
+  meta          TEXT                 -- source, effect, preview side metadata
 
 workstream_config
   ws_id       TEXT NOT NULL          -- composite PK with key
   key         TEXT NOT NULL
   value       TEXT
+  -- private durable incarnation token also lives here but is filtered from
+  -- every ordinary config read/snapshot
 
 conversations_fts                    -- SQLite FTS5 virtual table (optional)
   content     (content=conversations, content_rowid=id)
@@ -1083,25 +1378,20 @@ and are the single source of truth for both backends and Alembic migrations.
 
 | Method | Purpose |
 |--------|---------|
-| `register_workstream(ws_id, node_id, name, state)` | Create a workstreams row (no-op if exists) |
-| `save_message(ws_id, role, content, ...)` | Log a message to conversations |
-| `load_messages(ws_id)` | Reconstruct OpenAI message format from DB rows |
-| `list_workstreams_with_history(limit)` | List workstreams with >=1 message, ordered by updated DESC |
-| `delete_workstream(ws_id)` | Delete workstream and cascade conversations + config |
-| `prune_workstreams(retention_days)` | Remove empty workstreams and old unnamed workstreams |
-| `resolve_workstream(alias_or_id)` | Resolve alias, exact id, or id prefix to full ws_id |
-| `save_workstream_config(ws_id, config)` | Persist workstream configuration key/value pairs |
-| `load_workstream_config(ws_id)` | Retrieve workstream configuration |
-| `set_workstream_alias(ws_id, alias)` | Set user-friendly alias (returns False if taken) |
-| `get_workstream_display_name(ws_id)` | Return alias if set, else title, else None |
-| `update_workstream_title(ws_id, title)` | Set/update LLM-generated title |
-| `update_workstream_state(ws_id, state)` | Update workstream state and bump timestamp |
-| `update_workstream_name(ws_id, name)` | Update workstream display name |
-| `list_workstreams(node_id, limit, *, parent_ws_id, kind, user_id)` | List workstreams, optionally filtered by node, parent, kind, or owning user |
-| `kv_get(key)` / `kv_set(key, value)` / `kv_delete(key)` | Generic key-value store (backs memories table) |
-| `kv_list()` / `kv_search(query)` | List or search key-value pairs |
-| `search_history(query, limit)` | Full-text search (FTS5 on SQLite, tsvector on PostgreSQL) |
-| `search_history_recent(limit)` | Return most recent messages |
+| `register_workstream(..., fork_reservation_token=...)` | Atomically insert `creating` row plus private incarnation token; report collision |
+| `ensure_workstream_incarnation_snapshot(ws_id)` | Lock and return one exact row plus its private token, installing a token atomically for legacy rows |
+| `finalize_deferred_create(...)` | Apply alias/config/node writes only if row and token still match |
+| `publish_deferred_create(ws_id, token)` | Compare-and-swap the exact reservation from `creating` to `idle` |
+| `delete_workstream_if_fork_reserved(ws_id, token)` | Hard-delete only the exact durable incarnation that owns the token |
+| `delete_stale_creating_reservations(...)` | Atomically reap eligible crash-abandoned reservations with complete dependent and attachment-refcount cleanup |
+| `save_message(ws_id, role, content, ...)` | Persist one canonical-turn row and its side channels |
+| `load_message_turns(ws_id, checkpointed=True)` | Rehydrate canonical `Turn` objects, bounded by the latest valid compaction checkpoint |
+| `load_messages(ws_id, include_compaction=...)` | Materialized display/export projection; optionally surface compaction cards |
+| `clone_workstream(source, destination, ..., expected_session=...)` | Transactionally compare source and destination incarnations, authorize, and copy canonical history/config/project/attachment ownership |
+| `get_compaction_watermark/floor/checkpoint(...)` | Maintain resume checkpoints without deleting audit history |
+| `update_workstream_state(...)` | Persist a lifecycle state after manager/state-writer fencing |
+| `resolve_workstream(alias_or_id)` | Resolve alias, exact ID, or ID prefix |
+| `search_history(...)` | Full-text search (FTS5 on SQLite, tsvector on PostgreSQL) |
 | `close()` | Release resources (connection pool, engine) |
 
 ### Database Configuration
@@ -1118,37 +1408,53 @@ Environment variables: `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL`, `TURNSTONE_DB
 `TURNSTONE_DB_POOL_SIZE`.
 
 The default pool is intentionally small (2 base + 3 overflow = 5 per process)
-because all database operations are short-burst queries that hold connections for
-milliseconds. For clusters with many nodes sharing a PostgreSQL instance, use
-[PgBouncer](pgbouncer.md) in transaction pooling mode.
+because most database operations are short-burst queries. Atomic workstream
+forks are the deliberate exception: their serializable history/configuration/
+attachment clone can hold a connection for longer. For clusters with many nodes
+sharing PostgreSQL, use [PgBouncer](pgbouncer.md) in transaction pooling mode
+and size its server pool for expected concurrent fork traffic.
 
 ### Persistence and Resume
 
-`ws_id` is the sole persistent identity for both routing and conversation
-history. There is no separate `session_id` — the `workstreams` table holds
-alias, title, and state alongside the routing fields (`node_id`, `name`).
-Messages are saved to `conversations` (keyed by `ws_id`) as they happen
-via `save_message()`. Workstream state changes are tracked via
-`update_workstream_state()`.
+`ws_id` is the persistent conversation/lifecycle identity. There is no
+separate `session_id`: `workstreams` holds lifecycle, owner, kind, hierarchy,
+project, and display metadata, while `conversations` stores the append-only
+trajectory. `node_id` is an owning-service hint; rendezvous/service liveness,
+not that historical field alone, determines cluster routing and orphan safety.
 
-**Auto-titling:** After the first complete exchange (user message + assistant
-response), a background thread calls the LLM with a title-generation prompt
-(`reasoning_effort: "low"`, `max_completion_tokens: 200`). The generated
-title (3-8 words) is stored in `workstreams.title`.
+`ChatSession.messages` is `list[Turn]`. Persistence serializes the neutral
+fields, opaque provider-native lane, attachment references, SSE cursor, and
+side metadata independently. Provider lowering is never stored as canonical
+history. TOOL Turns may carry a wire-invisible typed `EffectStatus` in `meta`:
+`committed`, `none`, `unknown`, `partial`, or `rolled_back`. Ordinary completed
+results can leave the field unset; cancellation/compensation paths use it when
+deterministic consumers must distinguish “definitely did nothing” from “may
+have acted.” The prose result remains what the model sees.
 
-**Resume flow:** `ChatSession.resume(ws_id)` calls `load_messages()` which
-reconstructs the OpenAI message format from database rows:
+**Auto-titling:** After the first complete exchange, auxiliary model work
+generates a bounded title and stores it in `workstreams.title`. It runs through
+the same immutable lane/`model_turn()` seam as other model-backed roles and is
+cancelled or discarded if its workstream identity changes before publication.
 
-- `user` and `assistant` rows map directly
-- Consecutive `tool_call` rows are grouped into one assistant message's
-  `tool_calls` array, paired with subsequent `tool_result` rows via
-  `tool_call_id` (or positional matching for legacy data)
+**Resume flow:** `ChatSession.resume(ws_id)` calls
+`load_message_turns(checkpointed=True)` and adopts canonical Turns:
+
+- Current `user`, `assistant`, `tool`, and `system` rows map directly; legacy
+  split tool-call/result rows are normalized by the reconstruction boundary.
+- Tool results retain error, effect, preview, and attachment metadata; opaque
+  provider-native blocks replay only to their producing provider.
 - **Interrupted conversation repair:** If the last assistant message has
   `tool_calls` but fewer tool results than expected (conversation was
   interrupted mid-execution), the incomplete turn is stripped so the
-  LLM can re-generate cleanly
+  model can regenerate cleanly. Live cancellation normally prevents this shape
+  by synthesizing explicit results for unanswered calls.
+- **Compaction checkpoint:** the latest valid marker reconstructs as a
+  provenance-tagged `[USER summary label, ASSISTANT summary] + [rows after
+  watermark]` view. A missing or
+  corrupt watermark fails safe to the full transcript. Export/audit callers
+  request `checkpointed=False`, so compaction never erases source history.
 - The `ChatSession` adopts the resumed `_ws_id`, so new messages continue
-  in the same workstream
+  in the same workstream.
 
 **Config persistence:** LLM-affecting parameters (`temperature`,
 `reasoning_effort`, `max_tokens`, `instructions`, and the persona
@@ -1170,8 +1476,10 @@ workstreams that have at least one saved message (`WHERE EXISTS` on
 startup) are invisible until a message is sent.
 
 **Workstream pruning:** `prune_workstreams(retention_days, log_fn)` runs once
-at startup (CLI and server). It removes:
-- Workstreams with no messages (orphaned registrations)
+at startup (CLI and server). It deliberately excludes internal `creating`
+reservations, which belong to the crash-recovery path above. It removes:
+
+- Published workstreams with no messages (orphaned registrations)
 - Unnamed workstreams (`alias IS NULL`) older than `retention_days` days (default 90)
 
 Named (aliased) workstreams are never age-pruned. Configure with
@@ -1357,7 +1665,7 @@ Three hierarchical scopes control endpoint access:
 - **Console** is the auth management hub — it hosts the admin endpoints for
   creating users, issuing API tokens, and managing channel mappings. User
   records and token hashes live in the shared storage backend. The console
-  dashboard includes an **admin panel** (18 tabs) for managing
+  dashboard includes an **admin panel** for managing
   credentials, governance, MCP servers, models, node metadata, and runtime
   settings through the browser.
 - **Server** is a JWT validator only — it validates tokens on each request but
@@ -1431,8 +1739,8 @@ Starlette ASGI app (served by uvicorn)
   |
   +-- Async request handlers (all under /v1/ prefix)
   |     POST /v1/api/workstreams/{ws_id}/send    -> starts worker thread per workstream
-  |     POST /v1/api/workstreams/{ws_id}/approve -> unblocks WebUI._approval_event
-  |     POST /v1/api/workstreams/new             -> creates workstream + worker
+  |     POST /v1/api/workstreams/{ws_id}/approve -> resolves one ApprovalCycle
+  |     POST /v1/api/workstreams/new             -> hidden create/commit, then optional worker
   |     GET  /v1/api/workstreams/{ws_id}/events  -> SSE via EventSourceResponse (per workstream)
   |     GET  /v1/api/events/global               -> SSE via EventSourceResponse (fan-out)
   |
@@ -1441,7 +1749,8 @@ Starlette ASGI app (served by uvicorn)
   |
   +-- Worker thread per workstream (daemon)
   |     Runs session.send() synchronously -- ChatSession is fully blocking
-  |     Blocks on WebUI._approval_event (threading.Event)
+  |     Blocks on the addressed ApprovalCycle.event when human input is needed
+  |     A force-cancel can abandon the slot; generation fences retire late output
   |
   +-- Background daemon threads
         Global SSE fan-out: reads global_queue, copies to per-client queues
@@ -1457,15 +1766,16 @@ UI is available at `/docs`. SSE endpoints use `EventSourceResponse` from
 `asyncio.get_running_loop().run_in_executor()`.
 
 `ChatSession.send()` remains synchronous, running in daemon worker threads.
-WebUI keeps `threading.Event` and `queue.Queue` primitives (unchanged from
-the sync era). The `_global_fanout_thread` and `_idle_cleanup_thread` remain
-as daemon threads since they interact with sync primitives. A lifespan
-context manager handles startup/shutdown (health monitor, MCP client,
-registry).
+`SessionUIBase` keeps per-cycle `threading.Event` objects and per-listener
+`queue.Queue` primitives. Several task-agent approval cycles may be live while
+the workstream still has one main worker slot. The `_global_fanout_thread` and
+`_idle_cleanup_thread` remain daemon threads because they interact with sync
+primitives. A lifespan context manager handles startup/shutdown (health
+monitor, MCP client, registry).
 
 Each workstream's `WebUI` has:
 - `_listeners` (per-client SSE queues, fan-out on `_enqueue()`)
-- `_approval_event` (`threading.Event` for blocking)
+- `_approval_cycles` (ordered `cycle_id -> ApprovalCycle`; each owns its event)
 - `_global_queue` (class variable, shared, for state broadcasts)
 
 The SSE handlers bridge these sync queues to async via
@@ -1557,10 +1867,15 @@ API reference.
 
 When the prompt exceeds `auto_compact_pct` of the context window (default:
 80%, configurable via `--auto-compact-pct`), `ChatSession` auto-compacts by
-summarizing the entire conversation into a structured summary
-(`_compact_messages`). The summary model call uses `compact_max_tokens`
-(default: 32768, configurable via `--compact-max-tokens`). The summary
-preserves:
+summarizing the selected trajectory into a structured summary. Manual
+`/compact` claims a normal generation; automatic compaction remains owned by
+the send generation that triggered it. Both use the same cancellation,
+publication, and FIFO durability fences as a model turn.
+
+Compaction pins one `ModelLane` for the complete operation. Blocks are packed
+to an estimated window budget; a real provider overflow recursively
+subdivides the batch and merges partial summaries rather than silently dropping
+the newest messages. The summary preserves:
 
 - Decisions made (architecture, libraries, approaches)
 - Files read, created, or modified
@@ -1569,8 +1884,35 @@ preserves:
 - Open tasks
 - User preferences
 
-After compaction, `_read_files` is cleared to force re-reads before edits,
-since file contents are no longer in the message history.
+Tool-call tails needed by an in-flight batch can be preserved verbatim. Auto
+compaction can also carry the last real user request and a bounded verbatim
+wind-down. Coordinator compaction appends exact task/child handle mappings from
+storage instead of asking the summarizer to transcribe opaque IDs.
+
+The final swap is one generation commit:
+
+```
+full in-memory trajectory
+    -> [USER summary label, ASSISTANT summary, preserved tail]
+       (both synthetic Turns carry source="compaction")
+    -> successful compaction end event
+    -> ordered durable checkpoint marker {watermark, token counts, trigger}
+```
+
+The marker does not replace or delete source rows. Its watermark says which
+prefix the summary covers. Resume loads the latest valid summary plus rows
+after that boundary; `/history`, export, search, and audit retain the full
+transcript and omit or explicitly project checkpoint markers as appropriate.
+A malformed checkpoint falls back to full reconstruction rather than risking
+message loss.
+
+Cancellation or generation supersession before the final commit leaves both
+the live trajectory and checkpoint untouched. Typed `compaction` lifecycle
+events (`start`, `progress`, exactly one `end`) let SSE clients correlate and
+retire one run even when a force-abandoned predecessor finishes after a
+successor generation begins. After a successful swap, `_read_files` is cleared
+so edits require fresh file reads against content no longer present in the
+bounded model context.
 
 ---
 
@@ -1593,7 +1935,7 @@ setup, auth headers, `_request()` (REST) and `_stream_sse()` (SSE). Sync
 clients delegate through `_SyncRunner` which maintains a persistent background
 event loop on a daemon thread.
 
-**Event types**: 38 standalone dataclasses in `events.py` with a type-registry
+**Event types**: standalone dataclasses in `events.py` with a type-registry
 dispatch (`from_json()` on each event). Events are decoupled from server
 internals — the SDK parses SSE frames directly from the `/v1/api/events`
 streams.
@@ -1626,11 +1968,22 @@ between platform-native events and turnstone server API calls.
 The `ChannelRouter` manages bidirectional routing: it maps platform
 channel/thread IDs to turnstone workstream IDs, handles workstream
 creation and stale-route recovery, and resolves platform users to
-turnstone identities via the `channel_users` table. When an evicted
-workstream is reactivated, the router uses atomic resume via the
-`resume_ws` field on the workstream creation request — the server resumes
-the old workstream's conversation during creation in a single HTTP
-request, eliminating ordering fragility.
+turnstone identities via the `channel_users` table. A persisted route is usable
+only when its source still resolves in storage **and** is loaded in the owning
+manager: direct mode checks the server's manager-authoritative active list,
+while console mode uses the routed read-only live probe. Probe, routing, and
+authorization uncertainty propagates instead of being treated as a stale miss.
+
+When a saved source is not live, the router passes its ID as `resume_ws` on a
+new workstream request. Despite that compatibility name, the server atomically
+forks the source's saved conversation into a distinct destination ID; the
+source remains unchanged. The old mapping stays durable until the replacement
+and any initial message succeed, then moves to the fork. A fresh create is
+attempted once only when the fork returns the exact source-not-found response
+and a second authoritative storage lookup confirms that the source is gone;
+ACL, conflict, routing, and storage failures leave the old route intact. The
+clone and publication happen in one create lifecycle, eliminating the old
+resume-then-send ordering gap.
 
 Discord and Slack adapters ship today. See [channels.md](channels.md) for
 setup instructions, configuration reference, and the adapter development
@@ -1671,7 +2024,7 @@ at 100 (FIFO eviction) and cleaned up on workstream close.
 Turnstone governance extends the Phase 1 auth system with role-based access
 control (RBAC), tool execution policies, skills, usage tracking,
 and audit logging. The permission model has two layers: legacy scopes
-(`read`, `write`, `approve`) checked by `AuthMiddleware`, and 15 granular
+(`read`, `write`, `approve`) checked by `AuthMiddleware`, and granular
 permissions checked per-endpoint by `require_permission()`. Three built-in
 roles (admin, operator, viewer) are seeded by migration 008; custom roles
 can be created with any permission subset. JWTs carry both `scopes` and
@@ -1690,10 +2043,9 @@ and workstreams record which skill and version spawned them. Token budget
 enforcement tracks consumption in `session.send()` with 80% warning and
 100% approval gate via the `__budget_override__` synthetic tool name.
 
-The console admin panel exposes these capabilities as 18 permission-gated
-tabs: Users, API Tokens, Channels, Schedules, Watches, Roles, Policies,
-Prompts, Judge, Skills, MCP Servers, Usage, Audit, Memories, Models, Nodes,
-Settings, and TLS.
+The console admin panel exposes these capabilities through permission-gated
+administration surfaces rather than treating navigation visibility as
+authorization.
 Both Python and TypeScript SDKs expose governance methods on the console
 client.
 
@@ -1718,10 +2070,16 @@ implemented in `turnstone/core/judge.py`:
    If the LLM verdict has higher confidence than the heuristic, it replaces
    it via an `intent_verdict` SSE event.
 
-The judge is session-scoped (`IntentJudge`), lazy-initialized on first
-approval, and configured via the `[judge]` config section or `--judge` CLI
-flags. By default it uses self-consistency (same model), but supports
-cross-model and cross-provider configurations. Task sub-agents are exempt. All verdicts are persisted to the `intent_verdicts` table
-(migration 012) with the user's final decision, enabling future calibration.
+The main judge is session-scoped (`IntentJudge`) and lazy-initialized on first
+approval; each evaluation carries its own cancellation/generation identity.
+Task-agent tool calls use the same intent pipeline in independent
+`agent_gate` generations, so parallel siblings do not supersede each other's
+judge work. Each human-gated batch is joined to its own `ApprovalCycle`, and a
+late verdict must match that cycle's call ID and judge identity before it can
+reach Smart Approvals. Superseded verdicts remain durable audit facts but are
+withheld from live decision caches. Configuration comes from `[judge]` or CLI
+flags; self-consistency, cross-model, and cross-provider bindings all use the
+same `ModelLane`/backend-auth seam. Verdicts persist in `intent_verdicts` with
+the exact user or automatic decision, enabling calibration.
 The console exposes `GET /v1/api/admin/verdicts` for audit queries
 (requires `admin.judge` permission).

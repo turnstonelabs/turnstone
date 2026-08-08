@@ -404,13 +404,21 @@ class TestZeroBudgetDrain:
         """A bulky error output keeps its lead: a masked failure reads as
         success, which is the dishonesty #883 removes."""
         err = "Error: deploy failed: " + "trace line\n" * 500
-        session._tool_error_flags["tc_e"] = True
+
+        def execute_error_batch(*_args, **_kwargs):
+            # Side-map ownership begins inside the claimed generation.  A
+            # pre-send flag is predecessor state and is intentionally cleared
+            # by the claim before provider call ids may be reused.
+            session._tool_error_flags["tc_e"] = True
+            return ([("tc_e", err)], None)
+
         with _send_with_tool_batch(
             session,
             [{"id": "tc_e", "function": {"name": "bash", "arguments": "{}"}}],
             [("tc_e", err)],
             _remaining_token_budget=MagicMock(return_value=0),
             _compact_messages=MagicMock(return_value=False),
+            _execute_tools=MagicMock(side_effect=execute_error_batch),
         ):
             session.send("go")
 

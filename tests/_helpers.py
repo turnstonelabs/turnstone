@@ -71,6 +71,9 @@ def patch_session_storage(
     calls: list[str] = []
 
     class _Stub:
+        def get_workstream(self, ws_id: str) -> None:
+            return None
+
         def is_watch_active(self, watch_id: str) -> bool:
             calls.append(watch_id)
             if raise_on_is_active:

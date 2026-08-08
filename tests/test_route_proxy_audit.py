@@ -50,6 +50,7 @@ def _plain_jwt() -> str:
 
 _COORD_HEADERS: dict[str, str] = {"Authorization": f"Bearer {_coordinator_jwt()}"}
 _PLAIN_HEADERS: dict[str, str] = {"Authorization": f"Bearer {_plain_jwt()}"}
+_CREATED_WS_ID = "a" * 32
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +89,7 @@ def _make_app(router: Any = None) -> Any:
 
 
 def _make_proxy(status_code: int = 200, body: dict[str, Any] | None = None) -> MagicMock:
-    payload = body or {"ws_id": "abc123", "name": "test"}
+    payload = body or {"ws_id": _CREATED_WS_ID, "name": "test"}
 
     async def _post(*args: Any, **kwargs: Any) -> httpx.Response:
         return httpx.Response(
@@ -134,7 +135,7 @@ class TestRouteCreateAudit:
         router = _make_mock_router("node-a", "http://a:8080")
         app = _make_app(router=router)
         storage, captured = _capture_storage()
-        _wire(app, _make_proxy(200, {"ws_id": "child123", "name": "child"}), storage)
+        _wire(app, _make_proxy(200, {"ws_id": _CREATED_WS_ID, "name": "child"}), storage)
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.post(
@@ -221,7 +222,9 @@ class TestRouteCreateAudit:
                     503, json={"error": "overloaded"}, request=httpx.Request("POST", url)
                 )
             return httpx.Response(
-                200, json={"ws_id": "x", "name": "n"}, request=httpx.Request("POST", url)
+                200,
+                json={"ws_id": _CREATED_WS_ID, "name": "n"},
+                request=httpx.Request("POST", url),
             )
 
         proxy = MagicMock(spec=httpx.AsyncClient)
@@ -244,7 +247,7 @@ class TestRouteCreateAudit:
         """When auth_storage is not installed (e.g. pre-config-store tests), the new code is a no-op."""
         router = _make_mock_router()
         app = _make_app(router=router)
-        _wire(app, _make_proxy(200, {"ws_id": "x", "name": "n"}))  # NO storage
+        _wire(app, _make_proxy(200, {"ws_id": _CREATED_WS_ID, "name": "n"}))  # NO storage
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.post(

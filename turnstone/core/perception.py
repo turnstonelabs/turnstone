@@ -30,16 +30,13 @@ attachment by reference and the pre-built OpenAI-shaped parts (``image_url`` /
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.log import get_logger
-from turnstone.core.model_turn import model_turn, resolve_lane
+from turnstone.core.model_turn import ModelLane, ResolvedModelBinding, model_turn
+from turnstone.core.providers._protocol import refuse_aborted_request
 from turnstone.core.trajectory import AttachmentRef, Role, TextBlock, Turn
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from turnstone.core.providers._protocol import LLMProvider
 
 log = get_logger(__name__)
 
@@ -72,16 +69,10 @@ class PerceptionBackendError(RuntimeError):
 
 def describe(
     *,
-    provider: LLMProvider,
-    client: Any,
-    model: str,
+    lane: ModelLane,
     parts: list[dict[str, Any]],
     prompt: str = _DESCRIBE_PROMPT,
-    alias: str = "",
-    registry: Any | None = None,
-    config_store: Any | None = None,
-    capabilities: Any | None = None,
-    backend_auth_resolver: Callable[[str], str | None] | None = None,
+    cancel_ref: Any = None,
 ) -> str:
     """Perceive ``parts`` via the perception model, returning the text.
 
@@ -91,12 +82,9 @@ def describe(
     provider translator, which materializes the placeholder into these exact
     parts (one ref may expand to many, e.g. a rasterized PDF).
 
-    *alias* / *registry* / *config_store* make the perception lane a real
-    lane: the alias's capability overrides, ``server_compat.extra_body``
-    pins, and the temperature ladder (per-model → global
-    ``model.temperature`` → server default; house rule: no code pins) all
-    reach the wire, so an operator can actually remediate a degraded,
-    memoized description from the Models tab.  Raises
+    ``lane`` is the caller's already-resolved binding snapshot, so the
+    modality gate and the plant call cannot observe different registry
+    generations.  Raises
     :class:`PerceptionBackendError` if the backend call fails.  Never
     caches — see :func:`describe_cached`.
     """
@@ -112,26 +100,16 @@ def describe(
             ),
         )
     ]
-    # *capabilities* passthrough: the session caller already resolved the
-    # alias's caps for the modality gate — reusing them keeps the gate and
-    # the wire on ONE config generation (resolve_lane's stated purpose).
-    lane = resolve_lane(
-        provider,
-        client,
-        model,
-        alias=alias,
-        registry=registry,
-        config_store=config_store,
-        capabilities=capabilities,
-        backend_auth_resolver=backend_auth_resolver,
-    )
     try:
         result = model_turn(
             lane,
             turns,
             max_tokens=4096,
             resolve_attachments=lambda _ids: {_PERCEPTION_REF_ID: parts},
+            cancel_ref=cancel_ref,
         )
+    except DeadlineCancelledError:
+        raise
     except Exception as exc:
         raise PerceptionBackendError(f"perception backend failed: {exc}") from exc
     return (result.content or "").strip()
@@ -144,12 +122,22 @@ def describe(
 # subsequent turn.
 _CACHE_MAX = 256
 _cache_lock = threading.Lock()
-_cache: dict[tuple[str, str, str], str] = {}
+_cache: dict[tuple[str, str, int, str], str] = {}
 
 
-def _cache_key(*, principal_id: str, alias: str, content_hash: str) -> tuple[str, str, str]:
-    """Partition perceived content by the identity that authorized the call."""
-    return (principal_id, alias, content_hash)
+def _cache_key(
+    *,
+    principal_id: str,
+    binding: ResolvedModelBinding,
+    content_hash: str,
+) -> tuple[str, str, int, str]:
+    """Partition content by authorizing identity and exact registry binding."""
+    return (
+        principal_id,
+        binding.lane.alias,
+        binding.registry_generation,
+        content_hash,
+    )
 
 
 def _clear_perception_cache_for_test() -> None:
@@ -159,53 +147,56 @@ def _clear_perception_cache_for_test() -> None:
 
 def describe_cached(
     *,
-    provider: LLMProvider,
-    client: Any,
-    model: str,
+    binding: ResolvedModelBinding,
     principal_id: str,
-    alias: str,
     content_hash: str,
     parts: list[dict[str, Any]],
     prompt: str = _DESCRIBE_PROMPT,
-    registry: Any | None = None,
-    config_store: Any | None = None,
-    capabilities: Any | None = None,
-    backend_auth_resolver: Callable[[str], str | None] | None = None,
+    cancel_ref: Any = None,
 ) -> str:
-    """Memoized, non-raising :func:`describe` for the wire fallback.
+    """Memoized :func:`describe` for the wire fallback.
 
-    Keyed by ``(principal_id, alias, content_hash)``. The principal partition is
-    load-bearing for delegated backend authentication: a description produced
-    under one user's OBO grant must never be served to another user without a
-    call authorized as that user. Returns ``""`` on a backend failure (a
-    placeholder is rendered upstream) and does *not* cache failures.  A
-    completed-but-EMPTY description memoizes like any other result — one
-    perceive per key, ever (an all-reasoning pass pins the placeholder;
-    the remediation is server-side: a reasoning parser or the template
-    thinking toggle on the perception alias) — under one guard: an empty
-    result NEVER overwrites a concurrently memoized real description.
+    Keyed by ``(principal_id, alias, registry_generation, content_hash)``.  The
+    complete binding keeps the lane used for a miss and the generation used for
+    lookup inseparable.  Principal partitioning prevents one user's OBO result
+    from reaching another, while generation partitioning prevents an alias
+    reload from reusing output produced by an older backend/auth policy. Returns
+    ``""`` on a backend failure (a placeholder is rendered upstream) and does
+    *not* cache failures. Cancellation propagates as control flow so Stop can
+    abort the parent turn.
+    A completed-but-EMPTY description memoizes like any other result — one
+    perceive per key, ever (an all-reasoning pass pins the placeholder; the
+    remediation is server-side: a reasoning parser or the template thinking
+    toggle on the perception alias) — under one guard: an empty result NEVER
+    overwrites a concurrently memoized real description.
     """
-    key = _cache_key(principal_id=principal_id, alias=alias, content_hash=content_hash)
+    refuse_aborted_request(cancel_ref)
+    lane = binding.lane
+    key = _cache_key(
+        principal_id=principal_id,
+        binding=binding,
+        content_hash=content_hash,
+    )
     with _cache_lock:
-        if key in _cache:
-            return _cache[key]
+        cached = _cache.get(key)
+        cache_hit = key in _cache
+    if cache_hit:
+        refuse_aborted_request(cancel_ref)
+        return cached or ""
     try:
         text = describe(
-            provider=provider,
-            client=client,
-            model=model,
+            lane=lane,
             parts=parts,
             prompt=prompt,
-            alias=alias,
-            registry=registry,
-            config_store=config_store,
-            capabilities=capabilities,
-            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=cancel_ref,
         )
     except PerceptionBackendError as exc:
-        log.warning("perception fallback failed (alias=%s): %s", alias, exc)
+        refuse_aborted_request(cancel_ref)
+        log.warning("perception fallback failed (alias=%s): %s", lane.alias, exc)
         return ""
+    refuse_aborted_request(cancel_ref)
     with _cache_lock:
+        refuse_aborted_request(cancel_ref)
         # Re-check under the lock: the describe call ran unlocked, and a
         # concurrent racer may have memoized a REAL description — an empty
         # result must never clobber it (the memo has no invalidation
@@ -220,8 +211,13 @@ def describe_cached(
     return text
 
 
-def describe_peek(*, principal_id: str, alias: str, content_hash: str) -> str | None:
-    """Return the principal-scoped memoized description without computing.
+def describe_peek(
+    *,
+    principal_id: str,
+    binding: ResolvedModelBinding,
+    content_hash: str,
+) -> str | None:
+    """Return the principal-and-binding-scoped memo without computing.
 
     Lets the wire resolver skip the expensive parts build (a PDF rasterize) when
     the description is already memoized from an earlier send — :func:`describe_cached`
@@ -229,5 +225,9 @@ def describe_peek(*, principal_id: str, alias: str, content_hash: str) -> str | 
     """
     with _cache_lock:
         return _cache.get(
-            _cache_key(principal_id=principal_id, alias=alias, content_hash=content_hash)
+            _cache_key(
+                principal_id=principal_id,
+                binding=binding,
+                content_hash=content_hash,
+            )
         )

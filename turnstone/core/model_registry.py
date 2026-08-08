@@ -87,14 +87,26 @@ class ModelClientConstructionError(ValueError):
     the provider adapter (``create_provider`` refusing the row's provider /
     api_surface pairing, re-typed in :meth:`ModelRegistry.resolve_binding`).
 
-    A ``ValueError`` subclass so the HTTP routes' existing ValueError arms
-    keep mapping it unchanged, while in-process callers — the session bind
-    path — can tell "the alias is gone" (plain ``ValueError`` from the
-    lookup) from "the alias is present but its binding cannot be built" and
-    surface the construction cause. Conflating the two gave
-    self-contradictory diagnoses, e.g. a ``/model`` switch reporting the
-    alias unknown while listing it as available.
+    A ``ValueError`` subclass so the HTTP routes' existing ValueError arms keep
+    mapping it unchanged, while in-process callers — the session bind path —
+    can distinguish :class:`UnknownModelAliasError` from "the alias is present
+    but its binding cannot be built" and surface the construction cause.
+    Conflating the two gave self-contradictory diagnoses, e.g. a ``/model``
+    switch reporting the alias unknown while listing it as available.
     """
+
+
+class UnknownModelAliasError(ValueError):
+    """A registry lookup named an alias that is not present.
+
+    The ``ValueError`` base preserves route and caller compatibility while the
+    structured ``alias`` field lets lifecycle code distinguish an alias-removal
+    race from unrelated validation failures without parsing exception text.
+    """
+
+    def __init__(self, alias: str) -> None:
+        self.alias = alias
+        super().__init__(f"Unknown model alias: {alias}")
 
 
 class DynamicAuthKeyError(RuntimeError):
@@ -459,7 +471,7 @@ class ModelRegistry:
     def _get_client_locked(self, alias: str) -> Any:
         """``get_client`` body; the caller holds ``_client_lock``."""
         if alias not in self._models:
-            raise ValueError(f"Unknown model alias: {alias}")
+            raise UnknownModelAliasError(alias)
         if alias not in self._clients:
             cfg = self._models[alias]
             # An entra_obo / entra_app backend authenticates per-call via a
@@ -512,7 +524,7 @@ class ModelRegistry:
     def _get_provider_locked(self, alias: str) -> LLMProvider:
         """``get_provider`` body; the caller holds ``_client_lock``."""
         if alias not in self._models:
-            raise ValueError(f"Unknown model alias: {alias}")
+            raise UnknownModelAliasError(alias)
         if alias not in self._providers:
             cfg = self._models[alias]
             self._providers[alias] = create_provider(cfg.provider, api_surface=_api_surface_of(cfg))
@@ -521,7 +533,7 @@ class ModelRegistry:
     def get_config(self, alias: str) -> ModelConfig:
         """Return the ModelConfig for *alias*."""
         if alias not in self._models:
-            raise ValueError(f"Unknown model alias: {alias}")
+            raise UnknownModelAliasError(alias)
         return self._models[alias]
 
     def has_alias(self, alias: str) -> bool:
@@ -548,7 +560,7 @@ class ModelRegistry:
             alias = alias or self.default
             cfg = self._models.get(alias)
             if cfg is None:
-                raise ValueError(f"Unknown model alias: {alias}")
+                raise UnknownModelAliasError(alias)
             return self._get_client_locked(alias), cfg.model, cfg, self._generation
 
     def resolve_binding(
@@ -572,7 +584,7 @@ class ModelRegistry:
             alias = alias or self.default
             cfg = self._models.get(alias)
             if cfg is None:
-                raise ValueError(f"Unknown model alias: {alias}")
+                raise UnknownModelAliasError(alias)
             client = self._get_client_locked(alias)
             try:
                 provider = self._get_provider_locked(alias)

@@ -15,9 +15,9 @@ real ``ChatSession`` engine executing REAL bash) through a scripted
 provider at the SDK boundary, with a ``BrowserlikeSSEClient`` that speaks
 the exact interactive.js wire contract, and asserts convergence.
 
-Marked ``e2e_recovery`` (select with ``-m e2e_recovery``) AND ``live`` so
-the fast default suite (``-m "not live"``) skips them: the marker
-mechanism the repo already deselects by. Each scenario runs in tens of
+Marked only ``e2e_recovery`` (select with ``-m e2e_recovery``), not ``live``:
+the harness uses a scripted provider and needs no LLM backend. CI's fast lane
+explicitly deselects both marker families. Each scenario runs in tens of
 seconds; the tier-1 suite stays under ~5 minutes.
 """
 

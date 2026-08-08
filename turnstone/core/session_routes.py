@@ -40,6 +40,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from turnstone.core.log import get_logger
+from turnstone.core.session_manager import WorkstreamAlreadyExistsError
 from turnstone.core.session_ui_base import AutoApproveReason
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
@@ -218,6 +219,46 @@ CreateKwargsBuilder = Callable[
     ["Request", dict[str, Any], str, dict[str, Any] | None, str, int],
     dict[str, Any],
 ]
+# (request, ws, body, uid) -> extra response fields. Optional
+# kind-specific transaction gate fired after attachment validation but
+# before ``mgr.commit_create`` / audit / lifecycle publication. Interactive
+# uses it for the atomic storage fork; coord has no pre-commit work today.
+# Expected failures raise :class:`CreatePreCommitError`, causing the generic
+# handler to discard the unadvertised destination and return the exception's
+# sanitized response.
+CreatePreCommit = Callable[
+    ["Request", "Workstream", dict[str, Any], str],
+    "Awaitable[dict[str, Any]]",
+]
+
+
+class CreatePreCommitError(RuntimeError):
+    """Expected pre-commit refusal that requires destination rollback."""
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.public_message = message
+        self.status_code = status_code
+
+
+# Same shape as ``CreatePostInstall``, but runs after the transaction gate and
+# before lifecycle publication. It performs fallible storage/local setup and
+# prepares only bounded data for ``SessionEventEmitter.emit_created``; no live
+# event, watch registration, or worker dispatch may escape from this phase.
+CreatePrepareInstall = Callable[
+    [
+        "Request",
+        "Workstream",
+        dict[str, Any],
+        str,
+        dict[str, Any] | None,
+        int,
+        list[str],
+    ],
+    "Awaitable[dict[str, Any]]",
+]
+
+
 # (request, ws, body, uid, skill_data, applied_skill_version, attachment_ids) ->
 # extra response fields. Kind-specific tail end the lifted ``create``
 # body fires after the workstream is built, attachments are saved,
@@ -225,9 +266,9 @@ CreateKwargsBuilder = Callable[
 # response (e.g. interactive returns ``{resumed, message_count}``;
 # coord returns ``{}``). May spawn worker threads / register watch
 # runners / persist skill session config / dispatch initial messages
-# / pin routing. The factory does NOT wrap the call in try/except:
-# post-install failures should surface to the caller as 5xx so the
-# operator sees the misconfig instead of a half-built workstream.
+# / pin routing. This runs after commit and therefore must not contain
+# work whose failure should roll the create back; that belongs in
+# :data:`CreatePreCommit`.
 CreatePostInstall = Callable[
     [
         "Request",
@@ -240,6 +281,8 @@ CreatePostInstall = Callable[
     ],
     "Awaitable[dict[str, Any]]",
 ]
+
+
 # (request, ws, body, uid) -> None. Audit emitter for the create
 # event. Interactive emits ``workstream.created`` with
 # ``{kind, parent_ws_id}`` detail; coord emits ``coordinator.create``
@@ -449,12 +492,22 @@ class SessionEndpointConfig:
     # kind-specific kwarg shape and threads whatever this returns
     # straight through to ``await asyncio.to_thread(mgr.create, **kwargs)``.
     create_build_kwargs: CreateKwargsBuilder | None = None
+    # (request, ws, body, uid) -> extra response fields. Runs after
+    # attachment validation and before the deferred create is committed,
+    # audited, or published. Interactive wires its atomic fork hook here;
+    # ``None`` skips the gate.
+    create_pre_commit: CreatePreCommit | None = None
+    # Fallible kind-specific setup after the atomic pre-commit gate but before
+    # ``commit_create`` publishes lifecycle birth. Interactive applies alias,
+    # skill, routing and prepared bounded event/watch data here. Coord has no
+    # such setup today.
+    create_prepare_install: CreatePrepareInstall | None = None
     # (request, ws, body, uid, skill_data, applied_skill_version,
     # attachment_ids) -> extra response fields. Kind-specific tail
-    # end fired after attachments save + audit. Interactive returns
-    # ``{resumed, message_count}`` and spawns the initial-message
-    # worker thread; coord returns ``{}`` and dispatches via
-    # ``coord_adapter.send`` when an initial_message is provided.
+    # end fired after commit + audit. Interactive performs UI/watch/routing
+    # bookkeeping and spawns the initial-message worker thread; coord
+    # dispatches via ``coord_adapter.send`` when an initial_message is
+    # provided.
     # ``None`` skips the post-install entirely (response is just
     # ``{ws_id, name, ...}`` with empty parity fields).
     create_post_install: CreatePostInstall | None = None
@@ -1053,7 +1106,7 @@ def make_close_handler(
         ws_before = mgr.get(ws_id)
         if ws_before is None:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
-        if not mgr.close(ws_id):
+        if not await asyncio.to_thread(mgr.close, ws_id):
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
         storage = getattr(request.app.state, "auth_storage", None)
@@ -1102,6 +1155,7 @@ def make_refresh_title_handler(cfg: SessionEndpointConfig) -> Handler:
         import asyncio
 
         from turnstone.core.memory import get_workstream_display_name
+        from turnstone.core.web_helpers import auth_user_id
 
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
@@ -1124,7 +1178,10 @@ def make_refresh_title_handler(cfg: SessionEndpointConfig) -> Handler:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
         current_title = await asyncio.to_thread(get_workstream_display_name, ws_id) or ""
-        ws.session.request_title_refresh(current_title)
+        ws.session.request_title_refresh(
+            current_title,
+            principal_id=auth_user_id(request),
+        )
         return JSONResponse({"status": "ok"})
 
     return refresh_title
@@ -2403,9 +2460,9 @@ def make_create_handler(
 
     Both kinds share the create sequence (parse body → resolve uid
     → kind-specific validate → resolve skill → ``mgr.create`` (with
-    ``defer_emit_created=True``) → save attachments → ``mgr.discard``
-    on validation failure / ``mgr.commit_create`` on success → audit
-    → kind-specific post-install → respond). Per-kind divergence
+    ``defer_emit_created=True``) → save attachments → optional pre-commit
+    gate → ``mgr.discard`` on failure / ``mgr.commit_create`` on success
+    → audit → kind-specific post-install → respond). Per-kind divergence
     captured by the cfg + ``audit_emit``:
 
     - ``cfg.create_supports_attachments`` — when ``True``, the body
@@ -2423,8 +2480,11 @@ def make_create_handler(
       attachments+resume_ws combo; coord: 401-on-empty-uid).
     - ``cfg.create_build_kwargs`` — kind-specific kwargs for
       ``mgr.create``. Required when the kind mounts a create handler.
+    - ``cfg.create_pre_commit`` — kind-specific atomic gate after attachment
+      validation and before any audit/lifecycle publication (interactive's
+      transactional fork; coord has none).
     - ``cfg.create_post_install`` — kind-specific tail end (e.g.
-      interactive's resume + skill_config + initial-message worker
+      interactive's UI bookkeeping + skill_config + initial-message worker
       thread; coord's initial_message via coord_adapter.send).
     - ``audit_emit`` — ``workstream.created`` on interactive,
       ``coordinator.create`` on coord.
@@ -2438,7 +2498,10 @@ def make_create_handler(
        rejected upload produces zero lifecycle events. Failure path
        is ``mgr.discard`` + ``delete_workstream``; success path
        falls through.
-    3. ``mgr.commit_create(ws)`` runs BEFORE ``audit_emit`` and
+    3. ``cfg.create_pre_commit`` runs after validation but BEFORE commit,
+       audit, and publication. A refusal discards the destination while its
+       deferred lifecycle is still invisible.
+    4. ``mgr.commit_create(ws)`` runs BEFORE ``audit_emit`` and
        ``post_install`` so any state-change events ``post_install``
        triggers (e.g. a worker dispatched on ``initial_message``)
        reach the cluster collector for an already-known ws_id.
@@ -2513,7 +2576,7 @@ def make_create_handler(
     - **Always-include response shape.** The lifted body always
       returns ``{ws_id, name, resumed, message_count, attachment_ids}``,
       with the parity fields defaulting to ``False`` / ``0`` / ``[]``
-      on kinds whose post-install doesn't populate them. SDK
+      on kinds whose create hooks don't populate them. SDK
       consumers don't branch on kind.
 
     Args:
@@ -2591,14 +2654,16 @@ def make_create_handler(
             # creates carry the right owner. Token sources on end-user
             # tokens (including console-proxy tokens that carry the
             # real user's identity at the auth layer) are NOT trusted;
-            # only service identities. The deny-by-default keeps a
-            # malicious caller from impersonating other users.
+            # only service identities. Requiring the unassignable
+            # ``service`` scope as well as ``src=console`` keeps a
+            # forged/unscoped source label from opening the override.
             body_uid = body.get("user_id")
             if (
                 isinstance(body_uid, str)
                 and body_uid
                 and auth is not None
                 and getattr(auth, "token_source", "") in {"console"}
+                and "service" in getattr(auth, "scopes", frozenset())
             ):
                 uid = body_uid
 
@@ -2619,10 +2684,11 @@ def make_create_handler(
         # require_project_denies_create, not a mount property. On the
         # interactive mount, by this point the validator has applied any
         # parent-/resume-inherited project_id into body AND (for a fork)
-        # discarded any explicit pick to the source's project or "", so a
-        # private/dangling/projectless fork SOURCE funnels to the SAME uniform
-        # 400 as a projectless fresh create. (Coordinator has no fork/resume —
-        # its validator only checks attachability of an explicit pick.)
+        # discarded any explicit pick in favor of the source's project. A
+        # missing or invisible source was already rejected with the generic
+        # 404; this gate's uniform 400 covers accessible projectless/dangling
+        # sources. (Coordinator has no fork/resume — its validator only checks
+        # attachability of an explicit pick.)
         if cfg.create_gate_require_project:
             from turnstone.core.auth import (
                 REQUIRE_PROJECT_CODE,
@@ -2684,6 +2750,79 @@ def make_create_handler(
                 {"error": "create handler misconfigured"},
                 status_code=500,
             )
+
+        async def _finish_before_unwind(awaitable: Awaitable[Any]) -> Any:
+            """Shield admitted work, then preserve the caller's cancellation.
+
+            ``asyncio.to_thread`` keeps running after the awaiting request is
+            cancelled. Waiting for the admitted task prevents rollback from
+            racing a late storage commit. Repeated cancellation is absorbed
+            only until the task reaches a terminal state; the original
+            exception is then re-raised by the surrounding ``except``.
+            """
+            task = asyncio.ensure_future(awaitable)
+            try:
+                return await asyncio.shield(task)
+            except BaseException:
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                if task.done() and not task.cancelled():
+                    with contextlib.suppress(BaseException):
+                        task.exception()
+                raise
+
+        async def _settle_admitted(awaitable: Awaitable[Any]) -> Any:
+            """Wait through caller cancellation and return the task outcome."""
+            task = asyncio.ensure_future(awaitable)
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            return task.result()
+
+        def _discard_and_delete(candidate: Workstream) -> None:
+            """Rollback one exact hidden incarnation as a single operation."""
+            from turnstone.core.attachment_buffer import get_attachment_buffer
+            from turnstone.core.memory import (
+                delete_workstream,
+                delete_workstream_if_fork_reserved,
+            )
+
+            def _drop_staged_uploads() -> None:
+                buffer = get_attachment_buffer()
+                for staged in buffer.list_for(ws_id=candidate.id, user_id=uid):
+                    buffer.discard(
+                        staged.attachment_id,
+                        ws_id=candidate.id,
+                        user_id=uid,
+                    )
+
+            def _delete_reserved_row() -> None:
+                if candidate._fork_reservation_token:
+                    delete_workstream_if_fork_reserved(
+                        candidate.id,
+                        candidate._fork_reservation_token,
+                    )
+                else:
+                    # Compatibility for a custom manager that predates
+                    # deferred reservation tokens.
+                    delete_workstream(candidate.id)
+
+            removed = mgr.discard(
+                candidate.id,
+                expected=candidate,
+                before_release=_drop_staged_uploads,
+                after_release=_delete_reserved_row,
+            )
+            if not removed:
+                return
+
         try:
             if body_skill and not (isinstance(resume_ws_id_raw, str) and resume_ws_id_raw):
                 from turnstone.core.storage._registry import get_storage as _get_storage
@@ -2756,13 +2895,17 @@ def make_create_handler(
                 # was authored under — never a fresh default.  A corrupt
                 # stamp is a loud 400, mirroring the rehydrate contract; an
                 # unstamped (legacy) source forks unstamped.
-                from turnstone.core.memory import resolve_workstream
                 from turnstone.core.personas import snapshot_from_config
                 from turnstone.core.storage._registry import get_storage as _get_storage
 
                 _st = _get_storage()
-                resume_target = await asyncio.to_thread(resolve_workstream, resume_ws_id_raw)
-                if _st is not None and resume_target:
+                # ``create_validate_request`` already canonicalized this value
+                # after the source ACL check. Do not feed that canonical id
+                # back through alias-first resolution: another row may legally
+                # use the 32-char id as its alias and would lend this fork the
+                # wrong construction-time persona.
+                resume_target = resume_ws_id_raw
+                if _st is not None:
                     try:
                         persona_snapshot = snapshot_from_config(
                             await asyncio.to_thread(_st.load_workstream_config, resume_target) or {}
@@ -2820,9 +2963,51 @@ def make_create_handler(
                 # **extra_session_kwargs into the session factory.
                 kwargs["persona"] = persona_snapshot.name
                 kwargs["persona_snapshot"] = persona_snapshot
+            if (
+                cfg.create_pre_commit is not None
+                and isinstance(resume_ws_id_raw, str)
+                and resume_ws_id_raw
+            ):
+                # The token itself never crosses the HTTP boundary. Ask the
+                # manager to create a private storage-visible incarnation
+                # fence only for the transactional fork path that consumes it.
+                kwargs["_fork_reservation"] = True
             # Deferred emit — committed below post-attachment-
             # validation. See handler docstring's Ordering invariants.
-            ws = await asyncio.to_thread(mgr.create, defer_emit_created=True, **kwargs)
+            create_task = asyncio.ensure_future(
+                asyncio.to_thread(mgr.create, defer_emit_created=True, **kwargs)
+            )
+            try:
+                ws = await asyncio.shield(create_task)
+            except BaseException:
+                # The request may disappear while register/build_session is in
+                # a worker. Settle it, then roll back the exact returned
+                # reservation before propagating cancellation. This bracket
+                # begins before ``mgr.create`` rather than after it.
+                while not create_task.done():
+                    try:
+                        await asyncio.shield(create_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                if (
+                    create_task.done()
+                    and not create_task.cancelled()
+                    and create_task.exception() is None
+                ):
+                    created = create_task.result()
+                    try:
+                        await _settle_admitted(asyncio.to_thread(_discard_and_delete, created))
+                    except BaseException:
+                        log.warning(
+                            "ws.create.cancelled_cleanup_failed ws=%s",
+                            created.id[:8],
+                            exc_info=True,
+                        )
+                raise
+        except WorkstreamAlreadyExistsError:
+            return JSONResponse({"error": "Workstream already exists"}, status_code=409)
         except RuntimeError as exc:
             # ``SessionManager.create`` documents RuntimeError as
             # "manager at capacity" — translate to 429 (rate-limit /
@@ -2865,68 +3050,137 @@ def make_create_handler(
         # ``mgr.discard`` (no ``emit_closed`` because the create was
         # deferred) + ``delete_workstream`` for the storage row. See
         # handler docstring's Ordering invariants for the rationale.
-        attachment_ids: list[str] = []
-        if uploaded_files:
-            saved_ids, save_err = await asyncio.to_thread(
-                validate_and_save_uploaded_files, uploaded_files, ws.id, uid
-            )
-            if save_err is not None:
-                from turnstone.core.memory import delete_workstream as _delete_ws
-
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(mgr.discard, ws.id)
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(_delete_ws, ws.id)
-                return save_err
-            attachment_ids = saved_ids
-
-        # --- Commit the deferred emit_created ----------------------------
-        # Synchronous: in-memory non-blocking work on every kind
-        # (interactive: no-op stub; coord: dict + ``queue.put_nowait``).
-        mgr.commit_create(ws)
-
-        # --- Audit emit --------------------------------------------------
-        if audit_emit is not None:
+        async def _rollback_uncommitted_create() -> None:
             try:
-                audit_emit(request, ws, body, uid)
-            except Exception:
-                # Mirrors make_close_handler / make_cancel_handler /
-                # make_open_handler — audit-write failures shouldn't
-                # surface as HTTP 500. Log + continue.
+                await _settle_admitted(asyncio.to_thread(_discard_and_delete, ws))
+            except BaseException:
+                # Rollback is best-effort at the HTTP boundary, but the exact
+                # conditional delete prevents a cleanup failure from touching
+                # a replacement incarnation.
                 log.warning(
-                    "ws.create.audit_failed ws=%s",
-                    ws.id[:8] if ws.id else "",
+                    "ws.create.rollback_failed ws=%s",
+                    ws.id[:8],
                     exc_info=True,
                 )
 
-        # --- Per-kind post-install ---------------------------------------
-        extra_response: dict[str, Any] = {}
-        if cfg.create_post_install is not None:
-            extra_response = await cfg.create_post_install(
-                request,
-                ws,
-                body,
-                uid,
-                skill_data,
-                applied_skill_version,
-                attachment_ids,
-            )
+        committed = False
+        try:
+            attachment_ids: list[str] = []
+            if uploaded_files:
+                saved_ids, save_err = cast(
+                    "tuple[list[str], JSONResponse | None]",
+                    await _finish_before_unwind(
+                        asyncio.to_thread(
+                            validate_and_save_uploaded_files,
+                            uploaded_files,
+                            ws.id,
+                            uid,
+                        )
+                    ),
+                )
+                if save_err is not None:
+                    return save_err
+                attachment_ids = saved_ids
 
-        create_payload: dict[str, Any] = {
-            "ws_id": ws.id,
-            "name": ws.name,
-            "resumed": bool(extra_response.get("resumed", False)),
-            "message_count": int(extra_response.get("message_count", 0)),
-            "attachment_ids": attachment_ids,
-        }
-        if extra_response.get("initial_message_status"):
-            # Present only when the post-install hook could NOT deliver
-            # the initial message (raced live worker, interjection queue
-            # full) — the workstream exists, but a bare 200 would read as
-            # "first message accepted".  Mirrors /send's in-body
-            # ``queue_full`` backpressure surface.
-            create_payload["initial_message_status"] = str(extra_response["initial_message_status"])
-        return JSONResponse(create_payload)
+            # --- Kind-specific transaction gate -------------------------
+            # Interactive performs its storage fork here: after every upload
+            # is known-good, while emit_created/audit/global UI publication
+            # are still deferred. A typed refusal therefore leaves no
+            # advertised phantom.
+            pre_commit_response: dict[str, Any] = {}
+            if cfg.create_pre_commit is not None:
+                pre_commit_response = await _finish_before_unwind(
+                    cfg.create_pre_commit(request, ws, body, uid)
+                )
+
+            # --- Kind-specific pre-publication setup --------------------
+            # Keep fallible storage/config preparation outside the manager
+            # lifecycle lock. The hook may only prepare bounded publication
+            # data; live events, watch registration and worker dispatch are
+            # committed by the emitter/post-install phases below.
+            prepare_response: dict[str, Any] = {}
+            if cfg.create_prepare_install is not None:
+                prepare_response = await _finish_before_unwind(
+                    cfg.create_prepare_install(
+                        request,
+                        ws,
+                        body,
+                        uid,
+                        skill_data,
+                        applied_skill_version,
+                        attachment_ids,
+                    )
+                )
+
+            # --- Commit the deferred emit_created ------------------------
+            # A concurrent close/delete may retire a caller-known id while
+            # the fork transaction runs. Treat losing the exact reserved
+            # Workstream object as a conflict; never audit or advertise it.
+            if not mgr.commit_create(ws):
+                raise CreatePreCommitError(
+                    "Workstream creation was superseded",
+                    status_code=409,
+                )
+            committed = True
+
+            # --- Audit emit ----------------------------------------------
+            if audit_emit is not None:
+                try:
+                    audit_emit(request, ws, body, uid)
+                except Exception:
+                    # Mirrors make_close_handler / make_cancel_handler /
+                    # make_open_handler — audit-write failures shouldn't
+                    # surface as HTTP 500. Log + continue.
+                    log.warning(
+                        "ws.create.audit_failed ws=%s",
+                        ws.id[:8] if ws.id else "",
+                        exc_info=True,
+                    )
+
+            # --- Per-kind post-install -----------------------------------
+            extra_response = {**pre_commit_response, **prepare_response}
+            if cfg.create_post_install is not None:
+                post_install_response = cast(
+                    "dict[str, Any]",
+                    await _finish_before_unwind(
+                        cfg.create_post_install(
+                            request,
+                            ws,
+                            body,
+                            uid,
+                            skill_data,
+                            applied_skill_version,
+                            attachment_ids,
+                        )
+                    ),
+                )
+                extra_response.update(post_install_response)
+
+            create_payload: dict[str, Any] = {
+                "ws_id": ws.id,
+                "name": ws.name,
+                "resumed": bool(extra_response.get("resumed", False)),
+                "message_count": int(extra_response.get("message_count", 0)),
+                "attachment_ids": attachment_ids,
+            }
+            if extra_response.get("initial_message_status"):
+                # Present only when the post-install hook could NOT deliver
+                # the initial message (raced live worker, interjection queue
+                # full) — the workstream exists, but a bare 200 would read as
+                # "first message accepted". Mirrors /send's in-body
+                # ``queue_full`` backpressure surface.
+                create_payload["initial_message_status"] = str(
+                    extra_response["initial_message_status"]
+                )
+            return JSONResponse(create_payload)
+        except CreatePreCommitError as exc:
+            return JSONResponse(
+                {"error": exc.public_message},
+                status_code=exc.status_code,
+            )
+        finally:
+            if not committed:
+                await _rollback_uncommitted_create()
 
     return create
 

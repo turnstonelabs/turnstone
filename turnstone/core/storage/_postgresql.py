@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -20,7 +21,10 @@ import sqlalchemy as sa
 
 from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
+    FORK_RESERVATION_CONFIG_KEY,
     USER_SCOPED_AUTH_TYPES,
+    ForkCloneExpectation,
+    ForkCloneSnapshot,
     MCPOAuthPendingState,
     MCPPendingConsentRow,
     MCPUserToken,
@@ -91,6 +95,9 @@ from turnstone.core.storage._utils import (
     HISTORY_CONTEXT_EXCLUSION_SQL as _HISTORY_EXCL_SQL,
 )
 from turnstone.core.storage._utils import (
+    HISTORY_CREATING_EXCLUSION_SQL as _HISTORY_CREATING_EXCL_SQL,
+)
+from turnstone.core.storage._utils import (
     HISTORY_VISIBILITY_SCOPE_SQL as _HISTORY_SCOPE_SQL,
 )
 from turnstone.core.storage._utils import (
@@ -136,16 +143,18 @@ from turnstone.core.storage._utils import (
     build_attachments_by_msg as _build_attachments_by_msg,
 )
 from turnstone.core.storage._utils import (
-    escape_like as _escape_like,
-)
-from turnstone.core.storage._utils import (
+    clone_workstream_transaction,
     find_orphan_conversations,
     parse_checkpoint_watermark,
     prepare_provider_data_for_save,
     purge_orphan_conversations,
     release_attachment_refs,
+    retain_attachment_refs,
     sanitize_text,
     senders_from_user_meta,
+)
+from turnstone.core.storage._utils import (
+    escape_like as _escape_like,
 )
 from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
@@ -411,9 +420,16 @@ class PostgreSQLBackend:
         # Single timestamp for all rows — ordering is preserved by auto-increment id.
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         insert_rows = []
+        attachment_ids: list[str] = []
         ws_ids: set[str] = set()
         for row in rows:
             ws_ids.add(row["ws_id"])
+            row_attachment_ids = [
+                attachment_id
+                for attachment_id in row.get("attachment_ids", [])
+                if isinstance(attachment_id, str) and attachment_id
+            ]
+            attachment_ids.extend(row_attachment_ids)
             insert_rows.append(
                 {
                     "ws_id": row["ws_id"],
@@ -431,10 +447,12 @@ class PostgreSQLBackend:
                     "tool_calls": row.get("tool_calls"),
                     "_source": sanitize_text(row.get("source")),
                     "is_error": bool(row.get("is_error", False)),
+                    "attachments": (json.dumps(row_attachment_ids) if row_attachment_ids else None),
                     "meta": row.get("meta"),
                 }
             )
         with self._conn() as conn:
+            retain_attachment_refs(conn, attachment_ids)
             conn.execute(sa.insert(conversations), insert_rows)
             for wid in ws_ids:
                 conn.execute(
@@ -479,7 +497,9 @@ class PostgreSQLBackend:
                     .order_by(conversations.c.id)
                 ).fetchall()
         attachments = self._resolve_row_attachments(rows)
-        msg_rows = [tuple(r)[:11] for r in rows]
+        # Preserve the raw ref-list for canonical Turn/fork durability; see
+        # the SQLite twin for the source-delete race this closes.
+        msg_rows = [tuple(r) for r in rows]
         return msg_rows, (attachments or None)
 
     def load_messages(
@@ -508,6 +528,51 @@ class PostgreSQLBackend:
         return _recover_trajectory(
             _reconstruct_turns_checkpointed(msg_rows, ws_id, attachments, checkpoint=checkpointed)
         )
+
+    def clone_workstream(
+        self,
+        source_ws_id: str,
+        destination_ws_id: str,
+        *,
+        principal_id: str,
+        trusted_internal: bool = False,
+        expected_session: ForkCloneExpectation | None = None,
+    ) -> ForkCloneSnapshot:
+        """Clone source state at one serializable PostgreSQL snapshot."""
+        for attempt in range(3):
+            now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+            with self._conn() as base_conn:
+                conn = base_conn.execution_options(isolation_level="SERIALIZABLE")
+                try:
+                    snapshot = clone_workstream_transaction(
+                        conn,
+                        source_ws_id,
+                        destination_ws_id,
+                        principal_id=principal_id,
+                        trusted_internal=trusted_internal,
+                        expected_session=expected_session,
+                        now=now,
+                        lock_rows=True,
+                    )
+                    conn.commit()
+                    return snapshot
+                except sa.exc.DBAPIError as exc:
+                    conn.rollback()
+                    original = exc.orig
+                    sqlstate = getattr(original, "sqlstate", None) or getattr(
+                        original, "pgcode", None
+                    )
+                    if sqlstate in {"40001", "40P01"} and attempt < 2:
+                        # Source delete/project mutation and ordinary appends
+                        # may cross the clone lock order. Retry the entire
+                        # authorization + snapshot, never only the write tail.
+                        time.sleep(0.01 * (attempt + 1))
+                        continue
+                    raise
+                except Exception:
+                    conn.rollback()
+                    raise
+        raise RuntimeError("clone_workstream: retry loop exhausted")
 
     def _resolve_row_attachments(self, rows: Sequence[Any]) -> dict[int, list[dict[str, Any]]]:
         """Build the ``reconstruct_messages`` attachment map from row ref-lists.
@@ -699,7 +764,8 @@ class PostgreSQLBackend:
                         "w.node_id, w.state, w.kind, "
                         "wcm.value, wcs.value, "
                         "(SELECT COUNT(*) FROM workstreams ch "
-                        " WHERE ch.parent_ws_id = w.ws_id), "
+                        " WHERE ch.parent_ws_id = w.ws_id "
+                        " AND ch.state != 'creating'), "
                         "(SELECT ue.prompt_tokens FROM usage_events ue "
                         " WHERE ue.ws_id = w.ws_id "
                         " ORDER BY ue.timestamp DESC LIMIT 1), "
@@ -712,6 +778,7 @@ class PostgreSQLBackend:
                         "LEFT JOIN model_definitions md ON md.alias = wcm.value "
                         "WHERE EXISTS "
                         "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
+                        "AND w.state != 'creating' "
                         f"{kind_clause}"
                         f"{user_clause}"
                         f"{state_clause}"
@@ -728,7 +795,7 @@ class PostgreSQLBackend:
             orphan_rows = conn.execute(
                 sa.text(
                     "SELECT ws_id FROM workstreams "
-                    "WHERE NOT EXISTS "
+                    "WHERE state != 'creating' AND NOT EXISTS "
                     "  (SELECT 1 FROM conversations c "
                     "   WHERE c.ws_id = workstreams.ws_id)"
                 )
@@ -753,6 +820,7 @@ class PostgreSQLBackend:
                 )
                 stale_rows = conn.execute(
                     sa.select(workstreams.c.ws_id).where(
+                        workstreams.c.state != "creating",
                         workstreams.c.alias.is_(None),
                         workstreams.c.updated < cutoff,
                     )
@@ -780,19 +848,28 @@ class PostgreSQLBackend:
         with self._conn() as conn:
             # 1. Exact alias
             row = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias_or_id)
+                sa.select(workstreams.c.ws_id).where(
+                    workstreams.c.alias == alias_or_id,
+                    workstreams.c.state != "creating",
+                )
             ).fetchone()
             if row:
                 return str(row[0])
             # 2. Exact ws_id
             row = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == alias_or_id)
+                sa.select(workstreams.c.ws_id).where(
+                    workstreams.c.ws_id == alias_or_id,
+                    workstreams.c.state != "creating",
+                )
             ).fetchone()
             if row:
                 return str(row[0])
             # 3. Prefix match
             rows = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id.like(alias_or_id + "%"))
+                sa.select(workstreams.c.ws_id).where(
+                    workstreams.c.ws_id.like(alias_or_id + "%"),
+                    workstreams.c.state != "creating",
+                )
             ).fetchall()
             if len(rows) == 1:
                 return str(rows[0][0])
@@ -801,7 +878,10 @@ class PostgreSQLBackend:
     # -- Workstream config -----------------------------------------------------
 
     def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
-        if not config:
+        public_config = {
+            key: value for key, value in config.items() if key != FORK_RESERVATION_CONFIG_KEY
+        }
+        if not public_config:
             return
         with self._conn() as conn:
             conn.execute(
@@ -810,7 +890,10 @@ class PostgreSQLBackend:
                     "VALUES (:ws_id, :key, :value) "
                     "ON CONFLICT (ws_id, key) DO UPDATE SET value = EXCLUDED.value"
                 ),
-                [{"ws_id": ws_id, "key": key, "value": value} for key, value in config.items()],
+                [
+                    {"ws_id": ws_id, "key": key, "value": value}
+                    for key, value in public_config.items()
+                ],
             )
             conn.commit()
 
@@ -818,10 +901,160 @@ class PostgreSQLBackend:
         with self._conn() as conn:
             rows = conn.execute(
                 sa.select(workstream_config.c.key, workstream_config.c.value).where(
-                    workstream_config.c.ws_id == ws_id
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key != FORK_RESERVATION_CONFIG_KEY,
                 )
             ).fetchall()
             return {row[0]: row[1] for row in rows}
+
+    def finalize_deferred_create(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+        *,
+        alias: str | None = None,
+        config: dict[str, str] | None = None,
+        node_id: str | None = None,
+        override_reason: str = "local",
+    ) -> bool:
+        """Apply private prepublication writes to exactly one fork row."""
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        if not ws_id or not fork_reservation_token:
+            return False
+        public_config = {
+            key: value
+            for key, value in (config or {}).items()
+            if key != FORK_RESERVATION_CONFIG_KEY
+        }
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id).with_for_update()
+            ).fetchone()
+            reservation = conn.execute(
+                sa.select(workstream_config.c.value)
+                .where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+                .with_for_update()
+            ).fetchone()
+            if (
+                row is None
+                or str(row[0] or "") != "creating"
+                or reservation is None
+                or str(reservation[0] or "") != fork_reservation_token
+            ):
+                conn.rollback()
+                return False
+            if alias is not None:
+                incumbent = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias)
+                ).fetchone()
+                if incumbent is not None and str(incumbent[0]) != ws_id:
+                    conn.rollback()
+                    return False
+            try:
+                if alias is not None:
+                    conn.execute(
+                        sa.update(workstreams)
+                        .where(workstreams.c.ws_id == ws_id)
+                        .values(alias=alias)
+                    )
+                if public_config:
+                    config_stmt = pg_insert(workstream_config)
+                    conn.execute(
+                        config_stmt.on_conflict_do_update(
+                            index_elements=["ws_id", "key"],
+                            set_={"value": config_stmt.excluded.value},
+                        ),
+                        [
+                            {"ws_id": ws_id, "key": key, "value": value}
+                            for key, value in public_config.items()
+                        ],
+                    )
+                if node_id is not None:
+                    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+                    override_stmt = pg_insert(workstream_overrides).values(
+                        ws_id=ws_id,
+                        node_id=node_id,
+                        reason=override_reason,
+                        created=now,
+                        updated=now,
+                    )
+                    conn.execute(
+                        override_stmt.on_conflict_do_update(
+                            index_elements=[workstream_overrides.c.ws_id],
+                            set_={
+                                "node_id": node_id,
+                                "reason": override_reason,
+                                "updated": now,
+                            },
+                        )
+                    )
+                conn.commit()
+                return True
+            except sa.exc.IntegrityError:
+                conn.rollback()
+                if alias is not None:
+                    return False
+                raise
+
+    def publish_deferred_create(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        """CAS one exact durable reservation from creating to idle."""
+        if not ws_id or not fork_reservation_token:
+            return False
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id).with_for_update()
+            ).fetchone()
+            reservation = conn.execute(
+                sa.select(workstream_config.c.value)
+                .where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+                .with_for_update()
+            ).fetchone()
+            if (
+                row is None
+                or str(row[0] or "") != "creating"
+                or reservation is None
+                or str(reservation[0] or "") != fork_reservation_token
+            ):
+                conn.rollback()
+                return False
+            published = conn.execute(
+                sa.update(workstreams)
+                .where(
+                    workstreams.c.ws_id == ws_id,
+                    workstreams.c.state == "creating",
+                )
+                .values(state="idle", updated=now)
+                .returning(workstreams.c.ws_id)
+            ).fetchone()
+            if published is None:
+                conn.rollback()
+                return False
+            conn.commit()
+            return True
+
+    def get_workstream_reservation_token(self, ws_id: str) -> str:
+        if not ws_id:
+            return ""
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(workstream_config.c.value).where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+            ).fetchone()
+        return str(row[0] or "") if row is not None else ""
 
     # -- Workstream metadata ---------------------------------------------------
 
@@ -912,6 +1145,53 @@ class PostgreSQLBackend:
         """
         return self.get_workstreams_batch([ws_id]).get(ws_id)
 
+    def ensure_workstream_incarnation_snapshot(self, ws_id: str) -> dict[str, Any] | None:
+        """Read one row and install a legacy incarnation fence atomically."""
+        if not ws_id:
+            return None
+        with self._conn() as conn:
+            # Lock the durable row before its config fence, matching clone and
+            # conditional delete. A replacement cannot cross this snapshot.
+            row = conn.execute(
+                sa.select(workstreams).where(workstreams.c.ws_id == ws_id).with_for_update()
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            token_row = conn.execute(
+                sa.select(workstream_config.c.value)
+                .where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+                .with_for_update()
+            ).fetchone()
+            token = str(token_row[0] or "") if token_row is not None else ""
+            if not token:
+                token = uuid.uuid4().hex
+                if token_row is None:
+                    conn.execute(
+                        sa.insert(workstream_config),
+                        {
+                            "ws_id": ws_id,
+                            "key": FORK_RESERVATION_CONFIG_KEY,
+                            "value": token,
+                        },
+                    )
+                else:
+                    conn.execute(
+                        sa.update(workstream_config)
+                        .where(
+                            workstream_config.c.ws_id == ws_id,
+                            workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                        )
+                        .values(value=token)
+                    )
+            conn.commit()
+            snapshot = dict(row._mapping)
+            snapshot["fork_reservation_token"] = token
+            return snapshot
+
     def update_workstream_title(self, ws_id: str, title: str) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -936,7 +1216,8 @@ class PostgreSQLBackend:
         parent_ws_id: str | None = None,
         project_id: str | None = None,
         persona: str | None = None,
-    ) -> None:
+        fork_reservation_token: str = "",
+    ) -> bool:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -967,10 +1248,38 @@ class PostgreSQLBackend:
             created=now,
             updated=now,
         )
-        stmt = stmt.on_conflict_do_nothing(index_elements=["ws_id"])
+        insert_stmt = stmt.on_conflict_do_nothing(index_elements=["ws_id"]).returning(
+            workstreams.c.ws_id
+        )
         with self._conn() as conn:
-            conn.execute(stmt)
+            inserted_row = conn.execute(insert_stmt).fetchone()
+            inserted = inserted_row is not None
+            if inserted:
+                if fork_reservation_token:
+                    # Keep the row reservation and its incarnation fence in
+                    # one transaction, replacing any stale orphan key.
+                    token_stmt = pg_insert(workstream_config).values(
+                        ws_id=ws_id,
+                        key=FORK_RESERVATION_CONFIG_KEY,
+                        value=fork_reservation_token,
+                    )
+                    conn.execute(
+                        token_stmt.on_conflict_do_update(
+                            index_elements=["ws_id", "key"],
+                            set_={"value": fork_reservation_token},
+                        )
+                    )
+                else:
+                    # A non-fork incarnation must not inherit an orphaned
+                    # token that could authorize deletion by its predecessor.
+                    conn.execute(
+                        sa.delete(workstream_config).where(
+                            workstream_config.c.ws_id == ws_id,
+                            workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                        )
+                    )
             conn.commit()
+            return inserted
 
     def update_workstream_state(self, ws_id: str, state: str) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -1025,6 +1334,92 @@ class PostgreSQLBackend:
             conn.commit()
             return ids
 
+    def delete_stale_creating_reservations(
+        self,
+        kind: WorkstreamKind | str,
+        cutoff: str,
+        exclude_ws_ids: list[str],
+        *,
+        live_node_ids: list[str],
+        local_node_id: str | None,
+    ) -> list[str]:
+        """Hard-delete stale hidden creates under exact row/token locks."""
+        if live_node_ids is None:
+            # Liveness uncertainty is never permission to reap.
+            return []
+        norm_kind = WorkstreamKind(kind).value
+        local_owner = local_node_id or None
+        protected_live_nodes = {
+            node_id for node_id in live_node_ids if node_id and node_id != local_owner
+        }
+        conditions: list[Any] = [
+            workstreams.c.kind == norm_kind,
+            workstreams.c.state == "creating",
+            workstreams.c.updated < cutoff,
+        ]
+        if exclude_ws_ids:
+            conditions.append(~workstreams.c.ws_id.in_(exclude_ws_ids))
+        if protected_live_nodes:
+            conditions.append(
+                sa.or_(
+                    workstreams.c.node_id.is_(None),
+                    ~workstreams.c.node_id.in_(protected_live_nodes),
+                )
+            )
+
+        deleted: list[str] = []
+        tokenless_deleted = 0
+        with self._conn() as conn:
+            # Lock only the durable row at candidate admission. Publication
+            # takes the same row-first order, so it cannot retain the token,
+            # flip to idle, and then be erased by a token-only cleanup race.
+            candidates = conn.execute(
+                sa.select(workstreams.c.ws_id).where(*conditions).with_for_update(skip_locked=True)
+            ).fetchall()
+            for (candidate_id,) in candidates:
+                ws_id = str(candidate_id)
+                reservation = conn.execute(
+                    sa.select(workstream_config.c.value)
+                    .where(
+                        workstream_config.c.ws_id == ws_id,
+                        workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                    )
+                    .with_for_update()
+                ).fetchone()
+                token = str(reservation[0] or "") if reservation is not None else ""
+                exact_conditions: list[Any] = [
+                    workstreams.c.ws_id == ws_id,
+                    workstreams.c.kind == norm_kind,
+                    workstreams.c.state == "creating",
+                    workstreams.c.updated < cutoff,
+                ]
+                if token:
+                    exact_conditions.append(
+                        sa.exists(
+                            sa.select(workstream_config.c.ws_id).where(
+                                workstream_config.c.ws_id == ws_id,
+                                workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                                workstream_config.c.value == token,
+                            )
+                        )
+                    )
+                exact_incarnation = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(*exact_conditions)
+                ).fetchone()
+                if exact_incarnation is None:
+                    continue
+                if self._delete_workstream_on_connection(conn, ws_id):
+                    deleted.append(ws_id)
+                    if not token:
+                        tokenless_deleted += 1
+            conn.commit()
+        if tokenless_deleted:
+            log.warning(
+                "storage.stale_create_tokenless_reaped backend=postgresql count=%d",
+                tokenless_deleted,
+            )
+        return deleted
+
     def touch_workstream(self, ws_id: str) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
@@ -1043,38 +1438,81 @@ class PostgreSQLBackend:
             )
             conn.commit()
 
+    def _delete_workstream_on_connection(self, conn: Any, ws_id: str) -> bool:
+        """Delete one row and dependents inside the caller's transaction."""
+        # Refcount GC over every referenced blob (content-addressed ids are
+        # global, so a deduped blob may be shared with another workstream —
+        # decrement, don't blanket-delete by ws_id).  Blobs that hit 0 are
+        # pruned; any still referenced elsewhere survive.
+        referenced = conn.execute(
+            sa.select(conversations.c.attachments).where(
+                sa.and_(
+                    conversations.c.ws_id == ws_id,
+                    conversations.c.attachments.is_not(None),
+                )
+            )
+        ).fetchall()
+        ref_ids: list[str] = []
+        for (refs,) in referenced:
+            ref_ids.extend(_parse_attachment_refs(refs))
+        release_attachment_refs(conn, ref_ids)
+        conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
+        conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
+        conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id))
+        # Null-out parent_ws_id on children — see sqlite sibling for rationale.
+        conn.execute(
+            sa.update(workstreams)
+            .where(workstreams.c.parent_ws_id == ws_id)
+            .values(parent_ws_id=None)
+        )
+        deleted = conn.execute(
+            sa.delete(workstreams)
+            .where(workstreams.c.ws_id == ws_id)
+            .returning(workstreams.c.ws_id)
+        ).fetchone()
+        return deleted is not None
+
     def delete_workstream(self, ws_id: str) -> bool:
         with self._conn() as conn:
-            # Refcount GC over every referenced blob (content-addressed ids are
-            # global, so a deduped blob may be shared with another workstream —
-            # decrement, don't blanket-delete by ws_id).  Blobs that hit 0 are
-            # pruned; any still referenced elsewhere survive.
-            referenced = conn.execute(
-                sa.select(conversations.c.attachments).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.attachments.is_not(None),
-                    )
-                )
-            ).fetchall()
-            ref_ids: list[str] = []
-            for (refs,) in referenced:
-                ref_ids.extend(_parse_attachment_refs(refs))
-            release_attachment_refs(conn, ref_ids)
-            conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
-            conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
+            # Match clone/conditional-delete lock ordering: durable row first,
+            # then conversations/config/dependents.
             conn.execute(
-                sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id)
-            )
-            # Null-out parent_ws_id on children — see sqlite sibling for rationale.
-            conn.execute(
-                sa.update(workstreams)
-                .where(workstreams.c.parent_ws_id == ws_id)
-                .values(parent_ws_id=None)
-            )
-            result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
+            ).fetchone()
+            deleted = self._delete_workstream_on_connection(conn, ws_id)
             conn.commit()
-            return result.rowcount > 0
+            return deleted
+
+    def delete_workstream_if_fork_reserved(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        if not fork_reservation_token:
+            return False
+        with self._conn() as conn:
+            # Lock the durable incarnation before its config fence. This is
+            # the same ordering as clone_workstream_transaction.
+            row = conn.execute(
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            reservation = conn.execute(
+                sa.select(workstream_config.c.value)
+                .where(
+                    workstream_config.c.ws_id == ws_id,
+                    workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+                )
+                .with_for_update()
+            ).fetchone()
+            if reservation is None or str(reservation[0] or "") != fork_reservation_token:
+                conn.rollback()
+                return False
+            deleted = self._delete_workstream_on_connection(conn, ws_id)
+            conn.commit()
+            return deleted
 
     def list_orphan_conversations(self) -> list[dict[str, Any]]:
         with self._conn() as conn:
@@ -1243,6 +1681,7 @@ class PostgreSQLBackend:
                 q = q.where(workstreams.c.kind == WorkstreamKind(kind).value)
             if user_id is not None:
                 q = q.where(workstreams.c.user_id == user_id)
+            q = q.where(workstreams.c.state != "creating")
             return list(conn.execute(q).fetchall())
 
     def count_workstreams_by_state(
@@ -1256,7 +1695,11 @@ class PostgreSQLBackend:
         See the SQLite backend's docstring (#perf-1).
         """
         with self._conn() as conn:
-            q = sa.select(workstreams.c.state, sa.func.count()).group_by(workstreams.c.state)
+            q = (
+                sa.select(workstreams.c.state, sa.func.count())
+                .where(workstreams.c.state != "creating")
+                .group_by(workstreams.c.state)
+            )
             if parent_ws_id is not None:
                 q = q.where(workstreams.c.parent_ws_id == parent_ws_id)
             if user_id is not None:
@@ -1277,6 +1720,7 @@ class PostgreSQLBackend:
                 sa.select(sa.func.count())
                 .select_from(workstreams)
                 .where(workstreams.c.created >= since)
+                .where(workstreams.c.state != "creating")
             )
             if parent_ws_id is not None:
                 q = q.where(workstreams.c.parent_ws_id == parent_ws_id)
@@ -1306,7 +1750,9 @@ class PostgreSQLBackend:
         # SQL, not post-filtered in Python, so limit/offset pagination stays
         # honest — a page never silently shrinks because hidden rows were
         # fetched then dropped.
-        scope_sql = _HISTORY_SCOPE_SQL if user_id is not None else ""
+        scope_sql = _HISTORY_CREATING_EXCL_SQL
+        if user_id is not None:
+            scope_sql += _HISTORY_SCOPE_SQL
         scope_params: dict[str, Any] = {"scope_user": user_id} if user_id is not None else {}
         if exclude_ws_id is not None:
             scope_sql += _HISTORY_EXCL_SQL
@@ -1375,7 +1821,9 @@ class PostgreSQLBackend:
 
     def search_history_recent(self, limit: int = 20, *, user_id: str | None = None) -> list[Any]:
         capped = min(limit, 100)
-        scope_sql = _HISTORY_SCOPE_SQL if user_id is not None else ""
+        scope_sql = _HISTORY_CREATING_EXCL_SQL
+        if user_id is not None:
+            scope_sql += _HISTORY_SCOPE_SQL
         scope_params = {"scope_user": user_id} if user_id is not None else {}
         with self._conn() as conn:
             return list(
@@ -3652,7 +4100,10 @@ class PostgreSQLBackend:
                 out[r[0]] = int(r[1])
         return out
 
-    def get_workstreams_batch(self, ws_ids: list[str]) -> dict[str, dict[str, Any] | None]:
+    def get_workstreams_batch(
+        self,
+        ws_ids: list[str],
+    ) -> dict[str, dict[str, Any] | None]:
         if not ws_ids:
             return {}
         clean = [w for w in ws_ids if isinstance(w, str) and w]
@@ -3680,7 +4131,7 @@ class PostgreSQLBackend:
                 ).where(workstreams.c.ws_id.in_(clean))
             ).fetchall()
         for r in rows:
-            out[r[0]] = {
+            item = {
                 "ws_id": r[0],
                 "node_id": r[1],
                 "user_id": r[2],
@@ -3697,6 +4148,7 @@ class PostgreSQLBackend:
                 "project_id": r[13],
                 "persona": r[14],
             }
+            out[r[0]] = item
         return out
 
     # -- Audit events ----------------------------------------------------------
@@ -5351,7 +5803,10 @@ class PostgreSQLBackend:
                     workstreams.c.node_id,
                     workstreams.c.user_id,
                 )
-                .where(workstreams.c.project_id == project_id)
+                .where(
+                    workstreams.c.project_id == project_id,
+                    workstreams.c.state != "creating",
+                )
                 .order_by(workstreams.c.updated.desc())
             ).fetchall()
             return [

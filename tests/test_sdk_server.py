@@ -97,6 +97,25 @@ async def test_create_workstream():
 
 
 @pytest.mark.anyio
+async def test_create_workstream_forwards_structured_notify_targets():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return _json_response({"ws_id": "ws_new", "name": "Analysis"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        await client.create_workstream(
+            name="Analysis",
+            notify_targets=[{"channel_type": "slack", "channel_id": "C123"}],
+        )
+
+    assert captured["notify_targets"] == [{"channel_type": "slack", "channel_id": "C123"}]
+
+
+@pytest.mark.anyio
 async def test_close_workstream():
     transport = _mock_transport(
         {"POST /v1/api/workstreams/ws1/close": _json_response({"status": "ok"})}
@@ -185,12 +204,33 @@ async def test_send():
 @pytest.mark.anyio
 async def test_approve():
     transport = _mock_transport(
-        {"POST /v1/api/workstreams/ws1/approve": _json_response({"status": "ok"})}
+        {
+            "POST /v1/api/workstreams/ws1/approve": _json_response(
+                {"status": "ok", "cycle_id": "cycle-1"}
+            )
+        }
     )
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.approve(ws_id="ws1", approved=True, feedback="looks good")
         assert resp.status == "ok"
+        assert resp.cycle_id == "cycle-1"
+
+
+@pytest.mark.anyio
+async def test_cancel_preserves_dropped_snapshot():
+    transport = _mock_transport(
+        {
+            "POST /v1/api/workstreams/ws1/cancel": _json_response(
+                {"status": "cancelled", "dropped": {"tool_calls": ["call-1"]}}
+            )
+        }
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        resp = await client.cancel("ws1")
+        assert resp.status == "cancelled"
+        assert resp.dropped == {"tool_calls": ["call-1"]}
 
 
 @pytest.mark.anyio
@@ -376,16 +416,18 @@ async def test_create_workstream_extended_params():
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.create_workstream(
             name="ext",
+            judge_model="judge-fast",
             initial_message="hi",
-            auto_approve_tools="read_file,write_file",
+            auto_approve_tools=["read_file", "write_file"],
             user_id="u42",
             ws_id="ws_custom",
             persona="researcher",
             project_id="proj_9",
         )
         assert captured_body["name"] == "ext"
+        assert captured_body["judge_model"] == "judge-fast"
         assert captured_body["initial_message"] == "hi"
-        assert captured_body["auto_approve_tools"] == "read_file,write_file"
+        assert captured_body["auto_approve_tools"] == ["read_file", "write_file"]
         assert captured_body["user_id"] == "u42"
         assert captured_body["ws_id"] == "ws_custom"
         assert captured_body["persona"] == "researcher"
@@ -406,6 +448,7 @@ async def test_create_workstream_omits_empty_params():
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.create_workstream(name="min")
         assert captured_body == {"name": "min"}
+        assert "judge_model" not in captured_body
         assert "initial_message" not in captured_body
         assert "auto_approve_tools" not in captured_body
         assert "user_id" not in captured_body

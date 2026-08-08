@@ -1,190 +1,153 @@
 @startuml
 !theme plain
-title Turnstone — Authentication Architecture
+title Turnstone — User Authentication and Model-Backend Credentials
 
 skinparam class {
     BackgroundColor<<core>> #E8EAF6
-    BackgroundColor<<jwt>> #C8E6C9
+    BackgroundColor<<token>> #C8E6C9
     BackgroundColor<<storage>> #B3E5FC
-    BackgroundColor<<endpoint>> #FFE0B2
-    BackgroundColor<<scope>> #F3E5F5
+    BackgroundColor<<runtime>> #FFE0B2
+    BackgroundColor<<model>> #F3E5F5
 }
 
-' -- Core Auth --
-class "AuthConfig" as AC <<core>> {
-    +enabled: bool
-    +tokens: dict[str, str]
-    +check(token) → role | None
-    --
-    Static config-file tokens
-    hmac.compare_digest
+package "Request identity" {
+  class "AuthMiddleware / check_request()" as RequestAuth <<core>> {
+      Extract bearer or HttpOnly cookie
+      Validate audience + expiry
+      Check scope / permission
+      Publish AuthResult in request state
+  }
+
+  class "AuthResult" as AuthResult <<core>> {
+      + user_id: str
+      + scopes: frozenset[str]
+      + permissions: frozenset[str]
+      + token_source: str
+  }
+
+  class "JWT" as JWT <<token>> {
+      HS256, sub, aud, iat, exp
+      console proxy mints short-lived
+      server-audience identity
+  }
+
+  class "API / config token" as ApiToken <<token>> {
+      ts_* token: SHA-256 DB lookup
+      config token: constant-time compare
+  }
+
+  class "users / roles / api_tokens" as UserTables <<storage>> {
+      password hash + token hash
+      role-derived permissions
+  }
 }
 
-class "AuthResult" as AR <<core>> {
-    +user_id: str
-    +scopes: frozenset[str]
-    +token_source: str
-    +has_scope(scope) → bool
+package "Immutable model binding" {
+  class "ModelRegistry" as Registry <<model>> {
+      + resolve_binding(alias)
+      + generation: int
+      --
+      Atomically resolves client, provider,
+      model, ModelConfig, generation.
+  }
+
+  class "ModelConfig snapshot" as ModelConfig <<model>> {
+      + alias / provider / endpoint / static key
+      + auth_mode
+      + obo_audience
+      + obo_scopes
+      --
+      static | entra_obo | entra_app | rfc8693_obo
+  }
+
+  class "ModelLane" as Lane <<model>> {
+      + client / provider / model / capabilities
+      + backend_auth_config: ModelConfig
+      + backend_auth_resolver: Callable
+  }
+
+  class "Model definitions" as ModelTable <<storage>> {
+      DB + config-file definitions
+      encrypted protected fields
+  }
 }
 
-class "check_request()" as CR <<core>> {
-    auth_config, method, path,
-    auth_header, cookie_header,
-    jwt_secret, storage
-    → (allowed, status, msg, AuthResult)
-    --
-    1. Auth disabled → allow
-    2. Public path → allow
-    3. Extract Bearer / cookie
-    4. Detect token type
-    5. Validate → AuthResult
-    6. Check scope vs path
+package "Per-call credential resolution" {
+  class "resolve_model_backend_auth_token()" as Resolver <<runtime>> {
+      + alias + pinned ModelConfig
+      + initiating principal_id
+      + ConfigStore + mint client
+      → dynamic token | None | fail closed
+  }
+
+  class "Model mint client" as Mint <<runtime>> {
+      + mint_model_obo_token_sync(...)
+      + mint_app_token_sync(...)
+      --
+      Cached by alias / principal / grant leg;
+      retains refusal cause for diagnostics.
+  }
+
+  class "OIDC / OBO protected state" as OBOState <<storage>> {
+      encrypted user refresh credential
+      deployment Fernet key
+      configured grant profile
+  }
+
+  class "lane_call_client()" as CallClient <<runtime>> {
+      cancel check before mint
+      resolve once per plant call
+      cancel check after mint
+      client.with_options(api_key=token)
+  }
+
+  class "Provider SDK request" as ProviderCall <<runtime>> {
+      Anthropic: x-api-key
+      OpenAI-style: Authorization Bearer
+  }
 }
 
-' -- Token Types --
-class "JWT (HS256)" as JWT <<jwt>> {
-    sub: user_id
-    scopes: "read,write,approve"
-    src: "password" | "database"
-    iat, exp (24h default)
-    --
-    Detected by: contains "."
-    Validated locally
-    No DB call
-}
+RequestAuth --> JWT : validates
+RequestAuth --> ApiToken : validates
+RequestAuth --> UserTables : lookup + permissions
+RequestAuth --> AuthResult : returns
 
-class "API Token" as AT <<jwt>> {
-    Format: ts_ + 64 hex
-    Stored: SHA-256 hash
-    --
-    Detected by: starts with "ts_"
-    Lookup by hash in DB
-    Expiry check
-}
+ModelTable --> Registry : load / hot reload
+Registry --> ModelConfig : immutable snapshot
+Registry --> Lane : coherent binding
 
-class "Config Token" as CT <<core>> {
-    Raw value in memory
-    Role: "read" | "full"
-    --
-    Detected by: fallback
-    hmac.compare_digest
-    No DB needed
-}
+AuthResult --> Resolver : initiating principal
+Lane --> Resolver : callable + pinned config
+Resolver --> Mint : dynamic modes only
+Mint --> OBOState : decrypt / grant policy
+CallClient --> Lane
+CallClient --> Resolver
+CallClient --> ProviderCall : cloned SDK client
 
-' -- Scopes --
-class "Scope Hierarchy" as SH <<scope>> {
-    read: {read}
-    write: {read, write}
-    approve: {read, write, approve}
-    --
-    GET → read
-    POST write paths → write
-    POST /api/workstreams/{ws_id}/approve → approve
-    /api/admin/* → approve
-}
-
-' -- Storage --
-class "users" as UT <<storage>> {
-    user_id (PK)
-    username (unique)
-    display_name
-    password_hash (bcrypt)
-    created
-}
-
-class "api_tokens" as TT <<storage>> {
-    token_id (PK)
-    token_hash (SHA-256, unique)
-    token_prefix
-    user_id → users
-    name, scopes
-    created, expires
-}
-
-' -- Endpoints --
-class "POST /api/auth/login" as Login <<endpoint>> {
-    {username, password}
-    OR {token: "ts_xxx"}
-    → {jwt, role, scopes, user_id}
-    --
-    Sets HttpOnly cookie
-}
-
-class "GET /api/auth/status" as Status <<endpoint>> {
-    → {auth_enabled, has_users,
-       setup_required}
-    --
-    Public (no auth)
-    Drives UI setup wizard
-}
-
-class "POST /api/auth/setup" as Setup <<endpoint>> {
-    {username, display_name, password}
-    → {jwt, user_id, scopes}
-    --
-    Public (no auth)
-    Only when zero users exist
-    Returns 409 if already set up
-}
-
-class "Admin API (Console)" as Admin <<endpoint>> {
-    POST/GET/DELETE users
-    POST/GET tokens
-    DELETE tokens/{id}
-    --
-    Requires approve scope
-}
-
-' -- Relationships --
-CR --> AC : config tokens
-CR --> JWT : validate
-CR --> AT : hash lookup
-CR --> CT : hmac check
-CR --> AR : returns
-CR --> SH : checks
-
-Login --> JWT : issues
-Login --> UT : verify password
-Login --> TT : verify API token
-
-Setup --> UT : create first user
-Setup --> JWT : issues
-
-AT --> TT : lookup by hash
-Admin --> UT : CRUD
-Admin --> TT : CRUD
-
-AR --> SH : scopes from
-
-JWT ..> AR : produces
-AT ..> AR : produces
-CT ..> AR : produces
-
-note right of CR
-  **Middleware Flow**
-  AuthMiddleware on every request:
-  1. Extract token from header/cookie
-  2. Detect type (JWT / ts_ / config)
-  3. Validate → AuthResult
-  4. Set ctx_user_id for logging
-  5. Store auth_result in scope state
+note right of Resolver
+  **Mode policy**
+  • static: return None; registry client's explicit key remains.
+  • entra_obo / rfc8693_obo: require an effective principal. HTTP
+    turns pin the authenticated initiator; single-user internal lanes
+    may use their session owner. Never borrow another generation's identity.
+  • entra_app: use deployment app identity, no user required.
+  • rfc8693_obo alone sends obo_scopes; each dynamic mode is paired
+    with its required Entra or RFC 8693 grant profile.
 end note
 
-note bottom of SH
-  **Console** owns admin endpoints
-  **Server** validates JWT + config only
-  Both share JWT signing secret
+note bottom of CallClient
+  Dynamic credentials are minted at dispatch, not cached in the registry
+  snapshot. Endpoint, audience, scopes, auth mode, and static-key presence stay
+  pinned to the same ModelConfig generation as the SDK client. The global
+  model.auth_fail_closed policy is read live on every mint. A Stop that wins
+  before or during mint prevents model bytes from being sent afterward.
 end note
 
-note left of JWT
-  **Console Proxy Token Minting**
-  When proxying requests to server nodes:
-  1. Console AuthMiddleware validates user JWT (aud: turnstone-console)
-  2. Proxy mints new JWT (aud: turnstone-server)
-     with real user_id, scopes, permissions
-  3. src: "console-proxy" for audit traceability
-  4. 5-minute expiry (fresh per request)
-  5. Fallback: ServiceTokenManager if no user context
+note bottom of ProviderCall
+  If minting fails, a configured fail-closed deployment or a keyless alias
+  raises BackendAuthUnavailableError. A dynamic alias with an explicit static
+  key may fall back only when policy allows. Authentication refusal is not a
+  backend-health failure and does not walk to a static fallback model.
 end note
 
 @enduml

@@ -662,7 +662,7 @@ class CoordinatorClient:
         except Exception:
             log.debug("coord_client.is_own_subtree.lookup_failed ws=%s", ws_id, exc_info=True)
             return False
-        if row is None:
+        if row is None or row.get("state") == "creating":
             return False
         if row.get("parent_ws_id") != self._coord_ws_id:
             return False
@@ -681,6 +681,8 @@ class CoordinatorClient:
         path.  Returns False on a missing / None row so callers can
         safely pass ``rows.get(wid)``.
         """
+        if row is not None and row.get("state") == "creating":
+            return False
         if ws_id == self._coord_ws_id:
             return True
         if row is None:

@@ -408,7 +408,10 @@ def test_coord_refresh_title_triggers_regeneration(storage):
     assert resp.status_code == 200
     # The lifted handler resolves the current display name and asks the
     # live session to regenerate a (different) title in the background.
-    ws.session.request_title_refresh.assert_called_once_with("c1")
+    ws.session.request_title_refresh.assert_called_once_with(
+        "c1",
+        principal_id="user-1",
+    )
 
 
 def test_coord_refresh_title_requires_operator_permission(storage):
@@ -1668,6 +1671,27 @@ def test_export_serves_storage_only_coordinator(storage):
     assert "from cold storage" in contents
     # Export does NOT rehydrate — pool stays cold.
     assert mgr.get("storage-only-coord") is None
+
+
+def test_creating_storage_only_coordinator_is_not_addressable(storage):
+    """Both coordinator resolution ladders hide lifecycle reservations."""
+    ws_id = "c" * 32
+    storage.register_workstream(
+        ws_id,
+        kind="coordinator",
+        user_id="user-1",
+        state="creating",
+    )
+    storage.save_message(ws_id, "user", "unpublished coordinator transcript")
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    children = client.get(f"/v1/api/workstreams/{ws_id}/children", headers=_COORD_HEADERS)
+    exported = client.get(f"/v1/api/workstreams/{ws_id}/export", headers=_COORD_HEADERS)
+
+    assert children.status_code == 404
+    assert exported.status_code == 404
+    assert "unpublished coordinator transcript" not in exported.text
 
 
 def test_export_404_when_kind_interactive(storage):

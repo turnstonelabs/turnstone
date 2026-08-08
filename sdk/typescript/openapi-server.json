@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.8.0a5",
+    "version": "1.8.0a6",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -55,7 +55,7 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Accepts two content types. Default is `application/json` with a `CreateWorkstreamRequest` body. Alternatively, `multipart/form-data` with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) plus zero-or-more `file` parts saves each file as an attachment under the new workstream. When `initial_message` is also set, attachments are resolved onto that turn before the worker thread dispatches; otherwise they remain pending for a follow-up `POST /v1/api/workstreams/{ws_id}/send`.",
+        "description": "Accepts two content types. Default is `application/json` with a `CreateWorkstreamRequest` body. Alternatively, `multipart/form-data` with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) plus zero-or-more `file` parts saves each file as an attachment under the new workstream. When `initial_message` is also set, attachments are resolved onto that turn before the worker thread dispatches; otherwise they remain pending for a follow-up `POST /v1/api/workstreams/{ws_id}/send`. Setting `resume_ws` atomically forks the visible source history, configuration, project, persona, and attachment references into a distinct destination; it does not reopen or mutate the source. Attachments and `resume_ws` cannot be combined. Creation stays unpublished until validation and the optional fork transaction complete.",
         "requestBody": {
           "required": true,
           "content": {
@@ -87,6 +87,26 @@
               }
             }
           },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Error 409",
             "content": {
@@ -99,6 +119,36 @@
           },
           "413": {
             "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -335,13 +385,23 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/ApproveResponse"
                 }
               }
             }
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
             "content": {
               "application/json": {
                 "schema": {
@@ -442,7 +502,7 @@
           }
         ],
         "requestBody": {
-          "required": true,
+          "required": false,
           "content": {
             "application/json": {
               "schema": {
@@ -457,7 +517,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/CancelResponse"
                 }
               }
             }
@@ -2396,6 +2456,32 @@
             "description": "Auto-approve the tools in this batch going forward",
             "title": "Always",
             "type": "boolean"
+          },
+          "cycle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Resolve this exact approval cycle",
+            "title": "Cycle Id"
+          },
+          "call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Resolve the approval cycle containing this tool call",
+            "title": "Call Id"
           }
         },
         "required": [
@@ -2404,10 +2490,35 @@
         "title": "ApproveRequest",
         "type": "object"
       },
+      "ApproveResponse": {
+        "properties": {
+          "status": {
+            "default": "ok",
+            "description": "Request outcome",
+            "title": "Status",
+            "type": "string"
+          },
+          "cycle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Approval cycle that was resolved, or null when none was pending",
+            "title": "Cycle Id"
+          }
+        },
+        "title": "ApproveResponse",
+        "type": "object"
+      },
       "CommandRequest": {
         "properties": {
           "command": {
-            "description": "Slash command (e.g. /clear, /new, /resume)",
+            "description": "Workstream-local slash command (for example /clear or /instructions). Lifecycle commands such as /new and /resume are local-CLI-only; remote clients use the dedicated workstream endpoints.",
             "title": "Command",
             "type": "string"
           },
@@ -2434,6 +2545,24 @@
           }
         },
         "title": "CancelRequest",
+        "type": "object"
+      },
+      "CancelResponse": {
+        "properties": {
+          "status": {
+            "default": "ok",
+            "description": "Request outcome",
+            "title": "Status",
+            "type": "string"
+          },
+          "dropped": {
+            "additionalProperties": true,
+            "description": "Best-effort, credential-redacted snapshot of pending work affected by cancellation; keys are omitted when not observable",
+            "title": "Dropped",
+            "type": "object"
+          }
+        },
+        "title": "CancelResponse",
         "type": "object"
       },
       "RewindRequest": {
@@ -2465,15 +2594,43 @@
             "title": "Model",
             "type": "string"
           },
+          "judge_model": {
+            "default": "",
+            "description": "Optional judge model alias for this workstream. Empty uses the server's configured judge model.",
+            "title": "Judge Model",
+            "type": "string"
+          },
           "auto_approve": {
             "default": false,
             "description": "Auto-approve all tool calls",
             "title": "Auto Approve",
             "type": "boolean"
           },
+          "auto_approve_tools": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ],
+            "default": "",
+            "description": "Tool names to auto-approve even when auto_approve is false, accepted as either a comma-separated string or an array of strings.",
+            "title": "Auto Approve Tools"
+          },
+          "user_id": {
+            "default": "",
+            "description": "Optional workstream owner override. Honored only for trusted service identities (currently the console); ordinary callers remain bound to their authenticated user id.",
+            "title": "User Id",
+            "type": "string"
+          },
           "resume_ws": {
             "default": "",
-            "description": "Workstream ID to resume atomically during creation (empty = fresh start)",
+            "description": "Source workstream ID or alias to fork atomically into the new workstream (empty = fresh start)",
             "title": "Resume Ws",
             "type": "string"
           },
@@ -2510,7 +2667,7 @@
           },
           "client_type": {
             "default": "",
-            "description": "Client surface type (web, cli, chat). Defaults to web for server-created sessions.",
+            "description": "Client surface type (web, cli, chat, scheduled). Defaults to web for server-created sessions.",
             "title": "Client Type",
             "type": "string"
           },
@@ -2584,13 +2741,13 @@
           },
           "resumed": {
             "default": false,
-            "description": "Whether a previous workstream was resumed",
+            "description": "Whether the requested source was successfully forked",
             "title": "Resumed",
             "type": "boolean"
           },
           "message_count": {
             "default": 0,
-            "description": "Number of messages in the resumed workstream",
+            "description": "Number of messages cloned into the new workstream",
             "title": "Message Count",
             "type": "integer"
           },
@@ -2603,21 +2760,13 @@
             "type": "array"
           },
           "initial_message_status": {
-            "anyOf": [
-              {
-                "enum": [
-                  "queue_full",
-                  "refused_closed"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
             "description": "Present ONLY when the workstream was created but its initial_message could not be delivered: 'queue_full' (a raced live worker's interjection queue was at capacity \u2014 resend via /send; any uploads stay staged) or 'refused_closed' (the workstream was closed mid-create). Absent whenever the message was dispatched.",
-            "title": "Initial Message Status"
+            "enum": [
+              "queue_full",
+              "refused_closed"
+            ],
+            "title": "Initial Message Status",
+            "type": "string"
           }
         },
         "required": [

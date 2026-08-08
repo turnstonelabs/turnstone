@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests.conftest import resolve_when_pending
-from turnstone.core.session_ui_base import SessionUIBase
+from turnstone.core.session_ui_base import SessionUIBase, _SmartApprovalConfig
 
 
 class _ConcreteUI(SessionUIBase):
@@ -117,6 +117,8 @@ def _register_cycle(
     call_ids: list[str],
     *,
     judge_event: object | None = None,
+    cancel_witness: object | None = None,
+    cycle_id: str | None = None,
 ) -> Any:
     """Register a live ApprovalCycle the way ``approve_tools`` does.
 
@@ -130,9 +132,12 @@ def _register_cycle(
         {"call_id": cid, "func_name": "bash", "approval_label": "bash", "needs_approval": True}
         for cid in call_ids
     ]
+    if cancel_witness is not None:
+        for item in items:
+            item["_approval_cancel_witness"] = cancel_witness
     card: dict[str, Any] = {
         "type": "approve_request",
-        "cycle_id": f"cycle-{'-'.join(call_ids)}",
+        "cycle_id": cycle_id or f"cycle-{'-'.join(call_ids)}",
         "items": ui._serialize_approval_items(items),
         "judge_pending": False,
     }
@@ -218,6 +223,83 @@ def test_on_intent_verdict_persists_verdict_row() -> None:
     assert kwargs["verdict_id"] == "v1"
     assert kwargs["ws_id"] == "ws-1"
     assert kwargs["call_id"] == "c1"
+
+
+@pytest.mark.parametrize("resolve_first", [False, True], ids=["verdict-first", "decision-first"])
+def test_deferred_verdict_persistence_preserves_concurrent_approval_decision(
+    resolve_first: bool,
+) -> None:
+    """The deferred base UPSERT and approval decision commute.
+
+    ``ChatSession`` publishes the live verdict while holding its judge
+    lifecycle lock, then executes the returned storage action after releasing
+    that lock.  A human decision can land in that gap.  Whichever storage path
+    wins first, the durable row must finish with the operator's decision rather
+    than a late base UPSERT regressing it to ``pending``.
+    """
+
+    class _ConflictAwareStorage:
+        def __init__(self) -> None:
+            self.row: dict[str, Any] | None = None
+
+        def upsert_intent_verdict(self, **values: Any) -> None:
+            if self.row is None:
+                self.row = dict(values)
+                return
+            # Production's conflict update refreshes judge fields but does not
+            # overwrite the independently resolved user decision.
+            for key, value in values.items():
+                if key != "user_decision":
+                    self.row[key] = value
+
+        def update_intent_verdict(self, verdict_id: str, **values: Any) -> None:
+            if self.row is not None and self.row.get("verdict_id") == verdict_id:
+                self.row.update(values)
+
+    storage = _ConflictAwareStorage()
+    ui = _make_ui()
+    judge_event = threading.Event()
+    cycle = _register_cycle(ui, ["c-race"], judge_event=judge_event)
+    verdict = {
+        "verdict_id": "v-race",
+        "call_id": "c-race",
+        "func_name": "bash",
+        "tier": "llm",
+        "user_decision": "pending",
+    }
+
+    with _patch_get_storage(storage):
+        deferred = ui._publish_intent_verdict_live(verdict, judge_event)
+        assert cycle.pending_verdicts == [verdict]
+        if resolve_first:
+            ui.resolve_approval(True, cycle_id=cycle.cycle_id)
+        for persist in deferred:
+            persist()
+        if not resolve_first:
+            ui.resolve_approval(True, cycle_id=cycle.cycle_id)
+
+    assert storage.row is not None
+    assert storage.row["verdict_id"] == "v-race"
+    assert storage.row["user_decision"] == "approved"
+
+
+def test_raising_llm_metric_hook_does_not_drop_verdict_persistence() -> None:
+    """Metrics are auxiliary to the verdict's durable audit record."""
+
+    class _RaisingMetricUI(_ConcreteUI):
+        def _record_llm_judge_metric(self, verdict: dict[str, Any]) -> None:
+            del verdict
+            raise RuntimeError("metric collector unavailable")
+
+    storage = MagicMock()
+    ui = _RaisingMetricUI(ws_id="ws-metric", user_id="u1")
+    verdict = {"verdict_id": "v-metric", "call_id": "c-metric", "tier": "llm"}
+
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(verdict)
+
+    storage.upsert_intent_verdict.assert_called_once()
+    assert storage.upsert_intent_verdict.call_args.kwargs["verdict_id"] == "v-metric"
 
 
 def test_on_intent_verdict_parks_on_owning_cycle_when_undecided() -> None:
@@ -582,12 +664,13 @@ def test_on_intent_verdict_auto_reason_survives_resolve_cycle() -> None:
     }
     assert update_calls == {"v-pending": "approved"}
     # The auto verdict's INSERT carried the policy reason.
-    insert_calls = {
-        c.kwargs["verdict_id"]: c.kwargs["user_decision"]
-        for c in storage.upsert_intent_verdict.call_args_list
-    }
-    assert insert_calls["v-auto"] == "policy"
-    assert insert_calls["v-pending"] == "pending"
+    insert_calls: dict[str, list[str]] = {}
+    for call in storage.upsert_intent_verdict.call_args_list:
+        insert_calls.setdefault(call.kwargs["verdict_id"], []).append(call.kwargs["user_decision"])
+    assert insert_calls["v-auto"] == ["policy"]
+    # Resolution now UPSERTs the decided row before UPDATE so it is safe even
+    # when the deferred base verdict has not inserted yet.
+    assert insert_calls["v-pending"] == ["pending", "approved"]
 
 
 def test_persist_auto_approved_heuristic_verdicts_stamps_reason() -> None:
@@ -1966,6 +2049,41 @@ def test_smart_approval_stamps_verdict_user_decision() -> None:
     storage.update_intent_verdict.assert_called_once_with("v-c1", user_decision="smart_approval")
 
 
+def test_smart_approval_finalizes_exact_qualified_verdict_after_call_id_reuse() -> None:
+    """A sibling gate replacing the cache cannot inherit this decision."""
+    storage = MagicMock()
+    ui = _smart_ui()
+    item = _pending_item("c1")
+    qualified = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    qualified["verdict_id"] = "v-qualified"
+    ui._llm_verdicts["c1"] = qualified
+    commits: list[Callable[[], None]] = []
+    persistence: list[Callable[[], None]] = []
+
+    with _patch_get_storage(storage):
+        remaining = ui._apply_smart_approvals(
+            [item],
+            commit_actions=commits,
+            persistence_actions=persistence,
+        )
+        assert remaining == []
+        assert len(commits) == 1
+
+        sibling = _llm_verdict("c1", recommendation="deny", confidence=0.99)
+        sibling["verdict_id"] = "v-sibling"
+        ui._llm_verdicts["c1"] = sibling
+        commits[0]()
+        for persist in persistence:
+            persist()
+
+    assert qualified["user_decision"] == "smart_approval"
+    assert "user_decision" not in sibling
+    assert ui._llm_verdicts["c1"] is sibling
+    storage.update_intent_verdict.assert_called_once_with(
+        "v-qualified", user_decision="smart_approval"
+    )
+
+
 def test_approve_tools_smart_approves_whole_batch_without_prompt() -> None:
     """End-to-end through approve_tools: the verdict is delivered after
     the cache reset (via _SeedingUI), the gate auto-approves, and the
@@ -2257,7 +2375,10 @@ def test_tool_pending_precedes_smart_approval_gate() -> None:
     lq = ui._register_listener()
     captured: list[str] = []
 
-    def _spy(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _spy(
+        pending: list[dict[str, Any]],
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
         # Snapshot what the UI has already been told at gate-entry.
         captured.extend(e["type"] for e in _drain(lq))
         return []  # simulate the gate clearing the whole batch (no human, no wait)
@@ -2583,6 +2704,847 @@ def test_resolve_all_approvals_wakes_every_gate() -> None:
         assert "Cancelled by user" in (box_a["feedback"] or "")
 
 
+def test_resolve_all_continues_after_first_resolution_transport_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One broken transport mirror cannot strand sibling approval gates."""
+
+    ui = _make_ui()
+    first = _register_cycle(ui, ["transport-failure-first"])
+    second = _register_cycle(ui, ["transport-failure-second"])
+    broadcast = MagicMock(side_effect=[RuntimeError("transport unavailable"), None])
+    caplog.set_level("WARNING", logger="turnstone.core.session_ui_base")
+
+    with patch.object(ui, "_broadcast_approval_resolved", broadcast):
+        count = ui.resolve_all_approvals(False, "Cancelled by user")
+
+    assert count == 2
+    assert broadcast.call_count == 2
+    for cycle in (first, second):
+        assert cycle.resolved is True
+        assert cycle.result == (False, "Cancelled by user")
+        assert cycle.decision == "denied"
+        assert cycle.event.is_set()
+    assert ui.pending_approval_cards() == []
+    assert ui._pending_approval is None
+    assert any("approval.resolve_all.publish_failed" in record.message for record in caplog.records)
+
+
+def test_targeted_resolution_returns_claim_after_transport_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A claimed targeted decision survives its dismissal callback failing."""
+
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["targeted-transport-failure"])
+    caplog.set_level("WARNING", logger="turnstone.core.session_ui_base")
+
+    with patch.object(
+        ui,
+        "_broadcast_approval_resolved",
+        side_effect=RuntimeError("transport unavailable"),
+    ):
+        resolved = ui.resolve_approval(True, "approved", cycle_id=cycle.cycle_id)
+
+    assert resolved == cycle.cycle_id
+    assert cycle.resolved is True
+    assert cycle.result == (True, "approved")
+    assert cycle.decision == "approved"
+    assert cycle.event.is_set()
+    assert ui.pending_approval_cards() == []
+    assert ui._pending_approval is None
+    assert any("approval.resolve.publish_failed" in record.message for record in caplog.records)
+
+
+class _TestApprovalCancelWitness:
+    """Event-backed stand-in for a generation's private cancel witness."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+
+    @property
+    def aborted(self) -> bool:
+        return self.event.is_set()
+
+
+class _ObservedVerdictCondition(threading.Condition):
+    """Expose the instant a Smart Approval gate enters its real wait."""
+
+    def __init__(self, lock: threading.Lock, waiting: threading.Event) -> None:
+        super().__init__(lock)
+        self._waiting = waiting
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self._waiting.set()
+        return super().wait(timeout)
+
+
+class _ApprovalSurfaceProbeUI(_ConcreteUI):
+    """Record cross-stream approval surfaces that the base leaves abstract."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.activity_updates: list[tuple[str, str]] = []
+        self.approval_requests: list[dict[str, Any]] = []
+        super().__init__(*args, **kwargs)
+
+    def _broadcast_activity(self) -> None:
+        self.activity_updates.append((self._ws_current_activity, self._ws_activity_state))
+
+    def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:
+        self.approval_requests.append(dict(detail))
+
+
+class _BlockingApprovalPublicationUI(_ApprovalSurfaceProbeUI):
+    """Hold cross-stream prompt publication at a deterministic seam."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.prompt_broadcast_entered = threading.Event()
+        self.release_prompt_broadcast = threading.Event()
+        self.prompt_hook_took_ws_lock = False
+        self.cross_approval_events: list[tuple[str, str]] = []
+        super().__init__(*args, **kwargs)
+
+    def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:
+        # Transport hooks may need a UI-state snapshot of their own.  A
+        # timeout keeps a lock-order regression from stranding the test
+        # process while still proving the hook runs outside ``_ws_lock``.
+        self.prompt_hook_took_ws_lock = self._ws_lock.acquire(timeout=1)
+        self.prompt_broadcast_entered.set()
+        if not self.prompt_hook_took_ws_lock:
+            return
+        self._ws_lock.release()
+        if not self.release_prompt_broadcast.wait(2):
+            raise RuntimeError("test did not release approval broadcast")
+        self.cross_approval_events.append(("approve_request", detail["cycle_id"]))
+        super()._broadcast_approve_request(detail)
+
+    def _broadcast_approval_resolved(
+        self,
+        approved: bool,
+        feedback: str | None = None,
+        *,
+        always: bool = False,
+        cycle_id: str = "",
+        call_ids: tuple[str, ...] = (),
+    ) -> None:
+        del approved, feedback, always, call_ids
+        self.cross_approval_events.append(("approval_resolved", cycle_id))
+
+
+class _ObservedApprovalCondition(threading.Condition):
+    """Expose the instant a cancellation sweep waits for a live lease."""
+
+    def __init__(self) -> None:
+        super().__init__(threading.Lock())
+        self.sweep_waiting = threading.Event()
+
+    def wait_for(self, predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+        self.sweep_waiting.set()
+        return super().wait_for(predicate, timeout)
+
+
+def test_cancel_sweep_resolves_aborted_predecessor_but_not_fresh_successor() -> None:
+    """A workstream sweep targets only cycles owned by the stopped run.
+
+    Force replacement can publish a successor cycle before the predecessor's
+    route-level approval sweep runs.  The predecessor's monotonic witness is
+    aborted; the successor's is fresh.  Resolving the former must not consume
+    the latter's prompt.
+    """
+
+    ui = _make_ui()
+    listener = ui._register_listener()
+    predecessor_witness = _TestApprovalCancelWitness()
+    successor_witness = _TestApprovalCancelWitness()
+    predecessor_witness.event.set()
+    predecessor = _register_cycle(
+        ui,
+        ["predecessor"],
+        cancel_witness=predecessor_witness,
+    )
+    successor = _register_cycle(
+        ui,
+        ["successor"],
+        cancel_witness=successor_witness,
+    )
+
+    assert ui.resolve_all_approvals(False, "Cancelled by user") == 1
+
+    assert predecessor.resolved is True
+    assert predecessor.result == (False, "Cancelled by user")
+    assert predecessor.event.is_set()
+    assert successor.resolved is False
+    assert successor.event.is_set() is False
+    assert ui.pending_approval_cards() == [successor.card]
+    assert ui._pending_approval == successor.card
+    assert _drain(listener) == [
+        {
+            "type": "approval_resolved",
+            "approved": False,
+            "feedback": "Cancelled by user",
+            "always": False,
+            "cycle_id": predecessor.cycle_id,
+            "call_ids": ["predecessor"],
+            "ws_id": "ws-1",
+            "_event_id": 1,
+        }
+    ]
+
+
+def test_fresh_successor_admission_waits_for_active_cancel_sweep() -> None:
+    """A successor waits behind Stop, then acquires a real admission lease.
+
+    The sweep is held draining one predecessor lease while the fresh successor
+    enters admission.  Its witness remains live, so it must wait for the sweep
+    to retire and proceed—not inherit the predecessor's cancellation result.
+    """
+
+    ui = _make_ui()
+    admission_cond = _ObservedApprovalCondition()
+    ui._approval_admission_cond = admission_cond
+    predecessor_witness = _TestApprovalCancelWitness()
+    successor_witness = _TestApprovalCancelWitness()
+    assert ui._begin_approval_admission(lambda: predecessor_witness.aborted)
+    predecessor_lease_held = True
+    predecessor_witness.event.set()
+
+    sweep: dict[str, Any] = {}
+    successor: dict[str, Any] = {}
+    successor_checked_witness = threading.Event()
+    successor_finished = threading.Event()
+
+    def _run_sweep() -> None:
+        try:
+            sweep["count"] = ui.resolve_all_approvals(False, "Cancelled by user")
+        except Exception as exc:  # pragma: no cover - surfaced below
+            sweep["error"] = exc
+
+    def _successor_cancelled() -> bool:
+        successor_checked_witness.set()
+        return successor_witness.aborted
+
+    def _run_successor() -> None:
+        admitted = False
+        try:
+            admitted = ui._begin_approval_admission(_successor_cancelled)
+            successor["admitted"] = admitted
+        except Exception as exc:  # pragma: no cover - surfaced below
+            successor["error"] = exc
+        finally:
+            if admitted:
+                ui._end_approval_admission()
+            successor_finished.set()
+
+    resolver = threading.Thread(target=_run_sweep, daemon=True)
+    successor_gate = threading.Thread(target=_run_successor, daemon=True)
+    successor_started = False
+    resolver.start()
+    try:
+        assert admission_cond.sweep_waiting.wait(2), "approval sweep did not begin draining"
+        successor_gate.start()
+        successor_started = True
+        assert successor_checked_witness.wait(2), "successor never reached admission"
+        assert not successor_finished.is_set(), "successor bypassed the active approval sweep"
+
+        ui._end_approval_admission()
+        predecessor_lease_held = False
+        resolver.join(2)
+        successor_gate.join(2)
+    finally:
+        if predecessor_lease_held:
+            ui._end_approval_admission()
+        resolver.join(2)
+        if successor_started:
+            successor_gate.join(2)
+
+    assert not resolver.is_alive()
+    assert not successor_gate.is_alive()
+    assert "error" not in sweep
+    assert "error" not in successor
+    assert sweep["count"] == 0
+    assert successor["admitted"] is True
+    assert ui._approval_sweeps == 0
+    assert ui._active_approval_admissions == 0
+
+
+def test_cancel_wakes_smart_approval_verdict_wait_without_publishing() -> None:
+    """One zero-cycle cancel sweep wakes a gate parked before registration.
+
+    Smart Approvals can spend the full judge timeout waiting for a verdict,
+    before any ``ApprovalCycle`` exists for ``resolve_all_approvals`` to see.
+    The sweep must still wake that real condition-variable wait once the
+    generation witness is aborted.  The retired gate then denies promptly and
+    publishes no approval, execution, activity, persistence, or auto-approval
+    state after cancellation.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = float(ui._APPROVAL_WAIT_TIMEOUT)
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    item = _pending_item("cancel-smart-wait")
+    item["_approval_cancel_witness"] = witness
+    waiting = threading.Event()
+    ui._verdict_cond = _ObservedVerdictCondition(ui._ws_lock, waiting)
+    storage = MagicMock()
+    outcome: dict[str, tuple[bool, str | None]] = {}
+    finished = threading.Event()
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([item])
+        finally:
+            finished.set()
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    with _patch_get_storage(storage), _patch_policies({}):
+        gate.start()
+        try:
+            assert waiting.wait(2), "Smart Approval gate never entered its verdict wait"
+            # The early paint happened before cancellation.  Everything after
+            # this drain is attributable to the cancel race under test.
+            assert [event["type"] for event in _drain(listener)] == ["tool_pending"]
+            witness.event.set()
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+            assert finished.wait(2), "cancel did not wake the Smart Approval verdict wait"
+        finally:
+            if gate.is_alive():
+                # A broken implementation would otherwise retain this daemon
+                # in its production 3600-second wait for the rest of the run.
+                with ui._verdict_cond:
+                    ui._llm_verdicts[item["call_id"]] = _llm_verdict(item["call_id"])
+                    ui._verdict_cond.notify_all()
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert _drain(listener) == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+    assert ui._ws_current_activity == ""
+    assert ui._ws_activity_state == ""
+    assert ui.activity_updates == []
+    assert ui.approval_requests == []
+    assert ui._recent_auto_approvals == []
+    assert ui._auto_approve_reasons == {}
+    assert item.get("auto_approved") is not True
+    storage.create_intent_verdicts_bulk.assert_not_called()
+    storage.record_audit_event.assert_not_called()
+
+
+def test_cancelled_gate_cannot_cross_first_approval_publication() -> None:
+    """A retired gate blocked before its first publication stays invisible.
+
+    This pins the earliest practical entry seam: the old generation begins
+    approval work, blocks in the round purge before ``tool_pending``, then its
+    witness loses ownership.  The cancellation sweep must wait for that
+    admitted bundle to finish, then see zero cycles.  Releasing the old gate
+    must not let it paint a pending/info card, set activity, persist audit
+    state, or consume the blanket auto-approval configured below.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    admission_cond = _ObservedApprovalCondition()
+    ui._approval_admission_cond = admission_cond
+    ui.auto_approve = True
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    item = _pending_item("cancel-before-publish")
+    item["_approval_cancel_witness"] = witness
+    before_publish = threading.Event()
+    release_publish = threading.Event()
+    storage = MagicMock()
+    outcome: dict[str, tuple[bool, str | None]] = {}
+    sweep: dict[str, Any] = {}
+    sweep_started = threading.Event()
+    sweep_finished = threading.Event()
+
+    def _hold_before_publish(*_args: Any, **_kwargs: Any) -> None:
+        before_publish.set()
+        if not release_publish.wait(2):
+            raise RuntimeError("test did not release approval publication")
+
+    def _run_gate() -> None:
+        outcome["result"] = ui.approve_tools([item])
+
+    def _run_sweep() -> None:
+        sweep_started.set()
+        try:
+            sweep["count"] = ui.resolve_all_approvals(False, "Cancelled by user")
+        except Exception as exc:  # pragma: no cover - surfaced below
+            sweep["error"] = exc
+        finally:
+            sweep_finished.set()
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    resolver: threading.Thread | None = None
+    with (
+        _patch_get_storage(storage),
+        _patch_policies({}),
+        patch.object(ui, "_purge_round_verdicts", side_effect=_hold_before_publish),
+    ):
+        gate.start()
+        try:
+            assert before_publish.wait(2), "approval gate never reached its entry seam"
+            witness.event.set()
+            resolver = threading.Thread(target=_run_sweep, daemon=True)
+            resolver.start()
+            assert sweep_started.wait(2)
+            assert admission_cond.sweep_waiting.wait(2), (
+                "approval sweep did not wait for the admitted purge"
+            )
+            assert not sweep_finished.is_set()
+            assert _drain(listener) == []
+
+            release_publish.set()
+            resolver.join(2)
+            gate.join(2)
+        finally:
+            release_publish.set()
+            if resolver is not None:
+                resolver.join(2)
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert resolver is not None and not resolver.is_alive()
+    assert "error" not in sweep
+    assert sweep["count"] == 0
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert _drain(listener) == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+    assert ui._ws_current_activity == ""
+    assert ui._ws_activity_state == ""
+    assert ui.activity_updates == []
+    assert ui.approval_requests == []
+    assert ui._recent_auto_approvals == []
+    assert ui._auto_approve_reasons == {}
+    assert item.get("auto_approved") is not True
+    assert item["needs_approval"] is True
+    storage.create_intent_verdicts_bulk.assert_not_called()
+    storage.record_audit_event.assert_not_called()
+
+
+def test_cancel_before_cycle_registration_cannot_lose_its_wakeup() -> None:
+    """A cancel sweep that wins the pre-registration window is witnessed.
+
+    The final-admission seam pins the gate at the last pre-registration boundary.
+    This is the precise route ordering that used to hang: mark the operation
+    cancelled, sweep zero live cycles, then let the gate continue.  The
+    witness must make it self-deny without a timeout or a second resolver
+    sweep; an early cancellation fence may now prevent registration entirely.
+    """
+
+    class _Witness:
+        def __init__(self) -> None:
+            self.event = threading.Event()
+
+        @property
+        def aborted(self) -> bool:
+            return self.event.is_set()
+
+    ui = _make_ui()
+    listener = ui._register_listener()
+    witness = _Witness()
+    item = _pending_item("cancel-gap")
+    item["_approval_cancel_witness"] = witness
+    before_register = threading.Event()
+    release_register = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    real_begin = ui._begin_approval_admission
+    begin_count = 0
+
+    def _hold_before_register(cancelled: Callable[[], bool]) -> bool:
+        nonlocal begin_count
+        begin_count += 1
+        # Entry purge, early tool paint, then the final manual transaction.
+        if begin_count == 3:
+            before_register.set()
+            if not release_register.wait(2):
+                raise RuntimeError("test did not release approval registration")
+        return real_begin(cancelled)
+
+    def _run_gate() -> None:
+        outcome["result"] = ui.approve_tools([item])
+
+    gate = threading.Thread(target=_run_gate)
+    with (
+        _patch_get_storage(MagicMock()),
+        _patch_policies({}),
+        patch.object(ui, "_begin_approval_admission", side_effect=_hold_before_register),
+    ):
+        gate.start()
+        try:
+            assert before_register.wait(2)
+            witness.event.set()
+            # This is the one route sweep.  It intentionally sees no cycle.
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+            release_register.set()
+            gate.join(2)
+        finally:
+            release_register.set()
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert ui._approval_cycles == {}
+    events = _drain(listener)
+    assert "approve_request" not in [event["type"] for event in events]
+    assert "approval_resolved" not in [event["type"] for event in events]
+    # Private synchronization state never enters either wire projection.
+    assert all(
+        "_approval_cancel_witness" not in serialized
+        for event in events
+        for serialized in event.get("items", [])
+    )
+
+
+def test_cancel_after_smart_qualification_aborts_terminal_auto_commit() -> None:
+    """Smart qualification alone authorizes no mutation or side effect.
+
+    Hold the gate at its third admission (after the verdict qualified, before
+    the terminal auto-approval bundle), then let Stop win.  The prepared
+    commit closure must be discarded wholesale: the tool remains pending, the
+    cached verdict remains undecided, and no visible or durable auto-approval
+    surface advances.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    judge_event = threading.Event()
+    item = _pending_item("cancel-after-smart-qualification")
+    item["_approval_cancel_witness"] = witness
+    item["_judge_event"] = judge_event
+    verdict = _llm_verdict(item["call_id"], recommendation="approve", confidence=0.99)
+    ui._llm_verdicts[item["call_id"]] = verdict
+    ui._verdict_origins[item["call_id"]] = id(judge_event)
+
+    before_terminal_admission = threading.Event()
+    release_terminal_admission = threading.Event()
+    outcome: dict[str, Any] = {}
+    storage = MagicMock()
+    metric = MagicMock()
+    real_begin = ui._begin_approval_admission
+    begin_count = 0
+
+    def _hold_terminal_admission(cancelled: Callable[[], bool]) -> bool:
+        nonlocal begin_count
+        begin_count += 1
+        # Entry purge, early tool paint, then the terminal auto commit.
+        if begin_count == 3:
+            before_terminal_admission.set()
+            if not release_terminal_admission.wait(2):
+                raise RuntimeError("test did not release Smart Approval admission")
+        return real_begin(cancelled)
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([item])
+        except Exception as exc:  # pragma: no cover - surfaced below
+            outcome["error"] = exc
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    with (
+        _patch_get_storage(storage),
+        _patch_policies({}),
+        patch.object(ui, "_begin_approval_admission", side_effect=_hold_terminal_admission),
+        patch.object(ui, "_record_judge_metric", metric),
+    ):
+        gate.start()
+        try:
+            assert before_terminal_admission.wait(2), (
+                "Smart Approval never reached its terminal admission"
+            )
+            assert [event["type"] for event in _drain(listener)] == ["tool_pending"]
+            witness.event.set()
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+            release_terminal_admission.set()
+            gate.join(2)
+        finally:
+            release_terminal_admission.set()
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert begin_count == 3
+    assert item["needs_approval"] is True
+    assert item.get("auto_approved") is not True
+    assert "auto_approve_reason" not in item
+    assert "_llm_verdict" not in item
+    assert "user_decision" not in verdict
+    assert _drain(listener) == []
+    assert ui._ws_current_activity == ""
+    assert ui._ws_activity_state == ""
+    assert ui.activity_updates == []
+    assert ui.approval_requests == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+    assert ui._recent_auto_approvals == []
+    assert ui._auto_approve_reasons == {}
+    metric.assert_not_called()
+    assert storage.method_calls == []
+
+
+def test_cancel_after_manual_preparation_aborts_terminal_prompt_commit() -> None:
+    """A prepared mixed manual batch stays invisible if Stop wins admission.
+
+    The policy-cleared sibling makes this the mixed-auto path.  Holding the
+    third admission occurs after local heuristic rows and the cycle/card have
+    been prepared, but before any shared state or UI is committed.  Stop must
+    leave no activity, live cycle, prompt, verdict persistence, metric, ring
+    entry, reason lookup, or mixed-auto audit behind.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    policy_item = _pending_item("cancel-mixed-policy", func_name="safe_tool")
+    manual_item = _pending_item("cancel-mixed-manual", func_name="bash")
+    for item in (policy_item, manual_item):
+        item["_approval_cancel_witness"] = witness
+
+    before_terminal_admission = threading.Event()
+    release_terminal_admission = threading.Event()
+    outcome: dict[str, Any] = {}
+    storage = MagicMock()
+    metric = MagicMock()
+    real_begin = ui._begin_approval_admission
+    begin_count = 0
+
+    def _hold_terminal_admission(cancelled: Callable[[], bool]) -> bool:
+        nonlocal begin_count
+        begin_count += 1
+        # Entry purge, early tool paint, then the terminal manual commit.
+        if begin_count == 3:
+            before_terminal_admission.set()
+            if not release_terminal_admission.wait(2):
+                raise RuntimeError("test did not release manual approval admission")
+        return real_begin(cancelled)
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([policy_item, manual_item])
+        except Exception as exc:  # pragma: no cover - surfaced below
+            outcome["error"] = exc
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    with (
+        _patch_get_storage(storage),
+        _patch_policies({"safe_tool": "allow"}),
+        patch.object(ui, "_begin_approval_admission", side_effect=_hold_terminal_admission),
+        patch.object(ui, "_record_judge_metric", metric),
+    ):
+        gate.start()
+        try:
+            assert before_terminal_admission.wait(2), (
+                "manual gate never reached its terminal admission"
+            )
+            assert [event["type"] for event in _drain(listener)] == ["tool_pending"]
+            witness.event.set()
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+            release_terminal_admission.set()
+            gate.join(2)
+        finally:
+            release_terminal_admission.set()
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert begin_count == 3
+    assert policy_item["auto_approved"] is True
+    assert policy_item["auto_approve_reason"] == "policy"
+    assert manual_item["needs_approval"] is True
+    assert "user_decision" not in policy_item["_heuristic_verdict"]
+    assert "user_decision" not in manual_item["_heuristic_verdict"]
+    assert _drain(listener) == []
+    assert ui._ws_current_activity == ""
+    assert ui._ws_activity_state == ""
+    assert ui.activity_updates == []
+    assert ui.approval_requests == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+    assert ui._recent_auto_approvals == []
+    assert ui._auto_approve_reasons == {}
+    metric.assert_not_called()
+    assert storage.method_calls == []
+
+
+def test_aborted_cycle_rejects_targeted_approve_then_sweep_denies() -> None:
+    """A stale targeted click cannot beat Stop after ownership is lost.
+
+    Publish one real cycle, abort its monotonic witness, and attempt the
+    targeted approval before the workstream sweep.  The click cannot claim
+    the cycle; the sweep is its sole resolver and both the UI event and durable
+    intent-verdict decision record denial.
+    """
+
+    ui = _ApprovalSurfaceProbeUI(ws_id="ws-1", user_id="u1")
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    item = _pending_item("aborted-targeted-approve")
+    item["_approval_cancel_witness"] = witness
+    outcome: dict[str, Any] = {}
+    storage = MagicMock()
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([item])
+        except Exception as exc:  # pragma: no cover - surfaced below
+            outcome["error"] = exc
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    request: dict[str, Any] | None = None
+    with _patch_get_storage(storage), _patch_policies({}):
+        gate.start()
+        try:
+            while request is None:
+                try:
+                    event = listener.get(timeout=2)
+                except queue.Empty:
+                    pytest.fail("manual gate did not publish its approval request")
+                if event["type"] == "approve_request":
+                    request = event
+
+            witness.event.set()
+            assert ui.resolve_approval(True, cycle_id=request["cycle_id"]) is None
+            storage.update_intent_verdict.assert_not_called()
+            assert ui.resolve_all_approvals(False, "Cancelled by user") == 1
+            gate.join(2)
+        finally:
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"] == (False, "Cancelled by user")
+    assert item["denied"] is True
+    assert item["denial_msg"] == "Denied by user: Cancelled by user"
+    assert ui._recent_decisions[item["call_id"]][0] == "denied"
+    resolution = _drain(listener)
+    assert [event["type"] for event in resolution] == ["approval_resolved"]
+    assert resolution[0]["cycle_id"] == request["cycle_id"]
+    assert resolution[0]["approved"] is False
+    storage.upsert_intent_verdict.assert_called_once()
+    assert storage.upsert_intent_verdict.call_args.kwargs["user_decision"] == "denied"
+    storage.update_intent_verdict.assert_called_once_with(
+        item["_heuristic_verdict"]["verdict_id"],
+        user_decision="denied",
+    )
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+
+
+def test_cancel_resolution_waits_for_complete_prompt_publication() -> None:
+    """Stop cannot publish a resolution ahead of either prompt surface."""
+
+    ui = _BlockingApprovalPublicationUI(ws_id="ws-1", user_id="u1")
+    admission_cond = _ObservedApprovalCondition()
+    ui._approval_admission_cond = admission_cond
+    listener = ui._register_listener()
+    witness = _TestApprovalCancelWitness()
+    item = _pending_item("cancel-during-publish")
+    item["_approval_cancel_witness"] = witness
+    outcome: dict[str, Any] = {}
+    sweep: dict[str, Any] = {}
+    sweep_started = threading.Event()
+    sweep_finished = threading.Event()
+
+    def _run_gate() -> None:
+        try:
+            outcome["result"] = ui.approve_tools([item])
+        except Exception as exc:  # pragma: no cover - surfaced below
+            outcome["error"] = exc
+
+    def _run_sweep() -> None:
+        sweep_started.set()
+        try:
+            sweep["count"] = ui.resolve_all_approvals(False, "Cancelled by user")
+        except Exception as exc:  # pragma: no cover - surfaced below
+            sweep["error"] = exc
+        finally:
+            sweep_finished.set()
+
+    gate = threading.Thread(target=_run_gate, daemon=True)
+    resolver: threading.Thread | None = None
+    with (
+        _patch_get_storage(MagicMock()),
+        _patch_policies({}),
+    ):
+        gate.start()
+        try:
+            assert ui.prompt_broadcast_entered.wait(2), "prompt broadcast was not reached"
+            assert ui.prompt_hook_took_ws_lock, "prompt hook ran while _ws_lock was held"
+
+            # The local prompt is already visible; hold the cross-stream hook
+            # open, mark this operation cancelled, and run the route's one
+            # workstream-wide approval sweep.
+            local_before_resolution = _drain(listener)
+            assert [event["type"] for event in local_before_resolution] == [
+                "tool_pending",
+                "approve_request",
+            ]
+            request = local_before_resolution[-1]
+            witness.event.set()
+            resolver = threading.Thread(target=_run_sweep, daemon=True)
+            resolver.start()
+
+            assert sweep_started.wait(2)
+            assert admission_cond.sweep_waiting.wait(2), (
+                "approval sweep did not wait for prompt admission"
+            )
+            assert not sweep_finished.is_set()
+            assert [card["cycle_id"] for card in ui.pending_approval_cards()] == [
+                request["cycle_id"]
+            ]
+
+            ui.release_prompt_broadcast.set()
+            resolver.join(2)
+            gate.join(2)
+        finally:
+            ui.release_prompt_broadcast.set()
+            if resolver is not None:
+                resolver.join(2)
+            if gate.is_alive():
+                ui.resolve_all_approvals(False, "test teardown")
+                gate.join(2)
+
+    assert not gate.is_alive()
+    assert resolver is not None and not resolver.is_alive()
+    assert "error" not in outcome
+    assert "error" not in sweep
+    assert sweep["count"] == 1
+    assert outcome["result"] == (False, "Cancelled by user")
+
+    local_resolution = _drain(listener)
+    assert [event["type"] for event in local_resolution] == ["approval_resolved"]
+    assert local_resolution[0]["cycle_id"] == request["cycle_id"]
+    assert ui.cross_approval_events == [
+        ("approve_request", request["cycle_id"]),
+        ("approval_resolved", request["cycle_id"]),
+    ]
+    assert ui.pending_approval_cards() == []
+    assert ui._approval_cycles == {}
+    assert ui._pending_approval is None
+
+
 def test_resolve_all_approvals_noop_when_idle() -> None:
     """Idle cancels stay silent — no stale approval_resolved broadcast."""
     ui = _make_ui()
@@ -2661,6 +3623,102 @@ def test_stale_generation_verdict_cannot_touch_live_cycle() -> None:
     assert cycle.pending_verdicts and cycle.pending_verdicts[0]["verdict_id"] == "v-fresh"
 
 
+def test_resolved_reused_id_cycle_cannot_capture_successor_verdict() -> None:
+    """A resolved predecessor still awaiting unregister is not an owner.
+
+    Resolution wakes the gate before its thread unregisters the cycle.  A
+    parallel successor can register the same provider call id in that window;
+    its exact judge generation must bypass the older resolved entry and park
+    on the successor instead of being persisted as a stale verdict.
+    """
+    storage = MagicMock()
+    ui = _make_ui()
+    gen_a = threading.Event()
+    gen_b = threading.Event()
+    predecessor = _register_cycle(
+        ui,
+        ["c-reused"],
+        judge_event=gen_a,
+        cycle_id="cycle-predecessor",
+    )
+    with _patch_get_storage(storage):
+        assert ui.resolve_approval(True, cycle_id=predecessor.cycle_id) == predecessor.cycle_id
+    assert predecessor.resolved is True
+    # Deliberately leave the resolved cycle registered, matching the real
+    # resolve -> gate-thread-unregister scheduling window.
+    successor = _register_cycle(
+        ui,
+        ["c-reused"],
+        judge_event=gen_b,
+        cycle_id="cycle-successor",
+    )
+    verdict = {
+        "verdict_id": "v-successor",
+        "call_id": "c-reused",
+        "tier": "llm",
+    }
+
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(verdict, judge_event=gen_b)
+
+    assert ui._llm_verdicts["c-reused"] is verdict
+    assert predecessor.pending_verdicts == []
+    assert successor.pending_verdicts == [verdict]
+    assert storage.upsert_intent_verdict.call_args.kwargs["user_decision"] == "pending"
+
+
+def test_late_predecessor_verdict_cannot_park_on_reused_id_successor() -> None:
+    """Owner identity is revalidated after live verdict publication.
+
+    The predecessor owns the call at initial classification, then resolves and
+    a successor registers the same id while the verdict is between its cache
+    commit and final park.  The late predecessor verdict must take its own
+    recorded decision, never enter the successor's pending-verdict list.
+    """
+    storage = MagicMock()
+    ui = _make_ui()
+    gen_a = threading.Event()
+    gen_b = threading.Event()
+    predecessor = _register_cycle(
+        ui,
+        ["c-reused"],
+        judge_event=gen_a,
+        cycle_id="cycle-predecessor",
+    )
+    successor_box: list[Any] = []
+
+    def replace_owner(_verdict: dict[str, Any]) -> None:
+        assert ui.resolve_approval(True, cycle_id=predecessor.cycle_id) == predecessor.cycle_id
+        successor_box.append(
+            _register_cycle(
+                ui,
+                ["c-reused"],
+                judge_event=gen_b,
+                cycle_id="cycle-successor",
+            )
+        )
+
+    verdict = {
+        "verdict_id": "v-predecessor-late",
+        "call_id": "c-reused",
+        "tier": "llm",
+    }
+    with (
+        _patch_get_storage(storage),
+        patch.object(ui, "_broadcast_intent_verdict", side_effect=replace_owner),
+    ):
+        ui.on_intent_verdict(verdict, judge_event=gen_a)
+
+    successor = successor_box[0]
+    assert predecessor.resolved is True
+    assert successor.resolved is False
+    assert successor.pending_verdicts == []
+    storage.update_intent_verdict.assert_called_once_with(
+        "v-predecessor-late",
+        user_decision="approved",
+    )
+
+
 def test_smart_approval_rejects_stale_origin_verdict() -> None:
     """Smart-Approvals qualification requires the cached verdict to have
     been delivered by THIS batch's judge generation — a cached approve
@@ -2716,6 +3774,127 @@ def test_concurrent_smart_gate_and_human_gate() -> None:
         ui.resolve_approval(True, "ok", call_id="a-1")
         ta.join(timeout=5.0)
         assert box_a["approved"] is True
+
+
+def test_chat_session_stamps_one_smart_config_snapshot_without_mutating_ui() -> None:
+    """The gate producer copies one JudgeConfig generation onto every item."""
+    from turnstone.core.judge import JudgeConfig
+    from turnstone.core.session import ChatSession
+
+    ui = _make_ui()
+    ui.smart_approvals_enabled = False
+    ui.smart_approval_threshold = 0.42
+    ui.smart_approval_wait_seconds = 7.0
+    session = MagicMock()
+    session.ui = ui
+    session._judge_cfg = JudgeConfig(
+        enabled=True,
+        smart_approvals=True,
+        confidence_threshold=0.87,
+        timeout=4.5,
+    )
+    items = [_pending_item("snapshot-a"), _pending_item("snapshot-b")]
+
+    ChatSession._push_smart_approval_config(session, items)
+
+    snapshot = items[0]["_smart_approval_config"]
+    assert snapshot == _SmartApprovalConfig(enabled=True, threshold=0.87, wait_seconds=4.5)
+    assert items[1]["_smart_approval_config"] is snapshot
+    assert (
+        ui.smart_approvals_enabled,
+        ui.smart_approval_threshold,
+        ui.smart_approval_wait_seconds,
+    ) == (False, 0.42, 7.0)
+
+
+def test_concurrent_smart_gates_use_their_own_coherent_config_snapshots() -> None:
+    """Parallel gates cannot assemble a permissive config from two reloads.
+
+    Neither coherent configuration clears a 0.75 verdict: the old snapshot
+    disables Smart Approvals, while the new snapshot raises the threshold to
+    0.99.  Their torn combination (new enabled + old 0.50 threshold) would
+    auto-approve, so leave exactly that combination on the shared legacy UI
+    attributes while both gates run.  Each item must instead keep the snapshot
+    attached by its own preparation path and reach a human independently.
+    """
+    ui = _make_ui()
+    old_item = _pending_item("old-config")
+    new_item = _pending_item("new-config")
+    old_item["_smart_approval_config"] = _SmartApprovalConfig(
+        enabled=False,
+        threshold=0.50,
+        wait_seconds=0.0,
+    )
+    new_item["_smart_approval_config"] = _SmartApprovalConfig(
+        enabled=True,
+        threshold=0.99,
+        wait_seconds=0.0,
+    )
+
+    # Same-generation cached verdicts survive each gate's entry purge.  They
+    # qualify only under the impossible torn hybrid left on the shared UI.
+    for item in (old_item, new_item):
+        call_id = item["call_id"]
+        judge_event = threading.Event()
+        item["_judge_event"] = judge_event
+        ui._llm_verdicts[call_id] = _llm_verdict(call_id, confidence=0.75)
+        ui._verdict_origins[call_id] = id(judge_event)
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.50
+    ui.smart_approval_wait_seconds = 0.0
+
+    start = threading.Barrier(3)
+    outcomes: dict[str, tuple[bool, str | None]] = {}
+    listener = ui._register_listener()
+
+    def run_gate(item: dict[str, Any]) -> None:
+        start.wait()
+        outcomes[item["call_id"]] = ui.approve_tools([item])
+
+    threads = [
+        threading.Thread(target=run_gate, args=(item,), daemon=True)
+        for item in (old_item, new_item)
+    ]
+    storage = MagicMock()
+    with (
+        _patch_get_storage(storage),
+        _patch_policies({}),
+    ):
+        for thread in threads:
+            thread.start()
+        start.wait()
+        try:
+            approval_cards: list[dict[str, Any]] = []
+            while len(approval_cards) < 2:
+                try:
+                    event = listener.get(timeout=2.0)
+                except queue.Empty:
+                    pytest.fail(
+                        "a gate auto-approved by combining enabled from the new config "
+                        "with threshold from the old config"
+                    )
+                if event["type"] == "approve_request":
+                    approval_cards.append(event)
+            assert {card["items"][0]["call_id"] for card in approval_cards} == {
+                "old-config",
+                "new-config",
+            }
+            assert old_item.get("auto_approved") is not True
+            assert new_item.get("auto_approved") is not True
+            assert old_item["needs_approval"] is True
+            assert new_item["needs_approval"] is True
+            assert ui.resolve_approval(False, "hold", call_id="old-config") is not None
+            assert ui.resolve_approval(False, "hold", call_id="new-config") is not None
+        finally:
+            ui.resolve_all_approvals(False, "test teardown")
+            for thread in threads:
+                thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes == {
+        "old-config": (False, "hold"),
+        "new-config": (False, "hold"),
+    }
 
 
 def test_purge_round_verdicts_keeps_entry_from_the_entering_generation() -> None:

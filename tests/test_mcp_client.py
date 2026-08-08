@@ -2229,13 +2229,16 @@ class TestTCPProbe:
     def test_tcp_probe_default_port_http(self):
         """Default port 80 used for http:// URLs without explicit port."""
         mgr = MCPClientManager({})
+        connect = AsyncMock(side_effect=OSError("unreachable"))
 
         async def _run():
-            # Will fail (nothing on port 80), but should not crash on parsing
             with pytest.raises(ConnectionError):
                 await mgr._tcp_probe("srv", "http://127.0.0.1")
 
-        asyncio.run(_run())
+        with patch("asyncio.open_connection", connect):
+            asyncio.run(_run())
+
+        connect.assert_awaited_once_with("127.0.0.1", 80)
 
     def test_tcp_probe_dns_failure(self):
         """Unresolvable hostname raises ConnectionError."""

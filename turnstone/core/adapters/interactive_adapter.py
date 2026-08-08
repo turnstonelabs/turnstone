@@ -41,17 +41,13 @@ class InteractiveAdapter:
       (``reason="evicted"``) here so there's exactly one emission point;
       ``name`` powers the frontend's eviction toast.
 
-    - :meth:`emit_created` / :meth:`emit_state` / :meth:`emit_rehydrated`
-      are no-ops. The corresponding events fire from out-of-band paths:
-      the create HTTP handler enqueues ``ws_created`` directly onto
-      ``global_queue`` *after* attachment validation (so a rejected
-      upload doesn't surface a phantom create→close pair), and
-      ``WebUI._broadcast_state`` emits the full ``ws_state`` payload
-      (tokens + context_ratio + activity) via the
-      ``SessionUI.on_state_change`` callback chain. The stubs exist
-      solely to satisfy :class:`SessionEventEmitter` Protocol so the
-      adapter can be wired as the manager's ``event_emitter`` for the
-      ``emit_closed`` path.
+    - :meth:`emit_created` publishes the prepared ``ws_created`` event
+      during :meth:`SessionManager.commit_create`.  This keeps the bounded
+      queue publication ordered against manager-owned close/delete while
+      attachment validation and other fallible setup remain outside the
+      manager lock. :meth:`emit_state` / :meth:`emit_rehydrated` remain
+      no-ops: ``WebUI._broadcast_state`` emits the rich state payload and the
+      open handler owns the rehydrate event.
     """
 
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
@@ -97,7 +93,62 @@ class InteractiveAdapter:
     # ------------------------------------------------------------------
 
     def emit_created(self, ws: Workstream) -> None:
-        del ws  # no-op — ws_created fires from the create HTTP handler
+        """Publish one prepared create while the manager reservation is held.
+
+        Every operation here is bounded and exception-isolated: the manager
+        intentionally serializes this callback with terminal lifecycle
+        operations so a ``ws_closed`` event cannot overtake ``ws_created``.
+        Storage-backed/fallible setup belongs in the create handler's setup
+        hook, before ``commit_create``.
+        """
+        ui = ws.ui
+        if ws._create_clear_ui and ui is not None:
+            enqueue = getattr(ui, "_enqueue", None)
+            if callable(enqueue):
+                try:
+                    enqueue({"type": "clear_ui"})
+                except Exception:
+                    log.debug("interactive_adapter.create_clear_ui_failed", exc_info=True)
+
+        session = ws.session
+        with contextlib.suppress(queue.Full):
+            self._global_queue.put_nowait(
+                {
+                    "type": "ws_created",
+                    "ws_id": ws.id,
+                    "name": ws._create_event_name or ws.name,
+                    "model": session.model if session else "",
+                    "model_alias": session.model_alias if session else "",
+                    "kind": ws.kind,
+                    "parent_ws_id": ws.parent_ws_id,
+                    "user_id": ws.user_id,
+                    "project_id": ws.project_id,
+                    "persona": ws.persona,
+                }
+            )
+        if ws._create_emit_rename:
+            with contextlib.suppress(queue.Full):
+                self._global_queue.put_nowait(
+                    {"type": "ws_rename", "ws_id": ws.id, "name": ws.name}
+                )
+
+        runner = ws._create_watch_runner
+        if runner is not None and session is not None:
+            try:
+                session.set_watch_runner(runner, wake_fn=ws._create_watch_wake_fn)
+            except Exception:
+                log.warning(
+                    "interactive_adapter.create_watch_registration_failed ws=%s",
+                    ws.id[:8],
+                    exc_info=True,
+                )
+
+        # Release request-scoped references after the one-shot publication.
+        ws._create_event_name = ""
+        ws._create_clear_ui = False
+        ws._create_emit_rename = False
+        ws._create_watch_runner = None
+        ws._create_watch_wake_fn = None
 
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None:
         del ws, state  # no-op — ws_state fires from WebUI._broadcast_state

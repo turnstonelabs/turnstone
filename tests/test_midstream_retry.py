@@ -23,7 +23,13 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from tests._session_helpers import NullUI, RecordingUI, arm_session, make_session
+from tests._session_helpers import (
+    NullUI,
+    RecordingUI,
+    arm_session,
+    make_session,
+    replace_session_lane,
+)
 from turnstone.core.memory import load_last_error
 from turnstone.core.model_turn import WirePreparationError
 from turnstone.core.providers import IncompleteStreamError, StreamChunk, UsageInfo
@@ -203,13 +209,15 @@ class TestMidStreamRetry:
         def swap_binding():
             # A registry reload that rebinds mid-retry replaces the client
             # object (the identity signal the wrapper keys on).
-            session.client = MagicMock()
+            replace_session_lane(session, client=MagicMock())
 
         create = arm_session(session, *streams).create_streaming
         with (
             patch.object(session, "_refresh_model_from_registry", side_effect=swap_binding),
             patch.object(
-                session, "_prepare_wire_messages", wraps=session._prepare_wire_messages
+                session,
+                "_prepare_lowered_wire_messages",
+                wraps=session._prepare_lowered_wire_messages,
             ) as prep,
         ):
             session.send("test")
@@ -434,13 +442,15 @@ class TestMidStreamRetry:
             # call 1 is send()'s per-send driver at the top of the turn.
             refreshes["n"] += 1
             if refreshes["n"] == 2:
-                session.model = "swapped-model"
+                replace_session_lane(session, model="swapped-model")
 
         arm_session(session, *streams)
         with (
             patch.object(session, "_refresh_model_from_registry", side_effect=swap_model),
             patch.object(
-                session, "_prepare_wire_messages", wraps=session._prepare_wire_messages
+                session,
+                "_prepare_lowered_wire_messages",
+                wraps=session._prepare_lowered_wire_messages,
             ) as prep,
         ):
             session.send("test")
@@ -826,7 +836,9 @@ class TestRecreateWindowClassification:
             patch.object(session, "_get_health_tracker", return_value=tracker),
             patch.object(session, "_try_fallback_lane", return_value=None) as fb_spy,
             patch.object(
-                session, "_prepare_wire_messages", side_effect=ValueError("malformed turn 7")
+                session,
+                "_prepare_lowered_wire_messages",
+                side_effect=ValueError("malformed turn 7"),
             ),
             pytest.raises(WirePreparationError) as excinfo,
         ):
@@ -906,6 +918,133 @@ class TestRecreateWindowClassification:
         assert out is None
         fb_tracker.record_failure.assert_not_called()
         assert any("Fallback fb also failed: WirePreparationError" in i for i in ui.of("info"))
+
+
+class TestGenerationFencedCreationNotices:
+    """Retry/fallback theater belongs only to the generation that earned it."""
+
+    def test_force_successor_before_retry_notice_suppresses_notice_and_redispatch(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+        session._generation = 7
+
+        def supersede_before_notice(*args):
+            session._generation += 1
+            return False
+
+        from turnstone.core.session import _StreamTurnConsumer
+
+        consumer = _StreamTurnConsumer(session, 7)
+        with (
+            patch(
+                "turnstone.core.session.model_turn", side_effect=httpx.ConnectError("down")
+            ) as dispatch,
+            patch.object(session, "_stop_retrying", side_effect=supersede_before_notice),
+            pytest.raises(GenerationCancelled),
+        ):
+            session._model_turn_with_retry(
+                session._primary_lane(),
+                None,
+                consumer,
+                lambda wire, lane: wire,
+                7,
+            )
+
+        dispatch.assert_called_once()
+        assert not any("Retrying in" in info for info in ui.of("info"))
+
+    def test_stop_before_primary_fallback_notice_suppresses_notice_and_dispatch(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+        session._generation = 8
+        session._registry = MagicMock()
+
+        def stop_during_resolution(*args, **kwargs):
+            session._cancel_event.set()
+            return MagicMock()
+
+        from turnstone.core.session import _StreamTurnConsumer
+
+        consumer = _StreamTurnConsumer(session, 8)
+        with (
+            patch(
+                "turnstone.core.session.resolve_model_binding",
+                side_effect=stop_during_resolution,
+            ),
+            patch.object(session, "_build_main_lane", return_value=MagicMock()),
+            patch.object(session, "_model_turn_with_retry") as dispatch,
+            pytest.raises(GenerationCancelled),
+        ):
+            session._try_fallback_lane("fb", consumer, lambda wire, lane: wire, 8)
+
+        dispatch.assert_not_called()
+        assert not any("falling back to fb" in info for info in ui.of("info"))
+
+    def test_stop_before_degraded_fallback_notice_suppresses_notice_and_dispatch(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+        session._generation = 9
+        registry = MagicMock()
+        registry.fallback = ["fb"]
+        session._registry = registry
+
+        class _StopOnDegradedRead:
+            @property
+            def is_degraded(self):
+                session._cancel_event.set()
+                return True
+
+        health_registry = MagicMock()
+        health_registry.get_tracker_for_alias.return_value = _StopOnDegradedRead()
+        session._health_registry = health_registry
+
+        from turnstone.core.session import _StreamTurnConsumer
+
+        consumer = _StreamTurnConsumer(session, 9)
+        with (
+            patch.object(session, "_get_health_tracker", return_value=None),
+            patch.object(
+                session,
+                "_model_turn_with_retry",
+                side_effect=RuntimeError("primary failed"),
+            ),
+            patch.object(session, "_try_fallback_lane") as dispatch,
+            pytest.raises(GenerationCancelled),
+        ):
+            session._model_turn_with_fallback(consumer, lambda wire, lane: wire, 9)
+
+        dispatch.assert_not_called()
+        assert not any("degraded, trying anyway" in info for info in ui.of("info"))
+
+    def test_force_successor_before_fallback_failed_notice_suppresses_stale_notice(self, tmp_db):
+        ui = RecordingUI()
+        session = _make_session(ui)
+        session._generation = 10
+        session._registry = MagicMock()
+
+        def fail_after_successor_claim(*args, **kwargs):
+            session._generation += 1
+            raise httpx.ConnectError("fallback failed")
+
+        from turnstone.core.session import _StreamTurnConsumer
+
+        consumer = _StreamTurnConsumer(session, 10)
+        with (
+            patch("turnstone.core.session.resolve_model_binding", return_value=MagicMock()),
+            patch.object(session, "_build_main_lane", return_value=MagicMock()),
+            patch.object(
+                session,
+                "_model_turn_with_retry",
+                side_effect=fail_after_successor_claim,
+            ) as dispatch,
+            pytest.raises(GenerationCancelled),
+        ):
+            session._try_fallback_lane("fb", consumer, lambda wire, lane: wire, 10)
+
+        dispatch.assert_called_once()
+        infos = ui.of("info")
+        assert any("falling back to fb" in info for info in infos)
+        assert not any("Fallback fb also failed" in info for info in infos)
 
 
 class TestDebugDumpLatch:
@@ -1024,7 +1163,32 @@ class TestPrepareWireLaneCaps:
         session = _make_session(RecordingUI())
         arm_session(session, _good_stream("ok"))
         with patch.object(
-            session, "_prepare_wire_messages", wraps=session._prepare_wire_messages
+            session,
+            "_prepare_lowered_wire_messages",
+            wraps=session._prepare_lowered_wire_messages,
         ) as prep:
             session.send("test")
         assert prep.call_args.kwargs["caps"] is session._get_capabilities()
+
+    def test_interactive_history_legalizes_each_tool_call_once(self, tmp_db):
+        """The hot prepare suffix must not repeat model_turn's sanitizer."""
+        import turnstone.core.lowering as lowering
+        from turnstone.core.trajectory import ToolCall
+
+        session = _make_session(RecordingUI())
+        session.messages = [
+            Turn.assistant(
+                tool_calls=(ToolCall(id="call-bad", name="lookup", arguments="not-json"),)
+            ),
+            Turn.tool("call-bad", "handled"),
+        ]
+        arm_session(session, _good_stream("ok"))
+
+        with patch.object(
+            lowering,
+            "wire_valid_arguments",
+            wraps=lowering.wire_valid_arguments,
+        ) as validity_scan:
+            session.send("next")
+
+        assert validity_scan.call_count == 1

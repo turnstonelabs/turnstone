@@ -4,20 +4,19 @@ The helper turns bare backend-boundary exceptions (httpx ``ReadTimeout``,
 OpenAI SDK ``APITimeoutError`` / ``APIConnectionError`` /
 ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``) into
 operator-actionable messages that include the provider, base URL, and
-model.  We bind the method to lightweight stubs rather than constructing
-a full :class:`ChatSession`: the helper only reads ``self.client``,
-``self._provider``, ``self.model``, and ``self._model_alias``, so a
-SimpleNamespace stub exercises the same surface without dragging in the
-storage / prompt composition fixtures.
+model. We bind the method to lightweight stubs carrying one coherent
+``ModelLane`` rather than constructing a full :class:`ChatSession`.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from turnstone.core.model_turn import ModelLane
 from turnstone.core.session import ChatSession
 
 
@@ -36,9 +35,13 @@ def _stub(
     ``_base_url`` (httpx fallback) are exercised by the helper.
     """
     client_kwargs: dict[str, Any] = {client_attr: base_url}
-    return SimpleNamespace(
+    lane = ModelLane(
         client=SimpleNamespace(**client_kwargs),
-        _provider=SimpleNamespace(provider_name=provider_name),
+        provider=SimpleNamespace(provider_name=provider_name),
+        model=model,
+        alias=model_alias or "",
+    )
+    stub = SimpleNamespace(
         model=model,
         _model_alias=model_alias,
         # Dead-binding latches, clear: the formatter checks them first and
@@ -46,6 +49,9 @@ def _stub(
         _registry_alias_removed=None,
         _rebind_failed_key=None,
     )
+    stub._lane = lane
+    stub._primary_lane = lambda: stub._lane
+    return stub
 
 
 def _format(stub: Any, exc: BaseException) -> str | None:
@@ -318,7 +324,7 @@ def test_trailing_slash_and_query_string_stripped():
 
 def test_missing_provider_degrades_to_placeholder():
     stub = _stub()
-    stub._provider = None
+    stub._lane = dataclasses.replace(stub._lane, provider=None)
     msg = _format(stub, ReadTimeout())
     assert msg is not None
     # No exception, no NoneType formatting leaking through.
@@ -332,14 +338,8 @@ def test_client_base_url_raises_degrades_gracefully():
         def base_url(self) -> str:
             raise RuntimeError("boom")
 
-    stub = SimpleNamespace(
-        client=_BadClient(),
-        _provider=SimpleNamespace(provider_name="openai-compatible"),
-        model="flatspark",
-        _model_alias="flatspark",
-        _registry_alias_removed=None,
-        _rebind_failed_key=None,
-    )
+    stub = _stub()
+    stub._lane = dataclasses.replace(stub._lane, client=_BadClient())
     msg = _format(stub, ReadTimeout())
     assert msg is not None
     assert "Backend timeout" in msg
@@ -353,7 +353,8 @@ def test_httpx_underscore_base_url_fallback():
     stub = _stub(base_url="http://alt-host:9000", client_attr="_base_url")
     # SimpleNamespace exposes the attr; remove the public one so the
     # fallback path is exercised.
-    delattr(stub.client, "base_url") if hasattr(stub.client, "base_url") else None
+    client = stub._lane.client
+    delattr(client, "base_url") if hasattr(client, "base_url") else None
     msg = _format(stub, ReadTimeout())
     assert msg is not None
     assert "http://alt-host:9000" in msg
@@ -372,18 +373,11 @@ def _record_fatal_stub(ui: Any, captured: dict[str, str]) -> Any:
     internally, so the stub binds the unbound method to itself rather
     than relying on Python's descriptor protocol (which only kicks in
     when ``self`` is a real instance of the class)."""
-    stub = SimpleNamespace(
-        client=SimpleNamespace(base_url="http://192.168.0.5:8000/v1"),
-        _provider=SimpleNamespace(provider_name="openai-compatible"),
-        model="flatspark",
-        _model_alias="flatspark",
-        _registry_alias_removed=None,
-        _rebind_failed_key=None,
-        _ws_id="ws-test",
-        _has_persisted_error=False,
-        ui=ui,
-        _emit_state=lambda state: captured.setdefault("state", state),
-    )
+    stub = _stub()
+    stub._ws_id = "ws-test"
+    stub._has_persisted_error = False
+    stub.ui = ui
+    stub._emit_state = lambda state, **_kwargs: captured.setdefault("state", state)
     stub._format_backend_error = lambda exc: ChatSession._format_backend_error(stub, exc)
     return stub
 

@@ -350,6 +350,7 @@ def resolve_workstream_owner(
     *,
     mgr: Any | None = None,
     not_found_label: str = "Workstream not found",
+    resolved_row: dict[str, Any] | None = None,
 ) -> tuple[str, JSONResponse | None]:
     """Resolve ``ws_id`` to its owner; 404 when the row doesn't exist.
 
@@ -400,7 +401,12 @@ def resolve_workstream_owner(
     owner: str | None = None
     project_id = ""
 
-    if mgr is not None:
+    if resolved_row is not None:
+        if resolved_row.get("state") == "creating":
+            return "", _JSONResponse({"error": not_found_label}, status_code=404)
+        owner = resolved_row.get("user_id") or ""
+        project_id = resolved_row.get("project_id") or ""
+    elif mgr is not None:
         ws_mem = mgr.get(ws_id)
         if ws_mem is not None:
             owner = ws_mem.user_id or ""
@@ -412,7 +418,7 @@ def resolve_workstream_owner(
         from turnstone.core.memory import get_workstream_row
 
         row = get_workstream_row(ws_id)
-        if row is None:
+        if row is None or row.get("state") == "creating":
             return "", _JSONResponse({"error": not_found_label}, status_code=404)
         owner = row.get("user_id") or ""
         project_id = row.get("project_id") or ""

@@ -650,6 +650,33 @@ def test_inspect_cross_tenant_returns_same_shape_as_missing(populated_storage):
     assert missing["ws_id"] == "missing-x"
 
 
+def test_creating_child_is_unobservable_to_point_and_batch_guards(tmp_path):
+    """Matching parent and owner do not authorize an unpublished child."""
+    storage = SQLiteBackend(str(tmp_path / "creating-child.db"))
+    storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    ws_id = "a" * 32
+    storage.register_workstream(
+        ws_id,
+        kind="interactive",
+        parent_ws_id="coord-1",
+        user_id="user-1",
+        state="creating",
+    )
+    storage.save_message(ws_id, "assistant", "unpublished child transcript")
+    client = _make_read_client(storage)
+
+    sent = client.send(ws_id, "too early")
+    inspected = client.inspect(ws_id)
+    waited = client.wait_for_workstream([ws_id], timeout=0, mode="any")
+
+    assert sent["status"] == 404
+    assert inspected["status"] == 404
+    assert "messages" not in inspected
+    assert waited["complete"] is False
+    assert waited["results"][ws_id]["state"] == "not_found"
+    assert ws_id in {item["ws_id"] for item in waited["not_found"]}
+
+
 def test_list_children_excludes_closed_by_default(tmp_path):
     """Default ``list_children`` filters out closed / deleted rows —
     the common "what's still running?" query shouldn't have to

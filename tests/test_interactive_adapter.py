@@ -1,18 +1,13 @@
 """Tests for InteractiveAdapter.
 
-Focus: the ``emit_closed`` transport contract (sole path for
-``ws_closed`` onto the process-wide queue) and ``cleanup_ui``
+Focus: the interactive lifecycle transport contract and ``cleanup_ui``
 behavior (unblock pending events, broadcast ``ws_closed`` to per-UI
 listeners, cancel + close session). The SessionManager-level tests
 in ``test_session_manager.py`` cover the adapter-agnostic lifecycle.
 
-The other three :class:`SessionEventEmitter` methods
-(``emit_created`` / ``emit_state`` / ``emit_rehydrated``) are
-documented no-op stubs — ``ws_created`` is fired by the create HTTP
-handler after attachment validation, and ``ws_state`` is fired by
-``WebUI._broadcast_state`` with the full payload. No-op assertions
-on those methods would be tautological given the class docstring,
-so they're not retested here.
+``emit_created`` now owns the bounded global-queue publication after the
+HTTP handler has prepared and validated the create. ``emit_state`` and
+``emit_rehydrated`` remain out-of-band/no-op on interactive.
 """
 
 from __future__ import annotations
@@ -77,8 +72,7 @@ def _make_ws(**overrides: Any) -> Workstream:
 
 
 # ---------------------------------------------------------------------------
-# Transport — emit_closed (the only emit_* with real behavior on interactive;
-# emit_created / emit_state / emit_rehydrated are documented no-op stubs)
+# Transport
 # ---------------------------------------------------------------------------
 
 

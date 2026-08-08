@@ -3,7 +3,15 @@
 Supports SQLite (default, zero-config) and PostgreSQL (multi-node, production).
 """
 
-from turnstone.core.storage._protocol import StorageBackend, StorageConflictError
+from turnstone.core.storage._protocol import (
+    ForkCloneError,
+    ForkCloneExpectation,
+    ForkCloneSnapshot,
+    ForkDestinationConflictError,
+    ForkSourceUnavailableError,
+    StorageBackend,
+    StorageConflictError,
+)
 from turnstone.core.storage._registry import (
     StorageUnavailableError,
     get_storage,
@@ -15,6 +23,11 @@ from turnstone.core.storage._registry import (
 __all__ = [
     "StorageBackend",
     "StorageConflictError",
+    "ForkCloneError",
+    "ForkCloneExpectation",
+    "ForkCloneSnapshot",
+    "ForkDestinationConflictError",
+    "ForkSourceUnavailableError",
     "StorageUnavailableError",
     "get_storage",
     "init_storage",

@@ -88,7 +88,7 @@
     <rect x="300" y="151" width="160" height="2" fill="#161b22"/>
     <text x="380" y="178" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Console</text>
     <line x1="318" y1="190" x2="442" y2="190" stroke="#30363d" stroke-width="1"/>
-    <text x="380" y="208" text-anchor="middle" fill="#8b949e" font-size="9">hash-ring router</text>
+    <text x="380" y="208" text-anchor="middle" fill="#8b949e" font-size="9">FNV-1a rendezvous router</text>
     <text x="380" y="223" text-anchor="middle" fill="#8b949e" font-size="9">cluster dashboard</text>
     <text x="380" y="238" text-anchor="middle" fill="#8b949e" font-size="9">reverse proxy</text>
     <line x1="318" y1="250" x2="442" y2="250" stroke="#30363d" stroke-width="1"/>
@@ -115,7 +115,7 @@
     <rect x="608" y="162" width="184" height="28" rx="3" fill="#1c2128" stroke="#30363d" stroke-width="1"/>
     <text x="700" y="180" text-anchor="middle" fill="#8b949e" font-size="9">turnstone-server :8080</text>
     <!-- Tools label -->
-    <text x="700" y="206" text-anchor="middle" fill="#484f58" font-size="8">19 tools + MCP</text>
+    <text x="700" y="206" text-anchor="middle" fill="#484f58" font-size="8">model lanes + tools / MCP</text>
   </g>
 
   <!-- Node B -->
@@ -130,7 +130,7 @@
     <rect x="608" y="282" width="184" height="28" rx="3" fill="#1c2128" stroke="#30363d" stroke-width="1"/>
     <text x="700" y="300" text-anchor="middle" fill="#8b949e" font-size="9">turnstone-server :8080</text>
     <!-- Tools label -->
-    <text x="700" y="326" text-anchor="middle" fill="#484f58" font-size="8">19 tools + MCP</text>
+    <text x="700" y="326" text-anchor="middle" fill="#484f58" font-size="8">model lanes + tools / MCP</text>
   </g>
 
   <!-- ==================== LLM PROVIDERS ==================== -->
@@ -171,7 +171,7 @@
     <rect x="590" y="450" width="220" height="5" fill="#bc8cff"/>
     <rect x="590" y="453" width="220" height="2" fill="#161b22"/>
     <text x="700" y="476" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">PostgreSQL / SQLite</text>
-    <text x="700" y="492" text-anchor="middle" fill="#8b949e" font-size="9">conversations, memory, auth</text>
+    <text x="700" y="492" text-anchor="middle" fill="#8b949e" font-size="9">workstreams, turns, config, auth</text>
   </g>
   <text x="700" y="444" text-anchor="middle" fill="#bc8cff" font-size="9" font-weight="600" letter-spacing="2">STORAGE</text>
 
@@ -239,7 +239,7 @@
   <!-- Routing rules at bottom, left-aligned -->
   <text x="44" y="456" fill="#30363d" font-size="9" font-weight="600" letter-spacing="1">ROUTING</text>
   <circle cx="44" cy="474" r="3" fill="#3fb950" opacity="0.6"/>
-  <text x="54" y="477" fill="#484f58" font-size="9">control plane: client &#x2192; console &#x2192; server node (hash-ring bucket lookup)</text>
+  <text x="54" y="477" fill="#484f58" font-size="9">control plane: client &#x2192; console &#x2192; server node (FNV-1a rendezvous placement)</text>
   <circle cx="44" cy="494" r="3" fill="#58a6ff" opacity="0.6"/>
   <text x="54" y="497" fill="#484f58" font-size="9">data plane: client &#x2192; server node (direct SSE, node_url from create response)</text>
   <circle cx="44" cy="514" r="3" fill="#f47067" opacity="0.6"/>

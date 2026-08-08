@@ -31,7 +31,7 @@ node "Docker Host" as host {
                 Command: turnstone-console
                   --port 8090
                 Depends: server
-                Hash-ring router for
+                FNV-1a rendezvous router for
                   multi-node clusters
             end note
         }
@@ -69,7 +69,7 @@ apiclient --> server : HTTP + SSE\nport 8080
 ' Internal connections
 server --> llm_api : OpenAI API\n(HTTPS/HTTP)
 
-console --> server : HTTP proxy\n(hash-ring lookup,\nproxy /node/{id}/*)
+console --> server : HTTP proxy\n(FNV-1a rendezvous placement,\nproxy /node/{id}/*)
 
 ' Database connections (production/cluster profiles)
 server ..> pgbouncer : PostgreSQL\n(pool_size=2)

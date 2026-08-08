@@ -3,7 +3,7 @@ interactive and coordinator creates.
 
 Four surfaces:
   * the predicate matrix (``require_project_enabled`` / ``require_project_denies_create``);
-  * the fork/resume project inheritance + the cross-tenant 403-vs-400 oracle in the
+  * the always-on fork/resume visibility, canonicalization, and project binding in the
     interactive create validator (``_interactive_create_validate_request``);
   * the console cluster-create proxy's surface-only-require_project / mask-everything
     -else policy (``create_workstream``);
@@ -12,7 +12,7 @@ Four surfaces:
 
 Validator tests drive the coroutine synchronously via ``asyncio.run`` so they need no
 async-plugin marker. Storage is a MagicMock patched onto the singleton getter that both
-the RAW resume-resolve and ``ensure_project_attachable`` read.
+the resume boundary and ``ensure_project_attachable`` read.
 """
 
 from __future__ import annotations
@@ -153,7 +153,7 @@ class TestRequireProjectPredicate:
 
 
 # ---------------------------------------------------------------------------
-# Fork/resume inheritance + the 403-vs-400 cross-tenant oracle (node validator)
+# Fork/resume visibility + source-project inheritance (node validator)
 # ---------------------------------------------------------------------------
 
 
@@ -162,19 +162,24 @@ def _src_storage(
     project_id: str | None = None,
     project_visibility: str = "private",
     project_owner: str = "other",
+    source_owner: str = "other",
     members: tuple[str, ...] = (),
     resolve_none: bool = False,
     get_project_missing: bool = False,
 ) -> MagicMock:
-    """Storage double for the resume source: resolve + get_workstream (RAW) and
+    """Storage double for the resume source: resolve + get_workstream and
     the get_project/is_project_member surface ``ensure_project_attachable`` reads."""
     storage = MagicMock()
     storage.resolve_workstream.side_effect = lambda _x: None if resolve_none else "src-canon"
-    storage.get_workstream.return_value = {
+    source_row = {
         "ws_id": "src-canon",
         "project_id": project_id,
-        "user_id": "other",
+        "user_id": source_owner,
+        "state": "idle",
+        "fork_reservation_token": "src-incarnation",
     }
+    storage.get_workstream.return_value = source_row
+    storage.ensure_workstream_incarnation_snapshot.return_value = source_row
     if get_project_missing or project_id is None:
         storage.get_project.return_value = None
     else:
@@ -189,92 +194,135 @@ def _src_storage(
     return storage
 
 
-def _validate(monkeypatch: Any, body: dict[str, Any], uid: str, cs: Any, storage: Any) -> Any:
+def _validate(
+    monkeypatch: Any,
+    body: dict[str, Any],
+    uid: str,
+    cs: Any,
+    storage: Any,
+    *,
+    auth: Any = None,
+) -> Any:
     """Run ``_interactive_create_validate_request`` with a patched storage getter."""
     import turnstone.server as server_mod
 
     monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
-    req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(config_store=cs)))
+    req = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(config_store=cs)),
+        state=SimpleNamespace(auth_result=auth),
+    )
     return asyncio.run(server_mod._interactive_create_validate_request(req, body, uid, []))
 
 
-class TestResumeInheritanceOracle:
+class TestResumeVisibilityAndInheritance:
     def _on(self, make_config_store: Any) -> Any:
         return make_config_store(**{"server.require_project": True})
 
-    def test_inherits_attachable_source_project(
+    def test_flag_off_resolves_alias_pins_canonical_and_inherits_public_project(
         self, monkeypatch: Any, make_config_store: Any
     ) -> None:
         storage = _src_storage(project_id="ppub", project_visibility="public")
-        body: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
-        res = _validate(monkeypatch, body, "alice", self._on(make_config_store), storage)
+        body: dict[str, Any] = {
+            "resume_ws": "source-alias",
+            "kind": "interactive",
+            "project_id": "caller-choice",
+        }
+        res = _validate(monkeypatch, body, "alice", make_config_store(), storage)
         assert res is None
-        assert body["project_id"] == "ppub"  # inherited (attachable)
+        assert body["resume_ws"] == "src-canon"
+        assert body["project_id"] == "ppub"
+        storage.resolve_workstream.assert_called_once_with("source-alias")
+        storage.get_workstream.assert_not_called()
+        storage.ensure_workstream_incarnation_snapshot.assert_called_once_with("src-canon")
 
-    def test_member_of_private_source_inherits(
-        self, monkeypatch: Any, make_config_store: Any
+    @pytest.mark.parametrize(
+        ("project_owner", "members"),
+        [("alice", ()), ("other", ("alice",))],
+        ids=("project-owner", "project-member"),
+    )
+    def test_private_project_owner_or_member_inherits_when_flag_off(
+        self,
+        monkeypatch: Any,
+        make_config_store: Any,
+        project_owner: str,
+        members: tuple[str, ...],
     ) -> None:
         storage = _src_storage(
-            project_id="psecret", project_visibility="private", members=("alice",)
+            project_id="psecret",
+            project_visibility="private",
+            project_owner=project_owner,
+            members=members,
         )
         body: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
-        res = _validate(monkeypatch, body, "alice", self._on(make_config_store), storage)
+        res = _validate(monkeypatch, body, "alice", make_config_store(), storage)
         assert res is None
+        assert body["resume_ws"] == "src-canon"
         assert body["project_id"] == "psecret"
 
-    def test_private_source_no_403_oracle(self, monkeypatch: Any, make_config_store: Any) -> None:
-        # Source under a private project alice can't access → MUST NOT surface a
-        # distinguishable 403; drop to projectless so the gate 400s it uniformly.
-        storage = _src_storage(project_id="psecret", project_visibility="private", members=())
-        body: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
-        res = _validate(monkeypatch, body, "alice", self._on(make_config_store), storage)
-        assert res is None  # NOT a 403 JSONResponse
-        assert body.get("project_id", "") == ""
+    def test_private_nonmember_and_missing_source_are_uniform_404_when_flag_off(
+        self, monkeypatch: Any, make_config_store: Any
+    ) -> None:
+        cs = make_config_store()
+        private_storage = _src_storage(
+            project_id="psecret", project_visibility="private", members=()
+        )
+        private_body: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
+        private_res = _validate(monkeypatch, private_body, "alice", cs, private_storage)
 
-    def test_projectless_source_no_inherit(self, monkeypatch: Any, make_config_store: Any) -> None:
+        missing_storage = _src_storage(resolve_none=True)
+        missing_body: dict[str, Any] = {"resume_ws": "ghost", "kind": "interactive"}
+        missing_res = _validate(monkeypatch, missing_body, "alice", cs, missing_storage)
+
+        assert private_res.status_code == missing_res.status_code == 404
+        assert (
+            json.loads(private_res.body)
+            == json.loads(missing_res.body)
+            == {"error": "Workstream not found"}
+        )
+        private_storage.is_project_member.assert_called_once_with("psecret", "alice")
+
+    def test_projectless_source_remains_trusted_team_and_discards_caller_project(
+        self, monkeypatch: Any, make_config_store: Any
+    ) -> None:
         storage = _src_storage(project_id=None)
-        body: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
-        res = _validate(monkeypatch, body, "alice", self._on(make_config_store), storage)
+        body: dict[str, Any] = {
+            "resume_ws": "src",
+            "kind": "interactive",
+            "project_id": "caller-choice",
+        }
+        res = _validate(monkeypatch, body, "alice", make_config_store(), storage)
         assert res is None
+        assert body["resume_ws"] == "src-canon"
         assert body.get("project_id", "") == ""
+        storage.get_project.assert_not_called()
 
-    def test_nonexistent_source_no_inherit(self, monkeypatch: Any, make_config_store: Any) -> None:
-        storage = _src_storage(resolve_none=True)
-        body: dict[str, Any] = {"resume_ws": "ghost", "kind": "interactive"}
-        res = _validate(monkeypatch, body, "alice", self._on(make_config_store), storage)
-        assert res is None
-        assert body.get("project_id", "") == ""
+    def test_console_service_cannot_bypass_for_forwarded_different_user(
+        self, monkeypatch: Any, make_config_store: Any
+    ) -> None:
+        storage = _src_storage(project_id="psecret", project_visibility="private")
+        auth = _Auth(scopes=("service",), token_source="console", user_id="console-service")
+        body: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
+        res = _validate(
+            monkeypatch,
+            body,
+            "alice",
+            make_config_store(),
+            storage,
+            auth=auth,
+        )
+        assert res.status_code == 404
+        assert json.loads(res.body) == {"error": "Workstream not found"}
+        storage.is_project_member.assert_called_once_with("psecret", "alice")
 
     def test_dangling_source_project_no_oracle(
         self, monkeypatch: Any, make_config_store: Any
     ) -> None:
-        # Source's project was deleted → attach 400 → drop (uniform with the rest).
+        # Source's project was deleted → attach 400 → projectless downstream gate.
         storage = _src_storage(project_id="pdead", get_project_missing=True)
         body: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
         res = _validate(monkeypatch, body, "alice", self._on(make_config_store), storage)
         assert res is None
         assert body.get("project_id", "") == ""
-
-    def test_private_and_projectless_indistinguishable(
-        self, monkeypatch: Any, make_config_store: Any
-    ) -> None:
-        # The R1 core: private-source and projectless-source produce IDENTICAL
-        # observable outcomes — no cross-tenant oracle.
-        cs = self._on(make_config_store)
-        b_priv: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
-        _validate(monkeypatch, b_priv, "alice", cs, _src_storage(project_id="psecret"))
-        b_none: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
-        _validate(monkeypatch, b_none, "alice", cs, _src_storage(project_id=None))
-        assert b_priv.get("project_id", "") == b_none.get("project_id", "") == ""
-
-    def test_flag_off_never_resolves(self, monkeypatch: Any, make_config_store: Any) -> None:
-        # Byte-identical when off: the source is never resolved, nothing inherited.
-        storage = _src_storage(project_id="ppub", project_visibility="public")
-        body: dict[str, Any] = {"resume_ws": "src", "kind": "interactive"}
-        res = _validate(monkeypatch, body, "alice", make_config_store(), storage)
-        assert res is None
-        assert body.get("project_id", "") == ""
-        storage.resolve_workstream.assert_not_called()
 
     def test_explicit_project_discarded_for_projected_source(
         self, monkeypatch: Any, make_config_store: Any
@@ -291,10 +339,9 @@ class TestResumeInheritanceOracle:
     def test_explicit_project_discarded_projectless_source(
         self, monkeypatch: Any, make_config_store: Any
     ) -> None:
-        # The safe-vs-leaky discriminator: a fork of a PROJECTLESS source carrying
-        # an explicit owned project_id must NOT file under the pick — the pick is
-        # discarded, nothing inherited, so it funnels to the uniform projectless
-        # "" (400 downstream), indistinguishable from inaccessible/nonexistent.
+        # A fork of a PROJECTLESS source carrying an explicit owned project_id
+        # must NOT file under the pick: the pick is discarded, so the optional
+        # require-project gate sees a genuinely projectless destination.
         storage = _src_storage(project_id=None)
         body: dict[str, Any] = {"resume_ws": "src", "kind": "interactive", "project_id": "powned"}
         res = _validate(monkeypatch, body, "alice", self._on(make_config_store), storage)
@@ -304,12 +351,12 @@ class TestResumeInheritanceOracle:
     def test_explicit_project_discarded_nonexistent_source(
         self, monkeypatch: Any, make_config_store: Any
     ) -> None:
-        # Same discriminator for a NONEXISTENT source + explicit owned pid: "".
+        # A caller project cannot turn a missing source into a fresh chat.
         storage = _src_storage(resolve_none=True)
         body: dict[str, Any] = {"resume_ws": "ghost", "kind": "interactive", "project_id": "powned"}
         res = _validate(monkeypatch, body, "alice", self._on(make_config_store), storage)
-        assert res is None
-        assert body.get("project_id", "") == ""
+        assert res.status_code == 404
+        assert json.loads(res.body) == {"error": "Workstream not found"}
 
 
 # ---------------------------------------------------------------------------

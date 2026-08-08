@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from turnstone.core.model_registry import ModelClientConstructionError, UnknownModelAliasError
 from turnstone.core.session_manager import SessionKindAdapter, SessionManager
 from turnstone.core.workstream import (
     BULK_CLOSE_STATE_VALUES,
@@ -70,11 +72,13 @@ class FakeUI:
 class FakeSession:
     """Minimal ChatSession stand-in; exposes cancel / close / resume."""
 
-    def __init__(self, ws_id: str) -> None:
+    def __init__(self, ws_id: str, *, model_alias: str | None = None) -> None:
         self.ws_id = ws_id
+        self.model_alias = model_alias
         self.cancelled = False
         self.closed = False
         self.resumed = False
+        self.resume_hook: Callable[[], None] | None = None
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -83,6 +87,8 @@ class FakeSession:
         self.closed = True
 
     def resume(self, ws_id: str) -> None:
+        if self.resume_hook is not None:
+            self.resume_hook()
         self.resumed = True
 
 
@@ -102,6 +108,9 @@ class FakeAdapter:
         self.build_session_calls = 0
         self.build_session_raises = build_session_raises
         self.last_build_model: object | None = None
+        self.build_models: list[object | None] = []
+        self.built_sessions: list[FakeSession] = []
+        self.build_session_hook: Callable[[Workstream, object | None], FakeSession] | None = None
         # Slow down session build so concurrent tests can race.
         self.build_session_delay = 0.0
 
@@ -151,12 +160,20 @@ class FakeAdapter:
         # alias on rehydrate) so tests can assert SessionManager.open()
         # threads the persisted alias through to construction instead
         # of letting the adapter resolve the *current* default alias.
-        self.last_build_model = kwargs.get("model")
+        model = kwargs.get("model")
+        self.last_build_model = model
+        self.build_models.append(model)
         if self.build_session_delay:
             time.sleep(self.build_session_delay)
         if self.build_session_raises:
             raise RuntimeError("build_session forced failure")
-        return FakeSession(ws.id)
+        session = (
+            self.build_session_hook(ws, model)
+            if self.build_session_hook is not None
+            else FakeSession(ws.id)
+        )
+        self.built_sessions.append(session)
+        return session
 
     def events_of(self, kind: str) -> list[_Event]:
         with self._events_lock:
@@ -214,6 +231,7 @@ class FakeStorage:
         # "no peers alive" (every row unprotected by liveness).
         self.live_services: dict[str, list[str]] = {}
         self.list_services_raises = False
+        self.delete_stale_creating_raises = False
         # Per-ws config (model_alias, temperature, …).  Populated by
         # tests that exercise the rehydrate-preserves-config path; the
         # SessionManager.open() rehydrate path reads this through
@@ -221,6 +239,7 @@ class FakeStorage:
         # saved alias into ``build_session`` and avoid clobbering the
         # original on construction.
         self.ws_config: dict[str, dict[str, str]] = {}
+        self.fork_reservations: dict[str, str] = {}
 
     @staticmethod
     def _now_iso() -> str:
@@ -241,6 +260,7 @@ class FakeStorage:
         skill_version: int = 0,
         state: str = "idle",
         updated: str | None = None,
+        fork_reservation_token: str = "",
     ) -> None:
         if self.register_raises:
             raise RuntimeError("register forced failure")
@@ -258,6 +278,8 @@ class FakeStorage:
                 project_id=project_id,
                 persona=persona if persona else None,
             )
+            if fork_reservation_token:
+                self.fork_reservations[ws_id] = fork_reservation_token
 
     def touch_workstream(self, ws_id: str) -> None:
         with self.lock:
@@ -305,6 +327,42 @@ class FakeStorage:
                     closed.append(ws_id)
         return closed
 
+    def delete_stale_creating_reservations(
+        self,
+        kind: WorkstreamKind | str,
+        cutoff: str,
+        exclude_ws_ids: list[str],
+        *,
+        live_node_ids: list[str],
+        local_node_id: str | None,
+    ) -> list[str]:
+        if live_node_ids is None:  # type: ignore[comparison-overlap]
+            return []
+        if self.delete_stale_creating_raises:
+            raise RuntimeError("stale creating delete forced failure")
+        kind_str = kind.value if isinstance(kind, WorkstreamKind) else str(kind)
+        excluded = set(exclude_ws_ids)
+        protected_live = {
+            node_id for node_id in live_node_ids if node_id and node_id != local_node_id
+        }
+        deleted: list[str] = []
+        with self.lock:
+            for ws_id, row in list(self.rows.items()):
+                if (
+                    row.kind != kind_str
+                    or row.state != "creating"
+                    or row.updated >= cutoff
+                    or ws_id in excluded
+                ):
+                    continue
+                if row.node_id is not None and row.node_id in protected_live:
+                    continue
+                self.rows.pop(ws_id, None)
+                self.ws_config.pop(ws_id, None)
+                self.fork_reservations.pop(ws_id, None)
+                deleted.append(ws_id)
+        return deleted
+
     def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
         if self.list_services_raises:
             raise RuntimeError("list_services forced failure")
@@ -327,6 +385,27 @@ class FakeStorage:
                 "state": row.state,
                 "parent_ws_id": row.parent_ws_id,
                 "persona": row.persona,
+            }
+
+    def ensure_workstream_incarnation_snapshot(self, ws_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.rows.get(ws_id)
+            if row is None:
+                return None
+            token = self.fork_reservations.get(ws_id)
+            if not token:
+                token = uuid.uuid4().hex
+                self.fork_reservations[ws_id] = token
+            return {
+                "ws_id": row.ws_id,
+                "user_id": row.user_id,
+                "name": row.name,
+                "kind": row.kind,
+                "state": row.state,
+                "parent_ws_id": row.parent_ws_id,
+                "project_id": row.project_id,
+                "persona": row.persona,
+                "fork_reservation_token": token,
             }
 
     def list_workstreams(
@@ -373,6 +452,42 @@ class FakeStorage:
     def delete_workstream(self, ws_id: str) -> None:
         with self.lock:
             self.rows.pop(ws_id, None)
+            self.ws_config.pop(ws_id, None)
+            self.fork_reservations.pop(ws_id, None)
+
+    def delete_workstream_if_fork_reserved(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        with self.lock:
+            if self.fork_reservations.get(ws_id) != fork_reservation_token:
+                return False
+            self.rows.pop(ws_id, None)
+            self.ws_config.pop(ws_id, None)
+            self.fork_reservations.pop(ws_id, None)
+            return True
+
+    def publish_deferred_create(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        with self.lock:
+            row = self.rows.get(ws_id)
+            if (
+                row is None
+                or row.state != "creating"
+                or self.fork_reservations.get(ws_id) != fork_reservation_token
+            ):
+                return False
+            row.state = "idle"
+            row.updated = self._now_iso()
+            return True
+
+    def get_workstream_reservation_token(self, ws_id: str) -> str:
+        with self.lock:
+            return self.fork_reservations.get(ws_id, "")
 
     def count_skill_versions(self, template_id: str) -> int:
         return 0
@@ -472,11 +587,12 @@ def test_create_with_defer_emit_created_skips_emit() -> None:
     :meth:`SessionManager.discard` (rollback)."""
     mgr, adapter, storage = _make_manager()
     ws = mgr.create(user_id="u1", name="deferred", defer_emit_created=True)
-    # Workstream is fully constructed — only the broadcast is deferred.
+    # Workstream is fully constructed, but stays hidden from ordinary manager
+    # lookup until its lifecycle birth is committed.
     assert ws.session is not None
     assert ws.ui is not None
     assert ws.id in storage.rows
-    assert mgr.get(ws.id) is ws
+    assert mgr.get(ws.id) is None
     # No created event fired.
     assert adapter.events_of("created") == []
 
@@ -493,6 +609,7 @@ def test_commit_create_fires_deferred_emit_created() -> None:
     mgr.commit_create(ws)
 
     assert [e.ws_id for e in adapter.events_of("created")] == [ws.id]
+    assert mgr.get(ws.id) is ws
 
 
 def test_commit_create_is_noop_without_event_emitter() -> None:
@@ -667,12 +784,27 @@ def test_create_rolls_back_slot_on_session_failure() -> None:
     mgr, _, storage = _make_manager(adapter=adapter)
     with pytest.raises(RuntimeError, match="build_session forced failure"):
         mgr.create(user_id="u1")
-    # Slot freed — no dangling capacity consumption.  The storage row
-    # survives construction failure on purpose: the next ``open(ws_id)``
-    # retries build_session rather than forcing the user to create a
-    # brand-new workstream.
+    # Slot and hidden durable reservation are both released. A ``creating``
+    # row is intentionally undiscoverable, so retaining it would leak an
+    # unrecoverable workstream and its incarnation token.
     assert mgr.count == 0
-    assert len(storage.rows) == 1
+    assert storage.rows == {}
+
+
+def test_failed_pending_fork_create_deletes_exact_storage_reservation() -> None:
+    adapter = FakeAdapter(build_session_raises=True)
+    mgr, _, storage = _make_manager(adapter=adapter)
+
+    with pytest.raises(RuntimeError, match="build_session forced failure"):
+        mgr.create(
+            user_id="u1",
+            defer_emit_created=True,
+            _fork_reservation=True,
+        )
+
+    assert mgr.count == 0
+    assert storage.rows == {}
+    assert storage.fork_reservations == {}
 
 
 def test_create_rolls_back_slot_on_persist_failure() -> None:
@@ -754,6 +886,60 @@ def test_open_resurrects_closed_state() -> None:
     assert ws_id in [e.ws_id for e in adapter.events_of("rehydrated")]
 
 
+def test_open_supports_tokenless_legacy_rows_but_hides_creating() -> None:
+    """Rehydrate needs only the public row; private create state stays hidden."""
+
+    rows = {
+        "legacy-closed": {
+            "ws_id": "legacy-closed",
+            "user_id": "u1",
+            "name": "legacy",
+            "kind": WorkstreamKind.INTERACTIVE,
+            "state": "closed",
+            "parent_ws_id": None,
+            "project_id": None,
+            "persona": "",
+        },
+        "pending-create": {
+            "ws_id": "pending-create",
+            "user_id": "u1",
+            "name": "pending",
+            "kind": WorkstreamKind.INTERACTIVE,
+            "state": "creating",
+            "parent_ws_id": None,
+            "project_id": None,
+            "persona": "",
+        },
+    }
+
+    class _LegacyStorage:
+        """Pre-incarnation read surface: deliberately has no private snapshot API."""
+
+        def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
+            return rows.get(ws_id)
+
+        def load_workstream_config(self, ws_id: str) -> dict[str, str]:
+            return {}
+
+        def touch_workstream(self, ws_id: str) -> None:
+            return None
+
+    adapter = FakeAdapter()
+    mgr = SessionManager(
+        adapter,
+        storage=_LegacyStorage(),  # type: ignore[arg-type]
+        max_active=2,
+        event_emitter=adapter,
+    )
+
+    reopened = mgr.open("legacy-closed")
+
+    assert reopened is not None
+    assert reopened._fork_reservation_token == ""
+    assert mgr.open("pending-create") is None
+    assert mgr.get("pending-create") is None
+
+
 def test_open_threads_saved_model_alias_into_build_session() -> None:
     """Reopening a closed ws must build the session with the *original*
     model alias, not the current registry default.
@@ -826,8 +1012,253 @@ def test_open_keeps_saved_alias_when_validator_accepts() -> None:
     reopened = mgr.open(ws_id)
 
     assert reopened is not None
-    assert accepted == ["still-live"]
+    # Initial filter plus the pre/post-resume race checks all see the
+    # same still-live alias.
+    assert accepted == ["still-live", "still-live", "still-live"]
     assert adapter.last_build_model == "still-live"
+
+
+def test_open_retries_default_when_alias_disappears_during_build() -> None:
+    """The validator -> factory straddle retries only the rehydrate build."""
+    saved_alias = "raced-away"
+    live_aliases = {saved_alias}
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias in live_aliases,
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    storage.ws_config[ws_id] = {"model_alias": saved_alias}
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+    adapter.built_sessions.clear()
+    adapter.cleaned_up.clear()
+
+    def build(ws: Workstream, model: object | None) -> FakeSession:
+        if model == saved_alias:
+            live_aliases.clear()
+            raise UnknownModelAliasError(saved_alias)
+        return FakeSession(ws.id)
+
+    adapter.build_session_hook = build
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    active: Any = reopened.session
+    ui: Any = reopened.ui
+    assert adapter.build_models == [saved_alias, None]
+    assert active is adapter.built_sessions[-1]
+    assert active.resumed is True
+    assert adapter.cleaned_up == []
+    assert reopened._closed is False
+    assert ui.closed_broadcast is False
+
+
+def test_open_does_not_retry_when_alias_recheck_fails() -> None:
+    """A validator outage is not proof that the saved alias disappeared."""
+    saved_alias = "indeterminate"
+    checks = 0
+
+    def validator(alias: str) -> bool:
+        nonlocal checks
+        assert alias == saved_alias
+        checks += 1
+        if checks == 1:
+            return True
+        raise RuntimeError("registry membership unavailable")
+
+    mgr, adapter, storage = _make_manager(model_validator=validator)
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    storage.ws_config[ws_id] = {"model_alias": saved_alias}
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+    adapter.cleaned_up.clear()
+
+    def build(_ws: Workstream, model: object | None) -> FakeSession:
+        if model == saved_alias:
+            raise UnknownModelAliasError(saved_alias)
+        return FakeSession(ws_id)
+
+    adapter.build_session_hook = build
+    with pytest.raises(ValueError, match=f"Unknown model alias: {saved_alias}"):
+        mgr.open(ws_id)
+
+    assert checks == 2
+    assert adapter.build_models == [saved_alias]
+    assert adapter.cleaned_up == [ws_id]
+    assert mgr.get(ws_id) is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(
+            RuntimeError("unrelated factory failure"),
+            id="other-failure",
+        ),
+        pytest.param(
+            ValueError("unrelated factory value failure"),
+            id="other-value-failure",
+        ),
+        pytest.param(
+            ModelClientConstructionError("client construction failed"),
+            id="client-construction",
+        ),
+    ],
+)
+def test_open_does_not_downgrade_non_alias_build_failure(failure: Exception) -> None:
+    saved_alias = "broken-but-saved"
+    live_aliases = {saved_alias}
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias in live_aliases,
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    storage.ws_config[ws_id] = {"model_alias": saved_alias}
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+    adapter.cleaned_up.clear()
+
+    def build(_ws: Workstream, model: object | None) -> FakeSession:
+        if model == saved_alias:
+            # Even a coincident removal must not erase a more specific
+            # construction/runtime failure.
+            live_aliases.clear()
+            raise failure
+        return FakeSession(ws_id)
+
+    adapter.build_session_hook = build
+    with pytest.raises(type(failure), match=str(failure)):
+        mgr.open(ws_id)
+
+    assert adapter.build_models == [saved_alias]
+    assert adapter.cleaned_up == [ws_id]
+    assert mgr.get(ws_id) is None
+
+
+def test_open_replaces_candidate_when_alias_disappears_before_resume() -> None:
+    """A constructed stale lane is closed without closing its shared UI."""
+    saved_alias = "gone-after-build"
+    live_aliases = {saved_alias}
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias in live_aliases,
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    storage.ws_config[ws_id] = {"model_alias": saved_alias}
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+    adapter.built_sessions.clear()
+    adapter.cleaned_up.clear()
+    stale: list[FakeSession] = []
+
+    def build(ws: Workstream, model: object | None) -> FakeSession:
+        session = FakeSession(ws.id)
+        if model == saved_alias:
+            stale.append(session)
+            live_aliases.clear()
+        return session
+
+    adapter.build_session_hook = build
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    active: Any = reopened.session
+    ui: Any = reopened.ui
+    assert adapter.build_models == [saved_alias, None]
+    assert len(stale) == 1
+    assert stale[0].closed is True
+    assert stale[0].cancelled is True
+    assert stale[0].resumed is False
+    assert active is adapter.built_sessions[-1]
+    assert active.resumed is True
+    assert active.closed is False
+    assert adapter.cleaned_up == []
+    assert reopened._closed is False
+    assert ui.closed_broadcast is False
+
+
+def test_open_replaces_candidate_when_alias_disappears_during_resume() -> None:
+    """The post-resume check catches the has_alias -> bind race."""
+    saved_alias = "gone-during-resume"
+    live_aliases = {saved_alias}
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias in live_aliases,
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    storage.ws_config[ws_id] = {"model_alias": saved_alias}
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+    adapter.built_sessions.clear()
+    adapter.cleaned_up.clear()
+    stale: list[FakeSession] = []
+
+    def build(ws: Workstream, model: object | None) -> FakeSession:
+        session = FakeSession(ws.id)
+        if model == saved_alias:
+            stale.append(session)
+            session.resume_hook = live_aliases.clear
+        return session
+
+    adapter.build_session_hook = build
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    active: Any = reopened.session
+    ui: Any = reopened.ui
+    assert adapter.build_models == [saved_alias, None]
+    assert len(stale) == 1
+    assert stale[0].resumed is True
+    assert stale[0].closed is True
+    assert stale[0].cancelled is True
+    assert active is adapter.built_sessions[-1]
+    assert active.resumed is True
+    assert active.closed is False
+    assert adapter.cleaned_up == []
+    assert reopened._closed is False
+    assert ui.closed_broadcast is False
+
+
+def test_open_validates_alias_that_resume_actually_adopts() -> None:
+    """Post-resume validation must not reuse the factory candidate alias."""
+    saved_before = "saved-before"
+    saved_during = "saved-during"
+    live_aliases = {saved_before, saved_during}
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias in live_aliases,
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    storage.ws_config[ws_id] = {"model_alias": saved_before}
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+    adapter.built_sessions.clear()
+    stale: list[FakeSession] = []
+
+    def build(_ws: Workstream, model: object | None) -> FakeSession:
+        alias = saved_before if model is None else str(model)
+        session = FakeSession(ws_id, model_alias=alias)
+        if model == saved_before:
+            stale.append(session)
+
+            def adopt_then_remove() -> None:
+                session.model_alias = saved_during
+                live_aliases.remove(saved_during)
+
+            session.resume_hook = adopt_then_remove
+        return session
+
+    adapter.build_session_hook = build
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert adapter.build_models == [saved_before, None]
+    assert stale[0].resumed is True
+    assert stale[0].cancelled is True
+    assert stale[0].closed is True
+    assert reopened.session is adapter.built_sessions[-1]
+    assert reopened.session.model_alias == saved_before  # type: ignore[union-attr]
 
 
 def test_open_falls_back_to_none_when_no_saved_alias() -> None:
@@ -848,6 +1279,105 @@ def test_open_falls_back_to_none_when_no_saved_alias() -> None:
 
     assert reopened is not None
     assert adapter.last_build_model is None
+
+
+def test_open_retries_when_factory_default_disappears_during_resolution() -> None:
+    """A ``model=None`` factory race gets the same exact alias-miss retry."""
+    live_aliases = {"default-a"}
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias in live_aliases,
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+
+    def build(_ws: Workstream, model: object | None) -> FakeSession:
+        assert model is None
+        if len(adapter.build_models) == 1:
+            live_aliases.clear()
+            live_aliases.add("default-b")
+            raise UnknownModelAliasError("default-a")
+        return FakeSession(ws_id, model_alias="default-b")
+
+    adapter.build_session_hook = build
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert adapter.build_models == [None, None]
+    assert reopened.session is adapter.built_sessions[-1]
+    assert reopened.session.model_alias == "default-b"  # type: ignore[union-attr]
+
+
+def test_open_replaces_default_candidate_removed_before_resume() -> None:
+    """The concrete default alias is rechecked even with no persisted alias."""
+    live_aliases = {"default-a"}
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias in live_aliases,
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+    stale: list[FakeSession] = []
+
+    def build(_ws: Workstream, model: object | None) -> FakeSession:
+        assert model is None
+        alias = next(iter(live_aliases))
+        session = FakeSession(ws_id, model_alias=alias)
+        if alias == "default-a":
+            stale.append(session)
+            live_aliases.clear()
+            live_aliases.add("default-b")
+        return session
+
+    adapter.build_session_hook = build
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert adapter.build_models == [None, None]
+    assert stale[0].cancelled is True
+    assert stale[0].closed is True
+    assert reopened.session is adapter.built_sessions[-1]
+    assert reopened.session.model_alias == "default-b"  # type: ignore[union-attr]
+
+
+def test_open_replaces_default_candidate_removed_during_resume() -> None:
+    """Post-resume validation follows the candidate alias, not saved None."""
+    live_aliases = {"default-a"}
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias in live_aliases,
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+    stale: list[FakeSession] = []
+
+    def build(_ws: Workstream, model: object | None) -> FakeSession:
+        assert model is None
+        alias = next(iter(live_aliases))
+        session = FakeSession(ws_id, model_alias=alias)
+        if alias == "default-a":
+            stale.append(session)
+
+            def switch_default() -> None:
+                live_aliases.clear()
+                live_aliases.add("default-b")
+
+            session.resume_hook = switch_default
+        return session
+
+    adapter.build_session_hook = build
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert adapter.build_models == [None, None]
+    assert stale[0].resumed is True
+    assert stale[0].cancelled is True
+    assert stale[0].closed is True
+    assert reopened.session is adapter.built_sessions[-1]
+    assert reopened.session.model_alias == "default-b"  # type: ignore[union-attr]
 
 
 def test_open_touches_workstream_on_rehydrate() -> None:
@@ -924,8 +1454,79 @@ def test_concurrent_open_for_same_ws_id_returns_same_session() -> None:
 
 
 # ---------------------------------------------------------------------------
+# cancel
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_resolves_all_parallel_approval_cycles() -> None:
+    mgr, _, _ = _make_manager()
+    ws = mgr.create(user_id="u1")
+    ui = MagicMock()
+    ws.ui = ui
+
+    assert mgr.cancel(ws.id) is True
+
+    assert ws.session.cancelled is True  # type: ignore[attr-defined]
+    ui.resolve_all_approvals.assert_called_once_with(False, "cancelled")
+    ui.resolve_approval.assert_not_called()
+
+
+def test_cancel_falls_back_to_legacy_single_approval_api() -> None:
+    class _LegacyApprovalUI:
+        def __init__(self) -> None:
+            self.resolutions: list[tuple[bool, str]] = []
+
+        def resolve_approval(self, approved: bool, feedback: str) -> None:
+            self.resolutions.append((approved, feedback))
+
+    mgr, _, _ = _make_manager()
+    ws = mgr.create(user_id="u1")
+    ui = _LegacyApprovalUI()
+    ws.ui = ui
+
+    assert mgr.cancel(ws.id) is True
+
+    assert ws.session.cancelled is True  # type: ignore[attr-defined]
+    assert ui.resolutions == [(False, "cancelled")]
+
+
+# ---------------------------------------------------------------------------
 # close
 # ---------------------------------------------------------------------------
+
+
+def test_close_pending_fork_deletes_its_reserved_storage_row() -> None:
+    mgr, _, storage = _make_manager()
+    ws = mgr.create(
+        user_id="u1",
+        defer_emit_created=True,
+        _fork_reservation=True,
+    )
+    assert ws._fork_reservation_token
+    assert storage.fork_reservations[ws.id] == ws._fork_reservation_token
+
+    assert mgr.close(ws.id) is True
+
+    assert ws.id not in storage.rows
+    assert ws.id not in storage.fork_reservations
+    assert (ws.id, "closed") not in storage.state_updates
+
+
+def test_close_pending_fork_does_not_delete_replacement_reservation() -> None:
+    mgr, _, storage = _make_manager()
+    ws = mgr.create(
+        user_id="u1",
+        defer_emit_created=True,
+        _fork_reservation=True,
+    )
+    storage.rows[ws.id].name = "replacement"
+    storage.fork_reservations[ws.id] = "replacement-incarnation"
+
+    assert mgr.close(ws.id) is True
+
+    assert storage.rows[ws.id].name == "replacement"
+    assert storage.fork_reservations[ws.id] == "replacement-incarnation"
+    assert (ws.id, "closed") not in storage.state_updates
 
 
 def test_close_unblocks_ui_and_emits_closed() -> None:
@@ -1088,9 +1689,263 @@ def test_set_state_unknown_ws_is_noop() -> None:
     assert adapter.events_of("state") == []
 
 
+def test_set_state_deferred_mutates_live_then_persists_before_publish() -> None:
+    """The split path mutates now and defers its ordered durable/observer tail."""
+    mgr, adapter, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    storage.state_updates.clear()
+    order: list[tuple[str, str]] = []
+    deferred: list[Any] = []
+    before = ws.last_active
+    storage.update_workstream_state = MagicMock(
+        side_effect=lambda _ws_id, state: order.append(("persist", state))
+    )
+    adapter.emit_state = MagicMock(
+        side_effect=lambda _ws, state: order.append(("adapter", state.value))
+    )
+    mgr.subscribe_to_state(lambda _ws_id, state: order.append(("subscriber", state.value)))
+
+    mgr.set_state_deferred(
+        ws.id,
+        WorkstreamState.RUNNING,
+        error_msg="live detail",
+        deferred_persistence=deferred,
+    )
+
+    assert ws.state is WorkstreamState.RUNNING
+    assert ws.error_message == "live detail"
+    assert ws.last_active >= before
+    assert order == []
+    assert len(deferred) == 1
+
+    deferred[0]()
+
+    assert order == [
+        ("persist", "running"),
+        ("adapter", "running"),
+        ("subscriber", "running"),
+    ]
+
+
+def test_direct_set_state_persists_before_publishing() -> None:
+    """Legacy/direct callers retain the durable-before-live ordering."""
+    mgr, adapter, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    order: list[tuple[str, str]] = []
+    storage.update_workstream_state = MagicMock(
+        side_effect=lambda _ws_id, state: order.append(("persist", state))
+    )
+    adapter.emit_state = MagicMock(
+        side_effect=lambda _ws, state: order.append(("publish", state.value))
+    )
+
+    mgr.set_state(ws.id, WorkstreamState.ERROR, error_msg="boom")
+
+    assert ws.state is WorkstreamState.ERROR
+    assert ws.error_message == "boom"
+    assert order == [("persist", "error"), ("publish", "error")]
+
+
+def test_direct_successor_waits_for_running_deferred_tail_and_publishes_last() -> None:
+    """Direct and deferred callers share one persistence/publication lane."""
+    mgr, adapter, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    storage.state_updates.clear()
+    adapter.events.clear()
+    old_write_started = threading.Event()
+    release_old_write = threading.Event()
+    writes: list[str] = []
+
+    def update_state(_ws_id: str, state: str) -> None:
+        if state == "running":
+            old_write_started.set()
+            assert release_old_write.wait(2)
+        writes.append(state)
+
+    storage.update_workstream_state = update_state  # type: ignore[method-assign]
+    deferred: list[Callable[[], None]] = []
+    assert mgr.set_state_deferred(
+        ws.id,
+        WorkstreamState.RUNNING,
+        deferred_persistence=deferred,
+    )
+    predecessor = threading.Thread(target=deferred[0])
+    successor = threading.Thread(
+        target=mgr.set_state,
+        args=(ws.id, WorkstreamState.IDLE),
+    )
+    predecessor.start()
+    try:
+        assert old_write_started.wait(2)
+        successor.start()
+        deadline = time.monotonic() + 1
+        while ws.state is not WorkstreamState.IDLE and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert ws.state is WorkstreamState.IDLE
+        assert successor.is_alive()
+        assert adapter.events_of("state") == []
+    finally:
+        release_old_write.set()
+        predecessor.join(2)
+        if successor.ident is not None:
+            successor.join(2)
+
+    assert not predecessor.is_alive()
+    assert not successor.is_alive()
+    assert writes == ["running", "idle"]
+    assert [event.state for event in adapter.events_of("state")] == [WorkstreamState.IDLE]
+
+
+def test_deferred_state_without_emitter_still_publishes_to_subscriber() -> None:
+    """No emitter is a valid accepted tail, not the stale-tail sentinel."""
+    mgr, _, _ = _make_manager(event_emitter=None)
+    ws = mgr.create(user_id="u1")
+    observed: list[WorkstreamState] = []
+    mgr.subscribe_to_state(lambda _ws_id, state: observed.append(state))
+    deferred: list[Callable[[], None]] = []
+
+    assert mgr.set_state_deferred(
+        ws.id,
+        WorkstreamState.RUNNING,
+        deferred_persistence=deferred,
+    )
+    deferred[0]()
+
+    assert observed == [WorkstreamState.RUNNING]
+
+
+def test_delayed_state_persistence_cannot_overwrite_closed_workstream() -> None:
+    """A close tombstone makes an already-returned state closure wholly inert."""
+    mgr, adapter, storage = _make_manager()
+    ws = mgr.create(user_id="u1")
+    storage.state_updates.clear()
+    deferred: list[Any] = []
+    subscriber_events: list[tuple[str, WorkstreamState]] = []
+    mgr.subscribe_to_state(lambda ws_id, state: subscriber_events.append((ws_id, state)))
+
+    mgr.set_state_deferred(
+        ws.id,
+        WorkstreamState.RUNNING,
+        deferred_persistence=deferred,
+    )
+    assert ws.state is WorkstreamState.RUNNING
+    assert adapter.events_of("state") == []
+    assert storage.state_updates == []
+    assert len(deferred) == 1
+
+    assert mgr.close(ws.id) is True
+    assert ws._closed is True
+    assert storage.state_updates == [(ws.id, "closed")]
+
+    deferred[0]()
+
+    assert storage.state_updates == [(ws.id, "closed")]
+    assert storage.rows[ws.id].state == "closed"
+    assert adapter.events_of("state") == []
+    assert subscriber_events == []
+
+
 # ---------------------------------------------------------------------------
 # close_idle / list_all / get / count
 # ---------------------------------------------------------------------------
+
+
+def test_reap_stale_creating_reservations_recovers_local_restart_and_dead_peer() -> None:
+    mgr, _, storage = _make_manager(node_id="stable-node")
+    storage.live_services["server"] = ["stable-node", "live-peer"]
+    for ws_id, node_id, token in [
+        ("abandoned-local", "stable-node", "local-token"),
+        ("abandoned-dead-peer", "dead-peer", "dead-token"),
+        ("protected-live-peer", "live-peer", "live-token"),
+        ("ambiguous-tokenless", "dead-peer", ""),
+    ]:
+        storage.register_workstream(
+            ws_id,
+            node_id=node_id,
+            kind=WorkstreamKind.INTERACTIVE,
+            state="creating",
+            updated="2020-01-01T00:00:00",
+            fork_reservation_token=token,
+        )
+    storage.register_workstream(
+        "already-published",
+        node_id="dead-peer",
+        kind=WorkstreamKind.INTERACTIVE,
+        state="idle",
+        updated="2020-01-01T00:00:00",
+        fork_reservation_token="published-token",
+    )
+    pending = mgr.create(user_id="u1", defer_emit_created=True)
+    storage.rows[pending.id].updated = "2020-01-01T00:00:00"
+
+    reaped = mgr.reap_stale_creating_reservations(max_age_seconds=0)
+
+    assert set(reaped) == {
+        "abandoned-local",
+        "abandoned-dead-peer",
+        "ambiguous-tokenless",
+    }
+    assert "protected-live-peer" in storage.rows
+    assert "ambiguous-tokenless" not in storage.rows
+    assert storage.rows["already-published"].state == "idle"
+    assert storage.rows[pending.id].state == "creating"
+    assert mgr.commit_create(pending) is True
+
+
+def test_reap_stale_creating_reservations_fails_closed_on_liveness_error() -> None:
+    mgr, _, storage = _make_manager(node_id="stable-node")
+    storage.list_services_raises = True
+    storage.register_workstream(
+        "ambiguous-owner",
+        node_id="stable-node",
+        kind=WorkstreamKind.INTERACTIVE,
+        state="creating",
+        updated="2020-01-01T00:00:00",
+        fork_reservation_token="reservation",
+    )
+
+    assert mgr.reap_stale_creating_reservations(max_age_seconds=0) == []
+    assert storage.rows["ambiguous-owner"].state == "creating"
+
+
+def test_reap_stale_creating_reservations_fails_closed_on_delete_error() -> None:
+    mgr, _, storage = _make_manager(node_id="stable-node")
+    storage.delete_stale_creating_raises = True
+    storage.register_workstream(
+        "storage-uncertain",
+        node_id="stable-node",
+        kind=WorkstreamKind.INTERACTIVE,
+        state="creating",
+        updated="2020-01-01T00:00:00",
+        fork_reservation_token="reservation",
+    )
+
+    assert mgr.reap_stale_creating_reservations(max_age_seconds=0) == []
+    assert storage.rows["storage-uncertain"].state == "creating"
+
+
+def test_reap_stale_creating_reservations_supports_node_less_cli_boot() -> None:
+    mgr, _, storage = _make_manager(node_id=None)
+    storage.live_services["server"] = ["live-server"]
+    storage.register_workstream(
+        "abandoned-cli-create",
+        node_id=None,
+        kind=WorkstreamKind.INTERACTIVE,
+        state="creating",
+        updated="2020-01-01T00:00:00",
+        fork_reservation_token="cli-reservation",
+    )
+    storage.register_workstream(
+        "remote-live-create",
+        node_id="live-server",
+        kind=WorkstreamKind.INTERACTIVE,
+        state="creating",
+        updated="2020-01-01T00:00:00",
+        fork_reservation_token="remote-reservation",
+    )
+
+    assert mgr.reap_stale_creating_reservations(max_age_seconds=0) == ["abandoned-cli-create"]
+    assert "remote-live-create" in storage.rows
 
 
 def test_close_idle_closes_old_idle_and_keeps_active() -> None:

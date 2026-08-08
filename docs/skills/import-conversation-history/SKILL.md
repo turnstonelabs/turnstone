@@ -1,7 +1,7 @@
 ---
 name: import-conversation-history
 description: Use this skill when the user wants to import or migrate conversation history from another LLM chat or coding tool (e.g. ChatGPT, Claude.ai, Cursor, Copilot Chat, Aider, Gemini, a custom JSON export) into Turnstone. The skill teaches Turnstone's destination contracts — workstream identity, the OpenAI-shaped message rows, tool-call/result pairing, provider-fidelity blobs, attachments, and archive-vs-resumable choice — so the agent can map any source format onto them. Trigger phrases: "import my chats", "migrate this transcript into Turnstone", "bring my Claude.ai history over", "load this export as a workstream".
-version: 1.0.0
+version: 1.1.0
 ---
 
 # Importing Conversation History into Turnstone
@@ -12,7 +12,7 @@ Source formats vary; the destination does not. Your job is to translate whatever
 
 Two questions to settle with the user before writing anything:
 
-1. **Archive or resumable?** An archive ("saved" workstream — `state="closed"`) is read-only history. A resumable workstream (`state="idle"`) lets the user continue the conversation; this only works cleanly when the source LLM matches a Turnstone-supported provider/model and tool definitions still resolve.
+1. **Archive or resumable?** An archive is left closed and is read-only history. A resumable import is also kept closed and unloaded while rows are written, then explicitly opened after validation; this only works cleanly when the source LLM matches a Turnstone-supported provider/model and tool definitions still resolve.
 2. **One workstream per source thread, or merge?** Default to one-to-one unless the user explicitly asks to merge.
 
 Default to **archive** when in doubt — resuming a foreign transcript with mismatched tool schemas or stale provider signatures will fail at the next turn.
@@ -25,13 +25,13 @@ Two tables carry the conversation:
 
 | Column | Required | Notes |
 |---|---|---|
-| `ws_id` | yes | 32-char lowercase hex. Auto-generate with `secrets.token_hex(16)` if you don't already have one. **First 4 hex chars are the routing bucket** — see "Identity & Routing" below. |
+| `ws_id` | yes | 32-char lowercase hex. Auto-generate with `secrets.token_hex(16)` if you don't already have one. The router hashes the **full ID** — see "Identity & Routing" below. |
 | `name` | yes | Short title. Pull from source thread title; fall back to first ~60 chars of first user message. |
-| `state` | yes | `"closed"` for archive, `"idle"` for resumable. Never set `"running"` on import. |
+| `state` | yes | Register as `"closed"` while importing. Leave it closed for an archive; explicitly open it after commit for a resumable import. Never set `"running"` or `"creating"` directly. |
 | `kind` | yes | `"interactive"` for normal threads. Do NOT use `"coordinator"` for imports — that's reserved for cluster-spawned coordinator workstreams. |
 | `parent_ws_id` | no | Leave NULL. Only set if you're importing a coordinator-spawned subtree and re-parenting it; rare. |
 | `user_id` | yes | Owner. Must exist in `users`; importer must know which Turnstone user owns the imported history. |
-| `node_id` | yes (multi-node) | Denormalized cache of the node that owns this `ws_id`'s bucket. Single-node deployments can leave it NULL or set it to the only node. |
+| `node_id` | no | Nullable creation-time service/liveness hint. It is not the routing key or durable owner and may become stale after membership changes. Let a routed create stamp it; a direct shared-storage import may leave it NULL. |
 | `alias` | no | Human-typeable short name. Optional; must be unique cluster-wide if set. |
 | `title` | no | Auto-titled later by the LLM; safe to leave NULL on import. |
 | `skill_id`, `skill_version` | yes | Default `""` and `0` unless the source thread was scoped to a Turnstone skill. |
@@ -55,25 +55,65 @@ The internal format is **OpenAI-shaped**, even when the source was Anthropic or 
 ## Identity & Routing (`ws_id`)
 
 - `ws_id` is **32-char lowercase hex** (i.e. `secrets.token_hex(16)`).
-- The **routing bucket** is `int(ws_id[:4], 16)` — the first 4 hex chars place this workstream on a specific node via the consistent hash ring.
-- For multi-node imports: either insert through the console's routing proxy (which forwards to the owning node), or generate `ws_id`s and write directly to each node's database in batches grouped by bucket.
-- For single-node imports: bucket math is irrelevant; any `ws_id` works.
+- Ordinary placement is rendezvous (Highest Random Weight, HRW) selection over
+  the **full `ws_id`** and the current live server set. For each node, Turnstone
+  computes 32-bit FNV-1a over the node ID, a NUL separator, and the full
+  workstream ID; it then applies the node weight and selects the highest score.
+  A live per-workstream override takes precedence.
+- The live set comes from recent `services` heartbeats. Placement can therefore
+  change when nodes join, leave, change weight, or an override changes. There
+  is no stable prefix-derived placement to pre-compute or persist.
+- `workstreams.node_id` is stamped at creation and is not updated as HRW
+  placement changes. It supports display and liveness-safe cleanup; the console
+  router does not use it as the ordinary ownership decision.
+- For multi-node imports, create through the console routing proxy when the
+  lifecycle must be published, or write the history once through the cluster's
+  configured **shared storage backend**. Never partition rows across node-local
+  databases by ID prefix or by a one-time HRW result: a later membership change
+  can route the same full ID to another node.
+- For single-node imports, HRW placement is degenerate; any valid `ws_id` works.
 - **Do not reuse the source platform's IDs as `ws_id`** unless they happen to be 32-char hex. Generate fresh; if you need the old ID for traceability, store it in `workstream_config` under a key like `import.source_id`.
 
 ## Recommended Import Path
 
 Three options, in order of preference:
 
-### 1. Storage protocol (recommended for full history)
+### 1. Quiesced storage import (recommended for full history)
 
-Use `turnstone.core.storage.Storage.save_messages_bulk(rows)`. This is the canonical bulk-insert primitive and bypasses the LLM round-trip entirely.
+Use the current `turnstone.core.storage.StorageBackend` protocol against the
+same shared backend as the cluster. The destination must remain absent from all
+in-memory session managers while rows are changing: a loaded `ChatSession`
+holds its own trajectory and will not observe conversation rows inserted behind
+it.
+
+The safe sequence is:
+
+1. Normalize and validate the complete source transcript before writing.
+2. Call `register_workstream(..., state="closed")` and require a `True` return;
+   `False` means the caller-selected ID already exists, so abort rather than
+   appending to an unrelated workstream.
+3. Insert the ordered conversation rows and attachment references.
+4. Load the saved rows back and run the validation checklist below.
+5. Leave an archive closed. For a resumable import, only now invoke the normal
+   `POST /v1/api/workstreams/{ws_id}/open` endpoint on the currently routed
+   node so the session hydrates from the complete transcript.
+
+Do **not** create the destination through the web/SDK create endpoint before a
+direct bulk import. Create publishes an empty live session. If that already
+happened, close the workstream and confirm the manager-authoritative live probe
+returns false before writing, then explicitly open it again after validation.
+
+For attachment-free history, `save_messages_bulk(rows)` is the canonical
+single-transaction insert primitive and bypasses the LLM round-trip entirely.
+New attachment bytes require the per-row path described under
+[Attachments](#attachments).
 
 ```python
-from turnstone.core.storage import get_storage  # construct via the same path the server uses
+from turnstone.core.storage import get_storage  # initialized by the host/import entry point
 
-storage = get_storage(...)  # see turnstone.core.storage.__init__ for the project's wiring
+storage = get_storage()
 
-storage.create_workstream(  # or whatever the project's exposed creator is — check turnstone/core/storage/_protocol.py
+inserted = storage.register_workstream(
     ws_id=ws_id,
     user_id=user_id,
     name=name,
@@ -81,6 +121,8 @@ storage.create_workstream(  # or whatever the project's exposed creator is — c
     kind="interactive",
     ...
 )
+if not inserted:
+    raise RuntimeError(f"destination already exists: {ws_id}")
 
 storage.save_messages_bulk([
     {"ws_id": ws_id, "role": "user", "content": "Hello"},
@@ -94,7 +136,19 @@ storage.save_messages_bulk([
 ])
 ```
 
-`save_messages_bulk` handles `timestamp` and the workstream's `updated` column internally, so you don't need to compute them per row. **Verify the exact creator signature** by reading `turnstone/core/storage/_protocol.py` — table layout has shifted across migrations and the Storage protocol is the source of truth.
+`save_messages_bulk` handles `timestamp` and the workstream's `updated` column
+internally, so you don't need to compute them per row. Verify the exact
+`register_workstream` and message signatures in
+`turnstone/core/storage/_protocol.py`; the Storage protocol, not the physical
+table layout, is the source of truth.
+
+**Multi-node note:** this path assumes `get_storage()` is connected to the
+cluster's shared backend. Do not open a node-local database selected from the
+current HRW result, and do not pre-create a live session through the console
+routing proxy. After the shared-storage import commits, resolve the current
+route and open the closed workstream on that node. Any stored `node_id`
+describes creation-time placement, not a permanent shard that should receive a
+separate copy.
 
 ### 2. SDK `create_workstream(resume_ws=...)` (when the source is already a Turnstone workstream)
 
@@ -181,27 +235,48 @@ If the source thread had image or file attachments:
 
 - **Size limits**: images ≤ 4 MiB, text documents ≤ 512 KiB. Reject or downsample anything bigger.
 - **Allowed types**: server validates magic bytes for images and UTF-8-decodes for text. Binary blobs that aren't images won't pass.
-- **Lifecycle**: pending → reserved → consumed. For imports, the cleanest path is to upload as pending and immediately consume by attaching to the relevant `conversations.id`.
+- **Blob identity**: `attachment_id` is the lowercase SHA-256 hex digest of the
+  bytes. `workstream_attachments` stores that content-addressed blob and its
+  refcount; it has no workstream or message foreign key.
+- **Message link**: the sole message-to-blob link is the ordered JSON ID list in
+  `conversations.attachments`.
+- **No persisted staging lifecycle**: pending upload bytes live only in a
+  node's in-memory attachment buffer. The old persisted
+  `pending → reserved → consumed` lifecycle does not apply to storage imports.
 
-Two import paths:
+For new attachment bytes, preserve row order by calling `save_message()` for
+each turn. It returns the `conversations.id`; for every attachment referenced by
+that turn, call `save_attachment()` with its content hash and bytes, then call
+`set_message_attachments(ws_id, message_id, ordered_ids)`. Each
+`save_attachment()` call accounts for one reference, while
+`set_message_attachments()` records the ordered link.
 
-1. **Bulk-insert + post-attach**: insert messages first, get back the assistant/user `conversations.id`, then write `workstream_attachments` rows linking the file to `message_id`.
-2. **SDK multipart create**: `create_workstream(attachments=[...], initial_message=...)` for the *first* turn only — the server reserves and consumes them onto that turn. Doesn't help for mid-thread attachments.
+`save_messages_bulk(..., attachment_ids=[...])` is appropriate only when those
+content-addressed blobs already exist: the bulk transaction retains their
+references and writes the ordered lists. Do not first call `save_attachment()`
+for a new reference and then pass the same reference to `save_messages_bulk()`;
+both paths retain it and would double-count the refcount.
 
-For full-history imports with multiple attachments at different turns, path (1) is the only option.
+SDK multipart create remains useful only for attachments on a new first turn;
+it publishes a live session and is not the full-history import path.
 
 ## Validation Checklist
 
 Before declaring success, verify:
 
 - [ ] `ws_id` is 32-char lowercase hex.
-- [ ] `workstreams` row exists with the right `user_id`, `state`, `kind`.
+- [ ] The workstream remained closed and absent from every live manager while rows were written; archives stay closed and resumable imports are opened only after validation.
+- [ ] `workstreams` row exists with the right `user_id` and `kind`.
 - [ ] Conversation rows are inserted **in order** (autoincrement `id` will reflect insert order).
 - [ ] Every assistant `tool_calls[].id` has a matching `role="tool"` row with the same `tool_call_id`.
 - [ ] `tool_calls[].function.arguments` is a JSON-encoded **string**, not a parsed object.
 - [ ] First message is typically `role="user"` (not `system`) — Turnstone composes its own system prompt at runtime.
 - [ ] No empty assistant rows (`content=NULL` AND `tool_calls=NULL` is invalid).
-- [ ] If multi-node: the `ws_id`'s bucket maps to a node that exists; `workstreams.node_id` matches.
+- [ ] Every attachment ID is the SHA-256 of its stored bytes; each turn's ordered IDs are in `conversations.attachments`, and blob refcounts match message references.
+- [ ] If multi-node: the row is in shared storage and the node selected by
+  `ConsoleRouter.route(ws_id)` from the current live set can load it.
+  `workstreams.node_id`, when present, is treated as a creation-time hint rather
+  than asserted equal to the current HRW result.
 - [ ] Round-trip test: run `Storage.load_messages(ws_id)` and confirm the reconstructed list matches what you inserted (modulo timestamps).
 
 ## Anti-patterns
@@ -211,15 +286,20 @@ Before declaring success, verify:
 - **Don't fabricate `tool_call_id`s without re-pairing.** Mismatched ids silently break the replay chain on the next turn.
 - **Don't skip the `tool_name` field on `role="tool"` rows.** Some load paths use it for display and audit; NULL there will render as "unknown tool".
 - **Don't write through the LLM (`send()` per turn) for full history.** It's expensive, rewrites assistant turns, and rate-limits will bite long imports.
+- **Don't shard imported rows by an ID prefix or a one-time HRW result.** HRW
+  uses the full ID and live membership; placement may move. In a cluster, write
+  one copy to shared storage and let request routing select the live node.
 
 ## Quick Reference
 
 | Task | Path |
 |---|---|
 | Generate ws_id | `secrets.token_hex(16)` |
-| Bulk insert messages | `Storage.save_messages_bulk(rows)` |
+| Multi-node placement | Full-ID 32-bit FNV-1a HRW over live servers; store rows once in shared storage |
+| Bulk insert attachment-free messages | `Storage.save_messages_bulk(rows)` |
+| Attach new bytes | `save_message()` → `save_attachment()` per reference → `set_message_attachments()` |
 | Archive (read-only) | `state="closed"`, skip `provider_data` |
-| Resumable | `state="idle"`, populate `provider_data` if same provider |
+| Resumable | Register closed, import and validate while unloaded, then explicitly open; populate `provider_data` if same provider |
 | Tool call id | OpenAI shape: `{"id": ..., "type": "function", "function": {"name": ..., "arguments": "<json string>"}}` |
 | Tool result row | `role="tool"`, `tool_name`, `tool_call_id`, `content` |
 | Source role → Turnstone role | See "Role Mapping" table |
@@ -228,6 +308,8 @@ Before declaring success, verify:
 ## Files to read before writing the importer
 
 - `turnstone/core/storage/_schema.py` — authoritative table definitions.
-- `turnstone/core/storage/_protocol.py` — `save_message`, `save_messages_bulk`, `load_messages` signatures.
+- `turnstone/core/storage/_protocol.py` — `register_workstream`, message, attachment, and load signatures.
+- `turnstone/core/rendezvous.py` — authoritative full-ID FNV-1a HRW scoring.
+- `turnstone/console/router.py` — live-node discovery, override precedence, and routing behavior.
 - `turnstone/core/session.py` (around the message-save section) — how the runtime constructs in-memory message dicts; mirror this shape on import to round-trip cleanly.
 - `turnstone/api/server_schemas.py` — Pydantic shapes for the SDK paths if you go through HTTP.

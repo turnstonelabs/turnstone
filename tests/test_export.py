@@ -14,6 +14,8 @@ import io
 import json
 import zipfile
 
+import pytest
+
 from turnstone.core.export import (
     WorkstreamNotFoundError,
     _attach_reasoning_content,
@@ -175,6 +177,26 @@ def test_export_unknown_ws_raises(backend):
         assert "does-not-exist" in str(exc)
     else:
         raise AssertionError("expected WorkstreamNotFoundError")
+
+
+def test_export_creating_ws_raises_until_publication(backend):
+    ws_id = "pending-export"
+    token = "pending-export-incarnation"
+    assert backend.register_workstream(
+        ws_id,
+        user_id=USER,
+        kind="interactive",
+        state="creating",
+        fork_reservation_token=token,
+    )
+    backend.save_message(ws_id, "user", "unpublished transcript")
+
+    with pytest.raises(WorkstreamNotFoundError, match=ws_id):
+        export_workstream(backend, ws_id)
+
+    assert backend.publish_deferred_create(ws_id, token)
+    messages = _parse_messages(export_workstream(backend, ws_id).data)
+    assert [message["content"] for message in messages] == ["unpublished transcript"]
 
 
 def test_attach_reasoning_runs_before_sanitize(backend):

@@ -14,7 +14,7 @@ Tier order (highest priority first):
 3. ``registry.default`` (config.toml ``[model].default``, the boot-time
    fallback).
 
-These tests pin each branch by intercepting ``registry.resolve`` —
+These tests pin each branch by intercepting ``registry.resolve_binding`` —
 they short-circuit before ChatSession construction so the test never
 has to satisfy ChatSession's full kwarg contract.
 """
@@ -39,13 +39,13 @@ class _StopBeforeChatSessionError(Exception):
 
 
 class _CapturingRegistry:
-    """Records the alias passed to ``resolve()`` and short-circuits.
+    """Records the alias passed to ``resolve_binding()`` and short-circuits.
 
     ``has_alias`` answers from the configured known set so the
     ``model.default_alias`` validation tier behaves realistically.
     Mirrors the public surface ``ModelRegistry`` exposes to
-    session_factory: ``has_alias``, ``resolve`` (which returns the
-    reload generation beside the binding), and ``default``.
+    session_factory: ``has_alias``, ``resolve_binding`` (which returns the
+    provider beside the other atomic binding facets), and ``default``.
     """
 
     def __init__(self, *, default: str, known: set[str]) -> None:
@@ -56,7 +56,7 @@ class _CapturingRegistry:
     def has_alias(self, alias: str) -> bool:
         return alias in self._known
 
-    def resolve(self, alias: str) -> Any:
+    def resolve_binding(self, alias: str) -> Any:
         self.captured_alias = alias
         raise _StopBeforeChatSessionError()
 
@@ -132,7 +132,7 @@ def test_coordinator_model_alias_wins_when_no_per_call_override() -> None:
 
 def test_coordinator_model_alias_passed_through_unvalidated() -> None:
     """Tier 1 is an *explicit* operator pin — when it's stale or typoed
-    we deliberately pass it through to ``registry.resolve`` so the
+    we deliberately pass it through to ``registry.resolve_binding`` so the
     request layer turns it into a 503 with the alias surfaced in the
     error.  Falling through silently would mask the misconfiguration."""
     factory, registry = _build_factory(
@@ -150,7 +150,7 @@ def test_per_call_model_alias_arg_passed_through_unvalidated() -> None:
     """The per-call ``model_alias`` kwarg (POST body field — the more
     common production trigger) is the same kind of explicit pin as the
     ConfigStore setting, so a stale value passes through to
-    ``registry.resolve`` rather than silently falling through to the
+    ``registry.resolve_binding`` rather than silently falling through to the
     system default."""
     factory, registry = _build_factory(
         known_aliases={"registry-default"},
@@ -218,6 +218,68 @@ def test_whitespace_only_coord_alias_falls_through() -> None:
     )
     _invoke(factory)
     assert registry.captured_alias == "registry-default"
+
+
+# ---------------------------------------------------------------------------
+# Atomic model binding construction
+# ---------------------------------------------------------------------------
+
+
+def test_factory_passes_one_atomic_model_binding_to_chat_session() -> None:
+    """Every constructor facet comes from the same resolve_binding snapshot."""
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    registry = _fake_registry()
+    config_store = _FakeConfigStore({"model.temperature": 0.25})
+    factory = build_console_session_factory(
+        registry=registry,
+        config_store=config_store,  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+
+    with patch("turnstone.console.session_factory.ChatSession") as chat_session:
+        factory(ui, ws_id="w1")
+
+    registry.resolve_binding.assert_called_once_with("default")
+    registry.resolve.assert_not_called()
+    client, model, cfg, provider, generation = registry.resolve_binding.return_value
+    kwargs = chat_session.call_args.kwargs
+    binding = kwargs["model_binding"]
+    assert binding.lane.client is client
+    assert binding.lane.provider is provider
+    assert binding.lane.model == model
+    assert binding.lane.alias == "default"
+    assert binding.lane.registry is registry
+    assert binding.lane.temperature == 0.25
+    assert binding.config is cfg
+    assert binding.registry_generation == generation
+    assert kwargs["client"] is binding.lane.client
+    assert kwargs["model"] == binding.lane.model
+    assert kwargs["registry_generation"] == binding.registry_generation
+
+
+def test_unknown_explicit_alias_preserves_registry_value_error() -> None:
+    registry = MagicMock()
+    registry.default = "default"
+    registry.resolve_binding.side_effect = ValueError("Unknown model alias: ghost")
+    factory = build_console_session_factory(
+        registry=registry,
+        config_store=_FakeConfigStore({}),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+
+    with pytest.raises(ValueError, match=r"^Unknown model alias: ghost$"):
+        factory(ui, model_alias="ghost")
+
+    registry.resolve_binding.assert_called_once_with("ghost")
 
 
 # ---------------------------------------------------------------------------

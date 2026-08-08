@@ -186,6 +186,12 @@ overrides.
 > put [PgBouncer](pgbouncer.md) (transaction pooling) between turnstone and
 > PostgreSQL.
 
+> **Lifecycle upgrade:** the release that introduces hidden deferred-create
+> reservations must be deployed as a coordinated cohort across every server
+> sharing PostgreSQL; older processes do not understand `state='creating'`.
+> Drain create traffic until the cohort is upgraded. See
+> [PgBouncer: deferred workstream creation](pgbouncer.md#upgrade-note-deferred-workstream-creation).
+
 ### Ports
 
 Both stacks publish Caddy (dashboard) and PostgreSQL; the dev stack additionally

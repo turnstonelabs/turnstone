@@ -37,6 +37,7 @@ from alembic.config import Config
 from tests._oidc_test_helpers import (
     ISSUER,
     TOKEN_ENDPOINT,
+    keyed_app_state,
     make_oidc_config,
     mint_warn_state_reset,
 )
@@ -50,6 +51,7 @@ from turnstone.core.model_registry import (
     ModelRegistry,
     load_model_registry,
 )
+from turnstone.core.model_turn import ModelLane, resolve_model_binding
 from turnstone.core.session import BackendAuthUnavailableError, ChatSession
 from turnstone.core.storage._sqlite import SQLiteBackend
 
@@ -1474,15 +1476,13 @@ class TestModelOboToken:
             sess = _fake_session(registry=reg, user_id=USER, mint_token="minted-jwt")
             assert ChatSession._model_backend_auth_token(sess, "tf") == "minted-jwt"
 
-    def test_auxiliary_judges_inherit_the_session_obo_resolver(
-        self,
-        mock_openai_client: Any,
-    ) -> None:
+    def test_auxiliary_judges_inherit_the_session_obo_resolver(self) -> None:
         """Judge lanes must not quietly regress to app-only authentication."""
         reg = _registry_with(self._obo_cfg(provider="openai"))
+        binding = resolve_model_binding(reg, "tf")
         session = ChatSession(
-            client=mock_openai_client,
-            model="vmg/opus",
+            client=binding.lane.client,
+            model=binding.lane.model,
             ui=MagicMock(),
             instructions=None,
             temperature=0.5,
@@ -1490,6 +1490,7 @@ class TestModelOboToken:
             tool_timeout=30,
             registry=reg,
             model_alias="tf",
+            model_binding=binding,
             judge_config=JudgeConfig(
                 enabled=True,
                 output_guard_llm=True,
@@ -1506,9 +1507,12 @@ class TestModelOboToken:
 
         assert intent_judge is not None
         assert output_guard is not None
-        assert intent_judge._backend_auth_resolver == session._model_backend_auth_token
-        assert output_guard._backend_auth_resolver == session._model_backend_auth_token
-        assert intent_judge._backend_auth_resolver("tf") == "minted-jwt"
+        intent_resolver = intent_judge._lane.backend_auth_resolver
+        output_resolver = output_guard._lane.backend_auth_resolver
+        assert intent_resolver == session._model_backend_auth_token
+        assert output_resolver == session._model_backend_auth_token
+        assert intent_resolver is not None
+        assert intent_resolver("tf", intent_judge._lane.backend_auth_config) == "minted-jwt"
         session._mcp_mint_client.mint_model_obo_token_sync.assert_called_once_with(
             user_id=USER,
             alias="tf",
@@ -1528,15 +1532,16 @@ class TestModelOboToken:
         sess._config_store = None
         sess.temperature = 0.5
         sess.reasoning_effort = None
-
-        lane = ChatSession._build_main_lane(
-            sess,
+        base_lane = ModelLane(
             provider=MagicMock(provider_name="openai-compatible"),
             client=MagicMock(),
             model="vmg/opus",
             alias="tf",
             capabilities=SimpleNamespace(),
+            backend_auth_resolver=sess._model_backend_auth_token,
         )
+
+        lane = ChatSession._build_main_lane(sess, base_lane)
 
         assert lane.backend_auth_resolver is sess._model_backend_auth_token
         assert lane.alias == "tf"
@@ -1556,9 +1561,7 @@ class TestModelOboToken:
         sess._config_store = store
         sess.temperature = None
         sess.reasoning_effort = "high"
-
-        lane = ChatSession._build_main_lane(
-            sess,
+        base_lane = ModelLane(
             provider=MagicMock(provider_name="openai-compatible"),
             client=MagicMock(),
             model="m",
@@ -1566,20 +1569,72 @@ class TestModelOboToken:
             capabilities=SimpleNamespace(),
         )
 
+        lane = ChatSession._build_main_lane(sess, base_lane)
+
         assert not store.mock_calls
         assert lane.temperature is None
         assert lane.reasoning_effort == "high"
 
-    def test_primary_lane_built_with_session_alias_for_obo(self) -> None:
-        # Regression: the primary lane must carry the session alias, or the
-        # backend-auth resolver can't resolve the OBO token and an
-        # entra_obo main turn goes out on the static client key.  The lane
-        # build is the one place the alias enters.
+    def test_fallback_driver_uses_exact_primary_obo_lane(self) -> None:
+        # Regression: the driver must pass the binding's lane intact, including
+        # its alias and pinned auth config, into the retry/plant boundary.
         sess = MagicMock()
-        sess._model_alias = "oboagent"
-        ChatSession._model_turn_with_fallback(sess, MagicMock(), lambda wire, lane: wire)
-        sess._build_main_lane.assert_called_once()
-        assert sess._build_main_lane.call_args.kwargs["alias"] == "oboagent"
+        lane = MagicMock(spec=ModelLane)
+        lane.alias = "oboagent"
+        sess._primary_lane.return_value = lane
+        tracker = sess._get_health_tracker.return_value
+        consumer = MagicMock()
+        result = MagicMock()
+        sess._model_turn_with_retry.return_value = result
+
+        def prepare(wire: list[dict[str, Any]], _lane: ModelLane) -> list[dict[str, Any]]:
+            return wire
+
+        assert ChatSession._model_turn_with_fallback(sess, consumer, prepare) is result
+        sess._model_turn_with_retry.assert_called_once_with(
+            lane,
+            tracker,
+            consumer,
+            prepare,
+            0,
+            principal_id=None,
+        )
+
+    def test_lane_auth_uses_the_endpoint_generation_config_after_reload(self) -> None:
+        """A pinned endpoint never mints for a newer alias audience or grant."""
+        old_cfg = self._obo_cfg(
+            alias="tf",
+            auth_mode="rfc8693_obo",
+            obo_audience="api://old-gateway",
+            obo_scopes="old.scope openid",
+        )
+        reg = _registry_with(old_cfg)
+        sess = _fake_session(registry=reg, user_id=USER, mint_token="old-jwt")
+
+        def resolver(alias: str, cfg: ModelConfig | None) -> str | None:
+            return ChatSession._model_backend_auth_token(sess, alias, cfg)
+
+        old_binding = resolve_model_binding(reg, "tf", backend_auth_resolver=resolver)
+
+        new_cfg = self._obo_cfg(
+            alias="tf",
+            auth_mode="entra_app",
+            obo_audience="api://new-gateway",
+        )
+        reg.reload({"tf": new_cfg}, "tf", app_state=keyed_app_state())
+
+        lane = old_binding.lane
+        assert lane.backend_auth_resolver is not None
+        assert lane.backend_auth_config is old_cfg
+        assert lane.backend_auth_resolver(lane.alias, lane.backend_auth_config) == "old-jwt"
+        sess._mcp_mint_client.mint_model_obo_token_sync.assert_called_once_with(
+            user_id=USER,
+            alias="tf",
+            audience="api://old-gateway",
+            scopes="old.scope openid",
+            grant_leg="rfc8693",
+        )
+        sess._mcp_mint_client.mint_app_token_sync.assert_not_called()
 
     def test_fail_closed_refusal_never_enters_model_fallback_chain(self) -> None:
         sess = MagicMock()
@@ -1657,7 +1712,7 @@ class TestModelOboToken:
         """A delegated mode with no registered grant-profile pairing cannot
         pin a leg, so the dispatch refuses loudly before the mint bridge —
         minting with leg=None would run the pre-dedicated-mode overload."""
-        monkeypatch.setattr("turnstone.core.session.MODEL_AUTH_MODE_PROFILES", {})
+        monkeypatch.setattr("turnstone.core.model_backend_auth.MODEL_AUTH_MODE_PROFILES", {})
         reg = _registry_with(self._obo_cfg())
         sess = _fake_session(registry=reg, user_id=USER, mint_token="never")
         with pytest.raises(BackendAuthUnavailableError, match="grant-profile pairing"):

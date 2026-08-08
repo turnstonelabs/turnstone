@@ -129,7 +129,8 @@ def export_workstream(
 
     Raises :class:`WorkstreamNotFoundError` when ``ws_id`` has no row.
     """
-    if storage.get_workstream(ws_id) is None:
+    row = storage.get_workstream(ws_id)
+    if row is None or row.get("state") == "creating":
         raise WorkstreamNotFoundError(ws_id)
 
     parent_bytes = _build_openai_json(storage, ws_id)

@@ -429,9 +429,23 @@ async def test_list_schedule_runs():
 # ---------------------------------------------------------------------------
 
 
+def test_cluster_create_sdk_signatures_match_live_schema():
+    """The console SDK must not advertise fields the handler silently ignores."""
+    import inspect
+
+    from turnstone.api.console_schemas import ConsoleCreateWsRequest
+    from turnstone.sdk.console import TurnstoneConsole
+
+    expected = set(ConsoleCreateWsRequest.model_fields)
+    async_params = set(inspect.signature(AsyncTurnstoneConsole.create_workstream).parameters)
+    sync_params = set(inspect.signature(TurnstoneConsole.create_workstream).parameters)
+    assert async_params - {"self"} == expected
+    assert sync_params - {"self"} == expected
+
+
 @pytest.mark.anyio
-async def test_create_workstream_extended_params():
-    """New optional params appear in JSON body only when non-empty."""
+async def test_create_workstream_contract_params():
+    """Cluster create exposes every optional field accepted by its schema."""
     captured_body: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -446,15 +460,13 @@ async def test_create_workstream_extended_params():
         await client.create_workstream(
             node_id="n1",
             name="ext",
-            auto_approve=True,
-            auto_approve_tools="read_file",
-            user_id="u42",
+            project_id="project-42",
+            judge_model="judge-fast",
         )
         assert captured_body["node_id"] == "n1"
         assert captured_body["name"] == "ext"
-        assert captured_body["auto_approve"] is True
-        assert captured_body["auto_approve_tools"] == "read_file"
-        assert captured_body["user_id"] == "u42"
+        assert captured_body["project_id"] == "project-42"
+        assert captured_body["judge_model"] == "judge-fast"
 
 
 @pytest.mark.anyio
@@ -473,9 +485,8 @@ async def test_create_workstream_omits_empty_new_params():
         client = AsyncTurnstoneConsole(httpx_client=hc)
         await client.create_workstream(name="min")
         assert captured_body == {"name": "min"}
-        assert "auto_approve" not in captured_body
-        assert "auto_approve_tools" not in captured_body
-        assert "user_id" not in captured_body
+        assert "project_id" not in captured_body
+        assert "judge_model" not in captured_body
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +500,15 @@ async def test_route_create_workstream():
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured_body.update(json.loads(request.content))
-        return _json_response({"ws_id": "ws1", "node_url": "http://n1:8080", "node_id": "n1"})
+        return _json_response(
+            {
+                "ws_id": "ws1",
+                "name": "routed",
+                "node_url": "http://n1:8080",
+                "node_id": "n1",
+                "routing_strategy": "target_node",
+            }
+        )
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
@@ -498,16 +517,25 @@ async def test_route_create_workstream():
             name="routed",
             model="gpt-5",
             auto_approve=True,
+            project_id="project-42",
+            judge_model="judge-fast",
             target_node="n1",
             user_id="u1",
+            client_type="scheduled",
+            notify_targets=[{"channel_type": "slack", "channel_id": "C123"}],
         )
-        assert resp["ws_id"] == "ws1"
-        assert resp["node_url"] == "http://n1:8080"
+        assert resp.ws_id == "ws1"
+        assert resp.node_url == "http://n1:8080"
+        assert resp.routing_strategy == "target_node"
         assert captured_body["name"] == "routed"
         assert captured_body["model"] == "gpt-5"
         assert captured_body["auto_approve"] is True
+        assert captured_body["project_id"] == "project-42"
+        assert captured_body["judge_model"] == "judge-fast"
         assert captured_body["target_node"] == "n1"
         assert captured_body["user_id"] == "u1"
+        assert captured_body["client_type"] == "scheduled"
+        assert captured_body["notify_targets"] == [{"channel_type": "slack", "channel_id": "C123"}]
 
 
 @pytest.mark.anyio
@@ -537,7 +565,15 @@ async def test_route_create_workstream_omits_defaults():
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured_body.update(json.loads(request.content))
-        return _json_response({"ws_id": "ws1", "node_url": "http://n1:8080"})
+        return _json_response(
+            {
+                "ws_id": "ws1",
+                "name": "bare",
+                "node_url": "http://n1:8080",
+                "node_id": "n1",
+                "routing_strategy": "rendezvous",
+            }
+        )
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
@@ -688,3 +724,21 @@ async def test_route_lookup():
         assert resp["node_id"] == "n1"
         assert captured["path"] == "/v1/api/route"
         assert "ws_id=ws1" in captured["url"]
+
+
+@pytest.mark.anyio
+async def test_route_workstream_live():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        return _json_response({"ws_id": "ws1", "live": True})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.route_workstream_live("ws1")
+
+    assert resp.ws_id == "ws1"
+    assert resp.live is True
+    assert captured["path"] == "/v1/api/route/workstreams/ws1/live"

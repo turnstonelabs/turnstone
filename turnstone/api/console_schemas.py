@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 # TYPE_CHECKING the import vanishes and model creation fails.
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002
 
+from turnstone.api.server_schemas import CreateWorkstreamRequest, CreateWorkstreamResponse
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 
@@ -161,7 +162,8 @@ class ConsoleCreateWsRequest(BaseModel):
         description="Project to attach the workstream to (validated against membership, empty = none)",
     )
     resume_ws: str = Field(
-        default="", description="Workstream ID to resume (loads previous conversation)"
+        default="",
+        description=("Source workstream ID or alias to fork atomically into the new workstream"),
     )
     judge_model: str = Field(
         default="", description="Override judge model alias for this workstream"
@@ -1377,12 +1379,37 @@ class RouteResponse(BaseModel):
     node_id: str
 
 
-class RouteCreateResponse(BaseModel):
+class RouteLiveResponse(BaseModel):
+    """Non-mutating live-session probe for one routed workstream."""
+
+    ws_id: str
+    live: bool
+
+
+class RouteCreateRequest(CreateWorkstreamRequest):
+    """JSON workstream creation through the routing proxy."""
+
+    target_node: str = Field(
+        default="",
+        description=(
+            "Optional node id to pin placement to. The console generates a "
+            "workstream id whose rendezvous owner is that node."
+        ),
+    )
+
+
+class RouteCreateResponse(CreateWorkstreamResponse):
     """Workstream creation via the routing proxy."""
 
-    ws_id: str = ""
-    node_url: str = ""
-    node_id: str = ""
+    node_url: str
+    node_id: str
+    routing_strategy: Literal["rendezvous", "target_node", "resume"] = Field(
+        description=(
+            "Placement reason: rendezvous for a destination id, target_node for "
+            "a generated pinned id, or resume when an atomic fork is routed by "
+            "its canonical source id"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1518,6 +1545,14 @@ class CoordinatorApproveRequest(BaseModel):
             "When approved=True, also adds the pending tool name(s) to the session's "
             "auto-approve set so subsequent calls of the same tool skip the prompt."
         ),
+    )
+    cycle_id: str | None = Field(
+        default=None,
+        description="Resolve this exact approval cycle",
+    )
+    call_id: str | None = Field(
+        default=None,
+        description="Resolve the approval cycle containing this tool call",
     )
 
 

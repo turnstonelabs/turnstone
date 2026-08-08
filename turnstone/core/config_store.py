@@ -50,6 +50,10 @@ class ConfigStore:
         self._storage = storage
         self._node_id = node_id
         self._cache: dict[str, Any] = {}
+        # Serialize the storage operation and its cache publication as one
+        # mutation.  ``_lock`` stays short-lived so coherent snapshot readers
+        # never wait on database I/O; writers always nest mutation -> state.
+        self._mutation_lock = threading.Lock()
         self._lock = threading.Lock()
         self._version = 0
         self.reload()
@@ -61,25 +65,32 @@ class ConfigStore:
 
     @property
     def version(self) -> int:
-        """Monotonic counter incremented on every cache update."""
-        return self._version
+        """Monotonic counter identifying the currently published cache.
+
+        Writers replace ``_cache`` and advance ``_version`` in one critical
+        section.  Read the counter under that same lock so a freshness check
+        cannot observe the new cache paired with its predecessor's version.
+        """
+        with self._lock:
+            return self._version
 
     def reload(self) -> None:
         """Load all settings from storage into the in-memory cache."""
-        try:
-            raw = self._storage.get_system_settings_bulk(node_id=self._node_id)
-        except Exception:
-            log.warning("Failed to load settings from storage", exc_info=True)
-            return
-        new_cache: dict[str, Any] = {}
-        for key, json_val in raw.items():
+        with self._mutation_lock:
             try:
-                new_cache[key] = deserialize_value(key, json_val)
-            except (ValueError, KeyError):
-                log.warning("Skipping invalid setting: %s", key)
-        with self._lock:
-            self._cache = new_cache
-            self._version += 1
+                raw = self._storage.get_system_settings_bulk(node_id=self._node_id)
+            except Exception:
+                log.warning("Failed to load settings from storage", exc_info=True)
+                return
+            new_cache: dict[str, Any] = {}
+            for key, json_val in raw.items():
+                try:
+                    new_cache[key] = deserialize_value(key, json_val)
+                except (ValueError, KeyError):
+                    log.warning("Skipping invalid setting: %s", key)
+            with self._lock:
+                self._cache = new_cache
+                self._version += 1
 
     def get(self, key: str, default: Any = _UNSET) -> Any:
         """Get a setting value from cache.
@@ -103,27 +114,30 @@ class ConfigStore:
         """
         defn = validate_key(key)
         typed_value = validate_value(key, value)
-        self._storage.upsert_system_setting(
-            key=key,
-            value=serialize_value(typed_value),
-            node_id=self._node_id,
-            is_secret=defn.is_secret,
-            changed_by=changed_by,
-        )
-        with self._lock:
-            self._cache = {**self._cache, key: typed_value}
-            self._version += 1
+        serialized = serialize_value(typed_value)
+        with self._mutation_lock:
+            self._storage.upsert_system_setting(
+                key=key,
+                value=serialized,
+                node_id=self._node_id,
+                is_secret=defn.is_secret,
+                changed_by=changed_by,
+            )
+            with self._lock:
+                self._cache = {**self._cache, key: typed_value}
+                self._version += 1
         return typed_value
 
     def delete(self, key: str) -> bool:
         """Remove a setting from storage (reverts to default)."""
         validate_key(key)  # reject unknown keys
-        result = self._storage.delete_system_setting(key, node_id=self._node_id)
-        with self._lock:
-            new_cache = dict(self._cache)
-            new_cache.pop(key, None)
-            self._cache = new_cache
-            self._version += 1
+        with self._mutation_lock:
+            result = self._storage.delete_system_setting(key, node_id=self._node_id)
+            with self._lock:
+                new_cache = dict(self._cache)
+                new_cache.pop(key, None)
+                self._cache = new_cache
+                self._version += 1
         return result
 
     def all_effective(self) -> dict[str, Any]:
@@ -136,6 +150,21 @@ class ConfigStore:
         for key, defn in SETTINGS.items():
             result[key] = cache.get(key, defn.default)
         return result
+
+    def effective_snapshot(self) -> tuple[int, dict[str, Any]]:
+        """Return one coherent ``(version, effective settings)`` snapshot.
+
+        Ordinary single-key reads stay lock-free through :meth:`get`.  A
+        consumer that composes several settings needs the cache pointer and its
+        version from the same writer critical section, however; reading the two
+        independently can observe the cache swap before the following version
+        increment.  Capture both under the write lock, then expand the immutable
+        cache snapshot after releasing it.
+        """
+        with self._lock:
+            cache = self._cache
+            version = self._version
+        return version, {key: cache.get(key, defn.default) for key, defn in SETTINGS.items()}
 
     def stored_keys(self) -> frozenset[str]:
         """Return the keys that have explicit values in storage."""

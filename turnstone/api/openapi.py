@@ -53,6 +53,7 @@ class EndpointSpec:
     summary: str
     description: str = ""
     request_model: type[BaseModel] | None = None
+    request_required: bool = True
     response_model: type[BaseModel] | None = None
     response_code: int = 200
     error_codes: list[int] = field(default_factory=list)
@@ -108,7 +109,7 @@ def build_openapi(
             op["parameters"] = params
         if ep.request_model:
             op["requestBody"] = {
-                "required": True,
+                "required": ep.request_required,
                 "content": _json_content(ep.request_model),
             }
         responses: dict[str, Any] = {}

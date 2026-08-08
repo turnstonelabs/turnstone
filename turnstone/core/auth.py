@@ -482,9 +482,10 @@ def ensure_project_attachable(
 # on both sides rather than re-spelling the literal.
 REQUIRE_PROJECT_CODE = "require_project"
 
-# Operator-facing 400 message. Deliberately generic: a projectless, private,
-# dangling, or nonexistent fork source must all yield this IDENTICAL text, or
-# the message itself becomes a cross-tenant oracle.
+# Operator-facing 400 message for an accessible source that cannot supply the
+# project required by this deployment. Missing and invisible fork sources are
+# rejected earlier with the same generic 404, before destination creation, so
+# project enforcement cannot become a visibility oracle.
 REQUIRE_PROJECT_ERROR = (
     "This deployment requires every new chat to be filed under a project. "
     "Choose a project and try again."

@@ -396,11 +396,11 @@ def fold_system_turns(
     wire turn's content, then dropped from the list.
 
     Forgery defence is two-layer: ``fence.wrap`` neutralises the operator body's
-    closing marker (break-out), and before the first fold onto a host we
-    neutralise that (untrusted) host turn's ``[start system-reminder]`` markers via
-    :func:`_neutralize_host` (forge-in).  The host pass runs once per host —
-    re-running it would defang the real fences we append afterwards — so a leaked
-    or guessed nonce still cannot fabricate a trusted block.
+    closing marker (break-out), and every untrusted non-system text host is
+    neutralised before any real fence is appended (forge-in).  This includes
+    terminal hosts with no following operator turn and native lanes that inherit
+    a non-native primary's trust declaration during fallback.  The host pass runs
+    before folding so it can never defang a real fence appended here.
 
     Native models (*supports_mid_conversation_system*) keep the turns inline —
     the Anthropic converter emits them as real ``system`` messages.  Base-prompt
@@ -417,11 +417,23 @@ def fold_system_turns(
     Returns a transient copy as wire dicts; the input is untouched.  The fold's
     content-merge / host-escape logic keys directly on the wire content shape.
     """
+    safe_messages: list[dict[str, Any]] | None = None
+    for idx, msg in enumerate(messages):
+        safe = (
+            neutralize_message_fence_markers(msg, fence.SYSTEM_REMINDER_TAG)
+            if msg.get("role") != "system"
+            else msg
+        )
+        if safe is not msg:
+            if safe_messages is None:
+                safe_messages = list(messages)
+            safe_messages[idx] = safe
+    prepared = messages if safe_messages is None else safe_messages
     if supports_mid_conversation_system:
-        return messages
+        return prepared
     out: list[dict[str, Any]] = []
     host_escaped = False  # has out[-1] had its untrusted markers defanged?
-    for msg in messages:
+    for msg in prepared:
         if msg.get("role") == "system" and msg.get("_source"):
             raw = msg.get("content")
             text = raw if isinstance(raw, str) else str(raw or "")
@@ -445,46 +457,72 @@ def fold_system_turns(
                         msg.get("_source"),
                     )
                 if not host_escaped:
-                    out[-1] = _neutralize_host(out[-1])
+                    out[-1] = neutralize_message_fence_markers(out[-1], fence.SYSTEM_REMINDER_TAG)
                     host_escaped = True
                 out[-1] = _append_text_block(out[-1], wrapped)
             else:
                 out.append(msg)
             continue
         out.append(msg)
-        host_escaped = False
+        host_escaped = msg.get("role") != "system"
     return out
 
 
-def _neutralize_host(msg: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of *msg* with operator-fence markers defanged in its text.
+def neutralize_message_fence_markers(
+    msg: dict[str, Any],
+    tag: str,
+) -> dict[str, Any]:
+    """Return a copy of *msg* with *tag* fence markers defanged in plaintext.
 
-    Defence-in-depth for the fold path: before a real ``[start system-reminder_{nonce}]``
-    block is appended to this (untrusted) host turn, any literal
-    ``[start system-reminder]`` marker already in its content is neutralised via
-    :func:`turnstone.core.fence.neutralize` (opening + closing) so a leaked or
-    guessed nonce cannot be used to forge a trusted block here.  Never mutates
-    *msg* — the fold holds the read-only contract.
+    This is the shared copy-on-write trust-boundary pass for operator and sender
+    fences.  It covers canonical string/multipart text plus editable top-level
+    provider-native ``type=text`` blocks; otherwise Anthropic replay could prefer
+    an untouched native block and resurrect a marker defanged in the canonical
+    mirror.  Signed thinking, encrypted reasoning/server-tool blocks, tool-use
+    structures, and other opaque native content remain byte-exact.  Trusted
+    system messages are excluded by callers.  Never mutates *msg*.
     """
-    copy = dict(msg)
-    content = copy.get("content")
+    updates: dict[str, Any] = {}
+    content = msg.get("content")
     if isinstance(content, str):
-        copy["content"] = fence.neutralize(content, fence.SYSTEM_REMINDER_TAG, opening=True)
+        safe = fence.neutralize(content, tag, opening=True)
+        if safe != content:
+            updates["content"] = safe
     elif isinstance(content, list):
-        copy["content"] = [
-            (
-                {
-                    **p,
-                    "text": fence.neutralize(p["text"], fence.SYSTEM_REMINDER_TAG, opening=True),
-                }
-                if isinstance(p, dict)
-                and p.get("type") == "text"
-                and isinstance(p.get("text"), str)
-                else p
-            )
-            for p in content
-        ]
-    return copy
+        safe_parts: list[Any] | None = None
+        for idx, part in enumerate(content):
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ):
+                text = part["text"]
+                safe = fence.neutralize(text, tag, opening=True)
+                if safe != text:
+                    if safe_parts is None:
+                        safe_parts = list(content)
+                    safe_parts[idx] = {**part, "text": safe}
+        if safe_parts is not None:
+            updates["content"] = safe_parts
+
+    provider_content = msg.get("_provider_content")
+    if isinstance(provider_content, list):
+        safe_blocks: list[Any] | None = None
+        for idx, block in enumerate(provider_content):
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                text = block["text"]
+                safe = fence.neutralize(text, tag, opening=True)
+                if safe != text:
+                    if safe_blocks is None:
+                        safe_blocks = list(provider_content)
+                    safe_blocks[idx] = {**block, "text": safe}
+        if safe_blocks is not None:
+            updates["_provider_content"] = safe_blocks
+    return msg if not updates else {**msg, **updates}
 
 
 def _append_text_block(msg: dict[str, Any], block: str) -> dict[str, Any]:

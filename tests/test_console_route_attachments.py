@@ -101,7 +101,7 @@ class TestRouteCreateMultipart:
             resp = client.post(
                 f"/v1/api/route/workstreams/new?ws_id={ws_id}",
                 files=[("file", ("a.txt", b"hello", "text/plain"))],
-                data={"meta": '{"name":"demo"}'},
+                data={"meta": f'{{"name":"demo","ws_id":"{ws_id}"}}'},
                 headers=_AUTH,
             )
             assert resp.status_code == 200, resp.text
@@ -147,7 +147,7 @@ class TestRouteCreateMultipart:
             body = (
                 f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="meta"\r\n\r\n'
-                f'{{"name":"demo"}}\r\n'
+                f'{{"name":"demo","ws_id":"{ws_id}"}}\r\n'
                 f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="file"; filename="a.txt"\r\n'
                 f"Content-Type: text/plain\r\n\r\n"
@@ -180,7 +180,7 @@ class TestRouteCreateMultipart:
         async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
             return httpx.Response(
                 200,
-                json={"ws_id": "abc123", "name": "json"},
+                json={"ws_id": "a" * 32, "name": "json"},
                 request=httpx.Request("POST", args[0] if args else "http://test"),
             )
 
@@ -195,11 +195,34 @@ class TestRouteCreateMultipart:
                 headers=_AUTH,
             )
             assert resp.status_code == 200
-            assert resp.json()["ws_id"] == "abc123"
+            assert resp.json()["ws_id"] == "a" * 32
             # JSON path uses json= kwarg, not content=
             call_kwargs = mock_proxy.post.call_args.kwargs
             assert "json" in call_kwargs
             assert "content" not in call_kwargs
+        finally:
+            client.close()
+
+    def test_multipart_rejects_query_meta_ws_id_mismatch(self):
+        router = _make_router()
+        app = _make_app(router=router)
+        app.state.proxy_client = MagicMock(spec=httpx.AsyncClient)
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            query_ws_id = "a" * 32
+            meta_ws_id = "b" * 32
+            resp = client.post(
+                f"/v1/api/route/workstreams/new?ws_id={query_ws_id}",
+                files=[("file", ("a.txt", b"hello", "text/plain"))],
+                data={"meta": f'{{"ws_id":"{meta_ws_id}"}}'},
+                headers=_AUTH,
+            )
+            assert resp.status_code == 400
+            assert resp.json() == {
+                "error": "multipart meta.ws_id must match the ws_id query parameter"
+            }
+            router.route.assert_not_called()
+            app.state.proxy_client.post.assert_not_called()
         finally:
             client.close()
 

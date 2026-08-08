@@ -16,15 +16,18 @@ The permission model has two layers:
 2. **Permissions** (granular) — named permission strings checked per-endpoint by
    `require_permission()`.
 
-**Built-in roles** (seeded by migration 008):
+**Built-in roles** (seeded by migration 008 and extended by later feature
+migrations):
 
 | Role | Permissions |
 |------|-------------|
-| admin | read, write, approve, admin.users, admin.roles, admin.orgs, admin.policies, admin.skills, admin.audit, admin.usage, admin.schedules, admin.watches, tools.approve, workstreams.create, workstreams.close |
-| operator | read, write, workstreams.create, workstreams.close |
+| admin | Admin-default baseline: ordinary admin, lifecycle, tool-approval, coordinator, project, and persona capabilities. Explicit opt-in capabilities such as `model.skills.write` remain ungranted. |
+| operator | read, write, workstreams.create, workstreams.close, conversation.modify |
 | viewer | read |
 
-Custom roles can be created with any subset of the valid permissions.
+Custom roles can be created with any subset of the valid permissions. Built-in
+role permission overrides can grant or revoke individual capabilities, so the
+admin console is authoritative for the effective set on a deployment.
 The `persona.create` / `persona.read` / `persona.write` family gates
 persona administration; migration `063` seeds all three onto
 `builtin-admin`, and any role can be granted them through the standard
@@ -67,7 +70,7 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
   workstreams, concatenated in alphabetical order by name. Use name prefixes
   (e.g. `01-safety`, `02-style`) to control ordering.
 - **Explicit selection**: `--skill <name>` CLI flag, `skill` field on
-  `POST /v1/api/workstreams/new`, console creation modal dropdown, scheduled task
+  `POST /v1/api/workstreams/new`, console launcher dropdown, scheduled task
   config, and channel adapter config. An explicit skill *replaces* defaults.
 - **Variables**: Three built-in placeholders resolved at load time:
   `{{model}}` (active model name), `{{ws_id}}` (workstream ID),

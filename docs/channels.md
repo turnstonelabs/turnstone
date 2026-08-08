@@ -195,13 +195,17 @@ both and the gateway hosts both adapters in one process.
 - All subsequent messages in the thread are routed to the same workstream.
 - The bot streams responses via message edits, updated approximately every
   1.5 seconds.
-- If the workstream is evicted for capacity, the next message in the
-  thread auto-creates a new workstream and atomically resumes the
-  previous workstream via the `resume_ws` field on
-  `CreateWorkstreamMessage`. The server resumes the workstream during
-  creation (same HTTP request), and the server emits a
-  `WorkstreamResumedEvent` back to the channel. The thread receives a
-  *"Resumed: {name} ({count} messages restored)"* confirmation.
+- If a persisted channel route is no longer active on its owning node, the
+  router asks the create endpoint to fork the old workstream into a new ID via
+  `resume_ws`. The saved source can still resolve normally; its
+  checkpoint-bounded history, configuration, persona, effective project, and
+  attachment references are cloned before the channel route is repointed. The
+  old route remains durable until the replacement (and any initial message)
+  succeeds. If the create endpoint returns the ordinary
+  source-not-found response *and* a fresh authoritative storage lookup confirms
+  that the source is gone, the router retries once without `resume_ws` and
+  starts a fresh conversation. Other access, conflict, routing, and storage
+  failures remain visible rather than silently discarding history.
 
 ### Slash Commands
 
@@ -284,15 +288,17 @@ See [Security: Database Schema](security.md#database-schema) for the
    `channel_routes` table.
 2. **Active** — messages are routed bidirectionally. The bot streams
    responses via message edits (updated every ~1.5 seconds).
-3. **Eviction** — the server evicts an idle workstream for capacity. The
-   route is preserved and the thread stays open.
-4. **Reactivation** — the next message in the thread detects the stale
-   route and creates a new workstream with the old `ws_id`
-   as `resume_ws` on the creation request. The server resumes
-   the workstream during creation (no separate command or reverse lookup
-   needed). The channel receives a `WorkstreamResumedEvent`, and
-   the thread displays *"Resumed: {name} ({count} messages restored)"*.
-   If the old workstream was pruned, a fresh one starts with no error.
+3. **Eviction** — the server evicts an idle workstream for capacity. Its saved
+   source row and channel route remain durable, and the thread stays open.
+4. **Reactivation** — the next message resolves the saved route and probes
+   whether that workstream is live on its owning node. If it is not, the router
+   creates a distinct workstream with the old `ws_id` as `resume_ws`. The
+   create response confirms the fork and message count; there is no separate
+   resume command or channel-specific resumed event. Only after the replacement
+   succeeds does the router swap the persisted route. If the source was deleted
+   or pruned, an exact source-not-found response plus a second authoritative
+   storage miss triggers one fresh-create retry; other fork failures leave the
+   old route intact and are surfaced normally.
 5. **Close** — `/close` command closes the workstream via HTTP, deletes the
    route, unsubscribes from events, and archives the Discord thread.
 

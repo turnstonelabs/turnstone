@@ -6,6 +6,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+# Pydantic evaluates this annotation while building the schema, so the symbol
+# must remain available at runtime rather than behind TYPE_CHECKING.
+from pydantic.json_schema import SkipJsonSchema  # noqa: TC002
+
 from turnstone.core.workstream import WorkstreamKind
 
 # ---------------------------------------------------------------------------
@@ -131,10 +135,32 @@ class ApproveRequest(BaseModel):
     always: bool = Field(
         default=False, description="Auto-approve the tools in this batch going forward"
     )
+    cycle_id: str | None = Field(
+        default=None,
+        description="Resolve this exact approval cycle",
+    )
+    call_id: str | None = Field(
+        default=None,
+        description="Resolve the approval cycle containing this tool call",
+    )
+
+
+class ApproveResponse(BaseModel):
+    status: str = Field(default="ok", description="Request outcome")
+    cycle_id: str | None = Field(
+        default=None,
+        description="Approval cycle that was resolved, or null when none was pending",
+    )
 
 
 class CommandRequest(BaseModel):
-    command: str = Field(description="Slash command (e.g. /clear, /new, /resume)")
+    command: str = Field(
+        description=(
+            "Workstream-local slash command (for example /clear or /instructions). "
+            "Lifecycle commands such as /new and /resume are local-CLI-only; "
+            "remote clients use the dedicated workstream endpoints."
+        )
+    )
     ws_id: str = Field(description="Target workstream ID")
 
 
@@ -143,6 +169,17 @@ class CancelRequest(BaseModel):
         default=False,
         description="Force cancel: abandon the stuck worker thread immediately. "
         "Use when cooperative cancel has not resolved within a few seconds.",
+    )
+
+
+class CancelResponse(BaseModel):
+    status: str = Field(default="ok", description="Request outcome")
+    dropped: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Best-effort, credential-redacted snapshot of pending work affected "
+            "by cancellation; keys are omitted when not observable"
+        ),
     )
 
 
@@ -157,10 +194,35 @@ class RewindRequest(BaseModel):
 class CreateWorkstreamRequest(BaseModel):
     name: str = Field(default="", description="Workstream display name (auto-generated if empty)")
     model: str = Field(default="", description="Model alias from registry")
+    judge_model: str = Field(
+        default="",
+        description=(
+            "Optional judge model alias for this workstream. Empty uses the "
+            "server's configured judge model."
+        ),
+    )
     auto_approve: bool = Field(default=False, description="Auto-approve all tool calls")
+    auto_approve_tools: str | list[str] = Field(
+        default="",
+        description=(
+            "Tool names to auto-approve even when auto_approve is false, accepted "
+            "as either a comma-separated string or an array of strings."
+        ),
+    )
+    user_id: str = Field(
+        default="",
+        description=(
+            "Optional workstream owner override. Honored only for trusted service "
+            "identities (currently the console); ordinary callers remain bound to "
+            "their authenticated user id."
+        ),
+    )
     resume_ws: str = Field(
         default="",
-        description="Workstream ID to resume atomically during creation (empty = fresh start)",
+        description=(
+            "Source workstream ID or alias to fork atomically into the new "
+            "workstream (empty = fresh start)"
+        ),
     )
     skill: str = Field(default="", description="Skill name (replaces default skills)")
     persona: str = Field(
@@ -182,7 +244,10 @@ class CreateWorkstreamRequest(BaseModel):
     )
     client_type: str = Field(
         default="",
-        description="Client surface type (web, cli, chat). Defaults to web for server-created sessions.",
+        description=(
+            "Client surface type (web, cli, chat, scheduled). "
+            "Defaults to web for server-created sessions."
+        ),
     )
     initial_message: str = Field(
         default="",
@@ -231,9 +296,13 @@ class CreateWorkstreamRequest(BaseModel):
 class CreateWorkstreamResponse(BaseModel):
     ws_id: str = Field(description="Unique ID of the new workstream")
     name: str = Field(description="Assigned workstream name")
-    resumed: bool = Field(default=False, description="Whether a previous workstream was resumed")
+    resumed: bool = Field(
+        default=False,
+        description="Whether the requested source was successfully forked",
+    )
     message_count: int = Field(
-        default=0, description="Number of messages in the resumed workstream"
+        default=0,
+        description="Number of messages cloned into the new workstream",
     )
     attachment_ids: list[str] = Field(
         default_factory=list,
@@ -244,8 +313,8 @@ class CreateWorkstreamResponse(BaseModel):
             "/v1/api/workstreams/{ws_id}/send."
         ),
     )
-    initial_message_status: Literal["queue_full", "refused_closed"] | None = Field(
-        default=None,
+    initial_message_status: Literal["queue_full", "refused_closed"] | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
         description=(
             "Present ONLY when the workstream was created but its "
             "initial_message could not be delivered: 'queue_full' (a raced "

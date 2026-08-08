@@ -1,134 +1,117 @@
 @startuml
 !theme plain
-title Turnstone — Tool Execution Pipeline (Three Phases)
+title Turnstone — Tool Pipeline: Prepare, Approve, Execute, Fold
 
 start
 
-partition "Phase 1: Prepare" #E8F5E9 {
-    :Receive tool_calls list from LLM response;
+partition "Phase 1 — Prepare and assess" #E8F5E9 {
+    :Receive tool calls from one assistant Turn;
+    :Capture the generation's cancel event\nand acting principal;
 
-    while (more tool_calls?) is (yes)
-        :Extract call_id, func_name, raw_args;
-
-        if (json.loads(raw_args) succeeds?) then (yes)
-            :parsed_args = JSON dict;
+    while (more tool calls?) is (yes)
+        :Parse arguments and dispatch to\nthe tool-specific preparer;
+        if (preparation succeeds?) then (yes)
+            :Build item: call_id, name, header, preview,\nneeds_approval, execute closure;
         else (no)
-            :Fallback 1: regex extraction;
-            if (regex found keys?) then (yes)
-                :parsed_args = extracted dict;
-            else (no)
-                :Fallback 2: bare string →\nPRIMARY_KEY_MAP[func_name];
-            endif
+            :Build an error item for this call only;\nkeep sibling calls valid;
         endif
-
-        :Dispatch to _prepare_{func_name}();
-
-        note right
-            **Dispatch table (16 built-in + tool_search):**
-            ┌───────────────┬──────────────────┐
-            │ Tool          │ Needs Approval?  │
-            ├───────────────┼──────────────────┤
-            │ bash          │ ✓ Yes            │
-            │ read_file     │ ✗ Auto-approve   │
-            │ write_file    │ ✓ Yes            │
-            │ edit_file     │ ✓ Yes            │
-            │ search        │ ✗ Auto-approve   │
-            │ diff_file     │ ✗ Auto-approve   │
-            │ web_fetch     │ ✗ Auto-approve   │
-            │ web_search    │ ✗ Auto-approve   │
-            │ tool_search   │ ✗ Auto-approve   │
-            │ task_agent    │ ✓ Yes            │
-            │ memory        │ ✗ Auto-approve   │
-            │ recall        │ ✗ Auto-approve   │
-            │ notify        │ ✗ Auto-approve   │
-            │ watch         │ ✓ create only    │
-            │ skill         │ ✓ load only      │
-            │ read_resource │ ✓ Yes            │
-            │ use_prompt    │ ✓ Yes            │
-            ├───────────────┼──────────────────┤
-            │ mcp__*        │ ✓ Yes (external) │
-            └───────────────┴──────────────────┘
-        end note
-
-        :Build item dict:
-        {call_id, func_name, header,
-         preview, needs_approval,
-         approval_label, execute: Callable};
+        :Attach operation-local cancellation witness\nand pinned principal;
     endwhile (no)
+
+    :Reject only unsafe ordering shapes\n(for example tasks read + write in one batch);
+    :Run heuristic intent assessment immediately;
+    :Start generation-pinned LLM judge in background;
+    :Stamp one immutable Smart Approval\nsettings snapshot on the batch;
+
+    note right
+      Preparation is per-call isolated: one bad preparer
+      becomes one error Tool Turn rather than orphaning the
+      assistant's entire tool-call set.
+    end note
 }
 
-partition "Phase 2: Approve" #FFF3E0 {
-    if (any items need approval?) then (yes)
-        :_emit_state("attention");
-        :ui.approve_tools(items);
+partition "Phase 2 — Approval cycle" #FFF3E0 {
+    :Apply explicit bypasses:\nskill / always / policy / blanket;
+
+    if (Smart Approvals enabled?) then (yes)
+        :Wait within the batch's bounded judge deadline;
+        :Auto-approve only LLM approve verdicts\nat or above the captured threshold;
+    endif
+
+    if (human-gated items remain?) then (yes)
+        :Acquire approval-publication lease;
+        :Register independent ApprovalCycle\n(cycle_id, call_ids, event, result);
+        :Publish approve_request + heuristic verdicts;
 
         note right
-            **auto_approve check is handled
-            internally by ui.approve_tools()**
-
-            **TerminalUI**: Print headers/previews,
-            prompt [y/n/a, optional message]
-            If user chose "always":
-              Add pending tool names to auto_approve_tools
-              (auto-approve these tool types going forward)
-            **WebUI**: Enqueue approve_request,
-            block on _approval_event.wait()
-            **NullUI**: Return (True, None)
+          Parallel task agents can hold several cycles at once.
+          A decision selects one cycle_id / call_id (or the oldest
+          cycle for a legacy selector-less client). Double resolve
+          is a guarded no-op; one cycle cannot wake a sibling.
         end note
 
-        if (user approved?) then (yes)
-            :_emit_state("running");
-        else (denied)
-            :Mark all pending items as denied;
-            :denial_msg = "Denied by user";
-            :_emit_state("running");
+        if (operator approves?) then (yes)
+            :Record decision and optional feedback;
+        else (denies / policy blocks)
+            :Mark only pending items denied;\nEffectStatus = none;
         endif
-    else (all auto-approved)
-        :ui enqueues tool_info event\n(no blocking);
+        :Publish approval_resolved;\nunregister this cycle;
+    else (all bypassed / auto-approved)
+        :Publish tool_info with the exact\nauto-approve reason per item;
+    endif
+
+    if (owning operation cancelled?) then (yes)
+        :Cancel only cycles carrying that witness;
+        :Stage every unstarted call as\nEffectStatus = none;
+        stop
     endif
 }
 
-partition "Phase 3: Execute" #E3F2FD {
-    :_check_cancelled();
-    note right: Cancellation checkpoint:\nraises GenerationCancelled if\ncancel event is set
-    if (single tool call?) then (yes)
-        :Execute sequentially:\nrun_one(items[0]);
-    else (multiple)
-        :Execute in parallel:\nThreadPoolExecutor(max_workers=4)\npool.map(run_one, items);
+partition "Phase 3 — Execute" #E3F2FD {
+    :Generation + cancellation checkpoint;
+
+    if (batch requires serial ordering?) then (yes)
+        :Execute in provider order;
+    else (no)
+        :Execute via bounded ThreadPoolExecutor;
     endif
 
     note right
-        **run_one(item):**
-        if item.error → return error string
-        if item.denied → return denial message
-        else → item["execute"](item)
-          ├─ _exec_bash: subprocess.run(["bash", script.sh])
-          ├─ _exec_read_file: open().readlines() or _exec_read_image (base64)
-          ├─ _exec_write_file: makedirs + write
-          ├─ _exec_edit_file: find_occurrences + replace
-          ├─ _exec_search: grep subprocess
-          ├─ _exec_web_fetch: httpx.get + LLM summary
-          ├─ _exec_web_search: SearxNG JSON GET (fallback for local models)
-          ├─ _exec_tool_search: BM25 search + expand_visible()
-          ├─ _exec_task: _run_agent(TASK_AGENT_TOOLS)
-          ├─ _exec_notify: HTTP POST to channel gateway
-          ├─ _exec_memory: structured memory save/search/delete/list
-          ├─ _exec_recall: conversation history FTS5 search
-          ├─ _exec_read_resource: MCPClientManager.read_resource_sync()
-          ├─ _exec_use_prompt: MCPClientManager.get_prompt_sync()
-          └─ _exec_mcp_tool: MCPClientManager.call_tool_sync()
+      Each worker marks its call started only after the final
+      generation/cancel check. A missing result after that edge is
+      conservatively unknown; an unstarted call is definitively none.
     end note
 
-    :Collect results: [(call_id, output), ...];
+    :Stream tool chunks to the matching call card;
+    :Capture result / error / preview and effect disposition;
 
-    :_truncate_output() on each result\n(max context_window × chars_per_token × 0.5 chars\ndefault: ~context_window × 2 chars);
+    if (Stop interrupts execution?) then (yes)
+        :Abort child model scopes and subprocess groups;
+        :Synthesize cancellation receipts;
+        note right
+          EffectStatus vocabulary:
+          committed / none / unknown /
+          partial / rolled_back.
 
-    :bash: ui.on_tool_output_chunk(call_id, line) per stdout line;
-    :ui.on_tool_result(call_id, name, output, is_error) for each;
+          Observed but unreviewed bytes are omitted from the
+          model-facing receipt; effect truth is retained.
+        end note
+    endif
 }
 
-:Return (results, user_feedback);
+partition "Phase 4 — Guard and atomic fold" #F3E5F5 {
+    if (compaction already owed?) then (yes)
+        :Compact before sizing/folding results;\npreserve the assistant tool-call Turn;
+    endif
+
+    :Truncate each result against the remaining shared budget;
+    :Run heuristic + optional LLM output guard;
+    :Re-check generation after guard work;
+
+    :Under one generation commit, append the complete\nTool Turn block + advisories + feedback;
+    :Persist rows and effect/preview metadata\non the ordered durability lane;
+    :Return results to the next model turn;
+}
 
 stop
-
 @enduml

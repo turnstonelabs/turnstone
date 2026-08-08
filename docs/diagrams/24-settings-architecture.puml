@@ -13,7 +13,7 @@ skinparam participant {
 participant "Server\n(main)" as Server <<session>>
 participant "ConfigStore\n(config_store.py)" as Store <<config>>
 participant "SettingsRegistry\n(settings_registry.py)" as Registry <<config>>
-participant "StorageBackend\n(SQLite)" as Storage <<storage>>
+participant "StorageBackend\n(SQLite / PostgreSQL)" as Storage <<storage>>
 participant "Console Admin\n(console/server.py)" as Admin <<api>>
 participant "SDK Client\n(sdk/)" as SDK <<sdk>>
 participant "ChatSession\n(session.py)" as Session <<session>>
@@ -57,9 +57,10 @@ else key not in cache
     Store --> Session : default value
 end
 note right of Session
-  Settings are captured once
-  at workstream creation.
-  Not re-read on every turn.
+  Most session settings are captured once
+  at workstream creation. Documented live readers
+  (including model.auth_fail_closed per mint)
+  apply immediately.
 end note
 
 == Phase 3: Admin API — List / Schema ==
@@ -128,8 +129,9 @@ Store -> Storage : get_system_settings_bulk(node_id)
 Storage --> Store : all settings
 Store -> Store : rebuild cache,\nswap atomically,\nincrement _version
 note right
-  Existing sessions: unchanged
-  (frozen at creation time).
+  Most existing-session settings are unchanged
+  (frozen at creation time); documented
+  live readers apply immediately.
   New sessions: pick up
   updated values immediately.
 end note

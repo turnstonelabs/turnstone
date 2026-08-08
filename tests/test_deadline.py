@@ -136,3 +136,19 @@ class TestStreamAbortRef:
         stream = MagicMock()
         ref.append(stream)
         stream.close.assert_called_once()
+
+    def test_cancel_event_is_visible_before_explicit_abort(self) -> None:
+        """A worker observes cancellation before the polling parent aborts it."""
+        from unittest.mock import MagicMock
+
+        from turnstone.core.deadline import StreamAbortRef
+
+        cancel = threading.Event()
+        ref = StreamAbortRef(cancel)
+        assert not ref.aborted
+
+        cancel.set()
+        assert ref.aborted
+        stream = MagicMock()
+        ref.append(stream)
+        stream.close.assert_called_once()

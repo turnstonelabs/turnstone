@@ -481,9 +481,11 @@ class TestCompatSessionPlumbing:
         registry = ModelRegistry(models={"vllm-messages": cfg}, default="vllm-messages")
         session = _make_session(registry=registry, model_alias="vllm-messages")
         provider = create_provider("anthropic-compatible")
-        caps = session._resolve_capabilities(
-            provider, "deepseek-ai/DeepSeek-V4-Flash", "vllm-messages"
-        )
+        lane = session._model_binding.lane
+        assert lane.provider is provider
+        assert lane.model == "deepseek-ai/DeepSeek-V4-Flash"
+        caps = lane.capabilities
+        assert caps is not None
         assert caps.supports_mid_conversation_system is True
         assert caps.context_window == 131072
         # Untouched fields keep the compat-lane defaults.

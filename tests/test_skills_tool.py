@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from tests._session_helpers import provider_shell
+from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
 from turnstone.core.nudge_queue import TOOL_DRAIN
 from turnstone.core.tools import BUILTIN_TOOL_NAMES, PRIMARY_KEY_MAP
 
@@ -50,6 +52,26 @@ class TestToolRegistration:
 # ---------------------------------------------------------------------------
 
 
+def _seed_test_model_binding(session: Any) -> None:
+    """Give a ``__new__``-built session the coherent model lane init normally supplies."""
+    model = "test-model"
+    provider = provider_shell()
+    session.temperature = 0.5
+    session.reasoning_effort = ""
+    lane = ModelLane(
+        provider=provider,
+        client=MagicMock(),
+        model=model,
+        temperature=session.temperature,
+        capabilities=provider.get_capabilities(model),
+    )
+    session._model_binding = ResolvedModelBinding(
+        lane=lane,
+        config=None,
+        registry_generation=0,
+    )
+
+
 def _make_session(*, kind: str = "interactive", user_id: str = "test-user") -> Any:
     """Build a minimal ChatSession instance with the state required by
     the skills-tool prepare/exec paths.  ``kind`` sets ``self._kind`` —
@@ -60,7 +82,7 @@ def _make_session(*, kind: str = "interactive", user_id: str = "test-user") -> A
 
     session = ChatSession.__new__(ChatSession)
     session.ui = MagicMock()
-    session.model = "test-model"
+    _seed_test_model_binding(session)
     session._ws_id = "ws-test"
     session._node_id = "node-1"
     session._user_id = user_id
@@ -1324,13 +1346,9 @@ class TestSkillCatalogDisclosure:
         session = ChatSession.__new__(ChatSession)
         ui = MagicMock()
         session.ui = ui
-        session.model = "test-model"
-        # ``_init_system_messages`` resolves capabilities once (for the
-        # operator-instruction nonce declaration on the fold path); with no
-        # provider it skips the declaration.  ``_envelope_nonce`` /
-        # ``_model_alias`` are set by ``__init__`` (bypassed here).
-        session._provider = None
-        session._model_alias = None
+        # ``_init_system_messages`` reads capabilities from the coherent
+        # model lane that ``__init__`` normally installs (bypassed here).
+        _seed_test_model_binding(session)
         session._envelope_nonce = "test1234"
         session._ws_id = "ws-test"
         session._node_id = "node-1"
@@ -1387,6 +1405,8 @@ class TestSkillCatalogDisclosure:
         session._senders_dirty = True
         session._db_senders_loaded = True
         session._sender_label_nonce = "testnonce"
+        session._mem_search_cache = {}
+        session._touched_memory_keys = set()
 
         with (
             patch(

@@ -3,9 +3,11 @@ import type { ServerEvent } from "./events.js";
 import type {
   AttachmentContent,
   AttachmentUpload,
+  ApproveResponse,
   AuthLoginResponse,
   AuthSetupResponse,
   AuthStatusResponse,
+  CancelResponse,
   CreateWorkstreamRequest,
   CreateWorkstreamResponse,
   DashboardResponse,
@@ -173,7 +175,7 @@ export class TurnstoneServer extends BaseClient {
     cycleId?: string;
     /** Alternative selector: any call_id inside the target cycle. */
     callId?: string;
-  }): Promise<StatusResponse> {
+  }): Promise<ApproveResponse> {
     return this.request(
       "POST",
       `/v1/api/workstreams/${encodeURIComponent(opts.wsId)}/approve`,
@@ -201,7 +203,7 @@ export class TurnstoneServer extends BaseClient {
   async cancel(
     wsId: string,
     opts?: { force?: boolean },
-  ): Promise<StatusResponse> {
+  ): Promise<CancelResponse> {
     const body: Record<string, unknown> = {};
     if (opts?.force) body.force = true;
     return this.request(

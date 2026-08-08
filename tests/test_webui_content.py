@@ -1,6 +1,8 @@
 """Tests for WebUI content accumulation — server-side single source of truth."""
 
 import queue
+import threading
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -27,6 +29,58 @@ def _drain_global() -> list[dict]:
     while not WebUI._global_queue.empty():
         events.append(WebUI._global_queue.get_nowait())
     return events
+
+
+def test_public_intent_verdict_waits_for_storage_and_records_llm_metric() -> None:
+    """The public UI hook keeps its synchronous persistence contract.
+
+    Splitting live publication from audit I/O for the session's judge callback
+    must not make direct WebUI callers fire-and-forget.  Its LLM metric remains
+    part of live publication and the public call returns only after the UPSERT.
+    """
+    ui = _make_ui()
+    storage = MagicMock()
+    persistence_started = threading.Event()
+    release_persistence = threading.Event()
+    returned = threading.Event()
+
+    def blocked_upsert(**_kwargs) -> None:
+        persistence_started.set()
+        if not release_persistence.wait(5):
+            raise RuntimeError("test verdict persistence was not released")
+
+    storage.upsert_intent_verdict.side_effect = blocked_upsert
+    metrics = MagicMock()
+    verdict = {
+        "verdict_id": "v-web-llm",
+        "call_id": "call-web-llm",
+        "tier": "llm",
+        "risk_level": "high",
+        "latency_ms": 37,
+    }
+
+    def publish() -> None:
+        ui.on_intent_verdict(verdict)
+        returned.set()
+
+    with (
+        patch("turnstone.core.storage._registry.get_storage", return_value=storage),
+        patch("turnstone.server._metrics", metrics),
+    ):
+        thread = threading.Thread(target=publish)
+        thread.start()
+        try:
+            assert persistence_started.wait(2)
+            metrics.record_judge_verdict.assert_called_once_with("llm", "high", 37)
+            assert not returned.is_set()
+            assert thread.is_alive()
+        finally:
+            release_persistence.set()
+            thread.join(2)
+
+    assert not thread.is_alive()
+    assert returned.is_set()
+    storage.upsert_intent_verdict.assert_called_once()
 
 
 class TestContentAccumulation:

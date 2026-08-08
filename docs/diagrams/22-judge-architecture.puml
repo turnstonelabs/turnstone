@@ -1,218 +1,123 @@
 @startuml
 !theme plain
-title Turnstone — Intent Validation (Judge) Architecture
+title Turnstone — Intent Judge, Concurrent Approval Cycles, and Output Guard
 
-skinparam participant {
-    BackgroundColor<<session>> #C8E6C9
-    BackgroundColor<<judge>> #FFE0B2
-    BackgroundColor<<storage>> #B3E5FC
-    BackgroundColor<<ui>> #E8EAF6
-    BackgroundColor<<fs>> #F5F5F5
-}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceLifeLineBackgroundColor #F5F5F5
 
-participant "ChatSession\n(session.py)" as Session <<session>>
-participant "IntentJudge\n(judge.py)" as Judge <<judge>>
-participant "LLM Provider\n(provider)" as LLM <<judge>>
-participant "StorageBackend\n(SQLite)" as Storage <<storage>>
-participant "WebUI / SSE\n(server.py)" as UI <<ui>>
-participant "Filesystem" as FS <<fs>>
+participant "ChatSession\ngeneration N" as Session
+participant "SessionUIBase" as UI
+participant "IntentJudge" as Judge
+participant "model_turn()\n(pinned ModelLane)" as Model
+participant "Operator / client" as Operator
+participant "OutputGuardJudge" as Guard
+database "StorageBackend" as Storage
 
-== Tool Call Requires Approval ==
+== Intent assessment begins during preparation ==
 
-Session -> Session : _prepare_tool_calls()
-note right
-  Tool calls parsed from
-  LLM response. Auto-approved
-  tools dispatched immediately.
-  Remaining items need approval.
+Session -> Session : prepare each tool item independently\nattach principal + cancel witness
+Session -> Judge : evaluate(items, callback, cancel_ref)
+activate Judge
+Judge -> Judge : synchronous heuristic verdict\nfor each call (first matching rule)
+Judge --> Session : heuristic verdicts + daemon cancel event
+Session -> UI : cache / publish heuristic assessments
+Session -> Storage : persist heuristic intent verdicts
+
+note over Judge, Model
+  The judge owns an immutable resolved binding. Registry/config generations
+  are freshness watermarks: an effective lane change replaces the judge for
+  the next batch, while in-flight work keeps the lane it started with.
+  Dynamic backend auth is resolved for this batch's initiating principal.
 end note
 
-Session -> Session : _evaluate_intent(pending_items)
-
-== Tier 1: Heuristic (synchronous, sub-ms) ==
-
-Session -> Judge : evaluate(items, messages, callback)
-
-Judge -> Judge : evaluate_heuristic()\nfor each item
-note right
-  **36 rules (first match wins):**
-  Critical (0.90, deny): rm /, mkfs,
-    dd, pipe-to-shell, chmod 777 /,
-    write/edit /etc/ .ssh/,
-    download-then-execute chains
-  High (0.80, review): sudo, kill -9,
-    destructive git, DROP TABLE,
-    secrets, HTTP mutations, ssh/scp,
-    browser+data-export, transitive
-    install, control-plane mutation
-  Medium (0.70, review): content
-    ingestion, interpreter exec,
-    cloud CLI mutations, pkg install,
-    write_file, MCP tools, docker ops
-  Low (0.85, approve): read_file,
-    list_directory, search, recall,
-    tool_search, read_resource,
-    web_search, read-only bash
-  Default: medium, 0.50, review
-end note
-
-Judge --> Session : heuristic_verdicts[]
-
-Session -> Session : attach _heuristic_verdict\nto each pending item
-
-Session -> UI : SSE: approve_request\n{items: [{verdict: ...}],\n judge_pending: true}
-note right
-  Heuristic verdict displayed
-  immediately as risk badge.
-  Spinner shown while LLM
-  judge evaluates.
-end note
-
-Session -> Storage : create_intent_verdict()\nfor each heuristic verdict
-
-== Tier 2: LLM Judge (daemon thread, async) ==
-
-Judge -> Judge : spawn daemon thread\n"intent-judge"
-
-note over Judge, LLM
-  **Context preparation:**
-  1. FIFO-truncate conversation history
-     to max_context_ratio of context window
-  2. Append tool call details as user message
-  3. System prompt defines judge role + JSON schema
-end note
-
-loop up to 3 turns (timeout budget)
-
-    Judge -> LLM : model_turn(lane, judge_turns,\ntools=[read_file, list_directory])\nvia drained create_streaming
-    LLM --> Judge : ModelTurnResult
-
-    alt tool_calls present (turn < 3)
-        Judge -> Judge : _exec_read_only_tool()
-        note right
-          **Security hardening:**
-          Blocked: /etc/, /root/,
-          /proc/, /sys/, /dev/,
-          .ssh, .gnupg, .aws,
-          *.pem, *.key, *.p12
-          File cap: 32KB
-          Dir cap: 200 entries
-        end note
-        Judge -> FS : read_file / list_directory
-        FS --> Judge : file contents
-        Judge -> Judge : append tool result\nto judge_messages
-    else text response (final verdict)
-        Judge -> Judge : _parse_verdict()
-        note right
-          **4-stage JSON parsing:**
-          1. Direct JSON.loads
-          2. Markdown code block
-          3. Brace-counting
-          4. Regex field extraction
-        end note
+par LLM judge daemon
+  loop bounded turns / deadline
+    Judge -> Model : model_turn(judge lane, canonical Turns,\nread-only evidence tools, cancel_ref)
+    Model --> Judge : ModelTurnResult
+    alt evidence tool requested
+      Judge -> Judge : execute bounded read_file / list_directory
+    else verdict text
+      Judge -> Judge : parse + arbitrate against heuristic
     end
-
+  end
+  Judge --> UI : on_intent_verdict(verdict, judge generation)
+  UI -> Storage : persist LLM verdict / audit update
+else approval path continues
+  Session -> UI : approve_tools(items) with one\nSmart Approval config snapshot
 end
 
-== Tier 3: Arbitration ==
+== Policy, Smart Approval, and human gate ==
 
-Judge -> Judge : compare confidence:\nLLM vs heuristic
-note right
-  Only deliver LLM verdict
-  if confidence > heuristic.
-  Otherwise heuristic stands.
-end note
-
-alt LLM confidence > heuristic confidence
-    Judge -> Session : callback(llm_verdict)
-    Session -> UI : SSE: intent_verdict\n{tier: "llm", ...}
-    note right
-      UI replaces heuristic badge
-      with LLM verdict. Spinner
-      resolves to final assessment.
-    end note
-    Session -> Storage : create_intent_verdict()\nfor LLM verdict
+UI -> UI : apply explicit policy / skill / always / blanket bypasses
+opt Smart Approvals enabled
+  UI -> UI : wait within captured deadline for this batch's verdicts
+  UI -> UI : auto-approve only recommendation=approve\nand confidence >= captured threshold
+  UI -> Storage : persist auto-approval reason and decision
 end
 
-== User Decision ==
-
-UI -> Session : resolve_approval(\napproved, feedback)
-
-Session -> Storage : update_intent_verdict(\nverdict_id, user_decision)
-note right
-  All tracked verdicts
-  (heuristic + LLM) updated
-  with "approved" or "denied".
-  Swap-and-clear avoids racing
-  with daemon judge thread.
-end note
-
-== Tool Execution ==
-
-Session -> Session : _execute_tools()
-note right
-  Tools execute with
-  user approval.
-end note
-
-== Output Guard (synchronous, time-budgeted) ==
-
-Session -> Session : _evaluate_output()\nfor each tool result
-note right
-  **Priority-ordered checks (5s budget):**
-  P1: Prompt injection (role injection,
-    override phrases, instruction tags)
-  P2: Credential leakage (API keys,
-    PEM blocks, connection strings)
-  P3: Encoded payloads (data URIs,
-    hex shellcode)
-  P4: Adversarial URLs (cloud metadata,
-    credential query params)
-  P5: System info disclosure (private
-    IPs, sensitive paths)
-
-  Annotates + optionally redacts.
-  Does NOT gate.
-end note
-
-alt output_warning flags detected
-    Session -> UI : SSE: output_warning\n{call_id, risk_level, flags,\nfunc_name, redacted}
-    note right
-      Credential values replaced
-      with [REDACTED:<type>] before
-      output enters conversation.
-      sanitized text excluded from
-      SSE payload (defense in depth).
-    end note
-    UI -> Storage : record_output_assessment()\nfire-and-forget persistence
-    note right
-      Stored: flags, risk_level,
-      annotations, output_length,
-      redacted (bool). Raw tool
-      output is never stored.
-    end note
+alt human-gated items remain
+  UI -> UI : acquire publication lease; register ApprovalCycle\n(cycle_id, call_ids, event, result, witnesses)
+  UI -> Operator : approve_request with cycle_id + item verdicts
+  Operator -> UI : approve / deny by cycle_id or call_id
+  UI -> UI : atomically claim exactly one unresolved cycle
+  UI -> Operator : approval_resolved
+  UI --> Session : decision + optional feedback
+  UI -> Storage : stamp tracked verdicts with operator decision
+else every item bypassed / auto-approved
+  UI -> Operator : tool_info with exact auto_approve_reason
+  UI --> Session : approved
 end
 
-== Lifecycle ==
+note right of UI
+  Parallel task agents may register several ApprovalCycles. Each cycle owns
+  its own Event and result slot. A legacy selector-less decision targets the
+  oldest cycle; double resolution is a no-op. Cached LLM verdicts carry their
+  judge generation, so reused provider call ids cannot satisfy a new cycle.
+end note
 
-note over Session, Judge
-  **Lazy initialization:**
-  IntentJudge created on first approval if judge_config.enabled.
-  Re-uses session's provider/client by default (self-consistency).
-  Cross-model: separate provider/client from [judge] config.
+== Cancellation boundary ==
 
-  **Sub-agent exemption:**
-  Task sub-agents skip intent validation entirely.
+opt Stop / close / force-successor
+  Session -> Judge : abort all judge events owned by the cancelled operation
+  Session -> UI : resolve_all_approvals(False, "cancelled")
+  UI -> UI : block new admission leases; wait for admitted bundles;\nclaim only cycles whose cancellation witness is aborted
+  UI -> Operator : one cancelled resolution per claimed cycle
+  note over Session, UI
+    A Stop can win before cycle registration, during publication, or while a
+    click resolves. The witness + admission sweep makes exactly one terminal
+    outcome visible; a successor generation's new cycle is not swept.
+  end note
+end
 
-  **Output guard:**
-  Runs when judge_config.output_guard is true (default).
-  Credential redaction when judge_config.redact_secrets is true.
+note over Judge
+  Normal operator resolution does not necessarily cancel judge inference.
+  With cancel_on_approval=false, the daemon finishes and late verdicts remain
+  auditable. With it enabled, the batch event stops remaining judge work.
+end note
 
-  **Storage:**
-  intent_verdicts table (migration 012), output_assessments table
-  (migration 022). Both queryable via admin API endpoints
-  (requires admin.judge permission). Skills store risk_level,
-  scan_report, scan_version for install-time risk assessment.
+deactivate Judge
+
+== Tool output guard ==
+
+Session -> Session : execute admitted tools; truncate each result
+Session -> Guard : evaluate(result, tool context, cancel event)
+activate Guard
+Guard -> Guard : heuristic checks first
+opt LLM guard enabled and time remains
+  Guard -> Model : model_turn(output-guard lane, bounded prompt, cancel_ref)
+  Model --> Guard : structured verdict
+end
+Guard --> Session : assessment / redaction / warning
+deactivate Guard
+Session -> Session : re-check generation N before folding result
+Session -> UI : output warning (no raw secret payload)
+Session -> Storage : persist assessment + guarded Tool Turn metadata
+
+note over Guard, Storage
+  Output-guard objects also pin model/config lanes. Replacement retires the
+  old object but lets admitted evaluations drain before its private client is
+  closed. A cancelled or superseded evaluation cannot fold into the successor
+  trajectory. Raw pre-redaction secrets are never stored in assessment rows.
 end note
 
 @enduml

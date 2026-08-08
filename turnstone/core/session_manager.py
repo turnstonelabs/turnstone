@@ -10,6 +10,7 @@ persistence, per-ws lock refcount for concurrent lazy rehydrate.
 from __future__ import annotations
 
 import contextlib
+import functools
 import threading
 import time
 import uuid
@@ -17,11 +18,12 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 from turnstone.core.log import get_logger
+from turnstone.core.model_registry import ModelClientConstructionError, UnknownModelAliasError
 from turnstone.core.personas import snapshot_from_config
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from turnstone.core.child_event_bus import ChildEventBus
     from turnstone.core.session import ChatSession, SessionUI
@@ -29,6 +31,10 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = get_logger(__name__)
+
+
+class WorkstreamAlreadyExistsError(RuntimeError):
+    """A create request did not acquire a fresh durable workstream id."""
 
 
 # Maps each workstream kind to the ``services.service_type`` its hosting
@@ -45,6 +51,15 @@ _KIND_SERVICE_TYPE: dict[WorkstreamKind, str] = {
     WorkstreamKind.INTERACTIVE: "server",
     WorkstreamKind.COORDINATOR: "console",
 }
+
+# A create normally publishes in one request, but provider construction, a
+# large fork clone, or attachment validation can legitimately take longer than
+# a heartbeat window. Keep crash recovery independent from idle-session policy
+# and deliberately conservative: long-lived hosts run this maintenance at most
+# once per five minutes, the direct CLI runs one boot pass, and only
+# reservations abandoned for two hours qualify.
+STALE_CREATE_GRACE_SECONDS = 2 * 60 * 60
+STALE_CREATE_SWEEP_INTERVAL_SECONDS = 5 * 60
 
 
 class SessionKindAdapter(Protocol):
@@ -123,13 +138,12 @@ class SessionEventEmitter(Protocol):
     tests that omit an emitter entirely.
 
     Implementing the Protocol does not commit a kind to wiring every
-    method — interactive's ``emit_created`` / ``emit_state`` /
-    ``emit_rehydrated`` are documented no-op stubs because those
-    events fire from out-of-band channels (``WebUI._broadcast_state``
-    for state, the create HTTP handler for ``ws_created`` after
-    attachment validation). Only ``emit_closed`` carries a real body
-    on interactive. Coordinator's four methods are all real (cluster
-    collector's pseudo-node sees every transition). See
+    method — interactive's ``emit_state`` / ``emit_rehydrated`` are
+    documented no-op stubs because those events fire from out-of-band
+    channels (``WebUI._broadcast_state`` for state and the open handler for
+    rehydrate). Interactive ``emit_created`` and ``emit_closed`` are real,
+    bounded global-queue publications. Coordinator's four methods are all
+    real (cluster collector's pseudo-node sees every transition). See
     :class:`SessionKindAdapter` docstring for the asymmetry rationale.
     """
 
@@ -173,6 +187,9 @@ class SessionManager:
     by kind — a coordinator can't evict an interactive workstream.
     """
 
+    _REHYDRATE_BIND_ATTEMPTS = 3
+    _REHYDRATE_INCARNATION_ATTEMPTS = 3
+
     def __init__(
         self,
         adapter: SessionKindAdapter,
@@ -213,14 +230,32 @@ class SessionManager:
         self._model_validator = model_validator
         self._node_id = node_id
         self._workstreams: dict[str, Workstream] = {}
+        # Deferred creates are addressable internally before their pre-commit
+        # transaction finishes. Keep the exact reservation object beyond a
+        # racing close/delete so the rollback cannot ABA-delete a successor
+        # that reuses the caller-chosen id.
+        self._pending_creates: dict[str, Workstream] = {}
         self._order: list[str] = []
         self._lock = threading.Lock()
+        # State storage + observer tails use a per-id lane that survives a
+        # close/reopen overlap.  The lane never owns lifecycle state: callers
+        # retain it briefly under ``_lock``, then run storage and callbacks
+        # with only the lane held.  Entries disappear once no live workstream
+        # and no running tail references them, so the map is bounded by live
+        # and actively-unwinding workstreams.
+        self._state_tail_locks: dict[str, threading.Lock] = {}
+        self._state_tail_users: dict[str, int] = {}
+        self._state_incarnation = 0
+        # IDs removed for capacity remain unavailable until their terminal
+        # cleanup/event tail completes. This closes the pop→same-id-open ABA
+        # without holding the global manager lock over callbacks.
+        self._retiring_ids: set[str] = set()
         # Per-ws_id refcounted locks serializing concurrent lazy
         # rehydrate of the same ws_id. Ported from
         # ``CoordinatorManager._open_locks``: without refcounting, a
         # third arrival could allocate a fresh lock for the same ws_id
         # and defeat serialization on the failure path.
-        self._open_locks: dict[str, tuple[threading.Lock, int]] = {}
+        self._open_locks: dict[str, tuple[threading.RLock, int]] = {}
         # CLI REPL focus state. The web UI tracks active tab itself;
         # the CLI uses these for ``/switch`` / ``/next``. Coordinator
         # manager never reads them.
@@ -302,11 +337,14 @@ class SessionManager:
         with self._lock:
             if self._active_id is None:
                 return None
-            return self._workstreams.get(self._active_id)
+            ws = self._workstreams.get(self._active_id)
+            if ws is not None and self._pending_creates.get(ws.id) is ws:
+                return None
+            return ws
 
     def switch(self, ws_id: str) -> Workstream | None:
         with self._lock:
-            if ws_id in self._workstreams:
+            if ws_id in self._workstreams and ws_id not in self._pending_creates:
                 self._active_id = ws_id
                 return self._workstreams[ws_id]
         return None
@@ -314,8 +352,13 @@ class SessionManager:
     def switch_by_index(self, index: int) -> Workstream | None:
         """1-based index into the creation-order list."""
         with self._lock:
-            if 1 <= index <= len(self._order):
-                ws_id = self._order[index - 1]
+            visible = [
+                ws_id
+                for ws_id in self._order
+                if self._pending_creates.get(ws_id) is not self._workstreams.get(ws_id)
+            ]
+            if 1 <= index <= len(visible):
+                ws_id = visible[index - 1]
                 self._active_id = ws_id
                 return self._workstreams.get(ws_id)
         return None
@@ -323,8 +366,13 @@ class SessionManager:
     def index_of(self, ws_id: str) -> int:
         """1-based creation-order index of a workstream, or 0 if absent."""
         with self._lock:
+            visible = [
+                wid
+                for wid in self._order
+                if self._pending_creates.get(wid) is not self._workstreams.get(wid)
+            ]
             try:
-                return self._order.index(ws_id) + 1
+                return visible.index(ws_id) + 1
             except ValueError:
                 return 0
 
@@ -347,6 +395,43 @@ class SessionManager:
         project_id: str | None = None,
         persona: str = "",
         defer_emit_created: bool = False,
+        _fork_reservation: bool = False,
+        **extra_session_kwargs: Any,
+    ) -> Workstream:
+        """Create one workstream with an exact durable incarnation fence."""
+        return self._create_serialized(
+            user_id=user_id,
+            name=name,
+            skill=skill,
+            skill_id=skill_id,
+            skill_version=skill_version,
+            ws_id=ws_id,
+            model=model,
+            client_type=client_type,
+            parent_ws_id=parent_ws_id,
+            project_id=project_id,
+            persona=persona,
+            defer_emit_created=defer_emit_created,
+            _fork_reservation=_fork_reservation,
+            **extra_session_kwargs,
+        )
+
+    def _create_serialized(
+        self,
+        *,
+        user_id: str,
+        name: str = "",
+        skill: str | None = None,
+        skill_id: str = "",
+        skill_version: int = 0,
+        ws_id: str = "",
+        model: str | None = None,
+        client_type: str = "",
+        parent_ws_id: str | None = None,
+        project_id: str | None = None,
+        persona: str = "",
+        defer_emit_created: bool = False,
+        _fork_reservation: bool = False,
         **extra_session_kwargs: Any,
     ) -> Workstream:
         """Construct a new workstream, persist, and register.
@@ -362,10 +447,11 @@ class SessionManager:
         no idle workstream to evict — callers (HTTP handlers) translate
         this to 429.
 
-        ``defer_emit_created``: when ``True``, the ``emit_created`` call
-        on the configured event emitter is skipped. The caller takes
-        ownership of advertising the new workstream — typically by
-        calling :meth:`commit_create` after running additional
+        ``defer_emit_created``: when ``True``, the workstream is reserved and
+        fully constructed but hidden from ordinary lookup/list/open surfaces;
+        the ``emit_created`` call is skipped. The caller takes ownership of
+        advertising it — typically by calling :meth:`commit_create` after
+        running additional
         post-create work that might roll the create back (e.g. the
         Stage 2 ``create`` HTTP handler runs uploaded-attachment
         validation post-create and rolls the workstream back via
@@ -382,76 +468,218 @@ class SessionManager:
         slot is held forever (capacity leak). The HTTP handler bracket
         runs both terminations within a single request lifecycle.
         """
+        requested_ws_id = ws_id
         ws_id = ws_id or uuid.uuid4().hex
         effective_name = name or f"ws-{ws_id[:4]}"
+        # Every deferred create needs a durable incarnation fence: rollback,
+        # close and a storage clone must never delete or mutate a same-id row
+        # that another process registered after this reservation was retired.
+        # Every manager-created row gets a durable incarnation token. Deferred
+        # HTTP creates also remain in state=creating until commit publishes
+        # them, so cross-node open/delete cannot observe a half-built session.
+        fork_reservation_token = uuid.uuid4().hex
+        create_lane = self._acquire_open_lock(ws_id)
+        create_lane.acquire()
+        create_lane_released = False
 
-        with self._lock:
-            ws, evicted = self._reserve_and_install_locked(
+        def _release_create_lane() -> None:
+            nonlocal create_lane_released
+            if create_lane_released:
+                return
+            create_lane_released = True
+            create_lane.release()
+            self._release_open_lock(ws_id)
+
+        # Avoid allocating a UI or evicting an idle workstream for the common
+        # caller-chosen collision case. The insert result below is still the
+        # authoritative race-free reservation.
+        try:
+            if requested_ws_id and self._storage.get_workstream(ws_id) is not None:
+                raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} already exists")
+
+            ws, _evicted = self._reserve_and_install(
                 ws_id,
                 user_id=user_id,
                 name=effective_name,
                 parent_ws_id=parent_ws_id,
                 project_id=project_id,
                 persona=persona,
+                pending=True,
+                reservation_token=fork_reservation_token,
             )
-
-        if evicted is not None:
-            self._adapter.cleanup_ui(evicted)
-            if self._event_emitter is not None:
-                self._event_emitter.emit_closed(evicted.id, reason="evicted", name=evicted.name)
+        except BaseException:
+            _release_create_lane()
+            raise
 
         # Persist before session construction. Fail-closed: if the row
         # can't be written, the in-memory session would be invisible to
         # any lazy-rehydrate path and show up as "missing" after
         # restart — surface the storage failure now.
         try:
-            self._storage.register_workstream(
+            inserted = self._storage.register_workstream(
                 ws_id,
                 node_id=self._node_id,
                 user_id=user_id,
                 name=ws.name,
+                state="creating",
                 kind=self.kind,
                 parent_ws_id=parent_ws_id,
                 project_id=project_id,
                 persona=persona,
                 skill_id=skill_id,
                 skill_version=skill_version,
+                fork_reservation_token=fork_reservation_token,
             )
-        except Exception:
+            if inserted is False:
+                raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} already exists")
+        except BaseException:
             with self._lock:
                 self._remove_locked(ws_id)
+                if self._pending_creates.get(ws_id) is ws:
+                    self._pending_creates.pop(ws_id, None)
+            try:
+                self._adapter.cleanup_ui(ws)
+            except Exception:
+                log.warning(
+                    "session_mgr.create.register_failure_cleanup_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
+            _release_create_lane()
             raise
 
+        _release_create_lane()
+
+        built_session: Any | None = None
         try:
-            ws.session = self._adapter.build_session(
+            session_kwargs = dict(extra_session_kwargs)
+            session_kwargs["fork_reservation_token"] = fork_reservation_token
+            built_session = self._adapter.build_session(
                 ws,
                 skill=skill,
                 model=model,
                 client_type=client_type,
-                **extra_session_kwargs,
+                **session_kwargs,
             )
+            built_session._fork_reservation_token = fork_reservation_token
+
+            # Construction may block on provider/config/storage work. A
+            # terminal caller is allowed to retire the pending placeholder in
+            # that window, but the completed candidate must then be closed —
+            # never attach a live session to an object no longer owned by the
+            # manager registry.
+            with ws._lifecycle_lock, self._lock:
+                owned = (
+                    self._workstreams.get(ws_id) is ws and self._pending_creates.get(ws_id) is ws
+                )
+                if owned:
+                    ws.session = built_session
+            if not owned:
+                self._retire_built_session(built_session, ws_id)
+                built_session = None
+                raise RuntimeError(f"workstream {ws_id!r} was retired during construction")
         except Exception:
             # Release the slot so capacity isn't leaked, and call
             # cleanup_ui on the placeholder so any listener/lock state
             # the UI factory allocated is released. Storage row stays:
-            # the next open() on this ws_id retries construction.
-            self._adapter.cleanup_ui(ws)
-            with self._lock:
-                self._remove_locked(ws_id)
+            # the next open() on this ws_id retries construction. A pending
+            # fork is the exception: its HTTP rollback bracket was never
+            # entered, so remove exactly that durable reservation here.
+            with ws._lifecycle_lock:
+                with self._lock:
+                    owned = (
+                        self._workstreams.get(ws_id) is ws
+                        and self._pending_creates.get(ws_id) is ws
+                    )
+                    if owned:
+                        self._remove_locked(ws_id)
+                        self._pending_creates.pop(ws_id, None)
+                if owned:
+                    try:
+                        self._adapter.cleanup_ui(ws)
+                    except Exception:
+                        log.warning(
+                            "session_mgr.create.session_failure_cleanup_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
+            if built_session is not None and ws.session is not built_session:
+                self._retire_built_session(built_session, ws_id)
+            if owned and fork_reservation_token:
+                try:
+                    self._storage.delete_workstream_if_fork_reserved(
+                        ws_id,
+                        fork_reservation_token,
+                    )
+                except Exception:
+                    log.warning(
+                        "session_mgr.failed_fork_create_cleanup ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
             raise
 
         if not defer_emit_created:
-            # Mark fired BEFORE the actual emit so a concurrent
-            # ``discard`` can't observe ``False`` after the event
-            # already fanned out. The flag is observational (powers
-            # the discard warning); strict ordering relative to the
-            # event isn't load-bearing for fan-out correctness.
-            ws._emit_created_fired = True
-            if self._event_emitter is not None:
-                self._event_emitter.emit_created(ws)
+            try:
+                committed = self.commit_create(ws)
+            except BaseException:
+                self._rollback_direct_create(ws)
+                raise
+            if not committed:
+                self._rollback_direct_create(ws)
+                raise RuntimeError(f"workstream {ws_id!r} was retired during creation")
         return ws
 
-    def commit_create(self, ws: Workstream) -> None:
+    @staticmethod
+    def _retire_built_session(candidate: Any, ws_id: str) -> None:
+        """Best-effort retirement for a candidate that lost create ownership."""
+        if hasattr(candidate, "cancel"):
+            try:
+                candidate.cancel()
+            except Exception:
+                log.debug(
+                    "session_mgr.create_candidate_cancel_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
+        if hasattr(candidate, "close"):
+            try:
+                candidate.close()
+            except Exception:
+                log.debug(
+                    "session_mgr.create_candidate_close_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
+
+    def _rollback_direct_create(self, ws: Workstream) -> None:
+        """Best-effort exact rollback when immediate publication fails."""
+
+        def _delete_reserved() -> None:
+            try:
+                self._storage.delete_workstream_if_fork_reserved(
+                    ws.id,
+                    ws._fork_reservation_token,
+                )
+            except Exception:
+                log.warning(
+                    "session_mgr.direct_create_rollback_failed ws=%s",
+                    ws.id[:8],
+                    exc_info=True,
+                )
+
+        self.discard(
+            ws.id,
+            expected=ws,
+            after_release=_delete_reserved,
+        )
+
+    def commit_create(self, ws: Workstream) -> bool:
+        """Publish a deferred create on its stable per-id lifecycle lane."""
+        with self._id_lifecycle(ws.id):
+            return self._commit_create_serialized(ws)
+
+    def _commit_create_serialized(self, ws: Workstream) -> bool:
         """Fire the deferred ``emit_created`` event for ``ws``.
 
         Pairs with :meth:`create` called with
@@ -470,49 +698,129 @@ class SessionManager:
         broadcast somewhere").
 
         Caller-bug guard: under the manager lock, check that ``ws`` is
-        still tracked by this manager and that ``_emit_created_fired``
+        still the exact tracked pending reservation and that ``_emit_created_fired``
         is not already set. Either failure logs a warning and returns
         without firing the event — duplicate calls and calls after
         :meth:`discard` become safe no-ops. Symmetric to
         :meth:`discard`'s warning when invoked on an already-
         advertised workstream; together the two methods make the
-        deferred-create bracket robust against the obvious caller-
-        bug shapes.
+        deferred-create bracket robust against the obvious caller-bug shapes.
+        The bounded emitter runs in that same critical section so close/delete
+        can never publish a terminal event ahead of lifecycle birth.
         """
-        with self._lock:
-            if ws._emit_created_fired:
-                # Duplicate commit_create call. Could surface as a
-                # double ``ws_created`` on the wire if we proceeded;
-                # warn instead and bail.
-                log.warning(
-                    "session_mgr.commit_create.already_fired ws=%s",
-                    ws.id[:8] if ws.id else "",
-                )
-                return
-            tracked = self._workstreams.get(ws.id)
-            if tracked is not ws:
-                # Workstream was discarded (or never tracked, or
-                # replaced by a same-id reuse — which would be a
-                # different ws object). Firing emit_created for an
-                # untracked ws_id leaks a phantom ``ws_created`` to
-                # subscribers with no matching close. Warn + bail.
-                log.warning(
-                    "session_mgr.commit_create.untracked ws=%s",
-                    ws.id[:8] if ws.id else "",
-                )
-                return
-            # Both checks passed — flip the flag under the lock so a
-            # racing discard sees True before our emit completes
-            # outside the lock. (Manager lock is not held during the
-            # emit itself: emit_created on coord acquires its own
-            # locks for collector + children-registry updates and
-            # holding the manager lock during fan-out would couple
-            # the two unnecessarily.)
-            ws._emit_created_fired = True
-        if self._event_emitter is not None:
-            self._event_emitter.emit_created(ws)
+        # Per-object lifecycle serialization keeps the global manager lock out
+        # of adapter/listener callbacks. L→M is the sole acquisition order:
+        # terminal paths snapshot under M, release it, take L, then revalidate
+        # under M. A same-thread terminal callback sees the active flag and
+        # refuses instead of recursively retiring a half-published object.
+        with ws._lifecycle_lock:
+            with self._lock:
+                if ws._emit_created_fired:
+                    log.warning(
+                        "session_mgr.commit_create.already_fired ws=%s",
+                        ws.id[:8] if ws.id else "",
+                    )
+                    return False
+                tracked = self._workstreams.get(ws.id)
+                pending = self._pending_creates.get(ws.id)
+                if tracked is not ws or pending is not ws:
+                    log.warning(
+                        "session_mgr.commit_create.untracked ws=%s",
+                        ws.id[:8] if ws.id else "",
+                    )
+                    return False
+                ws._create_publication_active = True
+                ws._create_publication_thread = threading.get_ident()
 
-    def discard(self, ws_id: str) -> bool:
+            try:
+                published = self._storage.publish_deferred_create(
+                    ws.id,
+                    ws._fork_reservation_token,
+                )
+            except BaseException:
+                with self._lock:
+                    ws._create_publication_active = False
+                    ws._create_publication_thread = None
+                raise
+            if not published:
+                with self._lock:
+                    ws._create_publication_active = False
+                    ws._create_publication_thread = None
+                log.warning(
+                    "session_mgr.commit_create.reservation_lost ws=%s",
+                    ws.id[:8] if ws.id else "",
+                )
+                return False
+
+            with self._lock:
+                # Lifecycle serialization prevents a conforming terminal path
+                # from changing ownership between the durable CAS and this
+                # bounded publication phase.
+                if (
+                    self._workstreams.get(ws.id) is not ws
+                    or self._pending_creates.get(ws.id) is not ws
+                ):
+                    ws._create_publication_active = False
+                    ws._create_publication_thread = None
+                    return False
+                ws._emit_created_fired = True
+            try:
+                if self._event_emitter is not None:
+                    self._event_emitter.emit_created(ws)
+            except BaseException:
+                # Publication has already crossed the durable creating→idle
+                # CAS, so rolling the local object back would expose an idle
+                # durable row with no owning session. Production emitters are
+                # bounded and exception-isolated; isolate custom emitters here
+                # as well and complete the lifecycle transition.
+                log.warning(
+                    "session_mgr.commit_create.emit_failed ws=%s",
+                    ws.id[:8] if ws.id else "",
+                    exc_info=True,
+                )
+                with self._lock:
+                    ws._create_publication_active = False
+                    ws._create_publication_thread = None
+
+            with self._lock:
+                ws._create_publication_active = False
+                ws._create_publication_thread = None
+                if self._pending_creates.get(ws.id) is not ws:
+                    # No conforming terminal path can remove the reservation
+                    # while L is held. Treat a custom same-thread mutation as
+                    # a failed commit rather than exposing a phantom object.
+                    ws._emit_created_fired = False
+                    return False
+                self._pending_creates.pop(ws.id, None)
+                if self._active_id is None:
+                    self._active_id = ws.id
+            return True
+
+    def discard(
+        self,
+        ws_id: str,
+        *,
+        expected: Workstream | None = None,
+        before_release: Callable[[], None] | None = None,
+        after_release: Callable[[], None] | None = None,
+    ) -> bool:
+        """Discard one pending incarnation on its per-id lifecycle lane."""
+        with self._id_lifecycle(ws_id):
+            return self._discard_serialized(
+                ws_id,
+                expected=expected,
+                before_release=before_release,
+                after_release=after_release,
+            )
+
+    def _discard_serialized(
+        self,
+        ws_id: str,
+        *,
+        expected: Workstream | None = None,
+        before_release: Callable[[], None] | None = None,
+        after_release: Callable[[], None] | None = None,
+    ) -> bool:
         """Release a workstream's in-memory slot WITHOUT firing ``emit_closed``.
 
         Use after :meth:`create` was called with
@@ -544,8 +852,8 @@ class SessionManager:
         surfaces.
 
         Logs a ``warning`` when the workstream's
-        ``_emit_created_fired`` flag is set — that means the
-        workstream was already advertised to lifecycle subscribers
+        ``_emit_created_fired`` flag is set and an event emitter exists — that
+        means the workstream was already advertised to lifecycle subscribers
         (either created without ``defer_emit_created`` or committed
         via :meth:`commit_create`), and discarding now leaves a stale
         ``ws_created`` on the wire with no matching ``ws_closed``.
@@ -555,37 +863,97 @@ class SessionManager:
         was advertised and now needs to be retracted.
         """
         with self._lock:
-            ws = self._workstreams.pop(ws_id, None)
-            if ws is None:
+            tracked = self._workstreams.get(ws_id)
+            pending = self._pending_creates.get(ws_id)
+            if expected is not None and (tracked is not expected or pending is not expected):
                 return False
-            if ws_id in self._order:
-                self._order.remove(ws_id)
-            if self._active_id == ws_id:
-                self._active_id = self._order[0] if self._order else None
-        if ws._emit_created_fired:
-            # Caller-bug path: the workstream was already advertised
-            # via ``emit_created`` — a clean rollback would need
-            # ``close`` (which fires ``emit_closed``) to retract the
-            # advertisement, not ``discard``. Surface the misuse so
-            # operators / future contributors can find the call site
-            # via the log line; we still complete the in-memory
-            # release so the slot is freed.
-            log.warning(
-                "session_mgr.discard.after_emit_created ws=%s",
-                ws_id[:8] if ws_id else "",
-            )
+            candidate = expected or tracked or pending
+            if candidate is None:
+                return False
+            if (
+                candidate._create_publication_active
+                and candidate._create_publication_thread == threading.get_ident()
+            ):
+                return False
+
+        # L→M is the only nested lifecycle order. A concurrent commit holds L
+        # through birth publication; after it releases, the exact-pending check
+        # below makes an HTTP rollback a harmless no-op.
+        with candidate._lifecycle_lock:
+            with self._lock:
+                tracked = self._workstreams.get(ws_id)
+                pending = self._pending_creates.get(ws_id)
+                if expected is not None and (tracked is not expected or pending is not expected):
+                    return False
+                ws = tracked if tracked is candidate else None
+                owned_pending = pending is candidate
+                if ws is None and not owned_pending:
+                    return False
+
+            # Pending-upload cleanup must happen while this incarnation still
+            # owns the id. Releasing the manager slot first would let a same-id
+            # successor stage uploads that this rollback could erase.
+            if before_release is not None:
+                before_release()
+
+            with self._lock:
+                if self._workstreams.get(ws_id) is not candidate:
+                    return False
+                if expected is not None and self._pending_creates.get(ws_id) is not expected:
+                    return False
+                self._workstreams.pop(ws_id, None)
+                if self._pending_creates.get(ws_id) is candidate:
+                    self._pending_creates.pop(ws_id, None)
+                if ws_id in self._order:
+                    self._order.remove(ws_id)
+                if self._active_id == ws_id:
+                    self._active_id = self._first_visible_id_locked()
+                self._prune_state_tail_locked(
+                    ws_id,
+                    expected_lock=candidate._state_tail_lock,
+                )
+            if candidate._emit_created_fired and self._event_emitter is not None:
+                # Caller-bug path: the workstream was already advertised
+                # via ``emit_created`` — a clean rollback would need
+                # ``close`` (which fires ``emit_closed``) to retract the
+                # advertisement, not ``discard``. Surface the misuse so
+                # operators / future contributors can find the call site
+                # via the log line; we still complete the in-memory
+                # release so the slot is freed.
+                log.warning(
+                    "session_mgr.discard.after_emit_created ws=%s",
+                    ws_id[:8] if ws_id else "",
+                )
         # cleanup_ui runs OUTSIDE the manager lock to match
         # ``close``'s ordering — UI cleanup may join worker threads
         # or do other potentially-blocking work that must not hold
         # the slot-accounting mutex.
-        self._adapter.cleanup_ui(ws)
+        if candidate is not None:
+            try:
+                self._adapter.cleanup_ui(candidate)
+            except Exception:
+                # Rollback ownership has already been released. Cleanup is
+                # best-effort and must not hide the successful removal from
+                # the caller, which still owns deleting the durable row.
+                log.warning(
+                    "session_mgr.discard.cleanup_failed ws=%s",
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
+        if after_release is not None:
+            after_release()
         return True
 
     # ------------------------------------------------------------------
     # open — lazy rehydrate for a persisted workstream
     # ------------------------------------------------------------------
 
-    def open(self, ws_id: str) -> Workstream | None:
+    def open(
+        self,
+        ws_id: str,
+        *,
+        _incarnation_attempt: int = 0,
+    ) -> Workstream | None:
         """Rehydrate a persisted workstream on demand.
 
         Returns ``None`` when the row doesn't exist, doesn't match our
@@ -602,42 +970,54 @@ class SessionManager:
         try:
             with open_lock:
                 with self._lock:
+                    if ws_id in self._retiring_ids:
+                        return None
                     existing = self._workstreams.get(ws_id)
+                    if existing is not None and self._pending_creates.get(ws_id) is existing:
+                        return None
                     if existing is not None and existing.session is not None:
                         return existing
 
-                row = self._storage.get_workstream(ws_id)
+                # Bind every rehydrated object to the durable incarnation it
+                # represents. Legacy tokenless rows are assigned a private
+                # token atomically with this snapshot, so a later exact delete
+                # can reject a stale endpoint snapshot before mutating a
+                # same-id local successor.
+                incarnation_snapshot = getattr(
+                    self._storage,
+                    "ensure_workstream_incarnation_snapshot",
+                    None,
+                )
+                if callable(incarnation_snapshot):
+                    row = incarnation_snapshot(ws_id)
+                else:
+                    incarnation_snapshot = None
+                    row = self._storage.get_workstream(ws_id)
                 if row is None or row.get("kind") != self.kind:
                     return None
                 # ``deleted`` is a tombstone — never resurrect.
                 # ``closed`` IS resurrectable; the Saved Workstreams
                 # landing makes restore an explicit user action, and
-                # ``_reserve_and_install_locked`` still enforces
+                # ``_reserve_and_install`` still enforces
                 # max_active (evicting an idle peer or raising).
-                if row.get("state") == "deleted":
+                if row.get("state") in {"creating", "deleted"}:
                     return None
 
-                with self._lock:
-                    # Re-check fast path — another thread may have raced
-                    # through the whole open while we checked storage.
-                    existing = self._workstreams.get(ws_id)
-                    if existing is not None and existing.session is not None:
-                        return existing
-                    ws, evicted = self._reserve_and_install_locked(
-                        ws_id,
-                        user_id=row.get("user_id") or "",
-                        name=row.get("name") or f"ws-{ws_id[:4]}",
-                        parent_ws_id=row.get("parent_ws_id"),
-                        project_id=row.get("project_id"),
-                        persona=row.get("persona") or "",
-                    )
-
-                if evicted is not None:
-                    self._adapter.cleanup_ui(evicted)
-                    if self._event_emitter is not None:
-                        self._event_emitter.emit_closed(
-                            evicted.id, reason="evicted", name=evicted.name
-                        )
+                # Re-check + capacity admission happen inside the helper. The
+                # per-id open lane prevents another opener for this id, while
+                # the helper serializes any victim incarnation exactly.
+                reservation_token = str(row.get("fork_reservation_token") or "")
+                if incarnation_snapshot is not None and not reservation_token:
+                    raise RuntimeError(f"workstream {ws_id!r} incarnation snapshot has no token")
+                ws, _evicted = self._reserve_and_install(
+                    ws_id,
+                    user_id=row.get("user_id") or "",
+                    name=row.get("name") or f"ws-{ws_id[:4]}",
+                    parent_ws_id=row.get("parent_ws_id"),
+                    project_id=row.get("project_id"),
+                    persona=row.get("persona") or "",
+                    reservation_token=reservation_token,
+                )
 
                 # Thread the persisted ``model_alias`` into
                 # ``build_session`` so reopened workstreams keep the
@@ -683,37 +1063,141 @@ class SessionManager:
                     extra_build_kwargs: dict[str, Any] = {}
                     if persona_snapshot is not None:
                         extra_build_kwargs["persona_snapshot"] = persona_snapshot
-                    ws.session = self._adapter.build_session(
-                        ws, model=saved_alias, **extra_build_kwargs
-                    )
+
+                    requested_alias = saved_alias
+                    for bind_attempt in range(self._REHYDRATE_BIND_ATTEMPTS):
+                        try:
+                            ws.session = self._adapter.build_session(
+                                ws,
+                                model=requested_alias,
+                                **extra_build_kwargs,
+                            )
+                        except ModelClientConstructionError:
+                            # The alias still exists but its client/provider is
+                            # broken.  Never reinterpret that operator-visible
+                            # construction cause as an alias-removal fallback.
+                            raise
+                        except UnknownModelAliasError as exc:
+                            # ModelRegistry's alias miss carries the concrete alias.
+                            # For a saved alias, require that exact alias.  For
+                            # ``model=None``, extract the concrete default the
+                            # factory raced on.  In both cases a fresh validator
+                            # miss is required before retrying; unrelated and
+                            # indeterminate failures remain visible.
+                            raced_alias = self._raced_unknown_alias(exc, requested_alias)
+                            if (
+                                raced_alias is None
+                                or not self._model_alias_disappeared(raced_alias)
+                                or bind_attempt + 1 >= self._REHYDRATE_BIND_ATTEMPTS
+                            ):
+                                raise
+                            self._log_model_alias_race(ws_id, raced_alias, "build")
+                            requested_alias = None
+                            continue
+
+                        # Validate the alias the factory ACTUALLY bound, not the
+                        # nullable persisted request.  A default build resolves
+                        # ``model=None`` to a concrete alias before construction;
+                        # a reload can retire that client in either side of
+                        # resume just like it can for an explicit saved alias.
+                        candidate_alias = self._rehydrate_candidate_alias(
+                            ws,
+                            requested_alias,
+                        )
+                        if self._model_alias_disappeared(candidate_alias):
+                            self._log_model_alias_race(
+                                ws_id,
+                                candidate_alias,
+                                "before_resume",
+                            )
+                            self._retire_rehydrate_candidate(ws)
+                            if bind_attempt + 1 >= self._REHYDRATE_BIND_ATTEMPTS:
+                                raise RuntimeError(
+                                    "model registry changed repeatedly while reopening "
+                                    f"workstream {ws_id!r}"
+                                )
+                            requested_alias = None
+                            continue
+
+                        if ws.session is not None and hasattr(ws.session, "resume"):
+                            ws.session.resume(ws_id)
+
+                        # ``resume`` may adopt a persisted alias that differs
+                        # from the factory candidate (notably when an alias
+                        # reappears between default construction and resume).
+                        # Validate the lane that will actually be returned.
+                        resumed_alias = self._rehydrate_candidate_alias(
+                            ws,
+                            candidate_alias,
+                        )
+                        if self._model_alias_disappeared(resumed_alias):
+                            self._log_model_alias_race(
+                                ws_id,
+                                resumed_alias,
+                                "during_resume",
+                            )
+                            self._retire_rehydrate_candidate(ws)
+                            if bind_attempt + 1 >= self._REHYDRATE_BIND_ATTEMPTS:
+                                raise RuntimeError(
+                                    "model registry changed repeatedly while reopening "
+                                    f"workstream {ws_id!r}"
+                                )
+                            requested_alias = None
+                            continue
+                        break
                 except Exception:
-                    # Clean up the UI the adapter built before re-raising
-                    # so any listener/lock resources are released.
-                    self._adapter.cleanup_ui(ws)
-                    with self._lock:
-                        self._remove_locked(ws_id)
+                    # Build/resume failures leave no usable session. Resume
+                    # can also have partially loaded history/config, so roll
+                    # back the reserved slot and run the adapter's full UI
+                    # cleanup.  The raced-candidate replacement above is the
+                    # only path that intentionally avoids cleanup_ui.
+                    self._retire_rehydrate_slot(ws)
                     raise
 
-                if ws.session is not None and hasattr(ws.session, "resume"):
-                    try:
-                        ws.session.resume(ws_id)
-                    except Exception:
-                        # Resume can leave the session in a partial state
-                        # (``ChatSession.resume`` assigns ``self.messages``
-                        # before the config-restore block, so a failure
-                        # mid-restore loads the conversation but with
-                        # default ``temperature`` / ``max_tokens`` /
-                        # tool config). Treating this as success would
-                        # silently 200 with broken state; the user's next
-                        # send would run with default config instead of
-                        # the persisted config. Roll the slot back so the
-                        # caller surfaces a 5xx and the storage row stays
-                        # available for a retry. Mirrors the
-                        # build_session-failure unwind above.
-                        self._adapter.cleanup_ui(ws)
-                        with self._lock:
-                            self._remove_locked(ws_id)
-                        raise
+                # Construction and resume perform multiple by-id storage
+                # reads outside the snapshot transaction. A remote
+                # delete/re-register in that window can otherwise produce a
+                # hybrid object (A's metadata/token with B's config/history).
+                # Re-read the private incarnation witness before this object
+                # is touched, advertised, or returned. An openable successor
+                # gets a bounded retry from its own fresh snapshot; a deleted
+                # or provisional row simply remains unavailable.
+                try:
+                    current_row = (
+                        incarnation_snapshot(ws_id)
+                        if incarnation_snapshot is not None
+                        else self._storage.get_workstream(ws_id)
+                    )
+                except BaseException:
+                    self._retire_rehydrate_slot(ws)
+                    raise
+                current_openable = (
+                    current_row is not None
+                    and current_row.get("kind") == self.kind
+                    and current_row.get("state") not in {"creating", "deleted"}
+                )
+                current_token = (
+                    str(current_row.get("fork_reservation_token") or "")
+                    if current_row is not None
+                    else ""
+                )
+                if not current_openable or current_token != reservation_token:
+                    self._retire_rehydrate_slot(ws)
+                    if not current_openable:
+                        return None
+                    if _incarnation_attempt + 1 >= self._REHYDRATE_INCARNATION_ATTEMPTS:
+                        raise RuntimeError(
+                            f"workstream incarnation changed repeatedly while reopening {ws_id!r}"
+                        )
+                    log.warning(
+                        "session_mgr.rehydrate_incarnation_raced ws=%s attempt=%d",
+                        ws_id[:8],
+                        _incarnation_attempt + 1,
+                    )
+                    return self.open(
+                        ws_id,
+                        _incarnation_attempt=_incarnation_attempt + 1,
+                    )
 
                 # No DB state-flip on resurrect. The in-memory session
                 # is IDLE; the DB row may still say 'closed' from the
@@ -742,11 +1226,108 @@ class SessionManager:
         finally:
             self._release_open_lock(ws_id)
 
-    def _acquire_open_lock(self, ws_id: str) -> threading.Lock:
+    def _model_alias_disappeared(self, alias: str | None) -> bool:
+        """Whether a fresh validator read proves *alias* is now absent.
+
+        Validator failure is not proof of removal.  Preserve the original
+        construction/resume outcome in that case rather than converting an
+        infrastructure error into a default-model retry.
+        """
+        validator = self._model_validator
+        if not alias or validator is None:
+            return False
+        try:
+            return not validator(alias)
+        except Exception:
+            log.debug(
+                "session_mgr.saved_alias_recheck_failed alias=%s",
+                alias,
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
+    def _raced_unknown_alias(
+        exc: UnknownModelAliasError,
+        requested_alias: str | None,
+    ) -> str | None:
+        """Return the registry alias when it matches the attempted binding."""
+        missing_alias = exc.alias
+        if requested_alias is not None and missing_alias != requested_alias:
+            return None
+        return missing_alias
+
+    @staticmethod
+    def _rehydrate_candidate_alias(ws: Workstream, requested_alias: str | None) -> str | None:
+        """Concrete alias bound by a candidate, with a legacy-adapter fallback."""
+        candidate = ws.session
+        if candidate is None:
+            return requested_alias
+        actual_alias = getattr(candidate, "model_alias", None)
+        return actual_alias if isinstance(actual_alias, str) and actual_alias else requested_alias
+
+    @staticmethod
+    def _log_model_alias_race(ws_id: str, alias: str | None, phase: str) -> None:
+        log.warning(
+            "session_mgr.stale_alias_raced ws=%s alias=%s phase=%s",
+            ws_id[:8],
+            alias,
+            phase,
+        )
+
+    @staticmethod
+    def _retire_rehydrate_candidate(ws: Workstream) -> None:
+        """Cancel/close a stale candidate without closing its Workstream or UI."""
+        candidate = ws.session
+        ws.session = None
+        if candidate is None:
+            return
+        if hasattr(candidate, "cancel"):
+            try:
+                candidate.cancel()
+            except Exception:
+                log.debug(
+                    "session_mgr.rehydrate_candidate_cancel_failed ws=%s",
+                    ws.id[:8],
+                    exc_info=True,
+                )
+        if hasattr(candidate, "close"):
+            try:
+                candidate.close()
+            except Exception:
+                # The coherent default still has to be constructed.  This is a
+                # best-effort resource retirement, not permission to broadcast
+                # a workstream close or abandon the reserved slot.
+                log.debug(
+                    "session_mgr.rehydrate_candidate_close_failed ws=%s",
+                    ws.id[:8],
+                    exc_info=True,
+                )
+
+    def _retire_rehydrate_slot(self, ws: Workstream) -> None:
+        """Cleanup and remove one exact failed rehydrate placeholder."""
+        try:
+            self._adapter.cleanup_ui(ws)
+        finally:
+            with self._lock:
+                if self._workstreams.get(ws.id) is ws:
+                    self._remove_locked(ws.id)
+
+    @contextlib.contextmanager
+    def _id_lifecycle(self, ws_id: str) -> Iterator[None]:
+        """Serialize all local incarnations of one logical workstream id."""
+        lifecycle_lock = self._acquire_open_lock(ws_id)
+        try:
+            with lifecycle_lock:
+                yield
+        finally:
+            self._release_open_lock(ws_id)
+
+    def _acquire_open_lock(self, ws_id: str) -> threading.RLock:
         with self._lock:
             entry = self._open_locks.get(ws_id)
             if entry is None:
-                lk = threading.Lock()
+                lk = threading.RLock()
                 self._open_locks[ws_id] = (lk, 1)
                 return lk
             lk, refs = entry
@@ -769,6 +1350,11 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     def delete(self, ws_id: str, *, name: str = "") -> bool:
+        """Retire live state on the stable per-id lifecycle lane."""
+        with self._id_lifecycle(ws_id):
+            return self._delete_serialized(ws_id, name=name)
+
+    def _delete_serialized(self, ws_id: str, *, name: str = "") -> bool:
         """Drop the in-memory slot if present + emit ``ws_closed`` with
         ``reason="deleted"`` so subscribers (cluster collector → coord
         adapter → child-tree UI) can drop the row.
@@ -796,71 +1382,320 @@ class SessionManager:
         capacity accounting.
         """
         with self._lock:
-            ws = self._workstreams.pop(ws_id, None)
-            if ws is not None:
-                if ws_id in self._order:
-                    self._order.remove(ws_id)
-                if self._active_id == ws_id:
-                    self._active_id = self._order[0] if self._order else None
-        if ws is not None:
-            # cleanup_ui outside the manager lock — mirrors the close()
-            # ordering so any blocking UI teardown can't pin the
-            # slot-accounting mutex.
-            self._adapter.cleanup_ui(ws)
-        if self._event_emitter is not None:
-            # Fall back to the workstream's name when the caller didn't
-            # snapshot one (the event payload's ``name`` field surfaces
-            # in operator toasts on real-node closures; coord-side
-            # ``child_ws_closed`` ignores it but the global queue
-            # consumers don't all do so).
-            event_name = name or (ws.name if ws is not None else "")
-            self._event_emitter.emit_closed(ws_id, reason="deleted", name=event_name)
-        return ws is not None
+            candidate = self._workstreams.get(ws_id) or self._pending_creates.get(ws_id)
+            if candidate is not None and (
+                candidate._create_publication_active
+                and candidate._create_publication_thread == threading.get_ident()
+            ):
+                return False
+
+        if candidate is None:
+            if self._event_emitter is not None:
+                self._event_emitter.emit_closed(ws_id, reason="deleted", name=name)
+            return False
+
+        with candidate._lifecycle_lock:
+            with self._lock:
+                if self._workstreams.get(ws_id) is not candidate:
+                    return False
+                was_unadvertised = self._pending_creates.get(ws_id) is candidate
+                candidate._lifecycle_terminal_active = True
+                self._retain_state_tail_locked(candidate)
+
+            with candidate._lock:
+                candidate._closed = True
+                candidate._state_revision += 1
+
+            try:
+                with candidate._state_tail_lock:
+                    if self._state_writer is not None:
+                        self._state_writer.discard(
+                            ws_id,
+                            tombstone=True,
+                            incarnation=candidate._state_incarnation,
+                        )
+
+                with self._lock:
+                    if self._workstreams.get(ws_id) is not candidate:
+                        candidate._lifecycle_terminal_active = False
+                        return False
+                    self._workstreams.pop(ws_id, None)
+                    if was_unadvertised:
+                        self._pending_creates.pop(ws_id, None)
+                    if ws_id in self._order:
+                        self._order.remove(ws_id)
+                    if self._active_id == ws_id:
+                        self._active_id = self._first_visible_id_locked()
+
+                # cleanup_ui outside the manager lock — mirrors close().
+                try:
+                    self._adapter.cleanup_ui(candidate)
+                except Exception:
+                    log.warning(
+                        "session_mgr.delete.cleanup_failed ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
+                if self._event_emitter is not None and not was_unadvertised:
+                    event_name = name or candidate.name
+                    self._event_emitter.emit_closed(
+                        ws_id,
+                        reason="deleted",
+                        name=event_name,
+                    )
+                return True
+            finally:
+                self._release_state_tail(candidate)
+
+    def delete_persisted(
+        self,
+        ws_id: str,
+        *,
+        delete_fn: Callable[[], bool],
+        name: str = "",
+        expected_reservation_token: str = "",
+    ) -> bool:
+        """Hard-delete one incarnation on the stable per-id lifecycle lane."""
+        with self._id_lifecycle(ws_id):
+            return self._delete_persisted_serialized(
+                ws_id,
+                delete_fn=delete_fn,
+                name=name,
+                expected_reservation_token=expected_reservation_token,
+            )
+
+    def _delete_persisted_serialized(
+        self,
+        ws_id: str,
+        *,
+        delete_fn: Callable[[], bool],
+        name: str = "",
+        expected_reservation_token: str = "",
+    ) -> bool:
+        """Delete durable + live state under one lifecycle admission.
+
+        The HTTP hard-delete path previously deleted the row and only then
+        retired the manager object. A deferred create could publish in that
+        gap and return success for a row that no longer existed. For a loaded
+        incarnation, hold its lifecycle lock across the storage delete and
+        exact-object retirement. Pending creates use their durable reservation
+        token, so a delete/re-register ABA cannot erase the replacement row.
+        """
+        with self._lock:
+            candidate = self._workstreams.get(ws_id) or self._pending_creates.get(ws_id)
+            if candidate is not None and (
+                candidate._create_publication_active
+                and candidate._create_publication_thread == threading.get_ident()
+            ):
+                return False
+
+        if candidate is None:
+            deleted = delete_fn()
+            if deleted and self._event_emitter is not None:
+                self._event_emitter.emit_closed(ws_id, reason="deleted", name=name)
+            return deleted
+
+        with candidate._lifecycle_lock:
+            with self._lock:
+                if self._workstreams.get(ws_id) is not candidate:
+                    return False
+                token_direction_needed = bool(
+                    expected_reservation_token
+                    and candidate._fork_reservation_token != expected_reservation_token
+                )
+
+            # The endpoint's authorized durable snapshot may have gone stale
+            # before it entered this manager's per-id lane, or this manager may
+            # still hold the predecessor of the endpoint's current row.
+            # Resolve that direction without the global manager mutex: the
+            # per-id + object lifecycle lanes stabilize ``candidate`` while a
+            # database row lock may legitimately block.
+            current_token = ""
+            if token_direction_needed:
+                current_row = self._storage.ensure_workstream_incarnation_snapshot(ws_id)
+                current_token = (
+                    str(current_row.get("fork_reservation_token") or "")
+                    if current_row is not None
+                    else ""
+                )
+
+            with self._lock:
+                if self._workstreams.get(ws_id) is not candidate:
+                    return False
+                # * durable == local: request is stale; leave local untouched
+                # * durable == expected: local is stale; retire it, then let
+                #   delete_fn conditionally delete the authorized successor
+                # * third/missing incarnation: request changed again; no-op
+                if token_direction_needed:
+                    if current_token == candidate._fork_reservation_token:
+                        return False
+                    if current_token != expected_reservation_token:
+                        return False
+                was_unadvertised = self._pending_creates.get(ws_id) is candidate
+                candidate._lifecycle_terminal_active = True
+                self._retain_state_tail_locked(candidate)
+
+            with candidate._lock:
+                candidate._closed = True
+                candidate._state_revision += 1
+
+            deleted = False
+            try:
+                # Stop new generation commits and drain every durability batch
+                # admitted before the terminal latch. Worker/send flags alone
+                # are insufficient: an accepted save_message closure can
+                # outlive both and otherwise recreate conversation rows after
+                # the workstream delete.
+                drain_durability = getattr(
+                    candidate.session,
+                    "shutdown_publication_and_drain_durability",
+                    None,
+                )
+                if callable(drain_durability):
+                    drain_durability()
+
+                # Drain every admitted predecessor state write before the hard
+                # delete. The per-id lifecycle lane prevents a successor from
+                # registering until this tail is fully tombstoned and the
+                # terminal event has published.
+                with candidate._state_tail_lock:
+                    if self._state_writer is not None:
+                        self._state_writer.discard(
+                            ws_id,
+                            tombstone=True,
+                            incarnation=candidate._state_incarnation,
+                        )
+                    deleted = delete_fn()
+
+                if not deleted:
+                    # Exact deletion can fail only when the durable row/token
+                    # no longer matches the authorized snapshot. This local
+                    # object is therefore a stale incarnation; reopening it
+                    # would leave the manager serving predecessor state over a
+                    # same-id replacement. Retire it silently (the replacement
+                    # was not deleted, so no terminal event is ours to emit).
+                    self._retire_failed_persisted_delete(candidate)
+                    return False
+
+                with self._lock:
+                    if self._workstreams.get(ws_id) is not candidate:
+                        # The id + object lifecycle lanes make this impossible
+                        # for conforming paths; never emit against a replacement.
+                        candidate._lifecycle_terminal_active = False
+                        return False
+                    self._workstreams.pop(ws_id, None)
+                    if self._pending_creates.get(ws_id) is candidate:
+                        self._pending_creates.pop(ws_id, None)
+                    if ws_id in self._order:
+                        self._order.remove(ws_id)
+                    if self._active_id == ws_id:
+                        self._active_id = self._first_visible_id_locked()
+
+                try:
+                    self._adapter.cleanup_ui(candidate)
+                except Exception:
+                    log.warning(
+                        "session_mgr.delete_persisted.cleanup_failed ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
+                if self._event_emitter is not None and not was_unadvertised:
+                    self._event_emitter.emit_closed(
+                        ws_id,
+                        reason="deleted",
+                        name=name or candidate.name,
+                    )
+                return True
+            except BaseException:
+                # The terminal claim and publication latch cannot safely be
+                # rolled back: a concurrent worker may already have observed
+                # them. Retire this exact local object without publishing a
+                # false deleted event; if the durable row survived, a later
+                # open rehydrates a fresh object/incarnation cleanly.
+                self._retire_failed_persisted_delete(candidate)
+                raise
+            finally:
+                self._release_state_tail(candidate)
+
+    def _retire_failed_persisted_delete(self, candidate: Workstream) -> None:
+        """Silently retire the exact object after a failed hard-delete."""
+        ws_id = candidate.id
+        retired = False
+        with self._lock:
+            if self._workstreams.get(ws_id) is candidate:
+                self._workstreams.pop(ws_id, None)
+                retired = True
+            if self._pending_creates.get(ws_id) is candidate:
+                self._pending_creates.pop(ws_id, None)
+            if ws_id in self._order:
+                self._order.remove(ws_id)
+            if self._active_id == ws_id:
+                self._active_id = self._first_visible_id_locked()
+        if not retired:
+            return
+        try:
+            self._adapter.cleanup_ui(candidate)
+        except Exception:
+            log.warning(
+                "session_mgr.delete_persisted.failed_cleanup ws=%s",
+                ws_id[:8],
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # close / set_state / close_idle
     # ------------------------------------------------------------------
 
     def close(self, ws_id: str) -> bool:
+        """Soft-close one incarnation on the stable per-id lifecycle lane."""
+        with self._id_lifecycle(ws_id):
+            return self._close_serialized(ws_id)
+
+    def _close_serialized(self, ws_id: str) -> bool:
         """Soft-close: unload from memory + mark state=closed in storage.
 
         Returns ``True`` when a live workstream was removed,
         ``False`` if the id wasn't tracked.
         """
         with self._lock:
-            ws = self._workstreams.pop(ws_id, None)
+            ws = self._workstreams.get(ws_id)
             if ws is None:
                 return False
-            if ws_id in self._order:
-                self._order.remove(ws_id)
-            if self._active_id == ws_id:
-                self._active_id = self._order[0] if self._order else None
+            if (
+                ws._create_publication_active
+                and ws._create_publication_thread == threading.get_ident()
+            ):
+                return False
 
-        self._adapter.cleanup_ui(ws)
-        # Serialize the storage write against any in-flight set_state
-        # via ws._lock. Setting ``_closed`` inside the lock makes the
-        # close visible to set_state before we release — any set_state
-        # that acquires ws._lock after us sees _closed=True and skips
-        # its storage write. ``state_writer.discard`` (when present)
-        # drops any pending buffered transient AND waits for any
-        # in-flight flush, so a late-flushing 'running' can't land in
-        # storage AFTER our sync 'closed' write and resurrect the
-        # closed row.
-        with ws._lock:
-            ws._closed = True
-            if self._state_writer is not None:
-                self._state_writer.discard(ws_id)
+        with ws._lifecycle_lock:
+            with self._lock:
+                if self._workstreams.get(ws_id) is not ws:
+                    return False
+                self._workstreams.pop(ws_id, None)
+                was_unadvertised = self._pending_creates.get(ws_id) is ws
+                if was_unadvertised:
+                    self._pending_creates.pop(ws_id, None)
+                self._retain_state_tail_locked(ws)
+                if ws_id in self._order:
+                    self._order.remove(ws_id)
+                if self._active_id == ws_id:
+                    self._active_id = self._first_visible_id_locked()
+
+            # Publish the in-memory tombstone immediately. Storage and cleanup
+            # may block, but unrelated workstreams and manager lookups do not.
+            with ws._lock:
+                ws._closed = True
+                ws._state_revision += 1
             try:
-                self._storage.update_workstream_state(ws_id, "closed")
-            except Exception:
-                log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
-            try:
-                self._storage.delete_workstream_override(ws_id)
-            except Exception:
-                log.debug("session_mgr.override_delete_failed ws=%s", ws_id[:8], exc_info=True)
-        if self._event_emitter is not None:
-            self._event_emitter.emit_closed(ws_id, name=ws.name)
-        return True
+                self._adapter.cleanup_ui(ws)
+            finally:
+                if was_unadvertised and ws._fork_reservation_token:
+                    self._delete_unadvertised_fork(ws)
+                else:
+                    self._persist_closed_state(ws)
+            if self._event_emitter is not None and not was_unadvertised:
+                self._event_emitter.emit_closed(ws_id, name=ws.name)
+            return True
 
     def set_state(
         self,
@@ -868,42 +1703,299 @@ class SessionManager:
         state: WorkstreamState,
         error_msg: str = "",
     ) -> None:
-        """Update a workstream's state + fire the adapter's state event.
+        """Update state, then persist and publish on the workstream tail lane."""
+        admitted = self._admit_state_change(ws_id, state, error_msg)
+        if admitted is None:
+            return
+        ws, revision = admitted
+        self._run_state_tail(ws, revision, state)
 
-        Serializes against ``close()`` via ``ws._lock``: if close ran
-        first, it set ``ws._closed=True`` and wrote ``state='closed'``
-        to storage under the same lock — set_state sees the tombstone
-        and skips its own write to avoid resurrecting a closed row.
+    def set_state_deferred(
+        self,
+        ws_id: str,
+        state: WorkstreamState,
+        *,
+        deferred_persistence: list[Callable[[], None]],
+        error_msg: str = "",
+        after_persist: Callable[[], None] | None = None,
+        owner_valid: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Mutate live state now; defer durable and observer publication.
+
+        Generation-owned session commits use this split form so the short
+        lifecycle lock never spans a database flush or subscriber callback.
+        The deferred closure rechecks the workstream tombstone under
+        ``ws._lock``: a close that wins after live admission makes the whole
+        delayed transition inert, including adapter/subscriber and optional
+        session-local publication.  Direct callers keep :meth:`set_state`'s
+        historical persist-before-publish ordering.
         """
+        if not self._owner_is_valid(owner_valid):
+            return False
+        admitted = self._admit_state_change(ws_id, state, error_msg)
+        if admitted is None:
+            return False
+        ws, revision = admitted
+
+        def _persist_then_publish() -> None:
+            published = self._run_state_tail(
+                ws,
+                revision,
+                state,
+                owner_valid=owner_valid,
+            )
+            if published and after_persist is not None:
+                after_persist()
+
+        deferred_persistence.append(_persist_then_publish)
+        return True
+
+    def _admit_state_change(
+        self,
+        ws_id: str,
+        state: WorkstreamState,
+        error_msg: str,
+    ) -> tuple[Workstream, int] | None:
+        """Apply the bounded in-memory half of one state transition."""
         with self._lock:
             ws = self._workstreams.get(ws_id)
             if ws is None:
-                return
+                return None
         with ws._lock:
             if ws._closed:
-                # close() already ran; don't overwrite 'closed' in
-                # storage with a lagging set_state write.
-                return
-            ws.state = state
-            ws.last_active = time.monotonic()
-            ws.error_message = error_msg
-            # Terminal ERROR transitions flush sync — error-surfacing
-            # paths (dashboard, audit) must observe the row durably
-            # before any caller sees the state-change event. Non-
-            # terminal transitions buffer through state_writer so we
-            # don't hold ws._lock across a Postgres round-trip.
-            if self._state_writer is not None:
-                self._state_writer.record(
-                    ws_id,
-                    state.value,
-                    flush_now=(state is WorkstreamState.ERROR),
+                return None
+            self._apply_live_state(ws, state, error_msg)
+            revision = ws._state_revision
+        return ws, revision
+
+    @staticmethod
+    def _apply_live_state(
+        ws: Workstream,
+        state: WorkstreamState,
+        error_msg: str,
+    ) -> None:
+        ws.state = state
+        ws.last_active = time.monotonic()
+        ws.error_message = error_msg
+        ws._state_revision += 1
+
+    def _persist_state(self, ws: Workstream, state: WorkstreamState) -> None:
+        """Persist one accepted state without any lifecycle lock held."""
+        if self._state_writer is not None:
+            self._state_writer.record(
+                ws.id,
+                state.value,
+                flush_now=(state is WorkstreamState.ERROR),
+                incarnation=ws._state_incarnation,
+            )
+            return
+        try:
+            self._storage.update_workstream_state(ws.id, state.value)
+        except Exception:
+            log.debug(
+                "session_mgr.state_update_failed ws=%s",
+                ws.id[:8],
+                exc_info=True,
+            )
+
+    def _run_state_tail(
+        self,
+        ws: Workstream,
+        revision: int,
+        state: WorkstreamState,
+        *,
+        owner_valid: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Run storage + observers in the shared per-id serial lane.
+
+        A tail that has not started may be overtaken and becomes a cheap
+        no-op.  Once a tail starts, close and successor tails wait for it, so
+        storage and publication cannot reorder across direct/deferred callers
+        or an ABA reopen.  Only the lane lock spans storage/callbacks; manager,
+        workstream, and ChatSession generation locks never do.
+        """
+        if not self._retain_current_state_tail(ws):
+            return False
+        try:
+            with ws._state_tail_lock:
+                if not self._owner_is_valid(owner_valid) or not self._state_is_current(
+                    ws,
+                    revision,
+                ):
+                    return False
+                self._persist_state(ws, state)
+                if not self._owner_is_valid(owner_valid) or not self._state_is_current(
+                    ws,
+                    revision,
+                ):
+                    return False
+
+                # This current-revision check is the publication
+                # linearization.  Preparing the coordinator payload may
+                # destructively drain terminal content, so stale revisions
+                # never reach it.  A successor admitted after this point waits
+                # on the same lane before its own tail can publish.
+                event_publish = self._prepare_state_event(ws, state)
+                if not self._owner_is_valid(owner_valid):
+                    return False
+                self._publish_state_change(
+                    ws,
+                    state,
+                    event_publish=event_publish,
+                )
+                return True
+        finally:
+            self._release_state_tail(ws)
+
+    @staticmethod
+    def _owner_is_valid(owner_valid: Callable[[], bool] | None) -> bool:
+        if owner_valid is None:
+            return True
+        try:
+            return owner_valid()
+        except Exception:
+            log.debug("session_mgr.state_owner_check_failed", exc_info=True)
+            return False
+
+    def _state_is_current(self, ws: Workstream, revision: int) -> bool:
+        with self._lock:
+            if self._workstreams.get(ws.id) is not ws:
+                return False
+        with ws._lock:
+            return not ws._closed and ws._state_revision == revision
+
+    def _retain_current_state_tail(self, ws: Workstream) -> bool:
+        with self._lock:
+            if self._workstreams.get(ws.id) is not ws:
+                return False
+            self._retain_state_tail_locked(ws)
+            return True
+
+    def _retain_state_tail_locked(self, ws: Workstream) -> None:
+        """Retain ``ws``'s lane. Caller owns the manager lock."""
+        self._state_tail_locks.setdefault(ws.id, ws._state_tail_lock)
+        self._state_tail_users[ws.id] = self._state_tail_users.get(ws.id, 0) + 1
+
+    def _release_state_tail(self, ws: Workstream) -> None:
+        with self._lock:
+            users = self._state_tail_users.get(ws.id, 0)
+            if users <= 1:
+                self._state_tail_users.pop(ws.id, None)
+                self._prune_state_tail_locked(
+                    ws.id,
+                    expected_lock=ws._state_tail_lock,
                 )
             else:
+                self._state_tail_users[ws.id] = users - 1
+
+    def _prune_state_tail_locked(
+        self,
+        ws_id: str,
+        *,
+        expected_lock: threading.Lock | None = None,
+    ) -> None:
+        """Drop an unused per-id state lane. Caller owns manager lock."""
+        if (
+            ws_id in self._workstreams
+            or ws_id in self._pending_creates
+            or self._state_tail_users.get(ws_id, 0) > 0
+        ):
+            return
+        current = self._state_tail_locks.get(ws_id)
+        if expected_lock is not None and current is not expected_lock:
+            return
+        self._state_tail_locks.pop(ws_id, None)
+
+    def _persist_closed_state(self, ws: Workstream) -> None:
+        """Write the terminal row after all predecessor tails finish."""
+        try:
+            with ws._state_tail_lock:
+                if self._state_writer is not None:
+                    self._state_writer.discard(
+                        ws.id,
+                        tombstone=True,
+                        incarnation=ws._state_incarnation,
+                    )
                 try:
-                    self._storage.update_workstream_state(ws_id, state.value)
+                    self._storage.update_workstream_state(ws.id, "closed")
                 except Exception:
-                    log.debug("session_mgr.state_update_failed ws=%s", ws_id[:8], exc_info=True)
-        if self._event_emitter is not None:
+                    log.debug(
+                        "session_mgr.state_update_failed ws=%s",
+                        ws.id[:8],
+                        exc_info=True,
+                    )
+                try:
+                    self._storage.delete_workstream_override(ws.id)
+                except Exception:
+                    log.debug(
+                        "session_mgr.override_delete_failed ws=%s",
+                        ws.id[:8],
+                        exc_info=True,
+                    )
+        finally:
+            self._release_state_tail(ws)
+
+    def _delete_unadvertised_fork(self, ws: Workstream) -> None:
+        """Delete a pending fork only while its durable fence is still ours."""
+        try:
+            with ws._state_tail_lock:
+                if self._state_writer is not None:
+                    self._state_writer.discard(
+                        ws.id,
+                        tombstone=True,
+                        incarnation=ws._state_incarnation,
+                    )
+                try:
+                    deleted = self._storage.delete_workstream_if_fork_reserved(
+                        ws.id,
+                        ws._fork_reservation_token,
+                    )
+                    if not deleted:
+                        log.debug(
+                            "session_mgr.pending_fork_delete_lost_reservation ws=%s",
+                            ws.id[:8],
+                        )
+                except Exception:
+                    # Never fall back to delete-by-id: a replacement durable
+                    # row may now own this caller-known workstream id.
+                    log.warning(
+                        "session_mgr.pending_fork_delete_failed ws=%s",
+                        ws.id[:8],
+                        exc_info=True,
+                    )
+        finally:
+            self._release_state_tail(ws)
+
+    def _prepare_state_event(
+        self,
+        ws: Workstream,
+        state: WorkstreamState,
+    ) -> Callable[[], None] | None:
+        """Capture an immutable adapter payload for a deferred transition."""
+        if self._event_emitter is None:
+            return None
+        prepare = getattr(self._event_emitter, "prepare_state_event", None)
+        if prepare is not None:
+            prepared = prepare(ws, state)
+
+            def _publish_prepared() -> None:
+                prepared()
+
+            return _publish_prepared
+        # Compatibility for external emitters whose contract is state-only.
+        return functools.partial(self._event_emitter.emit_state, ws, state)
+
+    def _publish_state_change(
+        self,
+        ws: Workstream,
+        state: WorkstreamState,
+        *,
+        event_publish: Callable[[], None] | None = None,
+    ) -> None:
+        """Emit the bounded adapter/subscriber half of a state transition."""
+        if event_publish is not None:
+            event_publish()
+        elif self._event_emitter is not None:
             self._event_emitter.emit_state(ws, state)
         # Snapshot under the subscribers lock so concurrent
         # subscribe / unsubscribe can't shift the iterator's index
@@ -914,7 +2006,7 @@ class SessionManager:
             subscribers = list(self._state_subscribers)
         for callback in subscribers:
             with contextlib.suppress(Exception):
-                callback(ws_id, state)
+                callback(ws.id, state)
 
     # ------------------------------------------------------------------
     # State-change subscription
@@ -951,10 +2043,86 @@ class SessionManager:
                 ws.session.cancel()
             except Exception:
                 log.debug("session_mgr.cancel_failed ws=%s", ws_id[:8], exc_info=True)
-        if ws.ui is not None and hasattr(ws.ui, "resolve_approval"):
+        if ws.ui is not None:
+            resolve_all = getattr(ws.ui, "resolve_all_approvals", None)
+            resolve_one = getattr(ws.ui, "resolve_approval", None)
             with contextlib.suppress(Exception):
-                ws.ui.resolve_approval(False, "cancelled")
+                if callable(resolve_all):
+                    resolve_all(False, "cancelled")
+                elif callable(resolve_one):
+                    # Compatibility for older/minimal UI implementations.
+                    resolve_one(False, "cancelled")
         return True
+
+    def reap_stale_creating_reservations(
+        self,
+        max_age_seconds: float = STALE_CREATE_GRACE_SECONDS,
+    ) -> list[str]:
+        """Hard-delete crash-abandoned hidden create reservations.
+
+        This maintenance is independent from :meth:`close_idle`: disabling
+        idle eviction must not disable recovery of caller-known ids stranded by
+        a process death. The backend owns the atomic state/age/incarnation
+        check and complete dependent cleanup; this layer supplies the current
+        manager snapshot plus cluster liveness.
+
+        The current process's ``node_id`` is intentionally not treated as a
+        live-owner exemption by the backend. Stable ids (notably ``console``
+        and configured ``TURNSTONE_NODE_ID`` values) survive process restarts,
+        so an old reservation bearing our id must become reclaimable. Every
+        workstream presently loaded by this manager, including pending creates,
+        is excluded, and the age grace protects a create admitted just after
+        the snapshot.
+
+        Liveness or storage uncertainty fails closed and returns no ids.
+        """
+        service_type = self._service_type
+        if service_type is None:
+            log.debug(
+                "session_mgr.stale_create_reap_no_service_type kind=%s",
+                self.kind.value,
+            )
+            return []
+        with self._lock:
+            loaded = list(self._workstreams.keys())
+        try:
+            live_services = self._storage.list_services(service_type)
+            live_node_ids = [
+                str(service["service_id"]) for service in live_services if service.get("service_id")
+            ]
+        except Exception:
+            log.debug(
+                "session_mgr.stale_create_reap_liveness_failed kind=%s",
+                self.kind.value,
+                exc_info=True,
+            )
+            return []
+
+        cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        try:
+            reaped = self._storage.delete_stale_creating_reservations(
+                self.kind,
+                cutoff,
+                loaded,
+                live_node_ids=live_node_ids,
+                local_node_id=self._node_id,
+            )
+        except Exception:
+            log.debug(
+                "session_mgr.stale_create_reap_failed kind=%s",
+                self.kind.value,
+                exc_info=True,
+            )
+            return []
+        if reaped:
+            log.info(
+                "session_mgr.stale_create_reaped count=%d kind=%s",
+                len(reaped),
+                self.kind.value,
+            )
+        return reaped
 
     def close_idle(self, max_age_seconds: float) -> list[str]:
         """Close IDLE workstreams inactive for more than ``max_age_seconds``.
@@ -1006,45 +2174,19 @@ class SessionManager:
         ``self._lock`` — only a brief lock to snapshot loaded keys —
         so a slow UPDATE doesn't block create/get/set_state.
         """
-        now = time.monotonic()
-        popped: list[Workstream] = []
-        with self._lock:
-            # Collect candidate ids first to avoid mutating
-            # ``self._workstreams`` while iterating it.
-            victims = [
-                ws.id
-                for ws in self._workstreams.values()
-                if ws.state == WorkstreamState.IDLE and (now - ws.last_active) > max_age_seconds
-            ]
-            for ws_id in victims:
-                ws = self._close_if_idle_locked(ws_id)
-                if ws is not None:
-                    popped.append(ws)
-
         closed_ids: list[str] = []
-        for ws in popped:
-            self._adapter.cleanup_ui(ws)
-            # Mirrors ``close``: set ``ws._closed`` inside ws._lock
-            # before the storage write so any concurrent set_state sees
-            # the tombstone and skips its own write. ``state_writer.discard``
-            # drops any pending buffered transient + waits for any
-            # in-flight flush so the sync 'closed' write is the final
-            # one for this ws_id.
-            with ws._lock:
-                ws._closed = True
-                if self._state_writer is not None:
-                    self._state_writer.discard(ws.id)
-                try:
-                    self._storage.update_workstream_state(ws.id, "closed")
-                except Exception:
-                    log.debug("session_mgr.state_update_failed ws=%s", ws.id[:8], exc_info=True)
-                try:
-                    self._storage.delete_workstream_override(ws.id)
-                except Exception:
-                    log.debug("session_mgr.override_delete_failed ws=%s", ws.id[:8], exc_info=True)
-            if self._event_emitter is not None:
-                self._event_emitter.emit_closed(ws.id, name=ws.name)
-            closed_ids.append(ws.id)
+        now = time.monotonic()
+        with self._lock:
+            candidates = [
+                ws
+                for ws in self._workstreams.values()
+                if self._pending_creates.get(ws.id) is not ws
+            ]
+
+        for ws in candidates:
+            with self._id_lifecycle(ws.id):
+                if self._close_idle_candidate(ws, now, max_age_seconds):
+                    closed_ids.append(ws.id)
 
         # Pass 2: reap DB orphans of this kind older than the cutoff.
         # Snapshot loaded keys under self._lock briefly so a concurrent
@@ -1104,25 +2246,49 @@ class SessionManager:
         closed_ids.extend(orphans)
         return closed_ids
 
-    def _close_if_idle_locked(self, ws_id: str) -> Workstream | None:
-        """Pop the workstream atomically if it's still IDLE.
+    def _close_idle_candidate(
+        self,
+        ws: Workstream,
+        now: float,
+        max_age_seconds: float,
+    ) -> bool:
+        """Retire one still-idle, worker-free incarnation."""
+        # The id lane prevents a successor incarnation from publishing until
+        # this terminal tail and ws_closed event are complete. The object lock
+        # serializes with its own create publication/delete path. State and
+        # worker admission are owned by ``ws._lock`` rather than the manager
+        # lock, so revalidate both together and install the tombstone first.
+        with ws._lifecycle_lock:
+            with self._lock:
+                if self._workstreams.get(ws.id) is not ws or self._pending_creates.get(ws.id) is ws:
+                    return False
+            with ws._lock:
+                if (
+                    ws._closed
+                    or ws.state is not WorkstreamState.IDLE
+                    or ws._worker_running
+                    or (now - ws.last_active) <= max_age_seconds
+                ):
+                    return False
+                ws._closed = True
+                ws._state_revision += 1
+            with self._lock:
+                if self._workstreams.get(ws.id) is not ws:
+                    return False
+                self._workstreams.pop(ws.id, None)
+                if ws.id in self._order:
+                    self._order.remove(ws.id)
+                if self._active_id == ws.id:
+                    self._active_id = self._first_visible_id_locked()
+                self._retain_state_tail_locked(ws)
 
-        Caller must hold ``self._lock``. Returns the popped ws on
-        success, ``None`` if it wasn't IDLE or not tracked. Used by
-        :meth:`close_idle` so the state-check and pop happen under one
-        lock acquisition — a pending tool result can flip state to
-        RUNNING between an out-of-lock re-check and ``close`` picking
-        up ``self._lock`` again.
-        """
-        ws = self._workstreams.get(ws_id)
-        if ws is None or ws.state != WorkstreamState.IDLE:
-            return None
-        self._workstreams.pop(ws_id, None)
-        if ws_id in self._order:
-            self._order.remove(ws_id)
-        if self._active_id == ws_id:
-            self._active_id = self._order[0] if self._order else None
-        return ws
+            try:
+                self._adapter.cleanup_ui(ws)
+            finally:
+                self._persist_closed_state(ws)
+            if self._event_emitter is not None:
+                self._event_emitter.emit_closed(ws.id, name=ws.name)
+            return True
 
     # ------------------------------------------------------------------
     # Lookup
@@ -1130,18 +2296,25 @@ class SessionManager:
 
     def get(self, ws_id: str) -> Workstream | None:
         with self._lock:
-            return self._workstreams.get(ws_id)
+            ws = self._workstreams.get(ws_id)
+            if ws is not None and self._pending_creates.get(ws_id) is ws:
+                return None
+            return ws
 
     def list_all(self) -> list[Workstream]:
         """Return workstreams in creation order."""
         with self._lock:
-            return [self._workstreams[wid] for wid in self._order if wid in self._workstreams]
+            return [
+                self._workstreams[wid]
+                for wid in self._order
+                if wid in self._workstreams and wid not in self._pending_creates
+            ]
 
     # ------------------------------------------------------------------
-    # Internal — slot reservation (caller holds self._lock)
+    # Internal — slot reservation
     # ------------------------------------------------------------------
 
-    def _reserve_and_install_locked(
+    def _reserve_and_install(
         self,
         ws_id: str,
         *,
@@ -1150,53 +2323,197 @@ class SessionManager:
         parent_ws_id: str | None = None,
         project_id: str | None = None,
         persona: str = "",
+        pending: bool = False,
+        reservation_token: str = "",
     ) -> tuple[Workstream, Workstream | None]:
+        """Install one slot, retiring only an exact idle worker-free victim.
+
+        Capacity selection is merely a hint. The victim's stable per-id lane
+        and object lifecycle lock are acquired before state is revalidated and
+        a tombstone is claimed under ``ws._lock``. Worker admission uses that
+        same lock, so an IDLE workstream whose turn/command was admitted cannot
+        be evicted between the hint and the terminal claim.
+        """
+        while True:
+            with self._lock:
+                if ws_id in self._retiring_ids:
+                    raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} is retiring")
+                if ws_id in self._workstreams or ws_id in self._pending_creates:
+                    raise WorkstreamAlreadyExistsError(
+                        f"workstream {ws_id!r} already tracked by SessionManager"
+                    )
+                if len(self._workstreams) < self._max_active:
+                    ws = self._install_workstream_locked(
+                        ws_id,
+                        user_id=user_id,
+                        name=name,
+                        parent_ws_id=parent_ws_id,
+                        project_id=project_id,
+                        persona=persona,
+                        pending=pending,
+                        reservation_token=reservation_token,
+                    )
+                    return ws, None
+                candidates = sorted(
+                    (
+                        candidate
+                        for candidate in self._workstreams.values()
+                        if candidate.session is not None
+                        and self._pending_creates.get(candidate.id) is not candidate
+                        and not candidate._lifecycle_terminal_active
+                        and not candidate._closed
+                        and candidate.state is WorkstreamState.IDLE
+                        and not candidate._worker_running
+                        and not candidate.send_barrier_active()
+                    ),
+                    key=lambda candidate: candidate.last_active,
+                )
+            if not candidates:
+                raise RuntimeError(f"All {self._max_active} slots are active")
+
+            for victim in candidates:
+                install_exc: BaseException | None = None
+                with self._id_lifecycle(victim.id), victim._lifecycle_lock:
+                    with self._lock:
+                        if (
+                            self._workstreams.get(victim.id) is not victim
+                            or self._pending_creates.get(victim.id) is victim
+                            or victim._lifecycle_terminal_active
+                        ):
+                            continue
+                        victim._lifecycle_terminal_active = True
+
+                    with victim._lock:
+                        if (
+                            victim._closed
+                            or victim.state is not WorkstreamState.IDLE
+                            or victim._worker_running
+                            or victim.send_barrier_active()
+                        ):
+                            worker_free_idle = False
+                        else:
+                            worker_free_idle = True
+                            victim._closed = True
+                            victim._state_revision += 1
+                    if not worker_free_idle:
+                        with self._lock:
+                            victim._lifecycle_terminal_active = False
+                        continue
+
+                    with self._lock:
+                        if self._workstreams.get(victim.id) is not victim:
+                            victim._lifecycle_terminal_active = False
+                            restore_victim = True
+                        elif len(self._workstreams) < self._max_active:
+                            # Another terminal path freed a different slot while
+                            # we acquired this candidate. Do not over-evict.
+                            victim._lifecycle_terminal_active = False
+                            restore_victim = True
+                        else:
+                            restore_victim = False
+                            victim_order_index = (
+                                self._order.index(victim.id)
+                                if victim.id in self._order
+                                else len(self._order)
+                            )
+                            victim_was_active = self._active_id == victim.id
+                            self._workstreams.pop(victim.id, None)
+                            if victim.id in self._order:
+                                self._order.remove(victim.id)
+                            if victim_was_active:
+                                self._active_id = self._first_visible_id_locked()
+                            try:
+                                ws = self._install_workstream_locked(
+                                    ws_id,
+                                    user_id=user_id,
+                                    name=name,
+                                    parent_ws_id=parent_ws_id,
+                                    project_id=project_id,
+                                    persona=persona,
+                                    pending=pending,
+                                    reservation_token=reservation_token,
+                                )
+                            except BaseException as exc:
+                                # UI construction failed before the replacement
+                                # became observable. Restore the incumbent and
+                                # its order/focus exactly; it was not evicted.
+                                self._workstreams[victim.id] = victim
+                                self._order.insert(victim_order_index, victim.id)
+                                if victim_was_active:
+                                    self._active_id = victim.id
+                                victim._lifecycle_terminal_active = False
+                                restore_victim = True
+                                install_exc = exc
+                            else:
+                                self._retiring_ids.add(victim.id)
+                                self._retain_state_tail_locked(victim)
+                                self._eviction_count += 1
+                                try:
+                                    from turnstone.core.metrics import metrics as _m
+
+                                    _m.record_eviction()
+                                except Exception:
+                                    log.debug(
+                                        "session_mgr.metrics_eviction_failed",
+                                        exc_info=True,
+                                    )
+
+                    if restore_victim:
+                        with victim._lock:
+                            victim._closed = False
+                            victim._state_revision += 1
+                        if install_exc is not None:
+                            raise install_exc
+                        # Capacity changed under us; resnapshot rather than
+                        # retiring an unnecessary second workstream.
+                        break
+
+                    self._finish_eviction(victim)
+                    return ws, victim
+
+            # Every hinted candidate either admitted work or changed lifecycle
+            # before its exact claim. Recompute from current authoritative state.
+
+    def _install_workstream_locked(
+        self,
+        ws_id: str,
+        *,
+        user_id: str,
+        name: str,
+        parent_ws_id: str | None = None,
+        project_id: str | None = None,
+        persona: str = "",
+        pending: bool = False,
+        reservation_token: str = "",
+    ) -> Workstream:
         """Install a placeholder ``Workstream`` under ``self._lock``.
 
-        Ported from ``CoordinatorManager._reserve_and_install_locked``:
-        single-phase eviction, placeholders with ``session=None`` count
-        toward capacity but are never themselves eviction candidates
-        (a burst of concurrent creates must not evict each other —
-        that path silently exceeded max_active on the old WSM side).
+        Placeholders with ``session=None`` count toward capacity but are never
+        themselves eviction candidates (a burst of concurrent creates must not
+        evict each other). Victim admission is owned by
+        :meth:`_reserve_and_install`; this helper only performs the atomic
+        registry insertion once a slot is available or claimed.
 
         Caller MUST hold ``self._lock``. UI allocation is included in
         the locked path so concurrent ``get()`` never observes a
         placeholder with ``ui=None``; only ``session`` lags.
         """
-        if ws_id in self._workstreams:
+        if ws_id in self._workstreams or ws_id in self._pending_creates:
             # Defensive — create() uses a fresh uuid and open()
             # serializes on the per-ws lock which already bounces the
             # repeated install via the fast path.
-            raise RuntimeError(f"ws_id {ws_id[:8]!r} already tracked by SessionManager")
-
-        evicted: Workstream | None = None
-        if len(self._workstreams) >= self._max_active:
-            oldest: Workstream | None = None
-            for wid in self._order:
-                w = self._workstreams.get(wid)
-                if w is None or w.session is None:
-                    continue
-                if w.state == WorkstreamState.IDLE and (
-                    oldest is None or w.last_active < oldest.last_active
-                ):
-                    oldest = w
-            if oldest is None:
-                raise RuntimeError(f"All {self._max_active} slots are active")
-            self._workstreams.pop(oldest.id, None)
-            if oldest.id in self._order:
-                self._order.remove(oldest.id)
-            if self._active_id == oldest.id:
-                self._active_id = self._order[0] if self._order else None
-            self._eviction_count += 1
-            try:
-                from turnstone.core.metrics import metrics as _m
-
-                _m.record_eviction()
-            except Exception:
-                log.debug("session_mgr.metrics_eviction_failed", exc_info=True)
-            evicted = oldest
+            raise WorkstreamAlreadyExistsError(
+                f"workstream {ws_id!r} already tracked by SessionManager"
+            )
 
         ws = Workstream(id=ws_id, name=name)
+        state_tail_lock = self._state_tail_locks.get(ws_id)
+        if state_tail_lock is None:
+            state_tail_lock = threading.Lock()
+            self._state_tail_locks[ws_id] = state_tail_lock
+        self._state_incarnation += 1
+        ws._state_incarnation = self._state_incarnation
+        ws._state_tail_lock = state_tail_lock
         ws.kind = self.kind
         ws.user_id = user_id
         ws.parent_ws_id = parent_ws_id if parent_ws_id else None
@@ -1204,21 +2521,40 @@ class SessionManager:
         ws.persona = persona
         try:
             ws.ui = self._adapter.build_ui(ws)
-        except Exception:
-            # An IDLE peer may already have been popped above; if we
-            # propagate without unwinding, that peer leaks its session
-            # + worker + UI listeners and no ws_closed reaches
-            # subscribers.
-            if evicted is not None:
-                self._adapter.cleanup_ui(evicted)
-                if self._event_emitter is not None:
-                    self._event_emitter.emit_closed(evicted.id, reason="evicted", name=evicted.name)
+            if self._state_writer is not None:
+                self._state_writer.reopen(
+                    ws_id,
+                    incarnation=ws._state_incarnation,
+                )
+        except BaseException:
+            self._prune_state_tail_locked(
+                ws_id,
+                expected_lock=ws._state_tail_lock,
+            )
             raise
         self._workstreams[ws_id] = ws
         self._order.append(ws_id)
+        if reservation_token:
+            ws._fork_reservation_token = reservation_token
+        if pending:
+            self._pending_creates[ws_id] = ws
         if self._active_id is None:
             self._active_id = ws_id
-        return ws, evicted
+        if pending and self._active_id == ws_id:
+            self._active_id = self._first_visible_id_locked()
+        return ws
+
+    def _first_visible_id_locked(self) -> str | None:
+        """First advertised workstream id in creation order.
+
+        Caller holds ``self._lock``. Pending creates occupy capacity and order
+        slots but must never become CLI focus before lifecycle birth.
+        """
+        for ws_id in self._order:
+            ws = self._workstreams.get(ws_id)
+            if ws is not None and self._pending_creates.get(ws_id) is not ws:
+                return ws_id
+        return None
 
     def _remove_locked(self, ws_id: str) -> None:
         """Drop a (possibly-placeholder) workstream from tracking.
@@ -1227,8 +2563,57 @@ class SessionManager:
         session construction or persistence fails after slot
         reservation — the placeholder otherwise pins capacity forever.
         """
-        self._workstreams.pop(ws_id, None)
+        removed = self._workstreams.pop(ws_id, None)
+        if self._pending_creates.get(ws_id) is removed:
+            self._pending_creates.pop(ws_id, None)
         if ws_id in self._order:
             self._order.remove(ws_id)
         if self._active_id == ws_id:
-            self._active_id = self._order[0] if self._order else None
+            self._active_id = self._first_visible_id_locked()
+        self._prune_state_tail_locked(ws_id)
+
+    def _finish_eviction(self, ws: Workstream) -> None:
+        """Complete one already-reserved eviction and release its id fence."""
+        try:
+            # Drain every predecessor state tail after the live tombstone. A
+            # buffered writer is tombstoned for this in-memory incarnation but
+            # the durable row deliberately remains reopenable at its last state.
+            try:
+                with ws._state_tail_lock:
+                    if self._state_writer is not None:
+                        self._state_writer.discard(
+                            ws.id,
+                            tombstone=True,
+                            incarnation=ws._state_incarnation,
+                        )
+            except Exception:
+                log.warning(
+                    "session_mgr.eviction_state_tail_failed ws=%s",
+                    ws.id[:8],
+                    exc_info=True,
+                )
+            try:
+                self._adapter.cleanup_ui(ws)
+            except Exception:
+                log.warning(
+                    "session_mgr.eviction_cleanup_failed ws=%s",
+                    ws.id[:8],
+                    exc_info=True,
+                )
+            if self._event_emitter is not None:
+                try:
+                    self._event_emitter.emit_closed(
+                        ws.id,
+                        reason="evicted",
+                        name=ws.name,
+                    )
+                except Exception:
+                    log.warning(
+                        "session_mgr.eviction_emit_failed ws=%s",
+                        ws.id[:8],
+                        exc_info=True,
+                    )
+        finally:
+            with self._lock:
+                self._retiring_ids.discard(ws.id)
+            self._release_state_tail(ws)

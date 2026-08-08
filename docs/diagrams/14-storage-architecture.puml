@@ -1,170 +1,191 @@
 @startuml
 !theme plain
-title Turnstone — Storage Architecture
+title Turnstone — Storage, Deferred Create, Fork, and Checkpoint Architecture
 
 skinparam class {
     BackgroundColor<<protocol>> #E8EAF6
     BackgroundColor<<sqlite>> #C8E6C9
     BackgroundColor<<postgres>> #B3E5FC
-    BackgroundColor<<facade>> #FFF9C4
-    BackgroundColor<<migration>> #FFE0B2
+    BackgroundColor<<lifecycle>> #FFF9C4
     BackgroundColor<<schema>> #F3E5F5
+    BackgroundColor<<helper>> #FFE0B2
 }
 
-' -- Protocol --
-interface "StorageBackend" as SB <<protocol>> {
-    +save_message(ws_id, role, content, ...)
-    +load_messages(ws_id) → list[dict]
-    +register_workstream(ws_id, node_id, name, state)
-    +update_workstream_state(ws_id, state)
-    +update_workstream_name(ws_id, name)
-    +set_workstream_alias(ws_id, alias) → bool
-    +update_workstream_title(ws_id, title)
-    +resolve_workstream(alias_or_id) → str | None
-    +delete_workstream(ws_id) → bool
-    +prune_workstreams(retention_days) → (int, int)
-    +list_workstreams(node_id, limit, *, parent_ws_id, kind, user_id) → list
-    +save_workstream_config(ws_id, config)
-    +load_workstream_config(ws_id) → dict
-    +kv_get(key) → str | None
-    +kv_set(key, value) → str | None
-    +kv_delete(key) → bool
-    +kv_list() → list[(str, str)]
-    +kv_search(query) → list[(str, str)]
-    +search_history(query, limit) → list
-    +search_history_recent(limit) → list
-    +create_user(user_id, username, display_name, pw_hash)
-    +get_user(user_id) / get_user_by_username(username)
-    +list_users() / delete_user(user_id)
-    +create_api_token(...) / get_api_token_by_hash(hash)
-    +list_api_tokens(user_id) / delete_api_token(id)
-    +close()
-}
-
-' -- Backends --
-class "SQLiteBackend" as SQLite <<sqlite>> {
-    -_engine: sa.Engine
-    -_fts5_available: bool
-    +__init__(path: str)
+interface "StorageBackend" as Storage <<protocol>> {
+    + load_message_turns(ws_id, checkpointed=True) → list[Turn]
+    + save_message(ws_id, role, content, metadata...)
+    + clone_workstream(source, destination, principal, expected_session) → ForkCloneSnapshot
     --
-    FTS5 full-text search
-    Default pool, check_same_thread=False
+    + register_workstream(..., state, reservation_token) → bool
+    + ensure_workstream_incarnation_snapshot(ws_id) → row + token
+    + finalize_deferred_create(ws_id, token, config...) → bool
+    + publish_deferred_create(ws_id, token) → bool
+    + delete_workstream_if_fork_reserved(ws_id, token) → bool
+    + delete_stale_creating_reservations(...) → list[ws_id]
+    + update_workstream_state(ws_id, state)
+    + delete_workstream(ws_id) → bool
+    --
+    + attachment / project / memory / auth / governance APIs
+}
+
+class "SQLiteBackend" as SQLite <<sqlite>> {
+    - _engine: sa.Engine
+    - _fts5_available: bool
+    --
+    Fork clone: BEGIN IMMEDIATE
+    FTS5 refresh in same transaction
 }
 
 class "PostgreSQLBackend" as PG <<postgres>> {
-    -_engine: sa.Engine
-    +__init__(url: str, pool_size: int = 2,\n    max_overflow: int = 3)
+    - _engine: sa.Engine
     --
-    tsvector + ILIKE search
-    Connection pooling (5 max per process)
+    Fork clone: SERIALIZABLE + row locks
+    Retry SQLSTATE 40001 / 40P01
+    DML success uses RETURNING rows
 }
 
-' -- Schema --
-class "_schema.py" as Schema <<schema>> {
-    +metadata: MetaData
-    +memories: Table
-    +conversations: Table
-    +workstreams: Table (node_id, alias, title,\n    state, skill_id)
-    +workstream_config: Table
-    +users: Table (username, password_hash)
-    +api_tokens: Table (token_hash, scopes)
-    +channel_users: Table (channel_type)
-    +scheduled_tasks: Table (..., skill)
+class "_utils.py" as Utils <<helper>> {
+    + reconstruct_turns(rows) → list[Turn]
+    + recover_trajectory(turns) → list[Turn]
+    + reconstruct_turns_checkpointed(...)
+    + retain_attachment_refs(conn, ids)
+    + release_attachment_refs(conn, ids)
+    + clone_workstream_transaction(...) → ForkCloneSnapshot
+}
+
+class "ForkCloneExpectation" as Expectation <<lifecycle>> {
+    + persona_config
+    + project_id / name / writable
+    + source_reservation_token
+    + destination_reservation_token
+}
+
+class "ForkCloneSnapshot" as Snapshot <<lifecycle>> {
+    + turns: tuple[Turn, ...]
+    + config: dict[str, str]
+    + project_id: str | None
+}
+
+class "workstreams" as Workstreams <<schema>> {
+    ws_id PK
+    state: creating | live state | closed
+    user_id, node_id, kind, parent_ws_id
+    project_id, persona, alias, title
+}
+
+class "conversations" as Conversations <<schema>> {
+    canonical persisted Turn rows
+    provider_data + tool_calls mirror
+    event_id, source, is_error, meta
+    attachment-id ref list
     --
-    SQLAlchemy Core
-    Single source of truth
+    compaction marker:
+    source="compaction"
+    meta.watermark=<folded row id>
 }
 
-' -- Migration --
-class "_migrate.py" as Migrate <<migration>> {
-    +run_migrations(storage, backend)
-    -_bootstrap_existing_sqlite()
-    --
-    Programmatic Alembic
-    Auto-bootstrap existing DBs
+class "workstream_config" as WorkstreamConfig <<schema>> {
+    PK (ws_id, key)
+    stamped persona/session config
+    private durable incarnation fence:
+    __fork_destination_reservation
 }
 
-class "migrations/" as Versions <<migration>> {
-    001_initial_schema.py
-    002_user_identity.py
+class "workstream_attachments" as Attachments <<schema>> {
+    content-addressed blob
+    attachment_id, bytes, kind
+    refcount
 }
 
-' -- Registry --
-class "_registry.py" as Registry {
-    -_storage: StorageBackend | None
-    +init_storage(backend, path, url) → StorageBackend
-    +get_storage() → StorageBackend
-    +reset_storage()
-    --
-    Auto-initializes SQLite
-    if not configured
+class "projects + project_members" as Projects <<schema>> {
+    visibility / owner / membership
+    active project-memory envelope
 }
 
-' -- Facade --
-class "memory.py" as Facade <<facade>> {
-    +save_message()
-    +load_messages()
-    +register_workstream()
-    +update_workstream_state()
-    +save_workstream_config()
-    +save_memory() / delete_memory()
-    +search_memories()
-    +... (all delegated functions)
-    --
-    Thin delegation to
-    get_storage()
-    Silent failure behavior
+class "SessionManager" as Manager <<lifecycle>> {
+    + create(..., defer_emit_created)
+    + commit_create(ws)
+    + discard(ws)
+    + reap_stale_creating_reservations(max_age=2h)
+    + open / close / delete
 }
 
-' -- Consumers --
-class "session.py\nChatSession" as Session {
+class "ChatSession" as Session <<lifecycle>> {
+    + append canonical Turns
+    + compact / resume checkpoint
+    + fork_from_storage(...)
 }
 
-class "server.py\nWeb UI" as Server {
-}
+SQLite ..|> Storage
+PG ..|> Storage
+SQLite --> Utils
+PG --> Utils
 
-class "cli.py\nTerminal" as CLI {
-}
+Storage --> Workstreams
+Storage --> Conversations
+Storage --> WorkstreamConfig
+Storage --> Attachments
+Storage --> Projects
 
-' -- Relationships --
-SQLite ..|> SB
-PG ..|> SB
+Manager --> Storage : lifecycle reservation + state
+Session --> Storage : turn durability + resume
+Session --> Expectation : construction witness
+Storage --> Snapshot : atomic clone result
+Expectation --> Utils : checked inside transaction
+Utils --> Snapshot : builds
 
-SQLite --> Schema : uses
-PG --> Schema : uses
+note right of Manager
+  **Deferred create publication**
+  1. INSERT workstream as state="creating" and store a fresh
+     private token in the same transaction.
+  2. Construct UI/session and run attachment/fork gates while
+     ordinary list/open/history reads exclude the row.
+  3. finalize_deferred_create atomically applies config/alias.
+  4. publish_deferred_create compare-and-swaps creating → idle.
+  5. Only then emit ws_created.
 
-Registry --> SB : creates
-Registry --> Migrate : calls
-
-Migrate --> Versions : applies
-Migrate --> Schema : references
-
-Facade --> Registry : get_storage()
-
-Session --> Facade : imports
-Server --> Facade : imports
-CLI --> Facade : imports
-
-' -- Config --
-note right of Registry
-  [database]
-  backend = "sqlite" | "postgresql"
-  url = "postgresql+psycopg://..."
-  path = ".turnstone.db"
-  pool_size = 2 (+ 3 overflow)
+  Any normal prepublication failure immediately calls exact token-checked
+  deletion. The token survives publication as the row's incarnation fence:
+  rollback or later hard delete can never ABA-delete a replacement row.
+  A legacy row acquires the same private token atomically when rehydrate,
+  delete, or fork preflight takes its authoritative snapshot. Loaded hard
+  delete drains admitted session durability before its token-checked delete.
 end note
 
-note bottom of SQLite
-  Default backend.
-  Zero-config for
-  single-node / dev.
+note left of Manager
+  **Crash-abandoned hidden-create recovery**
+  • Boot pass; long-lived processes repeat every 5 min,
+    even when ordinary idle eviction is disabled.
+  • Candidates remain state="creating", are >2h old,
+    and are absent from the manager loaded/pending set.
+  • Live remote owners are protected. The current stable
+    node ID does not self-protect, enabling restart recovery.
+  • Unknown liveness or storage failure deletes nothing.
+  • One transaction rechecks state, age, and token, then
+    hard-deletes dependents and releases attachment refs.
+  • Tokenless legacy/corrupt rows use their locked durable
+    row as the incarnation fence and log a warning.
+  • Retention pruning excludes creating rows. Recovery never
+    closes or publishes them as live WorkstreamState values.
 end note
 
-note bottom of PG
-  Production backend.
-  Multi-node / Docker default.
-  Use PgBouncer (transaction mode)
-  for clusters > 50 nodes.
+note bottom of Utils
+  **Atomic fork clone**
+  • Reject a provisional source; compare the source incarnation captured
+    by canonical preflight; re-authorize project visibility and compare the
+    live session envelope inside the transaction.
+  • Require a same-owner, empty destination still in creating state
+    with the exact reservation token.
+  • Copy the checkpoint-bounded canonical trajectory and config;
+    retain every referenced attachment or roll everything back.
+  • Preserve/rebase a valid compaction checkpoint watermark and
+    return the exact snapshot installed into the live destination.
+end note
+
+note bottom of Conversations
+  Full transcript rows are never deleted by compaction. Normal resume
+  loads the latest valid [summary] + rows after its watermark; audit and
+  export can request the full marker-free history.
 end note
 
 @enduml

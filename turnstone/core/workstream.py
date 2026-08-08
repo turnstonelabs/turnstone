@@ -210,6 +210,29 @@ class Workstream:
     # Display carrier only — the session applies the stamped snapshot from
     # workstream_config, never this field.
     persona: str = ""
+    # Durable incarnation fence for every manager-created row. SessionManager
+    # persists it atomically with registration and hands it to ChatSession for
+    # transactional clone expectations. It survives publication so rollback
+    # and hard-delete can reject a same-id replacement exactly.
+    _fork_reservation_token: str = field(default="", repr=False)
+    # Prepared, bounded lifecycle-publication data for a deferred interactive
+    # create. The HTTP setup hook fills these fields before
+    # ``SessionManager.commit_create``; ``InteractiveAdapter.emit_created``
+    # consumes them while the manager still owns the exact pending
+    # reservation. Storage reads and request callbacks stay outside that
+    # commit, so created -> terminal ordering is atomic without holding the
+    # manager lock across unbounded work.
+    _create_event_name: str = field(default="", repr=False)
+    _create_clear_ui: bool = field(default=False, repr=False)
+    _create_emit_rename: bool = field(default=False, repr=False)
+    _create_watch_runner: Any | None = field(default=None, repr=False)
+    _create_watch_wake_fn: Callable[[], object] | None = field(default=None, repr=False)
+    _create_publication_active: bool = field(default=False, repr=False)
+    # True while a terminal path has admitted this exact object but has not
+    # yet removed it from the manager registry. Capacity eviction must skip it
+    # so it cannot bypass the object's lifecycle lock during durable delete or
+    # state-tail drain.
+    _lifecycle_terminal_active: bool = field(default=False, repr=False)
     # Tombstone: set by ``SessionManager.close`` under ``_lock`` so a
     # racing ``set_state`` can detect the close before it overwrites
     # the persisted ``state='closed'`` row. Guarded by ``_lock``.
@@ -261,6 +284,30 @@ class Workstream:
     # lock alongside the tracked-ws check so a racing ``discard`` can
     # never see it without also seeing the slot already popped.
     _emit_created_fired: bool = field(default=False, repr=False)
+    # Monotonic admission token for state transitions.  Deferred durability
+    # closures capture the revision they admitted and refuse observer
+    # publication once close or a newer transition has superseded it.
+    _state_revision: int = field(default=0, repr=False)
+    # Manager-assigned lifetime token.  A workstream id can be closed and
+    # reopened while an old deferred state tail is still unwinding; the token
+    # keeps that predecessor from writing through a persistence fence that now
+    # belongs to the replacement object.
+    _state_incarnation: int = field(default=0, repr=False)
+    # Persistence/publication tails for one logical id share this lock across
+    # live incarnations.  It is deliberately distinct from ``_lock``: storage
+    # and observer callbacks may block, while lifecycle and worker admission
+    # must remain responsive.
+    _state_tail_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Serializes this exact object's lifecycle birth with close/delete. Unlike
+    # the manager registry lock, it may span bounded event fan-out and terminal
+    # cleanup/storage without blocking unrelated workstreams or re-entrant
+    # manager lookups from adapters.
+    _lifecycle_lock: Any = field(default_factory=threading.RLock, repr=False)
+    # Thread currently running the bounded lifecycle-birth emitter. A terminal
+    # callback re-entering from that emitter must fail closed instead of trying
+    # to acquire the same lifecycle lock; terminal calls from other threads
+    # wait for birth to finish and therefore preserve created -> closed order.
+    _create_publication_thread: int | None = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:

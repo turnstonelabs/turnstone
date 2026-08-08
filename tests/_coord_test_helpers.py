@@ -21,6 +21,8 @@ from turnstone.console.collector import ClusterCollector
 from turnstone.console.coordinator_adapter import CoordinatorAdapter
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.core.auth import AuthResult
+from turnstone.core.model_registry import ModelConfig
+from turnstone.core.providers import ModelCapabilities
 from turnstone.core.session_manager import SessionManager
 
 if TYPE_CHECKING:
@@ -72,9 +74,21 @@ class _FakeConfigStore:
 
 
 def _fake_registry() -> MagicMock:
-    """MagicMock whose ``.resolve()`` succeeds so the 503 gate passes."""
+    """MagicMock whose legacy and atomic binding resolutions both succeed."""
+    client = MagicMock()
+    cfg = ModelConfig(
+        alias="default",
+        base_url="https://example.invalid/v1",
+        api_key="test",
+        model="gpt-4",
+    )
+    provider = MagicMock()
+    provider.provider_name = "openai"
+    provider.get_capabilities.return_value = ModelCapabilities()
     reg = MagicMock()
-    reg.resolve.return_value = (MagicMock(), "gpt-4", MagicMock(), 0)
+    reg.default = "default"
+    reg.resolve.return_value = (client, cfg.model, cfg, 0)
+    reg.resolve_binding.return_value = (client, cfg.model, cfg, provider, 0)
     return reg
 
 

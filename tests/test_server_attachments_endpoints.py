@@ -936,10 +936,21 @@ def voice_app_client(tmp_path):
         default="voice",
     )
     mock_client = MagicMock()
-    mock_client.audio.transcriptions.create.return_value = MagicMock(text="hello from speech")
-    speech = MagicMock()
-    speech.read.return_value = b"RIFF\x00\x00fakeaudio"
-    mock_client.audio.speech.create.return_value = speech
+    transcription_response = MagicMock()
+    transcription_response.parse.return_value = MagicMock(text="hello from speech")
+    transcription_manager = MagicMock()
+    transcription_manager.__enter__.return_value = transcription_response
+    transcription_manager.__exit__.return_value = False
+    mock_client.audio.transcriptions.with_streaming_response.create.return_value = (
+        transcription_manager
+    )
+    speech_response = MagicMock()
+    speech_response.read.return_value = b"RIFF\x00\x00fakeaudio"
+    speech_manager = MagicMock()
+    speech_manager.__enter__.return_value = speech_response
+    speech_manager.__exit__.return_value = False
+    mock_client.audio.speech.with_streaming_response.create.return_value = speech_manager
+    mock_client._voice_transcription_response = transcription_response
     registry._clients["voice"] = mock_client  # bypass real SDK client construction
 
     config_store = _VoiceConfigStore(
@@ -995,7 +1006,7 @@ class TestSpeechToText:
         body = resp.json()
         assert body["transcript"] == "hello from speech"
         assert body["model_alias"] == "voice"
-        assert mock_client.audio.transcriptions.create.called
+        assert mock_client.audio.transcriptions.with_streaming_response.create.called
 
     def test_empty_upload_returns_400(self, voice_app_client):
         client, _ = voice_app_client
@@ -1009,7 +1020,7 @@ class TestSpeechToText:
     def test_silence_returns_422(self, voice_app_client):
         # A successful transcription with no speech is not a backend failure.
         client, mock_client = voice_app_client
-        mock_client.audio.transcriptions.create.return_value = MagicMock(text="   ")
+        mock_client._voice_transcription_response.parse.return_value = MagicMock(text="   ")
         resp = client.post(
             "/v1/api/workstreams/ws-A/speech-to-text",
             files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
@@ -1021,9 +1032,8 @@ class TestSpeechToText:
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         # Backend SDK error detail must not leak into the client-facing body.
         client, mock_client = voice_app_client
-        mock_client.audio.transcriptions.create.side_effect = RuntimeError(
-            "Error code: 401 - internal-host:9 invalid_api_key"
-        )
+        create = mock_client.audio.transcriptions.with_streaming_response.create
+        create.side_effect = RuntimeError("Error code: 401 - internal-host:9 invalid_api_key")
         resp = client.post(
             "/v1/api/workstreams/ws-A/speech-to-text",
             files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
@@ -1046,6 +1056,19 @@ class TestSpeechToText:
         assert resp.status_code == 404
 
 
+class TestSpeechToTextStream:
+    def test_dedicated_endpoint_streams_transcript(self, voice_app_client):
+        client, mock_client = voice_app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text/stream",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.text == "hello from speech"
+        assert mock_client.audio.transcriptions.with_streaming_response.create.called
+
+
 class TestTextToSpeech:
     def test_unconfigured_returns_503(self, app_client):
         client, _ = app_client
@@ -1060,7 +1083,8 @@ class TestTextToSpeech:
         assert resp.content == b"RIFF\x00\x00fakeaudio"
         assert resp.headers.get("x-model-alias") == "voice"
         # audio.tts_voice setting supplies the voice when the body omits one.
-        assert mock_client.audio.speech.create.call_args.kwargs["voice"] == "alloy"
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["voice"] == "alloy"
 
     def test_empty_text_returns_400(self, voice_app_client):
         client, _ = voice_app_client
@@ -1074,14 +1098,119 @@ class TestTextToSpeech:
 
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         client, mock_client = voice_app_client
-        mock_client.audio.speech.create.side_effect = RuntimeError(
-            "Error code: 500 - internal-host:9 boom"
-        )
+        create = mock_client.audio.speech.with_streaming_response.create
+        create.side_effect = RuntimeError("Error code: 500 - internal-host:9 boom")
         resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
         assert resp.status_code == 502
         body = resp.json()
         assert body["error"] == "Speech synthesis backend failed"
         assert "internal-host" not in body["error"]
+
+
+def _voice_request(client, route: str, *, user_id: str):
+    if route == "stt":
+        return client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth(user_id),
+        )
+    if route == "stt-stream":
+        return client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text/stream",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth(user_id),
+        )
+    return client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth(user_id))
+
+
+class TestVoiceBackendAuth:
+    @pytest.mark.parametrize("route", ["stt", "stt-stream", "tts"])
+    def test_request_principal_is_used_instead_of_workstream_owner(
+        self,
+        voice_app_client,
+        route,
+    ):
+        from dataclasses import replace
+
+        client, mock_client = voice_app_client
+        registry = client.app.state.registry
+        cfg = registry._models["voice"]
+        registry._models["voice"] = replace(
+            cfg,
+            api_key="",
+            auth_mode="entra_obo",
+            obo_audience="api://voice",
+        )
+        mint_client = MagicMock()
+        mint_client.mint_model_obo_token_sync.return_value = "minted-token"
+        client.app.state.mcp_client = mint_client
+        mock_client.with_options.return_value = mock_client
+
+        response = _voice_request(client, route, user_id="userB")
+
+        assert response.status_code == 200, response.text
+        mint_client.mint_model_obo_token_sync.assert_called_once_with(
+            user_id="userB",
+            alias="voice",
+            audience="api://voice",
+            scopes="",
+            grant_leg="entra",
+        )
+        mock_client.with_options.assert_called_once_with(api_key="minted-token")
+
+    @pytest.mark.parametrize("route", ["stt", "stt-stream", "tts"])
+    def test_auth_failure_is_masked_and_never_dispatches(
+        self,
+        voice_app_client,
+        route,
+    ):
+        from dataclasses import replace
+
+        client, mock_client = voice_app_client
+        registry = client.app.state.registry
+        cfg = registry._models["voice"]
+        registry._models["voice"] = replace(
+            cfg,
+            api_key="",
+            auth_mode="entra_obo",
+            obo_audience="api://voice",
+        )
+        mint_client = MagicMock()
+        mint_client.mint_model_obo_token_sync.return_value = None
+        client.app.state.mcp_client = mint_client
+
+        response = _voice_request(client, route, user_id="userB")
+
+        assert response.status_code == 503
+        assert response.json() == {"error": "Model backend authentication unavailable"}
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        mock_client.audio.speech.with_streaming_response.create.assert_not_called()
+
+
+class TestVoiceStreamLifecycle:
+    def test_response_call_cancellation_aborts_opened_handle(self, monkeypatch):
+        import asyncio
+
+        from starlette.responses import StreamingResponse
+
+        from turnstone.core.deadline import StreamAbortRef
+        from turnstone.server import _AbortOnExitStreamingResponse
+
+        handle = MagicMock()
+        abort_ref = StreamAbortRef()
+        abort_ref.append(handle)
+
+        async def cancel_before_body(self, scope, receive, send):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(StreamingResponse, "__call__", cancel_before_body)
+        response = _AbortOnExitStreamingResponse([], abort_ref=abort_ref)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(response({}, MagicMock(), MagicMock()))
+
+        assert abort_ref.aborted
+        handle.close.assert_called()
 
 
 # ---------------------------------------------------------------------------

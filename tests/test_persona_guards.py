@@ -334,7 +334,11 @@ class TestMemoryOff:
         session._title_generated = True
         session.compact_max_tokens = 100
         session._system_tokens = 0
-        summary = SimpleNamespace(content="## Open tasks\nfinish it", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="## Open tasks\nfinish it",
+            finish_reason="stop",
+            producer="test-summary-provider",
+        )
         n = {"i": 0}
 
         def stream(*_a: Any, **_k: Any) -> ModelTurnResult:
@@ -670,7 +674,11 @@ class TestRehydrateThreading:
         session._msg_tokens = [5, 5]
         session.compact_max_tokens = 100
         session._system_tokens = 0
-        summary = SimpleNamespace(content="## Decisions\ndense", finish_reason="stop")
+        summary = SimpleNamespace(
+            content="## Decisions\ndense",
+            finish_reason="stop",
+            producer="test-summary-provider",
+        )
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session._compact_messages(auto=True) is True
 
@@ -1013,6 +1021,8 @@ class TestForkAdoptsStamp:
             WebUI,
             _interactive_create_build_kwargs,
             _interactive_create_post_install,
+            _interactive_create_pre_commit,
+            _interactive_create_prepare_install,
             _interactive_create_validate_request,
             _interactive_manager_lookup,
             _interactive_tenant_check,
@@ -1038,6 +1048,8 @@ class TestForkAdoptsStamp:
                 max_tokens=1000,
                 tool_timeout=10,
                 ws_id=ws_id,
+                user_id=getattr(ui, "_user_id", ""),
+                project_id=str(kw.get("project_id") or ""),
                 persona_snapshot=kw.get("persona_snapshot"),
             )
 
@@ -1065,7 +1077,9 @@ class TestForkAdoptsStamp:
                 create_supports_user_id_override=True,
                 create_validate_request=_interactive_create_validate_request,
                 create_build_kwargs=_interactive_create_build_kwargs,
+                create_pre_commit=_interactive_create_pre_commit,
                 create_post_install=_interactive_create_post_install,
+                create_prepare_install=_interactive_create_prepare_install,
             )
         )
         app = Starlette(
@@ -1124,6 +1138,102 @@ class TestForkAdoptsStamp:
         assert ws.session._persona_mcp is False
         assert ws.session._persona_memory is False
 
+    def test_fork_accepts_semantically_equivalent_persona_tool_json(self, _fork_app) -> None:
+        """Persona coherence compares the parsed envelope, not JSON bytes."""
+        from turnstone.core.memory import register_workstream, save_workstream_config
+
+        client, mgr = _fork_app
+        source_id = "d" * 32
+        destination_id = "e" * 32
+        register_workstream(source_id)
+        config = _snap(
+            name="scribe",
+            prompt="same prompt",
+            tools=frozenset({"bash", "read_file"}),
+            mcp=False,
+            memory=False,
+        ).to_config()
+        # Valid but deliberately noncanonical: reversed order plus whitespace.
+        config["persona_tools"] = '[ "read_file", "bash" ]'
+        save_workstream_config(source_id, config)
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"ws_id": destination_id, "resume_ws": source_id},
+        )
+
+        assert resp.status_code == 200, resp.text
+        ws = mgr.get(destination_id)
+        assert ws is not None and ws.session is not None
+        assert ws.persona == "scribe"
+        assert ws.session._persona_tools == frozenset({"bash", "read_file"})
+
+    def test_canonical_source_id_is_not_reresolved_through_alias_shadow(self, _fork_app) -> None:
+        """Validator canonicalization remains authoritative for config reads.
+
+        The request arrives through the source's ordinary alias.  A second
+        row deliberately owns an alias equal to the source's full ws_id.  Once
+        validation replaces ``resume_ws`` with that full id, generic create
+        must load its config directly; alias-first resolution a second time
+        would construct the fork under the shadow row's persona.
+        """
+        from turnstone.core.memory import register_workstream, save_workstream_config
+
+        client, mgr = _fork_app
+        storage = get_storage()
+        assert storage is not None
+        source_id = "1" * 32
+        shadow_id = "2" * 32
+        destination_id = "3" * 32
+        canonical_destination_id = "4" * 32
+        register_workstream(source_id)
+        register_workstream(shadow_id)
+        assert storage.set_workstream_alias(source_id, "source-alias") is True
+        assert storage.set_workstream_alias(shadow_id, source_id) is True
+        source_persona = _snap(
+            name="scribe",
+            prompt="source prompt",
+            tools=frozenset(),
+            mcp=False,
+            memory=False,
+        )
+        shadow_persona = _snap(
+            name="engineer",
+            prompt="shadow prompt",
+            tools=None,
+            mcp=True,
+            memory=True,
+        )
+        save_workstream_config(source_id, source_persona.to_config())
+        save_workstream_config(shadow_id, shadow_persona.to_config())
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"ws_id": destination_id, "resume_ws": "source-alias"},
+        )
+
+        assert resp.status_code == 200, resp.text
+        ws = mgr.get(destination_id)
+        assert ws is not None and ws.session is not None
+        assert ws.persona == "scribe"
+        assert ws.session._persona_name == "scribe"
+        assert ws.session._persona_tools == frozenset()
+        assert storage.resolve_workstream(source_id) == shadow_id  # race fixture is live
+        assert storage.load_workstream_config(destination_id)["persona"] == "scribe"
+
+        # A routing proxy forwards the canonical full id rather than the
+        # caller's alias.  The node must recognize that id as exact and must
+        # not feed it back through alias-first resolution to the shadow row.
+        canonical_resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"ws_id": canonical_destination_id, "resume_ws": source_id},
+        )
+        assert canonical_resp.status_code == 200, canonical_resp.text
+        canonical_ws = mgr.get(canonical_destination_id)
+        assert canonical_ws is not None and canonical_ws.session is not None
+        assert canonical_ws.persona == "scribe"
+        assert storage.load_workstream_config(canonical_destination_id)["persona"] == "scribe"
+
     def test_corrupt_source_stamp_is_400(self, _fork_app) -> None:
         from turnstone.core.memory import register_workstream, save_workstream_config
 
@@ -1135,6 +1245,200 @@ class TestForkAdoptsStamp:
         resp = client.post("/v1/api/workstreams/new", json={"resume_ws": src})
         assert resp.status_code == 400
         assert "cannot fork" in resp.json()["error"]
+
+    @pytest.mark.parametrize("source_change", ["different_persona", "corrupt_persona"])
+    def test_source_stamp_change_after_preflight_fails_closed(
+        self,
+        _fork_app,
+        source_change: str,
+    ) -> None:
+        """The atomic snapshot must agree with the construction envelope.
+
+        Fork creation has to construct the destination session before its
+        transactional clone runs.  If the source stamp changes in that gap,
+        adopting the new config into a session built under the old persona
+        would run one security envelope while persisting another.  Worse, the
+        next config save could overwrite the transaction's current (or corrupt)
+        stamp with the stale construction snapshot.  The fork must instead
+        disappear without touching the source's new value.
+        """
+        from turnstone.core.memory import register_workstream, save_workstream_config
+
+        client, mgr = _fork_app
+        storage = get_storage()
+        assert storage is not None
+        source_id = "a" * 32
+        destination_id = "b" * 32
+        register_workstream(source_id)
+        initial = _snap(
+            name="scribe",
+            prompt="old prompt",
+            tools=frozenset(),
+            mcp=False,
+            memory=False,
+        )
+        save_workstream_config(source_id, initial.to_config())
+
+        if source_change == "different_persona":
+            replacement = _snap(
+                name="engineer",
+                prompt="new prompt",
+                tools=frozenset({"read_file"}),
+                mcp=True,
+                memory=True,
+            ).to_config()
+        else:
+            replacement = dict(initial.to_config())
+            replacement["persona_tools"] = "{not-json"
+
+        original_load = storage.load_workstream_config
+        original_save = storage.save_workstream_config
+        original_clone = storage.clone_workstream
+        changed = False
+        clone_returned = False
+        post_clone_destination_saves: list[dict[str, str]] = []
+
+        def _change_after_preflight(ws_id: str) -> dict[str, str]:
+            nonlocal changed
+            config = original_load(ws_id)
+            if ws_id == source_id and not changed:
+                changed = True
+                save_workstream_config(source_id, replacement)
+            return config
+
+        def _track_clone(*args: Any, **kwargs: Any) -> Any:
+            nonlocal clone_returned
+            snapshot = original_clone(*args, **kwargs)
+            clone_returned = True
+            return snapshot
+
+        def _track_save(ws_id: str, config: dict[str, str]) -> None:
+            if ws_id == destination_id and clone_returned:
+                post_clone_destination_saves.append(dict(config))
+            original_save(ws_id, config)
+
+        with (
+            patch.object(storage, "load_workstream_config", side_effect=_change_after_preflight),
+            patch.object(storage, "clone_workstream", side_effect=_track_clone),
+            patch.object(storage, "save_workstream_config", side_effect=_track_save),
+        ):
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"ws_id": destination_id, "resume_ws": source_id},
+            )
+
+        assert changed is True
+        assert resp.status_code == 409, resp.text
+        assert resp.json() == {"error": "Fork source is no longer available"}
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert storage.load_workstream_config(destination_id) == {}
+        assert storage.get_workstream(source_id) is not None
+        assert storage.load_workstream_config(source_id) == replacement
+        assert post_clone_destination_saves == []
+
+    def test_source_project_archived_after_construction_fails_closed(self, _fork_app) -> None:
+        """An archived project cannot remain live in the fork's memory scope."""
+
+        client, mgr = _fork_app
+        storage = get_storage()
+        assert storage is not None
+        project_id = "archive-race-project"
+        source_id = "4" * 32
+        destination_id = "5" * 32
+        storage.create_project(project_id, "Archive race", "test-user", visibility="private")
+        storage.register_workstream(
+            source_id,
+            user_id="test-user",
+            project_id=project_id,
+            kind="interactive",
+        )
+        storage.save_message(source_id, "user", "source stays intact")
+        storage.save_workstream_config(source_id, {"source": "unchanged"})
+
+        original_clone = storage.clone_workstream
+        archived = False
+
+        def _archive_before_clone(*args: Any, **kwargs: Any) -> Any:
+            nonlocal archived
+            if not archived:
+                archived = True
+                assert storage.update_project(project_id, state="archived") is True
+            return original_clone(*args, **kwargs)
+
+        with patch.object(storage, "clone_workstream", side_effect=_archive_before_clone):
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"ws_id": destination_id, "resume_ws": source_id},
+            )
+
+        assert archived is True
+        assert resp.status_code == 409, resp.text
+        assert resp.json() == {"error": "Fork source is no longer available"}
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert storage.get_project(project_id)["state"] == "archived"
+        assert [turn.text for turn in storage.load_message_turns(source_id)] == [
+            "source stays intact"
+        ]
+        assert storage.load_workstream_config(source_id) == {"source": "unchanged"}
+
+    def test_source_member_write_revoked_after_construction_fails_closed(self, _fork_app) -> None:
+        """A public reader cannot inherit stale project-write authority."""
+
+        client, mgr = _fork_app
+        storage = get_storage()
+        assert storage is not None
+        project_id = "membership-race-project"
+        source_id = "6" * 32
+        destination_id = "7" * 32
+        storage.create_user("test-user", "test-user", "Test User", "unused")
+        storage.create_role(
+            "project-member-role",
+            "project-member-role",
+            "Project member",
+            "project.read,project.write",
+            False,
+            "",
+        )
+        storage.assign_role("test-user", "project-member-role", assigned_by="test")
+        storage.create_project(project_id, "Membership race", "project-owner", visibility="public")
+        storage.add_project_member(project_id, "test-user")
+        storage.register_workstream(
+            source_id,
+            user_id="project-owner",
+            project_id=project_id,
+            kind="interactive",
+        )
+        storage.save_message(source_id, "user", "public source stays intact")
+        storage.save_workstream_config(source_id, {"source": "unchanged"})
+
+        original_clone = storage.clone_workstream
+        membership_removed = False
+
+        def _remove_member_before_clone(*args: Any, **kwargs: Any) -> Any:
+            nonlocal membership_removed
+            if not membership_removed:
+                membership_removed = True
+                assert storage.remove_project_member(project_id, "test-user") is True
+            return original_clone(*args, **kwargs)
+
+        with patch.object(storage, "clone_workstream", side_effect=_remove_member_before_clone):
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"ws_id": destination_id, "resume_ws": source_id},
+            )
+
+        assert membership_removed is True
+        assert resp.status_code == 409, resp.text
+        assert resp.json() == {"error": "Fork source is no longer available"}
+        assert mgr.get(destination_id) is None
+        assert storage.get_workstream(destination_id) is None
+        assert storage.is_project_member(project_id, "test-user") is False
+        assert [turn.text for turn in storage.load_message_turns(source_id)] == [
+            "public source stays intact"
+        ]
+        assert storage.load_workstream_config(source_id) == {"source": "unchanged"}
 
     def test_unstamped_legacy_source_forks_unstamped(self, _fork_app) -> None:
         from turnstone.core.memory import register_workstream
@@ -1185,6 +1489,8 @@ class TestCreateStampsPersona:
             WebUI,
             _interactive_create_build_kwargs,
             _interactive_create_post_install,
+            _interactive_create_pre_commit,
+            _interactive_create_prepare_install,
             _interactive_create_validate_request,
             _interactive_manager_lookup,
             _interactive_tenant_check,
@@ -1237,7 +1543,9 @@ class TestCreateStampsPersona:
                 create_supports_user_id_override=True,
                 create_validate_request=_interactive_create_validate_request,
                 create_build_kwargs=_interactive_create_build_kwargs,
+                create_pre_commit=_interactive_create_pre_commit,
                 create_post_install=_interactive_create_post_install,
+                create_prepare_install=_interactive_create_prepare_install,
             ),
             accepted_permissions=("workstreams.create", "admin.coordinator"),
         )

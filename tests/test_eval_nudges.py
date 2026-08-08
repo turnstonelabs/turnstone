@@ -2312,7 +2312,6 @@ class TestToolLogEffectFlag:
             for calls in tool_call_turns
         ]
         sequence = iter(results)
-        monkeypatch.setattr(core_module, "resolve_lane", lambda *a, **k: None)
         monkeypatch.setattr(core_module, "model_turn", lambda *a, **k: next(sequence))
 
     @staticmethod

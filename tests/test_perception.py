@@ -8,6 +8,7 @@ import pytest
 
 from tests._session_helpers import as_stream, mock_completion_result
 from turnstone.core import perception
+from turnstone.core.model_turn import ModelLane, ResolvedModelBinding, resolve_lane
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -23,6 +24,7 @@ class _StubProvider:
     """
 
     provider_name = "openai-compatible"
+    retryable_error_names: frozenset[str] = frozenset()
 
     def __init__(self, *, content: str = "a description", fail_times: int = 0) -> None:
         self.calls = 0
@@ -35,6 +37,12 @@ class _StubProvider:
         from turnstone.core.providers._protocol import ModelCapabilities
 
         return ModelCapabilities()
+
+    def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return tools
+
+    def extract_reasoning_text(self, provider_blocks: list[dict[str, Any]] | None) -> str:
+        return ""
 
     def create_streaming(
         self,
@@ -67,9 +75,27 @@ def _parts() -> list[dict[str, Any]]:
     return [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
 
 
+def _lane(provider: _StubProvider, *, alias: str = "omni") -> ModelLane:
+    """Build the same resolved binding snapshot production hands perception."""
+    return resolve_lane(provider, object(), "m", alias=alias)
+
+
+def _binding(
+    provider: _StubProvider,
+    *,
+    alias: str = "omni",
+    generation: int = 0,
+) -> ResolvedModelBinding:
+    return ResolvedModelBinding(
+        lane=_lane(provider, alias=alias),
+        config=None,
+        registry_generation=generation,
+    )
+
+
 def test_describe_lowers_prompt_then_by_reference_parts() -> None:
     prov = _StubProvider(content="desc")
-    out = perception.describe(provider=prov, client=object(), model="m", parts=_parts())  # type: ignore[arg-type]
+    out = perception.describe(lane=_lane(prov), parts=_parts())
     assert out == "desc"
     assert prov.last_messages is not None
     content = prov.last_messages[0]["content"]
@@ -83,18 +109,130 @@ def test_describe_lowers_prompt_then_by_reference_parts() -> None:
 
 def test_describe_empty_parts_skips_backend() -> None:
     prov = _StubProvider()
-    assert perception.describe(provider=prov, client=object(), model="m", parts=[]) == ""  # type: ignore[arg-type]
+    assert perception.describe(lane=_lane(prov), parts=[]) == ""
     assert prov.calls == 0
 
 
-def test_describe_cached_memoizes_by_principal_alias_and_hash() -> None:
+def test_describe_passes_the_exact_supplied_lane_to_model_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from turnstone.core.model_turn import ModelTurnResult
+    from turnstone.core.trajectory import Turn
+
+    binding = _binding(_StubProvider())
+    lane = binding.lane
+    seen: list[ModelLane] = []
+
+    def _sample(sample_lane: ModelLane, *_args: Any, **_kwargs: Any) -> ModelTurnResult:
+        seen.append(sample_lane)
+        return ModelTurnResult(
+            turn=Turn.assistant("from seam"),
+            finish_reason="stop",
+            usage=None,
+            tool_calls=[],
+        )
+
+    monkeypatch.setattr(perception, "model_turn", _sample)
+
+    assert perception.describe(lane=lane, parts=_parts()) == "from seam"
+    assert seen == [lane]
+    assert seen[0] is lane
+
+
+def test_cancellation_ref_reaches_model_turn_and_is_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from turnstone.core.deadline import DeadlineCancelledError
+
+    ref = object()
+    seen: list[Any] = []
+
+    def abort(*_args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("cancel_ref"))
+        raise DeadlineCancelledError("stopped")
+
+    monkeypatch.setattr(perception, "model_turn", abort)
+    binding = _binding(_StubProvider())
+    lane = binding.lane
+
+    with pytest.raises(DeadlineCancelledError, match="stopped"):
+        perception.describe(lane=lane, parts=_parts(), cancel_ref=ref)
+    with pytest.raises(DeadlineCancelledError, match="stopped"):
+        perception.describe_cached(
+            binding=binding,
+            principal_id="user-a",
+            content_hash="h-cancel",
+            parts=_parts(),
+            cancel_ref=ref,
+        )
+
+    assert seen == [ref, ref]
+    assert (
+        perception.describe_peek(
+            principal_id="user-a",
+            binding=binding,
+            content_hash="h-cancel",
+        )
+        is None
+    )
+
+
+def test_completed_cancelled_description_is_not_memoized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+
+    binding = _binding(_StubProvider())
+    cancelled_ref = StreamAbortRef()
+    calls: list[str] = []
+
+    def complete_after_cancel(**_kwargs: Any) -> str:
+        calls.append("cancelled")
+        cancelled_ref.abort()
+        return "late description"
+
+    monkeypatch.setattr(perception, "describe", complete_after_cancel)
+    with pytest.raises(DeadlineCancelledError):
+        perception.describe_cached(
+            binding=binding,
+            principal_id="user-a",
+            content_hash="late",
+            parts=_parts(),
+            cancel_ref=cancelled_ref,
+        )
+    assert (
+        perception.describe_peek(
+            principal_id="user-a",
+            binding=binding,
+            content_hash="late",
+        )
+        is None
+    )
+
+    monkeypatch.setattr(
+        perception,
+        "describe",
+        lambda **_kwargs: calls.append("fresh") or "fresh description",
+    )
+    assert (
+        perception.describe_cached(
+            binding=binding,
+            principal_id="user-a",
+            content_hash="late",
+            parts=_parts(),
+            cancel_ref=StreamAbortRef(),
+        )
+        == "fresh description"
+    )
+    assert calls == ["cancelled", "fresh"]
+
+
+def test_describe_cached_memoizes_by_principal_alias_generation_and_hash() -> None:
     prov = _StubProvider(content="desc")
+    binding = _binding(prov)
     kw: dict[str, Any] = {
-        "provider": prov,
-        "client": object(),
-        "model": "m",
+        "binding": binding,
         "principal_id": "user-a",
-        "alias": "omni",
         "content_hash": "h1",
         "parts": _parts(),
     }
@@ -105,16 +243,34 @@ def test_describe_cached_memoizes_by_principal_alias_and_hash() -> None:
     assert prov.calls == 2  # distinct hash → fresh perceive
     perception.describe_cached(**{**kw, "principal_id": "user-b"})
     assert prov.calls == 3  # same content under another user's grant → fresh perceive
+    perception.describe_cached(**{**kw, "binding": _binding(prov, alias="other")})
+    assert prov.calls == 4  # same content under another alias → fresh perceive
+    newer = _binding(prov, generation=1)
+    perception.describe_cached(**{**kw, "binding": newer})
+    assert prov.calls == 5  # same alias under a new registry generation → fresh perceive
+    assert (
+        perception.describe_peek(
+            principal_id="user-a",
+            binding=binding,
+            content_hash="h1",
+        )
+        == "desc"
+    )
+    assert (
+        perception.describe_peek(
+            principal_id="user-a",
+            binding=_binding(prov, generation=2),
+            content_hash="h1",
+        )
+        is None
+    )
 
 
 def test_describe_cached_does_not_cache_failures() -> None:
     prov = _StubProvider(content="recovered", fail_times=1)
     kw: dict[str, Any] = {
-        "provider": prov,
-        "client": object(),
-        "model": "m",
+        "binding": _binding(prov),
         "principal_id": "user-a",
-        "alias": "omni",
         "content_hash": "h",
         "parts": _parts(),
     }
@@ -124,10 +280,11 @@ def test_describe_cached_does_not_cache_failures() -> None:
 
 
 def test_describe_peek_returns_none_when_absent() -> None:
+    binding = _binding(_StubProvider())
     assert (
         perception.describe_peek(
             principal_id="user-a",
-            alias="omni",
+            binding=binding,
             content_hash="missing",
         )
         is None
@@ -136,12 +293,10 @@ def test_describe_peek_returns_none_when_absent() -> None:
 
 def test_describe_peek_returns_cached_without_recompute() -> None:
     prov = _StubProvider(content="desc")
+    binding = _binding(prov)
     kw: dict[str, Any] = {
-        "provider": prov,
-        "client": object(),
-        "model": "m",
+        "binding": binding,
         "principal_id": "user-a",
-        "alias": "omni",
         "content_hash": "h",
         "parts": _parts(),
     }
@@ -152,7 +307,7 @@ def test_describe_peek_returns_cached_without_recompute() -> None:
     assert (
         perception.describe_peek(
             principal_id="user-a",
-            alias="omni",
+            binding=binding,
             content_hash="h",
         )
         == "desc"
@@ -160,7 +315,7 @@ def test_describe_peek_returns_cached_without_recompute() -> None:
     assert (
         perception.describe_peek(
             principal_id="user-b",
-            alias="omni",
+            binding=binding,
             content_hash="h",
         )
         is None
@@ -174,12 +329,10 @@ def test_describe_cached_memoizes_empty_descriptions() -> None:
     # The pin-until-restart residual is deliberate; the remediation is
     # server-side (reasoning parser / template thinking toggle).
     prov = _StubProvider(content="")
+    binding = _binding(prov)
     kw: dict[str, Any] = {
-        "provider": prov,
-        "client": object(),
-        "model": "m",
+        "binding": binding,
         "principal_id": "user-a",
-        "alias": "omni",
         "content_hash": "h-empty",
         "parts": _parts(),
     }
@@ -187,30 +340,37 @@ def test_describe_cached_memoizes_empty_descriptions() -> None:
     assert perception.describe_cached(**kw) == ""
     assert prov.calls == 1  # second call served from the memo
     assert (
-        perception.describe_peek(principal_id="user-a", alias="omni", content_hash="h-empty") == ""
+        perception.describe_peek(
+            principal_id="user-a",
+            binding=binding,
+            content_hash="h-empty",
+        )
+        == ""
     )
 
 
-def test_racing_empty_result_never_clobbers_memoized_real_description(monkeypatch) -> None:
+def test_racing_empty_result_never_clobbers_memoized_real_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The describe call runs unlocked: a racer can memoize a REAL
     # description while another call is producing "".  The empty commit
     # must yield to the existing memo, never overwrite it.
-    key_kwargs = {"principal_id": "user-a", "alias": "omni", "content_hash": "h-race"}
+    binding = _binding(_StubProvider(content=""))
+    call_key = {"principal_id": "user-a", "content_hash": "h-race"}
+    cache_key = {**call_key, "binding": binding}
 
     def _racing_describe(**_kw: Any) -> str:
         with perception._cache_lock:
-            perception._cache[perception._cache_key(**key_kwargs)] = "real from racer"
+            perception._cache[perception._cache_key(**cache_key)] = "real from racer"
         return ""
 
     monkeypatch.setattr(perception, "describe", _racing_describe)
     out = perception.describe_cached(
-        provider=_StubProvider(content=""),
-        client=object(),
-        model="m",
+        binding=binding,
         parts=_parts(),
-        **key_kwargs,
+        **call_key,
     )
     assert out == "real from racer"
     assert (
-        perception.describe_peek(**key_kwargs) == "real from racer"
+        perception.describe_peek(**cache_key) == "real from racer"
     )  # the billed real description survived

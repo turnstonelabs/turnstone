@@ -57,15 +57,16 @@ class StreamAbortRef(list[Any]):
     fix here must be mirrored there.
     """
 
-    __slots__ = ("_aborted",)
+    __slots__ = ("_aborted", "_cancel_event")
 
-    def __init__(self) -> None:
+    def __init__(self, cancel_event: threading.Event | None = None) -> None:
         super().__init__()
         self._aborted = False
+        self._cancel_event = cancel_event
 
     def append(self, stream: Any) -> None:
         super().append(stream)
-        if self._aborted:
+        if self.aborted:
             with contextlib.suppress(Exception):
                 stream.close()
 
@@ -91,7 +92,7 @@ class StreamAbortRef(list[Any]):
         meets the arriving handle at :meth:`append`, which is why that
         hook is not redundant with them.
         """
-        return self._aborted
+        return self._aborted or bool(self._cancel_event is not None and self._cancel_event.is_set())
 
 
 def run_abortable_with_deadline(
@@ -114,7 +115,7 @@ def run_abortable_with_deadline(
             timeout=...,
         )
     """
-    abort_ref = StreamAbortRef()
+    abort_ref = StreamAbortRef(cancel_event)
     return run_with_deadline(
         lambda: fn(abort_ref),
         timeout=timeout,

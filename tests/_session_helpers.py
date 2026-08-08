@@ -15,12 +15,13 @@ collect it as a test file — it's an importable utility, not a test.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-from turnstone.core.model_turn import ModelTurnResult
+from turnstone.core.model_turn import ModelTurnResult, resolve_model_binding
 from turnstone.core.providers import ModelCapabilities, StreamChunk, ToolCallDelta, UsageInfo
 from turnstone.core.session import ChatSession
 from turnstone.core.session_ui_base import SessionUIBase
@@ -33,6 +34,46 @@ class NullUI(SessionUIBase):
 
     def __init__(self) -> None:
         super().__init__()
+
+
+_UNCHANGED = object()
+
+
+def replace_session_lane(
+    session: Any,
+    *,
+    provider: Any = _UNCHANGED,
+    client: Any = _UNCHANGED,
+    model: Any = _UNCHANGED,
+    alias: Any = _UNCHANGED,
+    capabilities: Any = _UNCHANGED,
+) -> Any:
+    """Atomically replace selected facets of a test session's model lane.
+
+    Production sessions deliberately expose no mutable raw provider/client
+    slots. Tests that install a scripted provider use this one helper so their
+    setup follows the same whole-lane replacement rule as registry rebinding.
+    """
+    binding = session._model_binding
+    old_lane = binding.lane
+    next_provider = old_lane.provider if provider is _UNCHANGED else provider
+    next_model = old_lane.model if model is _UNCHANGED else model
+    if capabilities is _UNCHANGED:
+        next_capabilities = old_lane.capabilities
+        if provider is not _UNCHANGED:
+            next_capabilities = next_provider.get_capabilities(next_model)
+    else:
+        next_capabilities = capabilities
+    lane = dataclasses.replace(
+        old_lane,
+        provider=next_provider,
+        client=old_lane.client if client is _UNCHANGED else client,
+        model=next_model,
+        alias=old_lane.alias if alias is _UNCHANGED else alias,
+        capabilities=next_capabilities,
+    )
+    session._model_binding = dataclasses.replace(binding, lane=lane)
+    return lane
 
 
 def make_session(**kwargs: Any) -> ChatSession:
@@ -48,6 +89,20 @@ def make_session(**kwargs: Any) -> ChatSession:
         "tool_timeout": 30,
     }
     defaults.update(kwargs)
+    registry = defaults.get("registry")
+    model_alias = defaults.get("model_alias")
+    if registry is not None and model_alias and defaults.get("model_binding") is None:
+        binding = resolve_model_binding(
+            registry,
+            model_alias,
+            config_store=defaults.get("config_store"),
+        )
+        defaults["client"] = binding.lane.client
+        defaults["model"] = binding.lane.model
+        defaults["registry_generation"] = binding.registry_generation
+        defaults["model_binding"] = binding
+        if "context_window" not in kwargs and binding.config is not None:
+            defaults["context_window"] = binding.config.context_window
     return ChatSession(**defaults)
 
 
@@ -576,15 +631,15 @@ def arm_session(
         return iter(nxt) if not hasattr(nxt, "__next__") else nxt
 
     provider.create_streaming = MagicMock(side_effect=_create)
-    session._provider = provider
+    replace_session_lane(session, provider=provider)
     return provider
 
 
 def scripted_provider(chunks: list[StreamChunk]) -> MagicMock:
     """Provider fake replaying *chunks*, arming ``cancel_ref`` eagerly.
 
-    Assign to ``session._provider`` (never mutate a resolved provider —
-    the create_provider singleton rule above).  Each call returns a FRESH
+    Install with :func:`replace_session_lane` (never mutate a resolved
+    provider — the create_provider singleton rule above). Each call returns a FRESH
     iterator over the same script so ladder tests re-drive it; the armed
     handle is appended per call, matching the one-handle-per-create
     behavior of every real adapter.

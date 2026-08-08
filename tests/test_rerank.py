@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from turnstone.core.model_turn import resolve_capabilities
 from turnstone.core.rerank import (
     CohereJinaRerankClient,
     RerankHit,
@@ -592,7 +593,6 @@ class TestModelCapabilitiesRerankFields:
         import dataclasses
 
         from turnstone.core.providers._protocol import ModelCapabilities
-        from turnstone.core.session import ChatSession
 
         base = ModelCapabilities()
         provider = SimpleNamespace(get_capabilities=lambda model: base)
@@ -605,8 +605,7 @@ class TestModelCapabilitiesRerankFields:
             }
         )
         registry = SimpleNamespace(get_config=lambda alias: cfg)
-        stub = SimpleNamespace(_registry=registry)
-        caps = ChatSession._resolve_capabilities(stub, provider, "m", "rr")
+        caps = resolve_capabilities(provider, "m", "rr", registry)
         assert isinstance(caps, ModelCapabilities)
         assert caps.rerank_threshold == 0.5
         assert caps.rerank_scale == "logit (sigmoid-normalised)"

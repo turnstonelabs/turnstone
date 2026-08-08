@@ -52,7 +52,11 @@ def session(tmp_db, mock_openai_client):
 
 
 def _stub_summary(text: str = "DENSE"):
-    return SimpleNamespace(content=text, finish_reason="stop")
+    return SimpleNamespace(
+        content=text,
+        finish_reason="stop",
+        producer="test-summary-provider",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -378,10 +382,11 @@ class TestWindDownSpill:
     def test_do_auto_compact_forwards_carry_spill(self, session):
         """The end-of-turn site passes carry_spill=stopped_to_compact through
         _do_auto_compact — pin the forwarding."""
+        generation = session._claim_generation()
         with patch.object(session, "_compact_messages", return_value=True) as cm:
-            session._do_auto_compact(my_generation=3, carry_spill=True)
+            session._do_auto_compact(my_generation=generation, carry_spill=True)
         assert cm.call_args.kwargs["carry_spill"] is True
-        assert cm.call_args.kwargs["my_generation"] == 3
+        assert cm.call_args.kwargs["my_generation"] == generation
 
 
 # ---------------------------------------------------------------------------

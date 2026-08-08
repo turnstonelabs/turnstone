@@ -15,8 +15,20 @@ if TYPE_CHECKING:
 
 from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
 from turnstone.core.log import get_logger
+from turnstone.core.storage._protocol import (
+    FORK_RESERVATION_CONFIG_KEY,
+    ForkCloneExpectation,
+    ForkCloneSnapshot,
+    ForkDestinationConflictError,
+    ForkSourceUnavailableError,
+)
 from turnstone.core.storage._schema import (
     conversations,
+    project_members,
+    projects,
+    role_permission_overrides,
+    roles,
+    user_roles,
     workstream_attachments,
     workstream_config,
     workstream_overrides,
@@ -33,6 +45,7 @@ from turnstone.core.trajectory import (
     TurnMeta,
     dicts_from_turns,
     resolve_attachment_parts,
+    turn_to_dict,
 )
 
 log = get_logger(__name__)
@@ -143,6 +156,40 @@ def prepare_provider_data_for_save(
     return wrap_provider_data(
         normalize_native_for_save(role, provider_data, tool_calls_json), producer
     )
+
+
+def retain_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
+    """Increment existing blobs for a newly inserted batch of references.
+
+    Fork persistence writes copied conversation rows and their attachment links
+    in one transaction. Retaining the referenced blobs in that same transaction
+    keeps the links and global refcounts atomic: either every copied row and
+    increment commits, or none of them does.
+
+    Counts duplicate ids because the release side does too: two copied turns may
+    legitimately reference the same content-addressed blob. Missing blobs are a
+    hard failure; a dangling link would make a fork appear durable while its
+    attachment route already returns 404.
+    """
+    if not attachment_ids:
+        return
+    counts = Counter(attachment_ids)
+    ids = list(counts)
+    increment = sa.case(
+        *((workstream_attachments.c.attachment_id == aid, n) for aid, n in counts.items()),
+        else_=0,
+    )
+    retained = set(
+        conn.execute(
+            sa.update(workstream_attachments)
+            .where(workstream_attachments.c.attachment_id.in_(ids))
+            .values(refcount=workstream_attachments.c.refcount + increment)
+            .returning(workstream_attachments.c.attachment_id)
+        ).scalars()
+    )
+    missing = set(ids) - retained
+    if missing:
+        raise ValueError(f"cannot retain missing attachment blobs: {sorted(missing)!r}")
 
 
 def release_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
@@ -1130,6 +1177,18 @@ def reconstruct_turns(
                 meta.extra["sender"] = raw_meta["sender"]
             else:
                 meta.extra["source_meta"] = raw_meta
+        # Canonical storage loads retain the exact ordered ref-list captured
+        # with the conversation row. Blob materialization happens on a second
+        # query and may legitimately yield less (for example, source deletion
+        # wins between the two reads); forks must still attempt to retain every
+        # captured id and fail atomically rather than silently copy text only.
+        # This is an internal persistence side channel: turn_to_dict never
+        # projects it, so it cannot reach UI or provider wire payloads.
+        if len(row) > 11 and role in ("user", "tool"):
+            # Preserve even an empty list so an exact-row "no refs" snapshot
+            # cannot fall back to a workstream-wide ownership query and borrow
+            # a blob referenced by some other row.
+            meta.extra["storage_attachment_ids"] = parse_attachment_refs(row[11])
         src = str(source) if source else None
 
         if role == "user":
@@ -1244,6 +1303,21 @@ HISTORY_VISIBILITY_SCOPE_SQL = (
     ") "
 )
 
+# Deferred creates may already contain a cloned transcript before their
+# lifecycle birth is published.  Ordinary history/recall reads must not expose
+# that provisional content.  Keep this separate from the project-tenancy
+# predicate above because it applies to every caller, including unscoped local
+# CLI reads.  ``NOT EXISTS`` deliberately preserves the historical treatment
+# of orphan conversation rows while hiding only a row that is authoritatively
+# marked ``creating``.
+HISTORY_CREATING_EXCLUSION_SQL = (
+    "AND NOT EXISTS ("
+    "    SELECT 1 FROM workstreams w_creating"
+    "    WHERE w_creating.ws_id = c.ws_id"
+    "      AND w_creating.state = 'creating'"
+    ") "
+)
+
 # Live-context exclusion for the model-facing recall tool: drop rows of ONE
 # workstream (the caller's own) above its compaction checkpoint — those rows
 # are the live segment, already in the model's context, and returning them
@@ -1344,6 +1418,515 @@ def reconstruct_turns_checkpointed(
         *marker_turns,
         *reconstruct_turns(tail, ws_id, attachments_by_msg),
     ]
+
+
+def _fork_locked(statement: Any, *, lock_rows: bool) -> Any:
+    """Apply a PostgreSQL row lock while leaving SQLite statements unchanged."""
+    return statement.with_for_update() if lock_rows else statement
+
+
+def _fork_attachment_refs(raw: Any) -> list[str]:
+    """Strict fork-side decoder for a stored attachment ref-list.
+
+    Ordinary history reads tolerate a corrupt ref-list and show the surviving
+    text. A clone is a durability operation, so silently dropping one here
+    would commit a destination whose blob ownership no longer matches its
+    source. Refuse the whole transaction instead.
+    """
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, str):
+        raise ForkSourceUnavailableError("fork source attachment references are invalid")
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ForkSourceUnavailableError("fork source attachment references are invalid") from exc
+    if not isinstance(parsed, list) or any(
+        not isinstance(attachment_id, str) or not attachment_id for attachment_id in parsed
+    ):
+        raise ForkSourceUnavailableError("fork source attachment references are invalid")
+    return list(parsed)
+
+
+def _fork_user_permissions(conn: Any, user_id: str, *, lock_rows: bool) -> set[str]:
+    """Resolve one principal's effective RBAC set inside the clone snapshot."""
+    if not user_id:
+        return set()
+    role_stmt = (
+        sa.select(roles.c.role_id, roles.c.permissions, roles.c.builtin)
+        .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
+        .where(user_roles.c.user_id == user_id)
+    )
+    role_rows = conn.execute(_fork_locked(role_stmt, lock_rows=lock_rows)).fetchall()
+    builtin_role_ids = [row[0] for row in role_rows if row[2]]
+    grants: dict[str, set[str]] = {}
+    revokes: dict[str, set[str]] = {}
+    if builtin_role_ids:
+        override_stmt = sa.select(
+            role_permission_overrides.c.role_id,
+            role_permission_overrides.c.permission,
+            role_permission_overrides.c.action,
+        ).where(role_permission_overrides.c.role_id.in_(builtin_role_ids))
+        override_rows = conn.execute(_fork_locked(override_stmt, lock_rows=lock_rows)).fetchall()
+        for role_id, permission, action in override_rows:
+            if action == "grant":
+                grants.setdefault(str(role_id), set()).add(str(permission))
+            elif action == "revoke":
+                revokes.setdefault(str(role_id), set()).add(str(permission))
+    permissions: set[str] = set()
+    for role_id, raw_permissions, builtin in role_rows:
+        role_permissions = split_perms(raw_permissions)
+        if builtin:
+            role_permissions = (role_permissions | grants.get(str(role_id), set())) - revokes.get(
+                str(role_id), set()
+            )
+        permissions |= role_permissions
+    return permissions
+
+
+def _fork_turn_insert_row(
+    turn: Turn,
+    destination_ws_id: str,
+    now: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Serialize one canonical source turn for insertion under a new ws id."""
+    msg = turn_to_dict(turn)
+    tool_calls = msg.get("tool_calls")
+    tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+
+    provider_blocks = msg.get("_provider_content")
+    try:
+        provider_data = (
+            json.dumps(provider_blocks)
+            if provider_blocks and not isinstance(provider_blocks, str)
+            else provider_blocks
+        )
+    except (TypeError, ValueError):
+        provider_data = None
+
+    raw_storage_ids = turn.meta.extra.get("storage_attachment_ids")
+    if raw_storage_ids is not None:
+        if not isinstance(raw_storage_ids, list) or any(
+            not isinstance(attachment_id, str) or not attachment_id
+            for attachment_id in raw_storage_ids
+        ):
+            raise ForkSourceUnavailableError("fork source attachment references are invalid")
+        attachment_ids = list(raw_storage_ids)
+    else:
+        attachment_ids = [
+            block.attachment_id for block in turn.content if isinstance(block, AttachmentRef)
+        ]
+
+    preview = turn.meta.extra.get("preview")
+    fork_preview: dict[str, Any] | None = None
+    if turn.role is Role.TOOL and isinstance(preview, dict) and preview:
+        preview_id = preview.get("attachment_id")
+        if not isinstance(preview_id, str) or not preview_id or preview_id not in attachment_ids:
+            raise ForkSourceUnavailableError("fork source preview reference is invalid")
+        fork_preview = preview
+
+    meta_envelope: dict[str, Any] = {}
+    if turn.role is Role.TOOL:
+        if turn.effect_status is not None:
+            meta_envelope["effect_status"] = turn.effect_status.value
+        if fork_preview is not None:
+            meta_envelope["preview"] = fork_preview
+    else:
+        source_meta = turn.meta.extra.get("source_meta")
+        sender = turn.meta.extra.get("sender")
+        if isinstance(source_meta, dict) and source_meta:
+            meta_envelope = source_meta
+        elif turn.role is Role.USER and isinstance(sender, str) and sender:
+            meta_envelope = {"sender": sender}
+    meta_json = json.dumps(meta_envelope) if meta_envelope else None
+
+    source = msg.get("_source")
+    producer = msg.get("_producer")
+    role = turn.role.value
+    insert_row = {
+        "ws_id": destination_ws_id,
+        "timestamp": now,
+        "role": role,
+        "content": sanitize_text(turn.text),
+        "tool_name": msg.get("name"),
+        "tool_call_id": msg.get("tool_call_id"),
+        "provider_data": prepare_provider_data_for_save(
+            role,
+            sanitize_text(provider_data),
+            tool_calls_json,
+            producer if isinstance(producer, str) else None,
+        ),
+        "tool_calls": tool_calls_json,
+        "_source": source if isinstance(source, str) and source else None,
+        "event_id": None,
+        "is_error": bool(msg.get("is_error", False)),
+        "attachments": json.dumps(attachment_ids) if attachment_ids else None,
+        "meta": meta_json,
+    }
+    return insert_row, attachment_ids
+
+
+def clone_workstream_transaction(
+    conn: Any,
+    source_ws_id: str,
+    destination_ws_id: str,
+    *,
+    principal_id: str,
+    trusted_internal: bool,
+    expected_session: ForkCloneExpectation | None,
+    now: str,
+    lock_rows: bool,
+) -> ForkCloneSnapshot:
+    """Execute the backend-neutral body of an atomic workstream clone.
+
+    The caller owns transaction start, isolation, commit/rollback, dialect
+    retry policy, and SQLite's external-content FTS refresh. PostgreSQL passes
+    ``lock_rows=True`` and runs this body at SERIALIZABLE isolation; SQLite
+    enters with ``BEGIN IMMEDIATE`` and therefore already owns the writer lock.
+    """
+    if not source_ws_id:
+        raise ForkSourceUnavailableError("fork source is no longer available")
+    if not destination_ws_id or source_ws_id == destination_ws_id:
+        raise ForkDestinationConflictError("fork destination is not available")
+    if not trusted_internal and not principal_id:
+        raise ForkSourceUnavailableError("fork source is no longer available")
+
+    workstream_stmt = (
+        sa.select(workstreams)
+        .where(workstreams.c.ws_id.in_((source_ws_id, destination_ws_id)))
+        .order_by(workstreams.c.ws_id)
+    )
+    workstream_rows = conn.execute(_fork_locked(workstream_stmt, lock_rows=lock_rows)).fetchall()
+    by_ws_id = {str(row._mapping["ws_id"]): row._mapping for row in workstream_rows}
+    source = by_ws_id.get(source_ws_id)
+    if source is None:
+        raise ForkSourceUnavailableError("fork source is no longer available")
+    if str(source.get("state") or "") == "creating":
+        # A provisional row has not crossed lifecycle publication and is
+        # deliberately hidden from every source-selection surface. Enforce the
+        # same boundary in the transaction for internal/direct callers.
+        raise ForkSourceUnavailableError("fork source is no longer available")
+
+    source_reservation_stmt = sa.select(workstream_config.c.value).where(
+        workstream_config.c.ws_id == source_ws_id,
+        workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+    )
+    source_reservation_row = conn.execute(
+        _fork_locked(source_reservation_stmt, lock_rows=lock_rows)
+    ).fetchone()
+    source_reservation_token = (
+        str(source_reservation_row[0] or "") if source_reservation_row is not None else ""
+    )
+    if expected_session is not None and (
+        not expected_session.source_reservation_token
+        or source_reservation_token != expected_session.source_reservation_token
+    ):
+        # Preflight authorization was for a different durable incarnation.
+        # Treat replacement exactly like disappearance so the fork surface is
+        # not an existence/ownership oracle.
+        raise ForkSourceUnavailableError("fork source is no longer available")
+
+    raw_project_id = source.get("project_id")
+    source_project_id = (
+        raw_project_id.strip()
+        if isinstance(raw_project_id, str) and raw_project_id.strip()
+        else None
+    )
+    project = None
+    is_project_member = False
+    if source_project_id is not None:
+        project_stmt = sa.select(projects).where(projects.c.project_id == source_project_id)
+        project = conn.execute(_fork_locked(project_stmt, lock_rows=lock_rows)).fetchone()
+
+    # A dangling project link has the same trusted-team semantics as ordinary
+    # workstream visibility and is normalized to an unbound destination.
+    effective_project_id = source_project_id if project is not None else None
+    if project is not None:
+        project_map = project._mapping
+        visibility = str(project_map.get("visibility") or "private")
+        owner_id = str(project_map.get("owner_id") or "")
+        if owner_id != principal_id and (not trusted_internal or expected_session is not None):
+            member_stmt = sa.select(project_members.c.user_id).where(
+                project_members.c.project_id == effective_project_id,
+                project_members.c.user_id == principal_id,
+            )
+            member = conn.execute(_fork_locked(member_stmt, lock_rows=lock_rows)).fetchone()
+            is_project_member = member is not None
+        if not trusted_internal:
+            allowed = visibility != "private" or owner_id == principal_id or is_project_member
+            if not allowed:
+                raise ForkSourceUnavailableError("fork source is no longer available")
+
+    destination = by_ws_id.get(destination_ws_id)
+    if destination is None:
+        raise ForkDestinationConflictError("fork destination is not available")
+    if str(destination.get("state") or "") != "creating":
+        # A reservation token is retained as a durable incarnation fence for
+        # exact hard-delete. It is not a reusable clone capability once the
+        # workstream has crossed its publication CAS.
+        raise ForkDestinationConflictError("fork destination is not available")
+    if not trusted_internal and str(destination.get("user_id") or "") != principal_id:
+        raise ForkDestinationConflictError("fork destination is not available")
+    # Preserve an existing private reservation even for compatibility callers
+    # that do not supply a construction witness. Production HTTP forks also
+    # compare it to ``expected_session`` below; preservation keeps later
+    # prepublication finalization and cancellation rollback exact.
+    reservation_stmt = sa.select(workstream_config.c.value).where(
+        workstream_config.c.ws_id == destination_ws_id,
+        workstream_config.c.key == FORK_RESERVATION_CONFIG_KEY,
+    )
+    reservation_row = conn.execute(_fork_locked(reservation_stmt, lock_rows=lock_rows)).fetchone()
+    destination_reservation_token = str(reservation_row[0] or "") if reservation_row else ""
+    if expected_session is not None and (
+        not expected_session.destination_reservation_token
+        or destination_reservation_token != expected_session.destination_reservation_token
+    ):
+        # The caller's in-memory Workstream owns a different durable row
+        # incarnation (or no longer owns one at all).  This closes the
+        # cross-node delete/re-register ABA that a local manager-object
+        # identity check cannot observe.
+        raise ForkDestinationConflictError("fork destination is not available")
+    raw_destination_project_id = destination.get("project_id")
+    destination_project_id = (
+        raw_destination_project_id.strip()
+        if isinstance(raw_destination_project_id, str) and raw_destination_project_id.strip()
+        else None
+    )
+    if destination_project_id != effective_project_id:
+        # The destination was constructed under the preflight project context.
+        # If the source link/project disappeared or changed since then, cloning
+        # into that already-built session would make its in-memory project
+        # context disagree with durable storage. Refuse and let create discard
+        # the destination; a retry reconstructs it under the new context.
+        raise ForkSourceUnavailableError("fork source project changed")
+
+    destination_history_stmt = (
+        sa.select(conversations.c.id).where(conversations.c.ws_id == destination_ws_id).limit(1)
+    )
+    if (
+        conn.execute(_fork_locked(destination_history_stmt, lock_rows=lock_rows)).fetchone()
+        is not None
+    ):
+        raise ForkDestinationConflictError("fork destination already has history")
+
+    config_rows = conn.execute(
+        sa.select(workstream_config.c.key, workstream_config.c.value).where(
+            workstream_config.c.ws_id == source_ws_id
+        )
+    ).fetchall()
+    source_config: dict[str, str] = {
+        str(row[0]): row[1] for row in config_rows if str(row[0]) != FORK_RESERVATION_CONFIG_KEY
+    }
+    if expected_session is not None:
+        from turnstone.core.personas import snapshot_from_config
+
+        try:
+            source_persona_snapshot = snapshot_from_config(source_config)
+        except ValueError as exc:
+            raise ForkSourceUnavailableError("fork source persona is invalid") from exc
+        source_persona = (
+            tuple(sorted(source_persona_snapshot.to_config().items()))
+            if source_persona_snapshot is not None
+            else ()
+        )
+        if source_persona != expected_session.persona_config:
+            raise ForkSourceUnavailableError("fork source persona changed")
+
+        current_project_id = ""
+        current_project_name = ""
+        current_project_writable = False
+        if project is not None and effective_project_id is not None:
+            project_map = project._mapping
+            owner_id = str(project_map.get("owner_id") or "")
+            if owner_id == principal_id:
+                can_read = True
+                can_write = True
+            else:
+                permissions = _fork_user_permissions(
+                    conn,
+                    principal_id,
+                    lock_rows=lock_rows,
+                )
+                visibility = str(project_map.get("visibility") or "private")
+                can_read = "project.read" in permissions and (
+                    is_project_member or visibility == "public"
+                )
+                can_write = "project.write" in permissions and is_project_member
+            if can_read and str(project_map.get("state") or "active") != "archived":
+                current_project_id = effective_project_id
+                current_project_name = str(project_map.get("name") or "")
+                current_project_writable = can_write
+        if (
+            current_project_id != expected_session.project_id
+            or current_project_name != expected_session.project_name
+            or current_project_writable is not expected_session.project_writable
+        ):
+            raise ForkSourceUnavailableError("fork source project access changed")
+
+    conversation_columns = (
+        conversations.c.id,
+        conversations.c.role,
+        conversations.c.content,
+        conversations.c.tool_name,
+        conversations.c.tool_call_id,
+        conversations.c.provider_data,
+        conversations.c.tool_calls,
+        conversations.c._source,
+        conversations.c.event_id,
+        conversations.c.is_error,
+        conversations.c.meta,
+        conversations.c.attachments,
+    )
+    source_rows = [
+        tuple(row)
+        for row in conn.execute(
+            sa.select(*conversation_columns)
+            .where(conversations.c.ws_id == source_ws_id)
+            .order_by(conversations.c.id)
+        ).fetchall()
+    ]
+
+    marker = max(
+        (row for row in source_rows if _is_compaction_marker(row)),
+        key=lambda row: row[0],
+        default=None,
+    )
+    watermark = _compaction_watermark(marker) if marker is not None else None
+    has_checkpoint = marker is not None and watermark is not None
+    candidate_rows = (
+        [marker]
+        + [row for row in source_rows if row[0] > watermark and not _is_compaction_marker(row)]
+        if marker is not None and watermark is not None
+        else [row for row in source_rows if not _is_compaction_marker(row)]
+    )
+    candidate_attachment_refs: dict[int, list[str]] = {}
+    for row in candidate_rows:
+        refs = _fork_attachment_refs(row[11] if len(row) > 11 else None)
+        if refs and row[1] not in ("user", "tool"):
+            raise ForkSourceUnavailableError("fork source attachment references are invalid")
+        if refs:
+            candidate_attachment_refs[int(row[0])] = refs
+
+    preliminary_turns = recover_trajectory(
+        reconstruct_turns_checkpointed(source_rows, source_ws_id, checkpoint=True)
+    )
+    if has_checkpoint and (
+        len(preliminary_turns) < 2
+        or preliminary_turns[0].source != COMPACTION_SOURCE
+        or preliminary_turns[1].source != COMPACTION_SOURCE
+        or preliminary_turns[1].role is not Role.ASSISTANT
+        or preliminary_turns[1].tool_calls
+    ):
+        raise ForkSourceUnavailableError("fork source compaction marker is invalid")
+
+    preliminary_persisted = preliminary_turns[1:] if has_checkpoint else preliminary_turns
+    preliminary_serialized = [
+        _fork_turn_insert_row(turn, destination_ws_id, now) for turn in preliminary_persisted
+    ]
+    attachment_ids = [
+        attachment_id for _insert_row, refs in preliminary_serialized for attachment_id in refs
+    ]
+    try:
+        retain_attachment_refs(conn, attachment_ids)
+    except ValueError as exc:
+        raise ForkSourceUnavailableError("fork source attachments are no longer available") from exc
+
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None
+    if attachment_ids:
+        copied_ids = set(attachment_ids)
+        attachment_rows = conn.execute(
+            sa.select(
+                workstream_attachments.c.attachment_id,
+                workstream_attachments.c.filename,
+                workstream_attachments.c.mime_type,
+                workstream_attachments.c.size_bytes,
+                workstream_attachments.c.kind,
+            ).where(
+                workstream_attachments.c.attachment_id.in_(copied_ids),
+                workstream_attachments.c.kind != "preview",
+            )
+        ).fetchall()
+        rows_by_id = {
+            str(row._mapping["attachment_id"]): dict(row._mapping) for row in attachment_rows
+        }
+        attachments_by_msg = build_attachments_by_msg(
+            {
+                row_id: [attachment_id for attachment_id in refs if attachment_id in copied_ids]
+                for row_id, refs in candidate_attachment_refs.items()
+            },
+            rows_by_id,
+        )
+
+    final_turns = recover_trajectory(
+        reconstruct_turns_checkpointed(
+            source_rows,
+            source_ws_id,
+            attachments_by_msg,
+            checkpoint=True,
+        )
+    )
+    final_persisted = final_turns[1:] if has_checkpoint else final_turns
+    serialized = [_fork_turn_insert_row(turn, destination_ws_id, now) for turn in final_persisted]
+    final_attachment_ids = [
+        attachment_id for _insert_row, refs in serialized for attachment_id in refs
+    ]
+    if final_attachment_ids != attachment_ids:
+        raise ForkSourceUnavailableError("fork source attachment snapshot changed")
+
+    conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == destination_ws_id))
+    destination_config = dict(source_config)
+    if destination_reservation_token:
+        # Retain the private incarnation fence across clone and publication.
+        # Cancellation and later hard-delete can therefore delete A exactly
+        # without deleting a same-id replacement B.
+        destination_config[FORK_RESERVATION_CONFIG_KEY] = destination_reservation_token
+    if destination_config:
+        conn.execute(
+            sa.insert(workstream_config),
+            [
+                {"ws_id": destination_ws_id, "key": key, "value": value}
+                for key, value in destination_config.items()
+            ],
+        )
+
+    insert_rows = [insert_row for insert_row, _refs in serialized]
+    if has_checkpoint and insert_rows:
+        marker_result = conn.execute(sa.insert(conversations), insert_rows[0])
+        marker_id = marker_result.inserted_primary_key[0]
+        if marker_id is None:
+            raise RuntimeError("clone_workstream: marker primary key unavailable")
+        marker_meta_raw = insert_rows[0].get("meta")
+        try:
+            marker_meta = json.loads(marker_meta_raw) if marker_meta_raw else {}
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ForkSourceUnavailableError("fork source compaction marker is invalid") from exc
+        if not isinstance(marker_meta, dict):
+            raise ForkSourceUnavailableError("fork source compaction marker is invalid")
+        marker_meta["watermark"] = int(marker_id)
+        conn.execute(
+            sa.update(conversations)
+            .where(conversations.c.id == marker_id)
+            .values(meta=json.dumps(marker_meta))
+        )
+        if len(insert_rows) > 1:
+            conn.execute(sa.insert(conversations), insert_rows[1:])
+    elif insert_rows:
+        conn.execute(sa.insert(conversations), insert_rows)
+
+    updated = conn.execute(
+        sa.update(workstreams)
+        .where(workstreams.c.ws_id == destination_ws_id)
+        .values(project_id=effective_project_id, updated=now)
+        .returning(workstreams.c.ws_id)
+    ).fetchone()
+    if updated is None:
+        raise ForkDestinationConflictError("fork destination is no longer available")
+
+    return ForkCloneSnapshot(
+        turns=tuple(final_turns),
+        config=dict(source_config),
+        project_id=effective_project_id,
+    )
 
 
 def senders_from_user_meta(metas: Iterable[str | None]) -> list[str]:

@@ -11,7 +11,7 @@ skinparam participant {
 
 participant "ChatSession\n(session.py)" as Session <<session>>
 participant "WatchRunner\n(watch.py)" as Runner <<server>>
-participant "StorageBackend\n(SQLite)" as Storage <<storage>>
+participant "StorageBackend\n(SQLite / PostgreSQL)" as Storage <<storage>>
 participant "WebUI / SSE\n(server.py)" as UI <<ui>>
 
 == Create Phase ==
@@ -130,7 +130,7 @@ note right : action="cancel" (auto-approve)
 note over Runner, Storage
   **Startup:**
   1. WatchRunner created in main() with storage + node_id
-  2. restore_fn closure captures WorkstreamManager
+  2. restore_fn closure captures SessionManager
   3. Initial workstream: session.set_watch_runner(runner)
   4. _lifespan(): runner.start() — daemon thread begins
 

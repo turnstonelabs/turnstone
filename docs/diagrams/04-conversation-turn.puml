@@ -1,183 +1,145 @@
 @startuml
 !theme plain
-title Turnstone — Conversation Turn Lifecycle
+title Turnstone — Generation-Fenced Conversation Turn
 
 skinparam sequenceArrowThickness 1.5
 skinparam sequenceLifeLineBackgroundColor #F5F5F5
 
-participant "User /\nHTTP Client" as User
-participant "ChatSession" as CS
-participant "SessionUI" as UI
-participant "LLMProvider\n(OpenAI / Anthropic)" as LLM
-participant "Tool Executor\n(ThreadPool)" as TP
-database "SQLite" as DB
+participant "HTTP / CLI\ncaller" as User
+participant "SessionManager" as Manager
+participant "ChatSession" as Session
+participant "SessionUIBase" as UI
+participant "model_turn()\n+ lowering" as Plant
+participant "LLM provider" as Provider
+participant "Tool workers" as Tools
+database "StorageBackend\n(SQLite / PostgreSQL)" as Storage
 
-== User Input ==
+== Admission and generation claim ==
 
-User -> CS : send(user_input)
-activate CS
+User -> Manager : dispatch send on one Workstream
+Manager -> Session : bind_acting_user(principal)\nsend(text, attachments, send_id)
+activate Session
+Session -> Session : refresh immutable ResolvedModelBinding
 
-CS -> CS : messages.append({role: "user", content: input})
-CS -> DB : save_message(ws_id, "user", input)
-
-== LLM Call Loop ==
-
-group loop [while tool_calls present]
-
-    CS -> UI : on_turn_start()
-    note right of UI
-      SessionUIBase resets the per-turn inflight
-      buffers (_ws_inflight_content / reasoning /
-      seq) that fuel the SSE in_progress_snapshot
-      event for mid-stream refresh resume.
-    end note
-
-    CS -> UI : on_state_change("thinking")
-    CS -> UI : on_thinking_start()
-
-    CS -> LLM : provider.create_streaming(\n  client, model, messages, tools, ...)\n  (normalized StreamChunk iterator)
-    activate LLM
-
-    note right of CS
-      Retry up to 3× on transient errors:
-      RateLimitError, APITimeoutError,
-      APIConnectionError, InternalServerError,
-      ServiceUnavailableError, APIError
-      Backoff: 1s, 2s, 4s
-    end note
-
-    == Streaming Response ==
-
-    loop for each chunk in stream
-        LLM --> CS : delta
-        note right of CS
-          on_thinking_stop() called on first
-          delta token via _stop_spinner_once()
-        end note
-        alt reasoning_content present
-            CS -> UI : on_reasoning_token(text)
-        else content present
-            CS -> UI : on_content_token(text)
-        else tool_call delta
-            CS -> CS : accumulate in tool_calls_acc
-        else info_delta present
-            CS -> UI : on_info(text)\n(e.g. server-side web search status)
-        end
-    end
-
-        note right of CS
-          **Cancellation checkpoint:**
-          _check_cancelled() runs per chunk.
-          If cancel_event is set, raises
-          GenerationCancelled — preserves
-          partial content, emits idle state.
-        end note
-
-    LLM --> CS : stream complete (usage stats)
-    deactivate LLM
-
-    CS -> UI : on_thinking_stop()  (no-op guard: already called by _stop_spinner_once)
-    CS -> UI : on_stream_end()
-
-    CS -> CS : _update_token_table()\ncalibrate chars_per_token ratio
-    CS -> CS : messages.append(assistant_msg)
-    CS -> UI : on_turn_committed()
-    note right of UI
-      Drops the per-turn inflight buffers — the
-      assistant message is now in the history
-      list, so the in_progress_snapshot must
-      not re-render it during the next tool-
-      execution window or the next streaming turn.
-    end note
-    CS -> DB : save_message(ws_id, "assistant", content)
-    CS -> DB : save_message(ws_id, "tool_call", ...) ×N
-
-    == Tool Dispatch (if tool_calls) ==
-
-    alt no tool_calls
-        CS -> UI : on_status(usage, context_window, effort)
-
-        opt prompt_tokens > context_window × auto_compact_pct
-            CS -> CS : _compact_messages(auto=True)
-            CS -> LLM : Non-streaming summarization call
-            CS -> CS : Replace messages with [summary]
-        end
-
-        opt first exchange & no title
-            CS -> CS : Background thread: _generate_title()
-        end
-
-        CS -> UI : on_state_change("idle")
-        CS --> User : return
-
-    else has tool_calls
-        CS -> UI : on_state_change("running")
-
-        == Phase 1: Prepare ==
-        CS -> CS : [_prepare_tool(tc) for tc in tool_calls]\nParse JSON args, validate,\nbuild preview + header
-
-        == Phase 2: Approve ==
-        CS -> UI : on_state_change("attention")
-        CS -> UI : approve_tools(items)
-        activate UI
-        note right of UI
-          TerminalUI: input() prompt
-          WebUI: _approval_event.wait()
-          NullUI: returns (True, None)
-        end note
-        UI --> CS : (approved: bool, feedback: str?)
-        deactivate UI
-        CS -> UI : on_state_change("running")
-
-        == Phase 3: Execute ==
-        CS -> TP : ThreadPoolExecutor(max_workers=4)\nrun_one(item) for each tool
-        activate TP
-
-        note right of TP
-          Parallel execution:
-          bash → Popen + line-by-line streaming
-          read_file → open().read() or base64 image
-          search → grep subprocess
-          edit_file → string replace
-          task → _run_agent() sub-loop
-          web_fetch → httpx + LLM summarize
-          web_search → provider-native or SearxNG fallback
-          memory/recall → SQLite
-        end note
-
-        note right of TP
-          bash: on_tool_output_chunk(call_id, line)
-          called per stdout line,
-          then on_tool_result(call_id, name, output, is_error).
-          is_error=True when execution failed.
-          call_id routes chunks/results to correct
-          tool div during parallel execution.
-          Other tools: on_tool_result() only.
-        end note
-
-        TP --> CS : [(call_id, output), ...]
-        deactivate TP
-
-        loop for each result
-            CS -> CS : messages.append({role: "tool", ...})
-            CS -> DB : save_message(ws_id, "tool_result", ...)
-        end
-
-        opt user_feedback from approval
-            CS -> CS : messages.append({role: "user", content: feedback})
-        end
-
-        note right of CS : Loop back for next LLM call
-
-    else GenerationCancelled
-        CS -> CS : Preserve partial content\nor roll back incomplete tools
-        CS -> UI : on_info("[Generation cancelled]")
-        CS -> UI : on_state_change("idle")
-        CS --> User : return (no re-raise)
-    end
-
+opt token budget exhausted
+  Session -> UI : approve_tools(__budget_override__)
+  note right of UI
+    This gate precedes a generation claim but carries
+    a monotonic cancellation witness. Stop cannot be
+    mistaken for a budget-policy denial.
+  end note
 end
 
-deactivate CS
+Session -> Session : _claim_generation() → generation N\ninstall fresh cancel event
+Session -> Session : plan memory / participant context
+Session -> Storage : ordered durable batch:\nappend canonical user Turn + metadata
 
+note over Session, Storage
+  _commit_for_generation(N) admits bounded live mutations under the
+  generation lock, then executes immutable persistence closures in FIFO
+  ticket order. A force successor either follows the whole commit or
+  prevents it; storage I/O never holds the lifecycle lock.
+end note
+
+opt already over the hard context ceiling
+  Session -> Session : compact before first model call\n(preserve the new user turn)
+end
+
+== Model / tool loop ==
+
+loop until final answer and no queued input
+  Session -> UI : on_turn_start()\nreset per-stream replay buffers
+  Session -> UI : state = thinking\non_thinking_start()
+  Session -> Session : _stream_response(N)\nretry + fallback policy
+  Session -> Plant : model_turn(active ModelLane, Turns,\n tools, cancel_ref, on_chunk)
+  activate Plant
+  Plant -> Plant : canonical Turns → provider wire\nrestore ids + repair + lane-specific fold
+  Plant -> Plant : resolve per-call backend credential\nfrom lane's pinned ModelConfig
+  Plant -> Provider : create_streaming(...)
+  activate Provider
+
+  loop normalized stream chunks
+    Provider --> Plant : StreamChunk
+    Plant --> Session : on_chunk(StreamChunk)
+    Session -> Session : check cancel event + generation N
+    Session -> UI : reasoning / content / info token
+  end
+
+  Provider --> Plant : finish + usage + native blocks
+  deactivate Provider
+  Plant -> Plant : drain + re-ingest assistant Turn\nwith serving-lane provenance
+  Plant --> Session : ModelTurnResult
+  deactivate Plant
+
+  Session -> UI : on_stream_end()
+  Session -> Session : generation-fenced result commit:\nappend assistant Turn + token accounting
+  Session -> UI : on_turn_committed()
+  Session -> Storage : ordered durable assistant row\n(content + tool mirror + native lane)
+
+  alt no tool calls
+    opt over soft threshold
+      Session -> Session : cooperative / end-of-turn compaction
+      Session -> Storage : append checkpoint summary marker\nwith source watermark
+      note right of Storage
+        Full history remains durable. Resume loads
+        [summary] + rows after the checkpoint.
+      end note
+      opt model stopped for compaction
+        Session -> Storage : append synthetic compaction_resume Turn
+      end
+    end
+    alt queued messages drained
+      Session -> Storage : append combined queued user Turn
+    else truly complete
+      Session -> UI : state = idle
+    end
+  else tool calls present
+    Session -> UI : state = running
+    Session -> Session : prepare items + previews\nattach cancellation witnesses
+
+    opt one or more items require a human
+      Session -> UI : approve_tools(items)\nregister independent ApprovalCycle
+      note right of UI
+        Parallel agents may own concurrent cycles.
+        cycle_id / call_id routes exactly one decision;
+        Smart Approvals may clear qualifying items.
+      end note
+      User -> UI : approve / deny selected cycle
+      UI --> Session : decision + optional feedback
+    end
+
+    Session -> Tools : execute admitted items in parallel
+    activate Tools
+    Tools --> UI : chunks + result card\nwith effect disposition
+    Tools --> Session : outputs / errors / effect statuses
+    deactivate Tools
+    Session -> Session : output-guard evaluation\nthen generation N re-check
+
+    opt compaction owed before result sizing
+      Session -> Session : compact, preserving assistant tool-call Turn
+      Session -> Storage : append checkpoint marker
+    end
+
+    Session -> Session : one generation-fenced batch:\nappend all Tool Turns, advisories, feedback
+    Session -> Storage : FIFO durable tool rows + metadata
+  end
+end
+
+== Stop / force-successor boundary ==
+
+User -> Session : cancel()
+Session -> Session : atomically set generation event; snapshot\nmain stream, child scopes, judges, subprocesses
+Session -> Provider : close live stream handle
+Session -> Tools : abort child scopes + kill subprocess groups
+Session -> UI : resolve only cancelled operation's\napproval cycles
+
+note over Session, Storage
+  Every later publish/commit checks generation ownership. An abandoned
+  worker may unwind, but cannot append Turns, overwrite state, resolve a
+  successor approval, or repaint the successor UI. Observed tool effects
+  are preserved as controller-authored cancellation receipts; unreviewed
+  tool bytes are not laundered into model context.
+end note
+
+deactivate Session
 @enduml

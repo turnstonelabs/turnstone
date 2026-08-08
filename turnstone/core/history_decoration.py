@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core import fence
 from turnstone.core.log import get_logger
 
 log = get_logger(__name__)
@@ -403,7 +404,17 @@ def attach_vllm_chat_reasoning_field(
         if not text:
             out.append(msg)
             continue
-        out.append({**msg, "reasoning": text})
+        # This plaintext projection is inserted into vLLM's assistant replay
+        # template after the ordinary history-fold fence pass.  Defang any
+        # trusted marker the model echoed into captured reasoning so it cannot
+        # re-enter the next request as an exact operator or participant fence.
+        # The persisted provider blocks remain byte-exact (including
+        # signed/encrypted native reasoning); only the derived, unsigned replay
+        # field is changed. ``tool_output`` is intentionally absent: that fence
+        # is declared untrusted rather than authoritative to the assistant.
+        safe_text = fence.neutralize(text, fence.SYSTEM_REMINDER_TAG, opening=True)
+        safe_text = fence.neutralize(safe_text, fence.SENDER_LABEL_TAG, opening=True)
+        out.append({**msg, "reasoning": safe_text})
     return out
 
 

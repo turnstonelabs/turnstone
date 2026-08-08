@@ -15,18 +15,24 @@ in ``test_storage_sqlite.py``).  These tests verify the glue:
 - the helper unsubscribes when the thread exits so the subscriber
   doesn't leak past one cleanup-thread lifetime.
 
-The ``stop_event`` parameter is exclusively for tests — production
-callers pass ``None`` and the daemon runs for process lifetime.
+The ``stop_event`` parameter is shared by tests and production lifecycle
+shutdown so the daemon cannot outlive its manager.
 """
 
 from __future__ import annotations
 
 import contextlib
+import queue
 import threading
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from turnstone.console.server import _coord_idle_cleanup_thread
+from turnstone.console.server import (
+    _coord_idle_cleanup_thread,
+    _teardown_partial_coord_subsystem,
+)
+from turnstone.server import _idle_cleanup_thread
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -41,12 +47,19 @@ class _StubMgr:
     """
 
     def __init__(
-        self, *, stop_event: threading.Event, expected_calls: int, raise_after: int = -1
+        self,
+        *,
+        stop_event: threading.Event,
+        expected_calls: int,
+        raise_after: int = -1,
+        stop_on_reap: bool = False,
     ) -> None:
         self.calls: list[float] = []
+        self.reap_calls: list[float] = []
         self._stop_event = stop_event
         self._expected = expected_calls
         self._raise_after = raise_after
+        self._stop_on_reap = stop_on_reap
         self._subscribers: list[Callable[[str, object], None]] = []
         self._sub_lock = threading.Lock()
 
@@ -60,6 +73,12 @@ class _StubMgr:
             # regardless of whether this call raised.
             if len(self.calls) >= self._expected:
                 self._stop_event.set()
+        return []
+
+    def reap_stale_creating_reservations(self, max_age_seconds: float) -> list[str]:
+        self.reap_calls.append(max_age_seconds)
+        if self._stop_on_reap:
+            self._stop_event.set()
         return []
 
     def subscribe_to_state(self, callback: Callable[[str, object], None]) -> None:
@@ -123,6 +142,65 @@ def test_coord_idle_cleanup_runs_initial_sweep_before_wait() -> None:
     assert elapsed < 1.0
 
 
+def test_coord_cleanup_recovers_stale_creates_when_idle_eviction_is_disabled() -> None:
+    stop_event = threading.Event()
+    mgr = _StubMgr(
+        stop_event=stop_event,
+        expected_calls=1,
+        stop_on_reap=True,
+    )
+    thread = threading.Thread(
+        target=_coord_idle_cleanup_thread,
+        args=(mgr, 0.0, stop_event),
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert mgr.calls == []
+    assert len(mgr.reap_calls) == 1
+    assert mgr.reap_calls[0] > 0
+    assert mgr.subscribers_count == 0
+
+
+def test_server_cleanup_recovers_stale_creates_when_idle_eviction_is_disabled() -> None:
+    stop_event = threading.Event()
+    mgr = _StubMgr(
+        stop_event=stop_event,
+        expected_calls=1,
+        stop_on_reap=True,
+    )
+
+    _idle_cleanup_thread(
+        mgr,  # type: ignore[arg-type]
+        0.0,
+        queue.Queue(),
+        stop=stop_event,
+    )
+
+    assert mgr.calls == []
+    assert len(mgr.reap_calls) == 1
+    assert mgr.reap_calls[0] > 0
+
+
+def test_server_stale_create_gc_keeps_independent_cadence() -> None:
+    stop_event = threading.Event()
+    mgr = _StubMgr(stop_event=stop_event, expected_calls=3)
+    thread = threading.Thread(
+        target=_idle_cleanup_thread,
+        args=(mgr, 0.04, queue.Queue()),
+        kwargs={"stop": stop_event},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert len(mgr.calls) == 3
+    assert len(mgr.reap_calls) == 1
+
+
 def test_coord_idle_cleanup_calls_close_idle_each_tick() -> None:
     """Heartbeat path: with no state-change events, close_idle fires
     each ``check_every`` interval.  Test uses a tiny timeout so the
@@ -134,6 +212,83 @@ def test_coord_idle_cleanup_calls_close_idle_each_tick() -> None:
     _run_until_done(mgr, stop_event, timeout_sec=0.04)
     assert len(mgr.calls) == 3
     assert all(t == 0.04 for t in mgr.calls)
+    assert len(mgr.reap_calls) == 1
+
+
+def test_partial_teardown_stops_and_joins_coord_cleanup_thread() -> None:
+    stop_event = threading.Event()
+    wake_event = threading.Event()
+    thread = threading.Thread(
+        target=stop_event.wait,
+        name="test-coord-idle-cleanup",
+        daemon=True,
+    )
+    thread.start()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            coord_idle_cleanup_stop=stop_event,
+            coord_idle_cleanup_wake=wake_event,
+            coord_idle_cleanup_thread=thread,
+            coord_state_writer=None,
+            coord_idle_observer=None,
+            coord_adapter=None,
+            coord_mgr=None,
+            coord_registry=None,
+            _idle_nudge_watchers=[],
+        )
+    )
+
+    _teardown_partial_coord_subsystem(app)
+
+    assert stop_event.is_set()
+    assert not thread.is_alive()
+    assert app.state.coord_idle_cleanup_stop is None
+    assert app.state.coord_idle_cleanup_wake is None
+    assert app.state.coord_idle_cleanup_thread is None
+
+
+def test_idle_enabled_teardown_wakes_long_wait_without_post_stop_sweep() -> None:
+    stop_event = threading.Event()
+    wake_event = threading.Event()
+    mgr = _StubMgr(stop_event=stop_event, expected_calls=99)
+    thread = threading.Thread(
+        target=_coord_idle_cleanup_thread,
+        args=(mgr, 1200.0, stop_event),
+        kwargs={"min_sweep_interval": 0.0, "wake_event": wake_event},
+        name="test-coord-idle-cleanup-long-wait",
+        daemon=True,
+    )
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if len(mgr.calls) == 1 and mgr.subscribers_count == 1:
+            break
+        time.sleep(0.01)
+    assert len(mgr.calls) == 1
+    assert mgr.subscribers_count == 1
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            coord_idle_cleanup_stop=stop_event,
+            coord_idle_cleanup_wake=wake_event,
+            coord_idle_cleanup_thread=thread,
+            coord_state_writer=None,
+            coord_idle_observer=None,
+            coord_adapter=None,
+            coord_mgr=None,
+            coord_registry=None,
+            _idle_nudge_watchers=[],
+        )
+    )
+
+    started = time.monotonic()
+    _teardown_partial_coord_subsystem(app)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert not thread.is_alive()
+    assert mgr.subscribers_count == 0
+    assert len(mgr.calls) == 1
+    assert len(mgr.reap_calls) == 1
 
 
 def test_coord_idle_cleanup_survives_close_idle_exceptions() -> None:

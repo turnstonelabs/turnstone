@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import threading
 
 import pytest
 
@@ -244,6 +245,51 @@ class TestRefreshLifecycle:
         storage.services = [NODE_A, NODE_B]
         router.force_refresh()
         assert router.node_count() == 2
+
+    def test_remember_override_cannot_be_erased_by_stale_inflight_refresh(self) -> None:
+        """A pre-commit refresh snapshot publishes before the create hint."""
+
+        class _BlockingStorage(FakeStorage):
+            def __init__(self) -> None:
+                super().__init__()
+                self.override_snapshot_taken = threading.Event()
+                self.release_override_snapshot = threading.Event()
+
+            def list_workstream_overrides(self) -> list[dict[str, str]]:
+                snapshot = list(self.overrides)
+                self.override_snapshot_taken.set()
+                assert self.release_override_snapshot.wait(timeout=2)
+                return snapshot
+
+        storage = _BlockingStorage()
+        storage.services = [NODE_A, NODE_B]
+        router, _ = _make_router(storage)
+        ws_id = "a" * 32
+        owner = NodeRef("node-a", "http://a:8080")
+        refresh_done = threading.Event()
+        remember_done = threading.Event()
+
+        def refresh() -> None:
+            router.force_refresh()
+            refresh_done.set()
+
+        def remember() -> None:
+            router.remember_override(ws_id, owner)
+            remember_done.set()
+
+        refresher = threading.Thread(target=refresh)
+        publisher = threading.Thread(target=remember)
+        refresher.start()
+        assert storage.override_snapshot_taken.wait(timeout=1)
+        publisher.start()
+        assert not remember_done.wait(timeout=0.1), "create hint overtook stale refresh"
+        storage.release_override_snapshot.set()
+        refresher.join(timeout=2)
+        publisher.join(timeout=2)
+
+        assert refresh_done.is_set()
+        assert remember_done.is_set()
+        assert router.route(ws_id) == owner
 
     def test_version_is_monotonic_across_refreshes(self) -> None:
         router, storage = _make_router()

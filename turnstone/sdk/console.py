@@ -41,6 +41,8 @@ from turnstone.api.console_schemas import (
     ParseSkillResponse,
     RegistrySearchResponse,
     RoleInfo,
+    RouteCreateResponse,
+    RouteLiveResponse,
     SettingInfo,
     SkillDiscoverResponse,
     SkillInfo,
@@ -164,10 +166,9 @@ class AsyncTurnstoneConsole(_BaseClient):
         initial_message: str = "",
         skill: str = "",
         persona: str = "",
+        project_id: str = "",
         resume_ws: str = "",
-        auto_approve: bool = False,
-        auto_approve_tools: str = "",
-        user_id: str = "",
+        judge_model: str = "",
     ) -> ConsoleCreateWsResponse:
         body: dict[str, Any] = {}
         if node_id:
@@ -182,14 +183,12 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["skill"] = skill
         if persona:
             body["persona"] = persona
+        if project_id:
+            body["project_id"] = project_id
         if resume_ws:
             body["resume_ws"] = resume_ws
-        if auto_approve:
-            body["auto_approve"] = True
-        if auto_approve_tools:
-            body["auto_approve_tools"] = auto_approve_tools
-        if user_id:
-            body["user_id"] = user_id
+        if judge_model:
+            body["judge_model"] = judge_model
         return await self._request(
             "POST",
             "/v1/api/cluster/workstreams/new",
@@ -213,24 +212,27 @@ class AsyncTurnstoneConsole(_BaseClient):
         name: str = "",
         model: str = "",
         auto_approve: bool = False,
-        auto_approve_tools: str = "",
+        auto_approve_tools: str | list[str] = "",
         initial_message: str = "",
         skill: str = "",
         persona: str = "",
+        project_id: str = "",
         resume_ws: str = "",
+        judge_model: str = "",
         target_node: str = "",
         user_id: str = "",
         client_type: str = "",
+        notify_targets: str | list[dict[str, str]] = "",
         ws_id: str = "",
         attachments: list[AttachmentUpload] | None = None,
-    ) -> dict[str, Any]:
+    ) -> RouteCreateResponse:
         """Create a workstream via the console's routing proxy.
 
         Posts to /v1/api/route/workstreams/new.  When *attachments* is
         non-empty, the request is sent as multipart and the console
         routes via ``?ws_id=<hex>`` (auto-generated when not supplied)
-        so the body lands on the owning node directly.  Returns the
-        full response dict including ``node_url`` and ``node_id``.
+        so the body lands on the owning node directly. Returns a typed
+        response including the selected node and routing strategy.
         """
         body: dict[str, Any] = {}
         if name:
@@ -247,14 +249,20 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["skill"] = skill
         if persona:
             body["persona"] = persona
+        if project_id:
+            body["project_id"] = project_id
         if resume_ws:
             body["resume_ws"] = resume_ws
+        if judge_model:
+            body["judge_model"] = judge_model
         if target_node:
             body["target_node"] = target_node
         if user_id:
             body["user_id"] = user_id
         if client_type:
             body["client_type"] = client_type
+        if notify_targets and notify_targets != "[]":
+            body["notify_targets"] = notify_targets
 
         if attachments:
             # The console's multipart route_create routes by `?ws_id=` only —
@@ -288,11 +296,17 @@ class AsyncTurnstoneConsole(_BaseClient):
                 files=files,
                 data={"meta": _json.dumps(body)},
                 params={"ws_id": ws_id},
+                response_model=RouteCreateResponse,
             )
 
         if ws_id:
             body["ws_id"] = ws_id
-        return await self._request("POST", "/v1/api/route/workstreams/new", json_body=body)
+        return await self._request(
+            "POST",
+            "/v1/api/route/workstreams/new",
+            json_body=body,
+            response_model=RouteCreateResponse,
+        )
 
     # -- routing proxy: attachments -----------------------------------------
 
@@ -478,6 +492,14 @@ class AsyncTurnstoneConsole(_BaseClient):
         Returns {"node_url": "...", "node_id": "..."}.
         """
         return await self._request("GET", "/v1/api/route", params={"ws_id": ws_id})
+
+    async def route_workstream_live(self, ws_id: str) -> RouteLiveResponse:
+        """Check whether a routed workstream is loaded without opening it."""
+        return await self._request(
+            "GET",
+            f"/v1/api/route/workstreams/{ws_id}/live",
+            response_model=RouteLiveResponse,
+        )
 
     # -- streaming -----------------------------------------------------------
 
@@ -1247,10 +1269,9 @@ class TurnstoneConsole:
         initial_message: str = "",
         skill: str = "",
         persona: str = "",
+        project_id: str = "",
         resume_ws: str = "",
-        auto_approve: bool = False,
-        auto_approve_tools: str = "",
-        user_id: str = "",
+        judge_model: str = "",
     ) -> ConsoleCreateWsResponse:
         return self._runner.run(
             self._async.create_workstream(
@@ -1260,10 +1281,9 @@ class TurnstoneConsole:
                 initial_message=initial_message,
                 skill=skill,
                 persona=persona,
+                project_id=project_id,
                 resume_ws=resume_ws,
-                auto_approve=auto_approve,
-                auto_approve_tools=auto_approve_tools,
-                user_id=user_id,
+                judge_model=judge_model,
             )
         )
 
@@ -1280,17 +1300,20 @@ class TurnstoneConsole:
         name: str = "",
         model: str = "",
         auto_approve: bool = False,
-        auto_approve_tools: str = "",
+        auto_approve_tools: str | list[str] = "",
         initial_message: str = "",
         skill: str = "",
         persona: str = "",
+        project_id: str = "",
         resume_ws: str = "",
+        judge_model: str = "",
         target_node: str = "",
         user_id: str = "",
         client_type: str = "",
+        notify_targets: str | list[dict[str, str]] = "",
         ws_id: str = "",
         attachments: list[AttachmentUpload] | None = None,
-    ) -> dict[str, Any]:
+    ) -> RouteCreateResponse:
         return self._runner.run(
             self._async.route_create_workstream(
                 name=name,
@@ -1300,10 +1323,13 @@ class TurnstoneConsole:
                 initial_message=initial_message,
                 skill=skill,
                 persona=persona,
+                project_id=project_id,
                 resume_ws=resume_ws,
+                judge_model=judge_model,
                 target_node=target_node,
                 user_id=user_id,
                 client_type=client_type,
+                notify_targets=notify_targets,
                 ws_id=ws_id,
                 attachments=attachments,
             )
@@ -1409,6 +1435,9 @@ class TurnstoneConsole:
 
     def route_lookup(self, ws_id: str) -> dict[str, Any]:
         return self._runner.run(self._async.route_lookup(ws_id))
+
+    def route_workstream_live(self, ws_id: str) -> RouteLiveResponse:
+        return self._runner.run(self._async.route_workstream_live(ws_id))
 
     # -- streaming -----------------------------------------------------------
 

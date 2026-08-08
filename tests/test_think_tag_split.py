@@ -29,7 +29,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests._reasoning_dialect import CASES as DIALECT_CASES
-from tests._session_helpers import make_session, scripted_provider
+from tests._session_helpers import make_session, replace_session_lane, scripted_provider
 from turnstone.core.model_turn import ModelLane
 from turnstone.core.providers import StreamChunk, ToolCallDelta
 from turnstone.core.session import _CancelRef, _StreamTurnConsumer
@@ -340,7 +340,7 @@ def test_tool_calls_flush_pending_raw_at_current_state():
     session = make_session()
     ui = _TokenRecorderUI()
     session.ui = ui
-    session._provider = scripted_provider(chunks)
+    replace_session_lane(session, provider=scripted_provider(chunks))
     session.messages.append(Turn.user("hi"))
     result = session._stream_response(0)
     assert ui.tokens == [("content", "part<thi")]

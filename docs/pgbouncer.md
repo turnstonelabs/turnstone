@@ -15,11 +15,19 @@ down to a small number of real database connections.
 
 ## Why PgBouncer works well with turnstone
 
-All turnstone database operations are short-burst queries: acquire a
-connection, execute 1–3 statements, commit, release. No operation holds
-a connection for more than a few milliseconds. This makes **transaction
-pooling mode** ideal — PgBouncer assigns a real connection only for the
-duration of each transaction, then returns it to the pool.
+Most turnstone database operations are short-burst queries: acquire a
+connection, execute a small transaction, commit, release. Workstream forks are
+the deliberate exception: they clone the source's checkpoint-bounded history
+and configuration and retain its attachment references in one transaction.
+PostgreSQL runs that clone at `SERIALIZABLE` isolation and retries serialization
+or deadlock conflicts as a whole. A large fork can therefore hold its assigned
+server connection longer than an ordinary message write.
+
+This still makes **transaction pooling mode** the right fit — no operation
+depends on server-session state, and PgBouncer returns the connection as soon
+as the transaction finishes. Size and monitor the server pool with concurrent
+fork traffic in mind rather than assuming every transaction completes in a few
+milliseconds.
 
 | Cluster size | Client connections (max) | PgBouncer server connections needed |
 |--------------|------------------------|-------------------------------------|
@@ -143,9 +151,11 @@ PgBouncer (which then multiplexes to PostgreSQL):
 | `TURNSTONE_DB_URL` | — | Connection URL (point at PgBouncer, not PostgreSQL directly) |
 
 The default pool of 2 + 3 overflow = 5 connections per process is
-intentionally small to support large clusters. You should not need to
-increase this — turnstone's database operations are all short-burst
-context-managed queries that hold connections for milliseconds.
+intentionally small to support large clusters. Most deployments should not
+need to increase it. If operators create many large forks concurrently, watch
+PgBouncer's `cl_waiting` and PostgreSQL transaction latency before changing
+the per-process pool; adding client-side connections cannot help once the
+PgBouncer server pool is saturated.
 
 SQLAlchemy `pool_pre_ping` is enabled, so stale connections (e.g. after
 PgBouncer restarts) are automatically detected and replaced.
@@ -176,6 +186,32 @@ Key metrics to watch:
   non-zero values mean you need more `default_pool_size`.
 - **`sv_active`** — active server (PostgreSQL) connections. Should stay
   below PostgreSQL `max_connections`.
+
+Short `cl_waiting` spikes during large workstream forks can be normal. Sustained
+waiters accompanied by long serializable transactions indicate fork/storage
+load, not an SSE or HTTP client-pool problem.
+
+---
+
+## Upgrade note: deferred workstream creation
+
+The workstream lifecycle now uses durable, hidden `state='creating'`
+reservations while session construction, upload validation, and optional fork
+cloning complete. Older server processes do not understand that private state:
+against the same database they may resolve, list, open, or prune a reservation
+before its new owner publishes it.
+
+For the upgrade that introduces deferred creation, drain create traffic and
+upgrade all server processes sharing the database as one cohort. Do not resume
+creates until no older server process remains. The change needs no manual
+schema migration, but it is not safe to treat mixed lifecycle implementations
+as an ordinary rolling-upgrade state.
+
+A `creating` row should be transient and absent from normal APIs and cluster
+events. If one persists after a process crash, inspect the corresponding
+`ws.create.*` and `session_mgr.commit_create.*` logs before cleanup. Do not
+promote it to `idle` manually: its history, configuration, attachment
+references, or lifecycle publication may be incomplete.
 
 ---
 

@@ -13,7 +13,7 @@ skinparam participant {
 participant "ChatSession\n(session.py)" as Session <<session>>
 participant "MemoryFacade\n(memory.py)" as Facade <<facade>>
 participant "MemoryRelevance\n(memory_relevance.py)" as Relevance <<facade>>
-participant "StorageBackend\n(SQLite)" as Storage <<storage>>
+participant "StorageBackend\n(SQLite / PostgreSQL)" as Storage <<storage>>
 participant "Server API\n(server.py)" as API <<api>>
 participant "Console Admin\n(console/server.py)" as Admin <<api>>
 participant "SDK Client\n(sdk/)" as SDK <<sdk>>

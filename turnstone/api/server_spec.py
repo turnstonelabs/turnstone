@@ -20,8 +20,10 @@ from turnstone.api.schemas import (
 )
 from turnstone.api.server_schemas import (
     ApproveRequest,
+    ApproveResponse,
     AvailableModelInfo,
     CancelRequest,
+    CancelResponse,
     CloseWorkstreamRequest,
     CommandRequest,
     CreateWorkstreamRequest,
@@ -79,11 +81,16 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             "under the new workstream. When `initial_message` is also set, "
             "attachments are resolved onto that turn before the worker thread "
             "dispatches; otherwise they remain pending for a follow-up "
-            "`POST /v1/api/workstreams/{ws_id}/send`."
+            "`POST /v1/api/workstreams/{ws_id}/send`. Setting `resume_ws` "
+            "atomically forks the visible source history, configuration, project, "
+            "persona, and attachment references into a distinct destination; it "
+            "does not reopen or mutate the source. Attachments and `resume_ws` "
+            "cannot be combined. Creation stays unpublished until validation and "
+            "the optional fork transaction complete."
         ),
         request_model=CreateWorkstreamRequest,
         response_model=CreateWorkstreamResponse,
-        error_codes=[400, 409, 413],
+        error_codes=[400, 403, 404, 409, 413, 429, 500, 503],
         tags=["Workstreams"],
     ),
     EndpointSpec(
@@ -126,8 +133,8 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Approve or deny a tool call",
         request_model=ApproveRequest,
-        response_model=StatusResponse,
-        error_codes=[404],
+        response_model=ApproveResponse,
+        error_codes=[404, 409],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -147,7 +154,8 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Cancel the active generation in a workstream",
         request_model=CancelRequest,
-        response_model=StatusResponse,
+        request_required=False,
+        response_model=CancelResponse,
         error_codes=[400, 404],
         tags=["Chat"],
     ),
@@ -516,8 +524,10 @@ _ALL_MODELS: list[type[BaseModel]] = [
     SendResponse,
     DequeueRequest,
     ApproveRequest,
+    ApproveResponse,
     CommandRequest,
     CancelRequest,
+    CancelResponse,
     RewindRequest,
     CreateWorkstreamRequest,
     CreateWorkstreamResponse,

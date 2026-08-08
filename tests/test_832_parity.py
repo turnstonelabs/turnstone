@@ -30,7 +30,12 @@ from tests._parity_832 import (
     run_scenario,
     write_fixture,
 )
-from tests._session_helpers import RecordingUI, make_session, scripted_provider
+from tests._session_helpers import (
+    RecordingUI,
+    make_session,
+    replace_session_lane,
+    scripted_provider,
+)
 from turnstone.core.providers._protocol import StreamChunk, UsageInfo
 from turnstone.core.trajectory import Turn
 
@@ -129,7 +134,7 @@ class TestDisplayCommitMirror:
         ui = RecordingUI()
         session = make_session(ui=ui)
         session._RETRY_BASE_DELAY = 0
-        session._provider = scripted_provider(chunks)
+        replace_session_lane(session, provider=scripted_provider(chunks))
         session.messages.append(Turn.user("hi"))
         result = session._stream_response(0)
         displayed = "".join(d for k, d in ui.events if k == "content")

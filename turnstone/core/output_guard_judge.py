@@ -20,9 +20,9 @@ Design:
   a ``ThreadPoolExecutor`` worker, which ``concurrent.futures`` joins from an
   ``atexit`` hook regardless of ``shutdown(wait=False)``.
 - HTTP client is lazy-init + reused across evaluations on a single
-  judge instance.  Session-side model swaps drop the entire
-  :class:`OutputGuardJudge` (``session.py:1733``/``:2136``), which
-  drops the cached client with it; no separate reset needed.
+  judge instance.  Session-side model swaps retire the entire
+  :class:`OutputGuardJudge`; retirement rejects new evaluations and closes
+  the cached client after every active caller/deadline-worker lease exits.
 - Untrusted tool output is wrapped in per-call random-nonced
   ``[start tool_output_{nonce}]`` fences before reaching the judge LLM, with
   fence-escape sequences neutralised in the raw text first.  The
@@ -37,9 +37,10 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core import fence
@@ -50,19 +51,26 @@ from turnstone.core.deadline import (
 )
 from turnstone.core.judge import (
     _CHARS_PER_TOKEN,
+    _config_store_version,
+    _judge_binding_from_session,
+    _JudgeBindingState,
     _positive_window,
 )
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import ModelClientConstructionError
-from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
+from turnstone.core.model_turn import (
+    ResolvedModelBinding,
+    model_turn,
+    require_lane_capabilities,
+    resolve_model_binding,
+)
 from turnstone.core.trajectory import Turn
 
 if TYPE_CHECKING:
-    import threading
     from collections.abc import Callable
 
     from turnstone.core.judge import JudgeConfig
-    from turnstone.core.providers._protocol import LLMProvider, ModelCapabilities
+    from turnstone.core.model_registry import ModelConfig
 
 log = get_logger(__name__)
 
@@ -266,82 +274,51 @@ class OutputGuardJudge:
     def __init__(
         self,
         config: JudgeConfig,
-        session_provider: LLMProvider,
-        session_client: Any,
-        session_model: str,
-        model_registry: Any | None = None,
-        session_capabilities: ModelCapabilities | None = None,
-        session_model_alias: str = "",
+        session_binding: ResolvedModelBinding,
         config_store: Any | None = None,
-        backend_auth_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._config = config
-        # Carried into the per-evaluation ModelLane so extra_params, the
-        # live operator flags, and the temperature ladder resolve from the
-        # registry like every other lane.
-        self._model_registry = model_registry
-        self._config_store = config_store
-        self._backend_auth_resolver = backend_auth_resolver
-        # Caller's resolved session-model caps (config/registry-aware): the wire
-        # capabilities + window when this judge inherits the session model, and
-        # the alias path's window fallback.  The window comes ONLY from these
-        # (else a floor), never provider.get_capabilities() — see below.
-        session_window = (
-            session_capabilities.context_window if session_capabilities is not None else None
+        self._config_fingerprint = self._fingerprint_config(config)
+        session_caps = require_lane_capabilities(session_binding.lane)
+        session_window = _positive_window(
+            getattr(session_binding.config, "context_window", None),
+            session_caps.context_window,
         )
         # Alias resolution mirrors IntentJudge.__init__.
         # An empty / unset alias falls through to the session model silently;
         # a set-but-unknown alias logs a warning and also falls through.
         # Judge model's context window drives the oversize-output guard in
         # ``evaluate``.  It comes from the registry's ModelConfig on the alias
-        # path and the session's real window (``session_capabilities``, resolved
-        # by the caller from _get_capabilities) on the fallback path — NEVER
+        # path and the session binding's resolved window on the fallback path — NEVER
         # ``provider.get_capabilities()``, which returns a static 200000 for
         # every model absent from its table (i.e. every local / self-hosted
         # judge), so a guard keyed off it would never trip for the small-window
         # local judges it exists to protect.  ``_positive_window`` also
         # defensively coerces any non-positive window (which would zero out the
         # guard) to the session window, then a floor.
+        requested_alias = str(config.output_guard_model or "").strip()
+        registry = session_binding.lane.registry
+        config_version_at_start = _config_store_version(config_store)
+        binding = _judge_binding_from_session(session_binding, config_store)
         resolved = False
         construction_error: ModelClientConstructionError | None = None
-        if config.output_guard_model and model_registry is not None:
+        if requested_alias and registry is not None:
             try:
-                if model_registry.has_alias(config.output_guard_model):
-                    # One locked snapshot for client + provider — separate
-                    # resolve()/get_provider() calls could pair an old-map
-                    # client with a new-map provider (wrong SDK dialect).
-                    client, model_name, model_cfg, provider, _ = model_registry.resolve_binding(
-                        config.output_guard_model
-                    )
-                    self._provider = provider
-                    self._client_factory_args = self._extract_client_config(
-                        client, self._provider.provider_name
-                    )
-                    self._model = model_name
-                    self._judge_model_alias = config.output_guard_model
-                    self._lane_alias = config.output_guard_model
-                    # Shared lane resolver (model_turn); ModelConfig.context_window
-                    # stays separate and is sized into the guard window below.
-                    # ``cfg=model_cfg`` reuses the config resolve() already
-                    # fetched — one lookup, one generation.
-                    self._capabilities = resolve_capabilities(
-                        self._provider,
-                        self._model,
-                        config.output_guard_model,
-                        model_registry,
-                        cfg=model_cfg,
-                    )
-                    self._judge_context_window = _positive_window(
-                        getattr(model_cfg, "context_window", None),
-                        session_window,
-                    )
-                    resolved = True
+                binding = resolve_model_binding(
+                    registry,
+                    requested_alias,
+                    config_store=config_store,
+                    backend_auth_resolver=session_binding.lane.backend_auth_resolver,
+                )
+                resolved = True
             except ModelClientConstructionError as exc:
                 construction_error = exc
+            except (ValueError, KeyError):
+                pass
             except Exception:
                 log.debug(
                     "output_guard_judge.alias_resolution_failed",
-                    alias=config.output_guard_model,
+                    alias=requested_alias,
                 )
 
         if not resolved:
@@ -354,53 +331,86 @@ class OutputGuardJudge:
                     "judge.output_guard_model=%r is registered but its client "
                     "could not be constructed (%s) — falling back to session "
                     "model %r.",
-                    config.output_guard_model,
+                    requested_alias,
                     construction_error,
-                    session_model,
+                    session_binding.lane.model,
                 )
-            elif config.output_guard_model:
+            elif requested_alias:
                 log.warning(
                     "judge.output_guard_model=%r is not a registered alias — "
                     "falling back to session model %r.  Register the model in "
                     "the Models tab and set judge.output_guard_model to its alias.",
-                    config.output_guard_model,
-                    session_model,
+                    requested_alias,
+                    session_binding.lane.model,
                 )
-            self._provider = session_provider
-            self._client_factory_args = self._extract_client_config(
-                session_client, session_provider.provider_name
-            )
-            self._model = session_model
+            binding = _judge_binding_from_session(session_binding, config_store)
+
+        self._binding_state = _JudgeBindingState(
+            binding=binding,
+            requested_alias=requested_alias,
+            resolved_explicitly=resolved,
+            config_store=config_store,
+            checked_registry_generation=binding.registry_generation,
+            checked_config_version=config_version_at_start,
+        )
+        # The provider/model/config lane is immutable for this judge object's
+        # lifetime.  ``evaluate`` substitutes only the judge-owned cached HTTP
+        # client; no registry facet is re-resolved between evaluations.
+        self._lane = binding.lane
+        self._model = self._lane.model
+        self._capabilities = require_lane_capabilities(self._lane)
+        self._client_factory_args = self._extract_client_config(
+            self._lane.client,
+            self._lane.provider.provider_name,
+        )
+        self._judge_context_window = _positive_window(
+            getattr(binding.config, "context_window", None),
+            session_window,
+        )
+        if not resolved:
             # AUDIT label keeps its pre-#827 fallback semantics: "" here so
             # recorded verdicts show ``judge_model = self._model`` (the raw
             # model id), not the session alias — threading the alias into
             # this field would silently change recorded judge_model values
             # across the upgrade on default-config installs.
             self._judge_model_alias = ""
-            # LANE alias inherits the session's registry alias so the lane
-            # resolves extra_params / replay flag / temperature exactly like
-            # every other lane on the same model (see IntentJudge's fallback
-            # for the rationale).  Lane resolution and audit labeling are
-            # different roles — hence two fields.
-            self._lane_alias = session_model_alias
-            # Wire caps: the caller's resolved session caps, or the provider's
-            # static table as a last resort for degraded / legacy callers.
-            self._capabilities = (
-                session_capabilities
-                if session_capabilities is not None
-                else session_provider.get_capabilities(session_model)
-            )
-            # Session-model fallback: use the session's real context window
-            # (the caller resolved it from _get_capabilities, config/registry-
-            # aware) — NOT provider.get_capabilities(), which reports 200000 for
-            # a local session model and would leave the guard blind to overflow,
-            # the very failure this fixes.  Mirrors IntentJudge's fallback.
-            self._judge_context_window = _positive_window(session_window)
+        else:
+            self._judge_model_alias = requested_alias
 
-        # Lazy-init in _create_client(); reused across evaluate() calls.
-        # Session swaps the entire OutputGuardJudge on credential / model
-        # change (session.py:1733 / :2136), which drops the cached client.
+        # Lazy-init in _create_client(); reused across evaluate() calls.  The
+        # lifecycle lock pairs session-side retirement with active evaluations
+        # so a stale judge never closes a client still owned by its deadline
+        # worker, and concurrent first calls cannot construct duplicate clients.
+        self._lifecycle_lock = threading.Lock()
+        self._active_evaluations = 0
+        self._retired = False
         self._client: Any | None = None
+
+    @staticmethod
+    def _fingerprint_config(config: JudgeConfig) -> tuple[str, float]:
+        """Constructor-consumed behavior that requires a fresh guard object."""
+        return (
+            str(config.output_guard_model or "").strip(),
+            config.output_guard_llm_timeout,
+        )
+
+    def binding_is_current(
+        self,
+        session_binding: ResolvedModelBinding,
+        config: JudgeConfig,
+    ) -> bool:
+        """Whether this guard can be reused for the next evaluation.
+
+        Constructor-consumed behavioral settings invalidate immediately even
+        when the registry generation did not move. Unrelated ConfigStore or
+        registry edits merely advance the internal freshness watermark.
+        """
+        if self._fingerprint_config(config) != self._config_fingerprint:
+            return False
+        return self._binding_state.is_current(
+            session_binding,
+            requested_alias=str(config.output_guard_model or "").strip(),
+        )
 
     # -- Client lifecycle helpers ------------------------------------------
 
@@ -425,29 +435,72 @@ class OutputGuardJudge:
         latency.  IntentJudge's per-batch reuse pattern at ``judge.py:1046``
         is the precedent.
         """
-        if self._client is None:
+        with self._lifecycle_lock:
+            if self._client is not None:
+                return self._client
+            # A leased evaluation that began before retirement must be able to
+            # finish constructing its client.  A direct late call with no
+            # lease would otherwise create a client nobody can release.
+            if self._retired and self._active_evaluations == 0:
+                raise RuntimeError("output guard judge is retired")
+
             from turnstone.core.providers import create_client
 
             self._client = create_client(**self._client_factory_args)
-        return self._client
+            return self._client
 
-    def close(self) -> None:
-        """Tear down the cached HTTP client.
+    def _begin_evaluation(self) -> bool:
+        """Acquire one evaluation lease unless this judge is retired."""
+        with self._lifecycle_lock:
+            if self._retired:
+                return False
+            self._active_evaluations += 1
+            return True
 
-        Idempotent.  Callers do not normally need to invoke this — the
-        session-side ``_output_guard_judge = None`` reset paths at
-        ``session.py:1733`` (model update) and ``:2136`` (session restore)
-        drop the entire judge instance, and the cached client is dropped
-        with it.  Provided for callers that want explicit teardown (e.g.
-        tests) or for future code that holds judges across model swaps.
-        """
-        client = self._client
-        self._client = None
+    def _retain_evaluation(self) -> None:
+        """Retain a lease for a deadline worker spawned by an active call."""
+        with self._lifecycle_lock:
+            self._active_evaluations += 1
+
+    def _end_evaluation(self) -> None:
+        """Release a lease and close a retired judge after its last owner."""
+        client: Any | None = None
+        with self._lifecycle_lock:
+            if self._active_evaluations <= 0:
+                log.warning("output_guard_judge.unbalanced_evaluation_release")
+                return
+            self._active_evaluations -= 1
+            if self._retired and self._active_evaluations == 0:
+                client = self._client
+                self._client = None
+        self._close_client(client)
+
+    @staticmethod
+    def _close_client(client: Any | None) -> None:
+        """Best-effort close outside the lifecycle lock."""
         if client is not None and hasattr(client, "close"):
             try:
                 client.close()
             except Exception:
                 log.debug("output_guard_judge.client_close_failed", exc_info=True)
+
+    def retire(self) -> None:
+        """Prevent new evaluations and close after every active lease exits."""
+        client: Any | None = None
+        with self._lifecycle_lock:
+            self._retired = True
+            if self._active_evaluations == 0:
+                client = self._client
+                self._client = None
+        self._close_client(client)
+
+    def close(self) -> None:
+        """Retire the judge and tear down its client when safe.
+
+        Idempotent.  An evaluation already in progress retains its client until
+        both the public call and any deadline-abandoned worker have exited.
+        """
+        self.retire()
 
     # -- Public API --------------------------------------------------------
 
@@ -463,6 +516,7 @@ class OutputGuardJudge:
         heuristic_flags: tuple[str, ...] | list[str] = (),
         heuristic_annotations: tuple[str, ...] | list[str] = (),
         cancel_event: threading.Event | None = None,
+        backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     ) -> OutputJudgeVerdict:
         """Evaluate ``output`` and return a verdict.
 
@@ -492,7 +546,46 @@ class OutputGuardJudge:
 
         start = time.monotonic()
         verdict_id = uuid.uuid4().hex
+        if not self._begin_evaluation():
+            return self._error_verdict(verdict_id, call_id, start, "judge_retired")
+        try:
+            return self._evaluate_active(
+                output,
+                func_name=func_name,
+                call_id=call_id,
+                tool_description=tool_description,
+                tool_args=tool_args,
+                heuristic_risk=heuristic_risk,
+                heuristic_flags=heuristic_flags,
+                heuristic_annotations=heuristic_annotations,
+                cancel_event=cancel_event,
+                backend_auth_resolver=backend_auth_resolver,
+                start=start,
+                verdict_id=verdict_id,
+            )
+        finally:
+            self._end_evaluation()
+
+    def _evaluate_active(
+        self,
+        output: str,
+        *,
+        func_name: str,
+        call_id: str,
+        tool_description: str,
+        tool_args: str,
+        heuristic_risk: str,
+        heuristic_flags: tuple[str, ...] | list[str],
+        heuristic_annotations: tuple[str, ...] | list[str],
+        cancel_event: threading.Event | None,
+        backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None,
+        start: float,
+        verdict_id: str,
+    ) -> OutputJudgeVerdict:
+        """Evaluate while the public caller owns an active lifecycle lease."""
         timeout = max(self._config.output_guard_llm_timeout, 1.0)
+        if cancel_event is not None and cancel_event.is_set():
+            return self._error_verdict(verdict_id, call_id, start, "cancelled")
         judge_turns = [
             Turn.system(_SYSTEM_PROMPT),
             Turn.user(
@@ -549,19 +642,14 @@ class OutputGuardJudge:
         # worker is non-daemon, and concurrent.futures joins it from an atexit
         # hook regardless of shutdown(wait=False) — so a wedged upstream call
         # would otherwise hang shutdown.)
-        # Single-shot lane: constructor-frozen capabilities (window-coupled,
-        # refreshed on judge swap — see IntentJudge's lane note), extra_params
-        # / live flags / temperature ladder from the registry like every
-        # other lane.  ``_lane_alias``, not the audit label.
-        lane = resolve_lane(
-            self._provider,
-            client,
-            self._model,
-            alias=self._lane_alias,
-            registry=self._model_registry,
-            capabilities=self._capabilities,
-            config_store=self._config_store,
-            backend_auth_resolver=self._backend_auth_resolver,
+        # Only the judge-owned cached client differs from the immutable lane
+        # resolved at construction.  No config lookup occurs here, so every
+        # evaluation on this object keeps capabilities, window, extra params,
+        # and sampling semantics aligned until the session swaps the judge.
+        lane = replace(
+            self._lane,
+            client=client,
+            backend_auth_resolver=backend_auth_resolver,
         )
         # Sampling deliberately not pinned (house rule) — the lane inherits
         # the guard model's full assignment scheme, effort included: a
@@ -574,15 +662,37 @@ class OutputGuardJudge:
         # The abort wiring closes the abandoned worker's HTTP stream on the
         # timeout/cancel paths so the daemon thread exits promptly instead
         # of blocking on the read until the upstream's next chunk.
-        try:
-            result = run_abortable_with_deadline(
-                lambda ref: model_turn(
+        # The public call owns one lifecycle lease.  Retain a second for the
+        # daemon worker: on a timeout the public call returns immediately, but
+        # the abandoned worker can still be unwinding the SDK stream and must
+        # keep the client alive until it actually exits.
+        self._retain_evaluation()
+        release_lock = threading.Lock()
+        worker_released = False
+
+        def _release_worker() -> None:
+            nonlocal worker_released
+            with release_lock:
+                if worker_released:
+                    return
+                worker_released = True
+            self._end_evaluation()
+
+        def _run_model_turn(ref: Any) -> Any:
+            try:
+                return model_turn(
                     lane,
                     judge_turns,
                     tools=None,
                     max_tokens=512,
                     cancel_ref=ref,
-                ),
+                )
+            finally:
+                _release_worker()
+
+        try:
+            result = run_abortable_with_deadline(
+                _run_model_turn,
                 timeout=timeout,
                 cancel_event=cancel_event,
                 thread_name="output-guard-judge",
@@ -592,6 +702,9 @@ class OutputGuardJudge:
         except DeadlineExceededError:
             return self._error_verdict(verdict_id, call_id, start, "timeout")
         except Exception as e:
+            # Provider exceptions are released by the worker's ``finally``;
+            # this idempotent call also covers a failure to start that worker.
+            _release_worker()
             return self._error_verdict(
                 verdict_id, call_id, start, f"provider_error: {type(e).__name__}"
             )

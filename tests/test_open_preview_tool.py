@@ -685,8 +685,13 @@ class TestCancelledBatchPreservesPreview:
         monkeypatch.setattr(
             ChatSession,
             "_persist_attachment_refs",
-            lambda self, row_id, atts, origin="upload": persisted.update(
-                {"row": row_id, "ids": [a.attachment_id for a in atts], "origin": origin}
+            lambda self, row_id, atts, origin="upload", ws_id=None: persisted.update(
+                {
+                    "row": row_id,
+                    "ids": [a.attachment_id for a in atts],
+                    "origin": origin,
+                    "ws_id": ws_id,
+                }
             ),
         )
 
@@ -697,7 +702,7 @@ class TestCancelledBatchPreservesPreview:
         meta = _json.loads(saved["meta"])
         assert meta["preview"] == descriptor
         assert meta["effect_status"] == "unknown"
-        assert persisted == {"row": 42, "ids": ["abc"], "origin": "tool"}
+        assert persisted == {"row": 42, "ids": ["abc"], "origin": "tool", "ws_id": "ws-1"}
         # The in-memory synthesized turn carries the descriptor too.
         tool_turns = [t for t in s.messages if isinstance(t, Turn) and t.role is Role.TOOL]
         assert tool_turns and tool_turns[-1].meta.extra.get("preview") == descriptor

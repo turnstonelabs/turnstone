@@ -112,8 +112,8 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `stream_end`        | End of a single provider stream                                                            | — |
 | `tool_result`       | A tool call completed (success or error)                                                   | `call_id`, `name`, `output`, `is_error?` |
 | `tool_output_chunk` | Streaming tool output (e.g. long bash command)                                             | `call_id`, `chunk` |
-| `approve_request`   | One or more tool calls need operator approval                                              | `items: [{call_id, header, preview, func_name, approval_label, needs_approval}]` |
-| `approval_resolved` | Operator answered the approval prompt                                                      | `approved`, `feedback` |
+| `approve_request`   | One approval cycle needs operator action; several cycles may coexist                       | `cycle_id`, `items: [{call_id, header, preview, func_name, approval_label, needs_approval}]` |
+| `approval_resolved` | One identified approval cycle was answered                                                 | `cycle_id`, `call_ids`, `approved`, `feedback`, `always` |
 | `state_change`      | Worker-thread state transition (also re-emitted with the current state on every fresh subscribe so refresh-mid-stream restores composer mode) | `state` ∈ `running`, `thinking`, `attention`, `idle`, `error` |
 | `in_progress_snapshot` | One-shot replay of the in-progress turn's content + reasoning when this client connects mid-stream                              | `content`, `reasoning` |
 | `status`            | Token usage + context-window snapshot (fires on every streaming tick)                      | `prompt_tokens`, `completion_tokens`, `total_tokens`, `context_window`, `pct`, `effort`, `cache_creation_tokens`, `cache_read_tokens` |
@@ -129,8 +129,8 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `info` / `error`    | Operational messages                                                                       | `message` |
 
 **Reconnection contract:** a freshly-opened SSE connection receives
-the current snapshot of any pending tool approval (`approve_request`
-is re-sent if unresolved), any in-flight `wait_*` / `batch_*`
+one `approve_request` snapshot for every unresolved approval cycle, keyed by
+the same stable `cycle_id`, plus any in-flight `wait_*` / `batch_*`
 indicator, the worker's current `state_change`, and an
 `in_progress_snapshot` carrying any partial content / reasoning the
 model has produced for the in-progress turn — so a tab refresh
@@ -324,24 +324,35 @@ uses the cascade-mutation shape and how it differs from the
 
 The `approve` endpoint is what resolves an `approve_request` SSE
 event.  The coordinator's worker thread is blocked inside
-`ui.approve_tools` waiting for this POST.
+`ui.approve_tools` waiting for this POST. Parallel task agents can leave
+several approval cycles live at once, so current clients echo the event's
+`cycle_id` (or a member `call_id`). A selector-less request resolves the oldest
+cycle for compatibility.
 
 ```http
 POST /v1/api/workstreams/{ws_id}/approve
-{"approved": true, "feedback": null, "always": false}
+{"approved": true, "feedback": null, "always": false, "cycle_id": "cycle_789"}
 {"approved": false, "feedback": "spawn count looks too high — try 3 not 10"}
-{"approved": true, "feedback": null, "always": true}    // always-approve this tool name
+{"approved": true, "feedback": null, "always": true}    // remember this cycle's tool names
 ```
 
-`cancel` drops the coordinator's in-flight generation and, for a
-coordinator, auto-cascades the cancel to its direct children:
+Success returns `{"status": "ok", "cycle_id": "cycle_789"}`. A stale selector
+returns `409` with the currently oldest cycle/call IDs. `always` remembers only
+the tool names in the cycle that actually resolved; it does not enable blanket
+approval.
+
+`cancel` requests cooperative cancellation of the coordinator's in-flight
+generation and auto-cascades to its direct children:
 `cancel_workstream` is dispatched through the routing proxy for
-every direct child in the registry.  The coordinator itself is left
-idle and open for a fresh `send`:
+every direct child in the registry. The HTTP acknowledgement is immediate;
+the worker becomes idle after unwinding. Pass `{"force": true}` only to release
+a wedged worker slot immediately. The coordinator itself remains open for a
+fresh `send`:
 
 ```http
 POST /v1/api/workstreams/{ws_id}/cancel
 {}
+{"status": "ok", "dropped": {}}
 ```
 
 ---

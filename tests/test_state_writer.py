@@ -238,6 +238,62 @@ def test_discard_drops_pending_buffered_state() -> None:
     assert storage.calls == []
 
 
+def test_close_tombstone_rejects_late_records_until_same_id_reopens() -> None:
+    """A deferred close loser is inert, while a new owner clears the fence."""
+    storage = _FakeStorage()
+    writer = StateWriter(storage)
+
+    writer.discard("ws-reused", tombstone=True)
+    writer.record("ws-reused", "running")
+    writer.record("ws-reused", "error", flush_now=True)
+    writer.flush()
+    assert storage.calls == []
+
+    writer.reopen("ws-reused")
+    writer.record("ws-reused", "thinking")
+    writer.flush()
+    assert storage.calls == [("ws-reused", "thinking")]
+
+
+def test_old_flush_now_rechecks_incarnation_after_reopen() -> None:
+    """A terminal write waiting on the flush lane cannot cross an ABA reopen."""
+    storage = _FakeStorage()
+    writer = StateWriter(storage)
+    old_incarnation = writer.reopen("ws-reused", incarnation=10)
+    entered = threading.Event()
+
+    writer._flush_lock.acquire()
+
+    def write_old_error() -> None:
+        entered.set()
+        writer.record(
+            "ws-reused",
+            "error",
+            flush_now=True,
+            incarnation=old_incarnation,
+        )
+
+    old_tail = threading.Thread(target=write_old_error)
+    old_tail.start()
+    try:
+        assert entered.wait(1)
+        new_incarnation = writer.reopen("ws-reused", incarnation=11)
+    finally:
+        writer._flush_lock.release()
+        old_tail.join(2)
+
+    assert not old_tail.is_alive()
+    assert storage.calls == []
+
+    writer.record(
+        "ws-reused",
+        "thinking",
+        flush_now=True,
+        incarnation=new_incarnation,
+    )
+    assert storage.calls == [("ws-reused", "thinking")]
+
+
 def test_discard_waits_for_in_flight_flush_to_complete() -> None:
     """The bug-3 invariant: ``close()`` calls ``discard`` BEFORE its
     sync ``state='closed'`` write. If a flusher was mid-write for the

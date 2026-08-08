@@ -21,11 +21,20 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
+from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+from turnstone.core.model_turn import (
+    ResolvedModelBinding,
+    lane_call_client,
+    resolve_model_binding,
+)
 from turnstone.core.providers import thinking_off_template_kwargs
+from turnstone.core.providers._protocol import refuse_aborted_request
 from turnstone.core.server_compat import merge_server_compat
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
+
+    from turnstone.core.model_registry import ModelConfig
 
 log = get_logger(__name__)
 
@@ -127,6 +136,35 @@ class AudioUnavailableError(RuntimeError):
 
 class AudioBackendError(RuntimeError):
     """A configured audio backend failed during execution (maps to 502)."""
+
+
+def _resolve_audio_binding(
+    *,
+    registry: Any,
+    alias: str,
+    config_store: Any | None = None,
+    backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+) -> ResolvedModelBinding:
+    """Resolve one coherent registry generation for an audio role call."""
+    try:
+        binding = resolve_model_binding(
+            registry,
+            alias,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+        )
+    except Exception as exc:
+        raise AudioUnavailableError(f"Audio model alias {alias!r} is not available") from exc
+    if binding.config is None:
+        raise AudioUnavailableError(f"Audio model alias {alias!r} has no model definition")
+    return binding
+
+
+def _capture_audio_handle(cancel_ref: Any, handle: Any) -> None:
+    """Publish a closeable raw response/stream to the caller's abort ref."""
+    if cancel_ref is not None:
+        cancel_ref.append(handle)
+    refuse_aborted_request(cancel_ref)
 
 
 def _infer_audio_capability(model: str, role: str) -> bool:
@@ -294,13 +332,13 @@ def _omni_chat_messages(prompt: str, audio_b64: str) -> list[dict[str, Any]]:
 
 
 def _transcribe_via_chat(
-    client: Any,
-    model: str,
+    binding: ResolvedModelBinding,
     data: bytes,
     prompt: str,
     *,
     extra_body: dict[str, Any] | None = None,
     max_tokens: int = _OMNI_STT_MAX_TOKENS,
+    cancel_ref: Any = None,
 ) -> str:
     """Transcribe by handing the clip to an omni *chat* model as ``input_audio``.
 
@@ -315,20 +353,92 @@ def _transcribe_via_chat(
 
     wav = _to_wav_16k_mono(data)
     audio_b64 = base64.b64encode(wav).decode("ascii")
-    resp = client.chat.completions.create(
-        model=model,
+    lane = binding.lane
+    client = lane_call_client(lane, cancel_ref=cancel_ref)
+    manager = client.chat.completions.with_streaming_response.create(
+        model=lane.model,
         messages=_omni_chat_messages(prompt, audio_b64),
         max_tokens=max_tokens,
         extra_body=extra_body or None,
     )
+    refuse_aborted_request(cancel_ref)
+    with manager as response:
+        _capture_audio_handle(cancel_ref, response)
+        resp = response.parse()
     choices = getattr(resp, "choices", None) or []
     if not choices:
         return ""
     return (getattr(choices[0].message, "content", "") or "").strip()
 
 
+def _transcribe_binding(
+    binding: ResolvedModelBinding,
+    *,
+    data: bytes,
+    filename: str,
+    prompt: str = "",
+    cancel_ref: Any = None,
+) -> TranscriptionResult:
+    """Transcribe through one already-resolved binding generation."""
+    lane = binding.lane
+    cfg = binding.config
+    if cfg is None:
+        raise AudioUnavailableError(f"STT model alias {lane.alias!r} has no model definition")
+    model = lane.model
+    alias = lane.alias
+    if not _provider_carries_audio(cfg):
+        raise AudioUnavailableError(
+            f"STT model alias {alias!r} (provider {cfg.provider!r}) can't transcribe audio — "
+            "audio roles require an OpenAI-compatible provider."
+        )
+    caps = cfg.capabilities or {}
+    endpoint = _serves_transcription_endpoint(cfg, model)
+    if not endpoint and not caps.get("supports_audio_input"):
+        raise AudioUnavailableError(f"STT model alias {alias!r} cannot transcribe audio")
+    refuse_aborted_request(cancel_ref)
+    try:
+        if endpoint:
+            client = lane_call_client(lane, cancel_ref=cancel_ref)
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "file": (filename or "speech.webm", data),
+                "response_format": "json",
+            }
+            if prompt:
+                kwargs["prompt"] = prompt
+            manager = client.audio.transcriptions.with_streaming_response.create(**kwargs)
+            refuse_aborted_request(cancel_ref)
+            with manager as response:
+                _capture_audio_handle(cancel_ref, response)
+                resp = response.parse()
+            transcript = (getattr(resp, "text", "") or "").strip()
+        else:
+            transcript = _transcribe_via_chat(
+                binding,
+                data,
+                prompt or _OMNI_STT_PROMPT,
+                extra_body=_omni_chat_extra_body(cfg),
+                cancel_ref=cancel_ref,
+            )
+    except (AudioBackendError, BackendAuthUnavailableError):
+        raise
+    except Exception as exc:
+        refuse_aborted_request(cancel_ref)
+        raise AudioBackendError(f"Transcription backend failed: {exc}") from exc
+    refuse_aborted_request(cancel_ref)
+    return TranscriptionResult(transcript=transcript, model_alias=alias, model=model)
+
+
 def transcribe(
-    *, registry: Any, alias: str, data: bytes, filename: str, prompt: str = ""
+    *,
+    registry: Any,
+    alias: str,
+    data: bytes,
+    filename: str,
+    prompt: str = "",
+    config_store: Any | None = None,
+    backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+    cancel_ref: Any = None,
 ) -> TranscriptionResult:
     """Transcribe ``data`` using the STT role alias's audio backend.
 
@@ -341,72 +451,58 @@ def transcribe(
     the chat path falls back to :data:`_OMNI_STT_PROMPT` so a bare omni call still
     emits a clean transcript rather than a conversational reply.
     """
-    try:
-        client, model, cfg, _ = registry.resolve(alias)
-    except Exception as exc:  # unknown/removed alias
-        raise AudioUnavailableError(f"STT model alias {alias!r} is not available") from exc
-    # Defence in depth: resolve_role_alias already gates this, but a stale
-    # config or a direct caller could still point STT at a non-OpenAI-SDK
-    # provider (Anthropic has no audio surface).  Fail with an actionable
-    # message instead of an opaque ``'Anthropic' object has no attribute 'chat'``.
-    if not _provider_carries_audio(cfg):
-        raise AudioUnavailableError(
-            f"STT model alias {alias!r} (provider "
-            f"{getattr(cfg, 'provider', 'unknown')!r}) can't transcribe audio — "
-            "audio roles require an OpenAI-compatible provider."
-        )
-    caps = getattr(cfg, "capabilities", None) or {}
-    endpoint = _serves_transcription_endpoint(cfg, model)
-    if not endpoint and not caps.get("supports_audio_input"):
-        raise AudioUnavailableError(f"STT model alias {alias!r} cannot transcribe audio")
-    try:
-        if endpoint:
-            kwargs: dict[str, Any] = {
-                "model": model,
-                "file": (filename or "speech.webm", data),
-                "response_format": "json",
-            }
-            if prompt:
-                kwargs["prompt"] = prompt
-            resp = client.audio.transcriptions.create(**kwargs)
-            transcript = (getattr(resp, "text", "") or "").strip()
-        else:
-            transcript = _transcribe_via_chat(
-                client,
-                model,
-                data,
-                prompt or _OMNI_STT_PROMPT,
-                extra_body=_omni_chat_extra_body(cfg),
-            )
-    except AudioBackendError:
-        # Transcode errors already carry an actionable message — keep it.
-        raise
-    except Exception as exc:
-        raise AudioBackendError(f"Transcription backend failed: {exc}") from exc
-    return TranscriptionResult(transcript=transcript, model_alias=alias, model=model)
+    binding = _resolve_audio_binding(
+        registry=registry,
+        alias=alias,
+        config_store=config_store,
+        backend_auth_resolver=backend_auth_resolver,
+    )
+    return _transcribe_binding(
+        binding,
+        data=data,
+        filename=filename,
+        prompt=prompt,
+        cancel_ref=cancel_ref,
+    )
 
 
-def _iter_stream_deltas(stream: Any) -> Iterator[str]:
+def _iter_stream_deltas(stream: Any, *, cancel_ref: Any = None) -> Iterator[str]:
     """Yield non-empty content deltas from an OpenAI streaming chat response.
 
     Owns the stream's lifecycle: exhausting or closing this generator releases
     the underlying HTTP connection, so an abandoned stream can't leak it.
     """
     try:
-        for chunk in stream:
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            delta = getattr(choices[0].delta, "content", None)
-            if delta:
-                yield delta
+        try:
+            refuse_aborted_request(cancel_ref)
+            for chunk in stream:
+                refuse_aborted_request(cancel_ref)
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0].delta, "content", None)
+                if delta:
+                    yield delta
+            refuse_aborted_request(cancel_ref)
+        except Exception:
+            refuse_aborted_request(cancel_ref)
+            raise
     finally:
         close = getattr(stream, "close", None)
         if callable(close):
             close()
 
 
-def transcribe_stream(*, registry: Any, alias: str, data: bytes, prompt: str = "") -> Iterator[str]:
+def transcribe_stream(
+    *,
+    registry: Any,
+    alias: str,
+    data: bytes,
+    prompt: str = "",
+    config_store: Any | None = None,
+    backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+    cancel_ref: Any = None,
+) -> Iterator[str]:
     """Stream transcript content deltas for the STT role alias.
 
     Resolve, transcode, and opening the streaming-chat request all run eagerly
@@ -415,10 +511,18 @@ def transcribe_stream(*, registry: Any, alias: str, data: bytes, prompt: str = "
     whisper-style endpoint alias has no chat stream, so it emits the whole
     transcript as a single chunk.
     """
-    try:
-        client, model, cfg, _ = registry.resolve(alias)
-    except Exception as exc:  # unknown/removed alias
-        raise AudioUnavailableError(f"STT model alias {alias!r} is not available") from exc
+    binding = _resolve_audio_binding(
+        registry=registry,
+        alias=alias,
+        config_store=config_store,
+        backend_auth_resolver=backend_auth_resolver,
+    )
+    lane = binding.lane
+    cfg = binding.config
+    if cfg is None:
+        raise AudioUnavailableError(f"STT model alias {lane.alias!r} has no model definition")
+    model = lane.model
+    alias = lane.alias
     if not _provider_carries_audio(cfg):
         raise AudioUnavailableError(
             f"STT model alias {alias!r} (provider {getattr(cfg, 'provider', 'unknown')!r}) "
@@ -426,8 +530,12 @@ def transcribe_stream(*, registry: Any, alias: str, data: bytes, prompt: str = "
         )
     if _serves_transcription_endpoint(cfg, model):
         # Whisper-style endpoint: no chat stream — emit the whole transcript once.
-        text = transcribe(
-            registry=registry, alias=alias, data=data, filename="speech.webm", prompt=prompt
+        text = _transcribe_binding(
+            binding,
+            data=data,
+            filename="speech.webm",
+            prompt=prompt,
+            cancel_ref=cancel_ref,
         ).transcript
         return iter([text] if text else [])
     caps = getattr(cfg, "capabilities", None) or {}
@@ -439,17 +547,24 @@ def transcribe_stream(*, registry: Any, alias: str, data: bytes, prompt: str = "
     wav = _to_wav_16k_mono(data)
     audio_b64 = base64.b64encode(wav).decode("ascii")
     try:
-        stream = client.chat.completions.create(
-            model=model,
-            messages=_omni_chat_messages(prompt or _OMNI_STT_PROMPT, audio_b64),
-            max_tokens=_OMNI_STT_MAX_TOKENS,
-            extra_body=_omni_chat_extra_body(cfg) or None,
-            stream=True,
-            timeout=_OMNI_STT_TIMEOUT_S,
-        )
+        client = lane_call_client(lane, cancel_ref=cancel_ref)
+        request_kwargs = {
+            "model": model,
+            "messages": _omni_chat_messages(prompt or _OMNI_STT_PROMPT, audio_b64),
+            "max_tokens": _OMNI_STT_MAX_TOKENS,
+            "extra_body": _omni_chat_extra_body(cfg) or None,
+            "stream": True,
+            "timeout": _OMNI_STT_TIMEOUT_S,
+        }
+        refuse_aborted_request(cancel_ref)
+        stream = client.chat.completions.create(**request_kwargs)
+        _capture_audio_handle(cancel_ref, stream)
+    except BackendAuthUnavailableError:
+        raise
     except Exception as exc:
+        refuse_aborted_request(cancel_ref)
         raise AudioBackendError(f"Transcription backend failed: {exc}") from exc
-    return _iter_stream_deltas(stream)
+    return _iter_stream_deltas(stream, cancel_ref=cancel_ref)
 
 
 # -- transcript memoization (no-native-audio wire fallback) -------------------
@@ -459,7 +574,7 @@ def transcribe_stream(*, registry: Any, alias: str, data: bytes, prompt: str = "
 # re-sent to the (external, fallible) STT backend on every subsequent turn.
 _TRANSCRIPT_CACHE_MAX = 256
 _transcript_lock = threading.Lock()
-_transcript_cache: dict[str, str] = {}
+_transcript_cache: dict[tuple[str, str, int, str], str] = {}
 
 
 def _clear_transcript_cache_for_test() -> None:
@@ -468,24 +583,70 @@ def _clear_transcript_cache_for_test() -> None:
 
 
 def transcribe_cached(
-    *, registry: Any, alias: str, content_hash: str, data: bytes, filename: str
+    *,
+    registry: Any,
+    alias: str,
+    content_hash: str,
+    data: bytes,
+    filename: str,
+    principal_id: str = "",
+    config_store: Any | None = None,
+    backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+    cancel_ref: Any = None,
 ) -> str:
     """Memoized, non-raising :func:`transcribe` for the wire fallback.
 
-    Keyed by ``(alias, content_hash)``.  Returns ``""`` on a backend failure (a
-    placeholder is rendered upstream) and does *not* cache failures, so a
-    transient outage doesn't poison the memo.
+    Keyed by principal, concrete alias, registry generation, and content hash.
+    Returns ``""`` on an ordinary backend failure (a placeholder is rendered
+    upstream) and does *not* cache failures, so a transient outage doesn't
+    poison the memo.  Cancellation and dynamic-auth refusal remain control flow
+    and propagate to the caller.
     """
-    key = f"{alias}:{content_hash}"
-    with _transcript_lock:
-        if key in _transcript_cache:
-            return _transcript_cache[key]
+    refuse_aborted_request(cancel_ref)
     try:
-        text = transcribe(registry=registry, alias=alias, data=data, filename=filename).transcript
-    except (AudioUnavailableError, AudioBackendError) as exc:
+        binding = _resolve_audio_binding(
+            registry=registry,
+            alias=alias,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+        )
+    except AudioUnavailableError as exc:
+        refuse_aborted_request(cancel_ref)
         log.warning("audio transcription fallback failed: %s", exc)
         return ""
+    refuse_aborted_request(cancel_ref)
+    key = (
+        principal_id.strip(),
+        binding.lane.alias,
+        binding.registry_generation,
+        content_hash,
+    )
     with _transcript_lock:
+        cached = _transcript_cache.get(key)
+        cache_hit = key in _transcript_cache
+    if cache_hit:
+        refuse_aborted_request(cancel_ref)
+        return cached or ""
+    try:
+        text = _transcribe_binding(
+            binding,
+            data=data,
+            filename=filename,
+            cancel_ref=cancel_ref,
+        ).transcript
+    except (AudioUnavailableError, AudioBackendError) as exc:
+        refuse_aborted_request(cancel_ref)
+        log.warning("audio transcription fallback failed: %s", exc)
+        return ""
+    refuse_aborted_request(cancel_ref)
+    with _transcript_lock:
+        refuse_aborted_request(cancel_ref)
+        # The backend call ran unlocked.  Preserve a real result a concurrent
+        # caller already memoized instead of letting a slower empty completion
+        # pin the placeholder for this principal/binding generation.
+        existing = _transcript_cache.get(key)
+        if existing:
+            return existing
         if key not in _transcript_cache and len(_transcript_cache) >= _TRANSCRIPT_CACHE_MAX:
             _transcript_cache.pop(next(iter(_transcript_cache)), None)
         _transcript_cache[key] = text
@@ -493,23 +654,50 @@ def transcribe_cached(
 
 
 def synthesize(
-    *, registry: Any, alias: str, text: str, voice: str, response_format: str = "mp3"
+    *,
+    registry: Any,
+    alias: str,
+    text: str,
+    voice: str,
+    response_format: str = "mp3",
+    config_store: Any | None = None,
+    backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+    cancel_ref: Any = None,
 ) -> SpeechResult:
     """Synthesize ``text`` to speech using the TTS role alias's audio backend."""
+    binding = _resolve_audio_binding(
+        registry=registry,
+        alias=alias,
+        config_store=config_store,
+        backend_auth_resolver=backend_auth_resolver,
+    )
+    lane = binding.lane
+    cfg = binding.config
+    if cfg is None:
+        raise AudioUnavailableError(f"TTS model alias {lane.alias!r} has no model definition")
+    model = lane.model
+    alias = lane.alias
+    if not model_supports_role(cfg, "tts"):
+        raise AudioUnavailableError(f"TTS model alias {alias!r} cannot synthesize speech")
+    refuse_aborted_request(cancel_ref)
     try:
-        client, model, _cfg, _ = registry.resolve(alias)
-    except Exception as exc:
-        raise AudioUnavailableError(f"TTS model alias {alias!r} is not available") from exc
-    try:
-        resp = client.audio.speech.create(
+        client = lane_call_client(lane, cancel_ref=cancel_ref)
+        manager = client.audio.speech.with_streaming_response.create(
             model=model,
             voice=voice or _DEFAULT_VOICE,
             input=text,
             response_format=response_format,
         )
-        audio_bytes = resp.read() if hasattr(resp, "read") else bytes(getattr(resp, "content", b""))
+        refuse_aborted_request(cancel_ref)
+        with manager as response:
+            _capture_audio_handle(cancel_ref, response)
+            audio_bytes = response.read()
+    except BackendAuthUnavailableError:
+        raise
     except Exception as exc:
+        refuse_aborted_request(cancel_ref)
         raise AudioBackendError(f"TTS backend failed: {exc}") from exc
+    refuse_aborted_request(cancel_ref)
     return SpeechResult(
         audio_bytes=audio_bytes,
         media_type=_MEDIA_TYPES.get(response_format, "audio/mpeg"),
