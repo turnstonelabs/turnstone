@@ -1803,7 +1803,7 @@ class TestSessionRegistryGenerationPropagation:
         assert _lane(session) is not old_lane
         assert _client(session) is not old_lane.client
         assert _client(session) is reg.get_client("gw")
-        assert str(_client(session).base_url).startswith("http://b.example")
+        assert str(_client(session).base_url) == "http://b.example/v1/"
         assert session._registry_generation == reg.generation
 
     def test_atomic_construction_binding_refreshes_after_reload_window(self) -> None:
@@ -1999,7 +1999,7 @@ class TestSessionRegistryGenerationPropagation:
         assert current is not old_binding
         assert current.lane is not old_lane
         assert current.lane.client is reg.get_client("gw")
-        assert str(current.lane.client.base_url).startswith("http://b.example")
+        assert str(current.lane.client.base_url) == "http://b.example/v1/"
         assert current.config is reg.get_config("gw")
         assert current.registry_generation == reg.generation
         assert session._primary_lane().client is current.lane.client
@@ -2061,7 +2061,7 @@ class TestSessionRegistryGenerationPropagation:
         assert not second.is_alive()
         assert second_entered_resolver.is_set()
         assert session._registry_generation == reg.generation
-        assert str(_client(session).base_url).startswith("http://b.example")
+        assert str(_client(session).base_url) == "http://b.example/v1/"
 
     def test_stale_refresh_cannot_overwrite_explicit_cross_alias_switch(
         self,
@@ -2125,7 +2125,7 @@ class TestSessionRegistryGenerationPropagation:
         assert session.model_alias == "b"
         assert session.model == "model-b"
         assert session.context_window == 22_222
-        assert str(_client(session).base_url).startswith("http://b.example")
+        assert str(_client(session).base_url) == "http://b.example/v1/"
 
     def test_alias_deletion_race_keeps_old_binding_without_raise(self) -> None:
         """A deletion landing mid-rebind must neither raise out of send nor
@@ -2280,7 +2280,7 @@ class TestSessionRegistryGenerationPropagation:
         assert replacement is not original
         assert replacement._lane is not original_judge_lane
         assert replacement._lane.alias == "intent"
-        assert str(replacement._lane.client.base_url).startswith("http://intent-b.example")
+        assert str(replacement._lane.client.base_url) == "http://intent-b.example/v1/"
 
     def test_live_output_guard_alias_replaces_only_guard_and_resets_limiter(
         self, tmp_db: Any
@@ -2772,7 +2772,7 @@ class TestSessionRegistryGenerationPropagation:
         judge = results[0]
         assert judge is not None
         assert judge is session._judge
-        assert str(judge._lane.client.base_url).startswith("http://intent-b.example")
+        assert str(judge._lane.client.base_url) == "http://intent-b.example/v1/"
         assert intent_resolutions >= 3
 
     def test_intent_alias_reload_after_candidate_check_retries_before_publication(
@@ -2836,7 +2836,7 @@ class TestSessionRegistryGenerationPropagation:
         assert len(results) == 1
         judge = results[0]
         assert judge is not None
-        assert str(judge._lane.client.base_url).startswith("http://intent-b.example")
+        assert str(judge._lane.client.base_url) == "http://intent-b.example/v1/"
         assert check_calls >= 3
 
     def test_intent_alias_reload_after_cached_check_replaces_before_reuse(
@@ -2901,7 +2901,7 @@ class TestSessionRegistryGenerationPropagation:
         replacement = results[0]
         assert replacement is not None
         assert replacement is not original
-        assert str(replacement._lane.client.base_url).startswith("http://intent-b.example")
+        assert str(replacement._lane.client.base_url) == "http://intent-b.example/v1/"
         assert check_calls >= 3
 
     def test_output_guard_alias_reload_during_construction_retries_before_publication(
@@ -2966,7 +2966,7 @@ class TestSessionRegistryGenerationPropagation:
         guard = results[0]
         assert guard is not None
         assert guard is session._output_guard_judge
-        assert str(guard._lane.client.base_url).startswith("http://guard-b.example")
+        assert str(guard._lane.client.base_url) == "http://guard-b.example/v1/"
         assert guard_resolutions == 2
 
 
