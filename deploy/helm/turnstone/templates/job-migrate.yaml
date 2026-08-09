@@ -43,13 +43,29 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.migrate.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: migrate
           image: {{ include "turnstone.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.migrate.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           command:
             - python
             - -m
             - turnstone.core.storage._migrate
           env:
             {{- include "turnstone.db.env" . | nindent 12 }}
+          {{- with .Values.migrate.writablePaths }}
+          volumeMounts:
+            {{- include "turnstone.writableVolumeMounts" . | trim | nindent 12 }}
+          {{- end }}
+      {{- with .Values.migrate.writablePaths }}
+      volumes:
+        {{- include "turnstone.writableVolumes" . | trim | nindent 8 }}
+      {{- end }}

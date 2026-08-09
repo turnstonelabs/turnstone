@@ -258,6 +258,36 @@ URL.
 {{- end }}
 
 {{/*
+Ephemeral writable volumes, and their mounts, for a workload's
+writablePaths list. A read-only root filesystem leaves the container with
+nowhere to write, and the image needs several such places: /tmp for
+tempfile (skill scratch dirs, background shell scripts, generated TLS
+material), the home directory for ~/.config/turnstone and the caches the
+bundled git and npx tooling keeps, /data because it is the working
+directory, and /workspace for the agent workspace.
+
+Backed by emptyDir rather than the container's writable layer, which is
+exactly what readOnlyRootFilesystem removes. Nothing here survives a
+restart, but nothing here did before either.
+
+Both halves iterate the same list so a path can never be mounted without
+a volume behind it. Scope is the list itself, not the root context.
+*/}}
+{{- define "turnstone.writableVolumes" -}}
+{{- range . }}
+- name: {{ .name }}
+  emptyDir: {{ if .sizeLimit }}{ sizeLimit: {{ .sizeLimit | quote }} }{{ else }}{}{{ end }}
+{{- end }}
+{{- end }}
+
+{{- define "turnstone.writableVolumeMounts" -}}
+{{- range . }}
+- name: {{ .name }}
+  mountPath: {{ .path | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
 Determine the secret name for LLM API keys.
 */}}
 {{- define "turnstone.llm.secretName" -}}

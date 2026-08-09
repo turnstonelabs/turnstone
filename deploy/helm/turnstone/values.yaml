@@ -47,6 +47,37 @@ server:
   nodeSelector: {}
   affinity: {}
   tolerations: []
+  # -- Pod-level security context
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  # -- Container-level security context
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+  # -- Writable paths, each backed by an emptyDir and unbounded unless
+  # given a sizeLimit. Required by securityContext.readOnlyRootFilesystem
+  # — emptying this list without also turning that off leaves the
+  # container unable to write at all.
+  writablePaths:
+    - name: tmp
+      path: /tmp
+    - name: home
+      path: /home/turnstone
+    - name: data
+      path: /data
+    # Agent working files. The largest by some margin: checkouts, build
+    # output, and whatever a session downloads all land here.
+    - name: workspace
+      path: /workspace
 
 # -- Turnstone console (cluster dashboard)
 console:
@@ -65,6 +96,31 @@ console:
   nodeSelector: {}
   affinity: {}
   tolerations: []
+  # -- Pod-level security context
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  # -- Container-level security context
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+  # -- Writable paths (see server.writablePaths). No /workspace: the
+  # console serves the dashboard and runs no agent sessions.
+  writablePaths:
+    - name: tmp
+      path: /tmp
+    - name: home
+      path: /home/turnstone
+    - name: data
+      path: /data
 
 # -- Database migration Job (post-install/pre-upgrade hook)
 migrate:
@@ -72,6 +128,30 @@ migrate:
   nodeSelector: {}
   affinity: {}
   tolerations: []
+  # -- Pod-level security context
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  # -- Container-level security context
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+  # -- Writable paths
+  writablePaths:
+    - name: tmp
+      path: /tmp
+    - name: home
+      path: /home/turnstone
+    - name: data
+      path: /data
 
 # -- LLM provider configuration
 llm:
