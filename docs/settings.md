@@ -71,6 +71,21 @@ attempt. The cap is local to each process, not cluster-wide; account for the
 number of nodes targeting the same inference server. Direct STT/TTS protocol
 calls and Cohere/Jina reranking do not currently consume this generation cap.
 
+### Judge batch parallelism
+
+`judge.parallel_evaluations` controls how many independent tool calls from one
+approval batch the intent judge evaluates concurrently. It is an integer from
+1 through 16 and defaults to 1, preserving serial evaluation until an operator
+opts into wider fan-out. Changes are hot-read at the next batch; work already
+in flight keeps its captured worker count.
+
+This is a per-batch fan-out setting, not another backend capacity limit. The
+judge model alias's `max_concurrency` gate still caps total generations across
+all judge batches and every other role using that alias. Actual overlap is
+therefore bounded by the batch size, `judge.parallel_evaluations`, and available
+alias admission slots. A smaller positive alias cap also narrows the batch's
+worker pool so excess judge threads do not queue ahead of later alias traffic.
+
 ### Model backend authentication
 
 Model definitions support four backend credential modes:
@@ -243,7 +258,7 @@ initialization:
 | `mcp` | config_path, registry_url |
 | `ratelimit` | enabled, requests_per_second, burst, trusted_proxies |
 | `health` | backend_probe_interval, backend_probe_timeout, circuit_breaker_threshold, circuit_breaker_cooldown |
-| `judge` | enabled, model, provider, base_url, api_key, smart_approvals, confidence_threshold, max_context_ratio, timeout, read_only_tools, output_guard, redact_secrets, cancel_on_approval |
+| `judge` | enabled, model, smart_approvals, confidence_threshold, max_context_ratio, timeout, parallel_evaluations, read_only_tools, output_guard, output_guard_budget_seconds, output_guard_llm, output_guard_model, output_guard_llm_timeout, redact_secrets, cancel_on_approval |
 | `interface` | close_tab_action, theme |
 | `skills` | discovery_url |
 | `memory` | relevance_k, fetch_limit, max_content, nudge_cooldown, nudges |
@@ -420,13 +435,11 @@ Reset a setting to its registry default by removing it from storage.
 
 ## Secret Settings
 
-Settings with `is_secret=True` (currently only `judge.api_key`) are blocked
-from the write API with a `403` response. This prevents accidental exposure
-through the admin UI or audit logs. Secret settings must be configured via
-`config.toml` or environment variables.
-
-The list endpoint masks secret values: stored secrets appear as `"***"`
-rather than their actual value.
+The registry currently defines no production secret system setting. The generic
+machinery nevertheless treats any future `is_secret=True` entry as write-only:
+list and write responses return `"***"`, and submitting that sentinel preserves
+the stored value. Model API keys are fields on model definitions—not
+`judge.*` system settings—and use the Models tab's separate write-only flow.
 
 ---
 

@@ -2930,6 +2930,12 @@ class ChatSession:
             raise RuntimeError("judge config composition requires a base config")
         from turnstone.core.judge import JudgeConfig
 
+        parallel_evaluations = setting("judge.parallel_evaluations")
+        if parallel_evaluations is None:
+            # Backward compatibility for duck-typed stores that predate this
+            # registry key. Real ConfigStore snapshots always carry defaults.
+            parallel_evaluations = 1
+
         return JudgeConfig(
             enabled=setting("judge.enabled"),
             model=jc.model,
@@ -2937,6 +2943,7 @@ class ChatSession:
             confidence_threshold=setting("judge.confidence_threshold"),
             max_context_ratio=setting("judge.max_context_ratio"),
             timeout=setting("judge.timeout"),
+            parallel_evaluations=parallel_evaluations,
             read_only_tools=setting("judge.read_only_tools"),
             output_guard=setting("judge.output_guard"),
             output_guard_budget_seconds=setting("judge.output_guard_budget_seconds"),

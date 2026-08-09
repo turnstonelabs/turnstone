@@ -2,7 +2,10 @@
 
 import argparse
 
+import pytest
+
 import turnstone.core.config as config_mod
+from turnstone.cli import _judge_parallel_evaluations_arg
 
 apply_config = config_mod.apply_config
 load_config = config_mod.load_config
@@ -324,6 +327,7 @@ def test_apply_config_judge_section(tmp_path):
         'model = "gpt-5"\n'
         "confidence_threshold = 0.85\n"
         "timeout = 30.0\n"
+        "parallel_evaluations = 8\n"
         "read_only_tools = false\n"
     )
     set_config_path(str(cfg))
@@ -333,6 +337,12 @@ def test_apply_config_judge_section(tmp_path):
     parser.add_argument("--judge-model", dest="judge_model", default="")
     parser.add_argument("--judge-confidence", dest="judge_confidence", type=float, default=0.7)
     parser.add_argument("--judge-timeout", dest="judge_timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--judge-parallel-evaluations",
+        dest="judge_parallel_evaluations",
+        type=int,
+        default=1,
+    )
     parser.add_argument("--judge-read-only-tools", dest="judge_read_only_tools", default=True)
 
     apply_config(parser, ["judge"])
@@ -342,6 +352,7 @@ def test_apply_config_judge_section(tmp_path):
     assert args.judge_model == "gpt-5"
     assert args.judge_confidence == 0.85
     assert args.judge_timeout == 30.0
+    assert args.judge_parallel_evaluations == 8
     assert args.judge_read_only_tools is False
 
 
@@ -349,19 +360,36 @@ def test_apply_config_judge_cli_overrides(tmp_path):
     """CLI flags override config.toml [judge] values."""
     _reset_cache()
     cfg = tmp_path / "config.toml"
-    cfg.write_text("[judge]\nenabled = true\nconfidence_threshold = 0.85\n")
+    cfg.write_text(
+        "[judge]\nenabled = true\nconfidence_threshold = 0.85\nparallel_evaluations = 8\n"
+    )
     set_config_path(str(cfg))
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--judge", dest="judge_enabled", action="store_true", default=False)
     parser.add_argument("--no-judge", dest="judge_enabled", action="store_false")
     parser.add_argument("--judge-confidence", dest="judge_confidence", type=float, default=0.7)
+    parser.add_argument(
+        "--judge-parallel-evaluations",
+        dest="judge_parallel_evaluations",
+        type=int,
+        default=1,
+    )
 
     apply_config(parser, ["judge"])
-    args = parser.parse_args(["--no-judge"])
+    args = parser.parse_args(["--no-judge", "--judge-parallel-evaluations", "3"])
 
     assert args.judge_enabled is False  # CLI wins
     assert args.judge_confidence == 0.85  # config wins (no CLI override)
+    assert args.judge_parallel_evaluations == 3
+
+
+def test_judge_parallel_evaluations_cli_type_is_strict_and_bounded():
+    assert _judge_parallel_evaluations_arg("1") == 1
+    assert _judge_parallel_evaluations_arg("16") == 16
+    for invalid in ("0", "17", "01", "+1", "1.0"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _judge_parallel_evaluations_arg(invalid)
 
 
 def test_set_config_path_overrides_default(tmp_path):

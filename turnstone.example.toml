@@ -136,14 +136,14 @@
                                # NB: serving Qwen3-Reranker via vLLM REQUIRES --chat-template
                                # (the model's chat_template.jinja) or scores are near-random.
 
-# --- Judge (turnstone, node) ---
+# --- Judge (turnstone CLI; server/console use Admin -> Judge) ---
 
 [judge]
 # enabled = true               # Enable intent validation
-# smart_approvals = false      # Auto-approve high-confidence "approve" LLM verdicts (opt-in)
-# confidence_threshold = 0.95  # Smart Approvals auto-approve bar (LLM recommendation=approve)
-# output_guard = true          # Scan tool output for security signals
-# redact_secrets = true        # Redact detected credentials in output
+# model = ""                   # Registered judge alias; empty = same as session
+# confidence_threshold = 0.95  # Judge verdict confidence threshold
+# timeout = 120.0              # Per-turn LLM judge timeout in seconds
+# parallel_evaluations = 1     # Concurrent LLM evaluations per tool-call batch (1-16)
 
 # --- Memory (turnstone, node) ---
 

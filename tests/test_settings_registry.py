@@ -63,6 +63,25 @@ class TestValidateKey:
         assert defn.min_value == 0.0
         assert defn.max_value == 1.0
 
+    def test_judge_parallel_evaluations_registered(self):
+        defn = validate_key("judge.parallel_evaluations")
+        assert defn.type == "int"
+        assert defn.default == 1
+        assert defn.min_value == 1
+        assert defn.max_value == 16
+        assert defn.section == "judge"
+        assert defn.strict_int is True
+
+        assert validate_value("judge.parallel_evaluations", "1") == 1
+        assert validate_value("judge.parallel_evaluations", 16) == 16
+        for invalid in (True, 1.0, "01", "+1", " 1", "1.0"):
+            with pytest.raises(ValueError, match="Cannot convert"):
+                validate_value("judge.parallel_evaluations", invalid)
+        with pytest.raises(ValueError, match="minimum"):
+            validate_value("judge.parallel_evaluations", 0)
+        with pytest.raises(ValueError, match="maximum"):
+            validate_value("judge.parallel_evaluations", 17)
+
     def test_smart_approvals_bool_coercion(self):
         assert validate_value("judge.smart_approvals", "true") is True
         assert validate_value("judge.smart_approvals", "false") is False

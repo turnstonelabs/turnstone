@@ -29,6 +29,7 @@ class SettingDef:
     restart_required: bool = False
     help: str = ""  # plain-English explanation for non-experts
     reference_url: str = ""  # link to arXiv, docs, or provider reference
+    strict_int: bool = False  # reject bool/float/non-canonical strings before int coercion
 
 
 # Default auto-compaction trigger as a fraction of the context window.  Shared
@@ -648,6 +649,20 @@ def _build_registry() -> dict[str, SettingDef]:
             min_value=5.0,
         ),
         SettingDef(
+            "judge.parallel_evaluations",
+            "int",
+            1,
+            "Maximum concurrent LLM evaluations per judge batch",
+            "judge",
+            min_value=1,
+            max_value=16,
+            strict_int=True,
+            help="How many independent tool calls from one approval batch the intent judge "
+            "evaluates at once. Keep this at 1 for serial evaluation, or raise it to reduce "
+            "latency for wide batches. The judge model alias's Max concurrent generations "
+            "setting remains the process-wide ceiling and may reduce the actual overlap.",
+        ),
+        SettingDef(
             "judge.read_only_tools",
             "bool",
             True,
@@ -950,7 +965,21 @@ def validate_value(key: str, raw_value: Any) -> Any:
     # Type coercion
     try:
         if defn.type == "int":
-            typed: Any = int(raw_value)
+            if defn.strict_int:
+                if type(raw_value) is int:
+                    typed: Any = raw_value
+                elif isinstance(raw_value, str):
+                    typed = int(raw_value)
+                    if str(typed) != raw_value:
+                        raise ValueError(
+                            f"Expected a canonical integer string for {key}, got {raw_value!r}"
+                        )
+                else:
+                    raise TypeError(
+                        f"Expected an integer for {key}, got {type(raw_value).__name__}"
+                    )
+            else:
+                typed = int(raw_value)
         elif defn.type == "float":
             typed = float(raw_value)
         elif defn.type == "bool":

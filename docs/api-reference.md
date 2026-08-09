@@ -578,8 +578,9 @@ cancellation-completion signal.
 
 **`intent_verdict`** -- delivered asynchronously when the LLM judge completes
 its evaluation of a pending tool call. Only sent when intent validation is
-enabled (`--judge` or `[judge] enabled = true`). The `call_id` correlates with
-the item in the preceding `approve_request` event.
+enabled (`judge.enabled` through Admin → Judge or the admin settings API). The
+interactive CLI instead uses `--judge` or `[judge] enabled = true`. The
+`call_id` correlates with the item in the preceding `approve_request` event.
 
 ```json
 {

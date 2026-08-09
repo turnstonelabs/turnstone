@@ -28,10 +28,13 @@ note over Judge, Model
   are freshness watermarks: an effective lane change replaces the judge for
   the next batch, while in-flight work keeps the lane it started with.
   Dynamic backend auth is resolved for this batch's initiating principal.
+  parallel_evaluations (1-16) sets per-batch worker width; the model alias's
+  admission gate remains the process-wide generation ceiling.
 end note
 
-par LLM judge daemon
-  loop bounded turns / deadline
+par LLM judge daemon coordinator
+  Judge -> Judge : start min(batch size, parallel_evaluations,\npositive alias capacity) workers
+  loop each worker claims one independent call
     Judge -> Model : model_turn(judge lane, canonical Turns,\nread-only evidence tools, cancel_ref)
     Model --> Judge : ModelTurnResult
     alt evidence tool requested
@@ -39,9 +42,9 @@ par LLM judge daemon
     else verdict text
       Judge -> Judge : parse + arbitrate against heuristic
     end
+    Judge --> UI : on_intent_verdict(verdict, judge generation)
+    UI -> Storage : persist LLM verdict / audit update
   end
-  Judge --> UI : on_intent_verdict(verdict, judge generation)
-  UI -> Storage : persist LLM verdict / audit update
 else approval path continues
   Session -> UI : approve_tools(items) with one\nSmart Approval config snapshot
 end

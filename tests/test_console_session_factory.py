@@ -340,6 +340,14 @@ def test_mcp_no_getter_is_backward_compatible() -> None:
     assert got["mcp_client"] is None
 
 
+def test_judge_parallel_evaluations_reaches_coordinator_session() -> None:
+    got = _capture_chatsession_kwargs(
+        settings={"judge.parallel_evaluations": 7},
+        getter_passed=False,
+    )
+    assert got["judge_config"].parallel_evaluations == 7
+
+
 def test_mcp_getter_resolved_per_construction() -> None:
     """The getter is consulted at EVERY construction — a manager
     (re)constructed by the console ensure-helper after factory build must

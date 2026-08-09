@@ -175,6 +175,23 @@ class TestUpdateSetting:
         assert r.status_code == 400
         assert "minimum" in r.json()["error"]
 
+    @pytest.mark.parametrize("invalid", [True, 1.0, "01", "+1", "1.0"])
+    def test_judge_parallel_evaluations_requires_strict_integer(self, client, invalid):
+        r = client.put(
+            "/v1/api/admin/settings/judge.parallel_evaluations",
+            json={"value": invalid},
+        )
+        assert r.status_code == 400
+        assert "Cannot convert" in r.json()["error"]
+
+    def test_judge_parallel_evaluations_accepts_integer_input_string(self, client):
+        r = client.put(
+            "/v1/api/admin/settings/judge.parallel_evaluations",
+            json={"value": "8"},
+        )
+        assert r.status_code == 200
+        assert r.json()["value"] == 8
+
     def test_update_then_list_shows_storage(self, client):
         client.put(
             "/v1/api/admin/settings/tools.timeout",

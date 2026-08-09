@@ -8,9 +8,11 @@ is a fast, pure-function rule engine with zero external dependencies.
 from __future__ import annotations
 
 import fnmatch
+import itertools
 import json
 import math
 import os
+import queue
 import re
 import threading
 import time
@@ -46,6 +48,10 @@ if TYPE_CHECKING:
     from turnstone.core.model_turn import ModelTurnResult
 
 log = get_logger(__name__)
+
+_MAX_PARALLEL_EVALUATIONS = 16
+_JUDGE_READ_LIMIT = 32_768
+_JUDGE_DIRECTORY_LIMIT = 200
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -118,6 +124,50 @@ class JudgeConfig:
     # False (default) = the daemon runs every item to completion; only a
     # generation supersede (next batch) or session close aborts it.
     cancel_on_approval: bool = False
+    # Maximum tool-call evaluations this judge may run concurrently within
+    # one approval batch.  The selected model alias's admission limit remains
+    # the process-wide ceiling across judge and non-judge traffic.
+    parallel_evaluations: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.parallel_evaluations) is not int or not (
+            1 <= self.parallel_evaluations <= _MAX_PARALLEL_EVALUATIONS
+        ):
+            raise ValueError(
+                "judge.parallel_evaluations must be an integer between 1 and "
+                f"{_MAX_PARALLEL_EVALUATIONS}"
+            )
+
+
+@dataclass
+class _JudgeWorkOutcome:
+    """One indexed worker result awaiting coordinator delivery."""
+
+    index: int
+    verdict: IntentVerdict | None
+    fallback_reason: str
+    acknowledged: threading.Event = field(default_factory=threading.Event)
+
+
+class _JudgeBatchCancelEvent(threading.Event):
+    """Private batch abort composed with the caller-owned cancel event."""
+
+    def __init__(self, upstream: threading.Event | None) -> None:
+        super().__init__()
+        self._upstream = upstream
+
+    def is_set(self) -> bool:
+        return super().is_set() or bool(self._upstream and self._upstream.is_set())
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait for either the private abort or the upstream event."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            super().wait(0.05 if remaining is None else min(0.05, remaining))
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1230,7 +1280,7 @@ class IntentJudge:
             checked_config_version=config_version_at_start,
         )
         # The semantic lane is pinned for the judge object's lifetime.  Intent
-        # evaluations still substitute a fresh client per daemon batch for
+        # evaluations still substitute a fresh client per daemon worker for
         # thread isolation; no provider/model/config facet is re-resolved.
         self._lane = binding.lane
         self._model = self._lane.model
@@ -1245,12 +1295,13 @@ class IntentJudge:
         )
 
     @staticmethod
-    def _fingerprint_config(config: JudgeConfig) -> tuple[str, float, float, bool]:
+    def _fingerprint_config(config: JudgeConfig) -> tuple[str, float, float, int, bool]:
         """Constructor-consumed behavior that requires a fresh judge object."""
         return (
             str(config.model or "").strip(),
             config.max_context_ratio,
             config.timeout,
+            config.parallel_evaluations,
             config.read_only_tools,
         )
 
@@ -1313,8 +1364,8 @@ class IntentJudge:
                 close, and — only when ``cancel_on_approval`` is
                 enabled — as soon as the approval gate resolves.
             done_callback: Invoked exactly once from the daemon's
-                ``finally`` when this generation finishes — normally,
-                cancelled, or by escape of a delivery error.  ChatSession
+                ``finally`` when this generation finishes — normally or
+                cancelled. Callback errors are isolated per item. ChatSession
                 uses it to retire the generation's cancel event from its
                 live set (parallel task agents each spawn a generation;
                 ``close()`` aborts whatever is still live).
@@ -1374,7 +1425,7 @@ class IntentJudge:
         done_callback: Callable[[], None] | None = None,
         backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     ) -> None:
-        """Daemon thread: run LLM judge for each item and invoke callback.
+        """Daemon coordinator: run bounded LLM evaluations and invoke callback.
 
         ``cancel_event`` is an unconditional abort signal: once it fires,
         in-flight work stops and every remaining item is delivered as an
@@ -1389,7 +1440,6 @@ class IntentJudge:
         no supersede, every evaluation runs to completion so all
         verdicts are delivered.
         """
-        client: Any | None = None
         try:
             if cancel_event and cancel_event.is_set():
                 self._deliver_fallbacks(
@@ -1398,6 +1448,9 @@ class IntentJudge:
                     callback,
                     "judge cancelled before evaluating this call",
                 )
+                return
+
+            if not items:
                 return
 
             # Preserve the caller-pinned principal on the batch lane, but let
@@ -1421,94 +1474,169 @@ class IntentJudge:
                 )
                 return
 
-            client = self._create_client()
-            # One lane derivative for the whole batch: only the judge-owned
-            # fresh client differs from the immutable constructor binding.
-            # Every item and evidence turn therefore stays on one provider,
-            # model, capability, auth-config, and initiating-principal
-            # binding while credentials refresh per admitted attempt.
-            batch_lane = replace(batch_lane, client=client)
-            for idx, (item, h_verdict) in enumerate(zip(items, heuristic_verdicts, strict=True)):
-                if cancel_event and cancel_event.is_set():
-                    log.info("judge.cancelled", remaining=len(items) - idx)
-                    self._deliver_fallbacks(
-                        items[idx:],
-                        heuristic_verdicts[idx:],
-                        callback,
-                        "judge cancelled before evaluating this call",
-                    )
-                    return
+            width = min(
+                max(1, int(self._config.parallel_evaluations)),
+                _MAX_PARALLEL_EVALUATIONS,
+                len(items),
+            )
+            alias_limit = batch_lane.admission.limit if batch_lane.admission is not None else 0
+            if alias_limit > 0:
+                width = min(width, alias_limit)
+            log.info(
+                "judge.batch.start",
+                items=len(items),
+                parallel_evaluations=width,
+                configured_parallel_evaluations=self._config.parallel_evaluations,
+                model_alias=batch_lane.alias,
+                model_alias_limit=alias_limit,
+            )
+            work: queue.Queue[int | None] = queue.Queue()
+            outcomes: queue.Queue[_JudgeWorkOutcome] = queue.Queue()
+            batch_cancel = _JudgeBatchCancelEvent(cancel_event)
+            abort_lock = threading.Lock()
+            abort_reason = ""
+
+            for idx in range(len(items)):
+                work.put(idx)
+            for _ in range(width):
+                work.put(None)
+
+            def _current_abort_reason() -> str:
+                if cancel_event is not None and cancel_event.is_set():
+                    return "judge cancelled before evaluating this call"
+                with abort_lock:
+                    return abort_reason
+
+            def _abort_batch(reason: str) -> bool:
+                nonlocal abort_reason
+                with abort_lock:
+                    first = not abort_reason
+                    if first:
+                        abort_reason = reason
+                batch_cancel.set()
+                return first
+
+            def _worker() -> None:
+                client: Any | None = None
                 try:
-                    llm_verdict = self._evaluate_single(
-                        item,
-                        messages,
-                        cancel_event,
-                        client,
-                        lane=batch_lane,
-                    )
-                    if llm_verdict:
-                        log.info(
-                            "judge.verdict.llm",
-                            recommendation=llm_verdict.recommendation,
-                            confidence=llm_verdict.confidence,
-                            call_id=llm_verdict.call_id,
-                        )
-                        callback(llm_verdict)
-                    else:
-                        fallback = IntentVerdict(
-                            verdict_id=h_verdict.verdict_id,
-                            call_id=h_verdict.call_id,
-                            func_name=h_verdict.func_name,
-                            func_args=h_verdict.func_args,
-                            intent_summary=h_verdict.intent_summary,
-                            risk_level=h_verdict.risk_level,
-                            confidence=h_verdict.confidence,
-                            recommendation=h_verdict.recommendation,
-                            reasoning=h_verdict.reasoning + " (LLM judge did not return a verdict)",
-                            evidence=h_verdict.evidence,
-                            tier="llm_fallback",
-                            judge_model=self._model,
-                            latency_ms=h_verdict.latency_ms,
-                        )
-                        log.info(
-                            "judge.verdict.fallback",
-                            recommendation=fallback.recommendation,
-                            confidence=fallback.confidence,
-                            call_id=fallback.call_id,
-                        )
-                        callback(fallback)
-                    # After delivering this item's verdict, check whether the
-                    # abort signal fired while we were evaluating it.
-                    if cancel_event and cancel_event.is_set():
-                        log.info("judge.cancelled.after_eval", call_id=item.get("call_id", ""))
-                        self._deliver_fallbacks(
-                            items[idx + 1 :],
-                            heuristic_verdicts[idx + 1 :],
-                            callback,
-                            "judge cancelled before evaluating this call",
-                        )
-                        return
-                except BackendAuthUnavailableError:
-                    log.exception("Judge backend authentication failed")
-                    self._deliver_fallbacks(
-                        items[idx:],
-                        heuristic_verdicts[idx:],
-                        callback,
-                        "judge backend authentication failed",
-                    )
-                    return
-                except Exception:
-                    log.exception(
-                        "Judge evaluation failed for %s",
-                        item.get("func_name", "?"),
-                    )
-                    self._deliver_fallbacks([item], [h_verdict], callback, "judge evaluation error")
-        finally:
+                    while True:
+                        idx = work.get()
+                        if idx is None:
+                            work.task_done()
+                            return
+                        outcome: _JudgeWorkOutcome
+                        try:
+                            reason = _current_abort_reason()
+                            if reason:
+                                outcome = _JudgeWorkOutcome(idx, None, reason)
+                            else:
+                                if client is None:
+                                    try:
+                                        client = self._create_client()
+                                    except BaseException:  # noqa: BLE001 - contain daemon failure
+                                        reason = "judge client initialization failed"
+                                        if _abort_batch(reason):
+                                            log.exception("Judge client initialization failed")
+                                        outcome = _JudgeWorkOutcome(idx, None, reason)
+                                if client is not None:
+                                    worker_lane = replace(batch_lane, client=client)
+                                    try:
+                                        verdict = self._evaluate_single(
+                                            items[idx],
+                                            messages,
+                                            batch_cancel,
+                                            client,
+                                            lane=worker_lane,
+                                        )
+                                        reason = _current_abort_reason()
+                                        outcome = _JudgeWorkOutcome(
+                                            idx,
+                                            verdict,
+                                            reason
+                                            or (
+                                                ""
+                                                if verdict is not None
+                                                else "LLM judge did not return a verdict"
+                                            ),
+                                        )
+                                    except BackendAuthUnavailableError:
+                                        reason = "judge backend authentication failed"
+                                        if _abort_batch(reason):
+                                            log.exception("Judge backend authentication failed")
+                                        outcome = _JudgeWorkOutcome(idx, None, reason)
+                                    except BaseException:  # noqa: BLE001 - contain daemon failure
+                                        log.exception(
+                                            "Judge evaluation failed for %s",
+                                            items[idx].get("func_name", "?"),
+                                        )
+                                        outcome = _JudgeWorkOutcome(
+                                            idx,
+                                            None,
+                                            "judge evaluation error",
+                                        )
+                        finally:
+                            work.task_done()
+                        outcomes.put(outcome)
+                        # Callback delivery is the cancellation commit point.
+                        # Do not refill this worker until the coordinator has
+                        # invoked the callback and observed any resulting abort.
+                        outcome.acknowledged.wait()
+                finally:
+                    try:
+                        if client is not None and hasattr(client, "close"):
+                            client.close()
+                    except Exception:
+                        log.debug("judge.client_close_failed", exc_info=True)
+
+            workers: list[threading.Thread] = []
             try:
-                if client is not None and hasattr(client, "close"):
-                    client.close()
-            except Exception:
-                log.debug("judge.client_close_failed", exc_info=True)
+                for idx in range(width):
+                    worker = threading.Thread(
+                        target=_worker,
+                        daemon=True,
+                        name=f"intent-judge-eval-{idx + 1}",
+                    )
+                    worker.start()
+                    workers.append(worker)
+            except BaseException:  # noqa: BLE001 - preserve exact-once fallbacks
+                reason = "judge worker initialization failed"
+                _abort_batch(reason)
+                log.exception("Judge worker initialization failed")
+            if not workers:
+                self._deliver_fallbacks(items, heuristic_verdicts, callback, abort_reason)
+                return
+
+            delivered: set[int] = set()
+            for _ in range(len(items)):
+                outcome = outcomes.get()
+                try:
+                    if outcome.index in delivered:
+                        log.error("judge.verdict.duplicate", index=outcome.index)
+                        continue
+                    delivered.add(outcome.index)
+                    h_verdict = heuristic_verdicts[outcome.index]
+                    verdict = outcome.verdict or self._fallback_verdict(
+                        h_verdict,
+                        outcome.fallback_reason,
+                    )
+                    log.info(
+                        "judge.verdict.llm"
+                        if outcome.verdict is not None
+                        else "judge.verdict.fallback",
+                        recommendation=verdict.recommendation,
+                        confidence=verdict.confidence,
+                        call_id=verdict.call_id,
+                    )
+                    try:
+                        callback(verdict)
+                    except Exception:
+                        log.debug("judge.verdict_delivery_failed", exc_info=True)
+                finally:
+                    outcome.acknowledged.set()
+
+            for worker in workers:
+                worker.join()
+        finally:
             if done_callback is not None:
                 try:
                     done_callback()
@@ -1524,22 +1652,28 @@ class IntentJudge:
     ) -> None:
         """Deliver ``llm_fallback`` verdicts (heuristic content) for items the judge didn't complete."""
         for _item, h_verdict in zip(remaining_items, remaining_verdicts, strict=True):
-            fallback = IntentVerdict(
-                verdict_id=h_verdict.verdict_id,
-                call_id=h_verdict.call_id,
-                func_name=h_verdict.func_name,
-                func_args=h_verdict.func_args,
-                intent_summary=h_verdict.intent_summary,
-                risk_level=h_verdict.risk_level,
-                confidence=h_verdict.confidence,
-                recommendation=h_verdict.recommendation,
-                reasoning=h_verdict.reasoning + f" ({reason})",
-                evidence=h_verdict.evidence,
-                tier="llm_fallback",
-                judge_model=self._model,
-                latency_ms=h_verdict.latency_ms,
-            )
-            callback(fallback)
+            try:
+                callback(self._fallback_verdict(h_verdict, reason))
+            except Exception:
+                log.debug("judge.verdict_delivery_failed", exc_info=True)
+
+    def _fallback_verdict(self, h_verdict: IntentVerdict, reason: str) -> IntentVerdict:
+        """Relabel one heuristic verdict as an LLM fallback."""
+        return IntentVerdict(
+            verdict_id=h_verdict.verdict_id,
+            call_id=h_verdict.call_id,
+            func_name=h_verdict.func_name,
+            func_args=h_verdict.func_args,
+            intent_summary=h_verdict.intent_summary,
+            risk_level=h_verdict.risk_level,
+            confidence=h_verdict.confidence,
+            recommendation=h_verdict.recommendation,
+            reasoning=h_verdict.reasoning + f" ({reason})",
+            evidence=h_verdict.evidence,
+            tier="llm_fallback",
+            judge_model=self._model,
+            latency_ms=h_verdict.latency_ms,
+        )
 
     def _evaluate_single(
         self,
@@ -1590,8 +1724,8 @@ class IntentJudge:
         if self._config.read_only_tools:
             tools = list(_JUDGE_TOOL_SCHEMAS)
 
-        # ``lane`` is the constructor-pinned binding with only the fresh
-        # batch client substituted.  No registry/config facet is re-resolved
+        # ``lane`` is the constructor-pinned binding with only the worker's
+        # fresh client substituted.  No registry/config facet is re-resolved
         # inside an evaluation; window sizing and wire capabilities therefore
         # cannot disagree.
 
@@ -1915,12 +2049,15 @@ class IntentJudge:
         ]
 
     # Paths the judge is never allowed to read (security hardening).
-    _BLOCKED_PREFIXES: tuple[str, ...] = (
-        "/etc/",
-        "/root/",
-        "/proc/",
-        "/sys/",
-        "/dev/",
+    _BLOCKED_ROOTS: tuple[Path, ...] = tuple(
+        Path(root).resolve()
+        for root in (
+            "/etc",
+            "/root",
+            "/proc",
+            "/sys",
+            "/dev",
+        )
     )
     _BLOCKED_PARTS: frozenset[str] = frozenset(
         {
@@ -1933,14 +2070,18 @@ class IntentJudge:
     _BLOCKED_SUFFIXES: tuple[str, ...] = (".pem", ".key", ".p12", ".pfx")
 
     @staticmethod
-    def _is_path_blocked(path: Path) -> bool:
-        """Return True if *path* should not be readable by the judge."""
-        resolved = str(path.resolve())
-        if any(resolved.startswith(p) for p in IntentJudge._BLOCKED_PREFIXES):
+    def _is_resolved_path_blocked(path: Path) -> bool:
+        """Return whether an already-resolved path is protected."""
+        if any(path == root or root in path.parents for root in IntentJudge._BLOCKED_ROOTS):
             return True
         if IntentJudge._BLOCKED_PARTS & set(path.parts):
             return True
         return path.suffix.lower() in IntentJudge._BLOCKED_SUFFIXES
+
+    @staticmethod
+    def _is_path_blocked(path: Path) -> bool:
+        """Return True if *path* resolves to a protected location."""
+        return IntentJudge._is_resolved_path_blocked(path.resolve())
 
     @staticmethod
     def _exec_read_only_tool(name: str, args: dict[str, Any]) -> str:
@@ -1951,27 +2092,46 @@ class IntentJudge:
         try:
             if name == "read_file":
                 path = Path(str(args.get("path", "")))
-                if IntentJudge._is_path_blocked(path):
+                resolved_path = path.resolve()
+                if IntentJudge._is_resolved_path_blocked(resolved_path):
                     return f"Error: access denied: {path}"
-                if not path.is_file():
+                if not resolved_path.is_file():
                     return f"Error: file not found: {path}"
-                content = path.read_text(encoding="utf-8", errors="replace")
-                # Cap at 32KB to avoid blowing context
-                if len(content) > 32768:
-                    return content[:32768] + f"\n... (truncated, {len(content)} bytes total)"
+                # Bound acquisition itself, not merely the returned string:
+                # a parallel batch must not materialize one unbounded file per
+                # worker before applying the judge context cap.
+                with resolved_path.open("r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read(_JUDGE_READ_LIMIT + 1)
+                if len(content) > _JUDGE_READ_LIMIT:
+                    try:
+                        total_bytes = resolved_path.stat().st_size
+                        size_note = f", {total_bytes} bytes total"
+                    except OSError:
+                        size_note = ""
+                    return content[:_JUDGE_READ_LIMIT] + f"\n... (truncated{size_note})"
                 return content
 
             if name == "list_directory":
                 path = Path(str(args.get("path", "")))
-                if IntentJudge._is_path_blocked(path):
+                resolved_path = path.resolve()
+                if IntentJudge._is_resolved_path_blocked(resolved_path):
                     return f"Error: access denied: {path}"
-                if not path.is_dir():
+                if not resolved_path.is_dir():
                     return f"Error: directory not found: {path}"
-                entries = sorted(path.iterdir())[:200]  # cap at 200 entries
+                # Bound collection before sorting so concurrent evidence
+                # workers retain at most N+1 directory entries each.
+                entries = sorted(
+                    itertools.islice(resolved_path.iterdir(), _JUDGE_DIRECTORY_LIMIT + 1),
+                    key=lambda entry: entry.name,
+                )
+                truncated = len(entries) > _JUDGE_DIRECTORY_LIMIT
+                entries = entries[:_JUDGE_DIRECTORY_LIMIT]
                 lines: list[str] = []
                 for entry in entries:
                     suffix = "/" if entry.is_dir() else ""
                     lines.append(f"  {entry.name}{suffix}")
+                if truncated:
+                    lines.append("  ... (additional entries omitted)")
                 return "\n".join(lines) or "(empty directory)"
 
             return f"Error: unknown tool: {name}"

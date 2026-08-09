@@ -3130,8 +3130,13 @@ class TestLiveConfigUpdate:
 
         # Default: enabled=True
         assert session._judge_cfg.enabled is True
+        assert session._judge_cfg.parallel_evaluations == 1
 
-        # Admin disables the judge
+        # Admin changes behavioral settings for the next batch.
+        cs.set("judge.parallel_evaluations", 6, changed_by="test")
+        assert session._judge_cfg.parallel_evaluations == 6
+
+        # Admin disables the judge.
         cs.set("judge.enabled", False, changed_by="test")
         assert session._judge_cfg.enabled is False
 
@@ -3144,6 +3149,7 @@ class TestLiveConfigUpdate:
                 values = {key: defn.default for key, defn in SETTINGS.items()}
                 values["judge.smart_approvals"] = True
                 values["judge.confidence_threshold"] = 0.4
+                values["judge.parallel_evaluations"] = 5
                 return 7, values
 
             def get(self, _key):
@@ -3160,8 +3166,16 @@ class TestLiveConfigUpdate:
 
         assert direct is not None
         assert stable is not None
-        assert (direct.smart_approvals, direct.confidence_threshold) == (True, 0.4)
-        assert (stable.smart_approvals, stable.confidence_threshold) == (True, 0.4)
+        assert (
+            direct.smart_approvals,
+            direct.confidence_threshold,
+            direct.parallel_evaluations,
+        ) == (True, 0.4, 5)
+        assert (
+            stable.smart_approvals,
+            stable.confidence_threshold,
+            stable.parallel_evaluations,
+        ) == (True, 0.4, 5)
         assert version == 7
 
     def test_judge_client_config_stays_frozen(self, tmp_db):

@@ -995,6 +995,16 @@ def _close_all_sessions(manager: SessionManager) -> None:
         print(dim("  (interrupted — background shells already signalled)"))
 
 
+def _judge_parallel_evaluations_arg(value: str) -> int:
+    """Argparse adapter for the registry's strict bounded integer contract."""
+    from turnstone.core.settings_registry import validate_value
+
+    try:
+        return int(validate_value("judge.parallel_evaluations", value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive CLI for OpenAI-compatible models with tool calling.",
@@ -1187,6 +1197,14 @@ def main() -> None:
         help="LLM judge timeout in seconds (default: 120)",
     )
     judge_group.add_argument(
+        "--judge-parallel-evaluations",
+        dest="judge_parallel_evaluations",
+        type=_judge_parallel_evaluations_arg,
+        default=1,
+        metavar="N",
+        help="Concurrent LLM evaluations within one judge batch, 1-16 (default: 1)",
+    )
+    judge_group.add_argument(
         "--judge-confidence",
         dest="judge_confidence",
         type=float,
@@ -1316,6 +1334,7 @@ def main() -> None:
         model=args.judge_model,
         confidence_threshold=args.judge_confidence,
         timeout=args.judge_timeout,
+        parallel_evaluations=args.judge_parallel_evaluations,
     )
 
     # ChatSession factory — captures shared config for creating workstreams

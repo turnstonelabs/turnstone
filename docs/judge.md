@@ -30,22 +30,29 @@ persisted to the `intent_verdicts` table for audit and future calibration.
 
 ## Configuration
 
-### config.toml
+### Server and console
 
-```toml
-[judge]
-enabled = true
-model = ""                    # empty = same as session model
-provider = ""                 # empty = same as session provider
-base_url = ""
-api_key = ""
-smart_approvals = false       # auto-approve high-confidence "approve" LLM verdicts (opt-in)
-confidence_threshold = 0.95   # Smart Approvals auto-approve bar (LLM recommendation=approve)
-max_context_ratio = 0.5       # max % of judge context window for history
-timeout = 120.0               # per judge turn; also caps the Smart Approvals wait
-read_only_tools = true        # judge can use read_file/list_directory
-cancel_on_approval = false    # stop judging remaining tool calls once user decides
+Server and console workstreams read database-backed `judge.*` settings from
+the settings registry. Edit them at **Admin → Judge** or through the admin
+settings API; changes take effect for the next judge batch without a restart.
+The principal settings are:
+
+```text
+judge.enabled = true
+judge.model = ""                    # empty = same alias as the session
+judge.smart_approvals = false       # opt-in automatic approval
+judge.confidence_threshold = 0.95   # Smart Approvals confidence bar
+judge.max_context_ratio = 0.5       # fraction of judge context used for history
+judge.timeout = 120.0               # per judge turn and Smart Approvals wait
+judge.parallel_evaluations = 1      # concurrent calls within one batch, 1-16
+judge.read_only_tools = true        # permit read_file/list_directory evidence
+judge.cancel_on_approval = false    # stop unfinished calls when the gate resolves
 ```
+
+`parallel_evaluations = 1` preserves serial evaluation. Raising it reduces the
+latency of wide tool-call batches. The selected judge model alias's
+`max_concurrency` remains the process-wide generation ceiling, so it can reduce
+the actual overlap across judge batches and other roles using that alias.
 
 ### Smart Approvals
 
@@ -78,21 +85,22 @@ Requires the judge to be enabled. Auto-approved calls are tagged
 `smart_approval` in the dashboard and audit trail. Smart Approvals applies to
 the web and coordinator surfaces, not the interactive CLI.
 
-All fields are optional. The judge is enabled by default; use `enabled = false`
-(or `--no-judge` on the command line) to disable it.
+The judge is enabled by default. Disable `judge.enabled` in the admin Judge
+settings, or use `--no-judge` in the interactive CLI.
 
 ### CLI flags
 
 ```
 --judge / --no-judge           Enable/disable (default: enabled)
---judge-model MODEL            Model for judge
---judge-provider PROVIDER      Provider for judge
+--judge-model ALIAS            Registered model alias for judge
 --judge-timeout SECONDS        LLM judge timeout (default: 120)
+--judge-parallel-evaluations N Concurrent evaluations per batch, 1-16 (default: 1)
 --judge-confidence FLOAT       Confidence threshold, 0-1 (default: 0.95)
 ```
 
-(Smart Approvals is configured via `[judge] smart_approvals` / the admin Judge
-settings, not a CLI flag — the interactive CLI prompts for approval directly.)
+The same five values can be placed in the CLI's `config.toml` `[judge]`
+section. Smart Approvals is configured through the server/console admin Judge
+settings, not a CLI flag—the interactive CLI prompts for approval directly.
 
 CLI flags override `config.toml` values.
 
@@ -103,20 +111,19 @@ CLI flags override `config.toml` values.
 - **Default (self-consistency)**: When `model` is empty, the session model
   evaluates its own tool calls. Research shows self-consistency achieves
   comparable accuracy to multi-agent debate at a fraction of the cost.
-- **Cross-model**: Use a different model for the judge (e.g. local model for
-  the session, commercial model for the judge). Set `model` and `provider`
-  in the `[judge]` config section, or use `--judge-model` / `--judge-provider`
-  CLI flags.
-- **Cross-provider**: When both `model` and `provider` are set, the judge
-  creates its own LLM client. You can optionally specify `base_url` and
-  `api_key` for non-default endpoints.
-- **Google models**: The judge supports `google` as a provider. Note that
-  read-only tools are disabled for Google models (the Gemini API requires
-  `thought_signature` in tool call round-trips which the judge's normalized
-  format does not preserve).
+- **Cross-model**: Register the desired model in the Models tab, then set
+  `judge.model` to that alias (or pass `--judge-model ALIAS` to the CLI).
+- **Cross-provider**: A model alias carries its provider, endpoint, and
+  credential configuration together, so a judge alias may use a different
+  provider from the session without separate judge connection settings.
+- **Google models**: The judge supports `google` aliases, including read-only
+  evidence tools. Provider-native reasoning state such as Gemini
+  `thought_signature` stays attached to the pinned model lane across evidence
+  turns.
 
-The judge creates a fresh HTTP client for each evaluation run and closes it
-when done, avoiding stale connection issues across runs.
+The judge creates one fresh HTTP client per active batch worker and closes each
+when that worker finishes, avoiding cross-thread client sharing and stale
+connections across runs.
 
 If the LLM judge fails or returns no verdict, a fallback verdict with tier
 `llm_fallback` is delivered via the callback, ensuring the UI always receives
@@ -248,16 +255,23 @@ calls for approval, it calls `_evaluate_intent()` which:
 4. Attaches each heuristic verdict to its item as `_heuristic_verdict`
 5. The daemon thread runs the LLM judge and delivers results via `ui.on_intent_verdict()`
 
-The daemon evaluates items sequentially, so a large parallel batch can outlive
-its approval gate. With `cancel_on_approval = false` (the default) the daemon
-runs every item to completion: verdicts that land after the operator decided
-still stream to the UI and persist, stamped with the decision. A newer main-loop
-batch, session close, or explicit Stop retires the old generation; unfinished
-items degrade to `llm_fallback` verdicts. A judge/model binding edit prevents
+The daemon coordinates up to `parallel_evaluations` independent workers for
+one batch. Completed verdicts stream to the UI as workers finish, and every call
+still receives exactly one LLM or `llm_fallback` verdict. The default of 1 keeps
+the historical serial behavior; a higher value collapses a wide batch toward
+`ceil(batch size / workers)` judge-call intervals. A smaller positive model
+alias capacity also bounds the worker count, avoiding surplus threads queued at
+the same admission gate.
+
+With `cancel_on_approval = false` (the default) the daemon runs every item to
+completion: verdicts that land after the operator decided still stream to the
+UI and persist, stamped with the decision. A newer main-loop batch, session
+close, or explicit Stop retires the old generation; unfinished items degrade
+to `llm_fallback` verdicts. A judge/model binding or parallelism edit prevents
 reuse on the next batch, while already-started calls stay pinned to the binding
-they began with. With `cancel_on_approval = true`, an ordinary gate decision
-additionally aborts the remainder immediately, trading verdict completeness
-for inference savings — recommended when the judge shares a single local
+and worker count they began with. With `cancel_on_approval = true`, an ordinary
+gate decision additionally aborts unfinished work, trading verdict completeness
+for inference savings—recommended when the judge shares a single local
 inference backend with the session model. Explicit Stop always cancels every
 live judge generation, regardless of this preference.
 
@@ -441,13 +455,12 @@ Redaction types: `api_key`, `private_key`, `password`, `secret`.
 
 ### Configuration
 
-```toml
-[judge]
-output_guard = true    # enable output evaluation (default)
-redact_secrets = true  # auto-redact detected credentials (default)
+```text
+judge.output_guard = true    # enable output evaluation (default)
+judge.redact_secrets = true  # auto-redact detected credentials (default)
 ```
 
-Configurable at runtime via the admin Settings tab.
+Configure both at runtime through the admin Judge settings.
 
 ### Merge semantics (heuristic + LLM judge)
 

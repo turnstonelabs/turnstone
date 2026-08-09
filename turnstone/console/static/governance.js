@@ -3859,7 +3859,7 @@ function renderJudgeSettings() {
         ">" +
         '<span class="toggle-track" aria-hidden="true"></span>' +
         '<span class="toggle-label">Enabled</span></label>';
-    } else if (s.type === "float") {
+    } else if (s.type === "float" || s.type === "int") {
       // currentVal/min/max are expected to be numeric, but
       // ``admin_list_judge_settings`` can fall back to returning the
       // raw stored string when deserialization fails — escape +
@@ -3867,7 +3867,9 @@ function renderJudgeSettings() {
       // out of the value/min/max attribute boundary.
       inputHtml =
         '<div style="display:flex;gap:8px;align-items:center">' +
-        '<input type="number" step="0.01" data-judge-key="' +
+        '<input type="number" step="' +
+        (s.type === "int" ? "1" : "0.01") +
+        '" data-judge-key="' +
         eKey +
         '" value="' +
         escapeHtml(String(currentVal != null ? currentVal : "")) +

@@ -173,6 +173,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "confidence_threshold": "judge_confidence",
         "max_context_ratio": "judge_context_ratio",
         "timeout": "judge_timeout",
+        "parallel_evaluations": "judge_parallel_evaluations",
         "read_only_tools": "judge_read_only_tools",
     },
     "memory": {

@@ -2079,12 +2079,15 @@ implemented in `turnstone/core/judge.py`:
    (approve). First match wins. The heuristic verdict is attached to the
    `approve_request` SSE event immediately.
 
-2. **LLM judge tier** (asynchronous, daemon thread) -- A multi-turn evaluation
-   where the judge LLM receives conversation context and tool call details,
-   optionally uses `read_file`/`list_directory` to gather evidence (with
-   security-hardened path blocking), and produces a structured JSON verdict.
-   If the LLM verdict has higher confidence than the heuristic, it replaces
-   it via an `intent_verdict` SSE event.
+2. **LLM judge tier** (asynchronous daemon coordinator) -- A bounded worker
+   set evaluates independent calls from the batch. Each evaluation receives
+   conversation context and tool-call details, may use `read_file` /
+   `list_directory` to gather evidence (with security-hardened path blocking),
+   and produces a structured JSON verdict. `judge.parallel_evaluations`
+   controls the per-batch width from 1 through 16; the judge alias's model
+   admission gate remains the process-wide ceiling. If an LLM verdict has
+   higher confidence than the heuristic, it replaces it via an
+   `intent_verdict` SSE event.
 
 The main judge is session-scoped (`IntentJudge`) and lazy-initialized on first
 approval; each evaluation carries its own cancellation/generation identity.
@@ -2093,9 +2096,11 @@ Task-agent tool calls use the same intent pipeline in independent
 judge work. Each human-gated batch is joined to its own `ApprovalCycle`, and a
 late verdict must match that cycle's call ID and judge identity before it can
 reach Smart Approvals. Superseded verdicts remain durable audit facts but are
-withheld from live decision caches. Configuration comes from `[judge]` or CLI
-flags; self-consistency, cross-model, and cross-provider bindings all use the
-same `ModelLane`/backend-auth seam. Verdicts persist in `intent_verdicts` with
-the exact user or automatic decision, enabling calibration.
+withheld from live decision caches. Server and console behavior comes from the
+database-backed `judge.*` settings; the interactive CLI reads its flags and
+`config.toml` `[judge]` values. Self-consistency, cross-model, and
+cross-provider bindings all use the same `ModelLane` / backend-auth seam.
+Verdicts persist in `intent_verdicts` with the exact user or automatic
+decision, enabling calibration.
 The console exposes `GET /v1/api/admin/verdicts` for audit queries
 (requires `admin.judge` permission).

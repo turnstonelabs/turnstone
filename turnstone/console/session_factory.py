@@ -80,6 +80,7 @@ def build_console_session_factory(
             confidence_threshold=config_store.get("judge.confidence_threshold"),
             max_context_ratio=config_store.get("judge.max_context_ratio"),
             timeout=config_store.get("judge.timeout"),
+            parallel_evaluations=config_store.get("judge.parallel_evaluations", 1),
             read_only_tools=config_store.get("judge.read_only_tools"),
             output_guard=config_store.get("judge.output_guard"),
             output_guard_budget_seconds=config_store.get("judge.output_guard_budget_seconds"),

@@ -708,6 +708,22 @@ def test_audio_roles_gated_to_openai_sdk_providers() -> None:
     assert '_providerCarriesAudio((md && md.provider) || "openai")' in body
 
 
+def test_judge_integer_settings_render_as_bounded_number_inputs() -> None:
+    """The Judge tab has a custom schema renderer separate from Settings.
+
+    Integer settings must not fall through to its text-input branch: doing so
+    drops the registry's step/min/max affordances for parallel_evaluations.
+    """
+    governance = _CONSOLE_GOVERNANCE_JS.read_text(encoding="utf-8")
+    start = governance.index("function renderJudgeSettings()")
+    end = governance.index("\nfunction saveJudgeSetting(", start)
+    body = governance[start:end]
+    assert 's.type === "float" || s.type === "int"' in body
+    assert '(s.type === "int" ? "1" : "0.01")' in body
+    assert "s.min_value" in body
+    assert "s.max_value" in body
+
+
 # Tile keys that are deliberately NOT ``ModelCapabilities`` fields.
 # ``supports_rerank`` is a registry-level flag read off the model row.
 _NON_DATACLASS_TILES = {"supports_rerank"}
