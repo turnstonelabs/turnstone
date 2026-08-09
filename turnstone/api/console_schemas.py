@@ -1096,7 +1096,9 @@ class UpdateModelDefinitionRequest(BaseModel):
     # The runtime update handler is presence-keyed.  Keep null out of the
     # advertised union because explicit JSON null is refused; clients clear a
     # limit by sending the canonical unlimited value, zero.
-    max_concurrency: ModelMaxConcurrency | SkipJsonSchema[None] = None
+    max_concurrency: ModelMaxConcurrency | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None
+    )
     # SkipJsonSchema drops the null member from the ADVERTISED union while the
     # Python type still tolerates None: the presence-keyed update handler
     # refuses an explicit JSON null, so advertising null would let generated

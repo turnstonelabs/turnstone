@@ -314,6 +314,7 @@ def test_model_max_concurrency_schema_is_strict_non_nullable_integer() -> None:
     assert update_prop["minimum"] == 0
     assert update_prop["maximum"] == 2_147_483_647
     assert "anyOf" not in update_prop
+    assert "default" not in update_prop
 
 
 class TestCheckedInArtifactFreshness:

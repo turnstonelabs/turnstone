@@ -12329,7 +12329,6 @@
             "title": "Context Window"
           },
           "max_concurrency": {
-            "default": null,
             "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
             "maximum": 2147483647,
             "minimum": 0,
