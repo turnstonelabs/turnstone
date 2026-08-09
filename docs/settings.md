@@ -54,6 +54,23 @@ When a per-model override is `NULL` (empty in the UI), the global default is
 used. Switching models via `/model <alias>` re-resolves sampling parameters
 from the new model's overrides or global defaults.
 
+### Per-model concurrency
+
+Each model definition may set `max_concurrency` to limit simultaneous model
+generations for that alias in one Turnstone process. `0` or an omitted value
+means unlimited. The gate is shared by every role using the alias—interactive
+turns, coordinators, task agents, judges, output guards, perception, compaction,
+and title generation—and a streaming generation holds its slot until the
+stream is fully drained or closed.
+
+Admission is strictly per alias. Two aliases remain independent even when they
+point to the same URL; Turnstone does not infer shared capacity from endpoint
+text. Queue time is excluded from judge/output-guard deadline accounting, and
+each retry releases its slot before backoff and reacquires for the next wire
+attempt. The cap is local to each process, not cluster-wide; account for the
+number of nodes targeting the same inference server. Direct STT/TTS protocol
+calls and Cohere/Jina reranking do not currently consume this generation cap.
+
 ### Model backend authentication
 
 Model definitions support four backend credential modes:
@@ -445,6 +462,9 @@ send. Endpoint, provider, backend model ID, capabilities, extra parameters, and
 backend-auth configuration are replaced as one immutable binding. In-flight
 turns, judges, and task agents finish or cancel against the binding they
 started with; an admin edit never tears one request across two definitions.
+The alias's admission gate is retained and resized in place, so a concurrency
+edit preserves in-flight accounting and does not reset cached judges or the
+output-guard rate limiter.
 
 Sampling and other saved workstream configuration remain workstream state. A
 model-definition edit does not silently rewrite a live workstream's chosen

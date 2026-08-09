@@ -979,8 +979,9 @@ def _neutralize_untrusted_fences(text: str) -> str:
 def _neutralize_attachment_part(part: Any) -> Any:
     """Return an attachment part with textual trust-marker forgeries defanged.
 
-    Attachment placeholders are materialized after ordinary message folding,
-    so their text cannot rely on ``fold_system_turns`` for this boundary.  Only
+    Attachment placeholders are materialized after ordinary message folding and
+    before model admission, so their text cannot rely on ``fold_system_turns``
+    for this boundary.  Only
     model-visible text and document strings are inspected; binary image/audio
     data and base64 PDF payloads retain their exact bytes.
     """
@@ -5921,8 +5922,8 @@ class ChatSession:
 
         ``self.messages`` is the canonical ``Turn`` trajectory; lowering it here
         emits by-reference attachments as ``{type: kind, attachment_id}``
-        placeholders.  The provider translator materializes them to inline bytes
-        via :meth:`_resolve_attachments` — resolution lives at the C layer."""
+        placeholders.  ``model_turn`` materializes them to inline wire parts via
+        :meth:`_resolve_attachments` before acquiring the alias admission slot."""
         return self.system_messages + dicts_from_turns(self.messages)
 
     def _resolve_attachments(
@@ -5936,10 +5937,10 @@ class ChatSession:
         """Resolve content-addressed attachment ids to inline wire content parts.
 
         The send-time materialization of the by-reference content lane: handed to
-        the provider translator, which calls it with the placeholder ids it finds
-        and expands each to the inline part the wire needs.  Blobs are
-        batch-fetched from the content-addressed store; a pruned id resolves to
-        nothing and the translator drops its placeholder.
+        ``model_turn``, which calls it with the placeholder ids it finds and
+        expands each to the inline part the wire needs before model admission.
+        Blobs are batch-fetched from the content-addressed store; a pruned id
+        resolves to nothing and the shared materializer drops its placeholder.
 
         Kinds the active model can't ingest natively (pdf without ``supports_pdf``,
         audio without ``supports_audio_input``) are converted client-side here —
@@ -12672,8 +12673,8 @@ class ChatSession:
 
         # A shared workstream may bind a new actor while this daemon is still
         # evaluating later items.  Capture the initiating identity now; the
-        # daemon resolves one token after its initial cancellation check and
-        # reuses it for the whole batch.
+        # daemon carries this resolver into each admitted plant call so token
+        # refresh cannot switch to a successor principal.
         judge_principal = (
             (self._mcp_effective_user_id or "") if principal_id is None else principal_id
         ).strip()
@@ -20594,22 +20595,13 @@ class ChatSession:
         # invocation; the native lane carried here serves the WITHIN-RUN
         # reasoning continuity of the agent's own tool loop.
         same_lane = (lane.alias or "") == (primary_lane.alias or "")
-        # Resolve once per sub-agent run, outside its request retry loop.  A
-        # fail-open ``None`` is an intentional static-client result, not an
-        # invitation for ``model_turn`` to resolve again through the lane's
-        # mutable session-principal callback after a shared-user handoff.
+        # Keep the initiating principal pinned for the whole sub-agent run,
+        # but defer each credential mint until model_turn has acquired this
+        # alias's admission slot.  A long queue can outlive a bearer token;
+        # the principal-bound resolver refreshes at the dispatch boundary
+        # without consulting a later shared-workstream actor.
         cancel_scope.check()
-        try:
-            agent_backend_auth_token = self._model_backend_auth_token_for_principal(
-                lane.alias,
-                lane.backend_auth_config,
-                principal_id=agent_principal,
-            )
-        except Exception:
-            cancel_scope.check()
-            raise
-        cancel_scope.check()
-        lane = dataclasses.replace(lane, backend_auth_resolver=None)
+        lane = self._lane_for_backend_auth_principal(lane, agent_principal)
 
         def _api_call(
             turns: list[Turn],
@@ -20645,7 +20637,6 @@ class ChatSession:
                         or (self.reasoning_effort if same_lane else None),
                         mint=mint,
                         wire_id_map=wire_id_map,
-                        backend_auth_token=agent_backend_auth_token,
                         cancel_ref=cancel_scope.cancel_ref,
                         prepare_wire=lambda wire, serving_lane: self._prepare_lowered_wire_messages(
                             wire,

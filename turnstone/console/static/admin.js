@@ -7525,8 +7525,9 @@ function _renderModels(items) {
       colAlias.appendChild(document.createTextNode(" "));
       colAlias.appendChild(defBadge);
     }
-    // Per-model sampling override indicators
+    // Non-default per-model setting indicators
     const overrides = [];
+    if (m.max_concurrency > 0) overrides.push("limit=" + m.max_concurrency);
     if (m.temperature != null) overrides.push("temp=" + m.temperature);
     if (m.max_tokens != null) overrides.push("max_tok=" + m.max_tokens);
     if (m.reasoning_effort != null)
@@ -7569,10 +7570,10 @@ function _renderModels(items) {
       const ovrSpan = document.createElement("span");
       ovrSpan.className = "model-overrides-hint";
       ovrSpan.textContent = overrides.join(", ");
-      ovrSpan.title = "Per-model overrides (override global defaults)";
+      ovrSpan.title = "Per-model settings";
       ovrSpan.setAttribute(
         "aria-label",
-        "Per-model overrides: " + overrides.join(", "),
+        "Per-model settings: " + overrides.join(", "),
       );
       colAlias.appendChild(document.createElement("br"));
       colAlias.appendChild(ovrSpan);
@@ -7746,6 +7747,7 @@ function showCreateModelModal() {
   document.getElementById("model-api-key").value = "";
   document.getElementById("model-api-key").placeholder = "sk-...";
   document.getElementById("model-ctx-window").value = "0";
+  document.getElementById("model-max-concurrency").value = "0";
   document.getElementById("model-temperature").value = "";
   document.getElementById("model-max-tokens").value = "";
   document.getElementById("model-reasoning-effort").value = "";
@@ -7855,6 +7857,8 @@ function showEditModelModal(definitionId) {
         "\u2022\u2022\u2022 (leave blank to keep existing)";
       document.getElementById("model-ctx-window").value =
         m.context_window != null ? m.context_window : 0;
+      document.getElementById("model-max-concurrency").value =
+        m.max_concurrency != null ? m.max_concurrency : 0;
       document.getElementById("model-temperature").value =
         m.temperature != null ? m.temperature : "";
       document.getElementById("model-max-tokens").value =
@@ -8141,6 +8145,24 @@ function submitCreateModel() {
     capabilities: caps,
     enabled: document.getElementById("model-enabled").checked,
   };
+
+  // Per-alias admission. Empty and zero are the canonical unlimited value;
+  // every other spelling must be an exact non-negative integer.
+  const concurrencyText = document
+    .getElementById("model-max-concurrency")
+    .value.trim();
+  const maxConcurrency = concurrencyText === "" ? 0 : Number(concurrencyText);
+  if (
+    !Number.isInteger(maxConcurrency) ||
+    maxConcurrency < 0 ||
+    maxConcurrency > 2147483647
+  ) {
+    _showModelError(
+      "Max concurrent generations must be a whole number from 0 to 2147483647",
+    );
+    return;
+  }
+  form.max_concurrency = maxConcurrency;
 
   // Per-model sampling overrides — null when empty (use global default)
   const tempVal = document.getElementById("model-temperature").value.trim();

@@ -833,6 +833,7 @@ model_definitions = sa.Table(
     sa.Column("base_url", sa.Text, nullable=False, server_default=""),
     sa.Column("api_key", sa.Text, nullable=False, server_default=""),
     sa.Column("context_window", sa.Integer, nullable=False, server_default="32768"),
+    sa.Column("max_concurrency", sa.Integer, nullable=False, server_default="0"),
     sa.Column("capabilities", sa.Text, nullable=False, server_default="{}"),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("temperature", sa.Float, nullable=True),

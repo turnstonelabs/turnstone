@@ -11880,6 +11880,14 @@
             "title": "Context Window",
             "type": "integer"
           },
+          "max_concurrency": {
+            "default": 0,
+            "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
+            "maximum": 2147483647,
+            "minimum": 0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
           "capabilities": {
             "default": "{}",
             "title": "Capabilities",
@@ -12013,6 +12021,14 @@
           "context_window": {
             "default": 32768,
             "title": "Context Window",
+            "type": "integer"
+          },
+          "max_concurrency": {
+            "default": 0,
+            "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
+            "maximum": 2147483647,
+            "minimum": 0,
+            "title": "Max Concurrency",
             "type": "integer"
           },
           "capabilities": {
@@ -12149,6 +12165,14 @@
           "context_window": {
             "default": 32768,
             "title": "Context Window",
+            "type": "integer"
+          },
+          "max_concurrency": {
+            "default": 0,
+            "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
+            "maximum": 2147483647,
+            "minimum": 0,
+            "title": "Max Concurrency",
             "type": "integer"
           },
           "capabilities": {
@@ -12303,6 +12327,14 @@
             ],
             "default": null,
             "title": "Context Window"
+          },
+          "max_concurrency": {
+            "default": null,
+            "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
+            "maximum": 2147483647,
+            "minimum": 0,
+            "title": "Max Concurrency",
+            "type": "integer"
           },
           "capabilities": {
             "additionalProperties": true,

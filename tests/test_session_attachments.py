@@ -782,15 +782,13 @@ class TestPerceptionFallback:
         )
         assert part["type"] == "text"
         assert "DESCRIPTION" in part["text"]
-        # the perception model was handed the rasterized pages, not the raw
-        # PDF: the wire carries the prompt + a by-reference placeholder, and
-        # the threaded resolver materializes the page parts at the translator.
+        # The perception model was handed the rasterized pages, not the raw
+        # PDF: model_turn expands the by-reference placeholder before taking
+        # admission, then the provider receives inline pages and no resolver.
         sent = prov.create_streaming.call_args.kwargs["messages"][0]["content"]
         assert sent[0]["type"] == "text"
-        assert sent[1]["attachment_id"] == "perception-input"
-        resolver = prov.create_streaming.call_args.kwargs["resolve_attachments"]
-        pages = resolver(["perception-input"])["perception-input"]
-        assert [p["type"] for p in pages] == ["image_url", "image_url"]
+        assert [p["type"] for p in sent[1:]] == ["image_url", "image_url"]
+        assert prov.create_streaming.call_args.kwargs["resolve_attachments"] is None
 
     def test_audio_perception_when_omni_and_no_stt(self, tmp_db, mock_openai_client):
         s = _make_session(mock_openai_client)

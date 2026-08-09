@@ -2640,6 +2640,7 @@ class StorageBackend(Protocol):
         auth_mode: str = "static",
         obo_audience: str = "",
         obo_scopes: str = "",
+        max_concurrency: int = 0,
     ) -> None:
         """Create a model definition. No-op if definition_id already exists."""
         ...

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+from turnstone.core.admission import ModelAdmission
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
 from turnstone.core.providers import LLMProvider, create_client, create_provider
@@ -28,6 +29,12 @@ MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app", "rfc8693_obo"}
 # shared with the console write path's cleaner so the two layers cannot
 # drift into "console stores it, registry refuses to load it".
 MODEL_AUTH_TEXT_MAX_LEN = 2048
+
+# ``model_definitions.max_concurrency`` is an ``INTEGER`` on both supported
+# databases.  Keep the public/config/API bound aligned with PostgreSQL's
+# signed 32-bit representation so a value accepted on SQLite cannot fail when
+# the same definition is moved to PostgreSQL.
+MAX_MODEL_CONCURRENCY = 2_147_483_647
 
 # Derived, never hand-listed (fail-safe defaults): any mode later added to
 # MODEL_AUTH_MODES lands in this set BY CONSTRUCTION unless it is literally
@@ -78,6 +85,10 @@ def _is_dynamic_auth_mode(mode: str) -> bool:
 
 class ModelAuthConfigError(ValueError):
     """A model definition contains unsafe or internally inconsistent auth settings."""
+
+
+class ModelConcurrencyConfigError(ValueError):
+    """A model definition has an invalid per-alias concurrency limit."""
 
 
 class ModelClientConstructionError(ValueError):
@@ -263,6 +274,24 @@ class ModelConfig:
     auth_mode: str = "static"
     obo_audience: str = ""
     obo_scopes: str = ""
+    # Per-process admission limit for this alias.  Zero preserves the
+    # historical unlimited behavior.  Operational admission changes do not
+    # change binding identity, hence ``compare=False``.
+    max_concurrency: int = field(default=0, compare=False)
+
+    def __post_init__(self) -> None:
+        # ``bool`` is an ``int`` subclass, so use exact type equality.  A
+        # permissive coercion here could turn ``true`` into a one-request cap
+        # or a typo into unlimited operation.
+        if (
+            type(self.max_concurrency) is not int
+            or self.max_concurrency < 0
+            or self.max_concurrency > MAX_MODEL_CONCURRENCY
+        ):
+            raise ModelConcurrencyConfigError(
+                f"Model {self.alias!r} max_concurrency must be an integer "
+                f"between 0 and {MAX_MODEL_CONCURRENCY}"
+            )
 
 
 def strip_control_characters(value: str) -> str:
@@ -453,6 +482,10 @@ class ModelRegistry:
         self.task_effort = task_effort
         self._clients: dict[str, Any] = {}
         self._providers: dict[str, LLMProvider] = {}
+        self._admissions = {
+            alias: ModelAdmission(alias, int(getattr(cfg, "max_concurrency", 0)))
+            for alias, cfg in self._models.items()
+        }
         self._client_lock = threading.Lock()
         # Monotone count of completed reload() swaps. A counter, not a field
         # diff: sessions re-resolve on ANY difference at the next send, so an
@@ -536,6 +569,14 @@ class ModelRegistry:
             raise UnknownModelAliasError(alias)
         return self._models[alias]
 
+    def get_admission(self, alias: str) -> ModelAdmission:
+        """Return the stable per-alias admission gate."""
+        with self._client_lock:
+            gate = self._admissions.get(alias)
+            if gate is None:
+                raise UnknownModelAliasError(alias)
+            return gate
+
     def has_alias(self, alias: str) -> bool:
         """Check if *alias* exists in the registry."""
         return alias in self._models
@@ -565,8 +606,8 @@ class ModelRegistry:
 
     def resolve_binding(
         self, alias: str | None = None
-    ) -> tuple[Any, str, ModelConfig, LLMProvider, int]:
-        """Resolve *alias* to ``(client, model_name, config, provider, generation)``.
+    ) -> tuple[Any, str, ModelConfig, LLMProvider, ModelAdmission, int]:
+        """Resolve client, model, config, provider, admission, and generation.
 
         The session bind primitive: everything a rebind commits, read under
         ONE lock acquisition, so a :meth:`reload` landing between separate
@@ -592,7 +633,14 @@ class ModelRegistry:
                 raise
             except ValueError as exc:
                 raise ModelClientConstructionError(str(exc)) from exc
-            return (client, cfg.model, cfg, provider, self._generation)
+            return (
+                client,
+                cfg.model,
+                cfg,
+                provider,
+                self._admissions[alias],
+                self._generation,
+            )
 
     def resolve_agent_alias(self, kind: str) -> str | None:
         """Return the configured alias for a sub-agent ``kind``.
@@ -703,6 +751,20 @@ class ModelRegistry:
             self.agent_model = agent_model
             self.task_model = task_model
             self.task_effort = task_effort
+            # Admission is strictly per alias.  Resize surviving gates in
+            # place so live lanes and new resolutions coordinate through the
+            # same FIFO even when the alias moves to a different endpoint.
+            for alias, cfg in self._models.items():
+                limit = int(getattr(cfg, "max_concurrency", 0))
+                gate = self._admissions.get(alias)
+                if gate is None:
+                    self._admissions[alias] = ModelAdmission(alias, limit)
+                else:
+                    gate.set_limit(limit)
+            # Removed aliases remain as tombstones for this registry's
+            # lifetime.  A stale lane may still hold or queue on that object;
+            # re-adding the alias must reconfigure the same gate rather than
+            # split old and new work across two independent limits.
             # Selective teardown — close + drop only clients whose
             # construction/connection target changed (alias removed, or
             # base_url / api_key / provider / auth_mode differs). Keeps connection
@@ -894,8 +956,9 @@ def load_model_registry(
                     auth_mode=row_auth_mode,
                     obo_audience=row_obo_audience,
                     obo_scopes=row_obo_scopes,
+                    max_concurrency=row.get("max_concurrency", 0),
                 )
-        except ModelAuthConfigError:
+        except (ModelAuthConfigError, ModelConcurrencyConfigError):
             # Configuration errors are authoritative row content, not a
             # transient storage-read failure. Never degrade past them into a
             # config-only registry or provider SDK environment credentials.
@@ -979,6 +1042,7 @@ def load_model_registry(
             auth_mode=entry_auth_mode,
             obo_audience=entry_obo_audience,
             obo_scopes=entry_obo_scopes,
+            max_concurrency=entry.get("max_concurrency", 0),
         )
 
     # 3. Back-compat shim: synthesize a "default" alias from CLI/auto-detected

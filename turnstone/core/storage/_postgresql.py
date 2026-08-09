@@ -5537,6 +5537,7 @@ class PostgreSQLBackend:
         auth_mode: str = "static",
         obo_audience: str = "",
         obo_scopes: str = "",
+        max_concurrency: int = 0,
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -5562,6 +5563,7 @@ class PostgreSQLBackend:
                     auth_mode=auth_mode,
                     obo_audience=obo_audience,
                     obo_scopes=obo_scopes,
+                    max_concurrency=max_concurrency,
                     created_by=created_by,
                     created=now,
                     updated=now,

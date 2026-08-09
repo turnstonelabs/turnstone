@@ -44,6 +44,8 @@
 # provider = "openai"
 # base_url = "http://localhost:8000/v1"
 # context_window = 8192
+# max_concurrency = 1          # Per-process generation cap for this alias; 0 = unlimited.
+#                              # For llama.cpp, start with its usable -np slot count.
 #
 # [models.local.capabilities]
 # supports_vision = false

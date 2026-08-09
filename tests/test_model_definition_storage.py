@@ -33,6 +33,7 @@ class TestModelDefinitionStorage:
         assert m["base_url"] == "https://api.openai.com/v1"
         assert m["api_key"] == "sk-test"
         assert m["context_window"] == 128000
+        assert m["max_concurrency"] == 0
         assert m["capabilities"] == "{}"
         assert m["enabled"] is True
 
@@ -158,6 +159,7 @@ class TestModelDefinitionStorage:
         assert m["base_url"] == ""
         assert m["api_key"] == ""
         assert m["context_window"] == 32768
+        assert m["max_concurrency"] == 0
         assert m["capabilities"] == "{}"
         assert m["enabled"] is True
         assert m["created_by"] == ""
@@ -165,6 +167,23 @@ class TestModelDefinitionStorage:
         assert m["temperature"] is None
         assert m["max_tokens"] is None
         assert m["reasoning_effort"] is None
+
+    def test_create_update_and_list_max_concurrency(self, db: SQLiteBackend) -> None:
+        did = _make_id()
+        db.create_model_definition(
+            definition_id=did,
+            alias="limited",
+            model="gpt-5",
+            max_concurrency=3,
+        )
+        assert db.get_model_definition(did)["max_concurrency"] == 3
+
+        assert db.update_model_definition(did, max_concurrency=1)
+        assert db.get_model_definition_by_alias("limited")["max_concurrency"] == 1
+        assert db.list_model_definitions()[0]["max_concurrency"] == 1
+
+        assert db.update_model_definition(did, max_concurrency=0)
+        assert db.get_model_definition(did)["max_concurrency"] == 0
 
     def test_create_with_sampling_params(self, db: SQLiteBackend) -> None:
         did = _make_id()

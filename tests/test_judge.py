@@ -5,17 +5,23 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
+from turnstone.core.admission import ModelAdmission
 from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
+from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 from turnstone.core.model_registry import ModelConfig
 from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
-from turnstone.core.providers._protocol import ModelCapabilities
+from turnstone.core.providers._protocol import IncompleteStreamError, ModelCapabilities
 from turnstone.core.trajectory import Role
+
+if TYPE_CHECKING:
+    import pytest
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -412,33 +418,140 @@ class TestCancelEventSemantics:
         assert all(v.tier == "llm" for v in results)
         assert provider.create_streaming.call_count == 3
 
-    def test_batch_backend_auth_resolves_once_and_reuses_token(self):
-        """One judge batch owns one delegated credential snapshot."""
+    def test_queued_backend_auth_resolves_after_admission_per_attempt(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A queued judge never ages and reuses a pre-admission token."""
+        monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
         provider = _make_mock_provider(_good_verdict_json())
+        provider.retryable_error_names = frozenset({"IncompleteStreamError"})
+
+        def _incomplete_stream() -> Any:
+            yield from ()
+            raise IncompleteStreamError("retry after admission")
+
+        provider.create_streaming.side_effect = [
+            _incomplete_stream(),
+            as_stream(_mock_result(_good_verdict_json())),
+        ]
         judge = _make_judge(provider)
+        admission = ModelAdmission("judge", 1)
+        auth_config = MagicMock(name="pinned-auth-config")
+        judge._lane = replace(
+            judge._lane,
+            alias="judge",
+            admission=admission,
+            backend_auth_config=auth_config,
+        )
+
         batch_client = MagicMock()
-        bound_client = object()
-        batch_client.with_options.return_value = bound_client
+        batch_client.with_options.side_effect = lambda *, api_key: f"client:{api_key}"
         judge._create_client = MagicMock(return_value=batch_client)  # type: ignore[method-assign]
-        resolver = MagicMock(return_value="user-a-token")
+
+        token_epoch = "stale"
+        resolutions: list[tuple[str, Any, str]] = []
+
+        def _resolve(alias: str, config: ModelConfig | None) -> str:
+            token = f"{token_epoch}-{len(resolutions) + 1}"
+            resolutions.append((alias, config, token))
+            return token
+
         results: list[IntentVerdict] = []
-        items = [_make_item(call_id=f"tc_{i}") for i in range(2)]
+        done = threading.Event()
+        holder = admission.acquire()
 
         judge.evaluate(
-            items,
+            [_make_item()],
             [{"role": "user", "content": "test"}],
             results.append,
-            backend_auth_resolver=resolver,
+            done_callback=done.set,
+            backend_auth_resolver=_resolve,
         )
-        _wait_for(results, 2)
 
-        resolver.assert_called_once_with("", None)
+        deadline = time.monotonic() + 2.0
+        while admission.snapshot().queued != 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        queued = admission.snapshot().queued == 1
+        resolutions_while_queued = list(resolutions)
+        token_epoch = "fresh"
+        holder.release()
+
+        assert done.wait(5.0)
+        assert queued
+        assert resolutions_while_queued == []
+        assert resolutions == [
+            ("judge", auth_config, "fresh-1"),
+            ("judge", auth_config, "fresh-2"),
+        ]
         assert batch_client.with_options.call_count == 2
-        assert all(
-            call.kwargs["client"] is bound_client
-            for call in provider.create_streaming.call_args_list
+        assert [call.kwargs["api_key"] for call in batch_client.with_options.call_args_list] == [
+            "fresh-1",
+            "fresh-2",
+        ]
+        assert [call.kwargs["client"] for call in provider.create_streaming.call_args_list] == [
+            "client:fresh-1",
+            "client:fresh-2",
+        ]
+        assert len(results) == 1
+        assert results[0].tier == "llm"
+
+    def test_lazy_auth_failure_falls_back_remaining_batch_without_dispatch(self, caplog) -> None:
+        """A fail-closed mint after admission aborts the whole judge batch."""
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        admission = ModelAdmission("judge", 1)
+        auth_config = MagicMock(name="pinned-auth-config")
+        judge._lane = replace(
+            judge._lane,
+            alias="judge",
+            admission=admission,
+            backend_auth_config=auth_config,
         )
-        assert [verdict.call_id for verdict in results] == ["tc_0", "tc_1"]
+
+        batch_client = MagicMock()
+        judge._create_client = MagicMock(return_value=batch_client)  # type: ignore[method-assign]
+        resolver = MagicMock(side_effect=BackendAuthUnavailableError("mint unavailable"))
+        items = [_make_item(call_id=f"tc_{i}") for i in range(3)]
+        results: list[IntentVerdict] = []
+        done = threading.Event()
+        holder = admission.acquire()
+
+        with caplog.at_level("ERROR", logger="turnstone.core.judge"):
+            judge.evaluate(
+                items,
+                [{"role": "user", "content": "test"}],
+                results.append,
+                done_callback=done.set,
+                backend_auth_resolver=resolver,
+            )
+
+            deadline = time.monotonic() + 2.0
+            while admission.snapshot().queued != 1 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            queued = admission.snapshot().queued == 1
+            resolutions_while_queued = resolver.call_count
+            holder.release()
+            finished = done.wait(5.0)
+
+        assert queued
+        assert resolutions_while_queued == 0
+        assert finished
+        resolver.assert_called_once_with("judge", auth_config)
+        batch_client.with_options.assert_not_called()
+        provider.create_streaming.assert_not_called()
+        assert admission.snapshot().in_flight == 0
+        assert [verdict.call_id for verdict in results] == ["tc_0", "tc_1", "tc_2"]
+        assert all(verdict.tier == "llm_fallback" for verdict in results)
+        assert all(
+            "judge backend authentication failed" in verdict.reasoning for verdict in results
+        )
+        auth_logs = [
+            record
+            for record in caplog.records
+            if "Judge backend authentication failed" in record.getMessage()
+        ]
+        assert len(auth_logs) == 1
 
     def test_cancelled_batch_skips_backend_auth_resolution(self):
         """The daemon checks cancellation before doing a credential mint."""

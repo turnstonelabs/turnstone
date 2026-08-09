@@ -4484,6 +4484,7 @@ def internal_model_reload(request: Request) -> JSONResponse:
     from turnstone.core.model_registry import (
         DynamicAuthKeyError,
         ModelAuthConfigError,
+        ModelConcurrencyConfigError,
         load_model_registry,
     )
     from turnstone.core.storage._registry import get_storage
@@ -4503,10 +4504,10 @@ def internal_model_reload(request: Request) -> JSONResponse:
             provider=cli_args["provider"],
             storage=storage,
         )
-    except ModelAuthConfigError as exc:
-        # A row whose auth fields violate _normalize_auth_mode, reachable via
-        # direct SQL, a migration mishap, or console version skew (console
-        # writes are validated). The loader deliberately propagates it; this
+    except (ModelAuthConfigError, ModelConcurrencyConfigError) as exc:
+        # A row whose auth or concurrency fields violate registry validation,
+        # reachable via direct SQL, a migration mishap, or console version skew
+        # (console writes are validated). The loader deliberately propagates it; this
         # arm keeps the node from answering a bare 500 where the console's
         # refresh path catches the same row. Same structured 422 contract as
         # the bad-arguments arm below: the reason names the row and field.
@@ -4530,8 +4531,12 @@ def internal_model_reload(request: Request) -> JSONResponse:
 
     # No-op fast path: skip reload when nothing changed (avoids client churn
     # on broadcast model-reloads where this node has no pending changes).
+    admission_unchanged = {
+        alias: cfg.max_concurrency for alias, cfg in new_registry.models.items()
+    } == {alias: cfg.max_concurrency for alias, cfg in registry.models.items()}
     unchanged = (
         new_registry.models == registry.models
+        and admission_unchanged
         and new_registry.fallback == registry.fallback
         and new_registry.agent_model == registry.agent_model
         and eff_default == registry.default
@@ -4624,6 +4629,7 @@ def internal_model_status(request: Request) -> JSONResponse:
             "provider": cfg.provider,
             "source": cfg.source,
             "context_window": cfg.context_window,
+            "max_concurrency": cfg.max_concurrency,
             "enabled": True,
             "temperature": cfg.temperature,
             "max_tokens": cfg.max_tokens,

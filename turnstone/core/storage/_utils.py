@@ -682,6 +682,7 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "base_url",
         "api_key",
         "context_window",
+        "max_concurrency",
         "capabilities",
         "enabled",
         "temperature",

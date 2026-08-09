@@ -12,6 +12,8 @@ import ast
 import inspect
 import logging
 import textwrap
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -39,7 +41,7 @@ from turnstone.core.providers._protocol import (
     serialized_tool_chars,
 )
 from turnstone.core.session import ChatSession
-from turnstone.core.trajectory import Role, ToolCall, Turn
+from turnstone.core.trajectory import AttachmentRef, Role, ToolCall, Turn
 
 
 class _FakeProvider:
@@ -228,6 +230,230 @@ def test_resolve_model_binding_canonicalizes_empty_alias_to_default() -> None:
     assert binding.lane.client is client
     assert binding.config is cfg
     assert binding.registry_generation == 7
+
+
+def test_model_turn_materializes_before_admission_and_mints_inside_hold() -> None:
+    order: list[str] = []
+
+    class _Gate:
+        held = False
+
+        def acquire(self, *, cancel_ref: Any = None) -> Any:
+            del cancel_ref
+            order.append("acquire")
+            gate = self
+
+            class _Lease:
+                def __enter__(self) -> None:
+                    gate.held = True
+                    order.append("enter")
+
+                def __exit__(self, *_exc: object) -> None:
+                    gate.held = False
+                    order.append("release")
+
+            return _Lease()
+
+    gate = _Gate()
+    bound_client = object()
+    base_client = MagicMock()
+    base_client.with_options.return_value = bound_client
+
+    def _resolve(ids: list[str]) -> dict[str, Any]:
+        assert ids == ["image-1"]
+        assert not gate.held
+        order.append("materialize")
+        return {
+            "image-1": {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+            }
+        }
+
+    def _auth(_alias: str, _cfg: Any) -> str:
+        assert gate.held
+        order.append("auth")
+        return "minted-token"
+
+    class _Provider(_FakeProvider):
+        def create_streaming(self, **kwargs: Any) -> Any:
+            assert gate.held
+            assert kwargs["client"] is bound_client
+            assert kwargs["resolve_attachments"] is None
+            order.append("dispatch")
+            self.calls.append(kwargs)
+
+            def _stream() -> Any:
+                assert gate.held
+                order.append("drain")
+                yield from as_stream(CompletionResult(content="ok"))
+
+            return _stream()
+
+    provider = _Provider([])
+    lane = ModelLane(
+        provider=provider,
+        client=base_client,
+        model="m",
+        alias="primary",
+        backend_auth_resolver=_auth,
+        admission=gate,  # type: ignore[arg-type]
+    )
+    turn = Turn(Role.USER, (AttachmentRef(attachment_id="image-1", kind="image"),))
+
+    result = model_turn(lane, [turn], resolve_attachments=_resolve)
+
+    assert result.content == "ok"
+    assert order == ["materialize", "acquire", "enter", "auth", "dispatch", "drain", "release"]
+    assert result.wire_msgs == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc"},
+                }
+            ],
+        }
+    ]
+
+
+def test_model_turn_releases_admission_before_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from turnstone.core.deadline import StreamAbortRef
+
+    order: list[str] = []
+
+    class _Gate:
+        held = False
+        acquire_calls = 0
+
+        def acquire(self, *, cancel_ref: Any = None) -> Any:
+            del cancel_ref
+            self.acquire_calls += 1
+            gate = self
+
+            class _Lease:
+                def __enter__(self) -> None:
+                    assert not gate.held
+                    gate.held = True
+                    order.append("enter")
+
+                def __exit__(self, *_exc: object) -> None:
+                    gate.held = False
+                    order.append("release")
+
+            return _Lease()
+
+    gate = _Gate()
+    provider = _FlakyProvider([IncompleteStreamError("retry"), CompletionResult(content="ok")])
+    dispatch = provider.create_streaming
+
+    def _dispatch(**kwargs: Any) -> Any:
+        assert gate.held
+        order.append("dispatch")
+        return dispatch(**kwargs)
+
+    provider.create_streaming = _dispatch  # type: ignore[method-assign]
+
+    def _sleep(_delay: float) -> None:
+        assert not gate.held
+        order.append("backoff")
+
+    monkeypatch.setattr(model_turn_mod, "time", SimpleNamespace(sleep=_sleep))
+    lane = ModelLane(
+        provider=provider,
+        client=object(),
+        model="m",
+        admission=gate,  # type: ignore[arg-type]
+    )
+    ref = StreamAbortRef()
+
+    result = model_turn(lane, [Turn.user("x")], cancel_ref=ref)
+
+    assert result.content == "ok"
+    assert gate.acquire_calls == 2
+    assert ref.dispatch_count == 2
+    assert order == ["enter", "dispatch", "release", "backoff", "enter", "dispatch", "release"]
+
+
+def test_same_alias_attachment_work_completes_before_outer_admission() -> None:
+    from turnstone.core.admission import ModelAdmission
+
+    gate = ModelAdmission("primary", 1)
+    nested_completed = False
+
+    def _resolve(ids: list[str]) -> dict[str, Any]:
+        nonlocal nested_completed
+        assert ids == ["image-1"]
+        # Models a nested perception call using the same alias.  This would
+        # block forever if the outer model_turn had already taken the slot.
+        with gate.acquire():
+            nested_completed = True
+        return {"image-1": {"type": "image_url", "image_url": {"url": "data:x"}}}
+
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    lane = ModelLane(provider=provider, client=object(), model="m", admission=gate)
+    turn = Turn(Role.USER, (AttachmentRef(attachment_id="image-1", kind="image"),))
+
+    assert model_turn(lane, [turn], resolve_attachments=_resolve).content == "ok"
+    assert nested_completed
+    assert gate.snapshot().in_flight == 0
+
+
+def test_model_turn_releases_admission_when_eager_create_fails() -> None:
+    from turnstone.core.admission import ModelAdmission
+
+    class _CreateFailureProvider(_FakeProvider):
+        def create_streaming(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            raise RuntimeError("connect failed")
+
+    gate = ModelAdmission("primary", 1)
+    provider = _CreateFailureProvider([])
+    lane = ModelLane(provider=provider, client=object(), model="m", admission=gate)
+
+    with pytest.raises(RuntimeError, match="connect failed"):
+        model_turn(lane, [Turn.user("x")])
+
+    assert len(provider.calls) == 1
+    assert gate.snapshot().in_flight == 0
+
+
+def test_model_turn_cancelled_while_queued_never_dispatches() -> None:
+    from turnstone.core.admission import ModelAdmission
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+
+    gate = ModelAdmission("primary", 1)
+    holder = gate.acquire()
+    provider = _FakeProvider([CompletionResult(content="never")])
+    lane = ModelLane(provider=provider, client=object(), model="m", admission=gate)
+    cancel_ref = StreamAbortRef()
+    errors: list[BaseException] = []
+
+    def _call() -> None:
+        try:
+            model_turn(lane, [Turn.user("x")], cancel_ref=cancel_ref)
+        except BaseException as exc:  # test records the worker's exact exit
+            errors.append(exc)
+
+    thread = threading.Thread(target=_call, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while gate.snapshot().queued != 1:
+        if time.monotonic() >= deadline:
+            holder.release()
+            raise AssertionError("model turn did not queue")
+        time.sleep(0.005)
+    cancel_ref.abort()
+    thread.join(1.0)
+    holder.release()
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], DeadlineCancelledError)
+    assert provider.calls == []
 
 
 class _FlakyProvider:

@@ -16,6 +16,8 @@ import pytest
 from turnstone.core.deadline import (
     DeadlineCancelledError,
     DeadlineExceededError,
+    StreamAbortRef,
+    run_abortable_with_deadline,
     run_with_deadline,
 )
 
@@ -109,6 +111,70 @@ def test_on_abandon_errors_do_not_mask_the_deadline_error() -> None:
             thread_name="dl-abandon-e",
             on_abandon=_boom,
         )
+
+
+def test_abortable_deadline_credits_only_active_admission_wait() -> None:
+    def _work(ref: StreamAbortRef) -> str:
+        ref.begin_admission_wait()
+        time.sleep(0.12)
+        ref.end_admission_wait()
+        time.sleep(0.02)
+        return "ok"
+
+    start = time.monotonic()
+    assert (
+        run_abortable_with_deadline(
+            _work,
+            timeout=0.05,
+            poll=0.005,
+            thread_name="dl-admission-credit",
+        )
+        == "ok"
+    )
+    assert time.monotonic() - start >= 0.12
+
+
+def test_provider_time_still_expires_after_admission_credit() -> None:
+    provider_started = threading.Event()
+
+    def _work(ref: StreamAbortRef) -> None:
+        ref.begin_admission_wait()
+        time.sleep(0.08)
+        ref.end_admission_wait()
+        provider_started.set()
+        time.sleep(1.0)
+
+    with pytest.raises(DeadlineExceededError):
+        run_abortable_with_deadline(
+            _work,
+            timeout=0.05,
+            poll=0.005,
+            thread_name="dl-provider-after-admission",
+        )
+
+    # The admission interval was credited (the call reached provider work),
+    # but that work consumed the unchanged logical deadline and timed out.
+    assert provider_started.is_set()
+
+
+def test_dispatch_marker_is_observability_not_a_clock_reset() -> None:
+    captured: list[StreamAbortRef] = []
+
+    def _work(ref: StreamAbortRef) -> None:
+        captured.append(ref)
+        time.sleep(0.06)
+        ref.mark_dispatch()
+        time.sleep(0.08)
+
+    with pytest.raises(DeadlineExceededError):
+        run_abortable_with_deadline(
+            _work,
+            timeout=0.1,
+            poll=0.005,
+            thread_name="dl-dispatch-marker",
+        )
+    assert captured[0].dispatch_count == 1
+    assert captured[0].last_dispatch_at is not None
 
 
 class TestStreamAbortRef:

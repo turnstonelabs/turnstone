@@ -64,6 +64,7 @@ from turnstone.core.metacognition import field_str, sanitize_display
 from turnstone.core.model_registry import (
     APP_IDENTITY_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
+    MAX_MODEL_CONCURRENCY,
     MODEL_AUTH_MODE_PROFILES,
     MODEL_AUTH_TEXT_MAX_LEN,
     SCOPES_MODEL_AUTH_MODES,
@@ -11964,10 +11965,12 @@ def _oidc_configured_for_model_auth(request: Request) -> bool:
 # "changing this column can neither redirect where a minted credential is
 # sent nor re-arm minting that a disable or revocation stopped": the four
 # sampling/shaping knobs hit the same endpoint with the same credential,
-# and the two reasoning toggles only select what history surfaces.
+# the admission knob only limits callers of that alias, and the two reasoning
+# toggles only select what history surfaces.
 MODEL_AUTH_NEUTRAL_FIELDS = frozenset(
     {
         "context_window",
+        "max_concurrency",
         "temperature",
         "max_tokens",
         "reasoning_effort",
@@ -11975,6 +11978,26 @@ MODEL_AUTH_NEUTRAL_FIELDS = frozenset(
         "replay_reasoning_to_model",
     }
 )
+
+
+def _parse_model_max_concurrency(raw: Any) -> tuple[int, JSONResponse | None]:
+    """Parse the strict model-definition concurrency scalar.
+
+    JSON booleans are integer subclasses in Python, so exact type equality is
+    load-bearing.  Strings and integral floats are also refused rather than
+    silently normalized into a materially different admission policy.
+    """
+    if type(raw) is not int or raw < 0 or raw > MAX_MODEL_CONCURRENCY:
+        return 0, JSONResponse(
+            {
+                "error": (
+                    f"max_concurrency must be an integer between 0 and {MAX_MODEL_CONCURRENCY}"
+                )
+            },
+            status_code=400,
+        )
+    return raw, None
+
 
 # The two cross-field refusal messages, shared verbatim by the create and
 # update twins (their guard CONDITIONS differ — raw body vs post-merge pair —
@@ -12728,6 +12751,7 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
                 "base_url": "",
                 "api_key": "",
                 "context_window": nm.get("context_window", 0),
+                "max_concurrency": nm.get("max_concurrency", 0),
                 "capabilities": "{}",
                 "enabled": True,
                 "temperature": nm.get("temperature"),
@@ -12875,6 +12899,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     if isinstance(ctx_raw, float) and not math.isfinite(ctx_raw):
         return JSONResponse({"error": "context_window must be a finite number"}, status_code=400)
     context_window = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
+    max_concurrency, concurrency_err = _parse_model_max_concurrency(body.get("max_concurrency", 0))
+    if concurrency_err is not None:
+        return concurrency_err
     caps = body.get("capabilities", {})
     if not isinstance(caps, dict):
         # Mirror of the update twin's refusal: coercing a null or the STRING
@@ -12977,6 +13004,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         base_url=base_url,
         api_key=api_key,
         context_window=context_window,
+        max_concurrency=max_concurrency,
         capabilities=capabilities,
         enabled=enabled,
         created_by=audit_uid,
@@ -13120,6 +13148,11 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
                 {"error": "context_window must be a finite number"}, status_code=400
             )
         updates["context_window"] = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
+    if "max_concurrency" in body:
+        max_concurrency, concurrency_err = _parse_model_max_concurrency(body["max_concurrency"])
+        if concurrency_err is not None:
+            return concurrency_err
+        updates["max_concurrency"] = max_concurrency
     if "capabilities" in body:
         caps = body["capabilities"]
         if not isinstance(caps, dict):

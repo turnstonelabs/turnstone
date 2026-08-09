@@ -10057,6 +10057,75 @@ def test_task_agent_static_auth_fallback_never_reresolves_as_successor():
     lane.client.with_options.assert_not_called()
 
 
+def test_task_agent_defers_pinned_auth_resolution_until_model_admission():
+    """A child mints for its initiating user only after admission."""
+    from dataclasses import replace
+
+    from turnstone.core.admission import ModelAdmission
+    from turnstone.core.model_turn import model_turn as real_model_turn
+
+    session = _make_session()
+    session._acting_user_id = "user-b"
+    provider = seam_provider("done", provider_name="openai-compatible")
+    lane = replace_session_lane(session, provider=provider, alias="task-gateway")
+    auth_config = MagicMock(name="pinned-auth-config")
+    gate = ModelAdmission("task-gateway", 1)
+    stale_live_resolver = MagicMock(return_value="token-for-user-b")
+    lane = replace(
+        lane,
+        backend_auth_resolver=stale_live_resolver,
+        backend_auth_config=auth_config,
+        admission=gate,
+    )
+    session._model_binding = replace(session._model_binding, lane=lane)
+    bound_client = object()
+    lane.client.with_options.return_value = bound_client
+    mint_in_flight: list[int] = []
+
+    def _resolve_for_principal(alias, config, *, principal_id):
+        assert alias == "task-gateway"
+        assert config is auth_config
+        assert session._acting_user_id == "user-b"
+        assert principal_id == "user-a"
+        mint_in_flight.append(gate.snapshot().in_flight)
+        return "token-for-user-a"
+
+    pinned_resolver = MagicMock(side_effect=_resolve_for_principal)
+    session._model_backend_auth_token_for_principal = pinned_resolver
+    stream = provider.create_streaming.return_value
+
+    def _dispatch(**kwargs):
+        assert gate.snapshot().in_flight == 1
+        assert kwargs["client"] is bound_client
+        return stream
+
+    provider.create_streaming.side_effect = _dispatch
+
+    with patch("turnstone.core.session.model_turn", wraps=real_model_turn) as plant_call:
+        result = session._run_agent(
+            [Turn.user("finish the task")],
+            tools=[],
+            auto_tools=set(),
+            principal_id="user-a",
+        )
+
+    assert result == "done"
+    assert plant_call.call_count == 1
+    called_lane = plant_call.call_args.args[0]
+    assert called_lane.admission is gate
+    assert called_lane.backend_auth_resolver is not None
+    assert "backend_auth_token" not in plant_call.call_args.kwargs
+    pinned_resolver.assert_called_once_with(
+        lane.alias,
+        auth_config,
+        principal_id="user-a",
+    )
+    stale_live_resolver.assert_not_called()
+    lane.client.with_options.assert_called_once_with(api_key="token-for-user-a")
+    assert mint_in_flight == [1]
+    assert gate.snapshot().in_flight == 0
+
+
 def test_already_cancelled_task_agent_does_not_resolve_backend_auth():
     from turnstone.core.session import GenerationCancelled
 

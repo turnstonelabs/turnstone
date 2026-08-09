@@ -10,6 +10,7 @@ participant "SessionManager" as Manager
 participant "ChatSession" as Session
 participant "SessionUIBase" as UI
 participant "model_turn()\n+ lowering" as Plant
+participant "ModelAdmission\n(per alias)" as Admission
 participant "LLM provider" as Provider
 participant "Tool workers" as Tools
 database "StorageBackend\n(SQLite / PostgreSQL)" as Storage
@@ -54,6 +55,9 @@ loop until final answer and no queued input
   Session -> Plant : model_turn(active ModelLane, Turns,\n tools, cancel_ref, on_chunk)
   activate Plant
   Plant -> Plant : canonical Turns → provider wire\nrestore ids + repair + lane-specific fold
+  Plant -> Plant : materialize attachment refs\n(nested perception before outer slot)
+  Plant -> Admission : acquire(cancel_ref)
+  activate Admission
   Plant -> Plant : resolve per-call backend credential\nfrom lane's pinned ModelConfig
   Plant -> Provider : create_streaming(...)
   activate Provider
@@ -68,6 +72,8 @@ loop until final answer and no queued input
   Provider --> Plant : finish + usage + native blocks
   deactivate Provider
   Plant -> Plant : drain + re-ingest assistant Turn\nwith serving-lane provenance
+  Plant -> Admission : release before retry backoff
+  deactivate Admission
   Plant --> Session : ModelTurnResult
   deactivate Plant
 

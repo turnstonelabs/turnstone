@@ -25,6 +25,7 @@ from turnstone.core.deadline import (
     run_abortable_with_deadline,
 )
 from turnstone.core.log import get_logger
+from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 from turnstone.core.model_registry import ModelClientConstructionError
 from turnstone.core.model_turn import (
     ModelLane,
@@ -1318,9 +1319,10 @@ class IntentJudge:
                 live set (parallel task agents each spawn a generation;
                 ``close()`` aborts whatever is still live).
             backend_auth_resolver: Batch-scoped resolver whose closure pins
-                the initiating principal.  It is invoked once by the daemon,
-                after its initial cancellation check, and the resulting token
-                is reused for every item and evidence turn in this batch.
+                the initiating principal.  The resolver remains on the
+                batch's lane so each plant-call attempt mints after acquiring
+                alias admission.  The mint cache keeps this inexpensive while
+                preventing a queued bearer from expiring before dispatch.
 
         Returns:
             List of heuristic verdicts (one per item), available immediately.
@@ -1398,28 +1400,17 @@ class IntentJudge:
                 )
                 return
 
-            # Resolve delegated credentials exactly once for the batch.  The
-            # caller-supplied closure has already captured the initiating
-            # principal, so a later shared-workstream handoff cannot mint a
-            # successor user's token for this payload.
-            backend_auth_token: str | None = None
+            # Preserve the caller-pinned principal on the batch lane, but let
+            # model_turn resolve credentials only after alias admission.  An
+            # admission backlog can outlive a bearer token; carrying the
+            # resolver refreshes near-expiry tokens at the dispatch boundary
+            # without allowing a later shared-workstream actor to take over.
             batch_lane = self._lane
             if backend_auth_resolver is not None:
-                try:
-                    backend_auth_token = backend_auth_resolver(
-                        self._lane.alias,
-                        self._lane.backend_auth_config,
-                    )
-                except Exception:
-                    log.exception("Judge backend authentication failed")
-                    self._deliver_fallbacks(
-                        items,
-                        heuristic_verdicts,
-                        callback,
-                        "judge backend authentication failed",
-                    )
-                    return
-                batch_lane = replace(batch_lane, backend_auth_resolver=None)
+                batch_lane = replace(
+                    batch_lane,
+                    backend_auth_resolver=backend_auth_resolver,
+                )
 
             if cancel_event and cancel_event.is_set():
                 self._deliver_fallbacks(
@@ -1434,7 +1425,8 @@ class IntentJudge:
             # One lane derivative for the whole batch: only the judge-owned
             # fresh client differs from the immutable constructor binding.
             # Every item and evidence turn therefore stays on one provider,
-            # model, capability, config, and credential snapshot.
+            # model, capability, auth-config, and initiating-principal
+            # binding while credentials refresh per admitted attempt.
             batch_lane = replace(batch_lane, client=client)
             for idx, (item, h_verdict) in enumerate(zip(items, heuristic_verdicts, strict=True)):
                 if cancel_event and cancel_event.is_set():
@@ -1453,7 +1445,6 @@ class IntentJudge:
                         cancel_event,
                         client,
                         lane=batch_lane,
-                        backend_auth_token=backend_auth_token,
                     )
                     if llm_verdict:
                         log.info(
@@ -1497,6 +1488,15 @@ class IntentJudge:
                             "judge cancelled before evaluating this call",
                         )
                         return
+                except BackendAuthUnavailableError:
+                    log.exception("Judge backend authentication failed")
+                    self._deliver_fallbacks(
+                        items[idx:],
+                        heuristic_verdicts[idx:],
+                        callback,
+                        "judge backend authentication failed",
+                    )
+                    return
                 except Exception:
                     log.exception(
                         "Judge evaluation failed for %s",
@@ -1549,7 +1549,6 @@ class IntentJudge:
         client: Any | None,
         *,
         lane: ModelLane | None = None,
-        backend_auth_token: str | None = None,
     ) -> IntentVerdict | None:
         """Run LLM judge for a single tool call. Returns verdict or None."""
         if lane is None:
@@ -1654,7 +1653,6 @@ class IntentJudge:
                         tools=_tools,
                         max_tokens=2048,
                         cancel_ref=ref,
-                        backend_auth_token=backend_auth_token,
                     )
 
                 result = run_abortable_with_deadline(
@@ -1681,6 +1679,8 @@ class IntentJudge:
                         log.info("judge.verdict.from_partial", turn=turn + 1)
                         return verdict
                 return None
+            except BackendAuthUnavailableError:
+                raise
             except Exception as e:
                 log.info("judge.turn.failed", turn=turn + 1, error=str(e))
                 return None

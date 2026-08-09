@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
 
@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002
 
 from turnstone.api.server_schemas import CreateWorkstreamRequest, CreateWorkstreamResponse
+from turnstone.core.model_registry import MAX_MODEL_CONCURRENCY
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 
@@ -1002,6 +1003,18 @@ class RegistryInstallRequest(BaseModel):
 # Admin: Model Definitions
 # ---------------------------------------------------------------------------
 
+ModelMaxConcurrency: TypeAlias = Annotated[
+    int,
+    Field(
+        strict=True,
+        ge=0,
+        le=MAX_MODEL_CONCURRENCY,
+        description=(
+            "Maximum concurrent model generations for this alias in one process; zero means unlimited."
+        ),
+    ),
+]
+
 
 class ModelDefinitionInfo(BaseModel):
     definition_id: str
@@ -1011,6 +1024,7 @@ class ModelDefinitionInfo(BaseModel):
     base_url: str = ""
     api_key: str = ""
     context_window: int = 32768
+    max_concurrency: ModelMaxConcurrency = 0
     capabilities: str = "{}"
     enabled: bool = True
     temperature: float | None = None
@@ -1059,6 +1073,7 @@ class CreateModelDefinitionRequest(BaseModel):
     base_url: str = ""
     api_key: str = ""
     context_window: int = 32768
+    max_concurrency: ModelMaxConcurrency = 0
     capabilities: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
     temperature: float | None = None
@@ -1078,6 +1093,10 @@ class UpdateModelDefinitionRequest(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     context_window: int | None = None
+    # The runtime update handler is presence-keyed.  Keep null out of the
+    # advertised union because explicit JSON null is refused; clients clear a
+    # limit by sending the canonical unlimited value, zero.
+    max_concurrency: ModelMaxConcurrency | SkipJsonSchema[None] = None
     # SkipJsonSchema drops the null member from the ADVERTISED union while the
     # Python type still tolerates None: the presence-keyed update handler
     # refuses an explicit JSON null, so advertising null would let generated

@@ -455,7 +455,10 @@ configuration editor.
 The **Channels** tab links users to either a Discord or Slack account
 via a per-row channel-type selector. The **Models** tab is a CRUD
 editor for `model_definitions`, including static and dynamic backend-auth
-modes. Model edits rebind existing workstreams at their next send while
+modes and a per-process **Max concurrent generations** limit for each alias
+(`0` means unlimited). The limit is shared by every model-backed role using
+that alias and a streaming generation holds its slot through the full decode.
+Model edits rebind existing workstreams at their next send while
 in-flight requests keep their original definition snapshot; see
 [Settings](settings.md#model-definition-reloads) for the full contract. The **Nodes** tab edits per-node
 metadata, and the **TLS** tab manages CA and leaf certificates for the

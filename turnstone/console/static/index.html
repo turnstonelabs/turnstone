@@ -1695,6 +1695,23 @@
                   />
                 </div>
               </div>
+              <div class="field-pair">
+                <div>
+                  <label for="model-max-concurrency"
+                    >Max concurrent generations
+                    <span class="label-hint">0 = unlimited</span></label
+                  >
+                  <input
+                    type="number"
+                    id="model-max-concurrency"
+                    value="0"
+                    min="0"
+                    max="2147483647"
+                    step="1"
+                    title="Per-process limit for model generations using this alias"
+                  />
+                </div>
+              </div>
               <!-- Hidden outright on a deployment that cannot mint any dynamic
                    credential and whose row is not already using one; same
                    treatment the Roles sub-tab gets when its scope is missing. -->

@@ -12,7 +12,7 @@ Field set and rationale: ``docs/design/canonical-trajectory-ideal-target.md`` §
 NOTE: non-text content rides as ``AttachmentRef`` — a reference to a content-addressed
 blob in ``workstream_attachments``.  ``Turn``s never carry bytes, and the dict bridge
 carries only the ``{type: kind, attachment_id}`` placeholder.  Each output boundary (the
-provider translator, the ``/history`` display, export) materializes the placeholder to an
+model-dispatch path, the ``/history`` display, export) materializes the placeholder to an
 inline part by point-lookup against the blob store, via :func:`resolve_attachment_parts`.
 """
 
@@ -68,9 +68,9 @@ class TextBlock:
 class AttachmentRef:
     """A reference to attachment bytes held in the content-addressed blob store.
 
-    Non-text content is carried *by reference* (never inline bytes): the translator
-    resolves ``attachment_id`` to bytes and expands it to the provider's native
-    format at wire time.  ``kind`` is the by-reference placeholder type —
+    Non-text content is carried *by reference* (never inline bytes): the model-dispatch
+    path resolves ``attachment_id`` to bytes and expands it to the provider-neutral
+    inline wire part before provider admission.  ``kind`` is the placeholder type —
     ``"image"``, ``"document"`` (text docs), ``"pdf"``, or ``"audio"``.  The
     dict-bridge keys off ``attachment_id`` and is kind-agnostic, so new kinds
     need no change here.
@@ -437,10 +437,10 @@ def resolve_attachment_parts(
     ``{type: kind, attachment_id}`` placeholders in a message's list content;
     *parts_by_id* maps an id to its inline content part — or a *list* of parts
     (one placeholder may expand to several, e.g. a PDF rasterized to one image
-    per page for a vision model) — built from the content-addressed blob.  This is the materialization the
-    translator — and reconstruct, for display — runs at its output boundary: a
-    placeholder whose blob is missing (pruned) is dropped, so a consumer never
-    sees an unresolved reference.  Identity-preserving when no message carries a
+    per page for a vision model) — built from the content-addressed blob. This
+    shared substitution runs at each output boundary (model dispatch or display):
+    a placeholder whose blob is missing (pruned) is dropped, so a consumer never
+    sees an unresolved reference. Identity-preserving when no message carries a
     placeholder; never mutates the input.
     """
 
@@ -480,9 +480,9 @@ def materialize_attachments(
 ) -> list[dict[str, Any]]:
     """Expand by-reference attachment placeholders to inline parts at the wire.
 
-    The translator's entry point for the by-reference content lane: collect the
-    placeholder ids across *messages*, ask *resolve* (a storage point-lookup the
-    session hands down) for their inline content parts, and substitute via
+    The shared wire-boundary entry point for the by-reference content lane:
+    collect the placeholder ids across *messages*, ask *resolve* (a storage
+    point-lookup the session hands down) for their inline content parts, and substitute via
     :func:`resolve_attachment_parts`.  A ``None`` resolver (no storage — e.g. a
     unit test or an in-memory sub-agent whose media is already inline) or a
     placeholder-free trajectory is a no-op, so the common path is allocation-free.

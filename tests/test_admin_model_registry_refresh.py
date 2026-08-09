@@ -92,6 +92,7 @@ def _seed_model_def(
     obo_audience: str = "",
     obo_scopes: str = "",
     capabilities: str = "{}",
+    max_concurrency: int = 0,
 ) -> None:
     """Insert a model definition row directly via the storage API."""
     storage.create_model_definition(
@@ -108,6 +109,7 @@ def _seed_model_def(
         auth_mode=auth_mode,
         obo_audience=obo_audience,
         obo_scopes=obo_scopes,
+        max_concurrency=max_concurrency,
     )
 
 
@@ -2431,6 +2433,91 @@ def test_update_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
     assert registry.get_config("local").model == "new-model"
 
 
+def test_create_and_update_max_concurrency_refresh_registry(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    created = client.post(
+        "/v1/api/admin/model-definitions",
+        json={"alias": "limited", "model": "m2", "max_concurrency": 3},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["max_concurrency"] == 3
+    assert registry.get_config("limited").max_concurrency == 3
+
+    definition_id = created.json()["definition_id"]
+    updated = client.put(
+        f"/v1/api/admin/model-definitions/{definition_id}",
+        json={"max_concurrency": 0},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["max_concurrency"] == 0
+    assert registry.get_config("limited").max_concurrency == 0
+
+
+def test_update_omission_preserves_max_concurrency(storage: SQLiteBackend) -> None:
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        max_concurrency=2,
+    )
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"model": "m2"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["max_concurrency"] == 2
+    assert storage.get_model_definition("m1")["max_concurrency"] == 2
+
+
+@pytest.mark.parametrize("invalid", [None, True, "1", 1.0, -1, 2_147_483_648])
+def test_create_rejects_invalid_max_concurrency(
+    storage: SQLiteBackend,
+    invalid: Any,
+) -> None:
+    client = _make_client(storage, _make_registry())
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={"alias": "invalid", "model": "m", "max_concurrency": invalid},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "max_concurrency" in resp.json()["error"]
+    assert storage.get_model_definition_by_alias("invalid") is None
+
+
+@pytest.mark.parametrize("invalid", [None, True, "1", 1.0, -1, 2_147_483_648])
+def test_update_rejects_invalid_max_concurrency(
+    storage: SQLiteBackend,
+    invalid: Any,
+) -> None:
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        max_concurrency=2,
+    )
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"max_concurrency": invalid},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "max_concurrency" in resp.json()["error"]
+    assert storage.get_model_definition("m1")["max_concurrency"] == 2
+
+
 def test_update_endpoint_skips_refresh_on_empty_body(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3809,6 +3896,7 @@ def test_every_mutable_column_probes_its_classification(
         "base_url": "https://other.example/v1",
         "api_key": "sk-new",
         "context_window": 4096,
+        "max_concurrency": 2,
         "capabilities": {"note": "probe"},
         # Arm direction: the loop seeds THIS row disabled, so the probe is the
         # gated false→true flip rather than the carved-out disarm.

@@ -139,6 +139,7 @@ def test_model_status_route_carries_backend_auth_fields():
         auth_mode="rfc8693_obo",
         obo_audience="api://gw",
         obo_scopes="aud-gw openid",
+        max_concurrency=3,
     )
     reg = ModelRegistry(models={"gw": cfg}, default="gw")
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(registry=reg)))
@@ -147,6 +148,7 @@ def test_model_status_route_carries_backend_auth_fields():
     assert entry["auth_mode"] == "rfc8693_obo"
     assert entry["obo_audience"] == "api://gw"
     assert entry["obo_scopes"] == "aud-gw openid"
+    assert entry["max_concurrency"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +328,64 @@ def test_model_reload_endpoint_rewrites_models_metadata(monkeypatch, tmp_path):
     assert {r["alias"] for r in payload} == {"a", "b"}
 
 
+def test_model_reload_cap_only_change_resizes_the_stable_gate(monkeypatch):
+    """Operational capacity participates in the endpoint's no-op check even
+    though it deliberately does not participate in ModelConfig identity."""
+    from turnstone.server import internal_model_reload
+
+    old_reg = ModelRegistry(
+        {
+            "a": ModelConfig(
+                alias="a",
+                base_url="http://x",
+                api_key="k",
+                model="a",
+                max_concurrency=1,
+            )
+        },
+        default="a",
+    )
+    new_reg = ModelRegistry(
+        {
+            "a": ModelConfig(
+                alias="a",
+                base_url="http://x",
+                api_key="k",
+                model="a",
+                max_concurrency=3,
+            )
+        },
+        default="a",
+    )
+    original_gate = old_reg.get_admission("a")
+    app_state = SimpleNamespace(
+        registry=old_reg,
+        cli_model_args={
+            "base_url": "",
+            "api_key": "",
+            "model": "",
+            "context_window": 0,
+            "provider": "openai",
+        },
+        config_store=None,
+        node_id="",
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+    monkeypatch.setattr("turnstone.core.model_registry.load_model_registry", lambda **_kw: new_reg)
+    monkeypatch.setattr("turnstone.core.storage._registry.get_storage", MagicMock)
+    monkeypatch.setattr("turnstone.server._broadcast_agent_tool_schema_refresh", lambda _s: None)
+
+    response = internal_model_reload(request)  # type: ignore[arg-type]
+    body = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert body.get("noop", False) is False
+    assert old_reg.get_admission("a") is original_gate
+    assert original_gate.limit == 3
+    assert old_reg.generation == 1
+
+
 def test_model_reload_refuses_dynamic_auth_without_key(monkeypatch, tmp_path, caplog):
     """A keyless node cannot acquire a dynamic alias via model-reload: 503,
     a deployment fault, not the 422 bad-arguments exit."""
@@ -417,6 +477,44 @@ def test_model_reload_maps_auth_config_error_to_422(monkeypatch, tmp_path):
 
     assert response.status_code == 422
     assert "obo_audience" in json.loads(response.body)["reason"]
+    assert old_reg.has_alias("a")
+
+
+def test_model_reload_maps_concurrency_config_error_to_422(monkeypatch, tmp_path):
+    """A corrupt persisted cap uses the same structured config-error exit."""
+    from turnstone.core.model_registry import ModelConcurrencyConfigError
+    from turnstone.core.storage._sqlite import SQLiteBackend
+    from turnstone.server import internal_model_reload
+
+    storage = SQLiteBackend(str(tmp_path / "reload.db"))
+    old_reg = _registry(("a", "http://x"))
+    app_state = SimpleNamespace(
+        registry=old_reg,
+        cli_model_args={
+            "base_url": "",
+            "api_key": "",
+            "model": "",
+            "context_window": 0,
+            "provider": "openai",
+        },
+        config_store=None,
+        node_id="node-a",
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+    def _raise_concurrency_config(**_kw):
+        raise ModelConcurrencyConfigError("Model 'gw' max_concurrency must be an integer")
+
+    monkeypatch.setattr(
+        "turnstone.core.model_registry.load_model_registry",
+        _raise_concurrency_config,
+    )
+    monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
+
+    response = internal_model_reload(request)  # type: ignore[arg-type]
+
+    assert response.status_code == 422
+    assert "max_concurrency" in json.loads(response.body)["reason"]
     assert old_reg.has_alias("a")
 
 

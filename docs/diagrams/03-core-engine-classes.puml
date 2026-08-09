@@ -134,6 +134,7 @@ class "ModelLane" as ModelLane <<frozen>> {
     + capabilities: ModelCapabilities
     + extra_params: dict | None
     + registry: ModelRegistry | None
+    + admission: ModelAdmission | None
     + backend_auth_config: ModelConfig | None
     + backend_auth_resolver: Callable | None
 }
@@ -357,12 +358,13 @@ class "ModelRegistry" as ModelReg {
     - _models: dict[str, ModelConfig]
     - _clients: dict[str, Any]
     - _providers: dict[str, LLMProvider]
+    - _admissions: dict[str, ModelAdmission]
     - _client_lock: Lock
     + default: str
     + fallback: list[str]
     + agent_model: str | None
     --
-    + resolve_binding(alias) → (client, model, config, provider, generation)
+    + resolve_binding(alias) → (client, model, config, provider, admission, generation)
     + get_client(alias) → Any
     + get_provider(alias) → LLMProvider
     + has_alias(alias) → bool
@@ -376,6 +378,22 @@ class "ModelRegistry" as ModelReg {
     core/model_registry.py
 }
 
+class "ModelAdmission" as ModelAdmission {
+    - alias: str
+    - _limit: int
+    - _in_flight: int
+    - _waiters: deque
+    + acquire(cancel_ref) → AdmissionLease
+    + set_limit(limit)
+    + snapshot() → AdmissionSnapshot
+    --
+    Per-process FIFO generation gate.
+    Stable across alias hot reloads;
+    queue time is deadline credit.
+    --
+    core/admission.py
+}
+
 class "ModelConfig" as ModelCfg <<frozen>> {
     + alias: str
     + provider: str
@@ -385,6 +403,7 @@ class "ModelConfig" as ModelCfg <<frozen>> {
     + temperature: float | None
     + max_tokens: int | None
     + reasoning_effort: str | None
+    + max_concurrency: int
     + auth_mode: str
     + obo_audience: str
     + obo_scopes: str
@@ -475,12 +494,14 @@ KindAdapter ..> ChatSession : constructs
 
 ModelReg --> "*" ModelCfg : holds
 ModelReg --> "*" LLMProvider : caches
+ModelReg --> "*" ModelAdmission : owns per alias
 LLMProvider --> ModelCaps : returns
 ModelReg --> ResolvedBinding : resolves atomically
 ResolvedBinding --> ModelLane
 ModelLane --> LLMProvider
 ModelLane --> ModelCaps
 ModelLane --> ModelCfg : auth/config snapshot
+ModelLane --> ModelAdmission : admission lease
 ModelTurnFn --> ModelLane
 ModelTurnFn --> ModelTurnResult
 ModelTurnFn ..> BackendAuth : per-call resolver

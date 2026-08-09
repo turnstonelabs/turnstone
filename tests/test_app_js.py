@@ -909,6 +909,29 @@ def test_model_response_controls_are_capability_driven_and_sparse() -> None:
     assert 'apiSurfEl.addEventListener("change", _onModelFieldChange)' in admin
 
 
+def test_model_max_concurrency_form_round_trips_strict_integer() -> None:
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+
+    assert 'id="model-max-concurrency"' in html
+    assert 'max="2147483647"' in html
+    assert "0 = unlimited" in html
+
+    create = _slice_function_body(admin, "showCreateModelModal")
+    edit = _slice_function_body(admin, "showEditModelModal")
+    render = _slice_function_body(admin, "_renderModels")
+    assert create is not None and edit is not None and render is not None
+    assert 'getElementById("model-max-concurrency").value = "0"' in create
+    assert "m.max_concurrency != null ? m.max_concurrency : 0" in edit
+    # submitCreateModel is longer than the balanced-slice helper's bounded
+    # window; these names are unique to that form path, so whole-file pins are
+    # both stable and unambiguous.
+    assert "Number.isInteger(maxConcurrency)" in admin
+    assert "maxConcurrency > 2147483647" in admin
+    assert "form.max_concurrency = maxConcurrency" in admin
+    assert 'overrides.push("limit=" + m.max_concurrency)' in render
+
+
 def test_shared_utils_defines_set_safe_html_helper() -> None:
     """``setSafeHtml`` in ``shared/utils.js`` is the single audited entry
     point for installing trusted HTML strings into a DOM element outside

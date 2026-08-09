@@ -920,6 +920,7 @@ configurations so workstreams can use different LLM backends.
 [models.local]
 base_url = "http://localhost:8000/v1"
 model = "qwen3-32b"
+max_concurrency = 1
 # provider defaults to "openai"
 
 [models.claude]
@@ -957,6 +958,20 @@ registry generation; each new send compares by equality and replaces the whole
 binding on mismatch. Failed reload validation changes neither maps nor
 generation. If only non-transport fields changed, compatible client pools can
 remain warm, but the session still receives a new coherent config/lane.
+
+**Per-alias admission:** Each registry alias owns a stable, hot-resizable
+`ModelAdmission`. `max_concurrency = 0` is unlimited; a positive value limits
+simultaneous generations for that alias in one process. Every registry-backed
+role carries the same gate on its `ModelLane`, so main turns, judges, task
+agents, perception, compaction, and background generation coordinate through
+one FIFO. Two aliases never share a gate implicitly, even when their URLs are
+identical. `model_turn()` materializes attachment fallbacks before admission,
+then holds one lease across eager stream creation and the complete drain,
+releasing before retry backoff. Admission wait is credited out of deadline
+accounting, preventing queued judges from spending their request budget before
+dispatch. The gate survives cap-only reloads in place; the field is excluded
+from semantic `ModelConfig` equality so a capacity edit does not reset judges
+or output-guard state.
 
 Primary loops, recursive compaction, judges, title generation, audio, and task
 agents all consume `ModelLane` rather than inspecting provider/client handles.
@@ -1196,8 +1211,9 @@ Verified quirks of vLLM's Anthropic endpoint:
 
 **Database model definitions:** On server entry points, models can also be
 defined in the `model_definitions` table (admin Models tab). DB models support
-the same per-model sampling overrides. Config.toml models override DB models
-with the same alias in-memory (the DB rows are never modified).
+the same per-model sampling overrides and per-alias `max_concurrency`.
+Config.toml models override DB models with the same alias in-memory (the DB
+rows are never modified).
 
 **Lifecycle:**
 1. `load_model_registry()` loads DB model definitions (if storage available),

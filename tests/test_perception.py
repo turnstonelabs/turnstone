@@ -19,8 +19,8 @@ class _StubProvider:
 
     ``describe`` routes through ``model_turn``, so the stub carries the lane
     surface (``provider_name``, ``get_capabilities``) and returns a full
-    ``CompletionResult`` shape, and it records the ``resolve_attachments``
-    callback the translator would use to materialize the by-reference parts.
+    ``CompletionResult`` shape, and it records that ``model_turn`` already
+    materialized by-reference parts and cleared the provider callback.
     """
 
     provider_name = "openai-compatible"
@@ -100,11 +100,10 @@ def test_describe_lowers_prompt_then_by_reference_parts() -> None:
     assert prov.last_messages is not None
     content = prov.last_messages[0]["content"]
     assert content[0]["type"] == "text"  # prompt leads
-    # The attachment rides by reference; the translator materializes it via
-    # the threaded resolver, which must return the prebuilt parts verbatim.
-    assert content[1]["attachment_id"] == "perception-input"
-    assert prov.last_resolve is not None
-    assert prov.last_resolve(["perception-input"]) == {"perception-input": _parts()}
+    # model_turn materializes before admission, then hands the provider the
+    # prebuilt inline part with no resolver left to invoke under the gate.
+    assert content[1] == _parts()[0]
+    assert prov.last_resolve is None
 
 
 def test_describe_empty_parts_skips_backend() -> None:

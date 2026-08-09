@@ -17,6 +17,7 @@ from turnstone.core import model_registry as mr_module
 from turnstone.core.model_registry import (
     KEY_GUARD_DEFERRED_TO_LIFESPAN,
     DynamicAuthKeyError,
+    ModelConcurrencyConfigError,
     ModelConfig,
     ModelRegistry,
     UnknownModelAliasError,
@@ -50,6 +51,7 @@ class TestModelConfig:
         assert cfg.alias == "local"
         assert cfg.model == "qwen3-32b"
         assert cfg.context_window == 32768  # default
+        assert cfg.max_concurrency == 0
 
     def test_custom_context_window(self) -> None:
         cfg = ModelConfig(
@@ -111,6 +113,16 @@ class TestModelConfig:
         )
         assert cfg.surface_persisted_reasoning is False
         assert cfg.replay_reasoning_to_model is True
+
+    def test_max_concurrency_is_strict_and_not_binding_identity(self) -> None:
+        unlimited = ModelConfig(alias="x", base_url="x", api_key="x", model="x")
+        limited = dataclasses.replace(unlimited, max_concurrency=2)
+        assert limited.max_concurrency == 2
+        assert unlimited == limited
+
+        for invalid in (-1, 2_147_483_648, True, 1.0, "1", None):
+            with pytest.raises(ModelConcurrencyConfigError, match="max_concurrency"):
+                dataclasses.replace(unlimited, max_concurrency=invalid)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +398,7 @@ class TestLoadModelRegistry:
                     "api_key": "sk-test",
                     "model": "gpt-4o",
                     "context_window": 128000,
+                    "max_concurrency": 2,
                 },
             },
             "model": {
@@ -404,8 +417,26 @@ class TestLoadModelRegistry:
         assert reg.has_alias("openai")
         assert not reg.has_alias("default")
         assert reg.default == "openai"
-        _, model, _, _ = reg.resolve()
+        _, model, cfg, _ = reg.resolve()
         assert model == "gpt-4o"
+        assert cfg.max_concurrency == 2
+
+    @pytest.mark.parametrize("invalid", [-1, 2_147_483_648, True, 1.0, "1", None])
+    def test_config_rejects_invalid_max_concurrency(self, invalid: Any) -> None:
+        fake_cfg = {
+            "models": {
+                "local": {
+                    "base_url": "http://localhost:8000/v1",
+                    "model": "m",
+                    "max_concurrency": invalid,
+                }
+            }
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            pytest.raises(ModelConcurrencyConfigError, match="max_concurrency"),
+        ):
+            load_model_registry()
 
     def test_config_context_window_zero_inherits_detected(self) -> None:
         """``context_window = 0`` in a [models.*] entry is the auto-detect
@@ -794,6 +825,7 @@ class TestLoadModelRegistryWithDB:
                     "temperature": 1.5,
                     "max_tokens": 4096,
                     "reasoning_effort": "high",
+                    "max_concurrency": 4,
                 }
             ]
         )
@@ -803,6 +835,7 @@ class TestLoadModelRegistryWithDB:
         assert cfg.temperature == 1.5
         assert cfg.max_tokens == 4096
         assert cfg.reasoning_effort == "high"
+        assert cfg.max_concurrency == 4
 
     def test_db_sampling_params_null_means_none(self) -> None:
         """NULL sampling params in DB map to None (use global default)."""
@@ -3638,8 +3671,8 @@ class TestSessionAgentModel:
         session._run_agent([Turn.user("x")], label="task", agent_alias="fast")
         assert captured["model"] == "fast-model"
 
-    def test_session_fallback_uses_exact_primary_lane_and_caps(self) -> None:
-        """A sub-agent inherits the primary lane with auth already consumed."""
+    def test_session_fallback_uses_exact_primary_lane_and_pinned_auth(self) -> None:
+        """A sub-agent keeps the primary lane and pins its auth resolver."""
         import turnstone.core.session as session_module
 
         reg = self._three_model_registry()  # no agent_model / plan_model set
@@ -3658,8 +3691,11 @@ class TestSessionAgentModel:
 
         assert model_turn_spy.call_count == 1
         used_lane = model_turn_spy.call_args.args[0]
-        assert used_lane == dataclasses.replace(primary_lane, backend_auth_resolver=None)
-        assert used_lane.backend_auth_resolver is None
+        assert used_lane == dataclasses.replace(
+            primary_lane,
+            backend_auth_resolver=used_lane.backend_auth_resolver,
+        )
+        assert used_lane.backend_auth_resolver is not None
         assert used_lane.capabilities is primary_caps
         assert used_lane.client is _client(session)
         assert used_lane.alias == "main"

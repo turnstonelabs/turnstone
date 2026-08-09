@@ -23,8 +23,9 @@ one alias; a vision-only model covers image/PDF and is simply skipped for audio.
 The call goes through :func:`turnstone.core.model_turn.model_turn` (the shared
 plant-call seam, #827), so any provider works: the trajectory carries the
 attachment by reference and the pre-built OpenAI-shaped parts (``image_url`` /
-``input_audio``) materialize at the provider translator via the
-``resolve_attachments`` callback, exactly like the main loop's wire path.
+``input_audio``) materialize in ``model_turn`` via the ``resolve_attachments``
+callback before the alias admission slot is acquired, exactly like the main loop's
+wire path.
 """
 
 from __future__ import annotations
@@ -78,9 +79,9 @@ def describe(
 
     ``parts`` are pre-built OpenAI-shaped content parts — ``image_url`` for
     image/PDF-page perception, ``input_audio`` for audio.  The trajectory
-    carries them by reference; ``model_turn`` hands the resolver to the
-    provider translator, which materializes the placeholder into these exact
-    parts (one ref may expand to many, e.g. a rasterized PDF).
+    carries them by reference; ``model_turn`` uses the resolver before model
+    admission to materialize the placeholder into these exact parts (one ref
+    may expand to many, e.g. a rasterized PDF).
 
     ``lane`` is the caller's already-resolved binding snapshot, so the
     modality gate and the plant call cannot observe different registry
