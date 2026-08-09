@@ -1,3 +1,11 @@
+{{/*
+PostgreSQL only. On sqlite this Job would be a second pod contending for
+the one RWO claim the server already holds — a multi-attach failure
+whenever the scheduler places it on another node — and it would buy
+nothing: the database is local to the volume, and every service migrates
+it on startup through the image entrypoint before serving traffic.
+*/}}
+{{- if ne .Values.database.backend "sqlite" }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -61,11 +69,14 @@ spec:
             - turnstone.core.storage._migrate
           env:
             {{- include "turnstone.db.env" . | nindent 12 }}
-          {{- with .Values.migrate.writablePaths }}
           volumeMounts:
+            {{- include "turnstone.dataVolumeMount" . | trim | nindent 12 }}
+            {{- with .Values.migrate.writablePaths }}
             {{- include "turnstone.writableVolumeMounts" . | trim | nindent 12 }}
-          {{- end }}
-      {{- with .Values.migrate.writablePaths }}
+            {{- end }}
       volumes:
+        {{- include "turnstone.dataVolume" . | trim | nindent 8 }}
+        {{- with .Values.migrate.writablePaths }}
         {{- include "turnstone.writableVolumes" . | trim | nindent 8 }}
-      {{- end }}
+        {{- end }}
+{{- end }}

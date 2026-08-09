@@ -94,11 +94,13 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
-          {{- with .Values.server.writablePaths }}
           volumeMounts:
+            {{- include "turnstone.dataVolumeMount" . | trim | nindent 12 }}
+            {{- with .Values.server.writablePaths }}
             {{- include "turnstone.writableVolumeMounts" . | trim | nindent 12 }}
-          {{- end }}
-      {{- with .Values.server.writablePaths }}
+            {{- end }}
       volumes:
+        {{- include "turnstone.dataVolume" . | trim | nindent 8 }}
+        {{- with .Values.server.writablePaths }}
         {{- include "turnstone.writableVolumes" . | trim | nindent 8 }}
-      {{- end }}
+        {{- end }}

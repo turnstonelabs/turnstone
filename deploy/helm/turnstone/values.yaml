@@ -6,8 +6,34 @@ image:
 
 # -- Database configuration
 database:
-  # Backend type (postgresql)
+  # Backend type (postgresql or sqlite).
+  #
+  # sqlite is a single-node configuration, and the chart rejects the
+  # combinations that pretend otherwise. Server and console are separate
+  # pods that both read and write the registry, so they share the one
+  # volume below — and they must share a node with it. The backend opens
+  # the database in WAL mode, whose index lives in a mmap'd -shm file
+  # that is only coherent between processes on the same host, so a
+  # ReadWriteMany claim spread over two nodes corrupts rather than
+  # shares. Pin both workloads with the nodeSelector/affinity keys below
+  # and keep the claim ReadWriteOnce.
+  #
+  # Reach for postgresql for anything else. It is the only backend that
+  # can serve more than one server replica, since replicas discover each
+  # other through rows in the shared database.
   backend: postgresql
+  # -- Persistent storage for the SQLite database. Ignored on
+  # postgresql, where /data holds nothing durable.
+  persistence:
+    enabled: true
+    # Bring your own claim; the chart then creates none.
+    existingClaim: ""
+    # Empty means the cluster default StorageClass.
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 8Gi
+    annotations: {}
   # External database settings (used when postgresql.enabled is false)
   external:
     host: ""
@@ -63,17 +89,17 @@ server:
       drop:
         - ALL
     readOnlyRootFilesystem: true
-  # -- Writable paths, each backed by an emptyDir and unbounded unless
+  # -- Scratch paths, each backed by an emptyDir and unbounded unless
   # given a sizeLimit. Required by securityContext.readOnlyRootFilesystem
   # — emptying this list without also turning that off leaves the
-  # container unable to write at all.
+  # container unable to write at all. /data is not here: it is the
+  # working directory and, on sqlite, the database, so it is mounted
+  # unconditionally and configured under database.persistence.
   writablePaths:
     - name: tmp
       path: /tmp
     - name: home
       path: /home/turnstone
-    - name: data
-      path: /data
     # Agent working files. The largest by some margin: checkouts, build
     # output, and whatever a session downloads all land here.
     - name: workspace
@@ -112,15 +138,13 @@ console:
       drop:
         - ALL
     readOnlyRootFilesystem: true
-  # -- Writable paths (see server.writablePaths). No /workspace: the
+  # -- Scratch paths (see server.writablePaths). No /workspace: the
   # console serves the dashboard and runs no agent sessions.
   writablePaths:
     - name: tmp
       path: /tmp
     - name: home
       path: /home/turnstone
-    - name: data
-      path: /data
 
 # -- Database migration Job (post-install/pre-upgrade hook)
 migrate:
@@ -144,14 +168,12 @@ migrate:
       drop:
         - ALL
     readOnlyRootFilesystem: true
-  # -- Writable paths
+  # -- Scratch paths
   writablePaths:
     - name: tmp
       path: /tmp
     - name: home
       path: /home/turnstone
-    - name: data
-      path: /data
 
 # -- LLM provider configuration
 llm:

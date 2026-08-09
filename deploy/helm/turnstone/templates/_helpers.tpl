@@ -248,6 +248,17 @@ URL.
 {{- define "turnstone.db.env" -}}
 - name: TURNSTONE_DB_BACKEND
   value: {{ .Values.database.backend | quote }}
+{{- if eq .Values.database.backend "sqlite" }}
+{{- /*
+  Set outright rather than left to default. The backend falls back to
+  ".turnstone.db in cwd", which is only the mount because the image's
+  final WORKDIR happens to be /data — a coincidence that would put the
+  database on the root filesystem, unwritable and unpersisted, the day
+  anything overrides the working directory.
+*/}}
+- name: TURNSTONE_DB_PATH
+  value: {{ printf "%s/.turnstone.db" (include "turnstone.dataMountPath" .) | quote }}
+{{- else }}
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
@@ -255,6 +266,91 @@ URL.
       key: {{ include "turnstone.db.passwordKey" . }}
 - name: TURNSTONE_DB_URL
   value: "postgresql+psycopg://{{ include "turnstone.postgresql.username" . }}:$(POSTGRES_PASSWORD)@{{ include "turnstone.postgresql.host" . }}:{{ include "turnstone.postgresql.port" . }}/{{ include "turnstone.postgresql.database" . }}{{ if and (not .Values.postgresql.enabled) .Values.database.external.sslmode }}?sslmode={{ .Values.database.external.sslmode }}{{ end }}"
+{{- end }}
+{{- end }}
+
+{{/*
+The working directory, and on SQLite the database directory with it.
+
+Fixed rather than configurable: it is the image's WORKDIR, so moving it
+would desynchronise the mount from the process's cwd for no gain.
+*/}}
+{{- define "turnstone.dataMountPath" -}}
+/data
+{{- end }}
+
+{{- define "turnstone.data.claimName" -}}
+{{- if .Values.database.persistence.existingClaim }}
+{{- .Values.database.persistence.existingClaim }}
+{{- else }}
+{{- printf "%s-data" (include "turnstone.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Is /data holding a database, as opposed to being scratch space?
+
+Only on SQLite. On PostgreSQL every durable byte lives in the database
+server and /data holds nothing worth keeping across a restart, so an
+emptyDir is not a compromise there — it is the accurate description.
+*/}}
+{{- define "turnstone.data.persistent" -}}
+{{- if and (eq .Values.database.backend "sqlite") .Values.database.persistence.enabled }}true{{ end }}
+{{- end }}
+
+{{/*
+The /data volume and its mount. Every workload mounts it: it is the
+working directory in all three, and on SQLite all three open the same
+database file through it.
+*/}}
+{{- define "turnstone.dataVolume" -}}
+- name: data
+{{- if include "turnstone.data.persistent" . }}
+  persistentVolumeClaim:
+    claimName: {{ include "turnstone.data.claimName" . }}
+{{- else }}
+  emptyDir: {}
+{{- end }}
+{{- end }}
+
+{{- define "turnstone.dataVolumeMount" -}}
+- name: data
+  mountPath: {{ include "turnstone.dataMountPath" . | quote }}
+{{- end }}
+
+{{/*
+Reject the backend/topology combinations that cannot work, at render
+time rather than as a pod that comes up wrong.
+
+SQLite is a file opened by local processes, and this chart spreads those
+processes across pods: the server and the console are separate
+Deployments that both read and write the registry. WAL mode puts the
+index in a mmap'd -shm file that only coheres between processes on one
+host, so every consumer has to land on the node holding the claim. Two
+server replicas cannot satisfy that — nor could they discover each
+other, since discovery is itself rows in that same database.
+
+Co-location is left to the operator's nodeSelector/affinity rather than
+enforced here: the chart cannot tell which node the claim will bind to,
+and inventing an affinity rule would collide with whatever placement the
+operator already configured.
+*/}}
+{{- define "turnstone.validateBackend" -}}
+{{- $backend := .Values.database.backend }}
+{{- if not (has $backend (list "sqlite" "postgresql")) }}
+{{- fail (printf "database.backend must be \"sqlite\" or \"postgresql\", got %q" $backend) }}
+{{- end }}
+{{- if eq $backend "sqlite" }}
+{{- if .Values.postgresql.enabled }}
+{{- fail "database.backend=sqlite conflicts with postgresql.enabled=true: set postgresql.enabled=false, or switch the backend to postgresql." }}
+{{- end }}
+{{- if gt (int .Values.server.replicas) 1 }}
+{{- fail (printf "database.backend=sqlite supports one server replica, got %d: node discovery is rows in the shared database, which SQLite cannot be across pods. Use the postgresql backend to run more than one." (int .Values.server.replicas)) }}
+{{- end }}
+{{- if not .Values.database.persistence.enabled }}
+{{- fail "database.backend=sqlite with database.persistence.enabled=false would put the database on an emptyDir and lose it on every restart. Enable persistence, or switch the backend to postgresql." }}
+{{- end }}
+{{- end }}
 {{- end }}
 
 {{/*
