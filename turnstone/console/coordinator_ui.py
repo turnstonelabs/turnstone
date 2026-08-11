@@ -296,19 +296,15 @@ class ConsoleCoordinatorUI(SessionUIBase):
         ws = mgr.get(self.ws_id)
         if ws is None:
             return
-        with self._ws_lock:
-            tokens = self._ws_prompt_tokens + self._ws_completion_tokens
-            context_ratio = self._ws_context_ratio
-            activity = self._ws_current_activity
-            activity_state = self._ws_activity_state
+        payload = self.snapshot_state_payload_non_consuming()
         try:
             collector.emit_console_ws_state(
                 self.ws_id,
                 ws.state.value,
-                tokens=tokens,
-                context_ratio=context_ratio,
-                activity=activity,
-                activity_state=activity_state,
+                tokens=payload["tokens"],
+                context_ratio=payload["context_ratio"],
+                activity=payload["activity"],
+                activity_state=payload["activity_state"],
                 persistence_state=self._current_persistence_state(),
             )
         except Exception:

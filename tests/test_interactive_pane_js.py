@@ -1346,3 +1346,46 @@ def test_accepted_tool_event_recorded_only_when_painted() -> None:
     gate = case.index("if (\n          this.appendToolOutput(")
     record = case.index("recordAcceptedToolEvent(this._renderedToolEventIds, evt)")
     assert gate < record
+
+
+def test_replay_system_rows_do_not_terminate_the_tool_batch_window() -> None:
+    """A system row inside a tool batch is not a turn boundary: nulling
+    ``lastToolBlock`` in the ``role === "system"`` replay branch made every
+    tool result AFTER an interleaved row (mid-turn operator context, a
+    second writer's append) silently vanish from this pane while the
+    coordinator — whose indexHistoryToolOutcomes skips non-turn rows —
+    rendered the identical history correctly.  Only the user/assistant
+    branches may reset the anchor."""
+    body = _strip_comments(_INTERACTIVE.read_text(encoding="utf-8"))
+    start = body.index('(msg.role === "system")')
+    end = body.index("for (const leftovers of pendingAssessments.values())", start)
+    system_branch = body[start:end]
+    assert "lastToolBlock = null" not in system_branch, (
+        "the system replay branch terminates the batch result window — "
+        "interleaved-row tool results are dropped again"
+    )
+    # Mutation control: the anchor resets still exist in the turn branches
+    # (user, nudge-marker, assistant content/reasoning/pending arms).
+    loop = body[body.index("let lastToolBlock = null") : end]
+    assert loop.count("lastToolBlock = null") >= 4
+
+
+def test_orphan_tool_result_does_not_mark_a_batch_failed() -> None:
+    """Keeping the batch anchor live across non-turn rows means a tool row
+    that names a call_id this batch never issued (a result for an earlier
+    batch, a second writer's append) can reach the error stamp.  It must
+    not mark an all-succeeded batch as failed — the shared outcome index
+    skips unmatched occurrences for exactly this reason.  A row with NO
+    call_id is the legacy positional case and must still stamp, so the
+    guard keys on 'named a call_id we could not resolve', not on the
+    absence of a resolved target."""
+    body = _strip_comments(_INTERACTIVE.read_text(encoding="utf-8"))
+    assert "const isOrphanResult = !!msg.tool_call_id && !resultTarget;" in body, (
+        "the orphan discriminator must distinguish an unresolvable call_id "
+        "from a legacy row that carries none"
+    )
+    stamp = body.index("appendToolErrorBadge(lastToolBlock)")
+    guard = body.rindex("if (", 0, stamp)
+    assert "!isOrphanResult" in body[guard:stamp], (
+        "an orphan result can stamp conv-batch--error on a batch whose own calls all succeeded"
+    )

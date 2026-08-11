@@ -1081,32 +1081,34 @@ def test_coordinator_history_stale_latch_contract():
     # destroy() must abort the in-flight fetch (dead-not-inert, the
     # staleRetryTimer ruling applied to the r7 bound).
     # Producer pins first — the destroy() consumer sweep below is
-    # satisfiable by an always-empty Set without them.
-    assert body.count("histCtrls.add(histCtrl)") == 1, (
-        "every dispatch must register its controller in the abort Set."
+    # satisfiable by an always-empty Set without them.  ONE composite
+    # record per attempt: registering ctrl and deadline separately is the
+    # parallel-bookkeeping drift a future attempt site gets wrong.
+    assert body.count("histAttempts.add(attempt)") == 1, (
+        "every dispatch must register its composite {ctrl, deadline} record in the attempt Set."
     )
-    assert body.count("histCtrls.delete(histCtrl)") == 1, (
-        "the fetch finally must release its own controller — without the "
-        "delete the Set grows for the life of the pane."
+    assert body.count("histAttempts.delete(attempt)") == 1, (
+        "the fetch finally must release its own attempt record — without "
+        "the delete the Set grows for the life of the pane."
     )
-    assert body.index("histCtrls.add(histCtrl)", fetch_start) < awt, (
-        "the controller must be registered BEFORE the await."
+    assert body.index("histAttempts.add(attempt)", fetch_start) < awt, (
+        "the attempt must be registered BEFORE the await."
     )
-    assert fin < body.index("histCtrls.delete(histCtrl)", fetch_start), (
-        "the controller release must sit in the fetch finally."
+    assert fin < body.index("histAttempts.delete(attempt)", fetch_start), (
+        "the attempt release must sit in the fetch finally."
     )
     destroy_code = _strip_comments(destroy_slice)
-    assert "histCtrls.forEach" in destroy_code and ".abort()" in destroy_code, (
+    assert "histAttempts.forEach" in destroy_code and ".abort()" in destroy_code, (
         "destroy() must abort EVERY in-flight /history (a Set — a "
         "newest-wins single slot left older overlapping fetches "
         "unabortable); the 15s bound alone pins the destroyed closure "
         "until it fires."
     )
-    assert "histDeadlines.forEach" in destroy_code
-    assert "dispose({ expire: true, resolve: true })" in destroy_code, (
+    assert "attempt.deadline.dispose({ expire: true, resolve: true })" in destroy_code, (
         "destroy must settle every logical deadline immediately (expired + "
         "resolved, including when AbortController is unavailable) via the "
-        "module's dispose() — not by poking state slots."
+        "module's dispose() — from the SAME composite record its abort "
+        "came from, never a parallel Set."
     )
 
 

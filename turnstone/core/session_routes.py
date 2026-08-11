@@ -43,6 +43,7 @@ from starlette.routing import Route
 
 from turnstone.core.log import get_logger
 from turnstone.core.session_manager import WorkstreamAlreadyExistsError
+from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_ui_base import AutoApproveReason
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
@@ -451,12 +452,6 @@ class SessionEndpointConfig:
     # history stays on the separate REST ``/history`` bootstrap. Kinds that
     # don't need pre-replay wire ``None``.
     events_replay: EventsReplay | None = None
-    # Idempotent connected/status subset of ``events_replay``. The
-    # ``replay_ok`` path emits this plus current state before the buffered
-    # delta, but deliberately skips the full replay callback: pending
-    # approval/control cards may already be represented by the delta and are
-    # not safe to append twice.
-    events_preamble: EventsReplay | None = None
     # (request) -> Executor for the SSE live-loop's blocking
     # ``queue.get`` wait. Interactive returns the dedicated
     # ``request.app.state.sse_executor`` (200-thread pool) so SSE
@@ -2538,7 +2533,6 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
         # Capture the replay callback in a local so the inner
         # generator's closure doesn't have to re-read the cfg field.
         replay_cb = cfg.events_replay
-        preamble_cb = cfg.events_preamble
 
         async def event_generator() -> Any:
             import random
@@ -2676,17 +2670,19 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                     # status / current-state bootstrap. Do not invoke the full
                     # replay callback here: its pending-control cards can also
                     # exist in ``replay_events`` and appending both duplicates
-                    # operator controls.
-                    if preamble_cb is not None:
-                        try:
-                            for ev in preamble_cb(ws, ui, request):
-                                yield {"data": json.dumps(ev)}
-                        except Exception:
-                            log.debug(
-                                "ws.events.preamble_replay_failed ws=%s",
-                                ws_id[:8],
-                                exc_info=True,
-                            )
+                    # operator controls.  Called directly — both kinds wired
+                    # byte-equivalent trivial wrappers, so the preamble
+                    # contract lives in session_replay_preamble alone (it
+                    # no-ops on a detached session internally).
+                    try:
+                        for ev in session_replay_preamble(ws.session, ui):
+                            yield {"data": json.dumps(ev)}
+                    except Exception:
+                        log.debug(
+                            "ws.events.preamble_replay_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
                     state_evt = _current_state_event()
                     if state_evt is not None:
                         yield {"data": json.dumps(state_evt)}

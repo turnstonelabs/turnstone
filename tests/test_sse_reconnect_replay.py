@@ -565,7 +565,6 @@ def _wire_events_handler(
     state: str = "idle",
     session: Any = None,
     events_replay: Any = None,
-    events_preamble: Any = None,
 ) -> Any:
     """Build a minimal ``make_events_handler`` closure that returns
     yields suitable for the EventSourceResponse generator.
@@ -588,7 +587,6 @@ def _wire_events_handler(
         not_found_label="Workstream not found",
         audit_action_prefix="workstream",
         events_replay=events_replay,
-        events_preamble=events_preamble,
     )
     return make_events_handler(cfg)
 
@@ -602,7 +600,6 @@ def _drain_handler_yields(
     state: str = "idle",
     session: Any = None,
     events_replay: Any = None,
-    events_preamble: Any = None,
 ) -> tuple[list[Any], str]:
     """Synchronous helper: spin up the handler, drain up to N yields,
     return ``(raw_yields, decoded_blob)``.  Uses ``asyncio.run`` so
@@ -618,7 +615,6 @@ def _drain_handler_yields(
         state=state,
         session=session,
         events_replay=events_replay,
-        events_preamble=events_preamble,
     )
     req = _fake_request(headers=headers, query=query, path_params={"ws_id": ui.ws_id})
 
@@ -969,12 +965,23 @@ def test_tool_turn_capability_projects_canonical_or_redacted_pre_row_repair() ->
 
 
 class _HandoffSession:
-    """Route-seam double for ChatSession's atomic history registration."""
+    """Route-seam double for ChatSession's atomic history registration.
+
+    Carries the concrete fields the REAL shared preamble reads — the
+    lifted replay_ok path now calls ``session_replay_preamble`` directly
+    (the per-kind wrapper indirection is deleted), so the double must be
+    preamble-readable for the bootstrap pins to exercise the true path.
+    """
 
     def __init__(self, ui: _ConcreteUI, token: str = "revision-7") -> None:
         self.ui = ui
         self.token = token
         self.calls: list[tuple[str, int | None]] = []
+        self.model = "test"
+        self.model_alias = ""
+        self.context_window = 1000
+        self.reasoning_effort = "low"
+        self._last_usage = {"prompt_tokens": 12, "completion_tokens": 0}
 
     def register_listener_for_history_handoff(
         self,
@@ -1085,12 +1092,12 @@ def test_handoff_cursor_replay_keeps_preamble_without_pending_control_duplicate(
     ui.on_content_token("covered delta")
     session = _HandoffSession(ui)
 
-    def _preamble(_ws: Any, _ui: Any, _request: Any) -> Any:
+    def _full_replay(_ws: Any, _ui: Any, _request: Any) -> Any:
+        # The full replay's own preamble half is what the replay_ok path
+        # must NOT re-run; the lifted body calls the shared
+        # session_replay_preamble directly instead (no per-kind hook).
         yield {"type": "connected", "model": "test"}
         yield {"type": "status", "total_tokens": 12}
-
-    def _full_replay(_ws: Any, _ui: Any, _request: Any) -> Any:
-        yield from _preamble(_ws, _ui, _request)
         yield {"type": "approve_request", "items": [{"call_id": "duplicate"}]}
 
     _, blob = _drain_handler_yields(
@@ -1098,7 +1105,6 @@ def test_handoff_cursor_replay_keeps_preamble_without_pending_control_duplicate(
         query={"history_token": session.token, "last_event_id": "0"},
         session=session,
         events_replay=_full_replay,
-        events_preamble=_preamble,
         max_yields=10,
         state="running",
     )

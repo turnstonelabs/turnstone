@@ -19,6 +19,8 @@ docker-compose.override.yml
 .ruff_cache/
 .pytest_cache/
 *.db
+*.db-shm
+*.db-wal
 .plan.md
 .plan-*.md
 .hypothesis/

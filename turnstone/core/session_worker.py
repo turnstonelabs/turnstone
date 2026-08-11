@@ -98,18 +98,27 @@ def claimed_slot_queue_admission(
     return claimed_principal, kwargs
 
 
-def release_slot_locked(ws: Workstream) -> None:
+def release_slot_locked(ws: Workstream, *, keep_thread: bool = False) -> None:
     """Return the worker slot to its unclaimed state — THE release field set.
 
     Caller holds ``ws._lock`` and has already verified the release is
     legitimate (thread-identity / abandonable checks are per-site policy;
-    the four-field invariant is owned here).  This module declares itself
+    the field-set invariant is owned here).  This module declares itself
     sole owner of the slot lifecycle: a claim field added to the spawn
     branch must land here in the same change, or a released slot keeps a
     stale value that the next admission reads as live (e.g. queue
-    admission comparing against a departed principal).
+    admission comparing against a departed principal) — and the NORMAL
+    worker exit is the most common release, so a hand-copy there is the
+    likeliest site to go stale.
+
+    ``keep_thread=True`` is the ordinary ``_runner`` exit: the claim
+    fields clear but ``ws.worker_thread`` deliberately keeps pointing at
+    the finished thread (late owner-identity checks in that thread's own
+    closures compare against it; the next spawn overwrites it under this
+    same lock).
     """
-    ws.worker_thread = None
+    if not keep_thread:
+        ws.worker_thread = None
     ws._worker_running = False
     ws._worker_principal_id = ""
     ws._worker_force_abandonable = True
@@ -367,9 +376,7 @@ def send(
                 # else a third send sees ``_worker_running=False`` and
                 # spawns a second concurrent worker on the same session.
                 if ws.worker_thread is threading.current_thread():
-                    ws._worker_running = False
-                    ws._worker_principal_id = ""
-                    ws._worker_force_abandonable = True
+                    release_slot_locked(ws, keep_thread=True)
                     was_owner = True
             # Outside the lock (the retry's wake dispatch re-acquires it).
             # Owner only: an abandoned thread retrying would race the

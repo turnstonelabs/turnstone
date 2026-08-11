@@ -70,6 +70,25 @@ def _session_persistence_blocks_retirement(session: Any) -> bool:
     return state is None or bool(state)
 
 
+def _session_unresolved_persistence_nowait(session: Any) -> bool | None:
+    """Non-blocking unresolved probe for the per-second reconcile walk.
+
+    The steady-state pass concludes "nothing to do" on almost every
+    workstream almost every second; taking each session's generation and
+    handoff locks to learn that contends the very locks turn commits use,
+    forever, scaling with roster size.  Try-acquire instead: ``None``
+    (locks busy) means a turn owns the session right now — by definition
+    not a moment that needs an unattended repair — and the next one-second
+    pass re-probes.  Compatibility/test doubles without the nowait hook
+    keep the blocking read and their scripted answers.
+    """
+    probe = concrete_method(session, "has_unresolved_conversation_persistence_nowait")
+    if probe is None:
+        return _session_has_unresolved_persistence(session)
+    state = probe()
+    return None if state is None else bool(state)
+
+
 def _session_prepare_soft_close(session: Any) -> bool:
     """Run the concrete close fence; compatibility/test doubles have no hook."""
     prepare = concrete_method(session, "prepare_soft_close")
@@ -2406,8 +2425,25 @@ class SessionManager:
             )
         return reaped
 
-    def reconcile_unresolved_persistence(self, *, now: float | None = None) -> list[str]:
+    def reconcile_unresolved_persistence(
+        self,
+        *,
+        now: float | None = None,
+        blocking: bool = False,
+    ) -> list[str]:
         """Attempt every due transient conversation repair without manager locks.
+
+        ``blocking`` selects the probe discipline.  The default non-blocking
+        probe suits the per-second maintenance sweep: a workstream whose
+        generation/handoff locks are momentarily held is skipped and re-probed
+        on the next pass, so the steady-state walk never contends the locks
+        turn commits use.  A ONE-SHOT caller has no next pass —
+        ``_reserve_and_install`` runs this exactly once as a last-chance
+        repair before refusing a create — and must force a definite answer,
+        or the workstreams most likely to be skipped (the same contended ones
+        that emptied its candidate list) never get their due repair and the
+        create fails.  Only safe from callers holding no workstream or
+        manager lock.
 
         The maintenance owner is shared per process; sessions retain only a
         monotonic due timestamp. Permanent commit conflicts deliberately stay
@@ -2445,7 +2481,18 @@ class SessionManager:
                 if error_state_revision is not None
                 else None
             )
-            unresolved = _session_has_unresolved_persistence(session)
+            if blocking:
+                unresolved = _session_has_unresolved_persistence(session)
+            else:
+                probed = _session_unresolved_persistence_nowait(session)
+                if probed is None:
+                    # Probe contended: another caller holds the generation/
+                    # handoff locks this instant.  Nothing on this sweep is
+                    # due enough to block a live commit for — the next
+                    # one-second pass re-probes.  One-shot callers pass
+                    # ``blocking`` instead; for them there is no next pass.
+                    continue
+                unresolved = probed
             attempted = False
             if unresolved:
                 try:
@@ -2783,7 +2830,11 @@ class SessionManager:
             if not candidates:
                 if not persistence_recovery_attempted:
                     persistence_recovery_attempted = True
-                    self.reconcile_unresolved_persistence()
+                    # One shot, and the latch below makes it the only one:
+                    # force a definite probe rather than skipping the
+                    # contended sessions that are the likeliest reason this
+                    # candidate list came back empty.  No lock is held here.
+                    self.reconcile_unresolved_persistence(blocking=True)
                     continue
                 raise RuntimeError(f"All {self._max_active} slots are active")
 

@@ -761,3 +761,36 @@ def test_coordinator_maintenance_reconciles_when_idle_eviction_is_disabled() -> 
     assert manager.reconcile_calls == 2
     assert manager.close_calls == 0
     assert manager.reap_calls == 1
+
+
+def test_capacity_reconcile_forces_a_definite_probe(tmp_db: Any) -> None:
+    """``_reserve_and_install``'s last-chance repair runs ONCE, so it must
+    not skip a session whose locks are momentarily held.
+
+    The maintenance sweep probes without blocking and re-probes a second
+    later; this caller has no second pass — and the sessions likeliest to
+    be contended are exactly the ones whose unresolved journals emptied
+    its candidate list, so skipping them turns a repairable capacity
+    stall into ``All N slots are active``."""
+    manager, _adapter, _storage = _make_manager(max_active=1)
+    session = make_session()
+    ws = manager.create(user_id="u1", ws_id="cap-ws")
+    ws.session = session
+    ws.state = WorkstreamState.IDLE
+
+    probes: list[str] = []
+    session.has_unresolved_conversation_persistence = (  # type: ignore[method-assign]
+        lambda: probes.append("blocking") or False
+    )
+    session.has_unresolved_conversation_persistence_nowait = (  # type: ignore[attr-defined]
+        lambda: probes.append("nowait") or None
+    )
+
+    # The maintenance shape skips a contended session outright.
+    manager.reconcile_unresolved_persistence()
+    assert probes == ["nowait"]
+
+    # The one-shot capacity shape forces an answer instead.
+    probes.clear()
+    manager.reconcile_unresolved_persistence(blocking=True)
+    assert probes == ["blocking"]

@@ -699,20 +699,20 @@ function createCoordinatorPane(root, wsId, opts) {
   // an older snapshot landing late can neither double-render nor clear
   // the staleness latch over a newer truth.
   let refetchSeq = 0;
-  // EVERY in-flight /history AbortController — destroy() aborts them all
-  // so a slow fetch cannot pin the destroyed pane's closure for the
-  // bound's full 15s (the same dead-not-inert ruling destroy() applies
-  // to staleRetryTimer).  A Set, not a single slot (r9): overlapping
-  // dispatches settle in any order, and a newest-wins slot nulled by
-  // the newer dispatch's finally left the OLDER fetch unabortable.
-  const histCtrls = new Set();
-  // Logical deadlines paired with those controllers. AbortController is an
-  // optimization, not the settle guarantee: older runtimes can lack it and
-  // an underlying request can ignore abort. The race still releases repair
-  // state at 15s, while a late request has no render continuation.  Holds
-  // the module handles — retirement always goes through handle.dispose(),
+  // EVERY in-flight /history attempt as ONE composite { ctrl, deadline }
+  // record — destroy() aborts the fetch AND disposes the logical deadline
+  // from the same entry, so a future attempt site cannot register into
+  // one bookkeeping structure and not the other (an unaborted fetch pins
+  // the destroyed pane's closure for the bound's full 15s; an undisposed
+  // deadline leaves its timer + settle slot alive past destroy — the
+  // dead-not-inert ruling either way).  A Set, not a single slot (r9):
+  // overlapping dispatches settle in any order, and a newest-wins slot
+  // nulled by the newer dispatch's finally left the OLDER fetch
+  // unabortable.  `ctrl` is null on runtimes without AbortController —
+  // an optimization, not the settle guarantee; the deadline is
+  // unconditional and retirement always goes through handle.dispose(),
   // never direct state-slot pokes.
-  const histDeadlines = new Set();
+  const histAttempts = new Set();
   // call_ids of tool calls whose results are still ARRIVING ON THE LIVE
   // STREAM — the render-time gate's tool-phase liveness signal.  Fed
   // ONLY by live SSE events (tool_pending / tool_info add, tool_result
@@ -6365,11 +6365,11 @@ function createCoordinatorPane(root, wsId, opts) {
     // retry on later organic edges against a fresh attempt.
     const histCtrl =
       typeof AbortController === "function" ? new AbortController() : null;
-    if (histCtrl) histCtrls.add(histCtrl);
     const deadlineHandle = createHistoryHandoffDeadline(() => {
       if (histCtrl) histCtrl.abort();
     }, HISTORY_HANDOFF_FETCH_TIMEOUT_MS);
-    histDeadlines.add(deadlineHandle);
+    const attempt = { ctrl: histCtrl, deadline: deadlineHandle };
+    histAttempts.add(attempt);
     try {
       hist = await Promise.race([
         getJSON(
@@ -6383,8 +6383,7 @@ function createCoordinatorPane(root, wsId, opts) {
       hist = null;
     } finally {
       deadlineHandle.dispose();
-      histDeadlines.delete(deadlineHandle);
-      if (histCtrl) histCtrls.delete(histCtrl);
+      histAttempts.delete(attempt);
       refetchesInFlight--;
     }
     // A FAILED fetch keeps the pane intact: the wipe + tracking resets
@@ -6925,18 +6924,17 @@ function createCoordinatorPane(root, wsId, opts) {
     // Abort every in-flight /history for the same reason: the 15s bound
     // alone would keep the detached pane's closure alive until it fired
     // (the settled fetches' renders then discard via the !hist path).
-    histCtrls.forEach((c) => {
-      try {
-        c.abort();
-      } catch (_) {
-        /* noop */
+    histAttempts.forEach((attempt) => {
+      if (attempt.ctrl) {
+        try {
+          attempt.ctrl.abort();
+        } catch (_) {
+          /* noop */
+        }
       }
+      attempt.deadline.dispose({ expire: true, resolve: true });
     });
-    histCtrls.clear();
-    histDeadlines.forEach((handle) =>
-      handle.dispose({ expire: true, resolve: true }),
-    );
-    histDeadlines.clear();
+    histAttempts.clear();
     [
       cancelTimeoutId,
       forceTimeoutId,

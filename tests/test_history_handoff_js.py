@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._js_harness_helpers import extract_braced as _extract_braced
 from tests._js_harness_helpers import strip_js_comments as _strip_comments
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -20,7 +21,6 @@ _INTERACTIVE = _ROOT / "turnstone/shared_static/interactive.js"
 _COORDINATOR = _ROOT / "turnstone/console/static/coordinator/coordinator.js"
 _SHARED_HANDOFF = _ROOT / "turnstone/shared_static/history_handoff.js"
 _QUEUE = _ROOT / "turnstone/shared_static/composer_queue.js"
-_HANDOFF = _ROOT / "turnstone/shared_static/history_handoff.js"
 _TOOL_PROJECTION = _ROOT / "turnstone/shared_static/tool_projection.js"
 _PY_SDK = _ROOT / "turnstone/sdk/server.py"
 _PY_CHANNEL = _ROOT / "turnstone/channels/_sse.py"
@@ -43,51 +43,9 @@ def _run_module(tmp_path: Path, source: str) -> None:
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
 
 
-def _extract_braced(source: str, signature: str) -> str:
-    """Extract one JS function/method body without maintaining a source copy."""
-
-    start = source.index(signature)
-    brace = start + len(signature) - 1
-    assert source[brace] == "{"
-    depth = 0
-    quote = ""
-    escaped = False
-    line_comment = False
-    block_comment = False
-    i = brace
-    while i < len(source):
-        ch = source[i]
-        nxt = source[i + 1] if i + 1 < len(source) else ""
-        if line_comment:
-            if ch == "\n":
-                line_comment = False
-        elif block_comment:
-            if ch == "*" and nxt == "/":
-                block_comment = False
-                i += 1
-        elif quote:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == quote:
-                quote = ""
-        elif ch == "/" and nxt == "/":
-            line_comment = True
-            i += 1
-        elif ch == "/" and nxt == "*":
-            block_comment = True
-            i += 1
-        elif ch in {'"', "'", "`"}:
-            quote = ch
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return source[start : i + 1]
-        i += 1
-    raise AssertionError(f"unterminated JavaScript function: {signature}")
+# ``_extract_braced`` is the shared comment-and-string-aware brace walker
+# from tests/_js_harness_helpers — one implementation for every suite, so
+# the per-suite walkers cannot diverge on comment handling or bounds.
 
 
 def _as_function(source: str, signature: str) -> str:
@@ -256,7 +214,7 @@ import {{
   HISTORY_HANDOFF_FETCH_TIMEOUT_MS,
   HISTORY_HANDOFF_MAX_ATTEMPTS,
   historyHandoffAttemptAllowed,
-}} from {json.dumps(_HANDOFF.as_uri())};
+}} from {json.dumps(_SHARED_HANDOFF.as_uri())};
 if (HISTORY_HANDOFF_MAX_ATTEMPTS !== 4) throw new Error("attempt budget");
 if (HISTORY_HANDOFF_FETCH_TIMEOUT_MS !== 15000) throw new Error("deadline");
 for (let attempts = 0; attempts < 4; attempts++) {{
@@ -1091,6 +1049,20 @@ if (host.consumed.length !== 1 || host.consumed[0].join(",") !== "a1")
 acceptUserTurnEvent(own, host);
 if (host.painted.length !== 1 || host.consumed.length !== 1)
   throw new Error("a replayed event id projected twice");
+
+// The create path: the viewer's own accepted first turn carries consumed
+// attachment ids but matched NO optimistic bubble (the create dispatch never
+// made one).  The chip sync must follow the viewer policy, not the
+// matched-bubble gate — a rehydrated pending chip for a spent upload would
+// re-submit a drained id on the next send.
+host = makeHost([]);
+acceptUserTurnEvent(
+  {{ _event_id: 5, sender: "alice",
+     attachments: [{{ attachment_id: "c1" }}], content: "first turn" }},
+  host,
+);
+if (host.consumed.length !== 1 || host.consumed[0].join(",") !== "c1")
+  throw new Error("create-dispatched turn did not clear its composer chips");
 
 // A wake-driven turn paints the marker instead of a user bubble, and is still
 // recorded so its own replay stays inert.

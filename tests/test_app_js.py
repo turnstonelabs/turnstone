@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._js_harness_helpers import slice_braced_block
 from tests._js_harness_helpers import strip_js_comments as _strip_js_comments
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
@@ -1336,46 +1337,15 @@ def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
 # cleanly into a standalone node invocation.
 
 
-def _slice_balanced_body(body: str, anchor: int) -> str | None:
-    """Slice ``body`` from ``anchor`` (which must point at or just before
-    the opening ``{`` of a block) up to and including the matching ``}``.
-    Tracks brace depth + string state so the slice is robust to comment
-    growth and arbitrary body reorganisation.  Returns ``None`` if the
-    matching brace isn't found within a reasonable window.
-
-    Used to slice JS handler / function bodies for static assertions
-    without committing to a fixed character window."""
-    n = len(body)
-    i = body.find("{", anchor)
-    if i == -1 or i - anchor > 200:
-        return None
-    depth = 0
-    in_str: str | None = None
-    start = i
-    # 12000: connectSSE reached ~7950 chars during the 2026-07 SSE
-    # recovery campaign (cursor-override + capture-rationale comments);
-    # the window exists to bound a runaway scan, not to cap legitimate
-    # method growth — keep it comfortably above the largest real body.
-    while i < n and i - start < 12000:
-        ch = body[i]
-        if in_str:
-            if ch == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        if ch in ('"', "'", "`"):
-            in_str = ch
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return body[start : i + 1]
-        i += 1
-    return None
+# ``_slice_balanced_body`` is the shared comment-and-string-aware brace
+# walker from tests/_js_harness_helpers (imported at the top of this
+# file).  Comment awareness is a strict superset of the old string-only
+# local: most callers here pre-strip, where the two agree exactly, and a
+# few pass raw source (the persistence-badge and beforeunload pins),
+# where the shared walker is the more correct of the two — braces inside
+# comments no longer inflate its depth count.  One implementation means
+# a walker fix lands once for every suite.
+_slice_balanced_body = slice_braced_block
 
 
 def _slice_listener_body(body: str, event_name: str) -> str | None:
@@ -3052,8 +3022,9 @@ def test_strict_picker_requires_explicit_pick() -> None:
 def _slice_top_level_fn(body: str, header: str) -> str:
     """Slice a top-level ``function`` body from ``header`` to the next
     column-0 ``function`` declaration (or EOF).  Unlike
-    ``_slice_balanced_body`` this has no fixed-size window, so it is safe
-    for large functions like ``showNewWsModal``.  Nested (indented)
+    ``_slice_balanced_body`` this needs no balanced braces at all, so it
+    survives a body the walker would refuse (an unterminated block, or a
+    regex literal the walker misreads as a comment).  Nested (indented)
     ``function () {…}`` expressions never match the ``\\nfunction `` bound,
     so the slice stops at the next top-level function."""
     start = body.index(header)

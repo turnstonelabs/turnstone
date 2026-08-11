@@ -46,6 +46,30 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
+def _emit_coord_ui(ui: Any, ws: Workstream, hook: str, *args: Any) -> None:
+    """Fire ONE coordinator UI hook in isolation.
+
+    The coord counterpart of the interactive route's ``_emit_send_ui``,
+    with the same contract for the same reason: convergence emits come in
+    pairs, and a failure in one hook (a listener-queue overflow inside the
+    stream-end flush, say) must not suppress the sibling that follows —
+    the missed one is invariably the ``idle`` state change whose absence
+    leaves the dashboard row stuck busy.
+    """
+    method = getattr(ui, hook, None)
+    if not callable(method):
+        return
+    try:
+        method(*args)
+    except Exception:
+        log.debug(
+            "coord_adapter.ui_hook_failed ws=%s hook=%s",
+            ws.id[:8],
+            hook,
+            exc_info=True,
+        )
+
+
 def _coord_display_name(ws: Workstream) -> str:
     """Resolve a coordinator's display name (``alias > title > name``).
 
@@ -394,9 +418,14 @@ class CoordinatorAdapter:
                 # force-abandoned, ``ws.worker_thread`` was cleared — don't
                 # emit spurious events over the successor's stream.
                 if ws_ref.worker_thread is me:
-                    state_change = getattr(session.ui, "on_state_change", None)
-                    if callable(state_change):
-                        state_change("idle")
+                    # Both hooks, like the interactive /send and retry
+                    # siblings: ConsoleCoordinatorUI INHERITS a concrete
+                    # on_stream_end from SessionUIBase (finishAssistantStream
+                    # + the tool-output batcher flush live behind it) — a
+                    # state_change alone leaves an unfinalized streaming
+                    # bubble and unflushed chunks on the pane.
+                    _emit_coord_ui(session.ui, ws_ref, "on_stream_end")
+                    _emit_coord_ui(session.ui, ws_ref, "on_state_change", "idle")
             except Exception:
                 # Attachments were resolved (peeked) from the per-node upload
                 # buffer, not soft-locked — there is no reservation to release
@@ -411,7 +440,13 @@ class CoordinatorAdapter:
                 # error for the cluster fan-out / dashboard via
                 # :meth:`ChatSession._record_fatal_error`.  The adapter
                 # owns ONLY the worker-level cleanup (attachments,
-                # logging) above.
+                # logging) above — plus the one thing send() cannot emit
+                # for a raise that escaped its envelope: the stream-end
+                # hook, whose absence leaves the pane's assistant bubble
+                # unfinalized and its tool-output batch unflushed (the
+                # interactive sibling has always emitted it here).
+                if ws_ref.worker_thread is me:
+                    _emit_coord_ui(session.ui, ws_ref, "on_stream_end")
 
         def _enqueue() -> None:
             # Queued user turns can't carry attachments (see

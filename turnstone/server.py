@@ -268,14 +268,8 @@ class WebUI(SessionUIBase):
         ws = mgr.get(self.ws_id)
         if ws is None:
             return
-        with self._ws_lock:
-            payload = {
-                "tokens": self._ws_prompt_tokens + self._ws_completion_tokens,
-                "context_ratio": self._ws_context_ratio,
-                "activity": self._ws_current_activity,
-                "activity_state": self._ws_activity_state,
-                "content": "",
-            }
+        payload = self.snapshot_state_payload_non_consuming()
+        payload["content"] = ""
         self._publish_global_state_snapshot(ws.state.value, payload, include_content=False)
 
     def _broadcast_activity(self) -> None:
@@ -802,18 +796,6 @@ def _audit_retry_workstream(
     )
 
 
-def _interactive_events_preamble(
-    ws: Workstream,
-    ui: Any,
-    request: Request,  # noqa: ARG001 — preamble is request-independent
-) -> Iterable[dict[str, Any]]:
-    """Idempotent connected/status preamble used on every SSE path."""
-    session = ws.session
-    if session is None:
-        return
-    yield from session_replay_preamble(session, ui)
-
-
 def _interactive_events_replay(
     ws: Workstream, ui: Any, request: Request
 ) -> Iterable[dict[str, Any]]:
@@ -839,10 +821,10 @@ def _interactive_events_replay(
         # session can still be detached on the close-then-reopen path.
         return
 
-    # Connected + status preamble — same shape coord replays use; the
-    # shared helper keeps the two surfaces from drifting on a future
-    # field add.
-    yield from _interactive_events_preamble(ws, ui, request)
+    # Connected + status preamble — same shape coord replays and the
+    # lifted reconnect path use; one shared function, no per-kind
+    # wrapper, so a future field add cannot land on one surface only.
+    yield from session_replay_preamble(ws.session, ui)
 
     # Pending approval re-injection (so a reconnecting tab sees the
     # prompt) + cached LLM verdicts received since the prompt fired.
@@ -5414,7 +5396,6 @@ def create_app(
         open_resolve_alias=_resolve_workstream_alias,
         open_post_load=_interactive_open_post_load,
         events_replay=_interactive_events_replay,
-        events_preamble=_interactive_events_preamble,
         # Pre-lift ``events_sse`` used the dedicated 200-thread
         # ``sse_executor`` so SSE polling stayed isolated from
         # every other ``asyncio.to_thread`` caller in the process

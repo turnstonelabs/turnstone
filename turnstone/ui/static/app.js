@@ -925,9 +925,17 @@ function closeWorkstream(wsId) {
     body: "{}",
   })
     .then(function (r) {
-      return r.json().then(function (data) {
-        return { data: data, status: r.status };
-      });
+      // Non-JSON fallback (proxy 502/504 HTML, empty body): keep the HTTP
+      // status so the 409 arm still fires — the sibling postAndSettleSend
+      // handles exactly this proxy case the same way.
+      return r
+        .json()
+        .catch(function () {
+          return {};
+        })
+        .then(function (data) {
+          return { data: data, status: r.status };
+        });
     })
     .then(function (result) {
       const data = result.data;
@@ -943,7 +951,14 @@ function closeWorkstream(wsId) {
         );
       } else if (data.error) {
         showToast(data.error, "warning");
+      } else {
+        showToast("Couldn't end the session. Try again shortly.", "warning");
       }
+    })
+    .catch(function () {
+      // Transport failure: the close may not have reached the server at
+      // all — say so instead of leaving the pane open with no feedback.
+      showToast("Couldn't end the session. Try again shortly.", "warning");
     });
 }
 

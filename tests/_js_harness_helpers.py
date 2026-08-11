@@ -45,6 +45,80 @@ def demodulize(path: Path) -> str:
     return src
 
 
+def slice_braced_block(source: str, anchor: int) -> str | None:
+    """Slice the ``{ … }`` block starting at/just after ``anchor``.
+
+    THE brace walker every JS harness suite shares (the comment-AND-
+    string-aware superset of the per-suite predecessors, which disagreed
+    on comment handling and window bounds — the same source
+    reorganization could pass one suite's structural pin while breaking
+    the other's with a slice-dependent failure).  Comment awareness makes
+    it correct on raw AND pre-stripped input alike.  Returns ``None``
+    when no ``{`` opens within 200 chars of ``anchor`` (a missing brace
+    must not silently slice some later unrelated block) or the block is
+    unterminated.
+    """
+    start = source.find("{", anchor)
+    if start == -1 or start - anchor > 200:
+        return None
+    depth = 0
+    quote = ""
+    escaped = False
+    line_comment = False
+    block_comment = False
+    i = start
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ""
+        if line_comment:
+            if ch == "\n":
+                line_comment = False
+        elif block_comment:
+            if ch == "*" and nxt == "/":
+                block_comment = False
+                i += 1
+        elif quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+        elif ch == "/" and nxt == "/":
+            line_comment = True
+            i += 1
+        elif ch == "/" and nxt == "*":
+            block_comment = True
+            i += 1
+        elif ch in {'"', "'", "`"}:
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : i + 1]
+        i += 1
+    return None
+
+
+def extract_braced(source: str, signature: str) -> str:
+    """Extract one JS function/method (signature included) — raising form.
+
+    ``signature`` must end at its opening ``{``.  The loud sibling of
+    :func:`slice_braced_block` for suites that treat a missing or
+    unterminated function as a hard failure rather than a skip.
+    """
+    start = source.index(signature)
+    brace = start + len(signature) - 1
+    if source[brace] != "{":
+        raise AssertionError(f"signature does not end at an opening brace: {signature}")
+    block = slice_braced_block(source, brace)
+    if block is None:
+        raise AssertionError(f"unterminated JavaScript function: {signature}")
+    return source[start:brace] + block
+
+
 def strip_js_comments(source: str) -> str:
     """Strip ``//`` and ``/* */`` comments for source-pattern assertions —
     the single implementation every JS harness suite shares.

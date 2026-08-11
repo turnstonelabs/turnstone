@@ -558,25 +558,33 @@ def prepare_attachment_commit(
     if not commit_key:
         raise ValueError("atomic attachment commit requires a commit_key")
     attachment_ids, blobs = prepare_attachment_writes(attachments)
-    stored_content = sanitize_text(content)
-    if stored_content is None:  # ``content`` is typed str; defensive at the boundary.
+    if sanitize_text(content) is None:  # ``content`` is typed str; defensive at the boundary.
         raise TypeError("atomic attachment content must be text")
-    values = {
-        "ws_id": ws_id,
-        "timestamp": now,
-        "role": role,
-        "content": stored_content,
-        "tool_name": tool_name,
-        "tool_call_id": tool_call_id,
-        "provider_data": None,
-        "tool_calls": None,
-        "_source": sanitize_text(source),
-        "event_id": event_id,
-        "is_error": is_error,
-        "attachments": json.dumps(attachment_ids),
-        "meta": meta,
-        "commit_key": commit_key,
-    }
+    # The commit-identity dict comes from the ONE builder both commit lanes
+    # share — a column added to the commit identity reaches the plain and
+    # attachment lanes' inserts AND their conflict rechecks together (a
+    # hand-synced sibling here would let attachment retries validate
+    # against a stale field set on both dialects).  The attachment lane's
+    # only additions: the native lane is structurally empty (attachments
+    # never carry provider blocks) and the ordered reference list rides
+    # the ``attachments`` column.
+    values = prepare_conversation_row_values(
+        ws_id,
+        role,
+        content,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        provider_data=None,
+        tool_calls=None,
+        source=source,
+        event_id=event_id,
+        is_error=is_error,
+        producer=None,
+        meta=meta,
+        commit_key=commit_key,
+        now=now,
+    )
+    values["attachments"] = json.dumps(attachment_ids)
     return attachment_ids, blobs, values
 
 

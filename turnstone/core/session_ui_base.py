@@ -4393,3 +4393,22 @@ class SessionUIBase:
             "activity_state": activity_state,
             "content": content,
         }
+
+    def snapshot_state_payload_non_consuming(self) -> dict[str, Any]:
+        """Locked counters snapshot for observational operator-row refreshes.
+
+        The non-consuming sibling of :meth:`snapshot_and_consume_state_payload`
+        for hooks that must NOT touch the terminal turn-content accumulator
+        (the persistence refresh reports a journal transition, not a state
+        transition).  Both kinds' ``on_persistence_state_changed`` read
+        through here so the interactive dashboard and the console cluster
+        row cannot silently disagree after the same journal event — a
+        snapshot field added here reaches both surfaces at once.
+        """
+        with self._ws_lock:
+            return {
+                "tokens": self._ws_prompt_tokens + self._ws_completion_tokens,
+                "context_ratio": self._ws_context_ratio,
+                "activity": self._ws_current_activity,
+                "activity_state": self._ws_activity_state,
+            }

@@ -3684,15 +3684,6 @@ def _audit_retry_coordinator(
     )
 
 
-def _coord_events_preamble(
-    ws: Workstream,
-    ui: Any,
-    request: Request,  # noqa: ARG001 — coord replay doesn't need request context
-) -> Iterable[dict[str, Any]]:
-    """Idempotent connected/status preamble used on every SSE path."""
-    yield from session_replay_preamble(ws.session, ui)
-
-
 def _coord_events_replay(
     ws: Workstream,
     ui: Any,
@@ -3717,7 +3708,7 @@ def _coord_events_replay(
 
     Pure read — never mutates ``ui`` / ``ws`` / ``session``.
     """
-    yield from _coord_events_preamble(ws, ui, request)
+    yield from session_replay_preamble(ws.session, ui)
 
     # EVERY live approval cycle replays (parallel task agents can have
     # several outstanding), each card followed once by the cached LLM
@@ -15785,7 +15776,6 @@ def create_app(
         spawn_metrics=_coord_spawn_metrics,
         emit_message_queued=True,
         events_replay=_coord_events_replay,
-        events_preamble=_coord_events_preamble,
         create_supports_attachments=True,
         create_supports_user_id_override=False,
         # Coordinator creates honour ``server.require_project`` exactly like

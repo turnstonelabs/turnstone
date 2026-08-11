@@ -3898,8 +3898,16 @@ class Pane {
               buildPreviewChip(msg.preview, (d) => this._host.onPreview(d)),
             );
           }
+          // A row naming a call_id this batch does not own is an ORPHAN
+          // (a result for an earlier batch, or a second writer's append)
+          // — it must not stamp THIS batch as failed.  The shared outcome
+          // index skips unmatched occurrences for the same reason.  A row
+          // with no call_id at all is the legacy positional case and does
+          // belong to the preceding batch, so it still stamps.
+          const isOrphanResult = !!msg.tool_call_id && !resultTarget;
           if (
             isToolError &&
+            !isOrphanResult &&
             !lastToolBlock.classList.contains("conv-batch--denied")
           ) {
             lastToolBlock.classList.add("conv-batch--error");
@@ -3960,7 +3968,13 @@ class Pane {
         if (msg.event_id != null) {
           this._renderedSystemEventIds.add(String(msg.event_id));
         }
-        lastToolBlock = null;
+        // Deliberately does NOT null lastToolBlock: a system row is not a
+        // turn boundary.  The batch's result window ends at the next
+        // assistant/user row (both reset the anchor in their own
+        // branches) — same rule as indexHistoryToolOutcomes.  Nulling
+        // here made every tool result AFTER an interleaved system row
+        // (mid-turn operator context, a second writer's append) silently
+        // vanish from this pane while the coordinator rendered it.
       }
     }
     // Flush any output_assessments left in the map — these correspond

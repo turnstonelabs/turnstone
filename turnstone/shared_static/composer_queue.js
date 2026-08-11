@@ -623,15 +623,27 @@ export function acceptUserTurnEvent(evt, host) {
   const eventId = evt._event_id != null ? String(evt._event_id) : null;
   if (eventId && host.renderedEventIds.has(eventId)) return;
   const viewer = viewerUserId();
-  const matched = clientSendMaySettleForViewer(evt.sender, viewer)
-    ? settleAcceptedClientSends(
-        host.messagesEl,
-        host.queue,
-        evt.client_send_ids,
-        true,
-      )
-    : [];
-  if (matched.length && Array.isArray(evt.attachments)) {
+  const maySettle = clientSendMaySettleForViewer(evt.sender, viewer);
+  if (maySettle) {
+    // Called for the side effect — it settles and removes this viewer's
+    // optimistic bubbles.  Nothing below gates on how many it matched:
+    // an accepted turn with no local bubble (a create dispatch) still
+    // owns its attachment consumption.
+    settleAcceptedClientSends(
+      host.messagesEl,
+      host.queue,
+      evt.client_send_ids,
+      true,
+    );
+  }
+  // Chip sync follows the same viewer policy as bubble settling — NOT the
+  // matched-bubble gate: a create-dispatched first turn (or any accepted
+  // turn whose optimistic bubble this tab never held) carries consumed
+  // attachment ids whose staged uploads are spent.  A rehydrated pending
+  // chip left behind re-submits a drained id on the next send (spurious
+  // dropped-attachment warning) or double-delivers on a racing one.  A
+  // known-DIFFERENT sender still never clears this viewer's chips.
+  if (maySettle && Array.isArray(evt.attachments)) {
     host.consumeAttachments(
       evt.attachments.map((item) => item && item.attachment_id).filter(Boolean),
     );
