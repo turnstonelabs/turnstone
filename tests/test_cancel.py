@@ -225,6 +225,9 @@ class _ObservedRLock:
     def release(self) -> None:
         self._lock.release()
 
+    def locked(self) -> bool:
+        return self._lock.locked()
+
     def __enter__(self):
         self.acquire()
         return self
