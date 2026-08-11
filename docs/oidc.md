@@ -124,11 +124,14 @@ allow_private_network = true
 or via `TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK=true` (the env var wins
 when both are set).
 
-The opt-in admits private-range (RFC 1918), unique-local, CGNAT
-(100.64/10 — tailnets), and loopback addresses. Link-local, multicast,
-and reserved ranges stay refused even with the opt-in — cloud metadata
-services (169.254.169.254) live there, and no legitimate IdP does. The
-HTTPS requirement and the same-origin endpoint checks are unaffected.
+The opt-in admits private-range (RFC 1918), unique-local, site-local,
+CGNAT (100.64/10, where overlay VPNs commonly assign hosts), and
+loopback addresses. Link-local, multicast, reserved ranges and known
+cloud-metadata endpoints stay refused even with the opt-in — no
+legitimate IdP lives there. An address is judged by what it actually
+reaches, so an IPv6 transition address (NAT64, 6to4, Teredo) wrapping
+an internal IPv4 is treated exactly as that IPv4 would be. The HTTPS
+requirement and the same-origin endpoint checks are unaffected.
 
 This knob only affects the login-flow IdP configured here. OAuth
 endpoints advertised by remote MCP servers are untrusted input and are

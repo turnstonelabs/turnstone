@@ -21,9 +21,15 @@ transport is a future hardening step.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
-import socket
 import urllib.parse
+
+from turnstone.core.ip_classify import (
+    AddressLane,
+    ResolutionError,
+    describe_address,
+    reaches_only_loopback,
+    resolve_and_classify,
+)
 
 # ---------------------------------------------------------------------------
 # Trusted-host allowlist for well-known multi-origin IdPs / authorization
@@ -134,46 +140,84 @@ def validate_url_no_ssrf(
     IdP lives in those ranges. Non-public rejections raise the
     :class:`OAuthSSRFPrivateAddressError` subclass so callers that *have*
     an opt-in can point the operator at it.
-    """
-    parsed = urllib.parse.urlparse(url)
 
-    hostname = parsed.hostname
+    Both knobs judge an IPv6 transition address (NAT64, 6to4, Teredo,
+    IPv4-mapped, IPv4-compatible) by the IPv4 address it routes to rather
+    than by the wrapper — see :mod:`turnstone.core.ip_classify`. A NAT64
+    address embedding 192.168.1.5 is therefore treated exactly as
+    192.168.1.5 would be: allowed under ``allow_private``, refused
+    without it.
+
+    ``http://`` on a localhost hostname additionally requires every resolved
+    address to *be* loopback. ``*.localhost`` is ordinary DNS, so a hostile
+    authority can point it anywhere; the name alone is not evidence, and
+    accepting it would put an OIDC token exchange — ``client_secret`` and
+    authorization code included — on the wire in the clear.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        hostname = parsed.hostname
+        _ = parsed.port  # parsed lazily; raises for an out-of-range value
+    except ValueError as exc:
+        # Callers catch OAuthSSRFError only, and the URL can come from a
+        # hostile MCP server's discovery document — a bare ValueError here
+        # would escape discovery instead of becoming a clean refusal.
+        raise OAuthSSRFError(f"endpoint URL is malformed: {url}") from exc
+
     if not hostname:
         raise OAuthSSRFError(f"endpoint URL has no hostname: {url}")
 
     if parsed.username or parsed.password:
         raise OAuthSSRFError("endpoint URL must not contain embedded credentials (userinfo)")
 
+    # Cleartext is permitted only for a genuine loopback dev server. The
+    # hostname is not evidence of that — ``*.localhost`` is ordinary DNS a
+    # hostile authority answers however it likes — so the verdict is deferred
+    # until resolution proves loopback below. Deciding it here on the name
+    # alone would send an OIDC token exchange, client_secret and all, in the
+    # clear to whatever address that name happens to return.
+    http_pending_loopback_proof = False
     if parsed.scheme != "https":
         if allow_http and parsed.scheme == "http" and is_localhost(hostname):
-            pass
+            http_pending_loopback_proof = True
         else:
             raise OAuthSSRFError(f"endpoint URL must use HTTPS (got {parsed.scheme}://): {url}")
 
+    # ``resolve_and_classify`` raises rather than returning an empty list, so the
+    # deferred cleartext verdict below cannot be granted by default when a name
+    # answers with nothing.
     try:
-        addr_infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise OAuthSSRFError(f"endpoint hostname cannot be resolved: {hostname}") from exc
+        classified = resolve_and_classify(hostname)
+    except ResolutionError as exc:
+        raise OAuthSSRFError(f"endpoint hostname {exc}: {url}") from exc
 
-    for _family, _type, _proto, _canonname, sockaddr in addr_infos:
-        try:
-            addr = ipaddress.ip_address(sockaddr[0])
-        except ValueError as exc:
+    for lane, addr in classified:
+        # Ordered so the refusal names the real problem. Deciding the scheme
+        # first reports a metadata address as merely "must use HTTPS", and an
+        # operator acting on that re-registers the same endpoint over TLS
+        # without ever learning it pointed at the instance metadata service.
+        if lane is AddressLane.NEVER:
             raise OAuthSSRFError(
-                f"endpoint hostname resolved to invalid IP {sockaddr[0]!r}: {hostname}"
-            ) from exc
-        if addr.is_global or is_localhost(hostname):
+                f"endpoint URL resolves to a link-local/multicast/unspecified/"
+                f"reserved/metadata address ({describe_address(addr)}), refused "
+                f"even with private addresses allowed: {url}"
+            )
+        # Cleartext must reach loopback and nothing else, on every record.
+        if http_pending_loopback_proof and not reaches_only_loopback(addr):
+            raise OAuthSSRFError(
+                f"endpoint URL must use HTTPS: {hostname} does not resolve to "
+                f"loopback ({describe_address(addr)}): {url}"
+            )
+        if lane is AddressLane.PUBLIC or allow_private:
             continue
-        if allow_private:
-            if addr.is_link_local or addr.is_multicast or addr.is_unspecified or addr.is_reserved:
-                raise OAuthSSRFError(
-                    f"endpoint URL resolves to a link-local/multicast/"
-                    f"unspecified/reserved address ({addr}), refused even "
-                    f"with private addresses allowed: {url}"
-                )
+        # The localhost development lane, gated on the RESOLVED address rather
+        # than the hostname — and on the same predicate as the cleartext gate,
+        # since two spellings of "reaches loopback" disagree for a Teredo
+        # wrapper whose server half is loopback and whose client half is not.
+        if is_localhost(hostname) and reaches_only_loopback(addr):
             continue
         raise OAuthSSRFPrivateAddressError(
-            f"endpoint URL resolves to non-public address ({addr}): {url}"
+            f"endpoint URL resolves to non-public address ({describe_address(addr)}): {url}"
         )
 
     return parsed

@@ -235,7 +235,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "can be approved instead of being refused outright — the approval prompt "
             "marks it as a private-network request. A public site that redirects into "
             "your private network is still refused either way: that address never "
-            "appeared in the approval prompt, so it is never fetched.",
+            "appeared in the approval prompt, so it is never fetched. Cloud metadata "
+            "endpoints and link-local, multicast and reserved addresses stay refused "
+            "even with this on, including as a redirect target from a private address "
+            "you approved — no legitimate service of yours lives there.",
         ),
         SettingDef(
             "tools.search",

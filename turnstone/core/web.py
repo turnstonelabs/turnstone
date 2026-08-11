@@ -1,12 +1,18 @@
 """Web utilities — HTML stripping, SSRF protection, and the guarded fetch."""
 
-import ipaddress
+import dataclasses
 import re
-import socket
 from html import unescape as _html_unescape
 from urllib.parse import urlparse
 
 import httpx
+
+from turnstone.core.ip_classify import (
+    AddressLane,
+    ResolutionError,
+    describe_address,
+    resolve_and_classify,
+)
 
 _RE_INVISIBLE = re.compile(
     r"<(script|style|template|noscript)\b[^>]*>.*?</\1\s*>",
@@ -92,36 +98,79 @@ def strip_html(html: str) -> str:
     return text.strip()
 
 
-def check_ssrf(url: str) -> str | None:
-    """Return error string if URL resolves to a private/link-local address, else None.
+@dataclasses.dataclass(frozen=True)
+class UrlScreen:
+    """The verdict on one URL: which lane, why, and whether it is wholly private."""
 
-    Checks both IPv4 and IPv6 addresses via getaddrinfo to prevent bypasses
-    using IPv6 loopback (``::1``), link-local (``fe80::``), or unique-local
-    (``fd00::``/``fc00::``) addresses.
+    lane: AddressLane
+    error: str | None
+    all_private: bool
+    """True when EVERY resolved address is private.
+
+    ``lane`` is the worst address, which is the right basis for refusing. It is
+    the wrong basis for treating a chain as "inside the operator's network": a
+    hostname with both a private and a public A record folds to PRIVATE, but the
+    connection may land on the public record, so the approval the operator gave
+    does not describe where the fetch actually goes.
+    """
+
+
+def screen_url(url: str) -> UrlScreen:
+    """Classify every address *url* resolves to and return the worst lane.
+
+    The test is "globally routable", not "not in a private range". Those are
+    not complements: CGNAT (100.64.0.0/10, RFC 6598 shared address space —
+    where overlay VPNs commonly assign internal hosts) is neither private nor
+    global, so a denylist let it through. IPv6 transition addresses are judged
+    by the IPv4 they route to rather than by the wrapper (see
+    :mod:`turnstone.core.ip_classify`).
+
+    Every resolved address is classified and the *worst* lane wins. Returning
+    on the first offending address would let a hostname whose first A record is
+    merely private mask a second record that is link-local: the caller would
+    see the approvable lane, and under the operator opt-in the whole hostname —
+    including the record it never looked at — would be fetched.
+
+    Fails closed. A resolution failure is a refusal, not a pass: the fetch that
+    follows resolves again, so an authority that answers the guard's query with
+    SERVFAIL and the fetch's query with an internal address would otherwise
+    turn the guard off for that hop. Malformed URLs are refusals too — every
+    exception path returns a verdict rather than raising, because the callers
+    screen model-supplied URLs and one of them prepares tools outside any
+    ``try``.
     """
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
-        if not hostname:
-            return "Invalid URL: no hostname"
-        # Resolve all address families (IPv4 + IPv6)
-        results = socket.getaddrinfo(hostname, parsed.port or 80, proto=socket.IPPROTO_TCP)
-        for _family, _type, _proto, _canonname, sockaddr in results:
-            addr = str(sockaddr[0])
-            # Strip IPv6 zone/scope identifier (e.g. "fe80::1%lo0")
-            addr_clean = addr.split("%", 1)[0] if "%" in addr else addr
-            try:
-                ip = ipaddress.ip_address(addr_clean)
-            except ValueError:
-                return f"Blocked: unable to parse resolved address ({addr})"
-            # Normalize IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1)
-            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-                ip = ip.ipv4_mapped
-            if ip.is_private or ip.is_loopback or ip.is_link_local:
-                return f"Blocked: URL resolves to private/internal address ({addr})"
-    except (socket.gaierror, OSError):
-        pass  # DNS failure — let the actual fetch handle it
-    return None
+        # ``urlsplit.port`` parses lazily and raises for an out-of-range value.
+        port = parsed.port or 80
+    except ValueError:
+        return UrlScreen(AddressLane.NEVER, f"Blocked: malformed URL ({url})", False)
+    if not hostname:
+        return UrlScreen(AddressLane.NEVER, "Invalid URL: no hostname", False)
+
+    try:
+        classified = resolve_and_classify(hostname, port)
+    except ResolutionError as exc:
+        return UrlScreen(AddressLane.NEVER, f"Blocked: {exc}", False)
+
+    worst, offender = max(classified, key=lambda item: item[0])
+    all_private = all(lane is AddressLane.PRIVATE for lane, _ in classified)
+
+    if worst is AddressLane.PUBLIC:
+        return UrlScreen(AddressLane.PUBLIC, None, False)
+    if worst is AddressLane.NEVER:
+        return UrlScreen(
+            worst,
+            "Blocked: URL resolves to a link-local/multicast/unspecified/"
+            f"reserved/metadata address ({describe_address(offender)})",
+            all_private,
+        )
+    return UrlScreen(
+        worst,
+        f"Blocked: URL resolves to private/internal address ({describe_address(offender)})",
+        all_private,
+    )
 
 
 FETCH_BYTE_CEILING = 32 * 1024 * 1024
@@ -148,13 +197,19 @@ def fetch_with_ssrf_guard(
     executing the private-network request even if the response is later
     discarded.  Here each hop's URL is screened BEFORE its request is issued.
 
-    ``allow_private_origin`` is the ``[tools] allow_private_network`` lane:
-    the CALLER sets it only when the operator opted in AND the ORIGINAL
-    target itself named a private address — the approval gate then saw and
-    approved that private URL, so its redirect chain is the operator's own
-    network and hop screening is skipped.  A public origin never sets it,
-    so a public site bouncing the fetcher into private space stays blocked
-    regardless of the opt-in: that hop was never shown to the approval gate.
+    EVERY hop is screened, in every mode.  ``allow_private_origin`` widens
+    which lanes are acceptable, it does not turn screening off: the caller
+    sets it only when the operator opted in AND the original target itself
+    named a private address, so the approval gate saw and approved that
+    private URL.
+
+    The permission is also revoked the moment the chain leaves that network.
+    Once any hop resolves PUBLIC, private hops are refused for the rest of the
+    chain — the operator approved their own hosts, not whatever a public site
+    picks next, so ``private -> public -> private`` cannot be used to steer the
+    fetcher into internal endpoints of an attacker's choosing.  The NEVER lane
+    is absolute throughout: approving a private origin says "this is my
+    network", which is not a claim about the cloud metadata endpoint.
 
     The body is streamed under a *max_bytes* budget rather than buffered
     blind — ``client.get()`` would read an unbounded body into memory before
@@ -173,16 +228,25 @@ def fetch_with_ssrf_guard(
     stays the caller's call.
     """
     current = url
+    private_allowed = allow_private_origin
     with httpx.Client(
         headers={"User-Agent": user_agent},
         timeout=timeout,
         follow_redirects=False,
     ) as client:
         for _hop in range(max_redirects + 1):
-            if not allow_private_origin:
-                ssrf_err = check_ssrf(current)
-                if ssrf_err:
-                    raise ValueError(ssrf_err)
+            screen = screen_url(current)
+            if screen.lane is AddressLane.NEVER:
+                raise ValueError(screen.error)
+            if screen.lane is AddressLane.PRIVATE and not private_allowed:
+                raise ValueError(screen.error)
+            if not screen.all_private:
+                # The chain can no longer be shown to be inside the operator's
+                # network — either the hop is public, or it merely CONTAINS a
+                # private record and the connection may land on a public one.
+                # Their approval covered their own hosts, not whatever a public
+                # site picks next, so private hops stop being allowed here on.
+                private_allowed = False
             with client.stream("GET", current) as resp:
                 if resp.status_code in _REDIRECT_STATUSES:
                     location = resp.headers.get("location")

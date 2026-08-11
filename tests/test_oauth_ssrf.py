@@ -104,7 +104,7 @@ class TestValidateUrlNoSSRF:
         assert parsed.hostname == "auth.corp.example.com"
 
     def test_allow_private_accepts_cgnat(self) -> None:
-        # 100.64/10 (RFC 6598, shared address space) — e.g. a tailnet-hosted IdP.
+        # 100.64/10 (RFC 6598, shared address space) — e.g. an overlay-VPN IdP.
         with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("100.64.0.7", 0))]):
             validate_url_no_ssrf("https://idp.tail.example", allow_http=False, allow_private=True)
 

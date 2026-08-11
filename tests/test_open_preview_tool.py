@@ -13,6 +13,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from turnstone.core.session import ChatSession
 from turnstone.core.trajectory import Role, turn_from_dict, turn_to_dict
 
@@ -38,6 +40,41 @@ class _RecordingUI:
 
     def on_tool_result(self, call_id, name, output, **kwargs):
         self.tool_results.append((call_id, name, output, kwargs))
+
+
+@pytest.fixture(autouse=True)
+def _no_network_screen(monkeypatch):
+    """Keep prepare-time SSRF screening off the network.
+
+    Screening fails closed on a resolution failure, so a test naming a
+    third-party host (``example.com``) would otherwise depend on live public
+    DNS and break on an isolated CI runner. IP literals are passed through to
+    the real screen — they resolve locally, and the tests that exercise the
+    private/never lanes are written with literals precisely so they exercise
+    the real classifier.
+    """
+    import ipaddress
+    from urllib.parse import urlparse
+
+    from turnstone.core import web
+
+    real = web.screen_url
+    permissive = _screen_stub()
+
+    def _screen(url):
+        try:
+            host = urlparse(url).hostname or ""
+        except ValueError:
+            return real(url)
+        if not host:
+            return real(url)  # malformed URLs are the real screen's business
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return permissive(url)
+        return real(url)
+
+    monkeypatch.setattr("turnstone.core.session.screen_url", _screen)
 
 
 def _make_session(**kwargs):
@@ -166,6 +203,10 @@ class TestExecOpenPreview:
             raise ValueError("Blocked: URL resolves to private/internal address (169.254.169.254)")
 
         monkeypatch.setattr("turnstone.core.session.fetch_with_ssrf_guard", _blocked)
+        # The prepare-time screen fails closed on an unresolvable host, and
+        # innocent.example does not resolve — stub it so this test exercises
+        # the executor's ValueError lane rather than the screen.
+        monkeypatch.setattr("turnstone.core.session.screen_url", _screen_stub())
         item = s._prepare_open_preview("c1", {"target": "https://innocent.example/"})
         _, msg = s._exec_open_preview(item)
         assert msg.startswith("Error: fetch failed: Blocked")
@@ -497,11 +538,32 @@ class _FakeClient:
         return _FakeClient.table[url]
 
 
+def _screen_stub(blocked=None):
+    """Stand in for the real per-hop screen, so tests need no DNS.
+
+    Patches what the guard actually calls. Patching a function the guard has
+    stopped calling would leave the test green while screening nothing.
+    """
+    from turnstone.core.ip_classify import AddressLane
+    from turnstone.core.web import UrlScreen
+
+    table = blocked or {}
+
+    def _screen(url):
+        err = table.get(url)
+        if err is None:
+            return UrlScreen(AddressLane.PUBLIC, None, False)
+        return UrlScreen(AddressLane.NEVER, err, False)
+
+    return _screen
+
+
 class TestFetchWithSsrfGuard:
-    def _wire(self, monkeypatch, table):
+    def _wire(self, monkeypatch, table, blocked=None):
         _FakeClient.calls = []
         _FakeClient.table = table
         monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.screen_url", _screen_stub(blocked))
 
     def test_follows_public_redirect_chain(self, monkeypatch):
         from turnstone.core.web import fetch_with_ssrf_guard
@@ -513,7 +575,6 @@ class TestFetchWithSsrfGuard:
                 "https://b.example/x": _FakeHop(200, {}, body=b"landed"),
             },
         )
-        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
         resp = fetch_with_ssrf_guard("https://a.example/", timeout=5)
         assert resp.status_code == 200
         assert _FakeClient.calls == ["https://a.example/", "https://b.example/x"]
@@ -528,9 +589,8 @@ class TestFetchWithSsrfGuard:
             {
                 "https://a.example/": _FakeHop(302, {"location": "http://169.254.169.254/latest"}),
             },
+            blocked={"http://169.254.169.254/latest": "Blocked: private"},
         )
-        blocked = {"http://169.254.169.254/latest": "Blocked: private"}
-        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: blocked.get(url))
         with pytest.raises(ValueError, match="Blocked: private"):
             fetch_with_ssrf_guard("https://a.example/", timeout=5)
         # The load-bearing assertion: the private hop was NEVER requested.
@@ -546,7 +606,6 @@ class TestFetchWithSsrfGuard:
                 "https://a.example/moved": _FakeHop(200, {}),
             },
         )
-        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
         resp = fetch_with_ssrf_guard("https://a.example/start", timeout=5)
         assert resp.status_code == 200
         # The realized response carries the FINAL hop's URL — open_preview's
@@ -562,7 +621,6 @@ class TestFetchWithSsrfGuard:
             monkeypatch,
             {"https://a.example/": _FakeHop(302, {"location": "https://a.example/"})},
         )
-        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
         with pytest.raises(ValueError, match="redirects"):
             fetch_with_ssrf_guard("https://a.example/", timeout=5)
 
@@ -575,7 +633,6 @@ class TestFetchWithSsrfGuard:
             monkeypatch,
             {"https://a.example/": _FakeHop(200, {}, body=[b"aaaa", b"bbbb", b"cccc"])},
         )
-        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
         with pytest.raises(ValueError, match="fetch limit"):
             fetch_with_ssrf_guard("https://a.example/", timeout=5, max_bytes=10)
 
@@ -593,7 +650,6 @@ class TestFetchWithSsrfGuard:
                 "https://b.example/x": _FakeHop(200, {}, body=b"ok"),
             },
         )
-        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
         resp = fetch_with_ssrf_guard("https://a.example/", timeout=5)
         assert resp.status_code == 200
         assert resp.content == b"ok"
@@ -615,7 +671,6 @@ class TestFetchWithSsrfGuard:
                 )
             },
         )
-        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
         resp = fetch_with_ssrf_guard("https://a.example/", timeout=5)
         # iter_bytes() hands the guard content-DECODED bytes — a surviving
         # content-encoding would make .text try to gunzip plain text, and the
@@ -717,13 +772,13 @@ class TestAllowPrivateNetwork:
     def test_screen_public_url_passes(self):
         from turnstone.core.session import _screen_tool_url
 
-        err, private = _screen_tool_url("https://example.com/x", False)
+        err, private, _block = _screen_tool_url("https://example.com/x", False)
         assert err is None and private is False
 
     def test_screen_private_blocked_with_discoverable_hint(self):
         from turnstone.core.session import _screen_tool_url
 
-        err, private = _screen_tool_url("http://10.0.0.7/grafana", False)
+        err, private, _block = _screen_tool_url("http://10.0.0.7/grafana", False)
         assert err is not None and private is False
         # The refusal teaches the knob (mirrors the oidc opt-in hint pattern).
         assert "tools.allow_private_network" in err
@@ -732,13 +787,13 @@ class TestAllowPrivateNetwork:
     def test_screen_private_allowed_when_opted_in(self):
         from turnstone.core.session import _screen_tool_url
 
-        err, private = _screen_tool_url("http://10.0.0.7/grafana", True)
+        err, private, _block = _screen_tool_url("http://10.0.0.7/grafana", True)
         assert err is None and private is True
 
     def test_screen_invalid_url_never_hints(self):
         from turnstone.core.session import _screen_tool_url
 
-        err, private = _screen_tool_url("http://", True)
+        err, private, _block = _screen_tool_url("http://", True)
         assert err is not None and private is False
         assert "allow_private_network" not in err
 
@@ -792,7 +847,13 @@ class TestAllowPrivateNetwork:
         s._exec_open_preview(item)
         assert seen["allow_private_origin"] is True
 
-    def test_guard_skips_hop_screen_for_private_origin(self, monkeypatch):
+    def test_guard_permits_private_hops_for_an_approved_private_origin(self, monkeypatch):
+        """Screening is not skipped for a private origin — it is WIDENED.
+
+        The operator approved a private URL, so the PRIVATE lane is acceptable
+        on this chain; every hop is still classified. (These are IP literals,
+        so the real screen resolves them without touching the network.)
+        """
         from turnstone.core.web import fetch_with_ssrf_guard
 
         _FakeClient.calls = []
@@ -801,14 +862,104 @@ class TestAllowPrivateNetwork:
             "http://10.0.0.8/b": _FakeHop(200, {}),
         }
         monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
-
-        def _explode(url):
-            raise AssertionError("hop screening must be skipped for a private origin")
-
-        monkeypatch.setattr("turnstone.core.web.check_ssrf", _explode)
         resp = fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5, allow_private_origin=True)
         assert resp.status_code == 200
         assert _FakeClient.calls == ["http://10.0.0.7/a", "http://10.0.0.8/b"]
+
+    def test_private_hop_refused_without_the_private_origin_flag(self, monkeypatch):
+        import pytest
+
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        _FakeClient.calls = []
+        _FakeClient.table = {"http://10.0.0.7/a": _FakeHop(200, {})}
+        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        with pytest.raises(ValueError, match="private/internal"):
+            fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5)
+        assert _FakeClient.calls == []
+
+    def test_mixed_record_hop_revokes_the_private_permission(self, monkeypatch):
+        """A hop that merely CONTAINS a private record must not keep the permission.
+
+        The revocation used to key on the folded lane, so a hop resolving to
+        both a private and an attacker-controlled public record folded to
+        PRIVATE, was fetched, and did NOT revoke — letting the attacker's
+        server steer the next hop back into private space.
+        """
+        import pytest
+
+        from turnstone.core import web
+        from turnstone.core.ip_classify import AddressLane
+        from turnstone.core.web import UrlScreen, fetch_with_ssrf_guard
+
+        _FakeClient.calls = []
+        _FakeClient.table = {
+            "http://10.0.0.7/a": _FakeHop(302, {"location": "http://mixed.example/b"}),
+            "http://mixed.example/b": _FakeHop(302, {"location": "http://10.0.0.1/admin"}),
+            "http://10.0.0.1/admin": _FakeHop(200, {}),
+        }
+        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+
+        real = web.screen_url
+
+        def _screen(url):
+            if "mixed.example" in url:
+                # Worst lane PRIVATE, but not wholly private.
+                return UrlScreen(AddressLane.PRIVATE, "Blocked: private/internal", False)
+            return real(url)
+
+        monkeypatch.setattr("turnstone.core.web.screen_url", _screen)
+        with pytest.raises(ValueError, match="private/internal"):
+            fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5, allow_private_origin=True)
+        assert _FakeClient.calls == ["http://10.0.0.7/a", "http://mixed.example/b"]
+
+    def test_public_bounce_revokes_the_private_permission(self, monkeypatch):
+        """``private -> public -> private`` must not reach the final hop.
+
+        The operator approved their own hosts, not whatever a public site
+        picks next. Without this, a LAN page serving attacker-authored content
+        could steer the fetcher into internal endpoints of the attacker's
+        choosing and hand back the response.
+        """
+        import pytest
+
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        _FakeClient.calls = []
+        _FakeClient.table = {
+            "http://10.0.0.7/wiki": _FakeHop(302, {"location": "http://93.184.216.34/"}),
+            "http://93.184.216.34/": _FakeHop(302, {"location": "http://10.0.0.1/admin"}),
+            "http://10.0.0.1/admin": _FakeHop(200, {}),
+        }
+        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        with pytest.raises(ValueError, match="private/internal"):
+            fetch_with_ssrf_guard("http://10.0.0.7/wiki", timeout=5, allow_private_origin=True)
+        assert _FakeClient.calls == ["http://10.0.0.7/wiki", "http://93.184.216.34/"]
+
+    def test_guard_still_blocks_metadata_hop_from_a_private_origin(self, monkeypatch):
+        """Approving a private origin says "this is my network" — not "and the IMDS".
+
+        The PRIVATE lane is not re-screened for an approved private origin (see
+        the test above), but the NEVER lane is absolute: a LAN host that is
+        compromised, or simply serving attacker-authored content, must not be
+        able to bounce the fetcher into the cloud metadata endpoint.
+        """
+        import pytest
+
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        _FakeClient.calls = []
+        _FakeClient.table = {
+            "http://10.0.0.7/a": _FakeHop(
+                302, {"location": "http://169.254.169.254/latest/meta-data/"}
+            ),
+            "http://169.254.169.254/latest/meta-data/": _FakeHop(200, {}),
+        }
+        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+
+        with pytest.raises(ValueError, match="link-local"):
+            fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5, allow_private_origin=True)
+        assert _FakeClient.calls == ["http://10.0.0.7/a"], "metadata hop was never issued"
 
     def test_registry_entry_shape(self):
         from turnstone.core.settings_registry import SETTINGS

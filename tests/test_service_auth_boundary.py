@@ -134,7 +134,7 @@ class TestVerifyCollectorServiceScope:
 
         app = _scope_probe_app(
             services=[
-                {"service_id": "node-1", "url": "http://node-1:8001"},
+                {"service_id": "node-1", "url": "http://127.0.0.1:8001"},
             ]
         )
 
@@ -159,7 +159,7 @@ class TestVerifyCollectorServiceScope:
         the drift at boot rather than chasing empty-dashboard reports."""
         from turnstone.console.server import _verify_collector_service_scope
 
-        app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://node-1:8001"}])
+        app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://127.0.0.1:8001"}])
 
         def handler(_req: httpx.Request) -> httpx.Response:
             return httpx.Response(403, text='{"error":"service scope required"}')
@@ -183,7 +183,7 @@ class TestVerifyCollectorServiceScope:
         class as 403 — refuse to serve."""
         from turnstone.console.server import _verify_collector_service_scope
 
-        app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://node-1:8001"}])
+        app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://127.0.0.1:8001"}])
 
         def handler(_req: httpx.Request) -> httpx.Response:
             return httpx.Response(401, text="unauthorized")
@@ -212,7 +212,7 @@ class TestVerifyCollectorServiceScope:
         Leave ``collector_scope_error`` empty and log a warning."""
         from turnstone.console.server import _verify_collector_service_scope
 
-        app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://node-1:8001"}])
+        app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://127.0.0.1:8001"}])
 
         def handler(_req: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("connection refused")

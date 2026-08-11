@@ -214,27 +214,27 @@ def try_parse_media(output: str) -> dict[str, Any] | None:
 
 _BLOCKED_HOSTNAMES = frozenset({"localhost", "metadata.google.internal"})
 
-# Cloud-metadata deny-list applied *before* the `is_private` allowance so
-# ULA-hosted vendor metadata endpoints don't slip through the "private IPs
-# are fine, we trust the LAN" exception.  IPv4 169.254.169.254 is caught
-# by `is_link_local`; IPv6 ULA metadata (AWS Nitro IMDS at fd00:ec2::254,
-# ECS task metadata at fd00:ec2::23) is `is_private` and needs explicit
-# blocking.  Add new vendor prefixes here as they're published.
-_BLOCKED_IP_NETWORKS: tuple[str, ...] = (
-    "fd00:ec2::/32",  # AWS Nitro IMDS / ECS task metadata over IPv6
-)
-
 
 async def _is_safe_image_url(url: str) -> bool:
     """Validate that *url* uses http(s), has no embedded credentials, and does
-    not target loopback, link-local (incl. cloud metadata 169.254.169.254),
-    or reserved ranges — even after DNS resolution.
+    not target loopback or anything in the never-allowed lane — even after
+    DNS resolution.
 
     Resolves the hostname and checks every returned address so a DNS
     rebinding attack cannot swap a safe-looking public IP for an
     internal one between validation and fetch.  Private/LAN IPs are
-    still allowed (media servers typically live on the local network),
-    so only loopback + link-local + multicast + reserved are rejected.
+    still allowed (media servers typically live on the local network);
+    what is rejected is loopback — the bot's own host is not a media
+    server — plus the shared never-allowed lane, which covers link-local
+    (including cloud metadata at 169.254.169.254), multicast, unspecified,
+    reserved, and known vendor metadata prefixes such as AWS Nitro IMDS
+    over IPv6.  That lane lives in :mod:`turnstone.core.ip_classify` so
+    this guard cannot drift from the OAuth and fetch-tool guards again.
+
+    Note the classifier judges a transition address by the IPv4 it
+    REACHES, replacing the wrapper rather than adding to it, so
+    ``::ffff:192.168.0.6`` is the LAN address it routes to (allowed here)
+    rather than the reserved wrapper it looks like.
 
     NOTE: there is a residual TOCTOU gap because httpx resolves the
     hostname again when it actually issues the GET.  A 0-TTL rebinding
@@ -244,9 +244,14 @@ async def _is_safe_image_url(url: str) -> bool:
     backfill pass.
     """
     import asyncio
-    import ipaddress
-    import socket
     from urllib.parse import urlparse
+
+    from turnstone.core.ip_classify import (
+        AddressLane,
+        ResolutionError,
+        effective_addresses,
+        resolve_and_classify,
+    )
 
     try:
         parsed = urlparse(url)
@@ -264,37 +269,22 @@ async def _is_safe_image_url(url: str) -> bool:
 
     # Collect candidate IPs: either an IP literal in the URL, or every
     # A/AAAA record the resolver returns for a hostname.
-    candidates: list[str] = []
     try:
-        ipaddress.ip_address(hostname)
-        candidates.append(hostname)
-    except ValueError:
-        try:
-            infos = await asyncio.to_thread(socket.getaddrinfo, hostname, None, socket.AF_UNSPEC)
-        except socket.gaierror:
-            return False
-        # Strip IPv6 zone IDs (e.g. ``fe80::1%eth0``) before parsing —
-        # ipaddress.ip_address would raise on them and we'd drop the host
-        # on unrelated metadata.
-        candidates = [str(info[4][0]).partition("%")[0] for info in infos]
-        if not candidates:
-            return False
+        classified = await asyncio.to_thread(resolve_and_classify, hostname)
+    except ResolutionError:
+        return False
 
-    blocked_networks = [ipaddress.ip_network(cidr) for cidr in _BLOCKED_IP_NETWORKS]
-    for raw in candidates:
-        try:
-            ip = ipaddress.ip_address(raw)
-        except ValueError:
+    for lane, ip in classified:
+        # A transition address is judged by the IPv4 it routes to *instead of*
+        # by the wrapper — the classifier REPLACES the wrapper, it does not add
+        # to it. 2002:a9fe:a9fe:: is ordinary global unicast to ``ipaddress``
+        # but reaches 169.254.169.254 through a 6to4 relay.
+        if lane is AddressLane.NEVER:
             return False
-        if (
-            ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            return False
-        if any(ip in net for net in blocked_networks):
+        # Loopback is the one class this guard refuses that the shared NEVER
+        # lane does not: PRIVATE is allowed here (media servers live on the
+        # LAN), but the bot's own host is not a media server.
+        if any(item.is_loopback for item in effective_addresses(ip)):
             return False
     return True
 

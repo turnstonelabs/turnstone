@@ -4811,13 +4811,59 @@ def _probe_candidate_url(services: list[dict[str, Any]] | None) -> tuple[str, st
         if parsed.scheme not in _PROBE_ALLOWED_SCHEMES:
             continue
         host = (parsed.hostname or "").lower()
-        # 169.254.0.0/16 is the AWS / GCP instance metadata range;
-        # an http target there would turn a compromised registry into
-        # an SSRF to IMDS.  Loopback is retained for single-box dev.
-        if host.startswith("169.254."):
+        # Cheap, DNS-free rejection of an entry that NAMES a bad address. A
+        # poisoned registry pointing straight at cloud metadata is refused here
+        # without touching the resolver, so selection stays pure and console
+        # startup does no I/O; a hostname that RESOLVES somewhere bad is caught
+        # by _probe_url_is_safe, off the event loop, before the request.
+        if not host or _names_never_allowed_address(host):
             continue
         return raw_url, nid
     return "", ""
+
+
+def _names_never_allowed_address(host: str) -> bool:
+    """True when *host* is an IP literal in the never-allowed lane. No DNS."""
+    import ipaddress
+
+    from turnstone.core.ip_classify import AddressLane, classify_address
+
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a name, not a literal — resolved later by the caller
+    return classify_address(addr) is AddressLane.NEVER
+
+
+def _probe_url_is_safe(url: str) -> bool:
+    """True when *url* resolves entirely outside the never-allowed lane.
+
+    Blocking: the caller runs it off the event loop.  Selection stays pure so
+    console startup does no DNS inline — this is checked once, for the single
+    chosen candidate, immediately before the request that carries the collector
+    bearer token.
+
+    Fails CLOSED.  The probe sends ``Authorization: Bearer <collector token>``
+    and folds the upstream response body into operator-visible state, so an
+    unresolvable name is refused rather than probed: a registry entry that
+    SERVFAILs here and resolves at request time would otherwise disclose that
+    token to whatever answered.
+    """
+    from turnstone.core.ip_classify import AddressLane, ResolutionError, resolve_and_classify
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return False
+    if not host or host == "metadata.google.internal":
+        return False
+    try:
+        classified = resolve_and_classify(host, port)
+    except ResolutionError:
+        return False
+    return all(lane is not AddressLane.NEVER for lane, _ in classified)
 
 
 async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncClient) -> None:
@@ -4861,6 +4907,9 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
         )
         return
     probe_url, probe_node = _probe_candidate_url(services)
+    if probe_url and not await asyncio.to_thread(_probe_url_is_safe, probe_url):
+        log.warning("collector_scope_probe.candidate_refused node=%s", probe_node)
+        probe_url, probe_node = "", ""
     if not probe_url:
         # Distinguish "registry empty" (normal pre-discovery) from
         # "registry populated but every entry malformed" (operator-

@@ -570,12 +570,18 @@ class TestValidateIssuerURL:
             validate_issuer_url("https://evil.example.com")
 
     def test_rejects_link_local(self):
-        """Hostnames resolving to link-local addresses are rejected."""
+        """Hostnames resolving to link-local addresses are rejected.
+
+        Refused as link-local rather than as merely non-public, and WITHOUT the
+        allow_private_network hint: that opt-in never admits link-local, so
+        offering it would send the operator to a dead end.
+        """
         with (
             patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("169.254.169.254", 0))]),
-            pytest.raises(OIDCError, match="non-public address.*169.254.169.254"),
+            pytest.raises(OIDCError, match="link-local.*169.254.169.254") as exc_info,
         ):
             validate_issuer_url("https://metadata.internal")
+        assert "allow_private_network" not in str(exc_info.value)
 
     def test_rejects_unresolvable_hostname(self):
         """DNS resolution failure is rejected."""
@@ -681,11 +687,11 @@ class TestValidateDiscoveredEndpoint:
                 trusted_endpoint_hosts=frozenset(),
             )
 
-    def test_rejects_private_ip(self):
-        """Endpoint resolving to a private/link-local IP is rejected."""
+    def test_rejects_link_local_ip(self):
+        """Endpoint resolving to a link-local IP is rejected, with no dead-end hint."""
         with (
             patch("socket.getaddrinfo", return_value=self._PRIVATE_ADDR),
-            pytest.raises(OIDCError, match="non-public address.*169.254.169.254"),
+            pytest.raises(OIDCError, match="link-local.*169.254.169.254") as exc_info,
         ):
             validate_discovered_endpoint(
                 "https://idp.example.com/token",
@@ -693,6 +699,26 @@ class TestValidateDiscoveredEndpoint:
                 allow_http=False,
                 trusted_endpoint_hosts=frozenset(),
             )
+        assert "allow_private_network" not in str(exc_info.value)
+
+    def test_rejects_private_ip(self):
+        """Endpoint resolving to a genuinely private IP is rejected — and IS hinted.
+
+        ``_PRIVATE_ADDR`` is 169.254.169.254, which is link-local rather than
+        private, so this case covers what the name promises: an RFC 1918 address
+        the operator CAN reach by enabling the opt-in, and is told so.
+        """
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.7", 0))]),
+            pytest.raises(OIDCError, match="non-public address.*10.0.0.7") as exc_info,
+        ):
+            validate_discovered_endpoint(
+                "https://idp.example.com/token",
+                self._issuer(),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+        assert "allow_private_network" in str(exc_info.value)
 
     def test_rejects_embedded_credentials(self):
         """Endpoint with userinfo (user:pass@host) rejected."""

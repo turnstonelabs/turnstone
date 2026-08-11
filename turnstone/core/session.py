@@ -62,6 +62,7 @@ from turnstone.core.background_shells import (
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.deadline import StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
     TIMEOUT_OUTCOME_CLAUSE,
@@ -237,7 +238,7 @@ from turnstone.core.trajectory import (
     turns_from_dicts,
 )
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
-from turnstone.core.web import check_ssrf, fetch_with_ssrf_guard, strip_html
+from turnstone.core.web import fetch_with_ssrf_guard, screen_url, strip_html
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
     PENDING_SENDS_MAX,
@@ -2047,34 +2048,53 @@ def _notify_auth_headers() -> dict[str, str]:
     return header
 
 
-def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None, bool]:
+def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None, bool, bool]:
     """SSRF-screen a tool's target URL under the operator's private-network opt-in.
 
     ``allow_private_network`` is the live ``tools.allow_private_network``
     setting (admin Settings → Tools; DB-backed, hot-toggleable — the caller
-    reads it per prepare).  Returns ``(error, private_origin)``.  ``error`` is
-    the rejection text (``None`` = proceed); a private-address rejection names
+    reads it per prepare).  Returns ``(error, private_origin, private_block)``.
+    ``error`` is the rejection text (``None`` = proceed); ``private_block`` says
+    the refusal is one the opt-in COULD clear, so callers can label it without
+    re-deriving that from the wording.  A private-address rejection names
     the setting so a self-hosted operator learns the knob from the refusal
-    itself.  ``private_origin`` is True when the target NAMES a private
-    address the operator opted into: the approval header tags it, and the
-    guarded fetch skips per-hop screening for that chain — the gate approved a
+    itself.  ``private_origin`` is True when EVERY address the target resolves
+    to is private and the operator opted in: the approval header tags it, and
+    the guarded fetch accepts private hops on that chain — the gate approved a
     private URL, so its redirects are the operator's own network.  Public
     origins never set it, keeping the public→private redirect bounce blocked
     regardless of the opt-in.
+
+    "Every address", not "the worst address": a hostname answering with both a
+    private and a public record folds to the private lane, but the connection
+    may land on the public record, so the operator would be approving a LAN
+    fetch that actually reaches an attacker's server with private hops enabled
+    for the rest of the chain.
     """
-    ssrf_err = check_ssrf(url)
-    if not ssrf_err:
-        return None, False
-    is_private_block = "private/internal address" in ssrf_err
+    screen = screen_url(url)
+    if screen.error is None:
+        return None, False, False
+    # The LANE is the contract, not the wording. Substring-matching the refusal
+    # text made a docstring rewrap able to silently open the opt-in lane for
+    # cloud metadata, with nothing failing at the edit site.
+    is_private_block = screen.lane is AddressLane.PRIVATE
+    ssrf_err = screen.error
     if is_private_block and allow_private_network:
-        return None, True
+        # A split-horizon or hairpin-DNS host answering with both a LAN and a
+        # WAN address is approved like any other private target — refusing it
+        # would make a common self-hosting setup permanently unreachable with
+        # no remediation the operator could act on. The chain is still safe:
+        # ``fetch_with_ssrf_guard`` revokes private-hop permission after any
+        # hop that is not wholly private, so a mixed origin buys exactly one
+        # hop and cannot be used to walk further into the network.
+        return None, True, True
     hint = ""
     if is_private_block:
         hint = (
             " Enable 'tools.allow_private_network' in the console"
             " (Settings → Tools) to allow fetching private-network addresses."
         )
-    return f"Error: {ssrf_err}.{hint}", False
+    return f"Error: {ssrf_err}.{hint}", False, is_private_block
 
 
 def _tool_turn_meta(
@@ -14897,13 +14917,15 @@ class ChatSession:
         # SSRF screen \u2014 a NAMED private address is approvable under the
         # tools.allow_private_network opt-in (the header tags it so the
         # operator approves it as what it is).
-        screen_err, private_origin = _screen_tool_url(url, self._allow_private_network())
+        screen_err, private_origin, private_block = _screen_tool_url(
+            url, self._allow_private_network()
+        )
         if screen_err:
             return {
                 "call_id": call_id,
                 "func_name": "web_fetch",
                 "header": "\u2717 web_fetch: blocked (private network)"
-                if "private/internal" in screen_err
+                if private_block
                 else "\u2717 web_fetch: blocked",
                 "preview": f"    {url}",
                 "needs_approval": False,
@@ -14969,13 +14991,15 @@ class ChatSession:
             # Same opt-in lane as web_fetch: a named private address is
             # approvable under tools.allow_private_network, tagged so the
             # operator approves it as what it is.
-            screen_err, private_origin = _screen_tool_url(target, self._allow_private_network())
+            screen_err, private_origin, private_block = _screen_tool_url(
+                target, self._allow_private_network()
+            )
             if screen_err:
                 return {
                     "call_id": call_id,
                     "func_name": "open_preview",
                     "header": "✗ open_preview: blocked (private network)"
-                    if "private/internal" in screen_err
+                    if private_block
                     else "✗ open_preview: blocked",
                     "preview": f"    {target}",
                     "needs_approval": False,

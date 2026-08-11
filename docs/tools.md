@@ -327,7 +327,7 @@ Fetch a URL and extract specific information from it.
 | `url`      | string | yes      | The URL to fetch (must start with `http://` or `https://`). |
 | `question` | string | yes      | What to extract or answer from the page content. |
 
-- **What it does**: Fetches the URL, strips HTML to plain text, and uses the LLM to extract the answer to the question from the page content. Every redirect hop is SSRF-screened before it is requested. Private/internal addresses are refused by default; enable `tools.allow_private_network` (console Settings → Tools) to make them approvable for self-hosted setups whose services live on the local network — the approval prompt marks such requests, and a public site redirecting into private space is refused regardless.
+- **What it does**: Fetches the URL, strips HTML to plain text, and uses the LLM to extract the answer to the question from the page content. Every redirect hop is SSRF-screened before it is requested. Private/internal addresses are refused by default; enable `tools.allow_private_network` (console Settings → Tools) to make them approvable for self-hosted setups whose services live on the local network — the approval prompt marks such requests, and a public site redirecting into private space is refused regardless. Cloud metadata endpoints and link-local, multicast and reserved addresses are refused even with the opt-in enabled, including as a redirect target from a private address you approved. An address is judged by what it actually reaches, so an IPv6 transition address (NAT64, 6to4, Teredo) wrapping an internal IPv4 is treated exactly as that IPv4 would be.
 - **Auto-approve**: No -- requires user confirmation (makes network requests).
 - **Agent availability**: `task_agent`.
 

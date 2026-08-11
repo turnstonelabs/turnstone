@@ -239,20 +239,47 @@ def _reject_option(value: str) -> str | None:
 def _assert_safe_http_url(url: str) -> None:
     """Reject a model-supplied URL that isn't safe to fetch from this host.
 
-    Restricts the scheme to http/https (no ``file://``/``ftp://``) and blocks the
-    cloud link-local metadata range (``169.254.0.0/16`` / ``metadata.google.internal``)
+    Restricts the scheme to http/https (no ``file://``/``ftp://``) and refuses
+    the NEVER lane — cloud metadata and link-local/multicast/reserved space —
     so an LLM-driven probe can't be steered at the instance-metadata service.
-    Loopback and private cluster IPs stay allowed — probing
-    ``http://localhost:PORT/health`` and private node URLs is the job. Raises
-    ``ValueError`` when the URL is unsafe. Shared by every tool that fetches a
-    model-supplied URL (``http_health``, ``node_health``, ``check_llm_backend``).
+    Loopback and private cluster IPs stay allowed: probing
+    ``http://localhost:PORT/health`` and private node URLs is the job, so this
+    guard accepts the PRIVATE lane where the fetch tools gate it behind an
+    operator opt-in. Raises ``ValueError`` when the URL is unsafe. Shared by
+    every tool that fetches a model-supplied URL (``http_health``,
+    ``node_health``, ``check_llm_backend``).
+
+    Classification goes through :mod:`turnstone.core.ip_classify`, which
+    RESOLVES the hostname. The previous ``host.startswith("169.254.")`` string
+    test never resolved, so any DNS name pointing at the metadata service — or
+    any IPv6 transition address wrapping it, e.g.
+    ``::ffff:169.254.169.254`` — walked straight through.
     """
-    parts = urllib.parse.urlsplit(url)
+    from turnstone.core.ip_classify import (
+        AddressLane,
+        ResolutionError,
+        describe_address,
+        resolve_and_classify,
+    )
+
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError(f"refusing malformed URL: {url!r}") from exc
     if parts.scheme not in ("http", "https"):
         raise ValueError(f"refusing non-http(s) URL: {url!r}")
-    host = (parts.hostname or "").lower()
-    if host.startswith("169.254.") or host == "metadata.google.internal":
+    if not host or host == "metadata.google.internal":
         raise ValueError(f"refusing link-local/metadata host: {host!r}")
+
+    try:
+        classified = resolve_and_classify(host, port)
+    except ResolutionError as exc:
+        raise ValueError(f"refusing unresolvable host: {host!r}") from exc
+    for lane, addr in classified:
+        if lane is AddressLane.NEVER:
+            raise ValueError(f"refusing link-local/metadata host: {describe_address(addr)}")
 
 
 def _http_get_json(url: str, timeout: float = 5.0) -> Any:
