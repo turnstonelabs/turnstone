@@ -478,8 +478,13 @@ def test_append_user_turn_invalidates_shared_state():
     assert s._senders_dirty is True
 
 
-def test_new_participant_flips_shared_and_emits_join_note_once():
+def test_new_participant_flips_shared_and_emits_join_note_once(tmp_db):
+    from turnstone.core.memory import register_workstream
+
     s = make_session(user_id="owner")
+    # A participant-joined note is a keyed SYSTEM row.  Production creates the
+    # parent first; preserve that prerequisite in this direct-session test.
+    register_workstream(s.ws_id, user_id="owner")
     s._known_senders = {"owner"}
     # _maybe_note_new_participant recomputes (not hand-mutates) shared state,
     # deriving it from self.messages -- so, matching its real call contract

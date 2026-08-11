@@ -1426,7 +1426,7 @@ audio.media-player {
    here (not chat.css) because these classes only render on the
    per-node UI surface; coord uses the .approval-dock pattern instead.
 
-   DOM shape rendered by buildToolDiv() + renderVerdictBadge():
+   DOM shape rendered by buildToolDiv() + buildConvVerdict():
      .msg.ts-approval.ts-approval--inline[.approved]  ← outer card
        .ts-approval-tool
          .tool-name                   ← tool function name

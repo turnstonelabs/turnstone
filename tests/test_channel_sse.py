@@ -62,9 +62,11 @@ class _FakeConnect:
     def __init__(self, queue: list[_FakeEventSource]) -> None:
         self._queue = queue
         self.call_count = 0
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     def __call__(self, *args, **kwargs):  # noqa: ANN001, ANN204
         self.call_count += 1
+        self.calls.append((args, kwargs))
         if not self._queue:
             raise asyncio.CancelledError
         return self._queue.pop(0)
@@ -128,6 +130,7 @@ class TestStaleRoute:
         on_event.assert_not_awaited()
         # No reconnect after 404.
         assert fake_connect.call_count == 1
+        assert fake_connect.calls[0][1]["params"] == {"user_turn": 1}
         assert _fast_sleep == []
 
     def test_on_stale_exception_still_exits(self, monkeypatch, _fast_sleep):

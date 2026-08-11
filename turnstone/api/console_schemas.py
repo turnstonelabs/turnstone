@@ -16,6 +16,9 @@ from turnstone.core.model_registry import MAX_MODEL_CONCURRENCY
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 
+# Pydantic resolves this annotation while constructing the model schema.
+from turnstone.core.workstream import ConversationPersistenceState  # noqa: TC001
+
 # ---------------------------------------------------------------------------
 # Cluster overview
 # ---------------------------------------------------------------------------
@@ -85,6 +88,13 @@ class ClusterWorkstreamInfo(BaseModel):
     activity: str = ""
     activity_state: str = ""
     tool_calls: int = 0
+    persistence_state: ConversationPersistenceState = Field(
+        default="healthy",
+        description=(
+            "Sanitized durable-history status for a live row. Older nodes and "
+            "unloaded persisted-only rows default to healthy."
+        ),
+    )
 
 
 class ClusterWorkstreamsResponse(BaseModel):
@@ -1508,6 +1518,16 @@ class CoordinatorSendRequest(BaseModel):
     """Body for POST /v1/api/workstreams/{ws_id}/send."""
 
     message: str = Field(description="User message to queue onto the coordinator's worker.")
+    client_send_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description=(
+            "Opaque browser correlation token echoed in the accepted `user_turn` "
+            "event and history row. It is not an idempotency key."
+        ),
+    )
     attachment_ids: list[str] | None = Field(
         default=None,
         description=(
@@ -1736,7 +1756,8 @@ class ClusterWsDetailResponse(BaseModel):
     live: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Live in-flight counters (state, tokens, activity, pending_approval) when "
+            "Live in-flight counters and sanitized durable-history status "
+            "(state, tokens, activity, pending_approval, persistence_state) when "
             "the owning node returns them; null on degrade."
         ),
     )

@@ -77,11 +77,12 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 | | `list_attachments(ws_id)` | `ListAttachmentsResponse` |
 | | `get_attachment_content(ws_id, attachment_id)` | `bytes` |
 | | `delete_attachment(ws_id, attachment_id)` | `StatusResponse` |
-| **Chat** | `send(message, ws_id)` | `SendResponse` |
+| **Chat** | `send(message, ws_id, *, attachment_ids=None, client_send_id=None)` | `SendResponse` |
 | | `approve(*, ws_id, approved, feedback, always, cycle_id, call_id)` | `ApproveResponse` |
 | | `command(*, ws_id, command)` | `StatusResponse` |
 | | `cancel(ws_id, *, force=False)` | `CancelResponse` |
-| **Streaming** | `stream_events(ws_id)` | `Iterator[ServerEvent]` |
+| **History** | `get_history(ws_id, *, limit=100)` | `WorkstreamHistoryResponse` |
+| **Streaming** | `stream_events(ws_id, *, last_event_id=None, history_token=None)` | `Iterator[ServerEvent]` |
 | | `stream_global_events()` | `Iterator[ServerEvent]` |
 | **High-level** | `send_and_wait(message, ws_id, *, timeout, on_event)` | `TurnResult` |
 | **Saved** | `list_saved_workstreams()` | `ListSavedWorkstreamsResponse` |
@@ -127,11 +128,12 @@ SSE events are deserialized into typed dataclasses. Use `event.type` to discrimi
 | Type | Class | Key Fields |
 |------|-------|------------|
 | `connected` | `ConnectedEvent` | `model`, `model_alias`, `skip_permissions` |
+| `user_turn` | `UserTurnEvent` | `ws_id`, `content`, `attachments`, `sender`, `source`, `client_send_ids`, `_event_id` |
 | `content` | `ContentEvent` | `text` |
 | `reasoning` | `ReasoningEvent` | `text` |
 | `tool_info` | `ToolInfoEvent` | `items` |
 | `approve_request` | `ApproveRequestEvent` | `cycle_id`, `items` |
-| `tool_result` | `ToolResultEvent` | `call_id`, `name`, `output`, `is_error` |
+| `tool_result` | `ToolResultEvent` | `call_id`, `name`, `output`, `is_error`, `preview`, `accepted`, `effect_status`, `_event_id` |
 | `tool_output_chunk` | `ToolOutputChunkEvent` | `call_id`, `chunk` |
 | `status` | `StatusEvent` | `prompt_tokens`, `total_tokens`, `pct`, `effort`, `cache_creation_tokens`, `cache_read_tokens` |
 | `error` | `ErrorEvent` | `message` |
@@ -141,18 +143,90 @@ SSE events are deserialized into typed dataclasses. Use `event.type` to discrimi
 | `in_progress_snapshot` | `InProgressSnapshotEvent` | `content`, `reasoning` (one-shot mid-stream refresh resume) |
 | `approval_resolved` | `ApprovalResolvedEvent` | `cycle_id`, `call_ids`, `approved`, `feedback`, `always` |
 | `cancelled` | `CancelledEvent` | — |
+| `history_resync` | `HistoryResyncEvent` | `reason`, optional `ws_id` |
+
+The Python server `send()` and console `coordinator_send()` methods accept an
+optional `client_send_id`; TypeScript `send()` accepts the equivalent
+`options.clientSendId`. Values match `[A-Za-z0-9_-]{1,128}`. The value is an
+opaque optimistic-UI correlation token, not an idempotency key: reusing it
+still creates distinct accepted turns and events.
+Every upgraded listener on the shared workstream receives `UserTurnEvent`.
+Originating panes use `client_send_ids` only to settle the exact optimistic
+bubble, while peers render the accepted row once by `_event_id`. A
+`message_queued` event carrying the token can establish acceptance even if the
+POST acknowledgement is lost. History projects the same correlation alongside
+the accepted user row. These tokens are not credentials: when sender and viewer
+identities are both known, only a matching sender may settle local optimistic
+state; a peer event still renders its canonical row.
+
+The typed projection is negotiated with `?user_turn=1` on the per-workstream
+SSE URL. Python `stream_events()` / `send_and_wait()` and TypeScript
+`streamEvents()` / `sendAndWait()` set it automatically. Raw consumers that
+omit it receive a backward-compatible `replay_truncated` repair signal instead
+of the user row and must rebuild from `/history`; its pre-row cursor keeps the
+repair retryable if that history request fails.
+
+The browser-only final-tool upsert capability is `?tool_turn=1`. The bundled
+Python and TypeScript SDK streaming helpers and channel adapters intentionally
+do not negotiate it yet: they retain the executor-receipt `tool_result`
+contract and do not own a transcript reducer. `ToolResultEvent` can deserialize
+the accepted fields for direct/custom capable clients. Raw capable clients must
+deduplicate `_event_id` and replace the newest matching call occurrence; raw
+incapable clients receive the pre-row `tool_turn_projection_unsupported` repair
+frame and rebuild from history. That staging deliberately prices in two costs
+for incapable consumers. A raw client that treats every `replay_truncated`
+frame as a rebuild trigger refetches `/history` once per accepted tool row —
+one fetch per tool call on a long agentic turn; a client that wants tool
+results incrementally should negotiate `tool_turn=1` and reduce, and the
+bundled helpers (which ignore the frame rather than rebuild) stay correct
+because their receipt-only view never depends on the accepted projection.
+Second, only the accepted event carries post-execution output transforms, so a
+receipt-rendering consumer (for example, a channel adapter posting the
+executor receipt into a thread) keeps the pre-transform text; the accepted
+projection is a transcript-consistency mechanism, not a wire confidentiality
+boundary — see the API reference note on the preliminary `tool_result`.
 
 Current servers bootstrap conversation history through
 `GET /v1/api/workstreams/{ws_id}/history` before the SSE stream; they do not
 emit a `history` event. `HistoryEvent` remains deserializable only for
-compatibility with older servers. The Python client does not yet expose a
-typed helper for this bootstrap endpoint.
+compatibility with older servers. `get_history()` exposes the current REST
+bootstrap response, including its optional cursor and one-shot handoff token.
+
+### Caller-managed history handoff
+
+The SDK supplies typed handshake primitives but intentionally does not own a
+transcript renderer or reconnect policy. After rendering a successful history
+response, pass its cursor and token to exactly one initial stream:
+
+```python
+from turnstone.sdk import HistoryResyncEvent
+
+history = client.get_history(ws_id)
+render(history.messages)
+
+for event in client.stream_events(
+    ws_id,
+    last_event_id=history.cursor,
+    history_token=history.handoff_token,
+):
+    if isinstance(event, HistoryResyncEvent):
+        # Stop this stream. The caller chooses when to fetch, render, and
+        # reconnect with a new history response.
+        break
+    apply_live_event(event)
+```
+
+`history_resync` means numeric replay cannot prove that the rendered limited
+tail came from the same total accepted conversation-row prefix. Stop the
+stream, fetch and render history again, and use only the new cursor/token pair.
+A 503 history response raises `TurnstoneAPIError`; it is not authoritative, so
+retain any existing transcript and do not open a tokenless replacement stream.
 
 **Global events** (from `stream_global_events()`):
 
 | Type | Class | Key Fields |
 |------|-------|------------|
-| `ws_state` | `WsStateEvent` | `ws_id`, `state`, `tokens`, `activity` |
+| `ws_state` | `WsStateEvent` | `ws_id`, `state`, `tokens`, `activity`, `persistence_state` |
 | `ws_activity` | `WsActivityEvent` | `ws_id`, `activity`, `activity_state` |
 | `ws_rename` | `WsRenameEvent` | `ws_id`, `name` |
 | `ws_closed` | `WsClosedEvent` | `ws_id` |
@@ -163,11 +237,17 @@ typed helper for this bootstrap endpoint.
 |------|-------|------------|
 | `node_joined` | `NodeJoinedEvent` | `node_id` |
 | `node_lost` | `NodeLostEvent` | `node_id` |
-| `cluster_state` | `ClusterStateEvent` | `ws_id`, `node_id`, `state`, `tokens` |
-| `ws_created` | `ClusterWsCreatedEvent` | `ws_id`, `node_id`, `name` |
+| `cluster_state` | `ClusterStateEvent` | `ws_id`, `node_id`, `state`, `tokens`, `persistence_state` |
+| `ws_created` | `ClusterWsCreatedEvent` | `ws_id`, `node_id`, `name`, `persistence_state` |
 | `ws_closed` | `ClusterWsClosedEvent` | `ws_id` |
 | `ws_rename` | `ClusterWsRenameEvent` | `ws_id`, `name` |
 | `snapshot` | `ClusterSnapshotEvent` | `nodes`, `overview`, `timestamp` |
+
+Operator-facing workstream rows and rich state events expose only the sanitized
+`persistence_state`: `healthy`, `pending`, `retrying`, or `conflict`. SDK types
+treat it as optional for compatibility with older nodes; an omitted value means
+`healthy`. Retry counts, storage errors, commit keys, and conversation content
+are never part of this status surface.
 
 ### TurnResult
 
@@ -265,8 +345,14 @@ const ws = await client.createWorkstream({ name: "demo" });
 const result = await client.sendAndWait("Hello!", ws.ws_id);
 console.log(result.content);
 
-// Stream events
-for await (const event of client.streamEvents(ws.ws_id)) {
+// Render history, then use its one-shot hints on the initial stream.
+const history = await client.getHistory(ws.ws_id);
+render(history.messages);
+for await (const event of client.streamEvents(ws.ws_id, {
+  lastEventId: history.cursor ?? undefined,
+  historyToken: history.handoff_token ?? undefined,
+})) {
+  if (event.type === "history_resync") break; // caller refetches and reconnects
   if (event.type === "content") {
     process.stdout.write(event.text);
   }
@@ -342,7 +428,7 @@ turnstone/sdk/               Python SDK (sub-package)
   _base.py                   Shared httpx async client, auth, error handling
   _sync.py                   Background event loop for sync wrappers
   _types.py                  TurnResult + TurnstoneAPIError
-  events.py                  38 SSE event dataclasses with type registry
+  events.py                  Typed SSE event dataclasses with type registry
   server.py                  AsyncTurnstoneServer + TurnstoneServer
   console.py                 AsyncTurnstoneConsole + TurnstoneConsole
 

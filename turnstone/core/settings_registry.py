@@ -157,7 +157,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "session.retention_days",
             "int",
             90,
-            "Days to retain conversation history (0 = disabled)",
+            "Days to keep unnamed workstreams (0 = no age pruning; "
+            "empty unnamed workstreams are still removed after a two-hour grace)",
             "session",
             min_value=0,
         ),

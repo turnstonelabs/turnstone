@@ -41,6 +41,43 @@ class StorageConflictError(Exception):
     """
 
 
+class ConversationCommitConflictError(StorageConflictError):
+    """A keyed conversation retry does not match the committed operation.
+
+    A ``commit_key`` identifies one immutable logical write.  Returning the
+    existing row for a retry with different role-specific fields, metadata,
+    event cursor, or ordered attachment references would acknowledge data the
+    caller did not commit, so atomic attachment paths refuse that mismatch.
+    """
+
+
+class ConversationCommitWorkstreamGoneError(RuntimeError):
+    """A keyed conversation commit's durable parent row no longer exists.
+
+    Keyed saves refuse to recreate a hard-deleted workstream, so this failure
+    is permanent: no retry of the same commit can ever succeed.  The durability
+    journal uses the type to stop retrying instead of classifying the miss as
+    a transient storage failure.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentWrite:
+    """One content-addressed blob reference in an atomic conversation write.
+
+    The ordered input sequence is the message's reference list.  Repeated
+    ``attachment_id`` values therefore represent repeated references and each
+    contribute one to the global refcount.
+    """
+
+    attachment_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    kind: str
+    content: bytes
+
+
 class ForkCloneError(RuntimeError):
     """Base class for an atomic workstream-clone refusal."""
 
@@ -251,6 +288,7 @@ class StorageBackend(Protocol):
         is_error: bool = False,
         producer: str | None = None,
         meta: str | None = None,
+        commit_key: str | None = None,
     ) -> int:
         """Log a message to the conversations table.
 
@@ -268,9 +306,82 @@ class StorageBackend(Protocol):
         cursor space, distinct from the returned ``id`` PK.  NULL when the
         caller has no live UI counter (offline / bulk / fork re-saves).
 
-        ``meta`` is the pre-serialized JSON of an operator-context ``system``
-        turn's structured per-kind fields (the ``_source_meta`` side channel);
-        opaque to storage and NULL for ordinary rows.
+        ``meta`` is pre-serialized role-specific conversation metadata
+        (operator context, tool disposition/preview plus the tool turn's acting
+        principal, shared-workstream sender, or accepted-assistant model
+        provenance); opaque to storage and NULL when a row has no metadata.
+
+        ``commit_key`` is a caller-generated, non-empty idempotency identity scoped to
+        ``ws_id``.  The first save inserts the row; subsequent saves with the
+        same non-NULL key and identical normalized fields return that row's
+        existing ``id`` without appending or replacing content. A mismatched
+        retry raises :class:`ConversationCommitConflictError`. A keyed save
+        requires the durable workstream row to exist in the same transaction;
+        it refuses a retry after hard delete instead of recreating an orphan
+        conversation. NULL preserves append-only legacy/offline semantics,
+        including historical parent-less writers. PostgreSQL conditionally
+        takes the same parent-first lock as prune/delete when that parent
+        exists. If the call observes a parent before blocking behind deletion,
+        it refuses the post-delete insert; a call that genuinely begins
+        parentless may still create an orphan. NULL therefore remains
+        unsuitable for a live accepted row, which MUST use a key. An empty
+        string is rejected.
+        """
+        ...
+
+    def save_user_message_with_attachments(
+        self,
+        ws_id: str,
+        content: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        source: str | None = None,
+        event_id: int | None = None,
+        meta: str | None = None,
+        commit_key: str,
+    ) -> int:
+        """Atomically commit one keyed USER row and its attachment references.
+
+        The conversation row, new content-addressed blobs, exact per-reference
+        refcount increments, and ordered ``conversations.attachments`` list are
+        one database transaction.  A retry with the same ``(ws_id,
+        commit_key)`` and identical normalized payload returns the original row
+        id without changing refcounts.  A retry whose row payload or ordered
+        attachment ids differ raises
+        :class:`ConversationCommitConflictError`; no partial mutation survives
+        any failure. The durable workstream parent is locked/validated in the
+        same transaction, so a retry after hard delete is refused without
+        recreating either the row or attachment ownership.
+
+        This operation is intentionally narrower than :meth:`save_message`:
+        ordinary rows and attachment-free USER rows retain their established
+        persistence path.
+        """
+        ...
+
+    def save_tool_message_with_attachments(
+        self,
+        ws_id: str,
+        content: str,
+        tool_name: str,
+        tool_call_id: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        event_id: int | None = None,
+        is_error: bool = False,
+        meta: str | None = None,
+        commit_key: str,
+    ) -> int:
+        """Atomically commit one keyed TOOL row and its attachment references.
+
+        The immutable identity covers content, tool name/call id, event cursor,
+        error disposition, metadata, and the exact ordered attachment ids. Blob
+        bytes, size, MIME, and kind are validated under the content-addressed id;
+        newly inserted blobs carry ``origin='tool'``. An identical retry returns
+        the original row id without replaying refcount increments. Any mismatch
+        or partial failure raises and leaves the whole transaction unchanged.
+        The durable workstream parent is locked/validated in that transaction;
+        hard delete therefore cannot leave a later retry as an orphan.
         """
         ...
 
@@ -521,6 +632,17 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def truncate_messages_tail(self, ws_id: str, remove_count: int) -> int:
+        """Atomically remove up to *remove_count* newest conversation rows.
+
+        The backend locks the durable workstream, derives both the current row
+        count and latest compaction floor inside that transaction, and never
+        deletes rows backing the latest compaction marker.  Attachment
+        refcounts are released for exactly the rows deleted.  Missing
+        workstreams and storage failures raise; a negative count is invalid.
+        """
+        ...
+
     # -- Workstream management -------------------------------------------------
 
     def list_workstreams_with_history(
@@ -571,7 +693,13 @@ class StorageBackend(Protocol):
         ...
 
     def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
-        """Remove orphaned + stale unnamed workstreams. Returns (orphans, stale)."""
+        """Atomically remove orphaned + stale unnamed workstreams.
+
+        Candidate predicates are rechecked while holding the same parent-row
+        lock (or SQLite writer reservation) used by keyed conversation commits.
+        Deletion releases all attachment references transactionally. Returns
+        ``(orphans, stale)``.
+        """
         ...
 
     def resolve_workstream(self, alias_or_id: str) -> str | None:

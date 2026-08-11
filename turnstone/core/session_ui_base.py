@@ -35,6 +35,7 @@ import queue
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 from turnstone.core.log import get_logger
+from turnstone.core.workstream import session_persistence_state
 
 log = get_logger(__name__)
 
@@ -478,6 +480,14 @@ class SessionUIBase:
     def __init__(self, ws_id: str = "", user_id: str = "") -> None:
         self.ws_id = ws_id
         self._user_id = user_id
+        # The session this UI projects, bound by ChatSession.__init__.  Weak:
+        # SSE generators can outlive retirement holding the UI, and a strong
+        # back-reference would pin the whole retired session behind them.
+        # Self-derivation exists so persistence reporting never resolves the
+        # session through a registry by id — that lookup fails open to
+        # "healthy" (or to a replacement after id reuse) exactly while
+        # tombstone retention or retirement has the row out of the map.
+        self._session_ref: weakref.ref[Any] | None = None
         # Acting user of the current/last turn (the ``bind_acting_user``
         # initiator, owner fallback) — pushed by ``ChatSession._emit_state``
         # so web clients can gate cross-user sends on a shared workstream
@@ -489,6 +499,12 @@ class SessionUIBase:
         # SSE listener fan-out — one queue per connected browser tab.
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
+        # Terminal registration fence, guarded by ``_listeners_lock``.
+        # Teardown sets this before snapshotting/clearing the current queues;
+        # a stale events request that already holds the Workstream reference
+        # but reaches registration afterward receives an internal ws_closed
+        # sentinel on a non-retained queue instead of blocking forever.
+        self._listeners_terminal = False
         # Per-ws event ring buffer for ``Last-Event-ID`` SSE replay.
         # Holds ``(event_id, event_dict)`` tuples; deque ``maxlen``
         # evicts the oldest automatically when the cap is hit.  The
@@ -776,6 +792,30 @@ class SessionUIBase:
         # 0 and re-issue ids the prior process already stamped onto
         # ``conversations.event_id`` rows, corrupting cursor ordering.
         self._seed_event_id_from_storage()
+
+    # ------------------------------------------------------------------
+    # Session binding
+    # ------------------------------------------------------------------
+
+    def bind_session(self, session: Any) -> None:
+        """Bind the owning session (called once by ChatSession.__init__)."""
+        self._session_ref = weakref.ref(session)
+
+    def _bound_session(self) -> Any:
+        """The bound session, or None before binding / after collection."""
+        ref = self._session_ref
+        return ref() if ref is not None else None
+
+    def _current_persistence_state(self) -> str:
+        """Sanitized journal state of the UI's own session.
+
+        Derives through the bound session, never a registry lookup by id:
+        the registry fails open to "healthy" — or to a replacement
+        workstream after id reuse — exactly while failed-delete tombstone
+        retention or retirement has the row out of the map, which is
+        precisely when the operator badge must keep telling the truth.
+        """
+        return session_persistence_state(self._bound_session())
 
     # ------------------------------------------------------------------
     # Listener plumbing (SSE)
@@ -1229,8 +1269,23 @@ class SessionUIBase:
         """Create a per-client queue and register it as a listener."""
         client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
         with self._listeners_lock:
-            self._listeners.append(client_queue)
+            self._register_or_close_listener_locked(client_queue)
         return client_queue
+
+    def _register_or_close_listener_locked(
+        self,
+        client_queue: queue.Queue[dict[str, Any]],
+    ) -> None:
+        """Register live, or pre-close a stale post-terminal request.
+
+        Caller holds ``_listeners_lock``. The terminal queue is deliberately
+        not retained: the events route consumes ``ws_closed`` internally and
+        exits, while a nonexistent consumer cannot leak a queue on the dead UI.
+        """
+        if getattr(self, "_listeners_terminal", False):
+            client_queue.put_nowait({"type": "ws_closed"})
+            return
+        self._listeners.append(client_queue)
 
     def _unregister_listener(self, client_queue: queue.Queue[dict[str, Any]]) -> None:
         """Remove a client queue from the listener list."""
@@ -1283,7 +1338,7 @@ class SessionUIBase:
             captured_content = list(self._ws_inflight_content)
             captured_reasoning = list(self._ws_inflight_reasoning)
             with self._listeners_lock:
-                self._listeners.append(client_queue)
+                self._register_or_close_listener_locked(client_queue)
                 snap_seq = self._event_id
         return client_queue, {
             "content": "".join(captured_content),
@@ -1349,7 +1404,14 @@ class SessionUIBase:
         text (prevents double-rendering after a truncated emit).
 
         ``last_event_id`` semantics:
-          - ``< earliest_available_id - 1`` → ``"truncated"``.
+          - ``< 0`` or ``> _event_id`` at the registration boundary →
+            ``"truncated"``.  Per-workstream ids start at 1 and the captured
+            counter is their authoritative high-water mark, so neither cursor
+            can have been issued by this stream.  Failing closed forces the
+            caller through its authoritative snapshot/history recovery floor
+            instead of accepting an empty replay from a forged or corrupt
+            future cursor.
+          - Otherwise, ``< earliest_available_id - 1`` → ``"truncated"``.
             ``lost_count`` is the minimum gap (the buffer may have
             evicted strictly more than this — we only know the
             lower bound from what's still retained).
@@ -1365,10 +1427,9 @@ class SessionUIBase:
         distinguishes them:
 
           - ``_event_id == 0`` — genuine cold start (brand-new ws,
-            nothing ever emitted) → ``"replay_ok"`` with an empty
-            slice.  No false ``replay_truncated`` on freshly-opened
-            workstreams; the ``> 0`` guard also rejects a malformed
-            negative cursor (``?last_event_id=-1`` parses as an int).
+            nothing ever emitted).  Cursor 0 is the sole valid bootstrap
+            cursor and returns ``"replay_ok"`` with an empty slice; negative
+            or future cursors are rejected by the range check above.
           - ``_event_id > 0`` — this UI instance was rebuilt over an
             existing conversation (:meth:`_seed_event_id_from_storage`
             reseeds the counter from ``MAX(conversations.event_id)``
@@ -1383,11 +1444,14 @@ class SessionUIBase:
             load-bearing) means the client saw everything before the
             rebuild — no loss, ``"replay_ok"``.
 
-        On the empty-ring truncated path ``lost_count`` is the exact
-        counter gap and ``earliest_available_id`` is ``_event_id + 1``
-        (the next id that will exist; nothing below it is retained).
-        No production client reads either field — they are envelope
-        forensics — but tests assert them.
+        On the ordinary stale empty-ring path ``lost_count`` is the exact
+        counter gap and ``earliest_available_id`` is ``_event_id + 1`` (the
+        next id that will exist; nothing below it is retained).  For an
+        out-of-range cursor, ``lost_count`` is a conservative numeric floor
+        (zero for a future cursor) and ``earliest_available_id`` is the first
+        retained id, or the next counter id when the ring is empty.  No
+        production client reads either field — they are envelope forensics —
+        but tests assert them.
         """
         client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
         # Lock order matches writer: ``_ws_lock`` outer, ``_listeners_lock``
@@ -1403,13 +1467,23 @@ class SessionUIBase:
             captured_reasoning = list(self._ws_inflight_reasoning)
             with self._listeners_lock:
                 buffered = list(self._event_buffer)
-                self._listeners.append(client_queue)
+                self._register_or_close_listener_locked(client_queue)
                 snap_seq = self._event_id
         snapshot: dict[str, Any] = {
             "content": "".join(captured_content),
             "reasoning": "".join(captured_reasoning),
             "seq": snap_seq,
         }
+        if last_event_id < 0 or last_event_id > snap_seq:
+            # Event ids start at 1, with cursor 0 reserved for the initial
+            # bootstrap.  A negative or beyond-high-water cursor was never
+            # issued by this UI.  Treat it as an uncovered gap so the route
+            # emits replay_truncated and the client rebuilds from
+            # authoritative history instead of silently trusting an empty
+            # replay slice.
+            earliest_id = buffered[0][0] if buffered else snap_seq + 1
+            lost_count = max(0, (earliest_id - 1) - last_event_id)
+            return client_queue, [], "truncated", lost_count, earliest_id, snapshot
         if not buffered:
             # Derived staleness — see the docstring's empty-buffer
             # section.  ``snap_seq`` (the counter captured under the
@@ -3748,6 +3822,46 @@ class SessionUIBase:
             event["preview"] = preview
         self._enqueue(event)
 
+    def on_tool_turn_accepted(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+        preview: dict[str, Any] | None = None,
+        effect_status: str | None = None,
+    ) -> int:
+        """Publish the canonical accepted TOOL row without replaying metrics.
+
+        ``on_tool_result`` is the executor receipt: it closes the call's
+        output stream, increments tool metrics, clears activity, and paints a
+        provisional result immediately. Output guards and truncation run
+        afterwards, so the durable row may differ. This second hook carries
+        that final guarded scalar projection to listeners that missed the
+        receipt and lets reducers replace the provisional rendering in place.
+
+        Deliberately no chunk, activity, or metric bookkeeping lives here.
+        Replaying any of it would count one accepted tool twice. Structured
+        image bytes also stay out of the event ring; ``output`` is the same
+        text-only projection persisted for ``/history`` and attachments remain
+        content-addressed in storage.
+        """
+        event: dict[str, Any] = {
+            "type": "tool_result",
+            "accepted": True,
+            "call_id": call_id,
+            "name": name,
+            "output": output,
+        }
+        if is_error:
+            event["is_error"] = True
+        if preview:
+            event["preview"] = preview
+        if effect_status:
+            event["effect_status"] = effect_status
+        return self._enqueue(event)
+
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
         """Buffer one tool-output line into the per-call chunk batcher.
 
@@ -3944,6 +4058,45 @@ class SessionUIBase:
             # batch flushes via _enqueue below; chunks bypass it).
             self._flush_all_chunk_batches_locked()
         self._enqueue({"type": "error", "message": message})
+
+    def on_history_resync(self, reason: str) -> int:
+        """Tell connected panes to refetch the authoritative history view.
+
+        Reserved for exceptional repair paths: older/custom UIs without the
+        typed ``user_turn`` hook, history truncation, or an accepted row that
+        does not reach an unambiguous acknowledgement.
+        """
+        return self._enqueue({"type": "history_resync", "reason": reason})
+
+    def on_user_turn(
+        self,
+        content: str,
+        *,
+        attachments: list[dict[str, Any]],
+        sender: str | None,
+        source: str | None,
+        client_send_ids: list[str],
+    ) -> int:
+        """Publish one accepted user row to every connected pane.
+
+        ``client_send_ids`` correlate this canonical event with optimistic
+        bubbles in the sending browser. They are not idempotency keys; the
+        event's monotonic ``_event_id`` remains the durable row identity.
+        Peer panes render the same event directly, including sender,
+        synthetic-source, and attachment metadata.
+        """
+        event: dict[str, Any] = {
+            "type": "user_turn",
+            "content": content,
+            "client_send_ids": list(client_send_ids),
+        }
+        if attachments:
+            event["attachments"] = [dict(item) for item in attachments]
+        if sender:
+            event["sender"] = sender
+        if source:
+            event["source"] = source
+        return self._enqueue(event)
 
     def on_system_turn(
         self, content: str, source: str, meta: dict[str, Any] | None = None

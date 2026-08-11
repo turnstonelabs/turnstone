@@ -879,13 +879,47 @@ class TestWorkstreamConfig:
 # ── Prune workstreams ─────────────────────────────────────────────────
 
 
+def _backdate_updated(ws_id: str) -> None:
+    """Age a row past the orphan grace (and any retention cutoff)."""
+    engine = get_storage()._engine  # noqa: SLF001
+    with engine.connect() as conn:
+        conn.execute(
+            sa.text("UPDATE workstreams SET updated = '2020-01-01' WHERE ws_id = :ws"),
+            {"ws": ws_id},
+        )
+        conn.commit()
+
+
 class TestPruneWorkstreams:
     def test_orphan_removed(self, tmp_db):
-        """Workstream registered with no messages should be pruned."""
+        """An AGED empty workstream is pruned as an orphan (round-3 review:
+        eligibility now requires outliving the grace — see the fresh/named
+        twins below for the guards)."""
         register_workstream("orphan")
+        _backdate_updated("orphan")
         orphans, stale = prune_workstreams()
         assert orphans == 1
         assert list_workstreams_with_history() == []
+
+    def test_fresh_empty_workstream_survives_the_grace(self, tmp_db):
+        """A just-registered empty workstream is a user mid-first-turn (its
+        rows may still be journal-held on a serving node another node's prune
+        cannot see) — never housekeeping debris.  Round-3 review pin."""
+        register_workstream("fresh-empty")
+        orphans, stale = prune_workstreams()
+        assert (orphans, stale) == (0, 0)
+        assert get_storage().get_workstream("fresh-empty") is not None
+
+    def test_named_empty_workstream_never_pruned(self, tmp_db):
+        """An aliased workstream is explicit user intent: excluded from the
+        orphan category regardless of age, mirroring the stale category's
+        alias exclusion.  Round-3 review pin."""
+        register_workstream("named-empty")
+        set_workstream_alias("named-empty", "keep-me")
+        _backdate_updated("named-empty")
+        orphans, stale = prune_workstreams(retention_days=30)
+        assert (orphans, stale) == (0, 0)
+        assert get_storage().get_workstream("named-empty") is not None
 
     def test_workstream_with_messages_kept(self, tmp_db):
         """Workstream with messages should not be pruned."""
@@ -936,6 +970,7 @@ class TestPruneWorkstreams:
     def test_prune_removes_workstream_config(self, tmp_db):
         """Pruning orphan/stale workstreams should also remove their config rows."""
         register_workstream("orphan_cfg")
+        _backdate_updated("orphan_cfg")
         save_workstream_config("orphan_cfg", {"temperature": "0.5"})
 
         register_workstream("stale_cfg")

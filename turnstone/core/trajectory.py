@@ -83,6 +83,70 @@ class AttachmentRef:
 ContentBlock = TextBlock | AttachmentRef
 
 
+PROVENANCE_META_KEY = "provenance"
+
+
+@dataclass(frozen=True, slots=True)
+class TurnProvenance:
+    """Immutable identity of the model attempt that produced a turn.
+
+    The four fields are request facts, captured from one resolved serving lane
+    and the caller's already-pinned principal.  They deliberately exclude the
+    endpoint URL and credential: both can contain secrets, while neither is
+    needed to distinguish a registry binding for audit or accounting.
+
+    The serialized form rides ``TurnMeta.extra[PROVENANCE_META_KEY]``.  Empty
+    strings and generation zero are explicit "not registry/auth scoped"
+    values for direct CLI, eval, and test lanes; they are not omitted so every
+    accepted model turn has one stable four-axis shape.
+    """
+
+    model_alias: str = ""
+    backend_model_id: str = ""
+    registry_generation: int = 0
+    acting_principal_id: str = ""
+
+    def to_meta(self) -> dict[str, str | int]:
+        """Return the JSON-safe well-known metadata object."""
+        return {
+            "model_alias": self.model_alias,
+            "backend_model_id": self.backend_model_id,
+            "registry_generation": self.registry_generation,
+            "acting_principal_id": self.acting_principal_id,
+        }
+
+    @classmethod
+    def from_meta(cls, raw: Any) -> TurnProvenance | None:
+        """Decode a stored provenance object, rejecting torn/corrupt shapes.
+
+        A partially trustworthy identity is worse than no identity: consumers
+        could join it to the wrong registry generation or principal.  Require
+        every axis with its exact scalar type and tolerate future sibling keys
+        by projecting only the four fields owned here.
+        """
+        if not isinstance(raw, dict):
+            return None
+        model_alias = raw.get("model_alias")
+        backend_model_id = raw.get("backend_model_id")
+        registry_generation = raw.get("registry_generation")
+        acting_principal_id = raw.get("acting_principal_id")
+        if (
+            not isinstance(model_alias, str)
+            or not isinstance(backend_model_id, str)
+            or not isinstance(registry_generation, int)
+            or isinstance(registry_generation, bool)
+            or registry_generation < 0
+            or not isinstance(acting_principal_id, str)
+        ):
+            return None
+        return cls(
+            model_alias=model_alias,
+            backend_model_id=backend_model_id,
+            registry_generation=registry_generation,
+            acting_principal_id=acting_principal_id,
+        )
+
+
 @dataclass(slots=True)
 class ToolCall:
     """A client (locally-executed) tool call.  Server-side tool calls live in
@@ -113,17 +177,25 @@ class ProviderNative:
 class TurnMeta:
     """Sidecar metadata: never reaches the wire, never read by the lowering layer.
 
-    ``event_id`` is the per-ws SSE ``Last-Event-ID`` resume cursor; ``extra`` holds
-    open metadata under well-known keys — ``"source_meta"`` (an operator-context
+    ``event_id`` is the per-ws SSE ``Last-Event-ID`` resume cursor;
+    ``commit_key`` is the storage idempotency identity used only to reconcile a
+    live-to-durable history handoff. ``extra`` holds open metadata under
+    well-known keys — ``"source_meta"`` (an operator-context
     ``system`` turn's structured per-kind fields, e.g. ``watch_triggered``'s
     ``watch_name`` / ``command`` / poll counters; persisted in the
     ``conversations.meta`` column, surfaced to the FE for per-kind rendering) and
-    ``"attachments_meta"`` (display metadata for by-reference attachments).
-    Storage-backed canonical loads also carry ``"storage_attachment_ids"``:
-    the raw ordered row ref-list used only to make fork retention fail-closed;
-    dict/wire projection deliberately ignores it."""
+    ``"attachments_meta"`` (display metadata for by-reference attachments) and
+    ``"provenance"`` (the immutable model alias / backend id / registry
+    generation / acting-principal tuple captured by the successful attempt).
+    Storage-backed canonical loads also carry ``"storage_attachment_ids"`` (the
+    raw ordered row ref-list used only to make fork retention fail-closed) and,
+    on TOOL turns, ``"acting_principal"`` (the principal whose turn executed
+    the effect, for revocation and audit).  Both are persistence-only side
+    channels: dict/wire projection deliberately ignores them, so no public
+    payload can carry the audit identity."""
 
     event_id: int | None = None
+    commit_key: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -280,6 +352,19 @@ def _content_to_raw(content: tuple[ContentBlock, ...]) -> str | list[dict[str, A
     return parts
 
 
+def sanitize_client_send_ids(value: object) -> list[str]:
+    """Normalize an untrusted ``client_send_ids`` payload to its stable form.
+
+    The single filter for the correlation-id list every boundary reads
+    (turn reconstruction, /history projection, canonical storage reload) —
+    a hardening change lands here once, so the same stored row can never
+    project different correlation sets per path.
+    """
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
 def turn_from_dict(msg: dict[str, Any]) -> Turn:
     """Read an OpenAI-like message dict (with ``_``-side channels) as a ``Turn``."""
     role_str = msg.get("role", "")
@@ -301,7 +386,11 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
     if pc is not None:
         native = ProviderNative(producer=msg.get("_producer", ""), blocks=tuple(pc))
 
-    meta = TurnMeta(event_id=msg.get("_event_id"))
+    raw_commit_key = msg.get("_commit_key")
+    meta = TurnMeta(
+        event_id=msg.get("_event_id"),
+        commit_key=raw_commit_key if isinstance(raw_commit_key, str) and raw_commit_key else None,
+    )
     am = msg.get("_attachments_meta")
     if am is not None:
         meta.extra["attachments_meta"] = am
@@ -328,6 +417,12 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
     sndr = msg.get("_sender")
     if sndr:
         meta.extra["sender"] = sndr
+    stable_client_send_ids = sanitize_client_send_ids(msg.get("_client_send_ids"))
+    if stable_client_send_ids:
+        meta.extra["client_send_ids"] = stable_client_send_ids
+    provenance = TurnProvenance.from_meta(msg.get("_provenance"))
+    if provenance is not None:
+        meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
 
     return Turn(
         role=role,
@@ -365,6 +460,8 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
             msg["_producer"] = turn.native.producer
     if turn.meta.event_id is not None:
         msg["_event_id"] = turn.meta.event_id
+    if turn.meta.commit_key is not None:
+        msg["_commit_key"] = turn.meta.commit_key
     am = turn.meta.extra.get("attachments_meta")
     if am is not None:
         msg["_attachments_meta"] = am
@@ -380,6 +477,12 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
     sndr = turn.meta.extra.get("sender")
     if sndr:
         msg["_sender"] = sndr
+    client_send_ids = turn.meta.extra.get("client_send_ids")
+    if isinstance(client_send_ids, list) and client_send_ids:
+        msg["_client_send_ids"] = list(client_send_ids)
+    provenance = TurnProvenance.from_meta(turn.meta.extra.get(PROVENANCE_META_KEY))
+    if provenance is not None:
+        msg["_provenance"] = provenance.to_meta()
     return msg
 
 

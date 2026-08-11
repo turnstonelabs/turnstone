@@ -251,6 +251,7 @@ class _FakeCollectorRecorder:
         activity: str = "",
         activity_state: str = "",
         content: str = "",
+        persistence_state: str = "healthy",
     ) -> None:
         self.state_calls.append(
             {
@@ -261,6 +262,7 @@ class _FakeCollectorRecorder:
                 "activity": activity,
                 "activity_state": activity_state,
                 "content": content,
+                "persistence_state": persistence_state,
             }
         )
 
@@ -327,6 +329,7 @@ def test_coord_adapter_emit_state_passes_rich_payload_to_collector() -> None:
     assert call["activity_state"] == "thinking"
     # Mid-turn (RUNNING) — content stays accumulated for the eventual IDLE drain.
     assert call["content"] == ""
+    assert call["persistence_state"] == "healthy"
 
 
 def test_coord_adapter_emit_state_idle_drains_content() -> None:
@@ -403,6 +406,33 @@ def test_coord_ui_broadcast_activity_no_op_when_collector_unset() -> None:
     ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
     ConsoleCoordinatorUI._collector = None
     ui.on_thinking_start()  # must not raise
+
+
+def test_coord_ui_persistence_refresh_updates_cluster_without_transcript_event() -> None:
+    recorder = _FakeCollectorRecorder()
+    ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
+    session = MagicMock()
+    session.conversation_persistence_status = lambda: {"state": "retrying"}
+    ui.bind_session(session)
+    ws = MagicMock()
+    ws.state.value = "error"
+    # The registry row deliberately disagrees: the persistence field must
+    # come from the BOUND session, so a registry miss or an id-reuse
+    # replacement row can never report another session's journal.
+    ws.session.conversation_persistence_status = lambda: {"state": "healthy"}
+    mgr = MagicMock()
+    mgr.get.return_value = ws
+    ConsoleCoordinatorUI._collector = recorder  # type: ignore[assignment]
+    ConsoleCoordinatorUI._coord_mgr = mgr
+    try:
+        ui.on_persistence_state_changed()
+    finally:
+        ConsoleCoordinatorUI._collector = None
+        ConsoleCoordinatorUI._coord_mgr = None
+
+    assert recorder.state_calls[0]["state"] == "error"
+    assert recorder.state_calls[0]["persistence_state"] == "retrying"
+    assert ui._event_id == 0, "operator refresh must not enter the per-workstream SSE stream"
 
 
 def test_coord_ui_broadcast_activity_failure_does_not_strand_dedup() -> None:
@@ -672,5 +702,36 @@ def test_webui_on_tool_result_still_records_prometheus_tool_call() -> None:
         # Per-ws counter writes happened too (inherited from base).
         assert ui._ws_tool_calls == {"bash": 1}
         assert ui._ws_turn_tool_calls == 1
+    finally:
+        WebUI._global_queue = None
+
+
+def test_webui_accepted_tool_projection_is_metrics_free() -> None:
+    """Final guarded replacement must not count the executor receipt twice."""
+    import queue
+
+    from turnstone.server import WebUI
+
+    WebUI._global_queue = queue.Queue()
+    try:
+        ui = WebUI(ws_id="ws-int", user_id="u1")
+        ui._ws_tool_calls = {"bash": 1}
+        ui._ws_turn_tool_calls = 1
+        with patch("turnstone.server._metrics") as mock_metrics:
+            event_id = ui.on_tool_turn_accepted(
+                "call-1",
+                "bash",
+                "guarded output",
+                is_error=True,
+                effect_status="unknown",
+            )
+
+        assert event_id == 1
+        mock_metrics.record_tool_call.assert_not_called()
+        assert ui._ws_tool_calls == {"bash": 1}
+        assert ui._ws_turn_tool_calls == 1
+        projected = ui._event_buffer[-1][1]
+        assert projected["accepted"] is True
+        assert projected["effect_status"] == "unknown"
     finally:
         WebUI._global_queue = None

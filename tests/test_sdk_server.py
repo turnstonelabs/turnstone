@@ -202,6 +202,23 @@ async def test_send():
 
 
 @pytest.mark.anyio
+async def test_send_threads_client_send_id_without_idempotency_semantics():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"status": "ok"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        await client.send("Hello", "ws1", client_send_id="browser-send_1")
+
+    assert captured == {"message": "Hello", "client_send_id": "browser-send_1"}
+
+
+@pytest.mark.anyio
 async def test_approve():
     transport = _mock_transport(
         {
@@ -245,6 +262,36 @@ async def test_command():
 # ---------------------------------------------------------------------------
 # History
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_get_history_preserves_handoff_fields_and_limit():
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["limit"] = request.url.params["limit"]
+        return _json_response(
+            {
+                "ws_id": "ws1",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "system", "source": "compaction", "content": "summary"},
+                ],
+                "cursor": 0,
+                "handoff_token": "epoch.7",
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        resp = await client.get_history("ws1", limit=42)
+
+    assert captured == {"path": "/v1/api/workstreams/ws1/history", "limit": "42"}
+    assert resp.cursor == 0
+    assert resp.handoff_token == "epoch.7"
+    assert resp.messages[1]["role"] == "system"
 
 
 @pytest.mark.anyio

@@ -159,6 +159,7 @@ def tmp_db():
 
 def _make_session(client, model_id, tmp_db, **kwargs) -> tuple[ChatSession, RecordingUI]:
     """Create a ChatSession with RecordingUI and sensible test defaults."""
+    from turnstone.core.memory import register_workstream
     from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
     ui = RecordingUI()
@@ -174,6 +175,10 @@ def _make_session(client, model_id, tmp_db, **kwargs) -> tuple[ChatSession, Reco
     )
     defaults.update(kwargs)
     session = ChatSession(**defaults)
+    # Production creates the parent workstream before admitting any keyed
+    # conversation row.  These direct-session tests mirror that ordering so
+    # the storage orphan-write fence remains exercised rather than bypassed.
+    register_workstream(session.ws_id, user_id=kwargs.get("user_id"))
     # Mock-based tests use Chat Completions format (client.chat.completions)
     replace_session_lane(session, provider=OpenAIChatCompletionsProvider())
     session.auto_approve = True

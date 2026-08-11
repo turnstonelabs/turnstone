@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 # must remain available at runtime rather than behind TYPE_CHECKING.
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002
 
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import ConversationPersistenceState, WorkstreamKind
 
 # ---------------------------------------------------------------------------
 # Workstream management
@@ -19,6 +19,17 @@ from turnstone.core.workstream import WorkstreamKind
 
 class SendRequest(BaseModel):
     message: str = Field(description="User message text")
+    client_send_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description=(
+            "Opaque browser correlation token echoed in the accepted `user_turn` "
+            "event and history row. It is not an idempotency key; repeated sends "
+            "with the same value remain distinct turns."
+        ),
+    )
     attachment_ids: list[str] | None = Field(
         default=None,
         description=(
@@ -369,6 +380,15 @@ class WorkstreamInfo(BaseModel):
     parent_ws_id: str | None = None
     user_id: str = ""
     project_id: str | None = None
+    persistence_state: ConversationPersistenceState = Field(
+        default="healthy",
+        description=(
+            "Sanitized durable-history status for the loaded workstream: "
+            "healthy, pending its first save, retrying automatically, or blocked "
+            "by a permanent commit conflict. Older servers and unloaded rows "
+            "default to healthy."
+        ),
+    )
 
 
 class ListWorkstreamsResponse(BaseModel):
@@ -499,6 +519,13 @@ class DashboardWorkstream(BaseModel):
     parent_ws_id: str | None = None
     user_id: str = ""
     project_id: str | None = None
+    persistence_state: ConversationPersistenceState = Field(
+        default="healthy",
+        description=(
+            "Sanitized durable-history status for this live row. Contains no "
+            "storage error, commit key, retry count, or conversation content."
+        ),
+    )
     pending_approval_details: list[PendingApprovalDetail] = Field(
         default_factory=list,
         description=(
@@ -595,6 +622,13 @@ class WorkstreamDetailResponse(BaseModel):
     state: str
     user_id: str
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
+    persistence_state: ConversationPersistenceState = Field(
+        default="healthy",
+        description=(
+            "Sanitized durable-history status: healthy, pending its first save, "
+            "retrying automatically, or blocked by a permanent commit conflict."
+        ),
+    )
     pending_approval: bool = Field(
         default=False,
         description=(
@@ -635,12 +669,16 @@ class WorkstreamHistoryResponse(BaseModel):
     messages: list[dict[str, Any]] = Field(
         default_factory=list,
         description=(
-            "Tail of the workstream's message history, projected to the "
-            "canonical render shape (``role`` may be ``system`` for "
-            "operator-context turns; flat tool_calls with verdict / "
-            "output_assessment; top-level source / attachments / reasoning; "
-            "derived denied / is_error / pending). Bounded "
-            "by the ``limit`` query parameter (default 100, max 500)."
+            "Requested limit-bounded tail of one authoritative total accepted "
+            "conversation-row prefix, projected to the canonical render shape. "
+            "Roles include "
+            "``user``, ``assistant``, ``tool``, and ``system``; compaction "
+            "checkpoints project as ``role=system, source=compaction`` and "
+            "cancellation-generated assistant/tool markers appear when present. "
+            "The projection also carries flat tool_calls with verdict / "
+            "output_assessment; top-level source / attachments / reasoning; and "
+            "derived denied / is_error / pending. Bounded by the ``limit`` query "
+            "parameter (default 100, max 500)."
         ),
     )
     cursor: int | None = Field(
@@ -654,6 +692,18 @@ class WorkstreamHistoryResponse(BaseModel):
             "in-flight turn (tool calls, results, prompts) instead of the "
             "lossy synthetic snapshot. Null on every other read — the "
             "client connects fresh."
+        ),
+    )
+    handoff_token: str | None = Field(
+        default=None,
+        description=(
+            "Opaque token naming the exact accepted conversation-row prefix used "
+            "for this render. Present only while the workstream is loaded. A "
+            "client that renders this response passes the token once as the "
+            "initial event stream's ``history_token`` query parameter; the server "
+            "atomically validates it while registering the listener. Admission of "
+            "a later row changes the token; durable acknowledgement does not. "
+            "Clients must not inspect, persist, or reuse it for later reconnects."
         ),
     )
 

@@ -6,6 +6,8 @@ import httpx
 import pytest
 
 from turnstone.sdk._base import _BaseClient
+from turnstone.sdk.events import HistoryResyncEvent, UserTurnEvent
+from turnstone.sdk.server import AsyncTurnstoneServer
 
 
 def _sse_response(*events: str) -> httpx.Response:
@@ -108,3 +110,60 @@ async def test_stream_sse_multiple_events():
         assert len(events) == 5
         types = [e["type"] for e in events]
         assert types == ["connected", "content", "content", "status", "stream_end"]
+
+
+@pytest.mark.anyio
+async def test_stream_events_forwards_initial_history_handoff_hints():
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.url.params))
+        return _sse_response('{"type":"history_resync","ws_id":"ws1","reason":"handoff_mismatch"}')
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        events = [
+            event
+            async for event in client.stream_events(
+                "ws1",
+                last_event_id=0,
+                history_token="epoch.7",
+            )
+        ]
+
+    assert captured == {
+        "user_turn": "1",
+        "last_event_id": "0",
+        "history_token": "epoch.7",
+    }
+    assert len(events) == 1
+    assert isinstance(events[0], HistoryResyncEvent)
+    assert events[0].reason == "handoff_mismatch"
+
+
+@pytest.mark.anyio
+async def test_stream_events_decodes_canonical_user_turn_wire_identity():
+    """The capable SDK receives the payload identity, not only SSE transport id."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["user_turn"] == "1"
+        return _sse_response(
+            '{"type":"user_turn","ws_id":"ws1","content":"hello peer",'
+            '"sender":"alice","client_send_ids":["send-1"],"_event_id":17}'
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        events = [event async for event in client.stream_events("ws1", last_event_id=16)]
+
+    assert events == [
+        UserTurnEvent(
+            ws_id="ws1",
+            content="hello peer",
+            sender="alice",
+            client_send_ids=["send-1"],
+            _event_id=17,
+        )
+    ]

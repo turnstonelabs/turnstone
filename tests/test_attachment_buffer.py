@@ -68,6 +68,45 @@ def test_discard_is_scope_checked() -> None:
     assert buf.get(entry.attachment_id, ws_id="ws1", user_id="u1") is None
 
 
+def test_consume_all_consumes_present_subset_and_reports_missing() -> None:
+    """Survivors are consumed exactly once even when a sibling is missing.
+
+    Deliberate pin update: the old all-or-nothing contract left every
+    surviving reference staged when one handle expired, letting the same
+    uploads be attached again after the turn that owned their bytes already
+    committed (the double-spend the atomic transfer exists to prevent).
+    """
+
+    buf = AttachmentBuffer()
+    first = _stage(buf, content=b"first")
+    second = _stage(buf, content=b"second")
+    _stage(buf, content=b"first", ws="other", user="u1")
+    missing = hashlib.sha256(b"missing").hexdigest()
+
+    consumed = buf.consume_all(
+        [first.attachment_id, missing, second.attachment_id],
+        ws_id="ws1",
+        user_id="u1",
+    )
+    assert consumed == {first.attachment_id, second.attachment_id}
+    assert buf.get(first.attachment_id, ws_id="ws1", user_id="u1") is None
+    assert buf.get(second.attachment_id, ws_id="ws1", user_id="u1") is None
+    # Scope isolation: another workstream's staging of the same bytes survives.
+    assert buf.get(first.attachment_id, ws_id="other", user_id="u1") is not None
+
+    # A second consume finds nothing — the ownership reference is one-shot,
+    # and duplicate handles in one call consume it only once.
+    assert (
+        buf.consume_all(
+            [first.attachment_id, first.attachment_id, second.attachment_id],
+            ws_id="ws1",
+            user_id="u1",
+        )
+        == frozenset()
+    )
+    assert buf.consume_all([], ws_id="ws1", user_id="u1") == frozenset()
+
+
 def test_ttl_eviction_on_access() -> None:
     clock = [0.0]
     buf = AttachmentBuffer(ttl_seconds=10.0, clock=lambda: clock[0])

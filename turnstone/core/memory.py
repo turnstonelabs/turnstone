@@ -4,9 +4,11 @@ All functions maintain their existing signatures for consumers (session.py,
 server.py, cli.py). The actual storage implementation lives in
 ``turnstone.core.storage``.
 
-The no-raise contract is preserved — callers never see exceptions from this
-module.  All failures are logged so storage issues are visible in logs
-rather than silently swallowed.
+The established best-effort contract is preserved for operational failures.
+Operations whose callers require positive durability return an explicit
+failure sentinel rather than swallowing an exception into an indistinguishable
+successful ``None``.  Typed invariant conflicts remain exceptions: callers
+must never mistake a different immutable commit for a transient storage blip.
 """
 
 from __future__ import annotations
@@ -14,7 +16,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
-from turnstone.core.storage import get_storage
+from turnstone.core.storage import (
+    AttachmentWrite,
+    ConversationCommitConflictError,
+    ConversationCommitWorkstreamGoneError,
+    get_storage,
+)
 from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
@@ -33,6 +40,27 @@ def normalize_key(key: str) -> str:
 # -- Core conversation operations ---------------------------------------------
 
 
+_TYPED_COMMIT_ERRORS = (ConversationCommitConflictError, ConversationCommitWorkstreamGoneError)
+
+
+def _keyed_save(operation: Callable[[], int], describe: str) -> int:
+    """Run one keyed save with the shared typed-passthrough frame.
+
+    Typed commit outcomes must reach the session journal un-coerced — the
+    next typed class belongs in ``_TYPED_COMMIT_ERRORS`` ONCE, for every
+    wrapper (a missed wrapper would convert a permanent invariant conflict
+    into a logged return-0 the journal retries forever). Operational
+    failures log and return ``0``; the journal classifies and retries them.
+    """
+    try:
+        return operation()
+    except _TYPED_COMMIT_ERRORS:
+        raise
+    except Exception:
+        log.warning("%s", describe, exc_info=True)
+        return 0
+
+
 def save_message(
     ws_id: str,
     role: str,
@@ -46,11 +74,14 @@ def save_message(
     is_error: bool = False,
     producer: str | None = None,
     meta: str | None = None,
+    commit_key: str | None = None,
 ) -> int:
     """Log a message to the conversations table.
 
-    Returns the inserted row id, or ``0`` on failure (preserving the
-    module's no-raise contract).
+    Returns the inserted row id, or ``0`` on an operational failure.  A keyed
+    retry whose immutable payload conflicts with the committed row raises
+    :class:`ConversationCommitConflictError` so the durability journal can
+    classify the permanent invariant failure without retrying it.
 
     ``source`` is the persisted twin of the in-memory ``_source``
     side-channel (which producer synthesised the row); ``None`` for the
@@ -61,15 +92,18 @@ def save_message(
     passes ``self.ui._event_id`` so ``/history`` can return it as the
     ``Last-Event-ID`` resume cursor.  ``None`` for offline / bulk saves.
 
-    ``meta`` is the pre-serialized JSON of a first-class ``system`` turn's
-    structured per-kind operator-context fields (e.g. ``watch_triggered``'s
-    ``watch_name`` / ``command`` / poll counters) — the persisted twin of the
-    in-memory ``Turn.meta.extra["source_meta"]`` / ``_source_meta`` side
-    channel.  ``None`` for ordinary rows and operator turns with no extra
-    fields.  Opaque to storage (like ``tool_calls`` / ``provider_data``).
+    ``meta`` is pre-serialized role-specific conversation metadata: structured
+    operator context on system turns, effect/preview fields plus the acting
+    principal on tool turns, sender identity on shared-workstream user turns,
+    or the immutable model provenance envelope on accepted assistant turns.
+    It is opaque to the backend and decoded only at the row-to-Turn boundary.
+
+    ``commit_key`` is the per-workstream idempotency identity for one admitted
+    conversation row. Retrying the same non-NULL key returns the original row
+    id without appending a duplicate.
     """
-    try:
-        return get_storage().save_message(
+    return _keyed_save(
+        lambda: get_storage().save_message(
             ws_id,
             role,
             content,
@@ -82,10 +116,79 @@ def save_message(
             is_error=is_error,
             producer=producer,
             meta=meta,
-        )
-    except Exception:
-        log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)
-        return 0
+            commit_key=commit_key,
+        ),
+        f"Failed to save message for ws={ws_id} role={role}",
+    )
+
+
+def save_user_message_with_attachments(
+    ws_id: str,
+    content: str,
+    attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+    *,
+    source: str | None = None,
+    event_id: int | None = None,
+    meta: str | None = None,
+    commit_key: str,
+) -> int:
+    """Atomically persist a keyed USER row and its attachment ownership.
+
+    Returns the positively acknowledged row id, or ``0`` on an operational
+    failure.  An immutable commit mismatch raises
+    :class:`ConversationCommitConflictError`.  The session handoff journal may
+    acknowledge the row only when the backend has confirmed the row, blobs,
+    exact refcount increments, and ordered ref-list as one transaction.
+    Retrying the same immutable commit is safe.
+    """
+    return _keyed_save(
+        lambda: get_storage().save_user_message_with_attachments(
+            ws_id,
+            content,
+            attachments,
+            source=source,
+            event_id=event_id,
+            meta=meta,
+            commit_key=commit_key,
+        ),
+        f"Failed atomic user attachment commit for ws={ws_id} commit_key={commit_key}",
+    )
+
+
+def save_tool_message_with_attachments(
+    ws_id: str,
+    content: str,
+    tool_name: str,
+    tool_call_id: str,
+    attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+    *,
+    event_id: int | None = None,
+    is_error: bool = False,
+    meta: str | None = None,
+    commit_key: str,
+) -> int:
+    """Atomically persist a keyed TOOL row and its attachment ownership.
+
+    Returns the positively acknowledged row id, or ``0`` on an operational
+    failure.  An immutable commit mismatch raises
+    :class:`ConversationCommitConflictError`.  This is the storage seam for
+    ordinary tool-image rows and cancelled rows whose already-published preview
+    blob must survive with the synthesized result.
+    """
+    return _keyed_save(
+        lambda: get_storage().save_tool_message_with_attachments(
+            ws_id,
+            content,
+            tool_name,
+            tool_call_id,
+            attachments,
+            event_id=event_id,
+            is_error=is_error,
+            meta=meta,
+            commit_key=commit_key,
+        ),
+        f"Failed atomic tool attachment commit for ws={ws_id} commit_key={commit_key}",
+    )
 
 
 def save_messages_bulk(rows: list[dict[str, Any]]) -> bool:

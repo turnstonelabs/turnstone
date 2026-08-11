@@ -636,6 +636,16 @@ def test_postgresql_stale_creating_reaper_recovers_tokenless_locked_row(
 
 
 def test_postgresql_retention_prune_excludes_creating_rows() -> None:
+    """Both candidate discoveries exclude provisional rows, and take no locks.
+
+    Discovery moved out of the deleting transaction when prune became one
+    bounded transaction per candidate: it is a plain read now, with no
+    ``FOR UPDATE SKIP LOCKED`` and nothing to commit.  That lock rides each
+    candidate's own transaction instead — see
+    ``test_postgresql_prune_candidate_locks_rechecks_and_commits_alone`` in
+    tests/test_storage_prune_commit_races.py.  The predicates themselves are
+    unchanged, which is what this test pins.
+    """
     backend, conn = _scripted_postgres_backend(
         _UnknownRowcountResult(rows=[]),
         _UnknownRowcountResult(rows=[]),
@@ -644,12 +654,27 @@ def test_postgresql_retention_prune_excludes_creating_rows() -> None:
     assert backend.prune_workstreams(retention_days=30) == (0, 0)
 
     conn.assert_consumed()
-    assert conn.commits == 1
+    assert conn.commits == 0
+    orphan_select_sql = str(
+        conn.statements[0].compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    ).lower()
     stale_select_sql = str(
         conn.statements[1].compile(
             dialect=postgresql.dialect(),
             compile_kwargs={"literal_binds": True},
         )
     ).lower()
-    assert "workstreams.state" in stale_select_sql
-    assert "creating" in stale_select_sql
+    for candidate_sql in (orphan_select_sql, stale_select_sql):
+        assert "workstreams.state" in candidate_sql
+        assert "creating" in candidate_sql
+        assert "for update" not in candidate_sql
+    assert "not (exists" in orphan_select_sql
+    # Round-3 review guards: the orphan category excludes named workstreams
+    # (explicit user intent) and rows younger than the grace (a user
+    # mid-first-turn whose rows may still be journal-held on another node).
+    assert "workstreams.alias is null" in orphan_select_sql
+    assert "workstreams.updated" in orphan_select_sql
+    assert "workstreams.updated" in stale_select_sql

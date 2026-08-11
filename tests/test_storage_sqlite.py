@@ -598,7 +598,16 @@ class TestDeleteWorkstream:
 
 class TestPruneWorkstreams:
     def test_orphan_removed(self, backend):
+        import sqlalchemy as sa
+
         backend.register_workstream("orphan")
+        # Age past the orphan grace; a fresh empty row is deliberately kept
+        # (round-3 review) — pinned in test_sessions.py.
+        with backend._engine.connect() as conn:
+            conn.execute(
+                sa.text("UPDATE workstreams SET updated = '2020-01-01' WHERE ws_id = 'orphan'")
+            )
+            conn.commit()
         orphans, stale = backend.prune_workstreams()
         assert orphans == 1
 

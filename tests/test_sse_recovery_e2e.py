@@ -92,6 +92,51 @@ PACED_STORM = "for i in $(seq 1 40); do echo r-$i; sleep 0.05; done"
 
 
 # ---------------------------------------------------------------------------
+# Recovery-server event pulses used by the browser latch probes
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_server_pulses_follow_the_ordered_session_sse_path(
+    make_server: Callable[..., RecoveryServer],
+) -> None:
+    """Idle/tool pulses are real ordered UI events, not harness-only DOM calls."""
+    srv = make_server()
+    ws_id = srv.create_workstream(name="recovery-pulses")
+    client = BrowserlikeSSEClient(srv.base_url, ws_id, srv.token)
+    try:
+        client.connect()
+        client.wait_for_type("connected", timeout=10)
+
+        idle_id = srv.emit_idle_edge(ws_id)
+        pending_id = srv.emit_tool_pending(ws_id, "recovery-probe")
+        result_id = srv.emit_tool_result(ws_id, "recovery-probe")
+        expected_ids = {idle_id, pending_id, result_id}
+        client.wait_for(
+            lambda c: (
+                expected_ids
+                <= {f.event_id_int for f in c.all_frames() if f.event_id_int is not None}
+            ),
+            timeout=10,
+        )
+
+        frames = {f.event_id_int: f for f in client.all_frames() if f.event_id_int in expected_ids}
+        assert [idle_id, pending_id, result_id] == list(range(idle_id, result_id + 1))
+        assert [frames[event_id].etype for event_id in sorted(expected_ids)] == [
+            "state_change",
+            "tool_pending",
+            "tool_result",
+        ]
+        assert frames[idle_id].payload is not None
+        assert frames[idle_id].payload["state"] == "idle"
+        assert frames[pending_id].payload is not None
+        assert frames[pending_id].payload["items"][0]["call_id"] == "recovery-probe"
+        assert frames[result_id].payload is not None
+        assert frames[result_id].payload["call_id"] == "recovery-probe"
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------
 # Scenario 1 — storm without loss (fix-3 efficacy)
 # ---------------------------------------------------------------------------
 

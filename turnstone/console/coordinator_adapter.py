@@ -16,6 +16,7 @@ for the storage-seeded children rebuild.
 from __future__ import annotations
 
 import queue
+import threading
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core import session_worker
@@ -26,7 +27,12 @@ from turnstone.core.children_registry import ChildrenRegistry
 from turnstone.core.log import get_logger
 from turnstone.core.memory import get_workstream_display_name, get_workstream_display_names
 from turnstone.core.storage import is_storage_initialized
-from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
+from turnstone.core.workstream import (
+    Workstream,
+    WorkstreamKind,
+    WorkstreamState,
+    workstream_persistence_state,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -204,6 +210,7 @@ class CoordinatorAdapter:
             }
         ws_id = ws.id
         state_value = state.value
+        persistence_state = workstream_persistence_state(ws)
 
         def _emit() -> None:
             try:
@@ -215,6 +222,7 @@ class CoordinatorAdapter:
                     activity=payload["activity"],
                     activity_state=payload["activity_state"],
                     content=payload["content"],
+                    persistence_state=persistence_state,
                 )
             except Exception:
                 log.debug("coord_adapter.state_fanout_failed ws=%s", ws_id[:8], exc_info=True)
@@ -302,10 +310,17 @@ class CoordinatorAdapter:
     ) -> bool:
         """Queue a message onto a coordinator session's ChatSession.
 
-        Returns False if the coordinator isn't loaded in the manager or
-        if the worker's pending-message queue is full (caller should
-        surface 429 / backpressure). Priority is parsed from the message
-        prefix (``/high``, ``/urgent``, etc.) by :meth:`ChatSession.queue_message`.
+        Returns False when the dispatch is refused; the caller should surface
+        429 / backpressure. ``False`` is one undifferentiated signal covering
+        every refusal — the coordinator isn't loaded in the manager, the
+        worker's pending-message queue is full, a command window or the
+        order barrier holds the slot, or the sender's fresh turn was blocked
+        by another participant's retained queued input. The interactive routes
+        distinguish that last case as ``cross_user_interjection`` (HTTP 409)
+        because they have a per-refusal return channel; this signature has
+        none, so each refusal names its reason in a ``coord_adapter.*`` log
+        instead. Priority is parsed from the message prefix (``/high``,
+        ``/urgent``, etc.) by :meth:`ChatSession.queue_message`.
 
         ``acting_user_id`` is the authenticated sender. On a fresh turn it is
         bound as the coordinator's acting user — with coordinator MCP enabled
@@ -335,6 +350,11 @@ class CoordinatorAdapter:
         ``None`` so the steady-state ``coord_adapter.send`` call sites (no
         attachments) keep working unchanged.
         """
+        # Function-local like CrossUserInterjectionError below: the session
+        # module imports console-free core only, but the console package
+        # must not import it at module load.
+        from turnstone.core.session import GenerationCancelled
+
         mgr = self._manager
         if mgr is None:
             raise RuntimeError(
@@ -352,6 +372,7 @@ class CoordinatorAdapter:
         _send_id = send_id if _attachments else None
 
         def _run() -> None:
+            me = threading.current_thread()
             try:
                 # Fresh turn: bind the authenticated sender so any MCP tools run
                 # under their credentials and the acting-user signal is correct
@@ -362,6 +383,20 @@ class CoordinatorAdapter:
                     if callable(bind):
                         bind(acting_user_id)
                 session.send(message, attachments=_attachments, send_id=_send_id)
+            except GenerationCancelled:
+                # Safety net, the coord sibling of the /send route's arm: a
+                # Stop that lands between the slot claim and send()'s own
+                # convergence envelope raises out of send(), and
+                # ``session_worker._runner`` catches only ``Exception`` — a
+                # BaseException here would kill the worker thread via
+                # ``threading.excepthook`` and leave the dashboard's child
+                # row stuck busy/streaming.  If this thread was
+                # force-abandoned, ``ws.worker_thread`` was cleared — don't
+                # emit spurious events over the successor's stream.
+                if ws_ref.worker_thread is me:
+                    state_change = getattr(session.ui, "on_state_change", None)
+                    if callable(state_change):
+                        state_change("idle")
             except Exception:
                 # Attachments were resolved (peeked) from the per-node upload
                 # buffer, not soft-locked — there is no reservation to release
@@ -399,13 +434,32 @@ class CoordinatorAdapter:
                 # a message that would be capped and could cross a /resume
                 # identity swap.
                 raise queue.Full()
+            admission = session_worker.claimed_slot_queue_admission(ws, acting_user_id)
+            if admission is None:
+                from turnstone.core.session import CrossUserInterjectionError
+
+                raise CrossUserInterjectionError("Another participant's turn is in flight")
+            _claimed, queue_kwargs = admission
             att_ids = [a.attachment_id for a in _attachments] if _attachments else None
-            session.queue_message(
-                message,
-                attachment_ids=att_ids,
-                queue_msg_id=_send_id,
-                interjector_user_id=acting_user_id,
+            queue_kwargs.update({"attachment_ids": att_ids, "queue_msg_id": _send_id})
+            session.queue_message(message, **queue_kwargs)
+
+        def _before_spawn() -> bool:
+            if not session_worker.foreign_queue_conflict(session, acting_user_id):
+                return True
+            # This refusal reaches the caller as a bare ``False``, which carries
+            # none of the classification the route layer's twin surfaces as
+            # ``rejected="cross_user_interjection"`` (HTTP 409).  Name the
+            # reason here — this closure is the only place the cross-user
+            # judgement exists on the coordinator path, so an unlogged refusal
+            # would be indistinguishable from a full queue or an unloaded
+            # workstream when an operator asks why a message vanished.
+            log.warning(
+                "coord_adapter.send_refused_cross_user_queued_input ws=%s user=%s",
+                ws.id[:8],
+                acting_user_id,
             )
+            return False
 
         # Order-barrier yield, mirroring the /send route's pre-check: once
         # deferred sends are pending (or a claimed entry's dispatch is in
@@ -430,7 +484,10 @@ class CoordinatorAdapter:
             ws,
             enqueue=_enqueue,
             run=_run,
+            expected_session=session,
+            before_spawn=_before_spawn,
             thread_name=f"coord-worker-{ws.id[:8]}",
+            principal_id=acting_user_id,
         )
 
     # ------------------------------------------------------------------

@@ -2152,6 +2152,7 @@ class CoordinatorClient:
 
 
 _PROVIDER_FIDELITY_KEYS: frozenset[str] = frozenset({"_provider_content", "provider_blocks"})
+_PRIVATE_MESSAGE_KEYS: frozenset[str] = frozenset({"_commit_key", "_provenance"})
 
 
 def _serialize_messages(
@@ -2173,9 +2174,15 @@ def _serialize_messages(
     for r in rows:
         if isinstance(r, dict):
             if include_provider_content:
-                out.append(r)
+                out.append({k: v for k, v in r.items() if k not in _PRIVATE_MESSAGE_KEYS})
             else:
-                out.append({k: v for k, v in r.items() if k not in _PROVIDER_FIDELITY_KEYS})
+                out.append(
+                    {
+                        k: v
+                        for k, v in r.items()
+                        if k not in _PROVIDER_FIDELITY_KEYS and k not in _PRIVATE_MESSAGE_KEYS
+                    }
+                )
         else:
             # Fall back to a string repr so at least something lands.
             out.append({"raw": str(r)})

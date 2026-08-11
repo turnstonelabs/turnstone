@@ -44,7 +44,7 @@ from turnstone.api.console_spec import build_console_spec
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.coordinator_alias import resolve_coordinator_alias
-from turnstone.console.coordinator_client import load_task_envelope
+from turnstone.console.coordinator_client import _serialize_messages, load_task_envelope
 from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
 from turnstone.core.audit import record_audit
@@ -110,7 +110,11 @@ from turnstone.core.web_helpers import (
     read_json_or_400,
     require_storage_or_503,
 )
-from turnstone.core.workstream import Workstream, WorkstreamKind
+from turnstone.core.workstream import (
+    Workstream,
+    WorkstreamKind,
+    workstream_persistence_state,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterable
@@ -633,6 +637,7 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
                 "user_id": ws.user_id or "",
                 "project_id": ws.project_id or "",
                 "persona": ws.persona or "",
+                "persistence_state": workstream_persistence_state(ws),
             }
         )
         seen.add(ws.id)
@@ -663,6 +668,8 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
                 "user_id": row_owner,
                 "project_id": m.get("project_id") or "",
                 "persona": m.get("persona") or "",
+                # Persisted-only rows have no in-memory journal to inspect.
+                "persistence_state": "healthy",
             }
         )
     return rows
@@ -719,6 +726,7 @@ _CLUSTER_WS_LIVE_KEYS = (
     "model_alias",
     "title",
     "name",
+    "persistence_state",
     # Carries the inline approve/deny payloads (one per live cycle,
     # items + judge_verdict each) so coord live-bulk callers can render
     # row-level UI without a per-child round-trip. ``[]`` when no
@@ -870,6 +878,7 @@ def _coordinator_live_snapshot(ws: Any) -> dict[str, Any]:
         "pending_approval": pending_approval,
         "pending_approval_details": pending_approval_details,
         "recent_auto_approvals": recent_auto_approvals,
+        "persistence_state": workstream_persistence_state(ws),
     }
 
 
@@ -954,6 +963,7 @@ async def _fetch_live_block(
     for entry in payload.get("workstreams", []) or []:
         if isinstance(entry, dict) and entry.get("ws_id") == ws_id:
             live = {k: entry.get(k) for k in _CLUSTER_WS_LIVE_KEYS if k in entry}
+            live.setdefault("persistence_state", "healthy")
             # Derived field — kept in lockstep with
             # _coordinator_live_snapshot so both origins produce the
             # same keys. ``state="attention"`` is the canonical signal;
@@ -1082,8 +1092,8 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
             # Tail-N bound pushed into SQL (load_messages supports limit
             # on both backends).  Offloaded to the default executor so
             # the async SSE loop stays unblocked under rapid fan-out.
-            messages = await asyncio.to_thread(
-                storage.load_messages, ws_id, limit=limit, repair=False
+            messages = _serialize_messages(
+                await asyncio.to_thread(storage.load_messages, ws_id, limit=limit, repair=False)
             )
         except Exception:
             log.debug("cluster_ws_detail.load_messages_failed", exc_info=True)
@@ -3674,38 +3684,13 @@ def _audit_retry_coordinator(
     )
 
 
-def _coord_dispatch_retry(ws: Workstream, user_msg: str) -> None:
-    """Re-send ``user_msg`` on a coordinator workstream after ``/retry``.
-
-    Passed to :func:`make_retry_handler` as ``dispatch_retry``. Mirrors
-    :meth:`CoordinatorAdapter.send`'s worker shape — drives the shared
-    :func:`turnstone.core.session_worker.send` dispatcher — but without
-    attachment handling (a retry re-sends an existing text turn). The
-    ``run`` closure's error handling is intentionally light:
-    :meth:`ChatSession.send` already surfaces failures to SSE, persists
-    ``last_error`` and emits state=error via ``_record_fatal_error``, and
-    the shared dispatcher owns the ``_worker_running`` lifecycle — so the
-    worker only logs. The ``enqueue`` closure hard-rejects (a retry must
-    not silently queue behind an in-flight turn).
-    """
-    from turnstone.core import session_worker
-
-    session = ws.session
-    ui = ws.ui
-    if session is None:
-        return
-
-    def _run() -> None:
-        try:
-            session.send(user_msg)
-        except Exception:
-            log.exception("coord.retry.worker_failed ws=%s", ws.id[:8])
-
-    def _enqueue() -> None:
-        if ui is not None and hasattr(ui, "on_error"):
-            ui.on_error("Cannot retry: workstream is busy")
-
-    session_worker.send(ws, enqueue=_enqueue, run=_run, thread_name=f"coord-retry-{ws.id[:8]}")
+def _coord_events_preamble(
+    ws: Workstream,
+    ui: Any,
+    request: Request,  # noqa: ARG001 — coord replay doesn't need request context
+) -> Iterable[dict[str, Any]]:
+    """Idempotent connected/status preamble used on every SSE path."""
+    yield from session_replay_preamble(ws.session, ui)
 
 
 def _coord_events_replay(
@@ -3732,7 +3717,7 @@ def _coord_events_replay(
 
     Pure read — never mutates ``ui`` / ``ws`` / ``session``.
     """
-    yield from session_replay_preamble(ws.session, ui)
+    yield from _coord_events_preamble(ws, ui, request)
 
     # EVERY live approval cycle replays (parallel task agents can have
     # several outstanding), each card followed once by the cached LLM
@@ -3858,7 +3843,7 @@ async def _coord_create_post_install(
     Wired onto :attr:`SessionEndpointConfig.create_post_install`. When
     an ``initial_message`` is provided, dispatches via
     :meth:`CoordinatorAdapter.send`; any uploaded ``attachment_ids``
-    are resolved from the buffer onto the first turn (and drained) so
+    are resolved from the buffer onto the first turn so
     the worker picks them up exactly the way interactive's
     ``post_install`` worker thread does.
 
@@ -3876,24 +3861,13 @@ async def _coord_create_post_install(
     if coord_adapter is None:
         return {}
 
-    # Resolve (peek) the staged uploads for the dispatched first turn; the
-    # committing ``ChatSession.send`` drains them from the per-node buffer and
-    # persists them content-addressed.  ``send_id`` is a tracking token only —
-    # no DB reservation to release on worker failure.
+    # Resolve (peek) the staged uploads for the dispatched first turn. The
+    # accepted USER journal admission atomically transfers their buffer
+    # ownership; a refusal before admission leaves them staged for retry.
     send_id = _uuid.uuid4().hex
     resolved_atts: list[Any] = []
     if attachment_ids:
         resolved_atts, _ord, _drop = resolve_staged_attachments(attachment_ids, ws.id, uid)
-        # Drain the staged uploads now: the create-time dispatch is their only
-        # consumer, so leaving them staged would let the new coord pane's
-        # rehydrate race the worker's write-time drain and show them as still-
-        # pending composer chips (the committing send's discard then no-ops).
-        if _ord:
-            from turnstone.core.attachment_buffer import get_attachment_buffer
-
-            _buf = get_attachment_buffer()
-            for _aid in _ord:
-                _buf.discard(_aid, ws_id=ws.id, user_id=uid)
     coord_adapter.send(
         ws.id,
         initial_message,
@@ -5031,14 +5005,14 @@ def _coord_idle_cleanup_thread(
     behind by prior console process incarnations.
 
     Runs an initial sweep BEFORE the first wait so cold-start orphans are
-    reaped immediately. ``timeout_sec == 0`` disables ordinary idle eviction,
-    but the independent provisional-create recovery still runs with its fixed
-    conservative grace and cadence.
+    reaped immediately. A short tick also reconciles due accepted-row writes.
+    ``timeout_sec == 0`` disables ordinary idle eviction, but both persistence
+    and provisional-create recovery remain active at their independent
+    cadences.
 
     When idle eviction is enabled, the wait subscribes to manager state and a
-    transition can wake the next sweep early. With idle eviction disabled, the
-    thread uses only the fixed provisional-create cadence so ordinary turn
-    transitions do not cause redundant storage scans.
+    transition can request the next idle sweep early. The persistence tick does
+    not accelerate those idle/orphan storage scans.
 
     ``min_sweep_interval`` is the hard floor between successive
     ``close_idle`` calls (default 5 s) — without it, sustained
@@ -5061,19 +5035,21 @@ def _coord_idle_cleanup_thread(
 
     ``stop_event`` is the lifecycle shutdown signal and ``wake_event`` is the
     shared state-change/shutdown wake path. Lifecycle owners set both so an
-    idle-enabled thread cannot remain blocked in its long heartbeat wait.
+    idle-enabled thread exits immediately.
     """
     from turnstone.core.session_manager import (
+        PERSISTENCE_RECONCILE_INTERVAL_SECONDS,
         STALE_CREATE_GRACE_SECONDS,
         STALE_CREATE_SWEEP_INTERVAL_SECONDS,
     )
 
     idle_enabled = timeout_sec > 0
-    check_every = (
+    lifecycle_check_every = (
         min(STALE_CREATE_SWEEP_INTERVAL_SECONDS, timeout_sec / 4)
         if idle_enabled
         else float(STALE_CREATE_SWEEP_INTERVAL_SECONDS)
     )
+    check_every = min(PERSISTENCE_RECONCILE_INTERVAL_SECONDS, lifecycle_check_every)
     tick_now = wake_event if wake_event is not None else threading.Event()
 
     def _on_state_change(_ws_id: str, _state: Any) -> None:
@@ -5110,6 +5086,10 @@ def _coord_idle_cleanup_thread(
                 log.debug("console.coord_stale_create_cleanup_failed", exc_info=True)
 
     try:
+        try:
+            mgr.reconcile_unresolved_persistence()
+        except Exception:
+            log.debug("console.coord_persistence_reconcile_initial_failed", exc_info=True)
         # Initial sweep — runs once before entering the wait loop.
         # ``tick_now`` is intentionally not cleared here: any
         # state-change event that arrives between subscribe and the
@@ -5117,38 +5097,36 @@ def _coord_idle_cleanup_thread(
         # discarded.
         _sweep(initial=True)
         last_sweep_at = time.monotonic()
+        early_sweep_requested = False
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
             if idle_enabled:
-                tick_now.wait(check_every)
+                if tick_now.wait(check_every):
+                    early_sweep_requested = True
             elif stop_event is not None:
                 stop_event.wait(check_every)
             else:
                 time.sleep(check_every)
             if stop_event is not None and stop_event.is_set():
                 return
-            # Clear BEFORE the cadence floor so any state-change event
-            # arriving during the cooldown (or during the close_idle
-            # below) leaves ``tick_now`` set — the next loop iteration
-            # then re-enters ``wait`` already-set and re-evaluates
-            # promptly.  close_idle is idempotent so a spurious extra
-            # tick is just one redundant scan.
             tick_now.clear()
-            # Cadence floor — see docstring for the tight-spin
-            # hazard rationale.  Cooldown uses ``stop_event.wait``
-            # (not ``time.sleep``) so the test stop hook still
-            # terminates promptly during the cooldown window.
+            try:
+                mgr.reconcile_unresolved_persistence()
+            except Exception:
+                log.debug("console.coord_persistence_reconcile_failed", exc_info=True)
+            # Persistence repair has a one-second heartbeat, but expensive
+            # close-idle/orphan scans retain their original heartbeat and
+            # state-wake floor. Keep an early request latched instead of
+            # sleeping through persistence ticks during the cooldown.
             since_last = time.monotonic() - last_sweep_at
-            if since_last < min_sweep_interval:
-                gap = min_sweep_interval - since_last
-                if stop_event is not None:
-                    if stop_event.wait(gap):
-                        return
-                else:
-                    time.sleep(gap)
+            heartbeat_due = since_last >= lifecycle_check_every
+            early_due = idle_enabled and early_sweep_requested and since_last >= min_sweep_interval
+            if not heartbeat_due and not early_due:
+                continue
             _sweep()
             last_sweep_at = time.monotonic()
+            early_sweep_requested = False
     finally:
         if idle_enabled:
             mgr.unsubscribe_from_state(_on_state_change)
@@ -15807,6 +15785,7 @@ def create_app(
         spawn_metrics=_coord_spawn_metrics,
         emit_message_queued=True,
         events_replay=_coord_events_replay,
+        events_preamble=_coord_events_preamble,
         create_supports_attachments=True,
         create_supports_user_id_override=False,
         # Coordinator creates honour ``server.require_project`` exactly like
@@ -15910,7 +15889,6 @@ def create_app(
             ),
             retry=make_retry_handler(  # lifted: shared body (#549)
                 coord_endpoint_config,
-                dispatch_retry=_coord_dispatch_retry,
                 audit_emit=_audit_retry_coordinator,
             ),
             events=make_events_handler(coord_endpoint_config),  # lifted: shared body

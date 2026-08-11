@@ -172,7 +172,14 @@ def _make_session(ui=None, **kwargs):
     recording NullUI.  The defaults live in
     tests/_session_helpers.make_session — duplicating them here is
     exactly the drift its docstring warns about."""
-    return make_session(ui=ui or NullUI(), **kwargs)
+    session = make_session(ui=ui or NullUI(), **kwargs)
+    # Keyed conversation commits refuse orphan writes by design; production's
+    # manager creates the parent workstream row before constructing a live
+    # session, so direct-session tests mirror that prerequisite.
+    from turnstone.core.memory import register_workstream
+
+    register_workstream(session.ws_id, user_id=kwargs.get("user_id"))
+    return session
 
 
 class _BlockingAgentStream:
@@ -207,14 +214,23 @@ class _ObservedRLock:
         self._watched_thread = thread
         self.waiting.clear()
 
-    def __enter__(self):
+    # ``acquire``/``release`` (not just the context-manager pair) so this
+    # wrapper can back a ``threading.Condition``, which binds those two
+    # methods off the lock it is given.
+    def acquire(self, *args, **kwargs):
         if threading.current_thread() is self._watched_thread:
             self.waiting.set()
-        self._lock.acquire()
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self._lock.release()
+        self.release()
 
 
 class _GatedRLock:
@@ -3946,6 +3962,12 @@ class TestCancelledSendCleanupOwnership:
         session._system_composed_with_context = True
         observed_lock = _ObservedRLock()
         session._generation_lock = observed_lock
+        # This test replaces the generation lock to observe ownership. The
+        # production truncation condition is constructed from that same lock,
+        # so rebuild it on the replacement: leaving the fixture's condition
+        # bound to the old lock would split the ownership domain and let the
+        # claimant cross the cleanup transaction.
+        session._history_truncation_condition = threading.Condition(observed_lock)
         cleanup_entered = threading.Event()
         release_cleanup = threading.Event()
         send_errors: list[BaseException] = []
@@ -4042,7 +4064,9 @@ class TestCancelledSendCleanupOwnership:
         blocked_cleanup_calls = 0
         original_commit = session._commit_for_generation
 
-        def blocked_commit(origin_generation, commit, *, allow_cancelled=True):
+        def blocked_commit(origin_generation, commit, *, allow_cancelled=True, **kwargs):
+            # Pass through every admission flag (e.g. allow_workstream_gone on
+            # the cancel finalizer) — the shim only sequences, never narrows.
             nonlocal blocked_cleanup_calls
             publish_generations.append(origin_generation)
             publish_name = getattr(commit, "__name__", "")
@@ -4051,6 +4075,7 @@ class TestCancelledSendCleanupOwnership:
                     origin_generation,
                     commit,
                     allow_cancelled=allow_cancelled,
+                    **kwargs,
                 )
             blocked_cleanup_calls += 1
             publish_entered.set()
@@ -4060,6 +4085,7 @@ class TestCancelledSendCleanupOwnership:
                 origin_generation,
                 commit,
                 allow_cancelled=allow_cancelled,
+                **kwargs,
             )
 
         def run_cancelled_send():
@@ -4642,6 +4668,26 @@ class TestEffectStatusPersistence:
         assert json.loads(_tool_turn_meta(EffectStatus.UNKNOWN, {"kind": "web"})) == {
             "effect_status": "unknown",
             "preview": {"kind": "web"},
+        }
+
+    def test_acting_principal_is_a_sibling_channel_omitted_when_empty(self):
+        """The audit identity joins the same envelope, never a fifth axis.
+
+        An unattributed lane (wake / internal / CLI) writes NO key rather than
+        an empty string, so a revocation query reading the column can treat
+        presence as attribution — the convention the USER row's ``sender``
+        already follows.
+        """
+        assert _tool_turn_meta(None, None, acting_principal="") is None
+        assert json.loads(_tool_turn_meta(None, None, acting_principal="user-alice")) == {
+            "acting_principal": "user-alice",
+        }
+        assert json.loads(
+            _tool_turn_meta(EffectStatus.UNKNOWN, {"kind": "web"}, acting_principal="user-alice")
+        ) == {
+            "effect_status": "unknown",
+            "preview": {"kind": "web"},
+            "acting_principal": "user-alice",
         }
 
     def test_reconstruct_routes_tool_effect_status(self):

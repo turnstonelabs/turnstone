@@ -134,9 +134,9 @@ class BrowserlikeSSEClient:
     # -- connection lifecycle ------------------------------------------------
 
     def _events_path(self, cursor: str | None) -> str:
-        path = f"/v1/api/workstreams/{self._ws_id}/events"
+        path = f"/v1/api/workstreams/{self._ws_id}/events?user_turn=1&tool_turn=1"
         if cursor is not None:
-            path += f"?last_event_id={cursor}"
+            path += f"&last_event_id={cursor}"
         return path
 
     def connect(self, *, native: bool = False, rcvbuf: int | None = None) -> None:

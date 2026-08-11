@@ -6648,7 +6648,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Truncates the coordinator conversation by N turns via the shared rewind handler and emits ``clear_ui`` so the dashboard re-fetches the truncated history. Gated on ``admin.coordinator``.",
+        "description": "Claims the coordinator mutation slot, durably truncates N turns, and emits ``clear_ui`` so the dashboard re-fetches the truncated history. Concurrent sends are ordered after the cut; storage failure returns 503 without changing live history. Gated on ``admin.coordinator``.",
         "parameters": [
           {
             "name": "ws_id",
@@ -6730,7 +6730,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Drops the last response and re-sends the last user message via the shared worker dispatch, emitting ``clear_ui``. Gated on ``admin.coordinator``.",
+        "description": "Uses one shared worker claim to drop the last response and start the replacement generation, emitting ``clear_ui``. Another send cannot enter between those operations. Gated on ``admin.coordinator``.",
         "parameters": [
           {
             "name": "ws_id",
@@ -6802,7 +6802,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Releases the worker thread + UI listeners and marks the row ``state=closed`` in storage.  The row remains queryable (audit / history) but cannot be reopened \u2014 a closed coordinator is terminal from the manager's perspective.",
+        "description": "Releases the worker thread + UI listeners and marks the row ``state=closed`` in storage.  The row remains queryable (audit / history) but cannot be reopened \u2014 a closed coordinator is terminal from the manager's perspective. Returns 409 while an accepted live conversation row still requires persistence reconciliation; the coordinator remains loaded and its history journal is retained.",
         "parameters": [
           {
             "name": "ws_id",
@@ -6844,6 +6844,16 @@
               }
             }
           },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Error 500",
             "content": {
@@ -6874,7 +6884,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Server-Sent Events stream carrying ``status``, ``message``, ``tool_call``, ``tool_result``, ``approval``, ``error``, and the phase-3 ``child_ws_*`` fan-out events.  Pings every 5s.  Body is text/event-stream \u2014 the response schema is omitted from the catalog because OpenAPI 3.1 has no first-class SSE type.",
+        "description": "Server-Sent Events stream carrying ``status``, ``message``, ``tool_call``, ``tool_result``, ``approval``, ``error``, and the phase-3 ``child_ws_*`` fan-out events. After rendering REST history, pass its opaque handoff_token once as ?history_token=; it names the exact accepted conversation-row prefix used for that render. history_resync closes this stream and requires a fresh history read; numeric replay is not a substitute. Native Last-Event-ID reconnects take priority. Pass ?user_turn=1 to receive typed accepted-user events; without it, those rows use the backward-compatible strong-repair projection. Pass ?tool_turn=1 to receive final accepted tool rows as typed tool_result events with accepted=true; without it, accepted tool rows use the same pre-row strong-repair projection. Pings every 5s.  Body is text/event-stream \u2014 the response schema is omitted from the catalog because OpenAPI 3.1 has no first-class SSE type.",
         "parameters": [
           {
             "name": "ws_id",
@@ -6883,6 +6893,42 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "last_event_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Numeric per-workstream event cursor for manual reconnects."
+          },
+          {
+            "name": "history_token",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque one-shot token naming the accepted prefix rendered from REST history."
+          },
+          {
+            "name": "user_turn",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Set to 1 to receive typed user_turn events instead of history-repair frames."
+          },
+          {
+            "name": "tool_turn",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Set to 1 to receive final accepted tool_result projections."
           }
         ],
         "responses": {
@@ -6939,7 +6985,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Returns the tail of the conversation in OpenAI-like message format.  Used by the page-load handshake; SSE handles updates after that.  Bounded by the ``limit`` query parameter.",
+        "description": "Returns the tail of the conversation in OpenAI-like message format.  Used by the page-load handshake; SSE handles updates after that. Cold coordinators are rehydrated before history is served, so every successful response participates in the REST-to-SSE handoff. Messages are the requested tail of one authoritative total accepted conversation-row prefix: user, assistant, tool, and system rows, including projected compaction checkpoints and cancellation markers. The opaque handoff_token names the exact prefix used for the render and is passed once on initial SSE registration. Admission of a later row changes the token; durable acknowledgement does not. If the durable prefix cannot be loaded, the endpoint returns 503 with `History temporarily unavailable`; that response is not authoritative and supplies no usable handoff token. Bounded by the ``limit`` query parameter.",
         "parameters": [
           {
             "name": "ws_id",
@@ -8374,6 +8420,18 @@
             "default": 0,
             "title": "Tool Calls",
             "type": "integer"
+          },
+          "persistence_state": {
+            "default": "healthy",
+            "description": "Sanitized durable-history status for a live row. Older nodes and unloaded persisted-only rows default to healthy.",
+            "enum": [
+              "healthy",
+              "pending",
+              "retrying",
+              "conflict"
+            ],
+            "title": "Persistence State",
+            "type": "string"
           }
         },
         "required": [
@@ -8552,7 +8610,7 @@
               }
             ],
             "default": null,
-            "description": "Live in-flight counters (state, tokens, activity, pending_approval) when the owning node returns them; null on degrade.",
+            "description": "Live in-flight counters and sanitized durable-history status (state, tokens, activity, pending_approval, persistence_state) when the owning node returns them; null on degrade.",
             "title": "Live"
           },
           "messages": {
@@ -8929,6 +8987,22 @@
             "description": "User message text",
             "title": "Message",
             "type": "string"
+          },
+          "client_send_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Opaque browser correlation token echoed in the accepted `user_turn` event and history row. It is not an idempotency key; repeated sends with the same value remain distinct turns.",
+            "title": "Client Send Id"
           },
           "attachment_ids": {
             "anyOf": [
@@ -9368,6 +9442,22 @@
             "description": "User message to queue onto the coordinator's worker.",
             "title": "Message",
             "type": "string"
+          },
+          "client_send_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Opaque browser correlation token echoed in the accepted `user_turn` event and history row. It is not an idempotency key.",
+            "title": "Client Send Id"
           },
           "attachment_ids": {
             "anyOf": [
@@ -15031,6 +15121,18 @@
             "$ref": "#/components/schemas/WorkstreamKind",
             "default": "interactive"
           },
+          "persistence_state": {
+            "default": "healthy",
+            "description": "Sanitized durable-history status: healthy, pending its first save, retrying automatically, or blocked by a permanent commit conflict.",
+            "enum": [
+              "healthy",
+              "pending",
+              "retrying",
+              "conflict"
+            ],
+            "title": "Persistence State",
+            "type": "string"
+          },
           "pending_approval": {
             "default": false,
             "description": "True when at least one approval cycle is live (a gate thread parked awaiting an operator approve/deny).  Mirrors the same field on ``DashboardWorkstream`` / cluster live projections so a freshly-loaded chat tab can render the inline approval gate from the detail snapshot before SSE replay arrives.",
@@ -15170,7 +15272,7 @@
             "type": "string"
           },
           "messages": {
-            "description": "Tail of the workstream's message history, projected to the canonical render shape (``role`` may be ``system`` for operator-context turns; flat tool_calls with verdict / output_assessment; top-level source / attachments / reasoning; derived denied / is_error / pending). Bounded by the ``limit`` query parameter (default 100, max 500).",
+            "description": "Requested limit-bounded tail of one authoritative total accepted conversation-row prefix, projected to the canonical render shape. Roles include ``user``, ``assistant``, ``tool``, and ``system``; compaction checkpoints project as ``role=system, source=compaction`` and cancellation-generated assistant/tool markers appear when present. The projection also carries flat tool_calls with verdict / output_assessment; top-level source / attachments / reasoning; and derived denied / is_error / pending. Bounded by the ``limit`` query parameter (default 100, max 500).",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -15190,6 +15292,19 @@
             "default": null,
             "description": "SSE resume cursor (a ``Last-Event-ID`` value). Non-null only when the trailing turn is an executing in-flight tool batch that the live ring buffer can replay: ``messages`` then omits that turn and the client opens its initial SSE with this cursor so the existing delta replay fast-forwards the in-flight turn (tool calls, results, prompts) instead of the lossy synthetic snapshot. Null on every other read \u2014 the client connects fresh.",
             "title": "Cursor"
+          },
+          "handoff_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Opaque token naming the exact accepted conversation-row prefix used for this render. Present only while the workstream is loaded. A client that renders this response passes the token once as the initial event stream's ``history_token`` query parameter; the server atomically validates it while registering the listener. Admission of a later row changes the token; durable acknowledgement does not. Clients must not inspect, persist, or reuse it for later reconnects.",
+            "title": "Handoff Token"
           }
         },
         "required": [

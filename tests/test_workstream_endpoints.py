@@ -7,6 +7,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
@@ -43,7 +44,7 @@ from turnstone.core.session_routes import (
     make_set_title_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import Workstream, WorkstreamKind
 from turnstone.server import (
     _interactive_tenant_check,
     delete_workstream_endpoint,
@@ -236,19 +237,23 @@ def _rewind_retry_mocks(*, worker_running=False, rewind_return=4, retry_return="
     """Mocked ``(manager, session, enqueued-events)`` for the lifted
     rewind/retry handlers. ``ws._lock`` is a real lock so the handler's
     busy-gate ``with ws._lock`` works; ``ui._enqueue`` records events."""
-    import threading
-
     mock_session = MagicMock()
-    mock_session.rewind.return_value = rewind_return
-    mock_session.retry.return_value = retry_return
     enqueued: list[dict[str, Any]] = []
     mock_ui = MagicMock()
     mock_ui._enqueue.side_effect = lambda ev: enqueued.append(ev)
-    mock_ws = MagicMock()
-    mock_ws.session = mock_session
-    mock_ws.ui = mock_ui
-    mock_ws._lock = threading.Lock()
+    mock_ws = Workstream(id="ws1", session=mock_session, ui=mock_ui)
     mock_ws._worker_running = worker_running
+
+    def _rewind(_turns: int, *, publish_reset: Callable[[], None]) -> int:
+        publish_reset()
+        return rewind_return
+
+    def _retry(*, publish_reset: Callable[[], None]) -> str | None:
+        publish_reset()
+        return retry_return
+
+    mock_session.rewind.side_effect = _rewind
+    mock_session.retry.side_effect = _retry
     mock_mgr = MagicMock()
     mock_mgr.get.return_value = mock_ws
     return mock_mgr, mock_session, enqueued
@@ -279,8 +284,10 @@ def test_rewind_returns_removed_and_emits_clear_ui():
     resp = client.post("/v1/api/workstreams/ws1/rewind", json={"turns": 2})
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "removed": 4}
-    mock_session.rewind.assert_called_once_with(2)
-    assert {"type": "clear_ui"} in enqueued
+    mock_session.rewind.assert_called_once()
+    assert mock_session.rewind.call_args.args == (2,)
+    assert callable(mock_session.rewind.call_args.kwargs["publish_reset"])
+    assert enqueued == [{"type": "clear_ui"}]
 
 
 def test_rewind_rejects_non_positive_or_non_int_turns():
@@ -305,46 +312,194 @@ def test_rewind_while_busy_returns_busy_and_skips_mutation():
     assert any(e.get("type") == "busy_error" for e in enqueued)
 
 
-def test_retry_dispatches_and_emits_clear_ui():
-    mock_mgr, _session, enqueued = _rewind_retry_mocks(retry_return="hello")
-    dispatched: list[str] = []
-    handler = make_retry_handler(
-        _verb_cfg(mock_mgr), dispatch_retry=lambda _ws, msg: dispatched.append(msg)
-    )
+def test_retry_refused_409_when_foreign_queued_input_retained():
+    """Round-4 review pin: /retry runs the same foreign-queue admission gate
+    as ordinary sends — another participant's persistence-retained input
+    refuses the retry up-front with 409 cross_user_interjection, instead of
+    claiming the slot, truncating history, and dying mid-turn on the
+    advisory seam's ownership assert after the HTTP response already said ok.
+    """
+    mock_mgr, mock_session, _enqueued = _rewind_retry_mocks(retry_return="hello")
+    mock_session.has_foreign_queued_messages = lambda pid: True
+    handler = make_retry_handler(_verb_cfg(mock_mgr))
+    client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
+    resp = client.post("/v1/api/workstreams/ws1/retry")
+    assert resp.status_code == 409
+    assert resp.json()["status"] == "cross_user_interjection"
+    mock_session.retry.assert_not_called()
+    mock_session.send.assert_not_called()
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_retry_closure_sanitizes_error_display():
+    """Resurrected HEAD pin (round-5 review): a raise from the replacement
+    send BEFORE ChatSession's error-convergence envelope — after the
+    destructive cut succeeded and the HTTP response already said ok — must
+    converge the pane: sanitized ``on_error`` (a credential-bearing backend
+    URL never crosses into SSE), ``stream_end``, and ``state=error``.
+    Deliberately NOT routed through ensure_error_recorded (the reused-session
+    stale-flag hazard — #865); the display-sanitize half is fixed at the site.
+    """
+    mock_mgr, session, _enqueued = _rewind_retry_mocks(retry_return="retry this")
+    ws = mock_mgr.get.return_value
+    ui = ws.ui
+    converged = threading.Event()
+
+    def _state(state: str) -> None:
+        if state == "error":
+            converged.set()
+
+    ui.on_state_change.side_effect = _state
+
+    def _boom(_msg: str, *, acting_user_id: str | None = None) -> None:
+        raise RuntimeError("cannot reach https://user:pass@host:8000/v1 for model=x")
+
+    session.send.side_effect = _boom
+    handler = make_retry_handler(_verb_cfg(mock_mgr))
     client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
     resp = client.post("/v1/api/workstreams/ws1/retry")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "retried": True}
-    assert dispatched == ["hello"]
-    assert {"type": "clear_ui"} in enqueued
+
+    assert converged.wait(5), "retry failure never converged the pane"
+    errors = [c.args[0] for c in ui.on_error.call_args_list]
+    assert errors, "retry closure emitted no on_error"
+    assert all("user:pass" not in m for m in errors), errors
+    assert any("REDACTED" in m for m in errors)
+    ui.on_stream_end.assert_called()
+
+
+def test_retry_closure_converges_idle_on_pre_envelope_cancel():
+    """The GenerationCancelled arm (driven synthetically — send self-handles
+    in-turn cancels, so this is the raced-Stop residue): stream_end + idle,
+    never an error banner."""
+    from turnstone.core.session import GenerationCancelled
+
+    mock_mgr, session, _enqueued = _rewind_retry_mocks(retry_return="retry this")
+    ws = mock_mgr.get.return_value
+    ui = ws.ui
+    idled = threading.Event()
+
+    def _state(state: str) -> None:
+        if state == "idle":
+            idled.set()
+
+    ui.on_state_change.side_effect = _state
+    session.send.side_effect = GenerationCancelled()
+    handler = make_retry_handler(_verb_cfg(mock_mgr))
+    client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
+    resp = client.post("/v1/api/workstreams/ws1/retry")
+    assert resp.status_code == 200
+
+    assert idled.wait(5), "cancelled retry never converged to idle"
+    ui.on_stream_end.assert_called()
+    ui.on_error.assert_not_called()
+
+
+def test_retry_closure_stays_silent_when_the_slot_was_superseded():
+    """The non-owner negative HEAD's pin lacked: a force-cancel that swapped
+    the worker slot between the raise and the emissions must suppress them —
+    no error banner stamped over a live successor."""
+    mock_mgr, session, _enqueued = _rewind_retry_mocks(retry_return="retry this")
+    ws = mock_mgr.get.return_value
+    ui = ws.ui
+    worker: list[threading.Thread] = []
+
+    def _boom(_msg: str, *, acting_user_id: str | None = None) -> None:
+        worker.append(threading.current_thread())
+        ws.worker_thread = None  # the successor claimed / force-cancel swapped
+        raise RuntimeError("late failure")
+
+    session.send.side_effect = _boom
+    handler = make_retry_handler(_verb_cfg(mock_mgr))
+    client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
+    resp = client.post("/v1/api/workstreams/ws1/retry")
+    assert resp.status_code == 200
+
+    assert _wait_until(lambda: bool(worker))
+    worker[0].join(5)
+    assert not worker[0].is_alive()
+    ui.on_error.assert_not_called()
+    ui.on_stream_end.assert_not_called()
+
+
+def test_rewind_commit_refusal_returns_503_not_ok():
+    """A GenerationCancelled escaping rewind() (commit admission refused by a
+    racing close/delete/poison) must take the dispatcher's 503 error arm —
+    round-3 review: it previously escaped ``except Exception``, killed the
+    worker thread, and the handler answered ``200 ok/removed=0`` with no
+    ``clear_ui`` for a rewind that never ran.
+    """
+    from turnstone.core.session import GenerationCancelled
+
+    mock_mgr, mock_session, enqueued = _rewind_retry_mocks()
+    mock_session.rewind.side_effect = GenerationCancelled()
+    handler = make_rewind_handler(_verb_cfg(mock_mgr))
+    client = _verb_client("/api/workstreams/{ws_id}/rewind", handler)
+    resp = client.post("/v1/api/workstreams/ws1/rewind", json={"turns": 1})
+    assert resp.status_code == 503
+    assert "history was unchanged" in resp.json()["error"]
+    assert not any(e.get("type") == "clear_ui" for e in enqueued)
+
+
+def test_retry_dispatches_and_emits_clear_ui():
+    mock_mgr, session, enqueued = _rewind_retry_mocks(retry_return="hello")
+    ws = mock_mgr.get.return_value
+    send_called = threading.Event()
+    send_claims: list[tuple[bool, str, str]] = []
+
+    def capture_send(_message: str, *, acting_user_id: str | None = None) -> None:
+        send_claims.append(
+            (
+                threading.current_thread() is ws.worker_thread,
+                ws.worker_kind,
+                ws._worker_principal_id,
+            )
+        )
+        send_called.set()
+
+    session.send.side_effect = capture_send
+    handler = make_retry_handler(_verb_cfg(mock_mgr))
+    client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
+    resp = client.post("/v1/api/workstreams/ws1/retry")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "retried": True}
+    assert send_called.wait(timeout=5), "replacement send did not start"
+    session.send.assert_called_once_with("hello", acting_user_id="test-user")
+    assert send_claims == [(True, "turn", "test-user")]
+    # The compatibility callback must not claim a second worker after the
+    # atomic retry worker has already cut history and started its replacement.
+    assert enqueued == [{"type": "clear_ui"}]
 
 
 def test_retry_nothing_to_retry_skips_dispatch():
-    mock_mgr, _session, enqueued = _rewind_retry_mocks(retry_return=None)
-    dispatched: list[str] = []
-    handler = make_retry_handler(
-        _verb_cfg(mock_mgr), dispatch_retry=lambda _ws, msg: dispatched.append(msg)
-    )
+    mock_mgr, session, enqueued = _rewind_retry_mocks(retry_return=None)
+    handler = make_retry_handler(_verb_cfg(mock_mgr))
     client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
     resp = client.post("/v1/api/workstreams/ws1/retry")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "retried": False}
-    assert dispatched == []
-    assert {"type": "clear_ui"} in enqueued
+    session.send.assert_not_called()
+    assert enqueued == [{"type": "clear_ui"}]
 
 
 def test_retry_while_busy_returns_busy_and_skips_dispatch():
     mock_mgr, mock_session, enqueued = _rewind_retry_mocks(worker_running=True)
-    dispatched: list[str] = []
-    handler = make_retry_handler(
-        _verb_cfg(mock_mgr), dispatch_retry=lambda _ws, msg: dispatched.append(msg)
-    )
+    handler = make_retry_handler(_verb_cfg(mock_mgr))
     client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
     resp = client.post("/v1/api/workstreams/ws1/retry")
     assert resp.status_code == 200
     assert resp.json()["status"] == "busy"
     mock_session.retry.assert_not_called()
-    assert dispatched == []
+    mock_session.send.assert_not_called()
     assert any(e.get("type") == "busy_error" for e in enqueued)
 
 
@@ -368,7 +523,6 @@ def test_retry_invokes_audit_emit():
     captured: list[str] = []
     handler = make_retry_handler(
         _verb_cfg(mock_mgr),
-        dispatch_retry=lambda _ws, _msg: None,
         audit_emit=lambda _req, ws_id, _ws: captured.append(ws_id),
     )
     client = _verb_client("/api/workstreams/{ws_id}/retry", handler)
@@ -390,7 +544,8 @@ def test_rewind_swallows_audit_emit_exception():
     resp = client.post("/v1/api/workstreams/ws1/rewind", json={"turns": 1})
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "removed": 2}
-    mock_session.rewind.assert_called_once_with(1)
+    mock_session.rewind.assert_called_once()
+    assert mock_session.rewind.call_args.args == (1,)
 
 
 # ===========================================================================
@@ -1102,6 +1257,31 @@ class TestUpdateInterfaceSetting:
 # These tests pin the interactive wiring against the same factory.
 
 
+class _HistoryHandoffSession:
+    """Minimal concrete session implementing the authoritative history seam."""
+
+    def __init__(self) -> None:
+        self._history_generation = 0
+
+    def capture_history_handoff(
+        self,
+        load_messages: Callable[[int], list[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        return load_messages(0), f"test-history.{self._history_generation}"
+
+
+def _live_history_workstream(ws_id: str) -> SimpleNamespace:
+    ui = MagicMock()
+    ui._pending_approval = None
+    ui.can_replay_from.return_value = False
+    ui.get_agent_trajectory.return_value = None
+    return SimpleNamespace(
+        id=ws_id,
+        session=_HistoryHandoffSession(),
+        ui=ui,
+    )
+
+
 def _interactive_endpoint_cfg(
     mock_mgr: Any,
     tenant_check: Any = None,
@@ -1341,9 +1521,7 @@ class TestHistoryAgentStepsOverlay:
                 "is_error": False,
             }
         ]
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
-        mock_ws.ui._pending_approval = None
+        mock_ws = _live_history_workstream(ws_id)
         mock_ws.ui.get_agent_trajectory = lambda cid: steps if cid == "task1" else None
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
@@ -1362,9 +1540,7 @@ class TestHistoryAgentStepsOverlay:
         # so the client renders the flat parent record (never a 0-step card).
         ws_id = "ws-recall-cold"
         self._save_task_agent_turn(_inject_storage, ws_id)
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
-        mock_ws.ui._pending_approval = None
+        mock_ws = _live_history_workstream(ws_id)
         mock_ws.ui.get_agent_trajectory = lambda cid: None
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
@@ -1384,8 +1560,7 @@ class TestHistoryInteractive:
         ws_id = "ws-int-1"
         _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
         _inject_storage.save_message(ws_id, "user", "hello interactive")
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
+        mock_ws = _live_history_workstream(ws_id)
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
         client = _build_history_app(mock_mgr, _inject_storage)
@@ -1394,25 +1569,122 @@ class TestHistoryInteractive:
         assert r.status_code == 200
         body = r.json()
         assert body["ws_id"] == ws_id
+        assert body["handoff_token"]
         assert any(
             m.get("role") == "user" and m.get("content") == "hello interactive"
             for m in body["messages"]
         )
 
-    def test_serves_storage_only_workstream(self, _inject_storage):
-        """Persisted-but-not-loaded interactives serve history without
-        rehydrating — same shape as coord. Pre-lift interactive had no
-        history endpoint at all, so this is a feature gain."""
-        ws_id = "ws-cold"
+    def test_gone_latched_live_session_history_returns_503(self, _inject_storage):
+        """Round-3 review pin (the silent-wipe mechanism): once a session's
+        workstream-gone latch is set, ``capture_history_handoff`` refuses to
+        mint, and /history answers the fail-closed 503 — never a
+        token-bearing 200 over an empty transcript that would authorize the
+        pane to wipe its stale-but-real view."""
+        from turnstone.core.storage import ConversationCommitWorkstreamGoneError
+
+        ws_id = "ws-int-gone"
         _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
-        _inject_storage.save_message(ws_id, "assistant", "from cold storage")
+        _inject_storage.save_message(ws_id, "user", "hello")
+        mock_ws = _live_history_workstream(ws_id)
+
+        def _refuse(load_messages):
+            raise ConversationCommitWorkstreamGoneError("workstream was deleted")
+
+        mock_ws.session.capture_history_handoff = _refuse
         mock_mgr = MagicMock()
-        mock_mgr.get.return_value = None  # not loaded
+        mock_mgr.get.return_value = mock_ws
+
+        r = _build_history_app(mock_mgr, _inject_storage).get(
+            f"/v1/api/workstreams/{ws_id}/history"
+        )
+        assert r.status_code == 503
+        assert r.json()["error"] == "History temporarily unavailable"
+
+    def test_live_session_without_route_storage_downgrades_to_tokenless(self):
+        """Round-3 review pin: with no route-visible storage the durable
+        prefix is unreadable, so the live-session arm must NOT mint a handoff
+        token over the journal/live view — the 200 downgrades to the
+        deliberate tokenless render (the client bootstrap owns convergence
+        via ``clear_ui``), never a token-authorized splice of incomplete
+        history and never a 503 repair loop."""
+        ws_id = "ws-int-no-storage"
+        mock_ws = _live_history_workstream(ws_id)
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+
+        r = _build_history_app(mock_mgr, None).get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        assert r.json()["handoff_token"] is None
+
+    def test_tool_row_audit_principal_never_reaches_the_history_payload(self, _inject_storage):
+        """The route's public schema stays free of the tool row's audit identity.
+
+        A TOOL row records the principal its turn executed under so revocation
+        can read the row directly.  /history is the widest consumer of those
+        same rows, so the whole ladder — reconstruct, decorate, project, scrub
+        — has to drop it: the response body must not name the principal at
+        all, and the tool entry must gain no display ``meta`` from it.
+        """
+        ws_id = "ws-tool-principal"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "user", "run the probe")
+        _inject_storage.save_message(
+            ws_id,
+            "assistant",
+            "",
+            tool_calls=json.dumps(
+                [
+                    {
+                        "id": "call-audit",
+                        "type": "function",
+                        "function": {"name": "read_only_probe", "arguments": "{}"},
+                    }
+                ]
+            ),
+        )
+        _inject_storage.save_message(
+            ws_id,
+            "tool",
+            "probe output",
+            "read_only_probe",
+            tool_call_id="call-audit",
+            meta=json.dumps({"effect_status": "committed", "acting_principal": "private-user-id"}),
+        )
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
         client = _build_history_app(mock_mgr, _inject_storage)
 
         r = client.get(f"/v1/api/workstreams/{ws_id}/history")
         assert r.status_code == 200
-        assert any(m.get("content") == "from cold storage" for m in r.json()["messages"])
+        assert "private-user-id" not in r.text
+        assert "acting_principal" not in r.text
+        tool_entry = next(m for m in r.json()["messages"] if m.get("role") == "tool")
+        assert tool_entry["content"] == "probe output"
+        assert "meta" not in tool_entry
+
+    def test_serves_storage_only_workstream(self, _inject_storage):
+        """Persisted-but-not-loaded interactives serve history without rehydrating.
+
+        Deliberate pin update (back to the pre-handoff assertion, plus the
+        token contract): a cold row has no live writer and no splice to
+        witness, so /history is a pure storage read — tokenless, never
+        constructing a ChatSession into the bounded pool. The tokenless 200
+        seeds a render plus the tokenless stream bootstrap.
+        """
+        ws_id = "ws-cold"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_message(ws_id, "assistant", "from cold storage")
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None  # not loaded — and it stays that way
+        client = _build_history_app(mock_mgr, _inject_storage)
+
+        r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 200
+        body = r.json()
+        assert any(m.get("content") == "from cold storage" for m in body["messages"])
+        assert body["handoff_token"] is None
+        mock_mgr.open.assert_not_called()
 
     def test_404_on_missing_ws_id(self, _inject_storage):
         mock_mgr = MagicMock()
@@ -1448,8 +1720,7 @@ class TestHistoryInteractive:
         _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
         for i in range(4):
             _inject_storage.save_message(ws_id, "user", f"msg-{i}")
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
+        mock_ws = _live_history_workstream(ws_id)
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
         client = _build_history_app(mock_mgr, _inject_storage)
@@ -1500,8 +1771,7 @@ class TestHistoryInteractive:
         _inject_storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json)
         _inject_storage.save_message(ws_id, "tool", "file.txt", tool_call_id="call_1")
         # call_2 result not yet persisted — operator refreshes here.
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
+        mock_ws = _live_history_workstream(ws_id)
         # Mid-EXECUTION, not awaiting approval: any approval already
         # resolved, so ``_pending_approval`` is None.  The trailing orphan
         # tool turn must therefore RENDER (``pending`` absent) — marking it
@@ -1554,8 +1824,7 @@ class TestHistoryInteractive:
         )
         _inject_storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json)
         # No tool result yet AND the session is parked awaiting approval.
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
+        mock_ws = _live_history_workstream(ws_id)
         mock_ws.ui._pending_approval = {"type": "approve_request", "items": []}
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
@@ -1584,8 +1853,7 @@ class TestHistoryInteractive:
         )
         _inject_storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json, event_id=12)
         # call_1 result not yet persisted — executing in-flight orphan.
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
+        mock_ws = _live_history_workstream(ws_id)
         mock_ws.ui._pending_approval = None  # executing, not awaiting
         mock_ws.ui.can_replay_from.return_value = True  # buffer can fast-forward
         mock_mgr = MagicMock()
@@ -1617,8 +1885,7 @@ class TestHistoryInteractive:
             [{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
         )
         _inject_storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json, event_id=12)
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
+        mock_ws = _live_history_workstream(ws_id)
         mock_ws.ui._pending_approval = None
         mock_ws.ui.can_replay_from.return_value = False  # empty/evicted buffer
         mock_mgr = MagicMock()
@@ -1659,8 +1926,7 @@ class TestHistoryInteractive:
         # Cancel landed before any tool result — next turn happens.
         _inject_storage.save_message(ws_id, "user", "second")
         _inject_storage.save_message(ws_id, "assistant", "ok")
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
+        mock_ws = _live_history_workstream(ws_id)
         mock_ws.ui._pending_approval = None  # cancelled, not awaiting approval
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
@@ -1740,9 +2006,7 @@ class TestHistoryCoalescing:
         storage.save_message(ws_id, "assistant", "hi there")
 
     def _live_mgr(self, ws_id: str) -> MagicMock:
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
-        mock_ws.ui._pending_approval = None
+        mock_ws = _live_history_workstream(ws_id)
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
         return mock_mgr
@@ -1823,6 +2087,8 @@ class TestHistoryCoalescing:
         r1, r2 = asyncio.run(self._drive_two_joiners(app, url, gated, caplog))
         assert r1.status_code == 200
         assert r2.status_code == 200
+        assert r1.json()["handoff_token"]
+        assert r2.json()["handoff_token"]
         assert r1.json() == r2.json()
         contents = [m.get("content") for m in r1.json()["messages"]]
         assert contents == ["hello", "hi there"]
@@ -1886,18 +2152,39 @@ class TestHistoryCoalescing:
         self, _inject_storage: Any, caplog: Any
     ) -> None:
         """A transient ``load_messages`` failure in the shared draw
-        yields the owner's 200-empty (same as a lone request today) but
-        the JOINER retries independently and gets the real rows — one
-        storage blip must not wipe every coalesced pane."""
+        yields a bounded 503 for the owner, but the JOINER retries
+        independently and gets the real rows — one storage blip must not
+        fail every coalesced pane or authorize an incomplete render."""
         gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-fail")
         gated.fail_next = 1
 
         r1, r2 = asyncio.run(self._drive_two_joiners(app, url, gated, caplog))
-        assert r1.status_code == 200
-        assert r1.json()["messages"] == []
+        assert r1.status_code == 503
+        assert r1.json() == {"error": "History temporarily unavailable"}
         assert r2.status_code == 200
         assert [m.get("content") for m in r2.json()["messages"]] == ["hello", "hi there"]
         # Owner draw + joiner retry — never a third.
+        assert gated.load_calls == 2
+
+    def test_failed_shared_draw_and_joiner_retry_both_return_bounded_503(
+        self, _inject_storage: Any, caplog: Any
+    ) -> None:
+        """The joiner's independent retry must preserve its final failure bit.
+
+        Discarding that bit would turn the second failed reconstruction into a
+        200-empty response (or, with a live journal, pending-only history plus
+        a handoff token), while only the flight owner correctly reported the
+        outage.
+        """
+        gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-double-fail")
+        gated.fail_next = 2
+
+        r1, r2 = asyncio.run(self._drive_two_joiners(app, url, gated, caplog))
+        expected = {"error": "History temporarily unavailable"}
+        assert r1.status_code == 503
+        assert r1.json() == expected
+        assert r2.status_code == 503
+        assert r2.json() == expected
         assert gated.load_calls == 2
 
     def test_gates_run_per_request_before_join(self, _inject_storage: Any) -> None:
@@ -1965,35 +2252,38 @@ class TestHistoryCoalescing:
         assert r1.json() == r2.json()
         assert gated.load_calls == 2
 
-    def test_decoration_failure_is_shared_not_retried(
+    def test_decoration_failure_is_unavailable_and_joiner_retries_once(
         self, _inject_storage: Any, caplog: Any
     ) -> None:
-        """The inverse of the load-failure test: a decoration/projection
-        failure AFTER a successful load is degraded-but-non-empty, so it
-        is shared to joiners as-is — ``load_failed`` stays False and no
-        joiner retry fires (``load_calls`` stays 1, vs the load-failure
-        test's 2).  Pins the two failure modes apart: conflating them
-        (e.g. setting ``load_failed`` in the decoration except) would
-        turn every shared degraded draw into a double reconstruction."""
+        """A public projection failure is non-authoritative like load failure.
+
+        The owner gets the shared draw's bounded 503.  Its coalesced follower
+        gets exactly one independent reconstruction attempt, but a persistent
+        projection fault still returns 503 without messages or a handoff
+        token; raw pre-projection content must never escape.
+        """
         gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-decor")
+        private_sentinel = "PRIVATE-UNPROJECTED-HISTORY-SENTINEL"
+        _inject_storage.save_message("ws-flight-decor", "assistant", private_sentinel)
 
         with patch(
             "turnstone.core.history_decoration.project_history_messages",
             side_effect=RuntimeError("projection failure (test)"),
         ) as fake_project:
             r1, r2 = asyncio.run(self._drive_two_joiners(app, url, gated, caplog))
-        # The degraded path must actually have run — without this, a
-        # fixture whose cursor is None either way would let an
-        # ineffective patch pass the assertions below vacuously.
-        assert fake_project.called
-        assert r1.status_code == 200
-        assert r2.status_code == 200
-        # Degraded (un-projected, cursor=None) but NON-empty and identical —
-        # the joiner shared the draw instead of re-reconstructing.
-        assert r1.json() == r2.json()
-        assert r1.json()["messages"]
-        assert r1.json()["cursor"] is None
-        assert gated.load_calls == 1
+        expected = {"error": "History temporarily unavailable"}
+        assert r1.status_code == 503
+        assert r2.status_code == 503
+        assert r1.json() == expected
+        assert r2.json() == expected
+        assert private_sentinel not in r1.text
+        assert private_sentinel not in r2.text
+        assert "messages" not in r1.json()
+        assert "cursor" not in r1.json()
+        assert "handoff_token" not in r1.json()
+        # Shared owner reconstruction + one follower retry, never a third.
+        assert fake_project.call_count == 2
+        assert gated.load_calls == 2
 
     def test_owner_disconnect_leaves_joiner_completing(
         self, _inject_storage: Any, caplog: Any
@@ -2122,9 +2412,35 @@ class TestDetailInteractive:
             "state": "idle",
             "user_id": "test-user",
             "kind": "interactive",
+            "persistence_state": "healthy",
             "pending_approval": False,
             "pending_approval_details": [],
         }
+
+    def test_projects_sanitized_persistence_state(self):
+        ws_id = "ws-detail-persistence"
+        ws_state = MagicMock()
+        ws_state.value = "error"
+        loaded_ws = MagicMock()
+        loaded_ws.id = ws_id
+        loaded_ws.name = "needs-history-repair"
+        loaded_ws.state = ws_state
+        loaded_ws.user_id = "test-user"
+        loaded_ws.kind = "interactive"
+        loaded_ws.session.conversation_persistence_status = lambda: {
+            "state": "conflict",
+            "attempts": 1,
+            "last_failure_at": "sanitized-away",
+        }
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = loaded_ws
+        client = _build_detail_app(mock_mgr)
+
+        body = client.get(f"/v1/api/workstreams/{ws_id}").json()
+
+        assert body["persistence_state"] == "conflict"
+        assert "attempts" not in body
+        assert "last_failure_at" not in body
 
     def test_pending_approval_fields_propagate_from_ui(self):
         """When the workstream's UI is parked on an approval, the detail
@@ -2389,8 +2705,7 @@ class TestTenantCheckOnReadEndpoints:
         ws_id = "ws-mine-hist"
         _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
         _inject_storage.save_message(ws_id, "user", "hello")
-        mock_ws = MagicMock()
-        mock_ws.id = ws_id
+        mock_ws = _live_history_workstream(ws_id)
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = mock_ws
 
@@ -2424,8 +2739,9 @@ class TestTenantCheckOnReadEndpoints:
         ws_id = "ws-cold-cache-hist"
         _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
         _inject_storage.save_message(ws_id, "user", "from cold storage")
+        # Cold cache: nothing in memory, owner row only in storage — and it
+        # stays cold; /history never rehydrates.
         mock_mgr = MagicMock()
-        # Cold cache: nothing in memory, owner row only in storage.
         mock_mgr.get.return_value = None
 
         def cold_check(request: Any, ws_id: str, mgr: Any) -> JSONResponse | None:
@@ -2446,7 +2762,10 @@ class TestTenantCheckOnReadEndpoints:
             r = client.get(f"/v1/api/workstreams/{ws_id}/history")
 
         assert r.status_code == 200
-        assert any(m.get("content") == "from cold storage" for m in r.json()["messages"])
+        body = r.json()
+        assert any(m.get("content") == "from cold storage" for m in body["messages"])
+        assert body["handoff_token"] is None
+        mock_mgr.open.assert_not_called()
         # Pin the offload — reverting ``await asyncio.to_thread(cfg.tenant_check, ...)``
         # to ``cfg.tenant_check(...)`` leaves the response shape intact
         # but drops ``cold_check`` from the spy's call list.
@@ -2533,15 +2852,18 @@ class TestHistoryReasoningRehydration:
         _inject_storage.save_message(
             ws_id, "assistant", "Final answer.", provider_data=provider_data
         )
-        # No live session — exercises the storage-only path which
-        # falls back to default surface_persisted_reasoning=True.
+        # Cold rows are served storage-only (no rehydration), so reasoning
+        # exercises the storage fallback and the conservative
+        # surface_persisted_reasoning=True default.
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = None
         client = _build_history_app(mock_mgr, _inject_storage)
 
         r = client.get(f"/v1/api/workstreams/{ws_id}/history")
         assert r.status_code == 200
-        msgs = r.json()["messages"]
+        body = r.json()
+        assert body["handoff_token"] is None
+        msgs = body["messages"]
         assistant = next(m for m in msgs if m.get("role") == "assistant")
         assert assistant["reasoning"] == "let me reason"
 
@@ -2568,15 +2890,24 @@ class TestHistoryReasoningRehydration:
         _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
         provider_data = json.dumps([{"type": "thinking", "thinking": "hidden", "signature": "s"}])
         _inject_storage.save_message(ws_id, "assistant", "Answer.", provider_data=provider_data)
+        # A stored alias that would resolve to the permissive default: the
+        # live session's registry must win the tier order (round-3 review —
+        # the handler once read these attrs off the Workstream wrapper, which
+        # never carries them in production, so tier 1 silently never ran).
+        _inject_storage.save_workstream_config(ws_id, {"model_alias": "stored-stale-alias"})
+
+        def _live_only_reasoning_config(alias: str) -> SimpleNamespace:
+            assert alias == "claude-opus-4-7", alias
+            return SimpleNamespace(surface_persisted_reasoning=False)
+
+        session = _HistoryHandoffSession()
+        session._registry = SimpleNamespace(get_config=_live_only_reasoning_config)
+        session._model_alias = "claude-opus-4-7"
         live_session = SimpleNamespace(
             # The real Workstream carries .session (ChatSession | None);
-            # the flight key's typed generation read requires the shape.
-            session=None,
+            # registry and alias live on the ChatSession, never the wrapper.
+            session=session,
             id=ws_id,
-            _registry=SimpleNamespace(
-                get_config=lambda alias: SimpleNamespace(surface_persisted_reasoning=False)
-            ),
-            _model_alias="claude-opus-4-7",
         )
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = live_session
@@ -2606,7 +2937,8 @@ class TestHistoryReasoningRehydration:
             [{"type": "thinking", "thinking": "should not surface", "signature": "s"}]
         )
         _inject_storage.save_message(ws_id, "assistant", "Answer.", provider_data=provider_data)
-        # No live session — handler falls back to workstream_config + registry.
+        # Cold storage-only read: the handler resolves the persisted alias
+        # through storage and the kind-appropriate registry on app.state.
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = None
 

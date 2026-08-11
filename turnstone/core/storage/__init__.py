@@ -4,6 +4,9 @@ Supports SQLite (default, zero-config) and PostgreSQL (multi-node, production).
 """
 
 from turnstone.core.storage._protocol import (
+    AttachmentWrite,
+    ConversationCommitConflictError,
+    ConversationCommitWorkstreamGoneError,
     ForkCloneError,
     ForkCloneExpectation,
     ForkCloneSnapshot,
@@ -21,6 +24,9 @@ from turnstone.core.storage._registry import (
 )
 
 __all__ = [
+    "AttachmentWrite",
+    "ConversationCommitConflictError",
+    "ConversationCommitWorkstreamGoneError",
     "StorageBackend",
     "StorageConflictError",
     "ForkCloneError",

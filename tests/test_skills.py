@@ -97,6 +97,8 @@ class NullUI:
 
 
 def _make_session(**kwargs):
+    from turnstone.core.memory import register_workstream
+
     defaults = dict(
         client=MagicMock(),
         model="test-model",
@@ -107,7 +109,12 @@ def _make_session(**kwargs):
         tool_timeout=30,
     )
     defaults.update(kwargs)
-    return ChatSession(**defaults)
+    session = ChatSession(**defaults)
+    # Mirror production's parent-before-conversation ordering.  Skill slash
+    # commands persist keyed SYSTEM rows and must retain the orphan-write
+    # protection exercised by the storage layer.
+    register_workstream(session.ws_id, user_id=kwargs.get("user_id"))
+    return session
 
 
 def _sys_content(session: ChatSession) -> str:

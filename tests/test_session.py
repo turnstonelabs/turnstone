@@ -118,9 +118,15 @@ def _make_session(
     defaults live in tests/_session_helpers.make_session — duplicating
     them here is exactly the drift its docstring warns about."""
     kwargs.setdefault("ui", NullUI())
-    return make_session(
+    session = make_session(
         client=mock_openai_client or MagicMock(), instructions=instructions, **kwargs
     )
+    # Production creates the parent workstream before any keyed conversation
+    # commit. Direct-session tests mirror that orphan-write guard.
+    from turnstone.core.memory import register_workstream
+
+    register_workstream(session.ws_id, user_id=kwargs.get("user_id"))
+    return session
 
 
 @contextlib.contextmanager
@@ -274,6 +280,26 @@ class TestSkillCommand:
         session.ui = MagicMock()
         session.ui.on_system_turn.return_value = None
         session._ui_event_id = MagicMock(return_value=None)
+        session._history_handoff_lock = threading.RLock()
+        session._history_visibility_lock = threading.RLock()
+        session._generation_lock = threading.RLock()
+        # Lifecycle admission fields, seeded exactly as ``__init__`` builds
+        # them: the commit/publish guards read them directly, so a double
+        # missing them would fail the admission rather than skip it.
+        session._history_truncation_condition = threading.Condition(session._generation_lock)
+        session._history_truncation_active = False
+        session._soft_close_preparing = False
+        session._tool_structural_debt = None
+        session._publication_shutdown = False
+        session._cancel_event = threading.Event()
+        session._durability_cond = threading.Condition(threading.Lock())
+        session._durability_next_ticket = 0
+        session._durability_serving_ticket = 0
+        session._pending_conversation_commits = {}
+        session._history_handoff_revision = 0
+        session._conversation_persistence_error = None
+        session._conversation_persistence_failure_kind = None
+        session._conversation_persistence_next_retry_at = None
         session.set_skill = MagicMock(
             side_effect=lambda name: setattr(session, "_skill_name", name)
         )
@@ -5375,7 +5401,14 @@ class TestBatchEvaluateOutputs:
             try:
                 assert guard_entered.wait(2)
                 session.cancel()
-                successor_generation = session._claim_generation()
+                abandoned, persistence_error = session.force_abandon_generation(
+                    target_is_current=lambda: True,
+                    clear_target=lambda: True,
+                    publish_abandoned=lambda: None,
+                )
+                assert abandoned is True
+                assert persistence_error is None
+                successor_generation = session._generation
 
                 # Install successor-owned state under the same provider call id.
                 # The old guard continuation must neither pop nor persist it.
@@ -5638,10 +5671,10 @@ class TestCompletedModelResultPublication:
     def test_successor_claim_waits_for_entire_completed_result_commit(self, tmp_db) -> None:
         """A successor cannot observe the main result halfway through its fold.
 
-        ``on_turn_committed`` is a useful midpoint: status and the assistant
-        turn already landed, while assistant token bookkeeping and persistence
-        are still pending.  A successor driven to the generation lock there
-        must remain blocked until those trailing writes complete too.
+        ``on_turn_committed`` is a useful pre-append midpoint: the accepted
+        stream is finalized while the assistant row, token bookkeeping, and
+        persistence are still pending under the generation lock. A successor
+        driven to that lock must remain blocked until the whole fold completes.
         """
         session = _make_session()
         session._title_generated = True
@@ -5709,10 +5742,10 @@ class TestCompletedModelResultPublication:
             try:
                 assert commit_midpoint.wait(2)
                 old_generation = session._generation
-                # This is intentionally torn only while the old generation
-                # owns the transaction lock: the assistant turn is visible to
-                # itself, but its token/persistence tail has not run yet.
-                assert len(session.messages) == len(session._msg_tokens) + 1
+                # Acceptance now blocks before the assistant append, so even
+                # the old owner observes a complete USER-only prefix here.
+                assert len(session.messages) == len(session._msg_tokens)
+                assert [turn.role.value for turn in session.messages] == ["user"]
                 assert [call.args[1] for call in save_message.call_args_list] == ["user"]
                 assert session.ui.on_status.call_count == 1
 
@@ -7419,10 +7452,39 @@ class TestMetacognitiveBuffers:
         # authority, especially on the native path), not the raw text.
         assert content.endswith("User message: hows it going?")
         assert "while you were working" in content
-        # Queue cleared by the drain.
+        # Queue cleared by the drain, and the advisory pop window closed at
+        # the seam's return (the advisory lane has no restore path).
         assert session._queued_messages == {}
+        assert session._popped_in_flight == set()
         # _collect_advisories itself appends nothing — the caller does.
         assert len(session.messages) == pre_count
+
+    def test_user_interjection_meta_retains_sender_for_ui_correlation(self, tmp_db):
+        """The final system event cannot settle another viewer's reused token."""
+
+        session = _make_session(user_id="alice")
+        session.queue_message(
+            "still working?",
+            queue_msg_id="q1",
+            interjector_user_id="alice",
+            client_send_id="shared-token",
+        )
+
+        specs = session._collect_advisories(
+            assessment=None,
+            func_name="bash",
+            is_last_in_batch=True,
+        )
+
+        assert len(specs) == 1
+        source, _content, meta = specs[0]
+        assert source == "user_interjection"
+        assert meta == {
+            "priority": "notice",
+            "message": "still working?",
+            "sender": "alice",
+            "client_send_id": "shared-token",
+        }
 
     def test_cross_user_interjection_rejected(self, tmp_db):
         """A different authenticated participant cannot interject into another
@@ -7456,6 +7518,253 @@ class TestMetacognitiveBuffers:
         session._acting_user_id = "alice"
         session.queue_message("internal", interjector_user_id="", queue_msg_id="q1")
         assert "q1" in session._queued_messages
+
+    def test_interjection_into_empty_principal_turn_fails_closed(self, tmp_db):
+        """An authenticated interjector is rejected when the in-flight turn has
+        no bound principal (ownerless session, internal wake): admitting it
+        would run the words under the ambient credential context and
+        misattribute them to the turn's initiator."""
+        from turnstone.core.session import CrossUserInterjectionError
+
+        session = _make_session(user_id=None)  # no owner => empty effective id
+        assert not (session._mcp_effective_user_id or "")
+        with pytest.raises(CrossUserInterjectionError):
+            session.queue_message("let me in", interjector_user_id="bob")
+        assert session._queued_messages == {}
+
+    def test_interjection_into_empty_slot_principal_fails_closed(self, tmp_db):
+        """The immutable worker-slot principal fails closed the same way: an
+        empty ``turn_principal_id`` (claim taken with no principal — init
+        worker) rejects authenticated interjectors instead of comparing
+        against the mutable actor."""
+        from turnstone.core.session import CrossUserInterjectionError
+
+        session = _make_session(user_id="owner")
+        with pytest.raises(CrossUserInterjectionError):
+            session.queue_message(
+                "let me in",
+                interjector_user_id="bob",
+                turn_principal_id="",
+            )
+        assert session._queued_messages == {}
+
+    def test_pop_partitions_by_owner(self, tmp_db):
+        """The pop is owner-partitioned and flag-less: the acting user's and
+        unowned/legacy rows pop; another participant's rows are structurally
+        retained — never consumed under a different actor, never a raise
+        (rounds 3-5: the per-site mode flag was the defect factory)."""
+        session = _make_session(user_id="owner")
+        session._acting_user_id = "alice"
+        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
+        session._acting_user_id = "bob"
+        session.queue_message("bob's words", interjector_user_id="bob", queue_msg_id="qb")
+        # Pre-owner legacy 2-tuple: unowned, pops under any actor.
+        session._queued_messages["legacy"] = ("legacy words", "normal")
+
+        popped = session._pop_queued_messages()
+        assert sorted(popped) == ["legacy", "qb"]
+        assert list(session._queued_messages) == ["qa"]
+
+        # The retained row drains for its owner.
+        session._acting_user_id = "alice"
+        assert list(session._pop_queued_messages()) == ["qa"]
+        assert session._queued_messages == {}
+
+    def test_pop_with_empty_principal_drains_everything(self, tmp_db):
+        """CLI/internal lanes (empty effective principal) pop the whole
+        queue — an owned row cannot coexist with an empty actor (admission
+        fails closed on empty principals and the effective id is sticky), so
+        this arm only ever sees all-unowned queues."""
+        session = _make_session(user_id=None)
+        assert not (session._mcp_effective_user_id or "")
+        session.queue_message("internal one", interjector_user_id="", queue_msg_id="q1")
+        session._queued_messages["legacy"] = ("legacy words", "normal")
+
+        assert sorted(session._pop_queued_messages()) == ["legacy", "q1"]
+        assert session._queued_messages == {}
+
+    def test_retraction_ledger_survives_a_nested_partitioned_pop(self, tmp_db):
+        """Per-id ledger discipline: an inner pop (the wake send's flush
+        seams) must not destroy a suppression record guarding the OUTER wake
+        pop's window — a wholesale clear would let the restore resurrect a
+        message the user cancelled mid-wake (round-5 map, edge 3a)."""
+        session = _make_session(user_id="owner")
+        session._acting_user_id = "alice"
+        session.queue_message("outer", interjector_user_id="alice", queue_msg_id="q-outer")
+
+        outer = session._pop_queued_messages()
+        assert list(outer) == ["q-outer"]
+        # The pop OPENED the window: the id is in flight, which is the only
+        # reason the retraction below is recorded at all (round 6: misses
+        # for unheld ids record nothing — that unbounded growth was the
+        # price of unconditional recording under per-id discipline).
+        assert "q-outer" in session._popped_in_flight
+        # Retraction lands while the outer window holds the items.
+        assert session.dequeue_message("q-outer") is False
+        assert "q-outer" in session._retracted_while_popped
+
+        # An unrelated INNER pop (empty or different ids) must not consume
+        # the outer window's suppression record — nor close its window.
+        session.queue_message("inner", interjector_user_id="alice", queue_msg_id="q-inner")
+        inner = session._pop_queued_messages()
+        assert "q-outer" in session._retracted_while_popped
+        assert "q-outer" in session._popped_in_flight
+        session._close_pop_window(inner)
+        assert "q-inner" not in session._popped_in_flight
+        assert "q-outer" in session._popped_in_flight
+
+        # The outer restore honours the retraction, consumes its record, and
+        # closes the window it owned.
+        session._restore_queued_messages(outer)
+        assert "q-outer" not in session._queued_messages
+        assert "q-outer" not in session._retracted_while_popped
+        assert session._popped_in_flight == set()
+
+    def test_dequeue_miss_for_an_unheld_id_records_nothing(self, tmp_db):
+        """The ledger is bounded by OPEN pop windows: a miss for an id no
+        window holds — never queued, or already delivered and its window
+        closed — must record nothing.  Under per-id discipline nothing ever
+        prunes such an entry, so unconditional recording grew the set for
+        the session's lifetime (one permanent entry per retract-after-
+        delivery; unbounded for any authenticated writer looping DELETEs
+        with invented ids)."""
+        session = _make_session(user_id="owner")
+        session._acting_user_id = "alice"
+
+        # Never queued at all (the invented-id / other-node case).
+        assert session.dequeue_message("never-queued") is False
+        assert session._retracted_while_popped == set()
+
+        # Queued, popped, and its window CLOSED (delivered): the late
+        # retraction is a pure "already sent" no-op.
+        session.queue_message("delivered", interjector_user_id="alice", queue_msg_id="q-done")
+        popped = session._pop_queued_messages()
+        session._close_pop_window(popped)
+        assert session._popped_in_flight == set()
+        assert session.dequeue_message("q-done") is False
+        assert session._retracted_while_popped == set()
+
+    def test_identity_swap_drain_discards_what_cannot_land(self, tmp_db):
+        """Round-4 review pin: the /new//resume queue settlement never raises.
+        On a gone latch everything is discarded with a notice (flushing would
+        refuse and crash the REPL's only escape commands); a foreign-retained
+        entry is discarded with a notice rather than bleeding into the next
+        identity."""
+        # Gone latch: discard-all with notice.
+        ui = MagicMock()
+        session = _make_session(user_id="owner", ui=ui)
+        session._acting_user_id = "owner"
+        session.queue_message("stranded", interjector_user_id="owner", queue_msg_id="q1")
+        session._workstream_gone_ws = session._ws_id
+        # A stale in-flight marker must not outlive the identity swap: on
+        # the NEW workstream it would let a same-id miss record a bogus
+        # suppression.  (No window can be open on this CLI-only path — the
+        # clear is the belt-and-braces invariant, pinned here.)
+        session._popped_in_flight.add("stale-window-id")
+        session._drain_queue_for_identity_swap()
+        assert session._queued_messages == {}
+        assert session._popped_in_flight == set()
+        assert any("deleted" in str(c.args[0]) for c in ui.on_info.call_args_list)
+
+        # Foreign-retained entry on a healthy workstream: discarded, not bled.
+        ui2 = MagicMock()
+        session2 = _make_session(user_id="owner", ui=ui2)
+        session2._acting_user_id = "alice"
+        session2.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
+        session2._acting_user_id = "bob"
+        session2._drain_queue_for_identity_swap()
+        assert session2._queued_messages == {}
+        assert not any(
+            "alice's words" in str(m.get("content")) for m in dicts_from_turns(session2.messages)
+        )
+        assert any("another participant" in str(c.args[0]) for c in ui2.on_info.call_args_list)
+
+    def test_identity_swap_mixed_queue_flushes_own_and_notices_foreign_only(self, tmp_db):
+        """Round-5 review pin (notice accuracy): on a mixed queue /new's
+        settlement persists the acting user's row into the CURRENT workstream
+        and the discard notice counts ONLY the other participant's rows."""
+        ui = MagicMock()
+        session = _make_session(user_id="owner", ui=ui)
+        session._acting_user_id = "alice"
+        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
+        session._acting_user_id = "bob"
+        session.queue_message("bob's words", interjector_user_id="bob", queue_msg_id="qb")
+
+        session._drain_queue_for_identity_swap()
+
+        assert session._queued_messages == {}
+        # The flush's own window closed on the success path too.
+        assert session._popped_in_flight == set()
+        flushed = [
+            m
+            for m in dicts_from_turns(session.messages)
+            if m.get("role") == "user" and m.get("content") == "bob's words"
+        ]
+        assert len(flushed) == 1
+        notices = [str(c.args[0]) for c in ui.on_info.call_args_list]
+        assert any("1 queued message(s) from another participant" in n for n in notices)
+        assert not any("of your queued message" in n for n in notices)
+
+    def test_identity_swap_with_empty_queue_never_touches_the_journal(self, tmp_db):
+        """Round-5 review pin (total-ness): an empty queue skips the flush
+        preamble entirely, so a poisoned reconcile latch cannot raise out of
+        /new with nothing queued at all."""
+        from turnstone.core.session import ConversationPersistenceError
+
+        session = _make_session(user_id="owner")
+        session._conversation_persistence_failure_kind = "conflict"
+        session._conversation_persistence_error = ConversationPersistenceError("latched")
+
+        session._drain_queue_for_identity_swap()  # must not raise
+
+    def test_identity_swap_degrades_to_discard_when_the_flush_raises(self, tmp_db):
+        """Round-5 review pin (degrade arm): a flush failure of ANY class
+        becomes discard-with-notice — the escape commands can never be
+        blocked by an unhealthy journal, and the notice never miscounts the
+        actor's own rows as another participant's."""
+        ui = MagicMock()
+        session = _make_session(user_id="owner", ui=ui)
+        session._acting_user_id = "alice"
+        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
+
+        with patch.object(
+            session, "_flush_queued_messages", side_effect=RuntimeError("journal refused")
+        ):
+            session._drain_queue_for_identity_swap()  # must not raise
+
+        assert session._queued_messages == {}
+        notices = [str(c.args[0]) for c in ui.on_info.call_args_list]
+        assert any("1 of your queued message(s)" in n for n in notices)
+        assert not any("another participant" in n for n in notices)
+
+    def test_failure_finalizer_retains_foreign_queue_and_records_error(self, tmp_db):
+        """Round-3 review: a foreign-owned queued entry (retained across its
+        owner's failed turn) must not abort the next actor's failure finalizer
+        via the ownership assert — ``_record_fatal_error`` always runs
+        (spinner convergence + last_error) while the entry stays queued for
+        its owner's next turn."""
+        ui = MagicMock()
+        session = _make_session(user_id="owner", ui=ui)
+        session._acting_user_id = "alice"
+        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
+        session._acting_user_id = "bob"
+
+        def _boom(_gen):
+            raise RuntimeError("provider blew up")
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(session, "_stream_response", side_effect=_boom))
+            stack.enter_context(patch.object(session, "_full_messages", return_value=[]))
+            stack.enter_context(patch.object(session, "_update_token_table"))
+            stack.enter_context(patch.object(session, "_print_status_line"))
+            stack.enter_context(patch.object(session, "_emit_state"))
+            stack.enter_context(patch.object(session, "_visible_memory_count", return_value=0))
+            stack.enter_context(patch("turnstone.core.session.save_message"))
+            with pytest.raises(RuntimeError, match="provider blew up"):
+                session.send("bob's turn")
+
+        ui.on_error.assert_called()
+        assert "qa" in session._queued_messages
 
     def test_emit_state_surfaces_acting_user_to_ui(self, tmp_db):
         """_emit_state pushes the acting user (turn initiator, owner fallback)
@@ -8235,7 +8544,14 @@ class TestApplyPostExecuteAdvisories:
             try:
                 assert advisory_commit_entered.wait(2)
                 session.cancel()
-                successor_generation = session._claim_generation()
+                abandoned, persistence_error = session.force_abandon_generation(
+                    target_is_current=lambda: True,
+                    clear_target=lambda: True,
+                    publish_abandoned=lambda: None,
+                )
+                assert abandoned is True
+                assert persistence_error is None
+                successor_generation = session._generation
 
                 session._repeat_detector.clear()
                 session._repeat_detector.record("successor-signature")
@@ -8714,6 +9030,41 @@ class TestDeliverWakeNudge:
         assert "_reminders" not in wake_msg
         sys_turns = [m for m in msgs if m.get("role") == "system"]
         assert {"role": "system", "_source": "idle_children", "content": "your kids"} in sys_turns
+
+    def test_foreign_retained_input_does_not_kill_the_wake(self, tmp_db):
+        """Round-4 review pin: a persistence-retained FOREIGN queued entry
+        must not make the wake raise CrossUserInterjectionError — neither at
+        the drain's pop nor at the wake send's mid-turn flush seams (the
+        spawn backstop would hot-loop while the nudge sat undelivered).
+        The foreign entry stays queued for its owner; the nudge drains
+        normally."""
+        session = _make_session(user_id="owner")
+        session._title_generated = True
+        session._acting_user_id = "alice"
+        session.queue_message(
+            "alice's retained words", interjector_user_id="alice", queue_msg_id="qa"
+        )
+        session._acting_user_id = "bob"
+        session._nudge_queue.enqueue("idle_children", "your kids", "any")
+        with (
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.deliver_wake_nudge_from_queue()
+        # The nudge drained onto the synthetic turn...
+        sys_turns = [m for m in dicts_from_turns(session.messages) if m.get("role") == "system"]
+        assert {"role": "system", "_source": "idle_children", "content": "your kids"} in sys_turns
+        # ...and alice's entry is retained, never consumed under bob.
+        assert "qa" in session._queued_messages
+        assert not any(
+            "alice's retained words" in str(m.get("content"))
+            for m in dicts_from_turns(session.messages)
+        )
 
     def test_marks_source_tag_on_synthesized_user_msg(self, tmp_db):
         session = _make_session()
@@ -9445,6 +9796,7 @@ class TestReminderSidechannelIsolation:
         ]
         assert copied[0].meta.extra["attachments_meta"] == [
             {
+                "attachment_id": user_attachment_id,
                 "kind": "text",
                 "filename": "notes.txt",
                 "mime_type": "text/plain",

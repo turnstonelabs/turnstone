@@ -76,6 +76,7 @@ async def run_sse_stream(
                 "GET",
                 url,
                 headers=sse_headers,
+                params={"user_turn": 1},
             ) as event_source:
                 status = event_source.response.status_code
                 if status == 404:

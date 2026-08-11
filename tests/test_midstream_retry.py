@@ -45,6 +45,16 @@ def _make_session(ui=None, **kwargs):
     them here is exactly the drift its docstring warns about.
     """
     session = make_session(ui=ui or RecordingUI(), **kwargs)
+    # Production creates the durable workstream before a live session may
+    # admit keyed conversation rows.  These direct-session tests must mirror
+    # that ordering: bypassing it would weaken the hard-delete parent fence.
+    from turnstone.core.storage import get_storage
+
+    get_storage().register_workstream(
+        session.ws_id,
+        user_id=session._user_id,
+        kind=session._kind,
+    )
     session._RETRY_BASE_DELAY = 0
     # Latch the auto-title trigger: its background thread would drive a
     # second model call through the MagicMock client (drain retries, real
@@ -715,14 +725,21 @@ class TestRecreateWindowClassification:
         # re-create sequence, so a cancel fired there raises at the next
         # walk's loop-top _check_cancelled — the exact window.
         real_refresh = session._refresh_model_from_registry
+        refresh_calls = 0
 
         def cancel_in_window():
+            nonlocal refresh_calls
+            refresh_calls += 1
             real_refresh()
-            session._cancel_event.set()
+            # send() performs one preflight refresh before the first attempt;
+            # the second refresh is the retry re-create seam this test owns.
+            if refresh_calls == 2:
+                session._cancel_event.set()
 
         with patch.object(session, "_refresh_model_from_registry", side_effect=cancel_in_window):
             session.send("test")
 
+        assert refresh_calls == 2
         # The dead attempt streamed only its safe-flush prefix ("Ha");
         # the splitter carry ("lf an answer") must NEVER surface as a late
         # content token behind a duplicate stream_end.

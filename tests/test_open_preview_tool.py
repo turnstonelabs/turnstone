@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from turnstone.core.session import ChatSession
+from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import Role, turn_from_dict, turn_to_dict
 
 PNG_1x1 = (
@@ -693,13 +694,18 @@ class TestFetchWithSsrfGuard:
 
 
 class TestCancelledBatchPreservesPreview:
-    def test_synthesize_commits_staged_preview(self, monkeypatch):
-        import json as _json
-
+    def test_synthesize_commits_staged_preview(self, tmp_db):
         from turnstone.core.attachments import Attachment
         from turnstone.core.trajectory import Turn
 
         s = _make_session(ws_id="ws-1")
+        storage = get_storage()
+        storage.register_workstream(
+            s.ws_id,
+            user_id=s._user_id,
+            kind=s._kind,
+            parent_ws_id=s._parent_ws_id,
+        )
         descriptor = {
             "kind": "web",
             "title": "T",
@@ -734,35 +740,20 @@ class TestCancelledBatchPreservesPreview:
         )
         s._msg_tokens.append(1)
 
-        saved = {}
-        monkeypatch.setattr(
-            "turnstone.core.session.save_message",
-            lambda ws, role, content, name, **kw: (
-                saved.update({"meta": kw.get("meta"), "row": 42}) or 42
-            ),
-        )
-        persisted = {}
-        monkeypatch.setattr(
-            ChatSession,
-            "_persist_attachment_refs",
-            lambda self, row_id, atts, origin="upload", ws_id=None: persisted.update(
-                {
-                    "row": row_id,
-                    "ids": [a.attachment_id for a in atts],
-                    "origin": origin,
-                    "ws_id": ws_id,
-                }
-            ),
-        )
-
         s._synthesize_cancelled_results("Cancelled by user.")
 
         # Side channel drained; descriptor + blob committed with the turn.
         assert "c1" not in s._tool_previews
-        meta = _json.loads(saved["meta"])
-        assert meta["preview"] == descriptor
-        assert meta["effect_status"] == "unknown"
-        assert persisted == {"row": 42, "ids": ["abc"], "origin": "tool", "ws_id": "ws-1"}
+        stored = storage.load_message_turns(s.ws_id, checkpointed=False)
+        assert len(stored) == 1
+        assert stored[0].meta.extra["preview"] == descriptor
+        assert stored[0].meta.extra["effect_status"] == "unknown"
+        assert stored[0].meta.extra["storage_attachment_ids"] == ["abc"]
+        blob = storage.get_attachment("abc")
+        assert blob is not None
+        assert blob["content"] == b"<p>x</p>"
+        assert blob["origin"] == "tool"
+        assert blob["refcount"] == 1
         # The in-memory synthesized turn carries the descriptor too.
         tool_turns = [t for t in s.messages if isinstance(t, Turn) and t.role is Role.TOOL]
         assert tool_turns and tool_turns[-1].meta.extra.get("preview") == descriptor

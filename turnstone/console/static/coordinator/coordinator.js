@@ -40,15 +40,21 @@ import {
   buildConvActions,
   buildConvStatus,
   buildConvResult,
+  buildPreviewChip,
   batchKicker,
   indexLabel,
 } from "/shared/conversation.js";
 import { redactCredentials } from "/shared/redact_credentials.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "/shared/mcp_error.js";
 import {
+  acceptUserTurnEvent,
+  clientSendMaySettleForViewer,
   createQueueController,
+  mintClientSendId,
   parsePriority,
-  settleSendResponse,
+  postAndSettleSend,
+  settleAcceptedClientSends,
+  viewerUserId,
 } from "/shared/composer_queue.js";
 import {
   OVERFLOW_TRIP_COUNT,
@@ -62,6 +68,20 @@ import {
   overflowWindowTripped,
   degradedCooldownStep,
 } from "/shared/sse_overflow.js";
+import {
+  createHistoryHandoffDeadline,
+  createHistoryHandoffRepair,
+  HISTORY_HANDOFF_FETCH_TIMEOUT_MS,
+} from "/shared/history_handoff.js";
+import {
+  acceptedToolEventAlreadyRendered,
+  enqueueToolOccurrence,
+  indexHistoryToolOutcomes,
+  indexLatestToolRow,
+  recordAcceptedToolEvent,
+  shiftToolOccurrence,
+  shouldRefreshTasksForToolResult,
+} from "/shared/tool_projection.js";
 
 // Standalone-page pending-consent chip (#874): the rail-less coordinator
 // page's counterpart of the L-shell rail badge.  The pending set is
@@ -686,6 +706,13 @@ function createCoordinatorPane(root, wsId, opts) {
   // dispatches settle in any order, and a newest-wins slot nulled by
   // the newer dispatch's finally left the OLDER fetch unabortable.
   const histCtrls = new Set();
+  // Logical deadlines paired with those controllers. AbortController is an
+  // optimization, not the settle guarantee: older runtimes can lack it and
+  // an underlying request can ignore abort. The race still releases repair
+  // state at 15s, while a late request has no render continuation.  Holds
+  // the module handles — retirement always goes through handle.dispose(),
+  // never direct state-slot pokes.
+  const histDeadlines = new Set();
   // call_ids of tool calls whose results are still ARRIVING ON THE LIVE
   // STREAM — the render-time gate's tool-phase liveness signal.  Fed
   // ONLY by live SSE events (tool_pending / tool_info add, tool_result
@@ -747,6 +774,36 @@ function createCoordinatorPane(root, wsId, opts) {
   // brand-new EventSource (initial connect, scheduleReconnect after
   // close).
   let lastEventId = null;
+  // One-shot token tying a rendered REST history revision to its initial SSE
+  // listener registration. connectSSE consumes it once; subsequent reconnects
+  // are driven solely by Last-Event-ID / lastEventId.
+  let historyHandoffToken = null;
+  // A history_resync means the rendered transcript is not authoritative.
+  // Keep that repair intent across failed /history calls and every transport
+  // lifecycle edge; no cursorless/tokenless EventSource may open until a
+  // fresh response renders and supplies its handoff token. One capped
+  // exponential timer owns retries. The latch, budget, backoff, and parked
+  // prompt live in the shared controller so this pane and the interactive one
+  // cannot drift on them.
+  const historyRepair = createHistoryHandoffRepair({
+    baseDelayMs: STALE_RETRY_BASE_MS,
+    jitterMs: STALE_RETRY_JITTER_MS,
+    maxMs: DEGRADED_COOLDOWN_MAX_MS,
+    isAlive: () => !!visHandler,
+    load: (_scope, manualAttempt) => loadHistoryThenReconnect(manualAttempt),
+    connect: () => connectSSE(),
+    setStale: (stale) => {
+      historyStale = stale;
+    },
+    deferToShowEdge: () => {
+      hiddenDisconnect = true;
+    },
+    showPaused: () => setSseStatus("Live updates paused", "err"),
+    placePrompt: (prompt) => {
+      messagesEl.appendChild(prompt);
+      _scheduleScroll();
+    },
+  });
   let reconnectTimer = null;
   // --- SSE overflow-recovery state (client half — mirrors interactive.js) ---
   // Field instrumentation for the two distinct "output stops while the backend
@@ -804,6 +861,8 @@ function createCoordinatorPane(root, wsId, opts) {
   // by the system_turn handler — reset per refetchHistory.  Mirrors
   // ui/static/app.js's per-pane _renderedSystemEventIds.
   const renderedSystemEventIds = new Set();
+  const renderedUserEventIds = new Set();
+  const renderedToolEventIds = new Set();
 
   // Compaction lifecycle holder for the shared reducer
   // (conversation.applyCompactionEvent); `card` is the in-progress card
@@ -1363,7 +1422,12 @@ function createCoordinatorPane(root, wsId, opts) {
   // composer staged on submit.  Attachments is a list of
   // {kind, filename}; falsy/empty falls through to plain text.
   function appendUserMessageWithAttachments(text, attachments, opts) {
+    opts = opts || {};
     const el = appendText("user", text, opts);
+    if (opts.clientSendId) el.dataset.clientSendId = opts.clientSendId;
+    if (opts.eventId != null) el.dataset.eventId = String(opts.eventId);
+    if (opts.sender) el.dataset.sender = opts.sender;
+    if (opts.source) el.dataset.source = opts.source;
     // Per-message edit + rewind affordance (#549) on every user turn,
     // matching the interactive pane. Attached before the early-return so
     // image-only sends (no attachments) still get the action bar.
@@ -1417,6 +1481,37 @@ function createCoordinatorPane(root, wsId, opts) {
     el.appendChild(pills);
     _scheduleScroll();
     return el;
+  }
+
+  function markAcceptedClientSends(
+    clientSendIds,
+    remove,
+    skipAlreadyAccepted = false,
+  ) {
+    return settleAcceptedClientSends(
+      messagesEl,
+      queue,
+      clientSendIds,
+      remove,
+      skipAlreadyAccepted,
+    );
+  }
+
+  function acceptUserTurn(ev) {
+    acceptUserTurnEvent(ev, {
+      renderedEventIds: renderedUserEventIds,
+      messagesEl: messagesEl,
+      queue: queue,
+      consumeAttachments: (ids) => attachments.consume(ids, []),
+      renderNudgeMarker: appendSystemNudgeMarker,
+      renderUserTurn: (content, atts, opts) =>
+        appendUserMessageWithAttachments(content, atts || [], {
+          label: opts.sender && opts.sender === opts.viewer ? "you" : "user",
+          eventId: opts.eventId,
+          sender: opts.sender,
+          source: opts.source,
+        }),
+    });
   }
 
   // Thin ``.msg.user.system-nudge`` marker rendered for a wake-driven
@@ -1492,7 +1587,12 @@ function createCoordinatorPane(root, wsId, opts) {
   function appendToolResult(name, callId, output, isError, opts) {
     if (callId && toolRows.has(callId)) {
       const entry = toolRows.get(callId);
-      _appendResultToRow(entry.row, output, isError, opts);
+      const prior = toolResultNodes.get(callId);
+      if (prior && prior.row == null && prior.node && prior.node.isConnected) {
+        prior.node.remove();
+      }
+      const resultNode = _appendResultToRow(entry.row, output, isError, opts);
+      toolResultNodes.set(callId, { row: entry.row, node: resultNode });
       // The batch may have been --running (live tool_info auto path,
       // approval_resolved approved path, or replay-time orphan).
       // Drop --running once every row in the batch has a result so
@@ -1509,6 +1609,10 @@ function createCoordinatorPane(root, wsId, opts) {
     }
     // Orphan result (no live row — replay edge): still render the MCP
     // error card rather than the raw envelope (#725).
+    const prior = callId ? toolResultNodes.get(callId) : null;
+    if (prior && prior.row == null && prior.node && prior.node.isConnected) {
+      prior.node.remove();
+    }
     const orphanCard = _tryMcpErrorBlock(isError, output);
     if (orphanCard) {
       const el = appendMsg("error", "", {
@@ -1516,6 +1620,7 @@ function createCoordinatorPane(root, wsId, opts) {
         callId: callId,
       });
       el.querySelector(".msg-body").appendChild(orphanCard);
+      if (callId) toolResultNodes.set(callId, { row: null, node: el });
       return el;
     }
     const html = renderToolOutput(output);
@@ -1523,6 +1628,7 @@ function createCoordinatorPane(root, wsId, opts) {
       label: (isError ? "error · " : "") + (name || "tool"),
       callId: callId,
     });
+    if (callId) toolResultNodes.set(callId, { row: null, node: el });
     return el;
   }
 
@@ -1543,6 +1649,10 @@ function createCoordinatorPane(root, wsId, opts) {
   // item payload is intentionally not retained (long sessions would
   // pin per-call preview / parsed-args memory for the page lifetime).
   const toolRows = new Map();
+  const latestToolRowElements = new Map();
+  // Tracks the result node currently owned by a call id. Row-backed results
+  // are already replace-in-place; orphan bubbles need explicit removal.
+  const toolResultNodes = new Map();
 
   // Most-recently-rendered batch with an open approval gate.  Used for
   // keyboard focus claiming and approval_resolved fallbacks.
@@ -1823,9 +1933,17 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _appendResultToRow(row, output, isError, opts) {
-    if (!row) return;
-    const existing = row.querySelector(".conv-row-result");
-    if (existing) existing.remove();
+    if (!row) return null;
+    row
+      .querySelectorAll(".conv-row-result")
+      .forEach((existing) => existing.remove());
+    if (opts && opts.accepted) {
+      if (opts.effectStatus) {
+        row.dataset.effectStatus = String(opts.effectStatus);
+      } else {
+        delete row.dataset.effectStatus;
+      }
+    }
     if (isError) {
       row.classList.add("error");
       // Lift the row's error onto the enclosing batch so the left
@@ -1848,6 +1966,34 @@ function createCoordinatorPane(root, wsId, opts) {
     // across upgrade-in-place when the error came from a tool_result.
     if (isError) block.classList.add("conv-row-result--error");
     row.appendChild(block);
+    // Accepted and replayed preview rows retain the transcript affordance even
+    // when the result is an error/cancellation. Only the executor's
+    // preliminary event may auto-open; this final projection is chip-only.
+    if (opts && opts.preview) {
+      const chip = buildPreviewChip(opts.preview, (descriptor) => {
+        const shell = window.TS_SHELL;
+        if (shell && typeof shell.openPreview === "function") {
+          shell.openPreview(descriptor, { base: "", wsId: wsId });
+          return;
+        }
+        // The standalone coordinator has no split-pane host. Keep the chip
+        // useful by opening its same-origin stored preview in a new tab.
+        if (descriptor && descriptor.attachment_id) {
+          window.open(
+            "/v1/api/workstreams/" +
+              encodeURIComponent(wsId) +
+              "/attachments/" +
+              encodeURIComponent(descriptor.attachment_id) +
+              "/preview",
+            "_blank",
+            "noopener",
+          );
+        }
+      });
+      chip.classList.add("conv-row-result");
+      row.appendChild(chip);
+    }
+    return block;
   }
 
   // Concise, screen-reader friendly summary of a pending batch — used
@@ -2048,9 +2194,23 @@ function createCoordinatorPane(root, wsId, opts) {
     if (items.length === 0) return null;
     opts = opts || {};
 
-    const allMapped = items.every(
-      (it) => it.call_id && toolRows.has(it.call_id),
+    const mappedEntries = items.map((it) =>
+      it.call_id ? toolRows.get(it.call_id) : null,
     );
+    const allMapped = mappedEntries.every(Boolean);
+    const mappedBatch = allMapped ? mappedEntries[0].batch : null;
+    const sameMappedBatch =
+      allMapped && mappedEntries.every((entry) => entry.batch === mappedBatch);
+    const mappedRowsUnresolved =
+      sameMappedBatch &&
+      mappedEntries.every(
+        (entry) => !entry.row.querySelector(".conv-row-result"),
+      );
+    // Only an unresolved shell can be the same occurrence replayed with more
+    // authoritative state (early paint/history orphan -> tool_info/approval).
+    // A mapped row with a result is complete: the provider may legitimately
+    // reuse its call id in a later turn, which must create a fresh batch.
+    const canUpgradeMappedBatch = sameMappedBatch && mappedRowsUnresolved;
     // Partial-overlap guard.  If only SOME of the incoming call_ids
     // are mapped (i.e. they belong to a different prior batch),
     // overwriting toolRows in the create-new path below would orphan
@@ -2059,21 +2219,23 @@ function createCoordinatorPane(root, wsId, opts) {
     // the new batch.  This shape doesn't occur in normal operation
     // (the server never sends overlapping envelopes), so we log it +
     // unmap the stale entries before the new batch claims them.
-    if (!allMapped) {
+    if (!canUpgradeMappedBatch) {
       const partial = items.filter(
         (it) => it.call_id && toolRows.has(it.call_id),
       );
       if (partial.length > 0) {
-        console.warn(
-          "coord_ui: partial-overlap envelope — unmapping",
-          partial.length,
-          "stale call_ids before new batch claims them",
-        );
+        if (!allMapped || !sameMappedBatch) {
+          console.warn(
+            "coord_ui: partial-overlap envelope — unmapping",
+            partial.length,
+            "stale call_ids before new batch claims them",
+          );
+        }
         partial.forEach((it) => toolRows.delete(it.call_id));
       }
     }
-    if (allMapped) {
-      const existing = toolRows.get(items[0].call_id).batch;
+    if (canUpgradeMappedBatch) {
+      const existing = mappedBatch;
       // Late cycle identity (SSE approve_request upgrading a replay /
       // early-paint shell) — stamp it so the approve POST can route.
       if (opts.cycleId) existing.dataset.cycleId = opts.cycleId;
@@ -2216,6 +2378,12 @@ function createCoordinatorPane(root, wsId, opts) {
       batch.appendChild(row);
       renderedRows.push(row);
       if (it.call_id) {
+        indexLatestToolRow(
+          latestToolRowElements,
+          toolResultNodes,
+          it.call_id,
+          row,
+        );
         toolRows.set(it.call_id, { batch, row });
       }
       if (row.classList.contains("error")) anyRowError = true;
@@ -2495,12 +2663,13 @@ function createCoordinatorPane(root, wsId, opts) {
     let queuedEl = null;
     let optimisticEl = null;
     const isBusy = busy;
+    const clientSendId = mintClientSendId();
     // Display-only strip of the !!! prefix (the server re-parses it
     // authoritatively); shared parse so the settle helper's retro-convert
     // renders the same chip either pane would have built pre-POST.
     const { displayText, priority } = parsePriority(trimmed);
     if (isBusy) {
-      queuedEl = queue.addQueuedMessage(displayText, priority);
+      queuedEl = queue.addQueuedMessage(displayText, priority, clientSendId);
     } else {
       // "optimistic": no server state event asserted this — the settle
       // arms may undo it if the send turns out deferred/refused (see
@@ -2515,6 +2684,7 @@ function createCoordinatorPane(root, wsId, opts) {
         snap.attachments,
         {
           label: "you",
+          clientSendId: clientSendId,
         },
       );
     }
@@ -2533,6 +2703,7 @@ function createCoordinatorPane(root, wsId, opts) {
       body: JSON.stringify({
         message: trimmed,
         attachment_ids: snap.attachment_ids,
+        client_send_id: clientSendId,
       }),
     };
     let sendTimer = null;
@@ -2549,70 +2720,24 @@ function createCoordinatorPane(root, wsId, opts) {
       sendInit,
     );
     if (sendTimer) sendReq = sendReq.finally(() => clearTimeout(sendTimer));
-    sendReq
-      .then((r) => {
-        // A rejected send (4xx/5xx) carries {error}, not {status}; without
-        // this guard it falls through to the "unknown status" branch and gets
-        // promote()'d — a server-refused message shown as delivered (with a
-        // false "already sent" notice if it was dismissed). Route it to the
-        // .catch (removes the bubble + shows the error) instead, surfacing the
-        // server's {error} text ("No session", a rate-limit reason, etc.)
-        // rather than a bare status code. A wedged proxy can answer non-JSON
-        // (502/504 HTML); the parse-failure arm falls back to the status code
-        // so that can't surface as an "Unexpected token <" error.
-        if (!r.ok) {
-          // 409 = the server-side cross-user interjection block; convert to a
-          // handled status so it routes to the clean branch below (not the
-          // generic error). Reactive fallback for the race where the send
-          // button wasn't yet disabled.
-          if (r.status === 409) {
-            return r.json().then(
-              (b) => ({
-                status: "cross_user_interjection",
-                error: (b && b.error) || "",
-              }),
-              () => ({ status: "cross_user_interjection", error: "" }),
-            );
-          }
-          return r.json().then(
-            (b) => {
-              throw new Error((b && b.error) || "send_http_" + r.status);
-            },
-            () => {
-              throw new Error("send_http_" + r.status);
-            },
-          );
-        }
-        return r.json();
-      })
-      .then((data) => {
-        // The full status dispatch (queued/retro-convert, busy,
-        // queue_full, attachments_busy, cross_user, unknown-ok) lives in
-        // the shared helper — ONE settle matrix for both panes; see
-        // settleSendResponse's contract for the arm semantics.
-        settleSendResponse(queue, data, {
-          queuedEl,
-          optimisticEl,
-          isBusy,
-          displayText,
-          priority,
-          setBusy: (b) => setBusy(b),
-          busyIsOptimistic: () => busy && busySource === "optimistic",
-          paneIsBusy: () => busy,
-          renderError: (msg) => appendText("error", msg, { label: "error" }),
-          consumeAttachments: (attached, droppedIds) =>
-            attachments.consume(attached, droppedIds),
-        });
-      })
-      .catch((e) => {
-        if (queuedEl) queue.remove(queuedEl);
-        appendText(
-          "error",
-          "Connection error: " + (e && e.message ? e.message : e),
-          { label: "error" },
-        );
-        if (!queuedEl) setBusy(false);
-      });
+    // Response normalization, the full status dispatch (queued/retro-convert,
+    // busy, queue_full, attachments_busy, cross_user, unknown-ok) and the
+    // accepted-guarded transport catch all live in the shared helper — ONE
+    // send settle for both panes and both of each pane's send flows.
+    postAndSettleSend(queue, sendReq, {
+      queuedEl,
+      optimisticEl,
+      isBusy,
+      displayText,
+      priority,
+      clientSendId,
+      setBusy: (b) => setBusy(b),
+      busyIsOptimistic: () => busy && busySource === "optimistic",
+      paneIsBusy: () => busy,
+      renderError: (msg) => appendText("error", msg, { label: "error" }),
+      consumeAttachments: (attached, droppedIds) =>
+        attachments.consume(attached, droppedIds),
+    });
     return false;
   }
 
@@ -2705,6 +2830,14 @@ function createCoordinatorPane(root, wsId, opts) {
       return;
     }
     if (!resp.ok) {
+      if (resp.status === 409) {
+        const msg =
+          "Conversation history is still being saved. Try ending the session again shortly.";
+        if (typeof toast !== "undefined" && toast.error) toast.error(msg);
+        else window.alert(msg);
+        resumeSse();
+        return;
+      }
       let detail = "HTTP " + resp.status;
       try {
         const body = await resp.json();
@@ -2868,6 +3001,13 @@ function createCoordinatorPane(root, wsId, opts) {
     if (connectCursor != null) {
       url += "?last_event_id=" + encodeURIComponent(connectCursor);
     }
+    // Declare typed user-turn support on every manual URL. Native
+    // EventSource reconnects reuse this URL, so the capability survives
+    // transport churn without another client-side hook.
+    url += (url.includes("?") ? "&" : "?") + "user_turn=1";
+    // The accepted TOOL projection is likewise URL-sticky across native
+    // reconnects; SDK and channel consumers intentionally do not opt in.
+    url += "&tool_turn=1";
     // Close-on-hide / replay-on-show: install once per pane, removed by
     // destroy().  A hidden tab's throttled drain is the likeliest slow consumer
     // behind a server-side queue overflow, and an idle hidden tab holds a node
@@ -2898,8 +3038,25 @@ function createCoordinatorPane(root, wsId, opts) {
       setSseStatus("paused — tab hidden", "");
       return;
     }
+    if (historyRepair.isRepairing(wsId)) {
+      // A history mismatch is not a numeric replay gap. Refuse every
+      // transport redial until /history has rendered a fresh proof; this
+      // also makes hide/show, login, and degraded-recovery paths fail closed.
+      setSseStatus("history out of date — retrying…", "err");
+      statusBarEl.classList.add("ws-sb-disconnected");
+      sbTokensEl.textContent = "History out of date — retrying…";
+      historyRepair.schedule();
+      return;
+    }
+    if (historyHandoffToken != null) {
+      url +=
+        (url.includes("?") ? "&" : "?") +
+        "history_token=" +
+        encodeURIComponent(historyHandoffToken);
+    }
     setSseStatus("connecting…", "");
     evtSource = new EventSource(url, { withCredentials: true });
+    historyHandoffToken = null;
     evtSource.onopen = function () {
       reconnectAttempts = 0;
       // Measure the gap this open just closed, then clear it (disconnectedAt is
@@ -3332,7 +3489,13 @@ function createCoordinatorPane(root, wsId, opts) {
   //      closed stream keeps this async tail from reopening one on a
   //      destroyed pane (close-session's own resumeSse re-arms on its
   //      failure paths).
-  function loadHistoryThenReconnect() {
+  function loadHistoryThenReconnect(manualAttempt = false) {
+    const repairingHistoryHandoff = historyRepair.isRepairing(wsId);
+    let repairAttemptId = null;
+    if (repairingHistoryHandoff) {
+      if (!historyRepair.admitAttempt(manualAttempt)) return;
+      repairAttemptId = historyRepair.startAttempt(manualAttempt);
+    }
     suspendStream();
     currentAssistantEl = null;
     currentAssistantBuf = "";
@@ -3353,12 +3516,13 @@ function createCoordinatorPane(root, wsId, opts) {
     // reconnect still retries correctly: truncatedFromCursor (not
     // lastEventId) is the durable repair state the chokepoint presents.
     lastEventId = null;
+    historyHandoffToken = null;
     // A pending deferred resync is superseded by this full refetch — without
     // this clear, the next idle edge would run a second, pointless full
     // resync.
     pendingTruncatedResync = false;
     refetchHistory(true)
-      .then(() => {
+      .then((outcome) => {
         // Successful heal only (a failed fetch resolves too, but leaves the
         // record set; a render throw skips .then entirely): refresh the
         // sidebar once.  The envelope refreshed it at gap START; this
@@ -3403,8 +3567,26 @@ function createCoordinatorPane(root, wsId, opts) {
         ) {
           refreshSidebarAfterGap();
         }
+        return outcome;
       })
-      .finally(() => {
+      .catch((err) => {
+        // Normalize to a fail-closed settle below, but never silently: a
+        // render throw on the ordinary heal path used to surface as an
+        // unhandled rejection — keep the diagnostic loud.
+        console.error("history load/render failed", err);
+        return undefined;
+      })
+      .then((outcome) => {
+        if (repairingHistoryHandoff) {
+          historyRepair.endAttempt(repairAttemptId);
+          if (!visHandler) return;
+          historyRepair.settle({
+            outcome,
+            hasToken: historyHandoffToken != null,
+            manualAttempt,
+          });
+          return;
+        }
         if (visHandler) connectSSE();
       });
   }
@@ -3546,20 +3728,39 @@ function createCoordinatorPane(root, wsId, opts) {
         noteStreamOverflow();
         break;
       case "tool_result":
-        liveToolCalls.delete(ev.call_id || "");
-        appendToolResult(
-          ev.name || "tool",
-          ev.call_id || "",
-          ev.output || "",
-          !!ev.is_error,
-        );
-        // tasks mutations change persisted state the sidebar reads
-        // from GET /tasks — re-fetch so the operator sees
-        // add/update/remove/reorder without clicking the refresh icon.
-        // list is a read-only action; skip to avoid redundant fetches.
-        // Debounced so a burst of mutations coalesces into one fetch.
-        if (ev.name === "tasks" && !ev.is_error) {
-          loadTasksDebounced();
+        if (acceptedToolEventAlreadyRendered(renderedToolEventIds, ev)) {
+          break;
+        }
+        {
+          const callId = ev.call_id || "";
+          const mapped = callId ? toolRows.get(callId) : null;
+          const hadResult = !!(
+            (mapped && mapped.row.querySelector(".conv-row-result")) ||
+            (callId && toolResultNodes.has(callId))
+          );
+          liveToolCalls.delete(callId);
+          appendToolResult(
+            ev.name || "tool",
+            callId,
+            ev.output || "",
+            !!ev.is_error,
+            {
+              accepted: ev.accepted === true,
+              effectStatus: ev.effect_status,
+              preview: ev.preview,
+            },
+          );
+          recordAcceptedToolEvent(renderedToolEventIds, ev);
+          // tasks mutations change persisted state the sidebar reads
+          // from GET /tasks — re-fetch so the operator sees
+          // add/update/remove/reorder without clicking the refresh icon.
+          // list is a read-only action; skip to avoid redundant fetches.
+          // Debounced so a burst of mutations coalesces into one fetch. The
+          // accepted replacement does not repeat that side effect when the
+          // provisional receipt was already rendered.
+          if (shouldRefreshTasksForToolResult(ev, hadResult)) {
+            loadTasksDebounced();
+          }
         }
         break;
       case "approve_request":
@@ -3695,6 +3896,9 @@ function createCoordinatorPane(root, wsId, opts) {
         // styling which mis-categorised them as tool calls.
         appendText("info", ev.message || "", { label: "info" });
         break;
+      case "user_turn":
+        acceptUserTurn(ev);
+        break;
       case "system_turn": {
         // First-class operator-context system turn (output-guard finding,
         // user interjection, metacognitive nudge, watch result — see
@@ -3708,6 +3912,14 @@ function createCoordinatorPane(root, wsId, opts) {
         // /history+replay seam idempotent.  Mirrors ui/static/app.js.
         const sysEid = ev._event_id != null ? String(ev._event_id) : null;
         if (sysEid && renderedSystemEventIds.has(sysEid)) break;
+        if (
+          ev.source === "user_interjection" &&
+          ev.meta &&
+          ev.meta.client_send_id &&
+          clientSendMaySettleForViewer(ev.meta.sender, viewerUserId())
+        ) {
+          markAcceptedClientSends([ev.meta.client_send_id], true);
+        }
         renderSystemTurn(ev.source || "", ev.content || "", ev.meta);
         if (sysEid) renderedSystemEventIds.add(sysEid);
         break;
@@ -3874,6 +4086,11 @@ function createCoordinatorPane(root, wsId, opts) {
         // already showed it; nothing to render here. (Earlier this
         // surfaced an extra info row, which doubled up with the
         // queued bubble once the composer started rendering one.)
+        if (
+          ev.client_send_id &&
+          clientSendMaySettleForViewer(ev.sender, viewerUserId())
+        )
+          markAcceptedClientSends([ev.client_send_id], false, true);
         break;
       case "message_dispatched":
         // A deferred send left the parked list: fresh spawn (promote the
@@ -4030,20 +4247,42 @@ function createCoordinatorPane(root, wsId, opts) {
             if (!_pendingEditSend) return;
             const editText = _pendingEditSend;
             _pendingEditSend = null;
-            setBusy(true);
-            appendUserMessageWithAttachments(editText, [], { label: "you" });
-            authFetch(
-              "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send",
-              {
-                method: "POST",
-                credentials: "include",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ message: editText }),
-              },
-            ).catch((err) => {
-              appendText("error", "Connection error: " + err.message);
-              setBusy(false);
+            const editClientSendId = mintClientSendId();
+            const editPriority = parsePriority(editText);
+            setBusy(true, "optimistic");
+            const editEl = appendUserMessageWithAttachments(editText, [], {
+              label: "you",
+              clientSendId: editClientSendId,
             });
+            postAndSettleSend(
+              queue,
+              authFetch(
+                "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send",
+                {
+                  method: "POST",
+                  credentials: "include",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    message: editText,
+                    client_send_id: editClientSendId,
+                  }),
+                },
+              ),
+              {
+                queuedEl: null,
+                optimisticEl: editEl,
+                isBusy: false,
+                displayText: editPriority.displayText,
+                priority: editPriority.priority,
+                clientSendId: editClientSendId,
+                setBusy: (value) => setBusy(value),
+                busyIsOptimistic: () => busy && busySource === "optimistic",
+                paneIsBusy: () => busy,
+                renderError: (message) =>
+                  appendText("error", message, { label: "error" }),
+                consumeAttachments: () => {},
+              },
+            );
           })
           .catch((err) => {
             // Render runs outside refetchHistory's fetch try/catch by design;
@@ -4054,6 +4293,13 @@ function createCoordinatorPane(root, wsId, opts) {
           });
         break;
       }
+      case "history_resync":
+        // A conversation commit crossed the REST-history -> listener handoff.
+        // Ring replay cannot prove that a committed row was rendered. The
+        // explicit repair mode survives /history failure and refuses every
+        // cursorless/tokenless transport redial until a fresh proof renders.
+        historyRepair.begin(wsId);
+        break;
       case "replay_truncated": {
         // The stream just admitted losing events past recovery — treat the
         // connection as DEAD and run the full fresh-connect flow
@@ -6120,19 +6366,24 @@ function createCoordinatorPane(root, wsId, opts) {
     const histCtrl =
       typeof AbortController === "function" ? new AbortController() : null;
     if (histCtrl) histCtrls.add(histCtrl);
-    const histTimer = histCtrl
-      ? setTimeout(() => histCtrl.abort(), 15000)
-      : null;
+    const deadlineHandle = createHistoryHandoffDeadline(() => {
+      if (histCtrl) histCtrl.abort();
+    }, HISTORY_HANDOFF_FETCH_TIMEOUT_MS);
+    histDeadlines.add(deadlineHandle);
     try {
-      hist = await getJSON(
-        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
-        histCtrl ? { signal: histCtrl.signal } : undefined,
-      );
+      hist = await Promise.race([
+        getJSON(
+          "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
+          histCtrl ? { signal: histCtrl.signal } : undefined,
+        ),
+        deadlineHandle.promise,
+      ]);
     } catch (e) {
       console.warn("coord history fetch failed", e);
       hist = null;
     } finally {
-      if (histTimer) clearTimeout(histTimer);
+      deadlineHandle.dispose();
+      histDeadlines.delete(deadlineHandle);
       if (histCtrl) histCtrls.delete(histCtrl);
       refetchesInFlight--;
     }
@@ -6269,8 +6520,12 @@ function createCoordinatorPane(root, wsId, opts) {
       staleRetryTimer = null;
     }
     toolRows.clear();
+    latestToolRowElements.clear();
+    toolResultNodes.clear();
     activeBatch = null;
     renderedSystemEventIds.clear();
+    renderedUserEventIds.clear();
+    renderedToolEventIds.clear();
     resetCompactionHolder(compactionHolder);
     // Fresh-connect fast-forward: when the trailing turn is an executing
     // in-flight tool batch the server can replay, /history returns a
@@ -6291,9 +6546,17 @@ function createCoordinatorPane(root, wsId, opts) {
     // tool result rendered with the literal label "tool", which
     // looked like the tool calls had been replaced by raw JSON.
     const toolNameByCallId = new Map();
+    // Core TOOL rows must pair correctly even when a provider reuses call ids
+    // across turns or emits malformed duplicates inside one assistant batch.
+    // (Verdict/output-assessment decoration remains call-id keyed upstream.)
+    const pendingHistoryToolRows = new Map();
 
-    // Pre-scan every tool message's tool_call_id so the
-    // assistant.tool_calls branch below knows whether each call_id
+    // Structurally pair each assistant batch with only its immediately
+    // following TOOL rows. A bounded /history slice may begin with a TOOL whose
+    // assistant was cut off; a global call-id queue would let that leading
+    // orphan poison a later reused id's outcome.
+    //
+    // The assistant.tool_calls branch below needs to know whether each call_id
     // already has a result persisted.  An assistant tool_calls turn
     // with NO matching tool result for some call_ids = orphan: the
     // tool was dispatched but didn't complete before the reload
@@ -6307,26 +6570,8 @@ function createCoordinatorPane(root, wsId, opts) {
     // for case c.  Without this neutral state, painting Approve
     // buttons on a non-pending orphan was misleading and could
     // 409-on-submit because the call_id wasn't in pending_items.
-    const callOutcomes = new Map();
-    (hist.messages || []).forEach((m) => {
-      if ((m.role || "tool") !== "tool" || !m.tool_call_id) return;
-      // The server-side /history projection derives denied / is_error on
-      // each tool message (content-prefix heuristic + persisted flags),
-      // so we read those fields directly rather than re-sniffing content
-      // here.  "Denied by user" / "Blocked" -> denied; the error-prefix
-      // set (Error, Command timed out, ...) -> is_error.  The
-      // assistant.tool_calls render below reads this map to mark a batch
-      // resolved-denied (vs the default resolved-approved) and to
-      // propagate the error flag to appendToolResult; a call_id absent
-      // from the map is an orphan (no result yet) -> --running.
-      let outcome = "ok";
-      if (m.denied) {
-        outcome = "denied";
-      } else if (m.is_error) {
-        outcome = "error";
-      }
-      callOutcomes.set(m.tool_call_id, outcome);
-    });
+    const historyMessages = hist.messages || [];
+    const historyBatchOutcomes = indexHistoryToolOutcomes(historyMessages);
 
     // Render an assistant turn's tool_calls as a single batch
     // construct.  Synthesises one batch per assistant turn so a
@@ -6337,7 +6582,8 @@ function createCoordinatorPane(root, wsId, opts) {
     // resolvedCallIds rationale above).  SSE upgrades --running in
     // place when it knows more.
     function renderAssistantToolBatch(m) {
-      const items = m.tool_calls.map((tc) => {
+      const batchOutcomes = historyBatchOutcomes.get(m) || [];
+      const items = m.tool_calls.map((tc, callIndex) => {
         // tool_calls arrive flattened by the server /history projection:
         // {id, name, arguments} (no nested `function` wrapper).
         const name = String((tc && tc.name) || "tool");
@@ -6356,6 +6602,7 @@ function createCoordinatorPane(root, wsId, opts) {
           parsedArgs,
           argsRaw,
         );
+        item._historyOutcome = batchOutcomes[callIndex];
         // Server attaches the persisted intent_verdict to each
         // tc on /history (newest-wins per call_id; LLM upgrade
         // beats heuristic when both exist).  Stamp on the item
@@ -6399,17 +6646,33 @@ function createCoordinatorPane(root, wsId, opts) {
       //   - else → resolved-approved (a runtime error doesn't
       //     change the approval verdict; the per-row .error class
       //     comes from the tool_result branch below)
-      const outcomes = items.map((it) =>
-        it.call_id ? callOutcomes.get(it.call_id) : "ok",
-      );
+      const outcomes = items.map((it) => it._historyOutcome);
       const allResolved = outcomes.every((o) => o !== undefined);
+      let renderedBatch = null;
       if (!allResolved) {
-        appendToolBatch(items, { running: true });
+        renderedBatch = appendToolBatch(items, { running: true });
       } else if (outcomes.some((o) => o === "denied")) {
-        appendToolBatch(items, { resolved: { approved: false } });
+        renderedBatch = appendToolBatch(items, {
+          resolved: { approved: false },
+        });
       } else {
-        appendToolBatch(items, { resolved: { approved: true } });
+        renderedBatch = appendToolBatch(items, {
+          resolved: { approved: true },
+        });
       }
+      const renderedRows = renderedBatch
+        ? Array.from(renderedBatch.children).filter((child) =>
+            child.classList.contains("conv-row"),
+          )
+        : [];
+      items.forEach((item, index) => {
+        if (!item.call_id || !renderedRows[index]) return;
+        enqueueToolOccurrence(pendingHistoryToolRows, item.call_id, {
+          row: renderedRows[index],
+          name: item.func_name || "tool",
+          outcome: item._historyOutcome,
+        });
+      });
       // Output-guard findings — render each one as a chip
       // anchored to the .conv-row that tripped the guard
       // rather than a generic "[output guard]" chat line.
@@ -6422,9 +6685,9 @@ function createCoordinatorPane(root, wsId, opts) {
         if (!oa || !oa.risk_level || oa.risk_level === "none") continue;
         const cid = items[oi].call_id || "";
         if (!cid) continue;
-        const entry = toolRows.get(cid);
-        if (!entry || !entry.row) continue;
-        _attachOutputWarningChip(entry.row, oa);
+        const row = renderedRows[oi];
+        if (!row) continue;
+        _attachOutputWarningChip(row, oa);
       }
     }
 
@@ -6461,10 +6724,52 @@ function createCoordinatorPane(root, wsId, opts) {
         // batch state (no per-row error needed there; the row's
         // content reads "Denied by user").
         const callId = m.tool_call_id || "";
+        const occurrence = callId
+          ? shiftToolOccurrence(pendingHistoryToolRows, callId)
+          : null;
         const toolName =
-          (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
-        const isError = callOutcomes.get(callId) === "error";
-        appendToolResult(toolName, callId, content || "", isError);
+          (occurrence && occurrence.name) ||
+          (callId && toolNameByCallId.get(callId)) ||
+          m.tool_name ||
+          "tool";
+        // Orphan tool rows (their assistant batch fell outside the bounded
+        // /history window) have no occurrence; the row's own projected flag
+        // is the authority there — without it a failed tool reads on reload
+        // as a normal successful result.
+        const isError = occurrence
+          ? occurrence.outcome === "error"
+          : m.is_error === true;
+        const resultOpts = {
+          accepted: true,
+          effectStatus: m.effect_status,
+          preview: m.preview,
+        };
+        if (occurrence && occurrence.row) {
+          const resultNode = _appendResultToRow(
+            occurrence.row,
+            content || "",
+            isError,
+            resultOpts,
+          );
+          if (callId) {
+            toolResultNodes.set(callId, {
+              row: occurrence.row,
+              node: resultNode,
+            });
+          }
+          _unsetBatchRunningIfAllResults(occurrence.row.closest(".conv-batch"));
+        } else {
+          appendToolResult(
+            toolName,
+            callId,
+            content || "",
+            isError,
+            resultOpts,
+          );
+        }
+        if (m.event_id != null) {
+          renderedToolEventIds.add(String(m.event_id));
+        }
         // Tool-channel metacog nudges + queued interjections that used to
         // splice into the tool result now follow it as first-class
         // operator-context ``system`` rows and render via the ``system``
@@ -6538,12 +6843,19 @@ function createCoordinatorPane(root, wsId, opts) {
             // The nudges it carried are now first-class operator-context
             // ``system`` rows that follow it and render below.
             appendSystemNudgeMarker();
+            if (m.event_id != null)
+              renderedUserEventIds.add(String(m.event_id));
             return;
           }
           if (!content && userAttachments.length === 0) return;
+          const viewer = viewerUserId();
           appendUserMessageWithAttachments(content, userAttachments, {
-            label: role,
+            label: m.sender && m.sender === viewer ? "you" : "user",
+            eventId: m.event_id,
+            sender: m.sender || "",
+            source: m.source || "",
           });
+          if (m.event_id != null) renderedUserEventIds.add(String(m.event_id));
         } else if (role === "system") {
           // First-class operator-context system turn — ``renderSystemTurn``
           // routes by ``m.source`` to the structured card (watch / guard /
@@ -6566,6 +6878,19 @@ function createCoordinatorPane(root, wsId, opts) {
     // live-turn-ends case — without this a reloaded or rewound coordinator
     // showed assistant turns with no retry button.
     _refreshRetryButton();
+    // The token asserts that this exact REST revision was fully rendered.
+    // Arm it only after every synchronous render step succeeds; otherwise the
+    // caller's rejected promise must not reconnect under a false assertion.
+    if (seedCursor) {
+      historyHandoffToken =
+        typeof hist.handoff_token === "string" && hist.handoff_token
+          ? hist.handoff_token
+          : null;
+    }
+    // The outcome tells the repair settle whether a TOKENLESS response was a
+    // completed render (the server's deliberate cold storage-only read —
+    // downgrade to the tokenless bootstrap) or a failure (fail closed).
+    return "rendered";
   }
 
   // Re-arm the stream after a 401 re-auth: reset backoff + reconnect now.
@@ -6586,6 +6911,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
     // truncated resync).
     closeStreamTransport();
+    historyRepair.clear();
     // The clear_ui-failure retry deliberately survives closeStreamTransport
     // (transport-only redials keep the heal intent — see its decl), so it
     // must die HERE, the terminal path: destroy() bumps no generation, and
@@ -6607,6 +6933,10 @@ function createCoordinatorPane(root, wsId, opts) {
       }
     });
     histCtrls.clear();
+    histDeadlines.forEach((handle) =>
+      handle.dispose({ expire: true, resolve: true }),
+    );
+    histDeadlines.clear();
     [
       cancelTimeoutId,
       forceTimeoutId,

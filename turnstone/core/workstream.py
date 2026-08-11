@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -25,6 +25,47 @@ if TYPE_CHECKING:
 # type error instead of a silently never-firing command-window guard —
 # the /send defer keys on exactly these values.
 WorkerKind = Literal["", "turn", "command"]
+
+# Sanitized operator-facing projection of the accepted-conversation journal.
+# Detailed retry bookkeeping stays private to ChatSession; public API rows carry
+# only this four-state value so older nodes and unloaded rows can safely default
+# to ``healthy`` without exposing commit keys or internal errors.
+ConversationPersistenceState = Literal["healthy", "pending", "retrying", "conflict"]
+_CONVERSATION_PERSISTENCE_STATES: frozenset[str] = frozenset(get_args(ConversationPersistenceState))
+
+
+def normalize_conversation_persistence_state(value: Any) -> ConversationPersistenceState:
+    """Coerce a peer/session status value to the backward-compatible default."""
+    if isinstance(value, str) and value in _CONVERSATION_PERSISTENCE_STATES:
+        return cast("ConversationPersistenceState", value)
+    return "healthy"
+
+
+def concrete_method(obj: Any, name: str) -> Callable[..., Any] | None:
+    """Return ``obj``'s real ``name`` method, or ``None`` when it has none.
+
+    Sessions and UIs are consumed through optional hooks that compatibility
+    shims, older implementations, and test doubles may not carry, so every
+    caller of such a hook first has to ask whether this object really
+    implements it.  A plain ``getattr`` cannot answer that: ``MagicMock``
+    auto-vivifies any missing attribute as a callable child, which would make
+    every optional hook look present under unit tests.
+
+    A hook counts as concrete when the object's *type* defines it OR the name
+    is bound in the instance ``__dict__``.  The instance term keeps
+    deliberately installed per-instance hooks working — including an attribute
+    a test assigned on purpose — while auto-vivified mock children, which live
+    in ``_mock_children`` and never reach ``__dict__``, stay invisible.  An
+    attribute that resolves to a non-callable reads as "no hook".
+    """
+    instance_fields = getattr(obj, "__dict__", None)
+    if not (
+        callable(getattr(type(obj), name, None))
+        or (isinstance(instance_fields, dict) and name in instance_fields)
+    ):
+        return None
+    method = getattr(obj, name, None)
+    return method if callable(method) else None
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +290,9 @@ class Workstream:
     # retry / wake — the default) or "command" (a slash-command worker,
     # including the minutes-long manual /compact).  Written under
     # ``_lock`` by ``session_worker.send`` in the same acquisition that
-    # sets ``worker_thread``/``_worker_running``, so readers gating on
-    # the running flag see a coherent triple.  A stale value after the
+    # sets ``worker_thread``/``_worker_running`` and the active principal,
+    # so readers gating on the running flag see one coherent slot claim. A
+    # stale value after the
     # worker exits is harmless — every reader conjoins
     # ``_worker_running``.  The /send route defers (never queues) while
     # this reads "command": the mid-turn interjection queue is
@@ -258,6 +300,20 @@ class Workstream:
     # unreachable during command windows — deferred entries live on
     # ``_pending_sends`` below.
     worker_kind: WorkerKind = field(default="", repr=False)
+    # Authenticated principal that owns the active turn worker. Claimed in
+    # the same ``_lock`` transition as ``_worker_running``/``worker_thread``
+    # so queue admission never consults the previous turn's sticky session
+    # actor while a newly spawned worker is still binding its user context.
+    # Empty for internal/unauthenticated workers; readers must still conjoin
+    # ``_worker_running``.
+    _worker_principal_id: str = field(default="", repr=False)
+    # Whether operator force-cancel may abandon this exact worker slot and
+    # admit a concurrent successor. Ordinary sends/compactions are cooperative
+    # and abandonable; lifecycle mutations that destructively rewrite shared
+    # history claim ``False`` so force remains a cancellation request but may
+    # not reopen the slot until the mutation exits. Written and owner-cleared
+    # atomically with the rest of the worker claim under ``_lock``.
+    _worker_force_abandonable: bool = field(default=True, repr=False)
     # Sends deferred while the order barrier holds (full-fidelity
     # pending entries — see :class:`_PendingSend` above), dispatched in
     # arrival order by the per-workstream drain thread when the slot
@@ -345,3 +401,38 @@ class Workstream:
         """
         drain = self._pending_drain
         return bool(self._pending_sends) or (drain is not None and drain.is_alive())
+
+
+def session_persistence_state(session: Any) -> ConversationPersistenceState:
+    """Return the sanitized conversation-persistence state for a session.
+
+    ``ChatSession.conversation_persistence_status`` is intentionally richer
+    than the public API.  This projection accepts only its documented enum and
+    fails closed to ``healthy`` for missing sessions, older session
+    implementations, test doubles, exceptions, and malformed responses.
+    """
+    if session is None:
+        return "healthy"
+    status = concrete_method(session, "conversation_persistence_status")
+    if status is None:
+        return "healthy"
+    try:
+        result = status()
+    except Exception:
+        return "healthy"
+    if not isinstance(result, dict):
+        return "healthy"
+    return normalize_conversation_persistence_state(result.get("state"))
+
+
+def workstream_persistence_state(ws: Any) -> ConversationPersistenceState:
+    """Sanitized conversation-persistence state for a live registry row.
+
+    Registry-resolved callers only (list endpoints walking the manager's
+    rows).  A UI reporting on its *own* session must derive through the
+    session bound at construction (``SessionUIBase._current_persistence_state``)
+    instead: a registry lookup by id fails open to ``healthy`` — or to a
+    replacement workstream after id reuse — exactly while failed-delete
+    tombstone retention or retirement has the row out of the map.
+    """
+    return session_persistence_state(getattr(ws, "session", None))

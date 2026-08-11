@@ -14,6 +14,7 @@ from turnstone.sdk.events import (
     ContentEvent,
     ErrorEvent,
     HistoryEvent,
+    HistoryResyncEvent,
     InfoEvent,
     NodeJoinedEvent,
     NodeLostEvent,
@@ -27,6 +28,7 @@ from turnstone.sdk.events import (
     ToolInfoEvent,
     ToolOutputChunkEvent,
     ToolResultEvent,
+    UserTurnEvent,
     WsActivityEvent,
     WsClosedEvent,
     WsRenameEvent,
@@ -53,6 +55,45 @@ def test_history_event():
     e = ServerEvent.from_dict({"type": "history", "messages": msgs})
     assert isinstance(e, HistoryEvent)
     assert e.messages == msgs
+
+
+def test_history_resync_event_preserves_repair_reason():
+    e = ServerEvent.from_dict(
+        {
+            "type": "history_resync",
+            "ws_id": "ws1",
+            "reason": "handoff_mismatch",
+        }
+    )
+    assert isinstance(e, HistoryResyncEvent)
+    assert e.ws_id == "ws1"
+    assert e.reason == "handoff_mismatch"
+
+
+def test_user_turn_event_preserves_correlation_and_attribution():
+    e = ServerEvent.from_dict(
+        {
+            "type": "user_turn",
+            "ws_id": "ws1",
+            "content": "hello",
+            "attachments": [
+                {
+                    "attachment_id": "a1",
+                    "kind": "text",
+                    "filename": "note.txt",
+                    "mime_type": "text/plain",
+                }
+            ],
+            "sender": "user-1",
+            "client_send_ids": ["browser-send"],
+            "_event_id": 17,
+        }
+    )
+    assert isinstance(e, UserTurnEvent)
+    assert e.client_send_ids == ["browser-send"]
+    assert e.sender == "user-1"
+    assert e.attachments[0]["attachment_id"] == "a1"
+    assert e._event_id == 17
 
 
 def test_thinking_start_stop():
@@ -110,6 +151,31 @@ def test_tool_result_event():
     assert e.call_id == "c1"
     assert e.name == "search"
     assert e.output == "found it"
+
+
+def test_accepted_tool_result_event_carries_final_projection_metadata():
+    preview = {"kind": "html", "attachment_id": "preview-1"}
+    e = ServerEvent.from_dict(
+        {
+            "type": "tool_result",
+            "call_id": "c-final",
+            "name": "open_preview",
+            "output": "guarded\nscalar",
+            "is_error": True,
+            "preview": preview,
+            "accepted": True,
+            "effect_status": "unknown",
+            "_event_id": 42,
+        }
+    )
+
+    assert isinstance(e, ToolResultEvent)
+    assert e.output == "guarded\nscalar"
+    assert e.is_error is True
+    assert e.preview == preview
+    assert e.accepted is True
+    assert e.effect_status == "unknown"
+    assert e._event_id == 42
 
 
 def test_tool_output_chunk_event():
@@ -240,12 +306,20 @@ def test_ws_state_event():
             "context_ratio": 0.3,
             "activity": "Writing code",
             "activity_state": "thinking",
+            "persistence_state": "retrying",
         }
     )
     assert isinstance(e, WsStateEvent)
     assert e.ws_id == "ws1"
     assert e.state == "thinking"
     assert e.tokens == 500
+    assert e.persistence_state == "retrying"
+
+
+def test_ws_state_event_defaults_persistence_for_older_nodes():
+    e = ServerEvent.from_dict({"type": "ws_state", "ws_id": "ws1"})
+    assert isinstance(e, WsStateEvent)
+    assert e.persistence_state == "healthy"
 
 
 def test_ws_activity_event():
@@ -296,21 +370,30 @@ def test_cluster_state_event():
             "context_ratio": 0.5,
             "activity": "executing tool",
             "activity_state": "tool",
+            "persistence_state": "conflict",
         }
     )
     assert isinstance(e, ClusterStateEvent)
     assert e.node_id == "n1"
     assert e.state == "running"
     assert e.tokens == 1000
+    assert e.persistence_state == "conflict"
 
 
 def test_cluster_ws_created_event():
     e = ClusterEvent.from_dict(
-        {"type": "ws_created", "ws_id": "ws2", "node_id": "n1", "name": "New WS"}
+        {
+            "type": "ws_created",
+            "ws_id": "ws2",
+            "node_id": "n1",
+            "name": "New WS",
+            "persistence_state": "pending",
+        }
     )
     assert isinstance(e, ClusterWsCreatedEvent)
     assert e.ws_id == "ws2"
     assert e.name == "New WS"
+    assert e.persistence_state == "pending"
 
 
 def test_cluster_ws_closed_event():

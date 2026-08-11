@@ -75,6 +75,13 @@ conversations = sa.Table(
     # Stripped before the LLM wire (it is a ``_``-prefixed key by the time it
     # reaches a provider).  Added in migration 060.
     sa.Column("meta", sa.Text, nullable=True),
+    # Stable idempotency identity for an admitted live conversation commit. A
+    # retry after an ambiguous database acknowledgement can recover the original
+    # row instead of duplicating it. Nullable keeps every legacy/offline bulk
+    # writer on the historical append-only path; the partial composite unique
+    # index therefore constrains only keyed commits on both SQLite and
+    # PostgreSQL. Added in 071.
+    sa.Column("commit_key", sa.Text),
 )
 
 sa.Index("idx_conversations_timestamp", conversations.c.timestamp)
@@ -82,6 +89,14 @@ sa.Index("idx_conversations_timestamp", conversations.c.timestamp)
 # seek, not a row scan) and per-ws event-cursor range queries.  See
 # migration 059.
 sa.Index("idx_conversations_ws_event", conversations.c.ws_id, conversations.c.event_id)
+sa.Index(
+    "uq_conversations_ws_commit_key",
+    conversations.c.ws_id,
+    conversations.c.commit_key,
+    unique=True,
+    sqlite_where=conversations.c.commit_key.is_not(None),
+    postgresql_where=conversations.c.commit_key.is_not(None),
+)
 
 workstreams = sa.Table(
     "workstreams",

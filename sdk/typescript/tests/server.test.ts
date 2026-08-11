@@ -88,6 +88,21 @@ describe("TurnstoneServer", () => {
     expect(JSON.parse(init.body)).toEqual({ message: "Hello" });
   });
 
+  it("send threads the optional browser correlation token", async () => {
+    const fetchFn = mockFetch({ status: "ok" });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+    await client.send("Hello", "ws1", { clientSendId: "browser-send_1" });
+
+    const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({
+      message: "Hello",
+      client_send_id: "browser-send_1",
+    });
+  });
+
   it("approve selects a cycle without duplicating ws_id in the body", async () => {
     const fetchFn = mockFetch({ status: "ok", cycle_id: "cycle-1" });
     const client = new TurnstoneServer({
@@ -125,6 +140,57 @@ describe("TurnstoneServer", () => {
     const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(JSON.parse(init.body)).toEqual({ force: true });
     expect(response.dropped).toEqual({ tool_calls: ["call-1"] });
+  });
+
+  it("getHistory returns the cursor and one-shot handoff token", async () => {
+    const fetchFn = mockFetch({
+      ws_id: "ws1",
+      messages: [{ role: "system", source: "compaction", content: "summary" }],
+      cursor: 0,
+      handoff_token: "epoch.7",
+    });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    const history = await client.getHistory("ws1", { limit: 42 });
+
+    expect(history.cursor).toBe(0);
+    expect(history.handoff_token).toBe("epoch.7");
+    const [url] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe("http://test/v1/api/workstreams/ws1/history?limit=42");
+  });
+
+  it("streamEvents forwards caller-managed initial history hints", async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(
+          'data: {"type":"history_resync","ws_id":"ws1","reason":"handoff_mismatch"}\n\n',
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    const events = [];
+    for await (const event of client.streamEvents("ws1", {
+      lastEventId: 0,
+      historyToken: "epoch.7",
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      { type: "history_resync", ws_id: "ws1", reason: "handoff_mismatch" },
+    ]);
+    const [url] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe(
+      "http://test/v1/api/workstreams/ws1/events?user_turn=1&last_event_id=0&history_token=epoch.7",
+    );
   });
 
   it("injects auth header when token provided", async () => {

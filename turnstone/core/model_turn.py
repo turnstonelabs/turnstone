@@ -42,7 +42,7 @@ import contextlib
 import random
 import time
 import uuid
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -106,9 +106,11 @@ from turnstone.core.storage._utils import (
     strip_orphan_client_tool_blocks,
 )
 from turnstone.core.trajectory import (
+    PROVENANCE_META_KEY,
     ProviderNative,
     ToolCall,
     Turn,
+    TurnProvenance,
     dicts_from_turns,
     materialize_attachments,
 )
@@ -452,7 +454,10 @@ class ModelLane:
 
     *alias* is the registry alias used for config resolution, ``""`` when
     the lane runs outside the registry (then every registry-backed pass
-    degrades to its documented miss behavior).
+    degrades to its documented miss behavior). ``registry_generation`` is
+    captured with the binding by :func:`resolve_model_binding`; zero is the
+    explicit direct-lane value. Together with ``model`` those fields are the
+    immutable serving identity stamped on a successful turn.
 
     *temperature* / *reasoning_effort* are the lane's OPERATOR-resolved
     sampling knobs — the assignment scheme's operator rungs only
@@ -477,6 +482,9 @@ class ModelLane:
     capabilities: ModelCapabilities | None = None
     extra_params: dict[str, Any] | None = None
     registry: ModelRegistry | None = None
+    # Registry snapshot paired atomically with alias/client/model/config by
+    # ``resolve_model_binding``.  Zero is the explicit non-registry value.
+    registry_generation: int = 0
     temperature: float | None = None
     reasoning_effort: str | None = None
     # Runtime credential resolver supplied by the host that owns OAuth state.
@@ -680,6 +688,7 @@ def resolve_lane(
     *,
     alias: str = "",
     registry: ModelRegistry | None = None,
+    registry_generation: int = 0,
     capabilities: ModelCapabilities | None = None,
     extra_params: dict[str, Any] | None | EllipsisType = ...,
     cfg: ModelConfig | None | EllipsisType = ...,
@@ -736,6 +745,7 @@ def resolve_lane(
         capabilities=caps,
         extra_params=extra,
         registry=registry,
+        registry_generation=registry_generation,
         temperature=resolve_temperature_setting(resolved_cfg, config_store),
         reasoning_effort=resolve_effort_setting(resolved_cfg, config_store),
         backend_auth_resolver=backend_auth_resolver,
@@ -771,6 +781,7 @@ def resolve_model_binding(
         model,
         alias=effective_alias,
         registry=registry,
+        registry_generation=generation,
         cfg=cfg,
         config_store=config_store,
         backend_auth_resolver=backend_auth_resolver,
@@ -955,11 +966,12 @@ class ModelTurnResult:
     computed against what the provider actually counted, lowerings the
     caller cannot see included.
 
-    *producer* and *serving_model* identify the SERVING lane (the storage row's
-    ``producer`` column) — the identity stamped on ``turn.native`` when a
-    native lane exists, carried separately so a native-less turn still
-    records who produced it and a fallback-served turn is not labeled
-    with the primary binding.
+    *provenance* is the immutable serving alias / backend model id / registry
+    generation / acting-principal tuple. The same JSON-safe value is stamped
+    on ``turn.meta.extra["provenance"]`` before this result leaves the plant
+    call, so a later registry or shared-workstream rebind cannot relabel an
+    accepted turn at commit time. *producer* and *serving_model* remain the
+    provider-native and compatibility projections of that serving lane.
 
     *tool_def_chars* is the serialized size of the final provider-native tool
     definitions handed to that serving lane.  The session's token calibration
@@ -972,6 +984,7 @@ class ModelTurnResult:
     finish_reason: str
     usage: UsageInfo | None
     tool_calls: list[dict[str, Any]]
+    provenance: TurnProvenance = field(default_factory=TurnProvenance)
     wire_msgs: list[dict[str, Any]] | None = None
     producer: str = ""
     serving_model: str = ""
@@ -994,7 +1007,11 @@ def cap_tool_calls(result: ModelTurnResult, max_calls: int) -> tuple[list[dict[s
     capped = result.tool_calls[:max_calls]
     turn = result.turn
     if len(result.tool_calls) > len(capped):
-        turn = Turn.assistant(result.content, tool_calls=turn.tool_calls[: len(capped)])
+        turn = replace(
+            turn,
+            tool_calls=turn.tool_calls[: len(capped)],
+            native=None,
+        )
     return capped, turn
 
 
@@ -1090,6 +1107,7 @@ def model_turn(
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     cancel_ref: list[Any] | None = None,
     backend_auth_token: str | None = None,
+    acting_principal_id: str = "",
     deferred_names: frozenset[str] | None = None,
     prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
@@ -1224,6 +1242,13 @@ def model_turn(
     explicit argument is absent, ``lane.backend_auth_resolver`` resolves it
     after admission for each transport attempt, so a queued call cannot age a
     minted credential before it reaches the wire.
+
+    *acting_principal_id* is the caller's already-pinned effective principal,
+    not a live session lookup. It is never used to mint a credential here; it
+    only joins the immutable serving identity stamped after a successful
+    result. Session-backed CLI, eval, scheduled, and internal lanes pass their
+    effective owner credential principal; truly ownerless direct calls pass
+    the empty string.
     """
     if mint is not None and wire_id_map is None:
         raise ValueError(
@@ -1346,6 +1371,8 @@ def model_turn(
             error_type=type(drain_error).__name__,
             attempt=attempt,
             model=lane.model,
+            alias=lane.alias,
+            registry_generation=lane.registry_generation,
             retry_in=round(delay, 2),
         )
         if delay > 0:
@@ -1410,11 +1437,20 @@ def model_turn(
         if native_blocks
         else None
     )
+    provenance = TurnProvenance(
+        model_alias=lane.alias,
+        backend_model_id=lane.model,
+        registry_generation=lane.registry_generation,
+        acting_principal_id=acting_principal_id,
+    )
+    turn = Turn.assistant(result.content or "", tool_calls=tool_calls, native=native)
+    turn.meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
     return ModelTurnResult(
-        turn=Turn.assistant(result.content or "", tool_calls=tool_calls, native=native),
+        turn=turn,
         finish_reason=result.finish_reason,
         usage=result.usage,
         tool_calls=raw_calls,
+        provenance=provenance,
         wire_msgs=served_wire,
         producer=lane.provider.provider_name,
         serving_model=lane.model,

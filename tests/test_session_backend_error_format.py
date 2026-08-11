@@ -11,12 +11,16 @@ model. We bind the method to lightweight stubs carrying one coherent
 from __future__ import annotations
 
 import dataclasses
+import threading
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
+from tests._session_helpers import RecordingUI, make_session, provider_shell
 from turnstone.core.model_turn import ModelLane
+from turnstone.core.providers import ModelCapabilities
 from turnstone.core.session import ChatSession
 
 
@@ -295,6 +299,48 @@ def test_stream_death_with_overflow_phrasing_stays_stream_death():
     assert "Context window exceeded" not in msg
 
 
+def test_terminal_fallback_stream_death_reports_actual_lane(tmp_db):
+    """Fatal formatting consumes the fallback lane that armed the stream.
+
+    The original exception object survives the retry wrapper, while its
+    side-table context contains no client, credential, principal, or query.
+    """
+    from turnstone.core.providers import IncompleteStreamError
+
+    ui = RecordingUI()  # type: ignore[no-untyped-call]
+    session = make_session(model_alias="primary", ui=ui)
+    provider = provider_shell("fallback-provider")
+    fallback_lane = ModelLane(
+        provider=provider,
+        client=SimpleNamespace(base_url="https://fallback.example/v1?api_key=terminal-secret"),
+        model="fallback-kernel",
+        alias="fallback-alias",
+        registry_generation=19,
+        capabilities=ModelCapabilities(),
+    )
+    death = IncompleteStreamError("peer closed the response")
+
+    def _fail_on_fallback(consumer, *_args, **_kwargs):
+        consumer.begin_attempt(SimpleNamespace(armed=True), None, fallback_lane)
+        raise death
+
+    session._MID_STREAM_RETRIES = 0
+    with (
+        patch.object(session, "_model_turn_with_fallback", side_effect=_fail_on_fallback),
+        pytest.raises(IncompleteStreamError) as raised,
+    ):
+        session._stream_response()
+
+    assert raised.value is death
+    session._record_fatal_error(raised.value)
+    message = ui.of("error")[-1]
+    assert "fallback-provider" in message
+    assert "https://fallback.example/v1" in message
+    assert "model=fallback-alias (id=fallback-kernel)" in message
+    assert "primary" not in message
+    assert "terminal-secret" not in message
+
+
 # ---------------------------------------------------------------------------
 # Fall-through + degradation behaviour
 # ---------------------------------------------------------------------------
@@ -375,6 +421,7 @@ def _record_fatal_stub(ui: Any, captured: dict[str, str]) -> Any:
     when ``self`` is a real instance of the class)."""
     stub = _stub()
     stub._ws_id = "ws-test"
+    stub._generation_lock = threading.RLock()
     stub._has_persisted_error = False
     stub.ui = ui
     stub._emit_state = lambda state, **_kwargs: captured.setdefault("state", state)

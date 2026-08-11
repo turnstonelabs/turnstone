@@ -51,10 +51,12 @@ def _make_session(mock_client, user_id: str = "u1") -> ChatSession:
     return s
 
 
-def _run_send(session: ChatSession, text: str, attachments=None) -> None:
+def _run_send(
+    session: ChatSession, text: str, attachments=None, send_id: str | None = None
+) -> None:
     """Call send() but tolerate the stop-loop sentinel."""
     try:
-        session.send(text, attachments=attachments)
+        session.send(text, attachments=attachments, send_id=send_id)
     except RuntimeError as e:
         if "stop after append" not in str(e):
             raise
@@ -222,6 +224,41 @@ class TestPersistenceAndConsumption:
         assert att_row["refcount"] == 1
         assert att_row["origin"] == "upload"
 
+    def test_admission_raise_keeps_handles_staged_for_the_retry(self, tmp_db, mock_openai_client):
+        """Round-3 review pin: the staged-buffer drain runs only AFTER the
+        journal claim succeeds, so an admission raise leaves the handles
+        staged and the client's retry of the same send resolves them again —
+        never a rejected unknown/expired attachment for a turn that never
+        entered history."""
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+
+        s = _make_session(mock_openai_client)
+        buf = get_attachment_buffer()
+        staged = buf.stage(
+            ws_id=s._ws_id,
+            user_id=s._user_id,
+            filename="note.md",
+            mime_type="text/markdown",
+            kind="text",
+            content=b"buffered",
+        )
+        att = Attachment(staged.attachment_id, "note.md", "text/markdown", "text", b"buffered")
+
+        def _boom(**kwargs):
+            raise RuntimeError("injected admission failure")
+
+        s._journal_conversation_row_locked = _boom  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="injected admission failure"):
+            s.send("user text", attachments=[att], send_id="retry-me")
+
+        # The live turn rolled back AND the handle survived for the retry.
+        assert s.messages == []
+        assert buf.get(staged.attachment_id, ws_id=s._ws_id, user_id=s._user_id) is not None
+
+        # The retry can claim the surviving handle (ownership transfers once).
+        transferred = buf.consume_all((staged.attachment_id,), ws_id=s._ws_id, user_id=s._user_id)
+        assert staged.attachment_id in transferred
+
     def test_send_drains_the_upload_buffer(self, tmp_db, mock_openai_client):
         # Bytes staged in the per-node buffer are drained (discarded) once the
         # send commits them content-addressed — they don't linger as pending.
@@ -239,7 +276,7 @@ class TestPersistenceAndConsumption:
         )
         assert buf.get(staged.attachment_id, ws_id=s._ws_id, user_id=s._user_id) is not None
         att = Attachment(staged.attachment_id, "note.md", "text/markdown", "text", b"buffered")
-        _run_send(s, "user text", attachments=[att])
+        _run_send(s, "user text", attachments=[att], send_id="staged-send")
         # Drained from the buffer post-commit.
         assert buf.get(staged.attachment_id, ws_id=s._ws_id, user_id=s._user_id) is None
 
@@ -312,12 +349,19 @@ class TestProviderIntegration:
         meta = turn_to_dict(s.messages[-1]).get("_attachments_meta")
         assert meta == [
             {
+                "attachment_id": "a1",
                 "kind": "image",
                 "filename": "dog.png",
                 "mime_type": "image/png",
                 "size_bytes": len(PNG_1x1),
             },
-            {"kind": "text", "filename": "notes.md", "mime_type": "text/markdown", "size_bytes": 2},
+            {
+                "attachment_id": "a2",
+                "kind": "text",
+                "filename": "notes.md",
+                "mime_type": "text/markdown",
+                "size_bytes": 2,
+            },
         ]
 
     def test_attachments_meta_stripped_before_openai_wire(self, tmp_db, mock_openai_client):
@@ -377,7 +421,7 @@ class TestQueuedAttachmentsRejected:
         cleaned, priority, msg_id = s.queue_message("plain text")
         assert cleaned == "plain text"
         with s._queued_lock:
-            assert s._queued_messages[msg_id] == ("plain text", priority)
+            assert s._queued_messages[msg_id] == ("plain text", priority, "")
 
 
 class TestTokenAccounting:

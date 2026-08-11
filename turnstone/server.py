@@ -73,6 +73,7 @@ from turnstone.core.model_turn import (
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.session_manager import (
+    PERSISTENCE_RECONCILE_INTERVAL_SECONDS,
     STALE_CREATE_GRACE_SECONDS,
     STALE_CREATE_SWEEP_INTERVAL_SECONDS,
     SessionManager,
@@ -115,6 +116,8 @@ from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
     WorkstreamState,
+    concrete_method,
+    workstream_persistence_state,
 )
 from turnstone.prompts import ClientType
 
@@ -189,6 +192,41 @@ class WebUI(SessionUIBase):
         """
         return self._kind, self._parent_ws_id
 
+    # ``_current_persistence_state`` inherited from :class:`SessionUIBase`:
+    # derives through the session bound at construction, never a registry
+    # lookup by id (which fails open to "healthy" exactly while tombstone
+    # retention or retirement has the row out of the map).
+
+    def _publish_global_state_snapshot(
+        self,
+        state: str,
+        payload: dict[str, Any],
+        *,
+        include_content: bool,
+    ) -> None:
+        """Fan out one rich state snapshot without mutating session state."""
+        if WebUI._global_queue is None:
+            return
+        kind, parent_ws_id = self._ws_kind_and_parent()
+        event: dict[str, Any] = {
+            "type": "ws_state",
+            "ws_id": self.ws_id,
+            "state": state,
+            "tokens": payload["tokens"],
+            "context_ratio": payload["context_ratio"],
+            "activity": payload["activity"],
+            "activity_state": payload["activity_state"],
+            "kind": kind,
+            "parent_ws_id": parent_ws_id,
+            "persistence_state": self._current_persistence_state(),
+        }
+        if include_content and state == "idle":
+            event["content"] = payload["content"]
+        try:
+            WebUI._global_queue.put_nowait(event)
+        except queue.Full:
+            log.debug("Global SSE queue full, dropping %s event", event.get("type"))
+
     def _broadcast_state(self, state: str) -> None:
         """Send a state-change event to the global SSE channel.
 
@@ -200,20 +238,6 @@ class WebUI(SessionUIBase):
         """
         if WebUI._global_queue is not None:
             payload = self.snapshot_and_consume_state_payload(state)
-            kind, parent_ws_id = self._ws_kind_and_parent()
-            event: dict[str, Any] = {
-                "type": "ws_state",
-                "ws_id": self.ws_id,
-                "state": state,
-                "tokens": payload["tokens"],
-                "context_ratio": payload["context_ratio"],
-                "activity": payload["activity"],
-                "activity_state": payload["activity_state"],
-                "kind": kind,
-                "parent_ws_id": parent_ws_id,
-            }
-            if state == "idle":
-                event["content"] = payload["content"]
             # ``pending_approval_detail`` is NO LONGER piggybacked on
             # state-change events (Stage 3 cleanup). Symmetric event
             # flow now: initial approval items arrive via bulk fetch
@@ -222,10 +246,37 @@ class WebUI(SessionUIBase):
             # ``intent_verdict`` event class, and resolution via
             # ``approval_resolved``. Reducer no longer has to dedupe
             # the piggyback path against the explicit one.
-            try:
-                WebUI._global_queue.put_nowait(event)
-            except queue.Full:
-                log.debug("Global SSE queue full, dropping %s event", event.get("type"))
+            self._publish_global_state_snapshot(state, payload, include_content=True)
+
+    def on_persistence_state_changed(self) -> None:
+        """Refresh the operator row after journal failure or recovery.
+
+        This intentionally uses the global node stream only. Conversation-pane
+        SSE is a transcript/control channel and must not receive operator-only
+        storage diagnostics. Unlike a real state transition, this snapshot does
+        not consume the terminal turn-content accumulator.
+        """
+        # The registry read serves ONLY the row-state field (``ws.state``
+        # lives on the manager's row); the persistence field itself derives
+        # through the bound session inside the snapshot publish.  A miss
+        # here means the row left the roster — there is no operator row to
+        # refresh, so dropping is correct, and it can no longer launder a
+        # blocked journal into "healthy" (the pre-fix hazard).
+        mgr = WebUI._workstream_mgr
+        if mgr is None:
+            return
+        ws = mgr.get(self.ws_id)
+        if ws is None:
+            return
+        with self._ws_lock:
+            payload = {
+                "tokens": self._ws_prompt_tokens + self._ws_completion_tokens,
+                "context_ratio": self._ws_context_ratio,
+                "activity": self._ws_current_activity,
+                "activity_state": self._ws_activity_state,
+                "content": "",
+            }
+        self._publish_global_state_snapshot(ws.state.value, payload, include_content=False)
 
     def _broadcast_activity(self) -> None:
         """Send an activity-change event to the global SSE channel."""
@@ -751,66 +802,16 @@ def _audit_retry_workstream(
     )
 
 
-def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
-    """Re-send ``user_msg`` on an interactive workstream after ``/retry``.
-
-    Passed to :func:`make_retry_handler` as ``dispatch_retry``; called
-    once :meth:`ChatSession.retry` has truncated the last turn. Drives
-    the shared :func:`turnstone.core.session_worker.send` dispatcher with
-    an interactive ``run`` closure (surfaces ``GenerationCancelled`` /
-    errors through the WebUI hooks) and a hard-reject ``enqueue`` closure
-    (a retry must not silently queue behind an in-flight turn — preserves
-    the pre-lift inline behaviour). The shared dispatcher owns the
-    ``_worker_running`` lifecycle, so the ``run`` closure needs no
-    ``finally`` flag-clear of its own.
-
-    Deliberately NOT gated on the /send order barrier
-    (``ws._pending_sends``): a retry is an explicit user action that
-    rewinds a COMPLETED turn — dispatching it ahead of deferred sends is
-    an accepted overtake (the user just asked for exactly that turn to
-    run again), not the silent send-vs-send inversion the barrier exists
-    to prevent.  Deferred entries dispatch after it, order among
-    themselves preserved.
-    """
-    from turnstone.core import session_worker
-
+def _interactive_events_preamble(
+    ws: Workstream,
+    ui: Any,
+    request: Request,  # noqa: ARG001 — preamble is request-independent
+) -> Iterable[dict[str, Any]]:
+    """Idempotent connected/status preamble used on every SSE path."""
     session = ws.session
-    ui = ws.ui
-    if session is None or ui is None:
+    if session is None:
         return
-
-    def _run() -> None:
-        me = threading.current_thread()
-        try:
-            session.send(user_msg)
-        except GenerationCancelled:
-            if ws.worker_thread is me:
-                ui.on_stream_end()
-                ui.on_state_change("idle")
-        except Exception as exc:
-            # Deliberately NOT routed through session.ensure_error_recorded: on a
-            # REUSED session a pre-try raise after a prior errored turn finds
-            # _has_persisted_error stale-True (it is session-lifetime — cleared
-            # only by _emit_state idle/running, not per-turn), so the recorder
-            # would no-op and swallow the fresh error.  The DISPLAY string is
-            # sanitized inline (a credential-bearing base-URL in the exception
-            # text must not cross into the dashboard SSE, the confidentiality
-            # floor _record_fatal_error also enforces); the double state emit and
-            # the pre-try no-persist (a reused-session retry can then have the
-            # coordinator read a STALE last_error) still need the per-turn
-            # error-signal redesign and are tracked in #865, matching the /send
-            # and coord-send sibling closures.
-            if ws.worker_thread is me:
-                from turnstone.core.memory import sanitize_error_text
-
-                ui.on_error(f"Error: {sanitize_error_text(str(exc))}")
-                ui.on_stream_end()
-                ui.on_state_change("error")
-
-    def _enqueue() -> None:
-        ui.on_error("Cannot retry: workstream is busy")
-
-    session_worker.send(ws, enqueue=_enqueue, run=_run, thread_name=f"retry-{ws.id[:8]}")
+    yield from session_replay_preamble(session, ui)
 
 
 def _interactive_events_replay(
@@ -832,8 +833,7 @@ def _interactive_events_replay(
 
     Pure read — never mutates ``ws`` / ``ui`` / ``session``.
     """
-    session = ws.session
-    if session is None:
+    if ws.session is None:
         # Defensive — the lifted body's UI presence check guarantees
         # the workstream made it past placeholder state, but the
         # session can still be detached on the close-then-reopen path.
@@ -842,7 +842,7 @@ def _interactive_events_replay(
     # Connected + status preamble — same shape coord replays use; the
     # shared helper keeps the two surfaces from drifting on a future
     # field add.
-    yield from session_replay_preamble(session, ui)
+    yield from _interactive_events_preamble(ws, ui, request)
 
     # Pending approval re-injection (so a reconnecting tab sees the
     # prompt) + cached LLM verdicts received since the prompt fired.
@@ -1062,6 +1062,7 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
                 "model_alias": ws.session.model_alias if ws.session else "",
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
+                "persistence_state": workstream_persistence_state(ws),
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
                 "persona": ws.persona,
@@ -1441,6 +1442,7 @@ async def dashboard(request: Request) -> JSONResponse:
                 "model_alias": ws.session.model_alias if ws.session else "",
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
+                "persistence_state": workstream_persistence_state(ws),
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
                 "persona": ws.persona,
@@ -2128,6 +2130,7 @@ async def command(request: Request) -> JSONResponse:
                     ws,
                     enqueue=_reject_busy,
                     run=run,
+                    expected_session=session,
                     thread_name=thread_name,
                     worker_kind="command",
                 )
@@ -2274,6 +2277,16 @@ async def command(request: Request) -> JSONResponse:
                         updated_name = get_workstream_display_name(session.ws_id)
                         if updated_name:
                             ws.name = updated_name
+            except GenerationCancelled:
+                # Defense-in-depth, the sibling of _run_initial's arm (no
+                # generic command claims a generation today, so this is
+                # effectively unreachable).  ``session_worker._runner``
+                # catches only ``Exception`` — without this arm a stray
+                # cancel would kill the worker thread via
+                # ``threading.excepthook``; the finally below still
+                # unblocks the endpoint either way.
+                if ws.worker_thread is me:
+                    cmd_ui.on_info("Command cancelled.")
             except Exception as e:
                 # Same guard: a late "Command error:" from an abandoned
                 # worker would land mid-successor-turn.
@@ -3037,13 +3050,11 @@ async def _interactive_create_post_install(
         session = ws.session
         send_id = uuid.uuid4().hex
         resolved_atts: list[Any] = []
-        staged_ord: list[str] = []
         if attachment_ids:
-            # Resolve (peek) the staged uploads.  The buffer DRAIN happens
-            # after the dispatch below, and only on the spawn path — the
-            # enqueue path can't deliver attachments, so there they must
-            # stay staged (see ``_enqueue_init``).
-            resolved_atts, staged_ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
+            # Resolve without draining. Accepted USER journal admission owns
+            # the atomic transfer; every pre-admission refusal keeps staging
+            # intact for a retry (including the enqueue path below).
+            resolved_atts, _staged_ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
 
         def _run_initial() -> None:
             me = threading.current_thread()
@@ -3168,6 +3179,7 @@ async def _interactive_create_post_install(
             ws,
             enqueue=_enqueue_init,
             run=_run_initial,
+            expected_session=session,
             thread_name=f"ws-init-{ws.id[:8]}",
         )
         if not init_ok:
@@ -3187,20 +3199,6 @@ async def _interactive_create_post_install(
                 ws.id[:8],
                 initial_message_status,
             )
-        if staged_ord and not init_enqueued and init_ok:
-            # Spawn path took the message: drain the staged copies NOW,
-            # before this handler returns — the pane's rehydrate can only
-            # start after it receives this response, so it can never
-            # observe the consumed uploads as still-pending composer
-            # chips.  (``enqueue`` runs synchronously inside ``send``, so
-            # ``init_enqueued`` is settled here.)  ``_append_user_turn``'s
-            # own per-id discard then no-ops.
-            from turnstone.core.attachment_buffer import get_attachment_buffer
-
-            _buf = get_attachment_buffer()
-            for _aid in staged_ord:
-                _buf.discard(_aid, ws_id=ws.id, user_id=uid)
-
     out: dict[str, Any] = {}
     if initial_message_status:
         # Only present when the initial message was NOT delivered — the
@@ -3297,13 +3295,10 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
             reservation_token,
         )
         mgr = getattr(request.app.state, "workstreams", None)
-        supports_atomic_delete = mgr is not None and callable(
-            getattr(type(mgr), "delete_persisted", None)
-        )
-        if supports_atomic_delete:
-            assert mgr is not None
+        delete_persisted = concrete_method(mgr, "delete_persisted")
+        if delete_persisted is not None:
             deleted = await asyncio.to_thread(
-                mgr.delete_persisted,
+                delete_persisted,
                 ws_id,
                 delete_fn=delete_exact,
                 name=name,
@@ -3322,7 +3317,7 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
             # ever-growing tree on the dashboard.  Best-effort: an
             # emit failure must not roll back the storage delete or
             # 500 the response.
-            if mgr is not None and not supports_atomic_delete:
+            if mgr is not None and delete_persisted is None:
                 try:
                     mgr.delete(ws_id, name=name)
                 except Exception:
@@ -4889,7 +4884,7 @@ def _idle_cleanup_thread(
     rate_limiter: Any = None,
     stop: threading.Event | None = None,
 ) -> None:
-    """Run idle eviction plus always-on provisional-create recovery.
+    """Run persistence repair plus lifecycle and rate-limit maintenance.
 
     ``mgr.close_idle`` fires the adapter's ``emit_closed`` for each
     victim, which pushes ``ws_closed`` onto ``global_queue`` with
@@ -4897,44 +4892,58 @@ def _idle_cleanup_thread(
     is gone — the frontend didn't differentiate "idle" from "closed"
     anyway and the duplicate event caused spurious UI flicker.
 
-    Hidden ``state='creating'`` rows use their own conservative two-hour
-    grace and are reaped even when ``timeout_sec == 0`` disables ordinary idle
-    eviction. An initial recovery pass covers restart before the first periodic
-    wait. ``stop`` (#885) is the lifespan shutdown signal, using the same
-    ``wait``-as-sleep pattern as :func:`_aggregate_emitter_thread`.
+    Transient accepted-row persistence retries use a short one-second tick.
+    Ordinary idle eviction retains its timeout/4 cadence, and hidden
+    ``state='creating'`` rows retain their independent five-minute sweep and
+    conservative two-hour grace. Thus ``timeout_sec == 0`` disables only idle
+    eviction, not either recovery path. ``stop`` (#885) is the lifespan
+    shutdown signal, using the same ``wait``-as-sleep pattern as
+    :func:`_aggregate_emitter_thread`.
     """
     del global_queue  # adapter handles the emission
     if stop is None:
         stop = threading.Event()
     idle_enabled = timeout_sec > 0
-    check_every = (
+    lifecycle_check_every = (
         min(STALE_CREATE_SWEEP_INTERVAL_SECONDS, timeout_sec / 4)
         if idle_enabled
         else float(STALE_CREATE_SWEEP_INTERVAL_SECONDS)
     )
+    check_every = min(PERSISTENCE_RECONCILE_INTERVAL_SECONDS, lifecycle_check_every)
+    try:
+        mgr.reconcile_unresolved_persistence()
+    except Exception:
+        log.debug("server.persistence_reconcile_initial_failed", exc_info=True)
     try:
         mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
     except Exception:
         log.debug("server.stale_create_cleanup_initial_failed", exc_info=True)
     last_create_sweep_at = time.monotonic()
+    last_lifecycle_sweep_at = last_create_sweep_at
     while not stop.wait(check_every):
-        if idle_enabled:
-            try:
-                mgr.close_idle(timeout_sec)
-            except Exception:
-                log.debug("server.idle_cleanup_failed", exc_info=True)
+        try:
+            mgr.reconcile_unresolved_persistence()
+        except Exception:
+            log.debug("server.persistence_reconcile_failed", exc_info=True)
         now = time.monotonic()
-        if now - last_create_sweep_at >= STALE_CREATE_SWEEP_INTERVAL_SECONDS:
-            # Keep rare hidden-create GC on its own fixed cadence. A short
-            # idle timeout must not turn the cluster-liveness scan into part
-            # of the ordinary high-frequency idle sweep.
-            last_create_sweep_at = now
-            try:
-                mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
-            except Exception:
-                log.debug("server.stale_create_cleanup_failed", exc_info=True)
-        if rate_limiter is not None:
-            rate_limiter.cleanup()
+        if now - last_lifecycle_sweep_at >= lifecycle_check_every:
+            last_lifecycle_sweep_at = now
+            if idle_enabled:
+                try:
+                    mgr.close_idle(timeout_sec)
+                except Exception:
+                    log.debug("server.idle_cleanup_failed", exc_info=True)
+            if now - last_create_sweep_at >= STALE_CREATE_SWEEP_INTERVAL_SECONDS:
+                # Keep rare hidden-create GC on its own fixed cadence. A short
+                # idle timeout must not turn the cluster-liveness scan into part
+                # of the ordinary high-frequency persistence sweep.
+                last_create_sweep_at = now
+                try:
+                    mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
+                except Exception:
+                    log.debug("server.stale_create_cleanup_failed", exc_info=True)
+            if rate_limiter is not None:
+                rate_limiter.cleanup()
 
 
 # Shutdown sentinel for ``_global_fanout_thread`` (#885): the lifespan
@@ -5405,6 +5414,7 @@ def create_app(
         open_resolve_alias=_resolve_workstream_alias,
         open_post_load=_interactive_open_post_load,
         events_replay=_interactive_events_replay,
+        events_preamble=_interactive_events_preamble,
         # Pre-lift ``events_sse`` used the dedicated 200-thread
         # ``sse_executor`` so SSE polling stayed isolated from
         # every other ``asyncio.to_thread`` caller in the process
@@ -5469,7 +5479,6 @@ def create_app(
     )
     retry_handler = make_retry_handler(
         interactive_endpoint_config,
-        dispatch_retry=_interactive_dispatch_retry,
         audit_emit=_audit_retry_workstream,
         accepted_permissions=("conversation.modify",),
     )

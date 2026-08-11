@@ -318,9 +318,19 @@ class TestWakeWorkstreamIfPending:
         _mgr, ws = fake_mgr_and_ws
         ws.session._nudge_queue.enqueue("watch_triggered", "output", "any")
 
-        def _reuse_send(_ws: Any, *, enqueue: Any, run: Any, thread_name: Any) -> bool:
+        def _reuse_send(
+            _ws: Any,
+            *,
+            enqueue: Any,
+            run: Any,
+            expected_session: Any,
+            interjection_wake_signature: Any,
+            thread_name: Any,
+        ) -> bool:
             # Mimic a live worker owning the workstream: send routes the
             # wake to the no-op enqueue rather than spawning a daemon.
+            assert expected_session is ws.session
+            assert interjection_wake_signature is None
             enqueue()
             return True
 

@@ -249,6 +249,7 @@ class RecoveryServer:
         # reconnect actually reached the reborn node's real endpoint.
         self.global_events_requests = 0
         self._history_fail_remaining = 0
+        self._history_tokenless_remaining = 0
         self._history_delay_ms = 0
         # A thin pure-ASGI fault layer wrapping the REAL app (the production
         # app itself is untouched): count + optionally delay/fail
@@ -280,6 +281,26 @@ class RecoveryServer:
                             }
                         )
                         await send({"type": "http.response.body", "body": b'{"error": "injected"}'})
+                        return
+                    if self._history_tokenless_remaining > 0:
+                        # Old/malformed server simulation for the strong
+                        # handoff-repair latch. A 200 without handoff_token is
+                        # not proof and must never authorize EventSource.
+                        self._history_tokenless_remaining -= 1
+                        self.history_ok += 1
+                        await send(
+                            {
+                                "type": "http.response.start",
+                                "status": 200,
+                                "headers": [(b"content-type", b"application/json")],
+                            }
+                        )
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": (b'{"ws_id":"compat","messages":[],"cursor":null}'),
+                            }
+                        )
                         return
 
                     # Successful-RESPONSE counter, distinct from the arrival
@@ -459,6 +480,85 @@ class RecoveryServer:
         result: int | None = get_storage().get_max_event_id(ws_id)
         return result
 
+    def emit_idle_edge(self, ws_id: str) -> int:
+        """Publish one real per-workstream ``state_change: idle`` event.
+
+        Recovery scenarios use this test-server pulse when they need an
+        organic-settle-equivalent edge without admitting another user row.
+        A normal ``/send`` is not a neutral trigger: it publishes a live
+        ``user_turn``, starts model work, and changes the transcript/counts
+        these scenarios use to isolate the stale-history backstop.
+        """
+        ws = self._manager.get(ws_id)
+        ui = ws.ui if ws is not None else None
+        if not isinstance(ui, SessionUIBase):
+            raise AssertionError(f"emit_idle_edge: ws {ws_id} has no session UI")
+        before = ui._event_id
+        ui.on_state_change("idle")
+        if ui._event_id != before + 1:
+            raise AssertionError(
+                f"emit_idle_edge: expected one event after {before}, got {ui._event_id}"
+            )
+        return ui._event_id
+
+    def emit_history_resync(self, ws_id: str, reason: str = "recovery_probe") -> int:
+        """Publish the real strong repair frame through the ordered UI lane."""
+
+        ws = self._manager.get(ws_id)
+        ui = ws.ui if ws is not None else None
+        if not isinstance(ui, SessionUIBase):
+            raise AssertionError(f"emit_history_resync: ws {ws_id} has no session UI")
+        before = ui._event_id
+        ui.on_history_resync(reason)
+        if ui._event_id != before + 1:
+            raise AssertionError(
+                f"emit_history_resync: expected one event after {before}, got {ui._event_id}"
+            )
+        return ui._event_id
+
+    def emit_tool_pending(self, ws_id: str, call_id: str) -> int:
+        """Publish a live ``tool_pending`` phase without persisting a turn.
+
+        This drives the coordinator's event-owned ``liveToolCalls`` gate in
+        isolation.  ``on_agent_step`` is the production hook that emits this
+        exact envelope; the synthetic item is intentionally not added to
+        history, so a later authoritative repaint must remove its DOM shell.
+        """
+        ws = self._manager.get(ws_id)
+        ui = ws.ui if ws is not None else None
+        if not isinstance(ui, SessionUIBase):
+            raise AssertionError(f"emit_tool_pending: ws {ws_id} has no session UI")
+        before = ui._event_id
+        ui.on_agent_step(
+            "",
+            {
+                "call_id": call_id,
+                "func_name": "recovery_probe",
+                "approval_label": "recovery probe",
+                "header": "recovery render-gate probe",
+                "needs_approval": False,
+            },
+        )
+        if ui._event_id != before + 1:
+            raise AssertionError(
+                f"emit_tool_pending: expected one event after {before}, got {ui._event_id}"
+            )
+        return ui._event_id
+
+    def emit_tool_result(self, ws_id: str, call_id: str) -> int:
+        """Resolve a tool pulse emitted by :meth:`emit_tool_pending`."""
+        ws = self._manager.get(ws_id)
+        ui = ws.ui if ws is not None else None
+        if not isinstance(ui, SessionUIBase):
+            raise AssertionError(f"emit_tool_result: ws {ws_id} has no session UI")
+        before = ui._event_id
+        ui.on_tool_result(call_id, "recovery_probe", "probe complete")
+        if ui._event_id != before + 1:
+            raise AssertionError(
+                f"emit_tool_result: expected one event after {before}, got {ui._event_id}"
+            )
+        return ui._event_id
+
     def fetch_history(self, ws_id: str) -> dict[str, Any]:
         r = self._http.get(
             f"/v1/api/workstreams/{ws_id}/history",
@@ -500,6 +600,11 @@ class RecoveryServer:
         """Make the next ``count`` ``GET …/history`` responses a 500 — the
         failed refetch the #890 guard-before-wipe must survive."""
         self._history_fail_remaining = count
+
+    def tokenless_history(self, count: int) -> None:
+        """Make the next history responses 200 without a handoff proof."""
+
+        self._history_tokenless_remaining = count
 
     def delay_history(self, ms: int) -> None:
         """Hold each ``GET …/history`` ``ms`` ms before forwarding (0

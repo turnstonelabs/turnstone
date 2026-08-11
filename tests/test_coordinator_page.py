@@ -15,6 +15,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from tests._js_harness_helpers import strip_js_comments as _strip_comments
 from turnstone.console.server import coordinator_page
 
 
@@ -188,13 +189,17 @@ def test_coordinator_js_approval_keyboard_shortcuts():
     # turns must render with the correct batch state on reload, not
     # the contradictory "✓ approved" pill that pre-fix showed for
     # any prior denial.  bug-1 / bug-3 from the second /review pass.
-    # Post wire-shape unification the deny/error classification moved
-    # server-side into ``project_history_messages``; coord reads the
-    # derived ``m.denied`` / ``m.is_error`` flags (pin the live read,
-    # not the comment prose the old content-prefix sniffing left behind).
-    assert "m.denied" in body
-    assert "m.is_error" in body
-    assert "callOutcomes" in body
+    # Post wire-shape unification the deny/error classification is shared by
+    # both browser reducers. Pin the coordinator's use of the occurrence-aware
+    # helper and the helper's live reads of the projected flags; call ids may
+    # repeat across turns and therefore cannot be classified by a global map.
+    tool_projection = (
+        Path(__file__).resolve().parent.parent / "turnstone/shared_static/tool_projection.js"
+    ).read_text(encoding="utf-8")
+    assert "indexHistoryToolOutcomes(historyMessages)" in body
+    assert "historyBatchOutcomes.get(m)" in body
+    assert "result.denied" in tool_projection
+    assert "result.is_error" in tool_projection
     # User-message attachment pills — both live send (coordSend) and
     # history replay route through appendUserMessageWithAttachments.
     # Renaming or dropping the helper would silently regress the
@@ -571,16 +576,88 @@ def test_coordinator_js_seeds_resume_cursor_only_on_initial_connect():
     assert "await refetchHistory(true)" in body, (
         "the initial-connect path must call refetchHistory(true) to seed the cursor."
     )
-    flow = re.search(r"function loadHistoryThenReconnect\(\)\s*\{(.*?)\n  \}", body, re.S)
+    flow = re.search(
+        r"function loadHistoryThenReconnect\(manualAttempt = false\)\s*\{(.*?)\n  \}",
+        body,
+        re.S,
+    )
     assert flow is not None, "loadHistoryThenReconnect not found"
-    assert "refetchHistory(true)" in flow.group(1) and ".finally(" in flow.group(1), (
+    assert "refetchHistory(true)" in flow.group(1) and ".then((outcome) => {" in flow.group(1), (
         "the truncated resync (loadHistoryThenReconnect) must seed via "
-        "refetchHistory(true) and reconnect in .finally."
+        "refetchHistory(true) and reconnect in its outcome-threaded settle."
     )
     assert re.search(
         r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*url\s*\+=\s*\"\?last_event_id=\"",
         body,
     ), "connectSSE must gate ?last_event_id= on connectCursor != null (so cursor 0 isn't dropped)."
+
+
+def test_coordinator_initial_history_handoff_is_one_shot_and_mismatch_refetches():
+    """Coordinator mirrors interactive's opaque REST -> initial-SSE handoff."""
+    import re
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    start = body.index("function connectSSE()")
+    end = body.index("function scheduleReconnect", start)
+    connect = body[start:end]
+
+    hidden = connect.index("if (document.hidden)")
+    capability = connect.index('"user_turn=1"')
+    handoff_query = connect.index('"history_token="')
+    construct = connect.index("new EventSource(url")
+    consume = connect.index("historyHandoffToken = null;", construct)
+    assert capability < hidden < handoff_query < construct < consume
+    assert 'url += "?last_event_id="' in connect
+    assert '(url.includes("?") ? "&" : "?")' in connect
+    assert connect.count('"user_turn=1"') == 1
+
+    refetch_start = body.index("async function refetchHistory(seedCursor = false)")
+    refetch = body[refetch_start : body.index("\n  function ", refetch_start + 1)]
+    assert re.search(
+        r"if\s*\(seedCursor\)\s*\{\s*historyHandoffToken\s*=\s*"
+        r"typeof hist\.handoff_token === \"string\"",
+        refetch,
+    )
+
+    mismatch = body.index('case "history_resync"')
+    truncated = body.index('case "replay_truncated"', mismatch)
+    mismatch_case = body[mismatch:truncated]
+    assert "historyRepair.begin(wsId);" in mismatch_case
+    assert "last_event_id" not in mismatch_case
+
+    # A mismatch is a durable-history repair, not a transport retry. Once it
+    # is latched, connectSSE may only schedule the bounded REST retry and
+    # return; it cannot construct a cursorless/tokenless EventSource.  The
+    # latch, budget, backoff, and parked prompt moved into the shared
+    # controller (history_handoff.createHistoryHandoffRepair) — pinned there,
+    # once; what stays pinned HERE is this pane's use of it.
+    repair_guard = connect.index("if (historyRepair.isRepairing(wsId))")
+    assert repair_guard < handoff_query < construct
+    guard_end = connect.index("if (historyHandoffToken != null)", repair_guard)
+    guard = connect[repair_guard:guard_end]
+    assert "historyRepair.schedule();" in guard
+    assert "return;" in guard
+
+    load_start = body.index("function loadHistoryThenReconnect(manualAttempt = false)")
+    load_end = body.index("function enterDegradedCatchup", load_start)
+    load = body[load_start:load_end]
+    # Admission before any work, then the budget charge, then exactly one
+    # handover of the verdict; the non-repair tail keeps its own reconnect.
+    admit = load.index("historyRepair.admitAttempt(manualAttempt)")
+    start_attempt = load.index("historyRepair.startAttempt(manualAttempt)", admit)
+    settle = load.index("historyRepair.settle({", start_attempt)
+    assert admit < start_attempt < settle
+    assert "hasToken: historyHandoffToken != null" in load[settle:]
+    repair_return = load.index("return;", settle)
+    assert "connectSSE();" not in load[settle:repair_return]
+
+    destroy_start = body.index("function destroy()")
+    destroy_end = body.index("function reconnect()", destroy_start)
+    assert "historyRepair.clear();" in body[destroy_start:destroy_end]
 
 
 def test_coordinator_refetch_failure_preserves_the_pane():
@@ -711,9 +788,6 @@ def test_coordinator_history_stale_latch_contract():
     #    ELSE-IF of the truncated consumer (mutual exclusion: the
     #    truncated branch's own reload heals the latch too; two separate
     #    ifs would run both heals on one idle edge).
-    def _strip_comments(text: str) -> str:
-        return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//"))
-
     trunc_arm = body.index("if (pendingTruncatedResync)")
     backstop = body.index("historyStale &&", trunc_arm)
     assert "} else if (" in body[trunc_arm:backstop], (
@@ -820,7 +894,7 @@ def test_coordinator_history_stale_latch_contract():
         "fetch finally) so every exit rebalances it."
     )
     inc = body.index("refetchesInFlight++", fetch_start)
-    awt = body.index("await getJSON(", fetch_start)
+    awt = body.index("await Promise.race([", fetch_start)
     fin = body.index("} finally {", fetch_start)
     dec = body.index("refetchesInFlight--", fetch_start)
     assert inc < awt < fin < dec, (
@@ -967,11 +1041,16 @@ def test_coordinator_history_stale_latch_contract():
     # The await must be BOUNDED (r7): an accepted-but-never-answered
     # /history would pin refetchesInFlight above zero for the life of
     # the page and every heal would yield forever.
-    assert "histCtrl.abort()" in fetch_code and "clearTimeout(histTimer)" in fetch_code, (
-        "refetchHistory must bound its fetch with the AbortController + "
-        "flat-timeout shape (and clear the timer in the finally) — an "
-        "unbounded await pins the in-flight counter and permanently "
-        "disables both heals."
+    assert "if (histCtrl) histCtrl.abort();" in fetch_code
+    assert "deadlineHandle.dispose()" in fetch_code, (
+        "the fetch finally must retire its deadline through the module's "
+        "dispose() — direct state-slot pokes are the drift the shared "
+        "handle exists to prevent."
+    )
+    assert "createHistoryHandoffDeadline(" in fetch_code
+    assert "Promise.race([" in fetch_code and "deadlineHandle.promise" in fetch_code, (
+        "refetchHistory must have a logical deadline independent of abort — "
+        "older runtimes can lack AbortController and a request may ignore it."
     )
     # The seq stamp's PRODUCER must sit above the await, or the
     # last-dispatch-wins gate is permanently vacuous (a stamp captured
@@ -1022,6 +1101,12 @@ def test_coordinator_history_stale_latch_contract():
         "newest-wins single slot left older overlapping fetches "
         "unabortable); the 15s bound alone pins the destroyed closure "
         "until it fires."
+    )
+    assert "histDeadlines.forEach" in destroy_code
+    assert "dispose({ expire: true, resolve: true })" in destroy_code, (
+        "destroy must settle every logical deadline immediately (expired + "
+        "resolved, including when AbortController is unavailable) via the "
+        "module's dispose() — not by poking state slots."
     )
 
 
@@ -1139,6 +1224,24 @@ def test_coordinator_chrome_builder_and_thin_page():
     assert (base / "coord-chrome.css").exists(), "the migrated chrome stylesheet must exist"
 
 
+def test_coordinator_close_409_uses_plain_retry_copy():
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    start = body.index("async function coordCloseSession()")
+    end = body.index("// ------------------------------------------------------------------", start)
+    close = body[start:end]
+
+    assert "resp.status === 409" in close
+    assert (
+        "Conversation history is still being saved. Try ending the session again shortly." in close
+    )
+    assert "resumeSse();" in close, "a refused close must retain and resume the live pane"
+
+
 def test_coord_child_links_open_interactive_pane():
     """Step 5c (+ split revival): a coordinator child ws link (children tree +
     linkified tool output) opens the child as a node-proxied interactive pane
@@ -1186,16 +1289,21 @@ def test_coordinator_js_gates_send_on_cross_user_busy():
     assert "actingUserId !== me" in coord_js
     assert "composer.setSendBlocked(" in coord_js
     assert "function reconcileSendBlock()" in coord_js
-    # reactive 409 fallback — the pane converts the 409 body at the fetch
-    # stage; the status ARM itself lives in the shared settle helper
-    # (composer_queue.settleSendResponse) with the rest of the response
-    # matrix, one implementation for both panes.
-    assert "r.status === 409" in coord_js
-    assert 'status: "cross_user_interjection"' in coord_js
-    assert "settleSendResponse(" in coord_js
+    # reactive 409 fallback — the fetch-stage conversion and the status ARM
+    # both live in the shared helper (composer_queue.postAndSettleSend /
+    # settleSendResponse), one implementation for both panes and for both of
+    # each pane's send flows.  The pane owns only the request, so its
+    # edit-and-resend flow can no longer miss the conversion and report a
+    # refused resend as a connection error.
+    assert "cross_user_interjection" not in coord_js, (
+        "the 409 conversion must not be re-derived per pane"
+    )
+    assert coord_js.count("postAndSettleSend(") == 2, "composer send + edit-and-resend"
     helper = (
         Path(__file__).resolve().parents[1] / "turnstone/shared_static/composer_queue.js"
     ).read_text(encoding="utf-8")
+    assert "response.status === 409" in helper
+    assert 'status: "cross_user_interjection"' in helper
     assert 'status === "cross_user_interjection"' in helper
 
 

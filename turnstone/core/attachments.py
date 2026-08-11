@@ -353,9 +353,9 @@ def resolve_staged_attachments(
     This is a *peek*, not a drain: the entries stay in the buffer so a send
     that resolves them but doesn't commit (e.g. the queue rejects an
     attachment-bearing turn → ``attachments_busy``, and the client retries) can
-    still find them.  The committing path drains them at write time via
-    :meth:`ChatSession._append_user_turn` (``buffer.discard`` per persisted
-    id); anything left over expires on the buffer's TTL.
+    still find them.  The committing path transfers all referenced entries
+    atomically when :meth:`ChatSession._append_user_turn` admits the immutable
+    pending row; anything left over expires on the buffer's TTL.
 
     Kind-agnostic: both create-with-attachments and ``/send`` paths call this.
     The old ``send_id`` reservation token is gone — the buffer is the pending

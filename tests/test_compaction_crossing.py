@@ -33,6 +33,7 @@ import pytest
 
 from tests._session_helpers import make_session
 from turnstone.core.session import COMPACTION_SOURCE, COMPACTION_SUMMARY_LABEL
+from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import turns_from_dicts
 
 
@@ -42,13 +43,26 @@ def session(tmp_db, mock_openai_client):
     the summary output reserve is tiny and the carry budget is easy to compute
     (reserve=100, margin=500, spare=9_400, budget=min(2_500, 9_400)=2_500
     tokens → 10_000 chars at the uncalibrated 4.0 chars/token)."""
-    return make_session(
+    s = make_session(
         client=mock_openai_client,
         context_window=10_000,
         compact_max_tokens=100,
         max_tokens=1_000,
         tool_timeout=10,
     )
+    _register_session_workstream(s)
+    return s
+
+
+def _register_session_workstream(session):
+    """Give direct ChatSession fixtures their production parent row."""
+    get_storage().register_workstream(
+        session.ws_id,
+        user_id=session._user_id,
+        kind=session._kind,
+        parent_ws_id=session._parent_ws_id,
+    )
+    return session
 
 
 def _stub_summary(text: str = "DENSE"):
@@ -357,7 +371,7 @@ class TestWindDownSpill:
         spare // 2, so two oversize carries land truncated to the shared
         budget instead of stacking two solo quarter-window allowances on top
         of the half-window summary reserve."""
-        s = make_session(client=mock_openai_client, tool_timeout=10)
+        s = _register_session_workstream(make_session(client=mock_openai_client, tool_timeout=10))
         per_carry = s._carry_budget_chars(2)
         ask = "ASK-HEAD " + "a" * (per_carry * 2) + " ASK-TAIL"
         spill = "PLAN-HEAD " + "b" * (per_carry * 2) + " PLAN-TAIL"
@@ -432,16 +446,18 @@ def _coord_client(tasks=None, children=None) -> MagicMock:
 def _coord_session(mock_openai_client, *, coord_client=..., **kwargs):
     from turnstone.core.workstream import WorkstreamKind
 
-    return make_session(
-        client=mock_openai_client,
-        context_window=10_000,
-        compact_max_tokens=100,
-        max_tokens=1_000,
-        tool_timeout=10,
-        kind=WorkstreamKind.COORDINATOR,
-        user_id="u1",
-        coord_client=_coord_client() if coord_client is ... else coord_client,
-        **kwargs,
+    return _register_session_workstream(
+        make_session(
+            client=mock_openai_client,
+            context_window=10_000,
+            compact_max_tokens=100,
+            max_tokens=1_000,
+            tool_timeout=10,
+            kind=WorkstreamKind.COORDINATOR,
+            user_id="u1",
+            coord_client=_coord_client() if coord_client is ... else coord_client,
+            **kwargs,
+        )
     )
 
 
@@ -493,8 +509,8 @@ class TestCoordinatorHandles:
         fails and they must revisit that trade rather than stack both.
         """
         coord = _coord_session(mock_openai_client)
-        interactive = make_session(
-            client=mock_openai_client, context_window=10_000, tool_timeout=10
+        interactive = _register_session_workstream(
+            make_session(client=mock_openai_client, context_window=10_000, tool_timeout=10)
         )
         prompts = []
         for s in (coord, interactive):
@@ -517,12 +533,14 @@ class TestCoordinatorHandles:
         children, so the reads are skipped entirely — not merely rendered
         empty — and its summary is what it was before this existed."""
         client = _coord_client()
-        s = make_session(
-            client=mock_openai_client,
-            context_window=10_000,
-            compact_max_tokens=100,
-            tool_timeout=10,
-            coord_client=client,  # present but irrelevant: kind decides
+        s = _register_session_workstream(
+            make_session(
+                client=mock_openai_client,
+                context_window=10_000,
+                compact_max_tokens=100,
+                tool_timeout=10,
+                coord_client=client,  # present but irrelevant: kind decides
+            )
         )
         text = _compact(s)
         assert "## Handles" not in text
@@ -660,7 +678,7 @@ class TestCoordinatorHandles:
         s = _coord_session(mock_openai_client)
         s._ws_id = "ws-coord"
         with (
-            patch("turnstone.core.session.get_compaction_watermark", return_value=7),
+            patch.object(get_storage(), "get_compaction_watermark", return_value=7),
             patch("turnstone.core.session.save_message") as saved,
         ):
             _compact(s)

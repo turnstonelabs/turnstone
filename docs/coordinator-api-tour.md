@@ -37,7 +37,7 @@ schema changes.
 | # | Action                       | Operation                                                   |
 |---|------------------------------|-------------------------------------------------------------|
 | 1 | Create                       | `POST /v1/api/workstreams/new`                              |
-| 2 | Subscribe to events          | `GET /v1/api/workstreams/{ws_id}/events` (SSE)              |
+| 2 | Bootstrap history + subscribe | `GET .../history`, then `GET .../events` (SSE)             |
 | 3 | Send a user message          | `POST /v1/api/workstreams/{ws_id}/send`                     |
 | 4 | Inspect children             | `GET /v1/api/workstreams/{ws_id}/children`                  |
 | 5 | Inspect one workstream       | `GET /v1/api/cluster/ws/{ws_id}/detail`                     |
@@ -91,13 +91,33 @@ subscribers (step 2) see the session warm up as token traffic starts.
 
 ---
 
-## 2. Subscribe to the per-coordinator event stream
+## 2. Bootstrap history, then subscribe to the event stream
+
+Read and render history before opening the initial stream:
 
 ```http
-GET /v1/api/workstreams/{ws_id}/events HTTP/1.1
+GET /v1/api/workstreams/{ws_id}/history?limit=100 HTTP/1.1
+Authorization: Bearer <token>
+```
+
+For a loaded coordinator, `messages` is the requested tail of one total
+accepted conversation-row prefix: user, assistant, tool, and system rows,
+including projected compaction checkpoints and cancellation-generated markers.
+The response's optional `cursor` and `handoff_token` belong to that exact
+render. Pass both once on the initial stream URL:
+
+```http
+GET /v1/api/workstreams/{ws_id}/events?last_event_id={cursor}&history_token={handoff_token}&user_turn=1&tool_turn=1 HTTP/1.1
 Accept: text/event-stream
 Authorization: Bearer <token>
 ```
+
+Omit either query parameter when its history field is `null`. A handoff token
+is opaque and process-local: do not parse, persist, or reuse it. Admission of a
+later conversation row changes the token; durable acknowledgement does not. If
+history returns `503 {"error":"History temporarily unavailable"}`, the response
+is not authoritative: retain the current transcript, do not open a tokenless
+replacement stream, and retry the read.
 
 One persistent SSE connection per browser tab / SDK caller — the
 console fans each event out to every listener queue (cap 500 events
@@ -110,7 +130,7 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `reasoning`         | Reasoning-token stream chunk (when the model exposes it)                                   | `text` |
 | `content`           | Assistant-content stream chunk                                                             | `text` |
 | `stream_end`        | End of a single provider stream                                                            | — |
-| `tool_result`       | A tool call completed (success or error)                                                   | `call_id`, `name`, `output`, `is_error?` |
+| `tool_result`       | A tool call completed; capable panes also receive the accepted-history replacement          | `call_id`, `name`, `output`, `is_error?`, `accepted?`, `_event_id?`, `preview?`, `effect_status?` |
 | `tool_output_chunk` | Streaming tool output (e.g. long bash command)                                             | `call_id`, `chunk` |
 | `approve_request`   | One approval cycle needs operator action; several cycles may coexist                       | `cycle_id`, `items: [{call_id, header, preview, func_name, approval_label, needs_approval}]` |
 | `approval_resolved` | One identified approval cycle was answered                                                 | `cycle_id`, `call_ids`, `approved`, `feedback`, `always` |
@@ -127,6 +147,7 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `wait_started` / `wait_progress` / `wait_ended` | `wait_for_workstream` tool lifecycle (see §6)                  | `call_id`, `ws_ids`, `elapsed`, `results`, `complete` |
 | `batch_started` / `batch_ended` | `spawn_batch` / `close_all_children` tool lifecycle                            | `call_id`, `op`, `total`/`succeeded`/`denied`/`closed`/`failed`/`skipped` |
 | `info` / `error`    | Operational messages                                                                       | `message` |
+| `history_resync`    | The rendered history token no longer names the accepted row prefix                         | `ws_id`, `reason` |
 
 **Reconnection contract:** a freshly-opened SSE connection receives
 one `approve_request` snapshot for every unresolved approval cycle, keyed by
@@ -137,6 +158,11 @@ model has produced for the in-progress turn — so a tab refresh
 mid-approval, mid-tool-execution, or mid-stream restores both the
 correct composer mode and the partial assistant text without waiting
 for the response to complete.
+
+`history_resync` is stronger than a numeric replay gap. The server closes that
+stream; fetch and render `/history` again, then open a new stream with its new
+cursor/token pair. The API and SDK expose these primitives but deliberately do
+not choose a reconnect policy for callers.
 
 ---
 
@@ -371,6 +397,11 @@ the worker thread exits, SSE streams send a final `stream_end` and
 disconnect.  The row is reopenable via
 `POST /v1/api/workstreams/{ws_id}/open` so long as it hasn't been
 deleted.
+
+If any accepted live conversation row still requires persistence
+reconciliation, close returns `409 {"error":"workstream has unresolved
+persistence"}`. The coordinator remains loaded, its journal is retained, and
+no history is discarded; retry after storage recovers.
 
 ---
 

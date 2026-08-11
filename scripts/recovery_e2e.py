@@ -34,6 +34,10 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario coord-hidden-retry         # G5 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-orphan-rewind        # G6 (#894 r6)
     python3 scripts/recovery_e2e.py --scenario coord-joined-flight        # G7 (#894 r8)
+    python3 scripts/recovery_e2e.py --scenario handoff-repair-budget
+    python3 scripts/recovery_e2e.py --scenario coord-handoff-repair-budget
+    python3 scripts/recovery_e2e.py --scenario user-turn-two-pane
+    python3 scripts/recovery_e2e.py --scenario tool-turn-two-pane
     python3 scripts/recovery_e2e.py --scenario roster-restart    # F1 (#881)
     python3 scripts/recovery_e2e.py --scenario roster-restart-native  # F2 (#881)
     python3 scripts/recovery_e2e.py --scenario both   # A+B only (legacy)
@@ -83,21 +87,20 @@ BOTH its clear_ui refetch AND its one bounded 2s retry are forced to 500
 (``RecoveryServer.fail_history(2)``), so the latch cannot self-heal and
 rewind/edit stay latch-gated over the stale-but-real transcript (a row-0
 rewind click stays gated, ``rewind_requests`` holds at 1; the three user
-rows survive).  A plain send — sends are deliberately NOT latch-gated — runs
-a fourth scripted ``final_text`` turn whose ORGANIC turn-settle idle edge
-fires the backstop: a quiesced, same-token REST ``_refetchHistory``
+rows survive).  The recovery server publishes a real per-workstream idle
+edge through the loaded UI, firing a quiesced, same-token REST
+``_refetchHistory`` without admitting another user row
 (deliberately NOT ``_loadHistoryThenConnect`` — the old reload backstop drew
 the server's synthetic ``state_change:idle`` on its fresh reconnect and
 re-triggered itself, a zero-backoff reconnect/refetch storm against a
 recovering node).  With the fault budget now exhausted the refetch succeeds
-and rebuilds the rewound (ONE user turn, index 1 of 3 rewinds 2) + sent (a
-second user turn) transcript to TWO user rows, clearing the latch, so a
+and rebuilds the single post-rewind user row, clearing the latch, so a
 fresh rewind on a remaining row lands (``rewind_requests`` -> 2).  THE r5
 PROOF, both counted at the fault layer: ``events_requests`` is UNCHANGED
 across the whole heal episode (``sse0`` — zero new EventSource connections;
 the storm would have opened one per reconnect) and ``history_requests`` grew
-by exactly ONE (the backstop's single fetch — the plain fourth turn emits no
-clear_ui).  All polls are deadline-bounded so a regressed looping backstop
+by exactly ONE (the backstop's single fetch).  All polls are deadline-bounded
+so a regressed looping backstop
 stamps a clean FAILED, never a hang.  Stamps
 ``RECOVERY-READY-STALEBACKSTOP-heal1-sse0``.
 
@@ -116,10 +119,12 @@ UNCHANGED across the hidden window (``hidden0``), which regresses to
 ``hidden1`` the moment the guard's transport clause is removed.  Note the
 scope: a hide nulls ``evtSource``, so this exercises the PRESENCE term only —
 the ``readyState`` half needs a redial in progress, which no fault primitive
-produces deterministically (see the runner's docstring).  A replay_ok reconnect carries no synthetic ``state_change``, so
+produces deterministically (see the runner's docstring).  A replay_ok
+reconnect carries no synthetic ``state_change``, so
 the latch survives ``__show`` — the accepted liveness lag — and the heal
-rides a plain send's ORGANIC settle into the transport-free backstop, hence
-exactly ONE new SSE open across show + heal.  Stamps
+rides a server-origin idle edge into the transport-free backstop.  This avoids
+admitting a live ``user_turn`` and starting unrelated model work; exactly ONE
+new SSE open remains across show + heal.  Stamps
 ``RECOVERY-READY-HIDDENRETRY-hidden0-heal1``.
 
 Scenario E6 (await-window-gate): the seedless render's cursor-safety gate
@@ -139,9 +144,10 @@ owns.  Stamps ``RECOVERY-READY-AWAITGATE-rows3-latch1``.
 
 Scenario E8 (reconnect-in-await): the stream-generation term (#900 r2), and
 the FIRST detector here that can observe a double render at all.  Every other
-scenario counts ``.msg.user`` rows, and user rows never travel on the SSE
-stream, so none of them can see the artefact this campaign prevents — E8
-counts a sentinel's OCCURRENCES in the transcript text instead.  The retry
+scenario counts ``.msg.user`` rows; that count stays constant when an
+assistant/tool slice is painted twice, so none of them can see the artefact
+this campaign prevents. E8 counts a sentinel's OCCURRENCES in the transcript
+text instead.  The retry
 fires with the transport OPEN, its /history is held, and inside that await the
 transport DROPS and RE-ESTABLISHES: ``readyState`` reads OPEN afterwards
 exactly as before, so neither the presence nor the readyState term can tell
@@ -170,20 +176,19 @@ click provably lands in the aftermath window; the bounded 2s retry then
 heals and reopens.  Stamps ``RECOVERY-READY-COORDREWINDFAIL-posts2-heal1``.
 
 Scenario G3 (coord-stale-backstop): E4's port.  Double failure exhausts
-clear_ui refetch + retry; a plain send's ORGANIC settle fires the
-TRANSPORT-FREE backstop (plain seedless ``refetchHistory``, never
+clear_ui refetch + retry; a server-origin idle edge fires the TRANSPORT-FREE
+backstop (plain seedless ``refetchHistory``, never
 ``loadHistoryThenReconnect``).  Same storm proof: ``events_requests``
 UNCHANGED, ``history_requests`` +1.  Stamps
 ``RECOVERY-READY-COORDSTALEBACKSTOP-heal1-sse0``.
 
-Scenario G4 (coord-heal-midturn, #894 r4): the render-time gate.  A turn
-STARTED during a heal's held /history must survive the fetch resolution —
-the gate skips the wipe (pre-gate code detached the live turn's DOM into
-dangling refs and lost it), the latch stays set, and the turn's own settle
-re-fires the backstop, which heals.  Proofs: turn 5's sentinel paints into
-the still-stale transcript (``mid1``), the heal lands with the rewound-away
-seeds gone, ``events_requests`` UNCHANGED, ``history_requests`` +2 exactly
-(the skipped fetch + the heal).  Stamps
+Scenario G4 (coord-heal-midturn, #894 r4): the render-time live-tool gate.  A
+server-origin idle edge starts a held backstop fetch, then a real
+``tool_pending`` event makes the event-owned live-call set non-empty.  The
+good response must be declined without wiping the stale transcript or the
+live tool shell (``mid1``); a matching result plus another idle edge then
+heals.  ``events_requests`` stays unchanged and ``history_requests`` grows by
+exactly two (declined fetch + heal).  Stamps
 ``RECOVERY-READY-COORDHEALMIDTURN-heal1-mid1-sse0``.
 
 Scenario G5 (coord-hidden-retry, #894 r4): the retry's stream-liveness
@@ -193,7 +198,7 @@ double-renders on the show-edge replay): ``history_requests`` UNCHANGED
 across the hidden fire window (``hidden0``).  A replay_ok reconnect
 carries no synthetic state_change (only fresh/truncated replays do), so
 post-show the latch stays closed (the accepted liveness-lag residual)
-until the runner drives an ORGANIC settle with a plain send; that idle edge fires the TRANSPORT-FREE backstop on the live
+until a server-origin idle edge fires the TRANSPORT-FREE backstop on the live
 stream (exactly ONE new SSE open across show + heal — the user-driven
 reconnect; the heal adds zero).  Stamps
 ``RECOVERY-READY-COORDHIDDENRETRY-hidden0-heal1``.
@@ -397,18 +402,14 @@ HEALED_SENTINEL = "HEALED-e5b1"
 # a fresh bubble, not the stale one" is an honest DOM check.
 SECOND_SENTINEL = "SECOND-a7f3"
 
-# Fourth-turn sentinel for scenario E4 (stale-backstop): the scripted
-# final_text of the plain send that drives the idle-edge backstop.  Same
-# collision-proof discipline — the E4 transcript is pure final_text turns
-# ("one"/"two"/"three" + the seed messages), so this hex-suffixed token
-# proves the sent turn reached the healed /history render, distinct from
-# everything else on screen.
+# Heal sentinel for scenario E6 (await-window-gate): its scripted fourth turn
+# drives the later organic repair edge and proves that repair rendered.
 BACKSTOP_SENTINEL = "BACKSTOP-b2e4"
 # Scenario E8's duplicate-detector sentinel.  Its whole job is to be COUNTED,
 # not merely found: the artefact #900's stream-generation term prevents is a
 # turn rendered twice, and every other detector in this file counts
-# ``.msg.user`` rows — which never travel on the SSE stream, so none of them
-# can see it.
+# ``.msg.user`` rows — a duplicated assistant/tool slice does not change that
+# count, so none of them can see it.
 DUPLICATE_SENTINEL = "DUPE-c9a7"
 
 # Row-count selectors, hoisted above every runner that uses them (#900 r2):
@@ -418,14 +419,6 @@ DUPLICATE_SENTINEL = "DUPE-c9a7"
 # not be adopted by the runners that needed it most.
 _ROWS_JS = "window.__pane.messagesEl.querySelectorAll('.msg.user').length"
 _COORD_ROWS_JS = "document.getElementById('coord-messages').querySelectorAll('.msg.user').length"
-
-# Scenario G4 (coord-heal-midturn) sentinels: turn 4's final text (the
-# settle that fires the held backstop fetch) and turn 5's final text (the
-# turn that STARTS during that held fetch and must survive its resolution).
-# Same collision-proof discipline as the sentinels above; turn 5's bash
-# command output is ``g4-N`` lines, which contain neither token.
-MIDTURN_T4_SENTINEL = "MIDT4-c9d1"
-MIDTURN_T5_SENTINEL = "MIDT5-f47a"
 
 # ---------------------------------------------------------------------------
 # The recovery page — served same-origin by the node at /recovery.
@@ -484,7 +477,10 @@ PAGE_HTML = r"""<!doctype html>
       // other scenarios onto it would change what they are testing.
       let ctl = null;
       let pane;
-      if (scenario === "destroy-invalidation") {
+      if (
+        scenario === "destroy-invalidation" ||
+        scenario === "handoff-repair-budget"
+      ) {
         ctl = createInteractivePane(document.getElementById("mount"), wsId, {
           base: "",
         });
@@ -496,6 +492,21 @@ PAGE_HTML = r"""<!doctype html>
       }
       pane.wsId = wsId;
       window.__pane = pane;
+      let peerPane = null;
+      if (
+        scenario === "user-turn-two-pane" ||
+        scenario === "tool-turn-two-pane"
+      ) {
+        // The standalone default host is a shared singleton. Give each pane a
+        // shallow copy before wrapping onStreamOpen so instrumentation remains
+        // per-pane instead of nesting twice on the same callback object.
+        pane._host = { ...pane._host };
+        peerPane = new InteractivePane(wsId, { base: "" });
+        peerPane._host = { ...peerPane._host };
+        peerPane.wsId = wsId;
+        document.getElementById("mount").appendChild(peerPane.el);
+        window.__peerPane = peerPane;
+      }
 
       window.__hide = function () {
         Object.defineProperty(document, "hidden", { configurable: true, value: true });
@@ -542,6 +553,16 @@ PAGE_HTML = r"""<!doctype html>
           .catch((e) => { document.title = "RECOVERY-FAILED-send-" + e; });
       }
 
+      // Drive the production optimistic composer path for the multi-pane
+      // user_turn projection check. The pane mints client_send_id itself;
+      // the origin must replace that exact bubble while the peer paints the
+      // canonical row from the same event.
+      window.__sendProjectedUserTurn = function (msg) {
+        pane.inputEl.value = msg;
+        pane.sendMessage();
+        return true;
+      };
+
       // Drive /send once the stream is live (wrap the default host hook).
       const origOpen = pane._host.onStreamOpen.bind(pane._host);
       pane._host.onStreamOpen = function (p) {
@@ -555,10 +576,18 @@ PAGE_HTML = r"""<!doctype html>
           window.__streamOpen === 1
         )
           sendOnce("run a turn");
-        // rewind-window drives its turns SERVER-side before navigation (a
-        // /send never emits a live user row — only /history replay does), so
+        // rewind-window drives its turns SERVER-side before navigation, when
+        // no page listener exists; the initial /history paints those rows, so
         // the page never auto-sends there.
       };
+
+      if (peerPane) {
+        const peerOrigOpen = peerPane._host.onStreamOpen.bind(peerPane._host);
+        peerPane._host.onStreamOpen = function (p) {
+          peerOrigOpen(p);
+          window.__peerStreamOpen = (window.__peerStreamOpen || 0) + 1;
+        };
+      }
 
       // Shared transport instrumentation for the truncated-recovery
       // scenarios: count replay_truncated envelopes (the original restart
@@ -605,12 +634,15 @@ PAGE_HTML = r"""<!doctype html>
       // in-flight load destroy() must invalidate is the one connect()
       // starts.
       if (ctl) ctl.connect();
-      else pane._loadHistoryThenConnect(wsId);
+      else {
+        pane._loadHistoryThenConnect(wsId);
+        if (peerPane) peerPane._loadHistoryThenConnect(wsId);
+      }
 
       // Count a sentinel's OCCURRENCES in the transcript text.  Every other
-      // detector in this harness counts `.msg.user` rows, and user rows are
-      // never emitted on the SSE stream — so none of them can observe a turn
-      // rendered twice.  Counting text is structure-agnostic: it catches a
+      // detector in this harness counts `.msg.user` rows; an assistant/tool
+      // slice rendered twice leaves that count unchanged. Counting text is
+      // structure-agnostic: it catches a
       // duplicate assistant bubble, a duplicate tool block, or both.
       window.__countSentinel = function (s) {
         const text = pane.messagesEl.textContent || "";
@@ -865,9 +897,9 @@ PAGE_HTML = r"""<!doctype html>
         // backstop (#890, the round-5 critical).  A rewind's clear_ui refetch
         // AND its one bounded 2s retry both 500, so the latch cannot
         // self-heal and rewind/edit stay gated over the stale-but-real
-        // transcript.  A plain send (deliberately NOT latch-gated) runs a
-        // fresh turn whose ORGANIC turn-settle idle edge fires the backstop —
-        // a quiesced, same-token REST _refetchHistory, NOT
+        // transcript.  A server-origin idle state edge fires the backstop
+        // without admitting another user row — a quiesced, same-token REST
+        // _refetchHistory, NOT
         // _loadHistoryThenConnect (the old reload backstop drew the server's
         // synthetic state_change:idle on its fresh reconnect and re-triggered
         // itself: a zero-backoff reconnect/refetch storm).  The runner
@@ -883,12 +915,12 @@ PAGE_HTML = r"""<!doctype html>
         ) {
           const userRows =
             pane.messagesEl.querySelectorAll(".msg.user").length;
-          // heal1 = the backstop's quiesced REST refetch rebuilt the rewound
-          //   (ONE user turn) + sent (a second) transcript => TWO user rows,
-          //   latch cleared.  sse0 = it touched the transport ZERO times
+          // heal1 = the backstop's quiesced REST refetch rebuilt the single
+          //   post-rewind user row and cleared the latch.  sse0 = it touched
+          //   the transport ZERO times
           //   (sseDelta 0 — the storm regression opens one EventSource per
-          //   reconnect).  histDelta 1 = the backstop's single fetch (the
-          //   plain fourth turn emits no clear_ui).  gatedPosts 1 = the row-0
+          //   reconnect).  histDelta 1 = the backstop's single fetch.
+          //   gatedPosts 1 = the row-0
           //   rewind stayed latch-gated while stale.  posts 2 = the healed
           //   render reopened the gate and a fresh rewind landed.
           const ok =
@@ -932,8 +964,8 @@ PAGE_HTML = r"""<!doctype html>
         // A replay_ok reconnect carries no synthetic state_change (only
         // fresh/truncated replays do), so the latch stays closed across
         // __show — the accepted liveness-lag residual, not a defect.  The
-        // heal rides the runner's plain send, whose ORGANIC turn-settle
-        // idle edge fires the transport-free backstop on the live stream.
+        // heal rides a server-origin idle edge through the real UI event
+        // path, firing the transport-free backstop on the live stream.
         window.__verifyHiddenRetry = function (
           hiddenDelta,
           healed,
@@ -944,9 +976,8 @@ PAGE_HTML = r"""<!doctype html>
             pane.messagesEl.querySelectorAll(".msg.user").length;
           // hidden0 = the retry did NOT fetch while the transport was down
           //   (the guard held — the whole point of the scenario).
-          // heal1 = after __show + a plain send, the backstop's refetch
-          //   rebuilt the rewound (ONE user turn) + sent (a second)
-          //   transcript => TWO user rows with the sentinel.
+          // heal1 = after __show + the idle pulse, the backstop's refetch
+          //   rebuilt the single post-rewind user row.
           // showSse 1 = exactly ONE new EventSource across show + heal (the
           //   show edge's own reconnect; the transport-free heal adds none).
           // posts 2 = the healed render reopened the gate and a fresh
@@ -1109,6 +1140,7 @@ COORD_PAGE_HTML = r"""<!doctype html>
       (function () {
         const RealES = window.EventSource;
         function CountingES(url, opts) {
+          window.__lastEventSourceUrl = String(url);
           const es = new RealES(url, opts);
           es.addEventListener("open", function () {
             window.__esOpens += 1;
@@ -1287,12 +1319,10 @@ COORD_PAGE_HTML = r"""<!doctype html>
             userRows;
       };
 
-      // G4 — the render-time gate (#894 r4): a turn that STARTS during a
-      // heal's in-flight /history must SURVIVE its resolution (the gate
-      // skips the wipe; pre-gate code detached the live turn into a
-      // dangling ref and lost it).  midturnSurvived is the runner's
-      // observation that turn 5's sentinel painted while the stale
-      // transcript was still up — the not-wiped proof.
+      // G4 — the render-time tool gate (#894 r4): a live tool_pending phase
+      // starts during a held seedless /history.  The good response must be
+      // declined, leaving both the stale transcript and live tool shell
+      // continuously visible.  midturnSurvived carries that observation.
       window.__verifyCoordHealMidturn = function (
         healed,
         midturnSurvived,
@@ -1328,9 +1358,9 @@ COORD_PAGE_HTML = r"""<!doctype html>
       // is down (hiddenDelta 0 — a seedless render past the frozen
       // cursor double-renders on the show-edge replay); the show edge
       // only restores the transport (replay_ok carries no synthetic
-      // state_change), and the heal rides the next ORGANIC settle — the
-      // runner's plain send (one user-driven SSE open, rows healed,
-      // gate reopened).
+      // state_change), and the heal rides a server-origin idle edge through
+      // the real UI event path (one user-driven SSE open, rows healed, gate
+      // reopened).
       window.__verifyCoordHiddenRetry = function (
         hiddenDelta,
         healed,
@@ -2243,8 +2273,8 @@ def _send_in_page(cdp: CDP, message: str) -> None:
     """POST /send from inside the page via the pane's own authFetch (cookie
     auth, node-proxy base) — the one shared shape for scenarios that drive a
     turn mid-flight (the shared shape for every scenario that drives a
-    turn outside the composer).  A raw POST emits no live user row, so the sent
-    turn appears only via the next /history render."""
+    turn outside the composer). The accepted row is projected live as
+    ``user_turn`` just like a composer send."""
     cdp.evaluate(
         "window.authFetch('/v1/api/workstreams/' + "
         "encodeURIComponent(window.__pane.wsId) + '/send', {method:'POST',"
@@ -2431,16 +2461,14 @@ def _seed_three_completed_turns(name: str, extra_scripts: tuple[Any, ...] = ()) 
     """Boot a node and drive THREE completed ``final_text`` turns, returning
     ``(node, ws_id)`` — the byte-identical seeding the rewind scenarios
     (E2/E3/E4) share, extracted so their rewind arithmetic provably reads off
-    the SAME transcript.  Each of the three ``node.send`` calls consumes one
-    scripted turn; a /send never emits a live user row (only /history replay
-    does), so the initial page-load /history render is what paints all three
-    user rows.
+    the SAME transcript. Each of the three ``node.send`` calls consumes one
+    scripted turn before a browser listener exists, so the initial page-load
+    /history render paints all three user rows.
 
     ``extra_scripts`` are appended to the scripted client AFTER the three
-    seeding scripts and left UNSENT: E4 queues a fourth ``final_text`` turn
-    there for the later backstop-driving send (its positional script stays in
-    sync because the three seeding sends consume exactly the three seeding
-    scripts)."""
+    seeding scripts and left UNSENT for scenarios that later drive a real
+    turn.  Their positional scripts stay in sync because the three seeding
+    sends consume exactly the three leading scripts."""
     from tests._sse_recovery_server import final_text_script
 
     node = _boot_node()
@@ -2479,6 +2507,18 @@ def run_rewind_window(chrome: str) -> str:
             0.2,
         ):
             raise AssertionError("rewind-window: three user rows never rendered")
+        # The REST rows paint before the initial EventSource registration is
+        # guaranteed to finish.  Clicking in that legitimate handoff gap can
+        # advance the history token first, producing a strong resync instead
+        # of the established-listener ``clear_ui`` whose quiesce this scenario
+        # is specifically meant to exercise.  Coordinator G1 carries the same
+        # transport-open gate.
+        if not _poll_until(
+            lambda: cdp.evaluate("(window.__streamOpen || 0) >= 1"),
+            10,
+            0.05,
+        ):
+            raise AssertionError("rewind-window: SSE stream never opened")
         # Hold every /history 3s so the clear_ui refetch keeps the quiesce
         # armed long enough to click the second rewind mid-rebuild.
         node.delay_history(3000)
@@ -2654,33 +2694,24 @@ def run_stale_backstop(chrome: str) -> str:
     backstop (#890, the round-5 critical).  The DOUBLE-failure sibling of E3:
     a rewind's clear_ui refetch AND its one bounded 2s retry are BOTH forced
     to 500 (``node.fail_history(2)``), so the latch cannot self-heal and
-    rewind/edit stay gated over the stale-but-real transcript.  A plain send
-    — sends are deliberately NOT latch-gated (``sendMessage`` gates only on
-    ``busy``; the raw ``authFetch`` here bypasses even that) — runs the fourth
-    scripted ``final_text`` turn whose ORGANIC turn-settle idle edge fires the
-    backstop: a quiesced, same-token REST ``_refetchHistory``, deliberately
-    NOT ``_loadHistoryThenConnect`` (the old reload backstop drew the server's
-    synthetic ``state_change:idle`` on its fresh reconnect and re-triggered
-    itself — a zero-backoff reconnect/refetch storm).  With the fault budget
-    exhausted the refetch succeeds and heals the rewound + sent transcript.
+    rewind/edit stay gated over the stale-but-real transcript.  The recovery
+    server then publishes one real ``state_change:idle`` through the loaded
+    UI. That is the settle edge the backstop consumes, without admitting a
+    live ``user_turn`` or starting unrelated model work that would change the
+    row and transcript counters in this transport-isolation probe. The
+    backstop remains a quiesced, same-token
+    REST ``_refetchHistory``, deliberately NOT ``_loadHistoryThenConnect``.
+    With the fault budget exhausted it heals the rewound transcript.
 
     THE r5 PROOF (both counted at the fault layer): ``events_requests`` is
     UNCHANGED across the whole heal (``sse0`` — zero new EventSource
     connections; the storm regression opens one per reconnect) and
-    ``history_requests`` grew by exactly ONE (the backstop's single fetch —
-    the plain fourth turn emits no clear_ui).  Backend proofs:
+    ``history_requests`` grew by exactly ONE (the backstop's single fetch).
+    Backend proofs:
     ``rewind_requests`` 1 -> (gated) 1 -> 2, ``history_fail_remaining == 0``.
     Every poll is deadline-bounded so a regressed looping backstop stamps a
     clean FAILED, never a hang."""
-    from tests._sse_recovery_server import final_text_script
-
-    # Seed three turns and queue a FOURTH final_text (the sentinel-bearing
-    # turn the backstop-driving send below runs) — the shared helper keeps the
-    # seeding byte-identical to E2/E3 so the rewind arithmetic matches.
-    node, ws_id = _seed_three_completed_turns(
-        "browser-stale-backstop",
-        extra_scripts=(final_text_script(BACKSTOP_SENTINEL),),
-    )
+    node, ws_id = _seed_three_completed_turns("browser-stale-backstop")
     profile = Path(_scratch()) / "chrome-stale-backstop"
     proc, cdp_port = _launch_chrome(chrome, profile)
     cdp: CDP | None = None
@@ -2746,30 +2777,22 @@ def run_stale_backstop(chrome: str) -> str:
             raise AssertionError("stale-backstop: first-row rewind button missing")
         _poll_until(lambda: node.rewind_requests != 1, 1.5, 0.05)
         gated_posts = node.rewind_requests  # must still be 1 (latch gated it)
-        # Baselines captured the instant BEFORE the send: the heal must add
+        # Baselines captured immediately before the idle edge: the heal adds
         # exactly ZERO SSE opens and exactly ONE /history fetch relative here.
         events_baseline = node.events_requests
         history_baseline = node.history_requests
-        # Drive a plain send via in-page authFetch — sends are NOT latch-gated
-        # (see docstring), so this reaches the server, runs the fourth scripted
-        # turn (BACKSTOP_SENTINEL), and its ORGANIC turn-settle idle edge fires
-        # the backstop.
-        _send_in_page(cdp, "fourth turn")
-        # HEAL: the fourth turn settles -> idle edge -> quiesced REST refetch
-        # (fault exhausted) succeeds -> replayHistory rebuilds the rewound (ONE
-        # user turn) + sent (a second) transcript to TWO user rows, SENTINEL
-        # present, latch cleared.  The 3-user-rows -> 2-user-rows transition is
+        # Publish the same per-workstream idle envelope a real turn settle
+        # emits, without accepting/projecting another user turn or starting
+        # unrelated model work.
+        node.emit_idle_edge(ws_id)
+        # HEAL: idle edge -> quiesced REST refetch (fault exhausted) succeeds
+        # -> replayHistory rebuilds the rewound transcript to ONE user row and
+        # clears the latch.  The 3-user-rows -> 1-user-row transition is
         # the load-bearing proof the backstop RENDERED — a stale transcript can
         # only change via a successful /history render.  Deadline-bounded so a
         # regressed looping backstop times out to a clean FAILED, never a hang.
         healed = _poll_until(
-            lambda: cdp.evaluate(
-                _ROWS_JS + " === 2 "
-                "&& window.__pane._historyStale === false "
-                "&& (window.__pane.messagesEl.textContent||'').includes("
-                + json.dumps(BACKSTOP_SENTINEL)
-                + ")"
-            ),
+            lambda: cdp.evaluate(_ROWS_JS + " === 1 && window.__pane._historyStale === false"),
             20,
             0.2,
         )
@@ -2780,8 +2803,8 @@ def run_stale_backstop(chrome: str) -> str:
         #    connectSSE would bump events_requests by one per reconnect — the
         #    round-5 storm).  The EventSource opened at initial load is already
         #    folded into the baseline.
-        #  - history_delta MUST be 1: the plain fourth turn emits no clear_ui,
-        #    so the ONLY /history in the send+heal window is the backstop fetch.
+        #  - history_delta MUST be 1: the only /history in the edge+heal
+        #    window is the backstop fetch.
         events_delta = node.events_requests - events_baseline
         history_delta = node.history_requests - history_baseline
         # REOPEN: the healing render cleared the latch, so a rewind on a
@@ -2842,16 +2865,12 @@ def run_hidden_retry(chrome: str) -> str:
     A replay_ok reconnect carries NO synthetic ``state_change`` (only
     fresh/truncated replays do), so the latch stays closed across ``__show``:
     that is the accepted liveness-lag residual, and no timer may shortcut it.
-    The heal therefore rides the runner's plain send (sends are never
-    latch-gated), whose ORGANIC turn-settle idle edge fires the
-    TRANSPORT-FREE backstop on the now-live stream — hence exactly ONE new
-    SSE open across show + heal (the show edge's own; the heal adds zero)."""
-    from tests._sse_recovery_server import final_text_script
+    The recovery server therefore publishes one real ``state_change:idle``
+    after show; this is the same backstop trigger without admitting a live
+    user turn or starting unrelated model work. Exactly ONE new SSE
+    open remains across show + heal (the show edge's own; the heal adds zero)."""
 
-    node, ws_id = _seed_three_completed_turns(
-        "browser-hidden-retry",
-        extra_scripts=(final_text_script(BACKSTOP_SENTINEL),),
-    )
+    node, ws_id = _seed_three_completed_turns("browser-hidden-retry")
     profile = Path(_scratch()) / "chrome-hidden-retry"
     proc, cdp_port = _launch_chrome(chrome, profile)
     cdp: CDP | None = None
@@ -2897,20 +2916,15 @@ def run_hidden_retry(chrome: str) -> str:
         latch_held = cdp.evaluate("window.__pane._historyStale === true")
         # Show: the reconnect presents the frozen cursor (replay_ok, nothing
         # lost) and carries no synthetic state_change, so the latch survives
-        # it.  A plain send then drives the ORGANIC settle the backstop needs.
+        # it.  A server-origin idle edge then drives the settle the backstop
+        # needs without admitting another user row.
         events_before_show = node.events_requests
         cdp.evaluate("window.__show && window.__show()")
         if not _poll_until(lambda: node.events_requests == events_before_show + 1, 10, 0.05):
             raise AssertionError("hidden-retry: show-edge reconnect never arrived")
-        _send_in_page(cdp, "fourth turn")
+        node.emit_idle_edge(ws_id)
         healed = _poll_until(
-            lambda: cdp.evaluate(
-                _ROWS_JS
-                + " === 2 && window.__pane._historyStale === false"
-                + " && (window.__pane.messagesEl.textContent||'').includes("
-                + json.dumps(BACKSTOP_SENTINEL)
-                + ")"
-            ),
+            lambda: cdp.evaluate(_ROWS_JS + " === 1 && window.__pane._historyStale === false"),
             20,
             0.2,
         )
@@ -3061,10 +3075,10 @@ def run_reconnect_in_await(chrome: str) -> str:
     """Scenario E8 — the stream-generation term (#900 r2), and the first
     detector in this harness that can observe a DOUBLE RENDER at all.
 
-    Every other scenario counts ``.msg.user`` rows, and user rows never travel
-    on the SSE stream (a /send emits none — only /history replay paints them),
-    so none of them can see the artefact this whole campaign prevents: a turn
-    rendered twice.  E8 counts a sentinel's OCCURRENCES in the transcript text
+    Every other scenario counts ``.msg.user`` rows; an assistant/tool slice
+    rendered twice leaves that count unchanged, so none of them can see the
+    artefact this whole campaign prevents. E8 counts a sentinel's OCCURRENCES
+    in the transcript text
     instead, which is structure-agnostic across duplicate assistant bubbles and
     duplicate tool blocks.
 
@@ -3483,9 +3497,10 @@ def run_coord_stale_backstop(chrome: str) -> str:
     sibling of G2: the rewind's clear_ui refetch AND its one bounded 2s retry
     are BOTH forced to 500 (``node.fail_history(2)``), so the latch cannot
     self-heal and rewind/edit stay gated over the stale-but-real transcript.
-    A plain send (never latch-gated; raw authFetch here) runs the fourth
-    scripted turn whose ORGANIC turn-settle idle edge fires the backstop: a
-    plain seedless REST ``refetchHistory`` — deliberately NOT
+    The recovery server publishes one real ``state_change:idle`` through the
+    loaded UI, which fires the backstop without admitting a live user turn or
+    starting unrelated model work: a plain seedless REST
+    ``refetchHistory`` — deliberately NOT
     ``loadHistoryThenReconnect`` (a reconnecting heal draws the server's
     synthetic ``state_change:idle`` back into its own trigger: a
     zero-backoff reconnect/refetch storm).
@@ -3493,20 +3508,12 @@ def run_coord_stale_backstop(chrome: str) -> str:
     THE STORM PROOF (both counted at the fault layer): ``events_requests``
     is UNCHANGED across the whole heal (``sse0`` — zero new EventSource
     connections) and ``history_requests`` grew by exactly ONE (the
-    backstop's single fetch; the plain fourth turn emits no clear_ui).
+    backstop's single fetch).
     Coord's latch is closure-private, so the latch-cleared proof is the
     reopen POST (rewind_requests -> 2), not a field read.  Every poll is
     deadline-bounded so a regressed looping backstop stamps a clean FAILED,
     never a hang."""
-    from tests._sse_recovery_server import final_text_script
-
-    # Seed three turns and queue a FOURTH final_text (the sentinel-bearing
-    # turn the backstop-driving send below runs) — the shared helper keeps
-    # the seeding byte-identical to G1/G2 so the rewind arithmetic matches.
-    node, ws_id = _seed_three_completed_turns(
-        "browser-coord-stale-backstop",
-        extra_scripts=(final_text_script(BACKSTOP_SENTINEL),),
-    )
+    node, ws_id = _seed_three_completed_turns("browser-coord-stale-backstop")
     profile = Path(_scratch()) / "chrome-coord-stale-backstop"
     proc, cdp_port = _launch_chrome(chrome, profile)
     cdp: CDP | None = None
@@ -3523,26 +3530,18 @@ def run_coord_stale_backstop(chrome: str) -> str:
             raise AssertionError("coord-stale-backstop: first-row rewind button missing")
         _poll_until(lambda: node.rewind_requests != 1, 1.5, 0.05)
         gated_posts = node.rewind_requests  # must still be 1 (latch gated it)
-        # Baselines captured the instant BEFORE the send: the heal must add
+        # Baselines captured immediately before the idle edge: the heal adds
         # exactly ZERO SSE opens and exactly ONE /history fetch from here.
         events_baseline = node.events_requests
         history_baseline = node.history_requests
-        # Drive a plain send via in-page authFetch — sends are NOT
-        # latch-gated, so this reaches the server, runs the fourth scripted
-        # turn (BACKSTOP_SENTINEL), and its ORGANIC turn-settle idle edge
-        # fires the backstop.
-        _send_in_page(cdp, "fourth turn")
-        # HEAL: the fourth turn settles -> idle edge -> plain REST refetch
-        # (fault exhausted) succeeds -> the render rebuilds the rewound (ONE
-        # user turn) + sent (a second) transcript to TWO user rows, SENTINEL
-        # present.  The 3->2 transition is the load-bearing proof the
+        node.emit_idle_edge(ws_id)
+        # HEAL: idle edge -> plain REST refetch (fault exhausted) succeeds ->
+        # the render rebuilds the rewound transcript to ONE user row.  The
+        # 3->1 transition is the load-bearing proof the
         # backstop RENDERED; the latch-cleared proof is the reopen POST
         # below (the latch itself is closure-private).
         healed = _poll_until(
-            lambda: cdp.evaluate(
-                _COORD_ROWS_JS + " === 2 && (document.getElementById('coord-messages')"
-                ".textContent||'').includes(" + json.dumps(BACKSTOP_SENTINEL) + ")"
-            ),
+            lambda: cdp.evaluate(_COORD_ROWS_JS + " === 1"),
             20,
             0.2,
         )
@@ -3551,9 +3550,8 @@ def run_coord_stale_backstop(chrome: str) -> str:
         #  - events_delta MUST be 0: the backstop is a REST refetchHistory,
         #    ZERO EventSource connections (a reload backstop's connectSSE
         #    bumps events_requests per reconnect — the storm).
-        #  - history_delta MUST be 1: the plain fourth turn emits no
-        #    clear_ui, so the ONLY /history in the send+heal window is the
-        #    backstop's fetch.
+        #  - history_delta MUST be 1: the only /history in the edge+heal
+        #    window is the backstop's fetch.
         events_delta = node.events_requests - events_baseline
         history_delta = node.history_requests - history_baseline
         # REOPEN: the healing render cleared the latch, so a rewind on a
@@ -3583,49 +3581,29 @@ def run_coord_stale_backstop(chrome: str) -> str:
 
 
 def run_coord_heal_midturn(chrome: str) -> str:
-    """Scenario G4 — the render-time gate (#894 r4).  A turn that STARTS
-    while a heal's /history is in flight must SURVIVE the fetch resolution:
-    pre-gate code ran ``replaceChildren`` under the live turn, detaching its
-    bubble/tool rows into dangling refs (every remaining token rendered
-    invisibly, the optimistic user row was destroyed, and nothing
-    re-rendered the lost turn).  The gate skips the wipe instead — the
-    latch stays set and the turn's OWN settle re-fires the backstop.
+    """Scenario G4 — the coordinator's seedless render-time tool gate.
 
-    Choreography: G3's double-failure prologue leaves the latch stuck;
-    ``delay_history`` then holds the backstop fetch that turn 4's settle
-    fires; the moment the held fetch ARRIVES (history_requests bumps before
-    the hold sleeps) the runner sends turn 5 — a paced bash turn (~2.5s)
-    that is still mid-stream when the hold (1.5s) releases.  The gate must
-    skip that resolution (turn 5's sentinel paints into the still-stale
-    transcript = midturnSurvived), and turn 5's settle re-fires the
-    backstop, which now heals: transcript = rewound turn + turns 4 and 5,
-    seeds two/three gone.  Storm proof: zero SSE opens across the whole
-    episode; exactly TWO /history fetches (the skipped one + the heal).
+    G3's double-failure prologue leaves the latch stuck.  A server-origin
+    idle edge starts the seedless backstop fetch and ``delay_history`` holds
+    it.  While it is in flight the recovery server publishes a real
+    ``tool_pending`` envelope through ``SessionUIBase.on_agent_step``.  The
+    coordinator's event-owned ``liveToolCalls`` set is therefore non-empty
+    when the good history response resolves, so the render must be declined:
+    the stale transcript and the live tool shell both remain continuously
+    visible. This avoids using ``/send`` as a trigger; a send would project a
+    live ``user_turn`` and start unrelated model activity while this precise
+    render window is being measured.
 
-    Detector honesty: ``history_delta == 2`` is the DISCRIMINATING bit,
-    and the skip it witnesses rides the event-driven live-tool-call set
-    (fed by turn 5's live tool_pending announce) — turn 5 is in its TOOL
-    phase at resolution (content refs null), so this scenario is the
-    behavioral detector for the gate's tool-phase branch (the content-ref branch and the liveness statement
-    carry structural pins; G5 covers the hidden-retry liveness path).
-    Gate-stripped code renders the held fetch early, which CLEARS the
-    latch, kills the backstop refire, and stamps ``hist1`` (plus
-    downstream posts/rows drift).  The ``mid1`` bit alone cannot
-    discriminate: the early render repaints all three user rows from the
-    snapshot (the rewind pre-dates turn 4, so /history already carries
-    turns 4 and 5's user rows).  On gated code ``mid1`` asserts the
-    stronger continuous-visibility claim (nothing wiped at any point)."""
-    from tests._sse_recovery_server import final_text_script, parallel_bash_script
-
-    paced5 = parallel_bash_script({"g4": "for i in $(seq 1 50); do echo g4-$i; sleep 0.05; done"})
-    node, ws_id = _seed_three_completed_turns(
-        "browser-coord-heal-midturn",
-        extra_scripts=(
-            final_text_script(MIDTURN_T4_SENTINEL),
-            paced5,
-            final_text_script(MIDTURN_T5_SENTINEL),
-        ),
-    )
+    The matching ``tool_result`` retires the live-call entry and a second idle
+    edge re-fires the backstop.  That fetch may render and heals to the single
+    post-rewind user row.  Exact discriminators: the first successful payload
+    completed while rows3 + the live shell survived, zero SSE opens, and
+    exactly two history fetches (declined + healing).  Removing the tool gate
+    renders the first payload, wipes the shell, clears the latch, and leaves
+    only one history fetch."""
+    probe_call_id = "recovery-render-gate-probe"
+    probe_selector = ".conv-batch--running .conv-row[data-call-id='" + probe_call_id + "']"
+    node, ws_id = _seed_three_completed_turns("browser-coord-heal-midturn")
     profile = Path(_scratch()) / "chrome-coord-heal-midturn"
     proc, cdp_port = _launch_chrome(chrome, profile)
     cdp: CDP | None = None
@@ -3636,46 +3614,55 @@ def run_coord_heal_midturn(chrome: str) -> str:
         _coord_stick_latch(cdp, node, "coord-heal-midturn")
         events_baseline = node.events_requests
         history_baseline = node.history_requests
-        # Hold every /history long enough for turn 5 to start under it, but
-        # shorter than turn 5's ~2.5s bash phase, so the held fetch resolves
-        # MID-turn — the exact window the gate exists for.
+        history_ok_baseline = node.history_ok
+        # Hold the first backstop fetch long enough to publish and visibly
+        # confirm the live tool phase before its response resolves.
         node.delay_history(1500)
-        # Turn 4: settles -> idle edge -> backstop fires -> its fetch is
-        # HELD.  history_requests bumps on ARRIVAL (before the hold sleeps),
-        # which is the observable that the window is open.
-        _send_in_page(cdp, "fourth turn")
+        node.emit_idle_edge(ws_id)
         if not _poll_until(lambda: node.history_requests == history_baseline + 1, 20, 0.05):
             raise AssertionError("coord-heal-midturn: backstop fetch never arrived")
-        # Turn 5, INSIDE the hold: paced bash keeps it mid-stream when the
-        # held fetch resolves.  The gate must skip that render.
-        _send_in_page(cdp, "fifth turn")
-        # midturnSurvived: turn 5's final sentinel paints into the
-        # still-stale transcript (user rows unchanged at 3) — a wiped pane
-        # would have dropped to 1 row and swallowed the sentinel into a
-        # detached ref.  Poll spans the hold release (+1.5s) and turn 5's
-        # full run.
-        midturn_survived = _poll_until(
+        node.emit_tool_pending(ws_id, probe_call_id)
+        if not _poll_until(
             lambda: cdp.evaluate(
-                "(document.getElementById('coord-messages').textContent||'')"
-                ".includes(" + json.dumps(MIDTURN_T5_SENTINEL) + ") && " + _COORD_ROWS_JS + " === 3"
+                _COORD_ROWS_JS
+                + " === 3 && !!document.querySelector("
+                + json.dumps(probe_selector)
+                + ")"
             ),
-            20,
-            0.2,
+            10,
+            0.05,
+        ):
+            raise AssertionError("coord-heal-midturn: live tool phase never rendered")
+        # A 200 response proves the held request resolved with a renderable
+        # payload.  Observe for another bounded window so the browser has had
+        # ample time to process it; any wipe flips this predicate immediately.
+        if not _poll_until(lambda: node.history_ok >= history_ok_baseline + 1, 10, 0.05):
+            raise AssertionError("coord-heal-midturn: held /history never resolved successfully")
+        gate_broke = _poll_until(
+            lambda: (
+                not cdp.evaluate(
+                    _COORD_ROWS_JS
+                    + " === 3 && !!document.querySelector("
+                    + json.dumps(probe_selector)
+                    + ")"
+                )
+            ),
+            1.0,
+            0.05,
         )
-        # Release the hold so turn 5's settle-driven backstop refire heals
-        # promptly.
+        midturn_survived = not gate_broke
+
+        # Retire the event-owned live-call entry, then publish the settle edge
+        # that is now allowed to consume and render authoritative history.
         node.delay_history(0)
-        # HEAL: the refire renders the rewound truth — turn "first" + turns
-        # 4 and 5; the rewound-away seeds are GONE.  Text discriminators,
-        # not row counts: the healed pane also has 3 user rows.
+        node.emit_tool_result(ws_id, probe_call_id)
+        node.emit_idle_edge(ws_id)
         healed = _poll_until(
             lambda: cdp.evaluate(
-                "(function(){var t=document.getElementById('coord-messages')"
-                ".textContent||'';return t.includes("
-                + json.dumps(MIDTURN_T4_SENTINEL)
-                + ")&&t.includes("
-                + json.dumps(MIDTURN_T5_SENTINEL)
-                + ")&&!t.includes('second');})()"
+                _COORD_ROWS_JS
+                + " === 1 && !document.querySelector("
+                + json.dumps(".conv-row[data-call-id='" + probe_call_id + "']")
+                + ")"
             ),
             20,
             0.2,
@@ -3715,30 +3702,23 @@ def run_coord_hidden_retry(chrome: str) -> str:
     cursor and double-renders every turn the hidden render already painted.
     The ``evtSource`` fire-guard term skips the hidden firing instead
     (hiddenDelta 0); the show edge only restores the transport
-    (replay_ok carries no synthetic state_change), and the heal rides
-    the runner's plain send, whose organic turn-settle idle edge fires
-    the TRANSPORT-FREE backstop on the live stream.
+    (replay_ok carries no synthetic state_change), and the recovery server
+    publishes a real idle state edge to fire the TRANSPORT-FREE backstop on
+    the live stream without admitting another user row.
 
     A replay_ok reconnect (frozen cursor, nothing lost) carries no
     synthetic state_change — only fresh/truncated replays do — so the
-    latch stays closed after __show until the next ORGANIC settle — exactly the
-    accepted-residual ruling (heals ride organic edges; no timer may
-    shortcut the lag).  The runner drives that settle with a plain send
-    (sends are never latch-gated), whose turn-settle idle edge fires the
-    TRANSPORT-FREE backstop on the live stream.
+    latch stays closed after __show until the next settle edge — exactly the
+    accepted-residual ruling (no timer may shortcut the lag).  The test-server
+    pulse supplies that edge through the real UI event path.
 
     Proofs: history_requests UNCHANGED across the hidden retry window (the
     non-occurrence detector that regresses to hidden1 without the guard);
     exactly ONE new SSE open across show + heal (the user-driven reconnect
-    — the heal itself adds zero); the healed render carries the rewound
-    turn + the sent turn (TWO user rows, sentinel present); the reopen
-    click lands."""
-    from tests._sse_recovery_server import final_text_script
+    — the heal itself adds zero); the healed render carries the single
+    post-rewind user row; the reopen click lands."""
 
-    node, ws_id = _seed_three_completed_turns(
-        "browser-coord-hidden-retry",
-        extra_scripts=(final_text_script(BACKSTOP_SENTINEL),),
-    )
+    node, ws_id = _seed_three_completed_turns("browser-coord-hidden-retry")
     profile = Path(_scratch()) / "chrome-coord-hidden-retry"
     proc, cdp_port = _launch_chrome(chrome, profile)
     cdp: CDP | None = None
@@ -3778,21 +3758,16 @@ def run_coord_hidden_retry(chrome: str) -> str:
         # Show: the reconnect presents the frozen cursor and replays
         # replay_ok (nothing lost), which carries NO synthetic
         # state_change (only fresh/truncated replays do — the
-        # latch-closed lag is the accepted residual).  Wait for the
-        # reconnect itself, then
-        # drive an ORGANIC settle with a plain send — its idle edge fires
-        # the TRANSPORT-FREE backstop on the live stream and the heal
-        # renders the rewound (ONE) + sent (a second) transcript.
+        # latch-closed lag is the accepted residual).  Wait for the reconnect
+        # itself, then publish an idle edge through the loaded UI.  The heal
+        # renders the single post-rewind user row.
         events_before_show = node.events_requests
         cdp.evaluate("window.__show && window.__show()")
         if not _poll_until(lambda: node.events_requests == events_before_show + 1, 10, 0.05):
             raise AssertionError("coord-hidden-retry: show-edge reconnect never arrived")
-        _send_in_page(cdp, "fourth turn")
+        node.emit_idle_edge(ws_id)
         healed = _poll_until(
-            lambda: cdp.evaluate(
-                _COORD_ROWS_JS + " === 2 && (document.getElementById('coord-messages')"
-                ".textContent||'').includes(" + json.dumps(BACKSTOP_SENTINEL) + ")"
-            ),
+            lambda: cdp.evaluate(_COORD_ROWS_JS + " === 1"),
             20,
             0.2,
         )
@@ -4036,6 +4011,429 @@ def run_coord_joined_flight(chrome: str) -> str:
         node.stop()
 
 
+def run_handoff_repair_budget(chrome: str, *, coordinator: bool = False) -> str:
+    """Strong repair is bounded and fail-closed; a rendered tokenless 200 downgrades.
+
+    Four FAILED (500) history responses prove the bounded automatic budget:
+    both real browser clients make exactly four attempts without opening an
+    EventSource, park on the persistent manual prompt, and make one attempt
+    per Retry click. A rendered-but-tokenless 200 is the server's deliberate
+    cold storage-only read (or a pre-handoff server) and must DOWNGRADE to
+    the tokenless bootstrap — one cursorless EventSource, prompt gone — never
+    burn budget against a healthy response. A later resync answered by the
+    real (tokened) server reconnects with proof. A final held attempt is
+    destroyed before it settles and must not resurrect the stream.
+    """
+
+    tag = "COORDHANDOFF" if coordinator else "HANDOFF"
+    scenario = "coord-handoff-repair-budget" if coordinator else "handoff-repair-budget"
+    node = _boot_node()
+    ws_id = node.create_workstream(name=f"browser-{scenario}")
+    profile = Path(_scratch()) / f"chrome-{scenario}"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        route = "coord-recovery" if coordinator else "recovery"
+        url = f"{node.base_url}/{route}?ws_id={ws_id}&scenario={scenario}"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        open_expr = "window.__esOpens || 0" if coordinator else "window.__streamOpen || 0"
+        if not _poll_until(lambda: cdp.evaluate(open_expr) >= 1, 15, 0.1):
+            raise AssertionError(f"{scenario}: initial EventSource never opened")
+
+        history0 = node.history_requests
+        events0 = node.events_requests
+        node.fail_history(4)
+        node.emit_history_resync(ws_id)
+        prompt_expr = "!!document.querySelector('.history-handoff-repair')"
+        if not _poll_until(
+            lambda: node.history_requests == history0 + 4 and cdp.evaluate(prompt_expr),
+            25,
+            0.1,
+        ):
+            raise AssertionError(
+                f"{scenario}: repair did not park after four failed attempts "
+                f"(history={node.history_requests - history0}, events={node.events_requests - events0})"
+            )
+        # No hidden fifth attempt and no unverified EventSource.
+        time.sleep(3)
+        if node.history_requests != history0 + 4 or node.events_requests != events0:
+            raise AssertionError(
+                f"{scenario}: automatic budget failed closed "
+                f"(history={node.history_requests - history0}, events={node.events_requests - events0})"
+            )
+
+        # One manual FAILED response: exactly one request and no auto burst.
+        node.fail_history(1)
+        if not cdp.evaluate("document.querySelector('.history-handoff-retry').click(); true"):
+            raise AssertionError(f"{scenario}: manual retry button missing")
+        if not _poll_until(lambda: node.history_requests == history0 + 5, 8, 0.05):
+            raise AssertionError(f"{scenario}: manual retry did not issue one request")
+        time.sleep(3)
+        if node.history_requests != history0 + 5 or node.events_requests != events0:
+            raise AssertionError(f"{scenario}: manual failure re-armed automatic work")
+
+        # A rendered tokenless 200 downgrades: latch cleared, prompt gone, one
+        # CURSORLESS EventSource (no history_token). The server's tokenless
+        # bootstrap then converges the pane (clear_ui -> one more /history).
+        node.tokenless_history(1)
+        cdp.evaluate("document.querySelector('.history-handoff-retry').click()")
+        if not _poll_until(
+            lambda: (
+                node.history_requests >= history0 + 6
+                and node.events_requests == events0 + 1
+                and not cdp.evaluate(prompt_expr)
+            ),
+            12,
+            0.1,
+        ):
+            raise AssertionError(
+                f"{scenario}: rendered tokenless 200 did not downgrade to bootstrap "
+                f"(history={node.history_requests - history0}, events={node.events_requests - events0})"
+            )
+        tokenless_stream = (
+            cdp.evaluate("!((window.__lastEventSourceUrl || '').includes('history_token='))")
+            if coordinator
+            else cdp.evaluate(
+                "!!window.__pane.evtSource && "
+                "!window.__pane.evtSource.url.includes('history_token=')"
+            )
+        )
+        if not tokenless_stream:
+            raise AssertionError(f"{scenario}: downgraded stream claimed a handoff token")
+
+        # Let the bootstrap convergence (clear_ui refetch) settle before the
+        # next phase snapshots its counters.
+        def _history_settled() -> bool:
+            snapshot = node.history_requests
+            time.sleep(1.0)
+            return node.history_requests == snapshot
+
+        if not _poll_until(_history_settled, 15, 0.1):
+            raise AssertionError(f"{scenario}: bootstrap convergence never settled")
+
+        # A later resync answered by the REAL server reconnects with proof and
+        # never re-parks.
+        settled_history = node.history_requests
+        settled_events = node.events_requests
+        node.emit_history_resync(ws_id)
+        if not _poll_until(
+            lambda: (
+                node.history_requests >= settled_history + 1
+                and node.events_requests == settled_events + 1
+                and not cdp.evaluate(prompt_expr)
+            ),
+            12,
+            0.1,
+        ):
+            raise AssertionError(f"{scenario}: proven repair did not reconnect once")
+        tokened = (
+            cdp.evaluate("(window.__lastEventSourceUrl || '').includes('history_token=')")
+            if coordinator
+            else cdp.evaluate(
+                "!!window.__pane.evtSource && "
+                "window.__pane.evtSource.url.includes('history_token=')"
+            )
+        )
+        if not tokened:
+            raise AssertionError(f"{scenario}: proven repair reopened without proof")
+
+        # Terminal teardown during a held attempt: abort/settle immediately;
+        # when the server-side hold expires, no async tail may reopen.
+        node.delay_history(4000)
+        held0 = node.history_requests
+        opens_before_destroy = node.events_requests
+        node.emit_history_resync(ws_id)
+        if not _poll_until(lambda: node.history_requests == held0 + 1, 5, 0.05):
+            raise AssertionError(f"{scenario}: held teardown attempt never started")
+        history_before_destroy = node.history_requests
+        if coordinator:
+            cdp.evaluate("window.__pane.destroy()")
+        else:
+            cdp.evaluate("window.__ctl.destroy()")
+        time.sleep(5)
+        node.delay_history(0)
+        if (
+            node.events_requests != opens_before_destroy
+            or node.history_requests != history_before_destroy
+        ):
+            raise AssertionError(
+                f"{scenario}: teardown resurrected repair work "
+                f"(history={node.history_requests - history_before_destroy}, "
+                f"events={node.events_requests - opens_before_destroy})"
+            )
+
+        return f"RECOVERY-READY-{tag}-auto4-manual1-downgrade1-proof1-teardown0"
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
+def run_user_turn_two_pane(chrome: str) -> str:
+    """One accepted USER reaches two upgraded panes with no REST/redial fan-out."""
+
+    from tests._sse_recovery_server import final_text_script
+
+    node = _boot_node()
+    ws_id = node.create_workstream(
+        final_text_script("projection acknowledged"),
+        name="browser-user-turn-two-pane",
+    )
+    profile = Path(_scratch()) / "chrome-user-turn-two-pane"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    message = "one shared projected prompt"
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=user-turn-two-pane"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        opened = _poll_until(
+            lambda: (
+                (cdp.evaluate("window.__streamOpen || 0") or 0) == 1
+                and (cdp.evaluate("window.__peerStreamOpen || 0") or 0) == 1
+            ),
+            20,
+            0.1,
+        )
+        if not opened:
+            diagnostics = cdp.evaluate(
+                "({originOpens:window.__streamOpen||0,"
+                "peerOpens:window.__peerStreamOpen||0,"
+                "originUrl:window.__pane&&window.__pane.evtSource&&window.__pane.evtSource.url,"
+                "peerUrl:window.__peerPane&&window.__peerPane.evtSource&&"
+                "window.__peerPane.evtSource.url,title:document.title})"
+            )
+            raise AssertionError(
+                "user-turn-two-pane: both initial streams did not open once "
+                f"(browser={diagnostics!r}, history={node.history_requests}, "
+                f"events={node.events_requests})"
+            )
+
+        capability_urls = cdp.evaluate(
+            "({origin: window.__pane.evtSource.url, peer: window.__peerPane.evtSource.url})"
+        )
+        if not all("user_turn=1" in capability_urls[name] for name in ("origin", "peer")):
+            raise AssertionError(f"user-turn-two-pane: capability missing from {capability_urls!r}")
+
+        # Count reducer deliveries themselves as well as DOM rows. This catches
+        # a duplicate event that happened to be hidden by DOM/event-id dedup.
+        cdp.evaluate(
+            "window.__originUserEvents=0; window.__peerUserEvents=0; "
+            "window.__originRepairEvents=0; window.__peerRepairEvents=0; "
+            "const oh=window.__pane.handleEvent.bind(window.__pane); "
+            "window.__pane.handleEvent=function(e){"
+            "if(e&&e.type==='user_turn')window.__originUserEvents++;"
+            "if(e&&e.type==='replay_truncated')window.__originRepairEvents++;"
+            "return oh(e);}; "
+            "const ph=window.__peerPane.handleEvent.bind(window.__peerPane); "
+            "window.__peerPane.handleEvent=function(e){"
+            "if(e&&e.type==='user_turn')window.__peerUserEvents++;"
+            "if(e&&e.type==='replay_truncated')window.__peerRepairEvents++;"
+            "return ph(e);}; true"
+        )
+        history0 = node.history_requests
+        events0 = node.events_requests
+        cdp.evaluate(f"window.__sendProjectedUserTurn({json.dumps(message)})")
+
+        rows_expr = (
+            "window.__pane.messagesEl.querySelectorAll('.msg.user').length===1 && "
+            "window.__peerPane.messagesEl.querySelectorAll('.msg.user').length===1"
+        )
+        if not _poll_until(lambda: bool(cdp.evaluate(rows_expr)), 12, 0.05):
+            raise AssertionError("user-turn-two-pane: canonical rows did not render once")
+        node.wait_turn(ws_id, timeout=30)
+        time.sleep(0.5)
+
+        state = cdp.evaluate(
+            "(()=>{const row=(p)=>p.messagesEl.querySelector('.msg.user');"
+            "const text=(r)=>r&&r.querySelector('.msg-user-text')&&"
+            "r.querySelector('.msg-user-text').textContent;"
+            "const o=row(window.__pane),p=row(window.__peerPane);"
+            "return {originRows:window.__pane.messagesEl.querySelectorAll('.msg.user').length,"
+            "peerRows:window.__peerPane.messagesEl.querySelectorAll('.msg.user').length,"
+            "originText:text(o),peerText:text(p),"
+            "originId:o&&o.dataset.eventId,peerId:p&&p.dataset.eventId,"
+            "originEvents:window.__originUserEvents,peerEvents:window.__peerUserEvents,"
+            "originRepair:window.__originRepairEvents,peerRepair:window.__peerRepairEvents,"
+            "originOpens:window.__streamOpen,peerOpens:window.__peerStreamOpen};})()"
+        )
+        if state != {
+            "originRows": 1,
+            "peerRows": 1,
+            "originText": message,
+            "peerText": message,
+            "originId": state.get("originId"),
+            "peerId": state.get("peerId"),
+            "originEvents": 1,
+            "peerEvents": 1,
+            "originRepair": 0,
+            "peerRepair": 0,
+            "originOpens": 1,
+            "peerOpens": 1,
+        }:
+            raise AssertionError(f"user-turn-two-pane: unexpected projection state {state!r}")
+        if not state["originId"] or state["originId"] != state["peerId"]:
+            raise AssertionError(f"user-turn-two-pane: canonical ids diverged {state!r}")
+        if node.history_requests != history0 or node.events_requests != events0:
+            raise AssertionError(
+                "user-turn-two-pane: normal send caused REST/redial fan-out "
+                f"(history={node.history_requests - history0}, events={node.events_requests - events0})"
+            )
+        return "RECOVERY-READY-USERTURN-panes2-rows1-events1-history0-redial0"
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
+def run_tool_turn_two_pane(chrome: str) -> str:
+    """Two accepted TOOL rows reach two panes without REST/redial fan-out."""
+
+    from tests._sse_recovery_server import bash_toolcall_script, final_text_script
+
+    call_id = "browser-reused-tool-id"
+    first_sentinel = "TOOL_ONE_SENTINEL"
+    second_sentinel = "TOOL_TWO_SENTINEL"
+    node = _boot_node()
+    ws_id = node.create_workstream(
+        bash_toolcall_script(call_id, f"printf {first_sentinel}"),
+        bash_toolcall_script(call_id, f"printf {second_sentinel}"),
+        final_text_script("tool projection acknowledged"),
+        name="browser-tool-turn-two-pane",
+    )
+    profile = Path(_scratch()) / "chrome-tool-turn-two-pane"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=tool-turn-two-pane"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        opened = _poll_until(
+            lambda: (
+                (cdp.evaluate("window.__streamOpen || 0") or 0) == 1
+                and (cdp.evaluate("window.__peerStreamOpen || 0") or 0) == 1
+            ),
+            20,
+            0.1,
+        )
+        if not opened:
+            diagnostics = cdp.evaluate(
+                "({originOpens:window.__streamOpen||0,"
+                "peerOpens:window.__peerStreamOpen||0,"
+                "originUrl:window.__pane&&window.__pane.evtSource&&window.__pane.evtSource.url,"
+                "peerUrl:window.__peerPane&&window.__peerPane.evtSource&&"
+                "window.__peerPane.evtSource.url,title:document.title})"
+            )
+            raise AssertionError(
+                "tool-turn-two-pane: both initial streams did not open once "
+                f"(browser={diagnostics!r}, history={node.history_requests}, "
+                f"events={node.events_requests})"
+            )
+
+        capability_urls = cdp.evaluate(
+            "({origin: window.__pane.evtSource.url, peer: window.__peerPane.evtSource.url})"
+        )
+        for name in ("origin", "peer"):
+            if "tool_turn=1" not in capability_urls[name]:
+                raise AssertionError(
+                    f"tool-turn-two-pane: capability missing from {capability_urls!r}"
+                )
+
+        # Count reducer deliveries separately from DOM convergence. Each tool
+        # emits a preliminary receipt and one accepted replacement; only the
+        # accepted frames are the durable projection under test.
+        cdp.evaluate(
+            "window.__originAcceptedToolEvents=[]; window.__peerAcceptedToolEvents=[]; "
+            "window.__originRepairEvents=0; window.__peerRepairEvents=0; "
+            "const oh=window.__pane.handleEvent.bind(window.__pane); "
+            "window.__pane.handleEvent=function(e){"
+            "if(e&&e.type==='tool_result'&&e.accepted===true)"
+            "window.__originAcceptedToolEvents.push({id:e.call_id,name:e.name,output:e.output});"
+            "if(e&&e.type==='replay_truncated')window.__originRepairEvents++;"
+            "return oh(e);}; "
+            "const ph=window.__peerPane.handleEvent.bind(window.__peerPane); "
+            "window.__peerPane.handleEvent=function(e){"
+            "if(e&&e.type==='tool_result'&&e.accepted===true)"
+            "window.__peerAcceptedToolEvents.push({id:e.call_id,name:e.name,output:e.output});"
+            "if(e&&e.type==='replay_truncated')window.__peerRepairEvents++;"
+            "return ph(e);}; true"
+        )
+        history0 = node.history_requests
+        events0 = node.events_requests
+        cdp.evaluate("window.__sendProjectedUserTurn('run two reused-id tools')")
+        node.wait_turn(ws_id, timeout=45)
+
+        ready_expr = (
+            "window.__originAcceptedToolEvents.length===2 && "
+            "window.__peerAcceptedToolEvents.length===2 && "
+            f"window.__pane.messagesEl.querySelectorAll('.conv-row[data-call-id=\"{call_id}\"]').length===2 && "
+            f"window.__peerPane.messagesEl.querySelectorAll('.conv-row[data-call-id=\"{call_id}\"]').length===2"
+        )
+        if not _poll_until(lambda: bool(cdp.evaluate(ready_expr)), 15, 0.05):
+            raise AssertionError("tool-turn-two-pane: canonical rows did not converge twice")
+        time.sleep(0.5)
+
+        state = cdp.evaluate(
+            "(()=>{const project=(p)=>Array.from(p.messagesEl.querySelectorAll('.conv-batch'))"
+            f".filter((b)=>b.querySelector('.conv-row[data-call-id=\"{call_id}\"]'))"
+            ".map((b)=>({outputs:Array.from(b.querySelectorAll('.tool-output'))"
+            ".map((o)=>o.textContent)}));"
+            "return {origin:project(window.__pane),peer:project(window.__peerPane),"
+            "originEvents:window.__originAcceptedToolEvents,"
+            "peerEvents:window.__peerAcceptedToolEvents,"
+            "originRepair:window.__originRepairEvents,peerRepair:window.__peerRepairEvents,"
+            "originOpens:window.__streamOpen,peerOpens:window.__peerStreamOpen};})()"
+        )
+        for pane_name in ("origin", "peer"):
+            batches = state[pane_name]
+            if len(batches) != 2:
+                raise AssertionError(f"tool-turn-two-pane: {pane_name} batches={batches!r}")
+            rendered = ["\n".join(batch["outputs"]) for batch in batches]
+            if not all(
+                expected in rendered[index] and other not in rendered[index]
+                for index, (expected, other) in enumerate(
+                    ((first_sentinel, second_sentinel), (second_sentinel, first_sentinel))
+                )
+            ):
+                raise AssertionError(
+                    f"tool-turn-two-pane: {pane_name} occurrence outputs crossed {rendered!r}"
+                )
+            events = state[f"{pane_name}Events"]
+            if [event["id"] for event in events] != [call_id, call_id]:
+                raise AssertionError(
+                    f"tool-turn-two-pane: {pane_name} event ids diverged {events!r}"
+                )
+            event_outputs = [event["output"] for event in events]
+            if not all(
+                expected in event_outputs[index] and other not in event_outputs[index]
+                for index, (expected, other) in enumerate(
+                    ((first_sentinel, second_sentinel), (second_sentinel, first_sentinel))
+                )
+            ):
+                raise AssertionError(
+                    f"tool-turn-two-pane: {pane_name} accepted outputs crossed {events!r}"
+                )
+        if state["originRepair"] != 0 or state["peerRepair"] != 0:
+            raise AssertionError(f"tool-turn-two-pane: unexpected repair {state!r}")
+        if state["originOpens"] != 1 or state["peerOpens"] != 1:
+            raise AssertionError(f"tool-turn-two-pane: stream reopened {state!r}")
+        if node.history_requests != history0 or node.events_requests != events0:
+            raise AssertionError(
+                "tool-turn-two-pane: normal tool rows caused REST/redial fan-out "
+                f"(history={node.history_requests - history0}, "
+                f"events={node.events_requests - events0})"
+            )
+        return "RECOVERY-READY-TOOLTURN-panes2-rows2-events2-history0-redial0"
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
 def _wait_state(node: Any, ws_id: str, state: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -4092,6 +4490,10 @@ def main() -> None:
             "coord-hidden-retry",
             "coord-orphan-rewind",
             "coord-joined-flight",
+            "handoff-repair-budget",
+            "coord-handoff-repair-budget",
+            "user-turn-two-pane",
+            "tool-turn-two-pane",
             "roster-restart",
             "roster-restart-native",
             "both",
@@ -4188,6 +4590,22 @@ def main() -> None:
     if args.scenario in ("coord-joined-flight", "all"):
         verdict = run_coord_joined_flight(chrome)
         print(f"scenario G7 (coord-joinedflight): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("handoff-repair-budget", "all"):
+        verdict = run_handoff_repair_budget(chrome)
+        print(f"scenario H1 (handoff-budget): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("coord-handoff-repair-budget", "all"):
+        verdict = run_handoff_repair_budget(chrome, coordinator=True)
+        print(f"scenario H2 (coord-handoff-budget): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("user-turn-two-pane", "all"):
+        verdict = run_user_turn_two_pane(chrome)
+        print(f"scenario I1 (user-turn-two-pane): {verdict}")
+        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    if args.scenario in ("tool-turn-two-pane", "all"):
+        verdict = run_tool_turn_two_pane(chrome)
+        print(f"scenario I2 (tool-turn-two-pane): {verdict}")
         failures += 0 if verdict.startswith("RECOVERY-READY") else 1
     if args.scenario in ("roster-restart", "all"):
         verdict = run_roster_restart(chrome)

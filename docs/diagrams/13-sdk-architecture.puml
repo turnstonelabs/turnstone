@@ -32,7 +32,8 @@ package "turnstone/sdk/ (Python)" {
         + approve()
         + command()
         + cancel(ws_id)
-        + stream_events(ws_id)
+        + get_history(ws_id, limit) → WorkstreamHistoryResponse
+        + stream_events(ws_id, last_event_id?, history_token?)
         + stream_global_events()
         + send_and_wait()
         + list_saved_workstreams()
@@ -87,6 +88,13 @@ package "turnstone/sdk/ (Python)" {
         + ok: bool
     }
 
+    class WorkstreamHistoryResponse <<type>> {
+        + ws_id: str
+        + messages: list[dict]
+        + cursor: int | None
+        + handoff_token: str | None
+    }
+
     class ServerEvent <<event>> {
         + type: str
         + ws_id: str
@@ -105,6 +113,7 @@ package "turnstone/sdk/ (Python)" {
     TurnstoneConsole --> AsyncTurnstoneConsole : wraps
     TurnstoneConsole --> _SyncRunner : uses
     AsyncTurnstoneServer ..> TurnResult : returns
+    AsyncTurnstoneServer ..> WorkstreamHistoryResponse : renders before SSE
     AsyncTurnstoneServer ..> ServerEvent : yields
     AsyncTurnstoneConsole ..> ClusterEvent : yields
 }
@@ -122,7 +131,8 @@ package "sdk/typescript/ (TypeScript)" {
     class "TurnstoneServer" as TSServer <<ts>> {
         + listWorkstreams()
         + send()
-        + streamEvents()
+        + getHistory() → WorkstreamHistoryResponse
+        + streamEvents(cursor?, token?)
         + sendAndWait()
         ...
     }
@@ -152,6 +162,12 @@ note right of AsyncTurnstoneServer
   Returns Pydantic models from
   turnstone.api.server_schemas
   (no type duplication)
+end note
+
+note bottom of ServerEvent
+  history_resync is a typed repair signal.
+  SDKs expose the REST cursor/token handshake but
+  never refetch, render, or reconnect automatically.
 end note
 
 @enduml

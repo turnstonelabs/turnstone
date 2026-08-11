@@ -38,6 +38,7 @@ from turnstone.api.server_schemas import (
     MemoryInfo,
     SendResponse,
     UploadAttachmentResponse,
+    WorkstreamHistoryResponse,
 )
 from turnstone.sdk._base import _BaseClient
 from turnstone.sdk._sync import _SyncRunner
@@ -215,10 +216,13 @@ class AsyncTurnstoneServer(_BaseClient):
         ws_id: str,
         *,
         attachment_ids: list[str] | None = None,
+        client_send_id: str | None = None,
     ) -> SendResponse:
         body: dict[str, Any] = {"message": message}
         if attachment_ids is not None:
             body["attachment_ids"] = list(attachment_ids)
+        if client_send_id is not None:
+            body["client_send_id"] = client_send_id
         return await self._request(
             "POST",
             f"/v1/api/workstreams/{ws_id}/send",
@@ -350,11 +354,56 @@ class AsyncTurnstoneServer(_BaseClient):
             response_model=StatusResponse,
         )
 
+    # -- history --------------------------------------------------------------
+
+    async def get_history(
+        self,
+        ws_id: str,
+        *,
+        limit: int = 100,
+    ) -> WorkstreamHistoryResponse:
+        """Return the requested tail of the authoritative total accepted row prefix.
+
+        A loaded workstream may include a one-shot ``handoff_token``.  A caller
+        that renders this response can pass that token, together with the
+        optional ``cursor``, to its next :meth:`stream_events` call.  A 503 is
+        raised as :class:`TurnstoneAPIError`; that response is not authoritative
+        and must not replace a previously rendered transcript.
+        """
+        return await self._request(
+            "GET",
+            f"/v1/api/workstreams/{ws_id}/history",
+            params={"limit": limit},
+            response_model=WorkstreamHistoryResponse,
+        )
+
     # -- streaming -----------------------------------------------------------
 
-    async def stream_events(self, ws_id: str) -> AsyncIterator[ServerEvent]:
-        """Iterate over per-workstream SSE events."""
-        async for data in self._stream_sse(f"/v1/api/workstreams/{ws_id}/events"):
+    async def stream_events(
+        self,
+        ws_id: str,
+        *,
+        last_event_id: int | None = None,
+        history_token: str | None = None,
+    ) -> AsyncIterator[ServerEvent]:
+        """Iterate over per-workstream SSE events.
+
+        ``last_event_id`` and ``history_token`` are initial connection hints.
+        Pass the cursor and one-shot token returned by the history response only
+        after rendering that response.  If the stream yields
+        :class:`HistoryResyncEvent`, stop it, fetch and render history again, and
+        open a new stream with the new hints.  This raw iterator does not
+        reconnect or apply transcript-repair policy automatically.
+        """
+        params: dict[str, Any] = {"user_turn": 1}
+        if last_event_id is not None:
+            params["last_event_id"] = last_event_id
+        if history_token:
+            params["history_token"] = history_token
+        async for data in self._stream_sse(
+            f"/v1/api/workstreams/{ws_id}/events",
+            params=params,
+        ):
             yield ServerEvent.from_dict(data)
 
     async def stream_global_events(self) -> AsyncIterator[ServerEvent]:
@@ -398,7 +447,10 @@ class AsyncTurnstoneServer(_BaseClient):
         result = TurnResult(ws_id=ws_id)
 
         async def _consume() -> None:
-            async for data in self._stream_sse(f"/v1/api/workstreams/{ws_id}/events"):
+            async for data in self._stream_sse(
+                f"/v1/api/workstreams/{ws_id}/events",
+                params={"user_turn": 1},
+            ):
                 event = ServerEvent.from_dict(data)
                 if on_event:
                     on_event(event)
@@ -679,8 +731,16 @@ class TurnstoneServer:
         ws_id: str,
         *,
         attachment_ids: list[str] | None = None,
+        client_send_id: str | None = None,
     ) -> SendResponse:
-        return self._runner.run(self._async.send(message, ws_id, attachment_ids=attachment_ids))
+        return self._runner.run(
+            self._async.send(
+                message,
+                ws_id,
+                attachment_ids=attachment_ids,
+                client_send_id=client_send_id,
+            )
+        )
 
     # -- attachments ---------------------------------------------------------
 
@@ -738,10 +798,27 @@ class TurnstoneServer:
     def retry(self, ws_id: str) -> StatusResponse:
         return self._runner.run(self._async.retry(ws_id))
 
+    # -- history --------------------------------------------------------------
+
+    def get_history(self, ws_id: str, *, limit: int = 100) -> WorkstreamHistoryResponse:
+        return self._runner.run(self._async.get_history(ws_id, limit=limit))
+
     # -- streaming -----------------------------------------------------------
 
-    def stream_events(self, ws_id: str) -> Iterator[ServerEvent]:
-        return self._runner.run_iter(self._async.stream_events(ws_id))
+    def stream_events(
+        self,
+        ws_id: str,
+        *,
+        last_event_id: int | None = None,
+        history_token: str | None = None,
+    ) -> Iterator[ServerEvent]:
+        return self._runner.run_iter(
+            self._async.stream_events(
+                ws_id,
+                last_event_id=last_event_id,
+                history_token=history_token,
+            )
+        )
 
     def stream_global_events(self) -> Iterator[ServerEvent]:
         return self._runner.run_iter(self._async.stream_global_events())

@@ -22,6 +22,7 @@ import json
 import mimetypes
 import os
 import queue
+import random
 import re
 import shlex
 import shutil
@@ -33,9 +34,9 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape as _html_escape
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast
 
 import httpx
 
@@ -77,15 +78,11 @@ from turnstone.core.lowering import (
 )
 from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.memory import (
-    count_messages,
     count_structured_memories,
-    delete_messages_after,
     delete_structured_memory_by_id,
     delete_workstream,
     get_attachments,
     get_compaction_checkpoint,
-    get_compaction_floor,
-    get_compaction_watermark,
     get_skill_by_name,
     get_structured_memory_by_name,
     get_workstream_display_name,
@@ -98,16 +95,16 @@ from turnstone.core.memory import (
     load_workstream_config,
     normalize_key,
     resolve_workstream,
-    save_attachment,
     save_message,
     save_messages_bulk,
     save_structured_memory,
+    save_tool_message_with_attachments,
+    save_user_message_with_attachments,
     save_workstream_config,
     search_history,
     search_history_recent,
     search_structured_memories,
     search_visible_structured_memories,
-    set_message_attachments,
     set_workstream_alias,
     touch_structured_memories,
     update_workstream_title,
@@ -195,9 +192,15 @@ from turnstone.core.preview import (
 )
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
+from turnstone.core.session_worker import WorkerClaim, current_worker_claim
 from turnstone.core.settings_registry import DEFAULT_AUTO_COMPACT_PCT
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
+from turnstone.core.storage import (
+    AttachmentWrite,
+    ConversationCommitConflictError,
+    ConversationCommitWorkstreamGoneError,
+)
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.storage._utils import (
     COMPACTION_SOURCE,
@@ -224,6 +227,7 @@ from turnstone.core.tools import (
     merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
+    PROVENANCE_META_KEY,
     AttachmentRef,
     EffectStatus,
     ProviderNative,
@@ -231,6 +235,7 @@ from turnstone.core.trajectory import (
     TextBlock,
     ToolCall,
     Turn,
+    TurnProvenance,
     dicts_from_turns,
     last_assistant_text,
     turn_from_dict,
@@ -243,6 +248,7 @@ from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
     PENDING_SENDS_MAX,
     WorkstreamKind,
+    concrete_method,
 )
 from turnstone.prompts import (
     INTERACTIVE_CONSENT_CLIENT_TYPES,
@@ -326,6 +332,27 @@ class CrossUserInterjectionError(Exception):
     """
 
 
+class ConversationPersistenceError(Exception):
+    """An accepted conversation row could not be durably reconciled.
+
+    The row remains in the live history handoff journal.  Later sends must stop
+    before appending a causal suffix until the idempotent commit succeeds (or a
+    history read proves that an in-row-only commit already landed).  This is
+    distinct from an ordinary provider/tool failure: generic failure cleanup
+    flushes queued user messages, which would create a durable row *after* the
+    missing boundary.
+    """
+
+
+class _MalformedToolBatchError(RuntimeError):
+    """Provider tool calls cannot be executed without unambiguous identities."""
+
+
+_CONVERSATION_PERSISTENCE_RETRY_BASE_SECONDS = 1.0
+_CONVERSATION_PERSISTENCE_RETRY_CAP_SECONDS = 60.0
+_SOFT_CLOSE_STRUCTURAL_WAIT_SECONDS = 1.0
+
+
 class _CompactionIrreducibleError(Exception):
     """Raised by ``ChatSession._summarize_blocks`` when chunked summarisation
     cannot shrink the input — a recursion level fails to reduce the block count,
@@ -340,10 +367,39 @@ class _CompactionIrreducibleError(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class _SummaryResult:
-    """Compacted text plus the provider label from its final model turn."""
+    """Compacted text plus the identity of its final model turn."""
 
     text: str
     producer: str | None
+    provenance: TurnProvenance = dataclasses.field(default_factory=TurnProvenance)
+
+
+_ModelCalibrationKey = tuple[str, str, int]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TokenCalibration:
+    """One producing model binding's prompt estimator.
+
+    ``prompt_tokens`` anchors the exact prefix whose object identities ride in
+    ``message_prefix_ids``.  ``None`` retains the learned tokenizer ratio while
+    explicitly invalidating an anchor after a structural history replacement.
+    """
+
+    chars_per_token: float
+    prompt_tokens: int | None = None
+    message_prefix_ids: tuple[int, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ServingFailureContext:
+    """Secret-free identity of the lane that raised a terminal stream error."""
+
+    model_alias: str
+    backend_model_id: str
+    registry_generation: int
+    provider_label: str
+    base_url: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -363,6 +419,31 @@ class _CancelledToolResult:
     is_error: bool
     preview: dict[str, Any] | None
     live_emitted: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class _PendingConversationCommit:
+    """One accepted conversation row awaiting a complete durable ACK.
+
+    ``ack_from_durable_row`` is normally true because every accepted row kind
+    uses one keyed transaction (including user/tool attachments). It is
+    switched off after an immutable-key conflict: seeing a different durable
+    row with the same key must not acknowledge or hide the intended pending
+    operation.
+    """
+
+    commit_key: str
+    message: dict[str, Any]
+    persist: Callable[[], int]
+    ack_from_durable_row: bool = True
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ToolStructuralDebt:
+    """One accepted assistant tool-call block awaiting matching TOOL rows."""
+
+    generation: int
+    call_ids: tuple[str, ...]
 
 
 def _cancelled_observed_result_detail(
@@ -910,7 +991,21 @@ class _StreamTurnConsumer:
             content = self.partial_content()
             self._flush_terminal_carries()
             self._session.ui.on_stream_end()
-            self._session._cancelled_partial_msg = {"role": "assistant", "content": content}
+            msg: dict[str, Any] = {"role": "assistant", "content": content}
+            lane = self.lane
+            if lane is not None:
+                principal_id = (
+                    self._session._generation_principals.get(self._my_generation, "")
+                    if self._my_generation
+                    else ""
+                )
+                msg["_provenance"] = TurnProvenance(
+                    model_alias=lane.alias,
+                    backend_model_id=lane.model,
+                    registry_generation=lane.registry_generation,
+                    acting_principal_id=principal_id,
+                ).to_meta()
+            self._session._cancelled_partial_msg = msg
 
         self._session._publish_for_generation(
             self._my_generation,
@@ -2110,18 +2205,56 @@ def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None,
     return f"Error: {ssrf_err}.{hint}", False, is_private_block
 
 
+def _attachment_writes(attachments: Iterable[Attachment]) -> tuple[AttachmentWrite, ...]:
+    """Project resolved attachments onto the atomic conversation-write shape.
+
+    ``size_bytes`` is derived from the content actually being written rather
+    than carried alongside it, so the durable row can never disagree with the
+    blob.  Shared by the user-turn path and both accepted-TOOL-row paths.
+    """
+    return tuple(
+        AttachmentWrite(
+            attachment_id=attachment.attachment_id,
+            filename=attachment.filename,
+            mime_type=attachment.mime_type,
+            size_bytes=len(attachment.content),
+            kind=attachment.kind,
+            content=attachment.content,
+        )
+        for attachment in attachments
+    )
+
+
 def _tool_turn_meta(
-    status: EffectStatus | None, preview: dict[str, Any] | None = None
+    status: EffectStatus | None,
+    preview: dict[str, Any] | None = None,
+    *,
+    acting_principal: str = "",
 ) -> str | None:
     """Serialize a tool turn's typed side-channels to the ``conversations.meta``
-    JSON envelope: the effect disposition and/or the preview-pane descriptor.
-    Role-exclusive with ``source_meta`` (which rides SYSTEM turns); the decode +
-    role routing lives in ``reconstruct_turns``. No channels → no meta."""
+    JSON envelope: the effect disposition, the preview-pane descriptor, and/or
+    the principal the turn executed under.  Role-exclusive with ``source_meta``
+    (which rides SYSTEM turns); the decode + role routing lives in
+    ``reconstruct_turns``. No channels → no meta.
+
+    ``acting_principal`` is the generation's bound acting principal — the same
+    identity the accepted ASSISTANT row records as its provenance
+    ``acting_principal_id`` axis — so revocation and audit queries can read a
+    TOOL row's principal directly instead of joining back to the assistant row
+    that opened its batch.  It is deliberately NOT the four-axis provenance
+    envelope: a tool row is an effect receipt, not a model attempt, and empty
+    kernel axes would falsify what that envelope promises.  Empty (wake,
+    internal, and CLI lanes) omits the key rather than persisting a
+    meaningless empty string, matching the USER row's ``sender`` convention.
+    Private audit metadata: no projection lowers it to a wire or public
+    payload."""
     envelope: dict[str, Any] = {}
     if status is not None:
         envelope["effect_status"] = status.value
     if preview:
         envelope["preview"] = preview
+    if acting_principal:
+        envelope["acting_principal"] = acting_principal
     return json.dumps(envelope) if envelope else None
 
 
@@ -2150,6 +2283,29 @@ def _speaks_for_backend(err: BaseException) -> bool:
     predicate both walk arms use, so primary and fallback can never
     classify the same error differently."""
     return not isinstance(err, _NON_BACKEND_ERRORS)
+
+
+def _queued_row_owner(row: tuple[str, ...]) -> str:
+    """Owner principal of a queued-message row; ``""`` = unowned/legacy.
+
+    THE single reading of the tuple layout "owner is index 2 when
+    present" — the partition pop, the foreign-row predicate, the
+    identity-swap notice counting, and the advisory sender stamp must
+    all agree, or the before_spawn gate and the retention behavior
+    contradict each other.  Deliberately no ``.strip()``: owners are
+    stripped at write time and legacy rows injected by tests must read
+    back verbatim.
+    """
+    return row[2] if len(row) >= 3 and row[2] else ""
+
+
+def _queued_row_client_send_id(row: tuple[str, ...]) -> str:
+    """Browser correlation id of a queued row; ``""`` when absent.
+
+    The ``row[3]`` sibling of :func:`_queued_row_owner` — both fields'
+    layout knowledge is single-sourced together.
+    """
+    return row[3] if len(row) >= 4 and row[3] else ""
 
 
 class ChatSession:
@@ -2283,6 +2439,7 @@ class ChatSession:
             model_binding,
             lane=dataclasses.replace(
                 model_binding.lane,
+                registry_generation=model_binding.registry_generation,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort or None,
                 backend_auth_resolver=self._model_backend_auth_token,
@@ -2308,8 +2465,21 @@ class ChatSession:
         # cannot improve until an admin edits it.
         self._rebind_failed_key: tuple[str, int] | None = None
         self._rebind_failed_cause: str | None = None
+        # Exception objects are not uniformly attribute- or weakref-capable.
+        # Retain the value-only lane snapshot out-of-band until the fatal
+        # formatter consumes it; no client, resolver, credential, or principal
+        # crosses this boundary.
+        self._serving_failure_context_lock = threading.Lock()
+        self._serving_failure_contexts: dict[int, tuple[BaseException, _ServingFailureContext]] = {}
         self._health_registry = health_registry
         self.ui = ui
+        # Give the UI a self-derivation path for session-owned reporting
+        # (persistence state) so it never resolves this session through a
+        # registry by id — that lookup misses (or hits an id-reuse
+        # replacement) exactly during tombstone retention and retirement.
+        bind_session = concrete_method(ui, "bind_session")
+        if bind_session is not None:
+            bind_session(self)
         self.instructions = instructions
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -2490,6 +2660,12 @@ class ChatSession:
         # Turns→dicts at that boundary until those layers migrate.
         self.messages: list[Turn] = []
         self._last_usage: dict[str, int] | None = None
+        # Provider tokenization varies by coherent serving identity.  A
+        # fallback's ratio and prompt anchor must not replace the primary's:
+        # the next A dispatch after A -> B fallback resumes A's estimator.
+        self._token_calibrations: dict[_ModelCalibrationKey, _TokenCalibration] = {}
+        self._active_token_calibration_key: _ModelCalibrationKey | None = None
+        self._last_usage_calibration_key: _ModelCalibrationKey | None = None
         self._msg_tokens: list[int] = []  # parallel to self.messages
         self._system_tokens = 0  # tokens for system_messages
         # Workstream template metadata
@@ -2558,17 +2734,30 @@ class ChatSession:
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
         # Queued user turns never carry attachments — see
         # ``AttachmentsNotQueueableError`` for the role-ordering reason —
-        # so the entry tuple is just ``(cleaned, priority)``.
+        # so the entry tuple is ``(cleaned, priority, owner_principal)``.
+        # The immutable owner prevents a retained interjection from being
+        # drained under another participant after a persistence failure.
         # Ids retracted while a dispatcher held the popped items — the
         # DELETE route can land during the handoff's in-flight send, find
         # the id already popped, and answer "already sent"; a restore
         # that resurrected it would deliver a message the user explicitly
-        # cancelled.  Written under ``_queued_lock``; cleared at each pop
-        # (a new window) and consumed by the restore.
+        # cancelled.  Written under ``_queued_lock``; per-id: each pop
+        # discards the stale records for the ids it pops, the restore
+        # consumes the records for the ids it considered.
         self._retracted_while_popped: set[str] = set()
-        self._queued_messages: collections.OrderedDict[str, tuple[str, str]] = (
-            collections.OrderedDict()
-        )
+        # Ids currently held by an OPEN pop window (popped, not yet
+        # committed/restored/discarded).  ``dequeue_message`` records a
+        # retraction into the ledger above ONLY for these ids — a miss
+        # for any other id (already delivered, never queued) records
+        # nothing, which is what bounds the ledger: with per-id
+        # discipline nothing would ever prune such an entry.  All
+        # mutation under ``_queued_lock``; every window close removes
+        # its ids via ``_restore_queued_messages`` (atomic with its
+        # ledger consume) or ``_close_pop_window``.
+        self._popped_in_flight: set[str] = set()
+        self._queued_messages: collections.OrderedDict[
+            str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]
+        ] = collections.OrderedDict()
         self._queued_lock = threading.Lock()
         # Repeat detection: streak counter over tool-call signatures.
         # Fires when a (name, args) signature has been seen N times in
@@ -2605,6 +2794,21 @@ class ChatSession:
         # outside this lock and cooperatively cancellable.
         self._generation_transition_lock = threading.Lock()
         self._generation_lock = threading.RLock()
+        # An accepted assistant row with provider tool calls creates a
+        # generation-owned structural obligation: one journaled TOOL row per
+        # call must exist before a terminal close or successor generation can
+        # cross it. The condition lets soft close cooperatively cancel and
+        # wait briefly without holding the generation lock needed by the
+        # worker's cancellation/failure finalizer.
+        self._tool_structural_condition = threading.Condition(self._generation_lock)
+        self._tool_structural_debt: _ToolStructuralDebt | None = None
+        self._soft_close_preparing = False
+        # Acting-user changes touch several coupled MCP listener/catalog
+        # projections.  Serialize the whole rebind independently of generation
+        # transitions: Stop/force remains responsive, while a stale predecessor
+        # must finish (and fail its owner check) before the successor installs
+        # the final actor projection.
+        self._acting_user_bind_lock = threading.Lock()
         self._publication_shutdown = False
         # Durable writes admitted by generation commits execute in the same
         # order as their in-memory/live commits, but never while
@@ -2616,6 +2820,52 @@ class ChatSession:
         self._durability_cond = threading.Condition(threading.Lock())
         self._durability_next_ticket = 0
         self._durability_serving_ticket = 0
+        # A destructive history cut is admitted onto the durability lane, but
+        # applies its live slice only after the storage transaction commits.
+        # While that ticket is active, later generation/direct commits wait on
+        # this condition before mutating conversation state.  Stop and terminal
+        # generation claims use ``_generation_lock`` directly and therefore
+        # remain responsive while storage is blocked.
+        self._history_truncation_condition = threading.Condition(self._generation_lock)
+        self._history_truncation_active = False
+        # Conversation rows cross two independently observed surfaces:
+        # storage history and the live SSE stream. One ordered journal keeps
+        # their immutable, idempotently keyed rows from bounded generation
+        # admission until storage has positively acknowledged them.
+        # ``_history_handoff_lock`` owns the journal + monotonic accepted
+        # revision and is also the atomic bridge to initial listener
+        # registration.  ``_history_visibility_lock`` is deliberately separate
+        # from ``_generation_lock`` and spans only a history load or one
+        # conversation save/ack, making DB visibility and the pending overlay
+        # linearizable without blocking Stop/force-claim.
+        self._history_handoff_lock = threading.RLock()
+        # Reentrant because reconciliation owns the visibility lane across its
+        # publication-shutdown recheck and calls the single-entry persistence
+        # helper, which uses the same lane.  Lock order is visibility ->
+        # generation -> handoff; generation commit paths never acquire
+        # visibility while holding the generation lock.
+        self._history_visibility_lock = threading.RLock()
+        self._history_handoff_epoch = uuid.uuid4().hex
+        self._history_handoff_revision = 0
+        # KEYED BY WORKSTREAM IDENTITY: set to the ws_id whose durable parent
+        # a keyed save observed hard-deleted (cross-node delete or prune),
+        # never cleared. Readers compare against the CURRENT self._ws_id, so
+        # an identity swap (/new, resume) structurally un-poisons the session
+        # object while the latch stays permanent for the workstream that died
+        # — no reset choreography to forget (round-4 review).
+        self._workstream_gone_ws: str | None = None
+        self._pending_conversation_commits: collections.OrderedDict[
+            str, _PendingConversationCommit
+        ] = collections.OrderedDict()
+        self._conversation_persistence_error: ConversationPersistenceError | None = None
+        self._conversation_persistence_failure_kind: str | None = None
+        self._conversation_persistence_attempts = 0
+        self._conversation_persistence_first_failure_at: datetime | None = None
+        self._conversation_persistence_last_failure_at: datetime | None = None
+        self._conversation_persistence_next_retry_at: float | None = None
+        self._conversation_persistence_next_retry_wall_at: datetime | None = None
+        self._conversation_persistence_resync_commit_key: str | None = None
+        self._conversation_persistence_fatal_revision: int | None = None
         # Monotonic edge for approval gates that exist before a generation is
         # claimed (the token-budget override).  Unlike ``_cancel_event``, a
         # snapshot can distinguish a new Stop from a harmless set event left
@@ -2909,9 +3159,14 @@ class ChatSession:
         """
         lane = self._model_binding.lane
         effort = self.reasoning_effort or None
-        if lane.temperature != self.temperature or lane.reasoning_effort != effort:
+        if (
+            lane.registry_generation != self._model_binding.registry_generation
+            or lane.temperature != self.temperature
+            or lane.reasoning_effort != effort
+        ):
             lane = dataclasses.replace(
                 lane,
+                registry_generation=self._model_binding.registry_generation,
                 temperature=self.temperature,
                 reasoning_effort=effort,
             )
@@ -2945,10 +3200,10 @@ class ChatSession:
         cs = getattr(self, "_config_store", None)
         if cs is None:
             return jc
-        snapshot = getattr(type(cs), "effective_snapshot", None)
-        if callable(snapshot):
+        snapshot = concrete_method(cs, "effective_snapshot")
+        if snapshot is not None:
             try:
-                _version, values = snapshot(cs)
+                _version, values = snapshot()
                 if isinstance(values, dict):
                     return self._compose_judge_cfg(values.get)
             except Exception:
@@ -2997,10 +3252,10 @@ class ChatSession:
         if self._judge_config is None:
             return None, None
         cs = getattr(self, "_config_store", None)
-        snapshot = getattr(type(cs), "effective_snapshot", None)
-        if callable(snapshot):
+        snapshot = concrete_method(cs, "effective_snapshot")
+        if snapshot is not None:
             try:
-                version, values = snapshot(cs)
+                version, values = snapshot()
                 if type(version) is int and isinstance(values, dict):
                     return self._compose_judge_cfg(values.get), version
             except Exception:
@@ -4580,6 +4835,75 @@ class ChatSession:
         """Estimated token cost of the active tool definitions."""
         return int(self._tool_def_chars(caps) / self._chars_per_token)
 
+    @staticmethod
+    def _token_calibration_key(lane: ModelLane) -> _ModelCalibrationKey:
+        """Return the coherent registry identity whose tokenizer is in use."""
+        return (lane.alias, lane.model, lane.registry_generation)
+
+    @staticmethod
+    def _provenance_calibration_key(
+        provenance: TurnProvenance | None,
+    ) -> _ModelCalibrationKey | None:
+        """Project accepted-turn provenance onto its calibration identity."""
+        if provenance is None:
+            return None
+        key = (
+            provenance.model_alias,
+            provenance.backend_model_id,
+            provenance.registry_generation,
+        )
+        return key if any((key[0], key[1], key[2])) else None
+
+    def _calibration_anchor_valid(self, calibration: _TokenCalibration) -> bool:
+        """Whether a provider prompt count still names the live prefix."""
+        prefix = calibration.message_prefix_ids
+        if calibration.prompt_tokens is None or len(prefix) > len(self.messages):
+            return False
+        return prefix == tuple(id(turn) for turn in self.messages[: len(prefix)])
+
+    def _activate_token_calibration(self, lane: ModelLane) -> None:
+        """Activate *lane*'s ratio and coherent provider prompt anchor.
+
+        Lane activation happens before every main dispatch and before pre-send
+        budget checks.  Switching identities re-estimates the whole live
+        trajectory with that tokenizer ratio; staying on one identity preserves
+        exact completion-token counts already appended by the usage path.
+        """
+        key = self._token_calibration_key(lane)
+        calibration = self._token_calibrations.get(key)
+        ratio = calibration.chars_per_token if calibration is not None else 4.0
+        identity_changed = (
+            self._active_token_calibration_key != key or self._chars_per_token != ratio
+        )
+        self._active_token_calibration_key = key
+        self._chars_per_token = ratio
+
+        sys_chars = sum(self._msg_char_count(message) for message in self.system_messages)
+        self._system_tokens = max(1, int(sys_chars / ratio))
+        if identity_changed:
+            self._msg_tokens = [
+                max(1, int(self._msg_char_count(message) / ratio)) for message in self.messages
+            ]
+        if calibration is not None and self._calibration_anchor_valid(calibration):
+            self._calibrated_msg_count = len(calibration.message_prefix_ids)
+        else:
+            self._calibrated_msg_count = 0
+        if not self._manual_tool_truncation:
+            self.tool_truncation = int(self.context_window * ratio * 0.5)
+
+    def _invalidate_token_calibration_anchors(self) -> None:
+        """Forget prompt-prefix counts after replacing/removing history.
+
+        Tokenizer ratios remain useful per model binding; only the provider
+        counts tied to the old Turn identities become invalid.
+        """
+        self._token_calibrations = {
+            key: dataclasses.replace(value, prompt_tokens=None, message_prefix_ids=())
+            for key, value in self._token_calibrations.items()
+        }
+        self._last_usage_calibration_key = None
+        self._calibrated_msg_count = 0
+
     def _estimated_prompt_tokens(self) -> int:
         """Best estimate of the current prompt size, in tokens.
 
@@ -4595,9 +4919,14 @@ class ChatSession:
         auto-compaction triggers all read it, so they cannot disagree about
         the fullness of the same state.
         """
-        if self._last_usage:
-            # Clamp the index: a stale _calibrated_msg_count must not
-            # over-slice after compaction or message-list mutations.
+        active_key = self._active_token_calibration_key
+        calibration = self._token_calibrations.get(active_key) if active_key is not None else None
+        if calibration is not None and self._calibration_anchor_valid(calibration):
+            start = len(calibration.message_prefix_ids)
+            return int(calibration.prompt_tokens or 0) + sum(self._msg_tokens[start:])
+        if self._last_usage and self._last_usage_calibration_key is None:
+            # Compatibility for direct seam callers/tests that populate the
+            # legacy usage slot without going through _update_token_table.
             start = min(self._calibrated_msg_count, len(self._msg_tokens))
             return self._last_usage["prompt_tokens"] + sum(self._msg_tokens[start:])
         # No provider anchor yet (e.g. a just-resumed session before its first
@@ -4939,6 +5268,7 @@ class ChatSession:
                 ],
                 max_tokens=_TITLE_MAX_TOKENS,
                 lane=title_lane,
+                principal_id=captured_principal,
             )
             raw = result.content or ""
             log.info("ws.title.llm_response", ws_id=ws_id[:8], raw=raw[:200])
@@ -5353,11 +5683,13 @@ class ChatSession:
         self._read_files.clear()
         self._repeat_detector.clear()
         self._last_usage = None
-        self._calibrated_msg_count = 0
+        self._invalidate_token_calibration_anchors()
         self._title_generated = True  # don't re-title resumed workstreams
         self._msg_tokens = [
             max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
         ]
+        if not self._manual_tool_truncation:
+            self.tool_truncation = int(self.context_window * self._chars_per_token * 0.5)
         resume_diagnostics = lane_diagnostics(self._primary_lane())
         log.info(
             "Resuming ws=%s: %d messages, provider=%s, model=%s",
@@ -5518,6 +5850,7 @@ class ChatSession:
         if not fork:
             self._follow_watch_registration(old_ws_id)
         self._init_system_messages()
+        self._activate_token_calibration(self._primary_lane())
         return True
 
     def _follow_watch_registration(self, old_ws_id: str) -> None:
@@ -6752,6 +7085,7 @@ class ChatSession:
             if deferred_persistence is None:
                 clear_last_error(persist_ws_id)
                 self._has_persisted_error = False
+                self._conversation_persistence_fatal_revision = None
             else:
 
                 def _clear_if_owned() -> None:
@@ -6769,6 +7103,7 @@ class ChatSession:
                             and self._persisted_error_revision == error_revision
                         ):
                             self._has_persisted_error = False
+                            self._conversation_persistence_fatal_revision = None
 
                 deferred_persistence.append(_clear_if_owned)
         # Surface the acting user (turn initiator) to the UI so web clients can
@@ -6802,6 +7137,80 @@ class ChatSession:
             deferred_persistence.append(_publish_legacy_if_owned)
         else:
             self.ui.on_state_change(state)
+
+    def _remember_serving_failure_context(
+        self,
+        exc: BaseException,
+        lane: ModelLane,
+    ) -> None:
+        """Associate *exc* with the value-only lane that actually failed."""
+        model_alias = lane.alias
+        backend_model_id = lane.model
+        registry_generation = lane.registry_generation
+        provider_label = "?"
+        base_url = "?"
+        try:
+            diagnostics = lane_diagnostics(lane)
+            provider_label = diagnostics.provider_name or diagnostics.provider_type
+            # Query parameters are never diagnostic and can carry API keys.
+            base_url = diagnostics.base_url.split("?", 1)[0].rstrip("/")
+        except Exception:
+            log.debug("session.fatal.serving_lane_snapshot_failed", exc_info=True)
+        context = _ServingFailureContext(
+            model_alias=model_alias,
+            backend_model_id=backend_model_id,
+            registry_generation=registry_generation,
+            provider_label=provider_label,
+            base_url=base_url,
+        )
+        with self._serving_failure_context_lock:
+            # Bound abandoned/recovered retry objects.  Entries are normally
+            # consumed synchronously by _record_fatal_error.
+            while len(self._serving_failure_contexts) >= 32:
+                self._serving_failure_contexts.pop(next(iter(self._serving_failure_contexts)))
+            # Retain object identity beside the id: a recovered exception can
+            # otherwise be collected and its integer id reused before a stale
+            # bounded entry is evicted, misattributing an unrelated failure.
+            self._serving_failure_contexts[id(exc)] = (exc, context)
+
+    def _take_serving_failure_context(
+        self,
+        exc: BaseException,
+    ) -> _ServingFailureContext | None:
+        """Consume the lane snapshot associated with *exc*, if any."""
+        with self._serving_failure_context_lock:
+            stored = self._serving_failure_contexts.pop(id(exc), None)
+        if stored is None or stored[0] is not exc:
+            return None
+        return stored[1]
+
+    def _forget_serving_failure_context(self, exc: BaseException | None) -> None:
+        """Drop a recovered retry's no-longer-actionable lane snapshot."""
+        if exc is None:
+            return
+        with self._serving_failure_context_lock:
+            stored = self._serving_failure_contexts.get(id(exc))
+            if stored is not None and stored[0] is exc:
+                self._serving_failure_contexts.pop(id(exc), None)
+
+    @contextlib.contextmanager
+    def _recovered_serving_failures(self) -> Iterator[list[BaseException]]:
+        """Own the lane snapshots a retry ladder takes, and drop the dead ones.
+
+        The ladder appends every failure it remembered to the yielded list.
+        Leaving the block forgets all of them EXCEPT an exception that is still
+        escaping: that one's snapshot is what ``_record_fatal_error`` consumes
+        to name the lane that actually failed.
+        """
+        recovered: list[BaseException] = []
+        try:
+            yield recovered
+        except BaseException as escaping:
+            recovered = [failure for failure in recovered if failure is not escaping]
+            raise
+        finally:
+            for failure in recovered:
+                self._forget_serving_failure_context(failure)
 
     def _record_fatal_error(
         self,
@@ -6839,7 +7248,13 @@ class ChatSession:
         """
         from turnstone.core.memory import persist_last_error, sanitize_error_text
 
-        raw = self._format_backend_error(exc) or f"{type(exc).__name__}: {exc}"
+        take_context = getattr(self, "_take_serving_failure_context", None)
+        serving_context = take_context(exc) if callable(take_context) else None
+        raw = (
+            self._format_backend_error(exc)
+            if serving_context is None
+            else self._format_backend_error(exc, serving_context=serving_context)
+        ) or f"{type(exc).__name__}: {exc}"
         safe = sanitize_error_text(raw)
         # The one journal trace of a fatal turn — UI sinks and the config row
         # are invisible to log scrapers.  Sanitized text only (same
@@ -6847,12 +7262,18 @@ class ChatSession:
         # through this chokepoint too; it is a user action, not a fault, so it
         # logs at INFO instead of ERROR.
         fatal_log = log.info if isinstance(exc, KeyboardInterrupt) else log.error
-        fatal_log(
-            "session.fatal.recorded",
-            ws=self._ws_id,
-            error_type=type(exc).__name__,
-            error=safe,
-        )
+        fatal_fields: dict[str, Any] = {
+            "ws": self._ws_id,
+            "error_type": type(exc).__name__,
+            "error": safe,
+        }
+        if serving_context is not None:
+            fatal_fields.update(
+                model_alias=serving_context.model_alias,
+                backend_model_id=serving_context.backend_model_id,
+                registry_generation=serving_context.registry_generation,
+            )
+        fatal_log("session.fatal.recorded", **fatal_fields)
         # Frames only — ``exc_info=True`` would render the raw exception
         # message, which can carry credentials verbatim (the sanitize floor
         # the lines above exist to hold); format_tb renders the stack
@@ -6875,8 +7296,18 @@ class ChatSession:
             persist_last_error(persist_ws_id, safe)
         else:
             deferred_persistence.append(functools.partial(persist_last_error, persist_ws_id, safe))
-        self._persisted_error_revision = getattr(self, "_persisted_error_revision", 0) + 1
-        self._has_persisted_error = True
+        # Manager-owned persistence recovery reads and retires this exact
+        # revision under the generation lock. Publish the revision and both
+        # ownership latches as one atomic snapshot so a concurrent maintenance
+        # pass cannot observe a new revision with stale ownership metadata.
+        with self._generation_lock:
+            self._persisted_error_revision = getattr(self, "_persisted_error_revision", 0) + 1
+            self._has_persisted_error = True
+            self._conversation_persistence_fatal_revision = (
+                self._persisted_error_revision
+                if isinstance(exc, ConversationPersistenceError)
+                else None
+            )
         self._emit_state("error", deferred_persistence=deferred_persistence)
 
     def ensure_error_recorded(self, exc: BaseException) -> None:
@@ -6916,7 +7347,12 @@ class ChatSession:
             return
         self._record_fatal_error(exc)
 
-    def _format_backend_error(self, exc: BaseException) -> str | None:
+    def _format_backend_error(
+        self,
+        exc: BaseException,
+        *,
+        serving_context: _ServingFailureContext | None = None,
+    ) -> str | None:
         """Return an enriched message for known backend boundary errors.
 
         Returns ``None`` for exceptions outside the recognised set so the
@@ -6946,8 +7382,14 @@ class ChatSession:
         # The backend id (what the server was actually asked for) rides as a
         # labeled annotation for the operator, collapsing to one token when the
         # two coincide. Both labels derive from the frozen session binding.
-        alias = self._model_alias or ""
-        backend_id = self.model or ""
+        alias = (
+            serving_context.model_alias
+            if serving_context is not None
+            else (self._model_alias or "")
+        )
+        backend_id = (
+            serving_context.backend_model_id if serving_context is not None else (self.model or "")
+        )
         if alias and backend_id and alias != backend_id:
             model_label = f"{alias} (id={backend_id})"
         else:
@@ -7007,8 +7449,13 @@ class ChatSession:
         # the turn. Remediation is PER-LANE: /model is routable only on the
         # CLI and node-interactive command lanes, so the console coordinator
         # — which routes no slash commands — gets recreate-or-adjust wording.
-        if self._registry_alias_removed or (
-            self._rebind_failed_key is not None and self._rebind_failed_key[0] == self._model_alias
+        context_is_primary = serving_context is None or alias == (self._model_alias or "")
+        if context_is_primary and (
+            self._registry_alias_removed
+            or (
+                self._rebind_failed_key is not None
+                and self._rebind_failed_key[0] == self._model_alias
+            )
         ):
             available = ""
             if self._registry is not None and self._registry.count:
@@ -7038,17 +7485,18 @@ class ChatSession:
         # Pull backend identity — every branch swallows so a bad
         # accessor on a partially-initialised session can't hide the
         # original exception behind a NoneType error.
-        base_url = "?"
-        provider_label = "?"
-        try:
-            # The PRIMARY binding, deliberately: endpoint, model label, and
-            # provider must describe one coherent lane even if a fallback
-            # produced the terminal error.
-            diagnostics = lane_diagnostics(self._primary_lane())
-            base_url = diagnostics.base_url.split("?")[0].rstrip("/")
-            provider_label = diagnostics.provider_name or diagnostics.provider_type
-        except Exception:
-            log.debug("session.fatal.lane_diagnostics_failed", exc_info=True)
+        if serving_context is not None:
+            base_url = serving_context.base_url
+            provider_label = serving_context.provider_label
+        else:
+            base_url = "?"
+            provider_label = "?"
+            try:
+                diagnostics = lane_diagnostics(self._primary_lane())
+                base_url = diagnostics.base_url.split("?")[0].rstrip("/")
+                provider_label = diagnostics.provider_name or diagnostics.provider_type
+            except Exception:
+                log.debug("session.fatal.lane_diagnostics_failed", exc_info=True)
         if name in _BACKEND_TIMEOUT_EXC_NAMES:
             return (
                 f"Backend timeout ({name}): no response from {provider_label} "
@@ -7155,14 +7603,18 @@ class ChatSession:
         resolved dict rather than resolved separately — one config
         generation, as ``resolve_lane`` intends.
 
-        ``principal_id`` pins dynamic backend authentication for work that
-        outlives the caller's mutable session binding (compaction and parallel
-        tool extraction).  ``None`` preserves the lane's existing resolver for
-        direct and already-pinned callers such as title generation.
+        ``principal_id`` pins dynamic backend authentication and accepted-turn
+        audit identity for work that outlives the caller's mutable session
+        binding (compaction, title generation, and parallel tool extraction).
+        ``None`` snapshots the session's effective principal at entry.
         """
         lane = lane or self._primary_lane()
-        if principal_id is not None:
-            lane = self._lane_for_backend_auth_principal(lane, principal_id)
+        effective_principal_id = (
+            (self._mcp_effective_user_id or "").strip()
+            if principal_id is None
+            else principal_id.strip()
+        )
+        lane = self._lane_for_backend_auth_principal(lane, effective_principal_id)
         caps = require_lane_capabilities(lane)
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
         suppress_reasoning = lane_thinking_suppressed(lane)
@@ -7180,6 +7632,7 @@ class ChatSession:
             # parallel web-fetch calls each pass an independent
             # StreamAbortRef that never publishes into the main stream slot.
             cancel_ref=cancel_ref,
+            acting_principal_id=effective_principal_id,
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
@@ -7635,6 +8088,10 @@ class ChatSession:
         """
         if principal_id is not None:
             lane = self._lane_for_backend_auth_principal(lane, principal_id)
+        # Wire preparation, attachment materialization, and tool-output budget
+        # helpers all read the session estimator.  Activate the exact lane
+        # before any of them can run.
+        self._activate_token_calibration(lane)
         diagnostics = lane_diagnostics(lane)
         safe_url = diagnostics.base_url.split("?")[0]  # query params may contain keys
         caps = require_lane_capabilities(lane)
@@ -7669,6 +8126,7 @@ class ChatSession:
                         principal_id=principal_id,
                     ),
                     cancel_ref=ref,
+                    acting_principal_id=principal_id or "",
                     on_chunk=consumer,
                 )
             except Exception as e:
@@ -7770,6 +8228,84 @@ class ChatSession:
         for scope in scopes:
             scope.abort()
 
+    def _capture_worker_claim(self, principal_id: str = "") -> WorkerClaim | None:
+        """Capture one fresh worker slot's immutable session admission.
+
+        ``session_worker.send`` calls this immediately before entering the
+        workstream slot lock.  Capturing in that order avoids the inverse of a
+        generation commit's generation-lock -> UI -> workstream-lock path.
+        Stop/close publish their monotonic edge under the same generation lock
+        used here; if one lands between this snapshot and slot installation,
+        send entry rejects the conservatively stale epoch.
+
+        Internal workers omit an authenticated principal; pin the current
+        effective actor at claim time so wake/init continuations cannot later
+        borrow a mutable actor changed by another request.
+        """
+
+        with self._generation_lock:
+            if self._publication_shutdown:
+                raise RuntimeError("Cannot claim a worker on a closed session")
+            if self._soft_close_preparing:
+                raise RuntimeError("Cannot claim a worker while the session is closing")
+            if self._tool_structural_debt is not None and self._cancel_event.is_set():
+                # An exceptional cancellation/close window still owes TOOL
+                # receipts. Refuse a fresh/reuse dispatch until its owner has
+                # journaled them; normal in-flight tool execution keeps the
+                # event clear and therefore retains interjection behavior.
+                raise RuntimeError("Cannot claim a worker while tool cleanup is pending")
+            principal = principal_id.strip() or (self._mcp_effective_user_id or "").strip()
+            cancel_event = self._cancel_event
+            return WorkerClaim(
+                session=self,
+                principal_id=principal,
+                cancel_epoch=self._approval_cancel_epoch,
+                cancel_event=cancel_event,
+                cancel_event_was_set=cancel_event.is_set(),
+            )
+
+    def _worker_claim_is_current(self, claim: WorkerClaim) -> bool:
+        """Revalidate a captured worker witness without acquiring any lock.
+
+        ``session_worker.send`` calls this while holding the workstream lock,
+        so this method MUST remain a bounded read of fields published under
+        ``_generation_lock``. The predecessor releases its workstream slot
+        only after those writes, making the enqueue/spawn crossing coherent
+        without introducing a workstream -> generation lock inversion.
+
+        Event identity deliberately is not compared: a normal first worker
+        rotates the session Event when it claims its generation, while a
+        concurrent sender captured just before that rotation must still be
+        allowed to enqueue. An unset-to-set transition on the exact captured
+        Event is the monotonic evidence that cancellation/structural poison
+        overtook the claim. An Event already set at capture can be the valid
+        post-truncation state that the fresh worker is expected to rotate.
+        """
+        return bool(
+            claim.session is self
+            and claim.cancel_epoch == getattr(self, "_approval_cancel_epoch", -1)
+            and (claim.cancel_event_was_set or not claim.cancel_event.is_set())
+            and not getattr(self, "_publication_shutdown", False)
+            and not self._soft_close_preparing
+            and not (self._tool_structural_debt is not None and self._cancel_event.is_set())
+        )
+
+    def _poison_tool_structural_debt_locked(self, generation: int | None = None) -> bool:
+        """Publish one fail-stop edge for an incomplete accepted tool block.
+
+        Caller holds ``_generation_lock``. Advancing the existing monotonic
+        worker epoch only on the Event's unset-to-set transition invalidates a
+        claim captured before the poison without repeatedly advancing it when
+        force and send-finally observe the same retained debt.
+        """
+        debt = self._tool_structural_debt
+        if debt is None or (generation is not None and debt.generation != generation):
+            return False
+        if not self._cancel_event.is_set():
+            self._approval_cancel_epoch = getattr(self, "_approval_cancel_epoch", 0) + 1
+            self._cancel_event.set()
+        return True
+
     def cancel(self) -> None:
         """Request cancellation of the current generation.
 
@@ -7857,7 +8393,76 @@ class ChatSession:
         if _generation_superseded(self, my_generation):
             raise GenerationCancelled()
 
-    def _claim_generation(self, *, principal_id: str | None = None) -> int:
+    def _check_generation_admission(self, my_generation: int) -> None:
+        """Fence pre-turn setup against Stop, force-successor, and close.
+
+        This deliberately does not dispatch through ``_check_cancelled``.
+        That later cooperative probe is an established lightweight-session
+        test seam and also includes task-agent-local cancellation.  The setup
+        path needs the narrower, non-overridable session ownership invariant:
+        once a generation loses its event, number, or publication latch it may
+        not bind an actor, refresh configuration, or admit a user row.
+        """
+
+        if (
+            self._publication_shutdown
+            or self._cancel_event.is_set()
+            or _generation_superseded(self, my_generation)
+        ):
+            raise GenerationCancelled()
+
+    def _admit_tool_structural_debt_locked(
+        self,
+        generation: int,
+        call_ids: tuple[str, ...],
+    ) -> None:
+        """Record an accepted assistant tool block under generation ownership."""
+        if not call_ids:
+            return
+        if self._tool_structural_debt is not None:
+            raise RuntimeError("Cannot accept a new tool block before completing the prior block")
+        self._tool_structural_debt = _ToolStructuralDebt(
+            generation=generation,
+            call_ids=call_ids,
+        )
+
+    def has_tool_structural_debt(self) -> bool:
+        """Whether an accepted assistant block still needs TOOL receipts."""
+        with self._generation_lock:
+            return self._tool_structural_debt is not None
+
+    def _complete_tool_structural_debt_locked(
+        self,
+        generation: int,
+        completed_call_ids: list[str] | tuple[str, ...],
+    ) -> bool:
+        """Clear exact generation debt only after every TOOL row is journaled."""
+        debt = self._tool_structural_debt
+        if debt is None:
+            return False
+        if debt.generation != generation:
+            raise RuntimeError("Tool structural debt belongs to another generation")
+        expected = collections.Counter(debt.call_ids)
+        observed = collections.Counter(completed_call_ids)
+        if observed != expected:
+            missing = expected - observed
+            unexpected = observed - expected
+            details: list[str] = []
+            if missing:
+                details.append(f"missing: {', '.join(sorted(missing.elements()))}")
+            if unexpected:
+                details.append(f"unexpected: {', '.join(sorted(unexpected.elements()))}")
+            raise RuntimeError(f"Tool structural debt mismatch ({'; '.join(details)})")
+        self._tool_structural_debt = None
+        self._tool_structural_condition.notify_all()
+        return True
+
+    def _claim_generation(
+        self,
+        *,
+        principal_id: str | None = None,
+        expected_cancel_epoch: int | None = None,
+    ) -> int:
         """Claim the next generation and install its fresh cancel event.
 
         The entry half of the per-generation cancel discipline shared by
@@ -7882,6 +8487,18 @@ class ChatSession:
         with self._generation_transition_lock, self._generation_lock:
             if self._publication_shutdown:
                 raise RuntimeError("Cannot claim a generation on a closed session")
+            if self._soft_close_preparing:
+                raise RuntimeError("Cannot claim a generation while the session is closing")
+            if self._tool_structural_debt is not None:
+                raise RuntimeError("Cannot claim a generation before tool cleanup completes")
+            if (
+                expected_cancel_epoch is not None
+                and self._approval_cancel_epoch != expected_cancel_epoch
+            ):
+                # This worker slot predates a Stop/force/terminal admission.
+                # Never replace the edge it was meant to observe with a fresh
+                # event: a successor may already own the workstream slot.
+                raise GenerationCancelled()
             self._generation += 1
             generation = self._generation
             self._cancel_event = threading.Event()
@@ -7931,9 +8548,11 @@ class ChatSession:
         zero generation is the legacy/direct-call unscoped form and remains
         publishable.
         """
-        with self._generation_lock:
+        with self._history_truncation_condition:
+            self._history_truncation_condition.wait_for(lambda: not self._history_truncation_active)
             if (
                 self._publication_shutdown
+                or (not origin_generation and self._soft_close_preparing)
                 or (origin_generation and self._generation != origin_generation)
                 or (not allow_cancelled and self._cancel_event.is_set())
             ):
@@ -7941,12 +8560,904 @@ class ChatSession:
             publish()
             return True
 
+    def _history_handoff_token_locked(self) -> str:
+        """Return the opaque token for the currently accepted row prefix."""
+        return f"{self._history_handoff_epoch}.{self._history_handoff_revision}"
+
+    def capture_history_handoff(
+        self,
+        load_messages: Callable[[int], list[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Load durable history and merge accepted conversation rows once.
+
+        ``load_messages`` runs while the per-session visibility lane is held.
+        Every conversation-row persistence closure uses the same lane through
+        durable commit and journal acknowledgement, so the result linearizes on one side of
+        that transition:
+
+        * reader first: old durable prefix plus the pending immutable row;
+        * writer first: new durable prefix with the journal entry removed.
+
+        A backend commit whose acknowledgement was lost is identified by its
+        stable ``_commit_key`` and reconciled during this read.  The accepted
+        revision does not change when a row moves from journal to storage — the
+        two representations are visibility-equivalent.
+
+        The loader receives the pending-journal size and must widen any
+        tail-bounded window by that many rows.  Within one live session every
+        durable write flows through the journal in admission order and the
+        visibility lane freezes the durable snapshot across this whole
+        capture, so a pending key's committed twin — acknowledged or lost —
+        is always among the newest ``journal size`` durable rows: the widened
+        window necessarily contains it, and a journal row missing from the
+        window is genuinely not yet durable and appends at the tail in
+        admission order.  (A second writer — cross-node re-home overlap or a
+        legacy NULL-key append — can in principle push a twin beyond the
+        widened window; that residual degrades to the same tail append and
+        self-heals on reconcile.)  The caller keeps ownership of the loaded
+        rows — they are merged without copying, so the loader must return
+        rows nothing else retains; only journal overlay entries are copied.
+        No storage call ever runs under the handoff lock here: the journal
+        size is sampled first, the load runs outside it, and the merge is
+        pure in-memory work.
+        """
+        notify_state_change = False
+        with self._history_visibility_lock:
+            with self._history_handoff_lock:
+                if self._workstream_gone_ws == self._ws_id:
+                    # The durable parent is deleted: there is no authoritative
+                    # transcript to verify a handoff against, and minting a
+                    # token over the empty load is exactly the silent-wipe
+                    # mechanism (round-3 review). Raising routes /history to
+                    # its fail-closed 503 arm, which keeps the pane's stale
+                    # transcript visible.
+                    raise ConversationCommitWorkstreamGoneError(
+                        "workstream was deleted; no history handoff can be verified"
+                    )
+                overscan = len(self._pending_conversation_commits)
+            loaded = load_messages(overscan)
+            if not isinstance(loaded, list):
+                raise TypeError("history loader must return a list")
+            with self._history_handoff_lock:
+                previous_state = self._conversation_persistence_state_locked()
+                durable_indexes = {
+                    str(message.get("_commit_key")): index
+                    for index, message in enumerate(loaded)
+                    if isinstance(message, dict) and message.get("_commit_key")
+                }
+                for commit_key, pending in list(self._pending_conversation_commits.items()):
+                    if commit_key in durable_indexes and pending.ack_from_durable_row:
+                        self._pending_conversation_commits.pop(commit_key, None)
+                if not self._pending_conversation_commits:
+                    self._clear_conversation_persistence_failure_locked()
+                notify_state_change = self._conversation_persistence_state_needs_notification(
+                    previous_state,
+                    self._conversation_persistence_state_locked(),
+                )
+
+                merged = list(loaded)
+                for commit_key, pending in self._pending_conversation_commits.items():
+                    durable_index = durable_indexes.get(commit_key)
+                    if durable_index is not None:
+                        # A non-atomic extension may expose a keyed row before
+                        # its full closure ACKs — and a conflicted entry
+                        # (``ack_from_durable_row`` False) deliberately renders
+                        # the journal's version in place, fail-visible beside
+                        # its persistence banner.
+                        merged[durable_index] = copy.deepcopy(pending.message)
+                    else:
+                        merged.append(copy.deepcopy(pending.message))
+                result = merged, self._history_handoff_token_locked()
+        if notify_state_change:
+            self._notify_conversation_persistence_state_changed()
+        return result
+
+    def register_listener_for_history_handoff(
+        self,
+        token: str,
+        *,
+        last_event_id: int | None = None,
+        maxsize: int = 500,
+    ) -> tuple[Any, list[dict[str, Any]], str, int, int, dict[str, Any]] | None:
+        """Validate a history token and atomically register its SSE listener.
+
+        Every conversation-row admission takes the same short handoff lock
+        while journaling a complete row and publishing the corresponding live
+        transition.  Therefore a commit either changes the token before this
+        comparison or reaches the listener registered here; it cannot fall
+        between those operations.  A mismatched epoch/revision returns ``None``
+        and callers must refetch history rather than trusting numeric ring
+        coverage.
+        """
+        with self._history_handoff_lock:
+            if not token or token != self._history_handoff_token_locked():
+                return None
+            ui_base: Any = self.ui
+            if last_event_id is not None:
+                return cast(
+                    "tuple[Any, list[dict[str, Any]], str, int, int, dict[str, Any]]",
+                    ui_base.register_listener_with_replay(last_event_id, maxsize=maxsize),
+                )
+            client_queue, snapshot = ui_base.register_listener_with_in_progress_snapshot(
+                maxsize=maxsize
+            )
+            return client_queue, [], "fresh", 0, 0, snapshot
+
+    def has_unresolved_conversation_persistence(self) -> bool:
+        """Whether an accepted row lacks a confirmed complete durable commit.
+
+        Blocking form — only for callers holding NO workstream or manager
+        lock (reconcile scans, delete-ambiguity arms). Scans that probe while
+        holding ``ws._lock`` / the manager lock must use
+        :meth:`has_unresolved_conversation_persistence_nowait` instead: this
+        method acquires the generation and handoff locks, which inverts the
+        generation→workstream/manager order those scans hold.
+        """
+        with self._generation_lock:
+            if self._tool_structural_debt is not None:
+                return True
+        with self._history_handoff_lock:
+            return bool(self._pending_conversation_commits)
+
+    def has_unresolved_conversation_persistence_nowait(self) -> bool | None:
+        """Non-blocking probe for retirement scans holding ws/manager locks.
+
+        Returns ``None`` when either session lock is momentarily held —
+        callers treat that as "busy, skip this candidate this sweep": a busy
+        session is never closed or evicted on a stale answer, and never
+        blocked on. Blocking here from under ``ws._lock`` deadlocks against
+        force-cancel's finalizer, which publishes under the generation lock
+        and then takes the workstream lock (round-4 review).
+        """
+        if not self._generation_lock.acquire(blocking=False):
+            return None
+        try:
+            if self._tool_structural_debt is not None:
+                return True
+        finally:
+            self._generation_lock.release()
+        if not self._history_handoff_lock.acquire(blocking=False):
+            return None
+        try:
+            return bool(self._pending_conversation_commits)
+        finally:
+            self._history_handoff_lock.release()
+
+    def is_workstream_gone(self) -> bool:
+        """True once a keyed save observed THIS workstream's parent deleted.
+
+        The latch records the ws_id that died and is never cleared; readers
+        compare it against the current identity, so an identity swap (/new,
+        ``resume``) to a different workstream reads False structurally.
+        While it matches, new conversation admissions refuse (the
+        finalizer/force-abandon lanes still converge via
+        ``allow_workstream_gone``) and ``capture_history_handoff`` refuses to
+        mint tokens, so a pane keeps its stale transcript rather than
+        rendering a silently wiped one.
+        """
+        with self._history_handoff_lock:
+            return self._workstream_gone_ws == self._ws_id
+
+    def conversation_persistence_status(self) -> dict[str, object]:
+        """Return a content-free live projection of durable journal health."""
+        with self._generation_lock:
+            structural_pending = (
+                len(self._tool_structural_debt.call_ids)
+                if self._tool_structural_debt is not None
+                else 0
+            )
+        with self._history_handoff_lock:
+            pending_rows = len(self._pending_conversation_commits) + structural_pending
+            # One classifier, shared with the notification edge. Structural
+            # tool debt widens an otherwise-healthy journal to ``pending``:
+            # its receipts will re-journal but are not yet in the commit map.
+            state = self._conversation_persistence_state_locked()
+            if state == "healthy" and structural_pending:
+                state = "pending"
+            return {
+                "state": state,
+                "pending_rows": pending_rows,
+                "attempts": self._conversation_persistence_attempts,
+                "first_failure_at": (
+                    self._conversation_persistence_first_failure_at.isoformat()
+                    if self._conversation_persistence_first_failure_at is not None
+                    else None
+                ),
+                "last_failure_at": (
+                    self._conversation_persistence_last_failure_at.isoformat()
+                    if self._conversation_persistence_last_failure_at is not None
+                    else None
+                ),
+                "next_retry_at": (
+                    self._conversation_persistence_next_retry_wall_at.isoformat()
+                    if self._conversation_persistence_next_retry_wall_at is not None
+                    else None
+                ),
+            }
+
+    def conversation_persistence_fatal_revision(self) -> int | None:
+        """Return the current fatal-error revision only when persistence owns it."""
+        with self._generation_lock:
+            revision = self._conversation_persistence_fatal_revision
+            if (
+                revision is None
+                or not self._has_persisted_error
+                or revision != self._persisted_error_revision
+            ):
+                return None
+            return revision
+
+    def acknowledge_conversation_persistence_state_recovery(self, revision: int) -> bool:
+        """Retire one exact in-memory fatal latch after manager recovery.
+
+        The sanitized durable ``last_error`` remains as an audit record; public
+        readers expose it only while the workstream state is ``error``. A later
+        fatal error therefore cannot be deleted by a stale repair callback.
+        """
+        with self._generation_lock:
+            if (
+                self._conversation_persistence_fatal_revision != revision
+                or self._persisted_error_revision != revision
+                or not self._has_persisted_error
+            ):
+                return False
+            self._conversation_persistence_fatal_revision = None
+            self._has_persisted_error = False
+            return True
+
+    def _clear_conversation_persistence_failure_locked(self) -> None:
+        """Reset failure metadata after the complete accepted prefix ACKs."""
+        self._conversation_persistence_error = None
+        self._conversation_persistence_failure_kind = None
+        self._conversation_persistence_attempts = 0
+        self._conversation_persistence_first_failure_at = None
+        self._conversation_persistence_last_failure_at = None
+        self._conversation_persistence_next_retry_at = None
+        self._conversation_persistence_next_retry_wall_at = None
+        self._conversation_persistence_resync_commit_key = None
+
+    def _conversation_persistence_retry_delay(self, attempt: int) -> float:
+        """Return equal-jitter exponential backoff for one transient failure."""
+        ceiling = min(
+            _CONVERSATION_PERSISTENCE_RETRY_CAP_SECONDS,
+            _CONVERSATION_PERSISTENCE_RETRY_BASE_SECONDS * (2.0 ** min(30, max(0, attempt - 1))),
+        )
+        return random.uniform(ceiling / 2.0, ceiling)
+
+    def _conversation_persistence_state_locked(self) -> str:
+        if not self._pending_conversation_commits:
+            return "healthy"
+        return self._conversation_persistence_failure_kind or "pending"
+
+    @staticmethod
+    def _conversation_persistence_state_needs_notification(
+        previous_state: str,
+        current_state: str,
+    ) -> bool:
+        failure_states = {"retrying", "conflict"}
+        return previous_state != current_state and (
+            previous_state in failure_states or current_state in failure_states
+        )
+
+    def _notify_conversation_persistence_state_changed(self) -> None:
+        """Best-effort operator projection refresh, always outside journal locks."""
+        callback = concrete_method(self.ui, "on_persistence_state_changed")
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            log.debug("ui.on_persistence_state_changed raised", exc_info=True)
+
+    def _prepare_direct_conversation_mutation(
+        self,
+        deferred_persistence: list[Callable[[], None]] | None,
+    ) -> None:
+        """Fence an unbatched row mutation behind the accepted FIFO prefix.
+
+        Generation commits already serialize their durable closures through
+        the ticket lane. Direct command/test helpers have no such batch, so
+        they must reconcile an older pending row *before* changing in-memory
+        history. Otherwise a successful direct save could persist a causal
+        suffix after an unresolved accepted predecessor.
+        """
+        if deferred_persistence is None:
+            try:
+                self._reconcile_pending_conversation_commits()
+            except GenerationCancelled as exc:
+                raise RuntimeError("Cannot mutate a closed session") from exc
+
+    def _journal_conversation_row_locked(
+        self,
+        *,
+        commit_key: str,
+        message: dict[str, Any],
+        persist: Callable[[], int],
+        event_id: int | None,
+    ) -> _PendingConversationCommit:
+        """Admit one immutable row while the history handoff lock is held."""
+        pending_message = copy.deepcopy(message)
+        pending_message["_commit_key"] = commit_key
+        pending_message["_event_id"] = event_id
+        pending_message["_pending_durability"] = True
+        pending = _PendingConversationCommit(
+            commit_key=commit_key,
+            message=pending_message,
+            persist=persist,
+        )
+        self._pending_conversation_commits[commit_key] = pending
+        self._history_handoff_revision += 1
+        return pending
+
+    def _rollback_live_journal_admission_locked(
+        self,
+        *,
+        turn: Turn,
+        commit_key: str,
+        history_revision_before: int,
+        reason: str,
+    ) -> None:
+        """Undo a live-tail append whose journal admission raised.
+
+        Shared by the USER, SYSTEM, and TOOL admission sites so a raise inside
+        ``_journal_conversation_row_locked`` can never leave a live turn that
+        no journal entry or durable row will ever represent.
+        """
+        if not self.messages or self.messages[-1] is not turn:
+            raise RuntimeError("journal rollback lost live-tail ownership")
+        self.messages.pop()
+        self._msg_tokens.pop()
+        self._pending_conversation_commits.pop(commit_key, None)
+        self._history_handoff_revision = history_revision_before
+        self._request_history_resync_locked(reason)
+
+    def _schedule_conversation_persistence(
+        self,
+        pending: _PendingConversationCommit,
+        deferred_persistence: list[Callable[[], None]] | None,
+    ) -> None:
+        """Put a journal entry on its generation batch or persist directly."""
+        if deferred_persistence is not None:
+            deferred_persistence.append(lambda: self._persist_pending_conversation_commit(pending))
+            return
+        self._persist_pending_conversation_commit(pending)
+
+    def _request_history_resync_locked(self, reason: str) -> int | None:
+        """Best-effort repair event for an accepted row handoff.
+
+        Current UIs return the exact enqueued event id, which callers persist
+        directly. A custom legacy hook returning ``None`` retains the previous
+        immediate high-water sample as a best-effort compatibility fallback.
+        """
+        request_resync = concrete_method(self.ui, "on_history_resync")
+        if request_resync is None:
+            return None
+        try:
+            event_id = _coerce_event_id(request_resync(reason))
+        except Exception:
+            log.debug("ui.on_history_resync raised", exc_info=True)
+            return None
+        return event_id if event_id is not None else self._ui_event_id()
+
+    def _publish_user_turn_locked(
+        self,
+        *,
+        content: str,
+        attachments: list[dict[str, Any]],
+        sender: str | None,
+        source: str | None,
+        client_send_ids: list[str],
+    ) -> int | None:
+        """Publish one accepted user row, falling back to a repair refetch.
+
+        The caller holds ``_history_handoff_lock`` across the in-memory append,
+        journal admission, and this publication.  A listener registered before
+        that boundary therefore receives the complete ``user_turn`` event;
+        one attempting to register afterwards must present the new history
+        revision.  Older/custom UIs without the hook retain the exceptional
+        ``history_resync`` repair path instead of silently missing the row.
+        """
+        publish = concrete_method(self.ui, "on_user_turn")
+        if publish is not None:
+            try:
+                event_id = _coerce_event_id(
+                    publish(
+                        content,
+                        attachments=attachments,
+                        sender=sender,
+                        source=source,
+                        client_send_ids=client_send_ids,
+                    )
+                )
+                if event_id is not None:
+                    return event_id
+                log.debug("ui.on_user_turn returned no event id; using repair fallback")
+            except Exception:
+                log.debug("ui.on_user_turn raised", exc_info=True)
+        return self._request_history_resync_locked("user_turn_accepted")
+
+    def _publish_tool_turn_locked(
+        self,
+        *,
+        call_id: str,
+        name: str,
+        output: str,
+        is_error: bool,
+        preview: dict[str, Any] | None,
+        effect_status: str | None,
+        projection_safe: bool,
+    ) -> int | None:
+        """Publish one accepted TOOL row or request exceptional repair.
+
+        The executor's earlier ``on_tool_result`` is deliberately provisional:
+        output guarding and context truncation can still change the text that
+        enters history. A capable UI receives this final scalar projection and
+        upserts it by provider call id. Duplicate or blank ids within one
+        accepted assistant batch are not an unambiguous browser key, so they
+        retain the strong history-repair path.
+
+        The caller holds the history handoff lock across append, publication,
+        and journal admission. A listener therefore sees either the canonical
+        event or a newer REST revision, never an unrepresented accepted row.
+        """
+        if projection_safe:
+            publish = concrete_method(self.ui, "on_tool_turn_accepted")
+            if publish is not None:
+                try:
+                    event_id = _coerce_event_id(
+                        publish(
+                            call_id,
+                            name,
+                            output,
+                            is_error=is_error,
+                            preview=preview,
+                            effect_status=effect_status,
+                        )
+                    )
+                    if event_id is not None:
+                        return event_id
+                    log.debug(
+                        "ui.on_tool_turn_accepted returned no event id; using repair fallback"
+                    )
+                except Exception:
+                    log.debug("ui.on_tool_turn_accepted raised", exc_info=True)
+            repair_reason = "tool_turn_accepted"
+        else:
+            repair_reason = "tool_turn_projection_ambiguous"
+        return self._request_history_resync_locked(repair_reason)
+
+    def _persist_pending_conversation_commit(
+        self,
+        entry: _PendingConversationCommit,
+        *,
+        _retry_admitted: bool = False,
+    ) -> None:
+        """Attempt one idempotent save and either ACK or classify the head."""
+        error: ConversationPersistenceError | None = None
+        error_cause: Exception | None = None
+        notify_state_change = False
+        request_resync = False
+        resync_reason = "conversation_persistence_unresolved"
+        with self._history_visibility_lock:
+            with self._history_handoff_lock:
+                if entry.commit_key not in self._pending_conversation_commits:
+                    return
+                if (
+                    self._conversation_persistence_failure_kind == "conflict"
+                    and self._conversation_persistence_error is not None
+                ):
+                    raise self._conversation_persistence_error
+                if (
+                    not _retry_admitted
+                    and self._conversation_persistence_failure_kind == "retrying"
+                    and self._conversation_persistence_error is not None
+                ):
+                    raise self._conversation_persistence_error
+                previous_state = self._conversation_persistence_state_locked()
+
+            row_id = 0
+            conflict: ConversationCommitConflictError | None = None
+            gone: ConversationCommitWorkstreamGoneError | None = None
+            try:
+                row_id = int(entry.persist() or 0)
+            except ConversationCommitConflictError as exc:
+                conflict = exc
+                error_cause = exc
+            except ConversationCommitWorkstreamGoneError as exc:
+                gone = exc
+                error_cause = exc
+            except Exception as exc:
+                error_cause = exc
+
+            with self._history_handoff_lock:
+                if row_id > 0:
+                    self._pending_conversation_commits.pop(entry.commit_key, None)
+                    if not self._pending_conversation_commits:
+                        self._clear_conversation_persistence_failure_locked()
+                    notify_state_change = self._conversation_persistence_state_needs_notification(
+                        previous_state,
+                        self._conversation_persistence_state_locked(),
+                    )
+                elif gone is not None:
+                    # The durable parent row was hard-deleted after these rows
+                    # were accepted; keyed saves never recreate it, so no retry
+                    # can succeed. The delete is the newer authoritative ruling
+                    # on this workstream: discard the journal so close and
+                    # eviction stop waiting on rows that can never land, and
+                    # return NORMALLY — the deletion, not this persist, is the
+                    # user-facing event, and raising here would only re-latch a
+                    # phantom error over an empty journal. The revision bump
+                    # invalidates every token minted over the discarded rows.
+                    # The latch makes the discovery terminal: new conversation
+                    # admissions refuse (finalizer lanes still converge) and
+                    # capture_history_handoff stops minting tokens, so panes
+                    # keep their stale-but-real transcript instead of a
+                    # silently wiped one. Re-entry with the latch already set
+                    # (further in-flight saves of the same generation) is
+                    # idempotent. The forensic log carries commit keys and
+                    # roles only — never message content.
+                    discarded = [
+                        (key, str(entry.message.get("role", "")))
+                        for key, entry in self._pending_conversation_commits.items()
+                    ]
+                    self._pending_conversation_commits.clear()
+                    self._clear_conversation_persistence_failure_locked()
+                    self._history_handoff_revision += 1
+                    self._workstream_gone_ws = self._ws_id
+                    request_resync = True
+                    resync_reason = "workstream_gone"
+                    log.error(
+                        "session.conversation_rows_discarded_workstream_gone ws=%s rows=%d discarded=%s",
+                        self._ws_id[:8],
+                        len(discarded),
+                        discarded,
+                    )
+                    notify_state_change = self._conversation_persistence_state_needs_notification(
+                        previous_state,
+                        self._conversation_persistence_state_locked(),
+                    )
+                else:
+                    failed_at = datetime.now(UTC)
+                    self._conversation_persistence_attempts += 1
+                    if self._conversation_persistence_first_failure_at is None:
+                        self._conversation_persistence_first_failure_at = failed_at
+                    self._conversation_persistence_last_failure_at = failed_at
+                    if conflict is not None:
+                        current = self._pending_conversation_commits.get(entry.commit_key)
+                        if current is not None and current.ack_from_durable_row:
+                            self._pending_conversation_commits[entry.commit_key] = (
+                                dataclasses.replace(current, ack_from_durable_row=False)
+                            )
+                        self._conversation_persistence_failure_kind = "conflict"
+                        self._conversation_persistence_next_retry_at = None
+                        self._conversation_persistence_next_retry_wall_at = None
+                        error = ConversationPersistenceError(
+                            "Accepted conversation row has an immutable durable commit conflict"
+                        )
+                    else:
+                        self._conversation_persistence_failure_kind = "retrying"
+                        delay = self._conversation_persistence_retry_delay(
+                            self._conversation_persistence_attempts
+                        )
+                        self._conversation_persistence_next_retry_at = time.monotonic() + delay
+                        self._conversation_persistence_next_retry_wall_at = failed_at + timedelta(
+                            seconds=delay
+                        )
+                        error = ConversationPersistenceError(
+                            "Accepted conversation row is awaiting durable storage reconciliation"
+                        )
+                    if error_cause is not None:
+                        error.__cause__ = error_cause
+                    self._conversation_persistence_error = error
+                    request_resync = (
+                        self._conversation_persistence_resync_commit_key != entry.commit_key
+                    )
+                    if request_resync:
+                        self._conversation_persistence_resync_commit_key = entry.commit_key
+                    notify_state_change = self._conversation_persistence_state_needs_notification(
+                        previous_state,
+                        self._conversation_persistence_state_locked(),
+                    )
+        if notify_state_change:
+            self._notify_conversation_persistence_state_changed()
+        # A listener can atomically register immediately before a tool-only
+        # assistant is accepted. Its inflight snapshot is empty, and failure
+        # prevents the later tool-info event that would reconstruct the row.
+        # Force those already-connected panes through the authoritative
+        # history overlay. Keep this outside both history locks: enqueue takes
+        # UI locks and browser callbacks may immediately start a new request.
+        # The repair fires for the non-raising workstream-gone discard too —
+        # its panes must leave the discarded rows for the (deleted)
+        # authoritative history.
+        if request_resync:
+            request_resync_hook = concrete_method(self.ui, "on_history_resync")
+            if request_resync_hook is not None:
+                try:
+                    request_resync_hook(resync_reason)
+                except Exception:
+                    log.debug("ui.on_history_resync raised", exc_info=True)
+        if error is not None:
+            if error_cause is not None:
+                raise error from error_cause
+            raise error
+        return
+
+    def _reconcile_pending_conversation_commits(
+        self,
+        *,
+        _terminal_admitted_repair: bool = False,
+        _force_retry: bool = False,
+    ) -> None:
+        """Retry every unresolved row in total acceptance order.
+
+        Ordinary callers enter the history-visibility lane and then recheck
+        publication admission.  This is the un-ticketed repair equivalent of
+        durability admission: if hard-delete's terminal barrier wins first,
+        no repair write can start after it; if reconciliation wins first, the
+        barrier waits for its acknowledgement before deletion proceeds.
+
+        ``_terminal_admitted_repair`` is deliberately private and narrow.  A
+        soft close must repair the accepted prefix after installing its latch
+        so it can decide whether unloading is safe; an already-admitted
+        durability ticket may likewise finish its ordered predecessor repair
+        while hard-delete waits for that ticket. No unadmitted caller may
+        write conversation storage after publication shutdown.
+        """
+
+        with self._history_visibility_lock:
+            with self._generation_lock:
+                if self._publication_shutdown and not _terminal_admitted_repair:
+                    raise GenerationCancelled()
+            with self._history_handoff_lock:
+                persistence_error = self._conversation_persistence_error
+                failure_kind = self._conversation_persistence_failure_kind
+                next_retry_at = self._conversation_persistence_next_retry_at
+                if failure_kind == "conflict" and persistence_error is not None:
+                    raise persistence_error
+                if (
+                    not _force_retry
+                    and failure_kind == "retrying"
+                    and next_retry_at is not None
+                    and time.monotonic() < next_retry_at
+                    and persistence_error is not None
+                ):
+                    raise persistence_error
+                pending = list(self._pending_conversation_commits.values())
+            for entry in pending:
+                self._persist_pending_conversation_commit(entry, _retry_admitted=True)
+
+    def reconcile_unresolved_persistence_if_due(self, *, now: float | None = None) -> bool:
+        """Run one due transient repair pass for manager-owned maintenance.
+
+        Returns whether a due pass was admitted. Expected persistence failures
+        remain represented by the journal state and are not allowed to tear
+        down the shared maintenance thread.
+        """
+        check_at = time.monotonic() if now is None else now
+        with self._history_visibility_lock:
+            with self._generation_lock:
+                if self._publication_shutdown:
+                    return False
+            with self._history_handoff_lock:
+                failure_kind = self._conversation_persistence_failure_kind
+                next_retry_at = self._conversation_persistence_next_retry_at
+                if not self._pending_conversation_commits or failure_kind == "conflict":
+                    return False
+                if failure_kind == "retrying" and (
+                    next_retry_at is None or check_at < next_retry_at
+                ):
+                    return False
+            try:
+                self._reconcile_pending_conversation_commits(_force_retry=True)
+            except GenerationCancelled:
+                return False
+            except ConversationPersistenceError:
+                return True
+            return True
+
+    def _await_prior_conversation_persistence(self, my_generation: int) -> None:
+        """Fence a new user turn behind all prior accepted durability batches."""
+        with self._durability_cond:
+            high_water = self._durability_next_ticket
+            already_drained = self._durability_serving_ticket >= high_water
+        with self._history_handoff_lock:
+            needs_reconciliation = bool(
+                self._pending_conversation_commits or self._conversation_persistence_error
+            )
+        # Preserve the historical first-send sequencing (including lightweight
+        # test/CLI sessions whose cancellation probe begins after user append).
+        # The fence is needed only when a predecessor ticket or unresolved row
+        # actually exists.
+        if already_drained and not needs_reconciliation:
+            return
+        while True:
+            with self._durability_cond:
+                if self._durability_serving_ticket >= high_water:
+                    break
+                self._durability_cond.wait(timeout=0.05)
+            self._check_cancelled(my_generation)
+        self._check_cancelled(my_generation)
+        self._reconcile_pending_conversation_commits()
+        self._check_cancelled(my_generation)
+
+    def prepare_soft_close(self) -> bool:
+        """Cancel, close structural debt, then reconcile the durable prefix.
+
+        Preparing is a short admission latch distinct from terminal shutdown:
+        it blocks fresh generations and unscoped mutations while the accepted
+        worker retains ownership long enough to journal any owed TOOL receipts.
+        A wedged worker gets a bounded grace period; refusal keeps the live
+        session loaded for an operator force-cancel instead of unloading an
+        invalid USER/ASSISTANT prefix.
+        """
+        with self._generation_transition_lock, self._generation_lock:
+            if self._publication_shutdown:
+                return not self.has_unresolved_conversation_persistence()
+            if self._soft_close_preparing:
+                return False
+            self._soft_close_preparing = True
+
+        # Use the complete cooperative cancellation path so provider streams,
+        # tool subprocesses, judges, and task-agent scopes all receive the
+        # close edge. Fresh claims remain fenced by the preparing latch while
+        # cancel() briefly reacquires the transition lock.
+        try:
+            self.cancel()
+        except BaseException:
+            with self._tool_structural_condition:
+                self._soft_close_preparing = False
+                self._tool_structural_condition.notify_all()
+            raise
+
+        deadline = time.monotonic() + _SOFT_CLOSE_STRUCTURAL_WAIT_SECONDS
+        with self._tool_structural_condition:
+            while self._tool_structural_debt is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._soft_close_preparing = False
+                    self._tool_structural_condition.notify_all()
+                    return False
+                self._tool_structural_condition.wait(timeout=remaining)
+
+            self._publication_shutdown = True
+            self._soft_close_preparing = False
+            # Invalidate worker slots captured before this close attempt even
+            # when durability reconciliation refuses the close and the terminal
+            # latch is rolled back. Fresh slots admitted after rollback capture
+            # this newer edge and remain usable.
+            durability_high_water = self._durability_next_ticket
+
+        with self._durability_cond:
+            self._durability_cond.wait_for(
+                lambda: self._durability_serving_ticket >= durability_high_water
+            )
+
+        try:
+            self._reconcile_pending_conversation_commits(
+                _terminal_admitted_repair=True,
+                _force_retry=True,
+            )
+        except ConversationPersistenceError:
+            durable_prefix_settled = False
+        else:
+            durable_prefix_settled = not self.has_unresolved_conversation_persistence()
+        if durable_prefix_settled:
+            return True
+        with self._generation_lock:
+            self._generation += 1
+            self._cancel_event = threading.Event()
+            self._publication_shutdown = False
+            self._soft_close_preparing = False
+        return False
+
+    def force_abandon_generation(
+        self,
+        *,
+        target_is_current: Callable[[], bool],
+        clear_target: Callable[[], bool],
+        publish_abandoned: Callable[[], None],
+    ) -> tuple[bool, ConversationPersistenceError | None]:
+        """Supersede one pinned worker after closing its accepted tool block.
+
+        The caller supplies two tiny workstream-slot callbacks so this method
+        can preserve the global lock order (generation -> workstream) without
+        importing manager state. While the generation lock is held,
+        ``session_worker`` cannot capture a successor claim: an exact target
+        check therefore stays authoritative through supersession, UNKNOWN
+        receipt journaling, and the owner-conditional slot clear. TOOL storage
+        closures enter the ordinary FIFO ticket and remain poison-gated behind
+        any unresolved predecessor row. The terminal UI callback then runs
+        after that FIFO settles but before the transition lock releases, so a
+        successor cannot publish thinking ahead of the predecessor's
+        stream-end/idle edge.
+        """
+        abandoned = False
+        persistence_error: ConversationPersistenceError | None = None
+
+        def _finalize_force_abandon(durable: list[Callable[[], None]]) -> None:
+            nonlocal abandoned
+            if not target_is_current():
+                return
+            debt = self._tool_structural_debt
+            self._cancel_event.set()
+            self._generation += 1
+            self._cancel_event = threading.Event()
+            if debt is not None:
+                try:
+                    self._synthesize_cancelled_results(
+                        "Force-cancelled before the tool outcome could be observed.",
+                        deferred_persistence=durable,
+                        structural_generation=debt.generation,
+                    )
+                except BaseException:
+                    # Force installed a fresh generation event above. If its
+                    # own structural finalizer fails, no send-finally hook will
+                    # poison that new event for us; keep dispatcher admission
+                    # closed until a later force retry repairs the same debt.
+                    self._poison_tool_structural_debt_locked(debt.generation)
+                    raise
+            try:
+                self._drain_pending_advisories()
+            except Exception:
+                # Advisory cleanup is best-effort and historically could not
+                # defeat the force escape hatch. Structural completion above
+                # remains fail-closed; only this ancillary latch is demoted.
+                log.debug(
+                    "session.force_abandon.advisory_cleanup_failed ws=%s",
+                    self._ws_id[:8],
+                    exc_info=True,
+                )
+            abandoned = clear_target()
+
+        with self._generation_transition_lock:
+            # Destructive history/lifecycle workers advertise a non-abandonable
+            # slot. Refuse before entering the truncation/durability admission
+            # path so force remains a prompt cooperative cancel instead of
+            # waiting on the very transaction whose ownership must be kept.
+            if not target_is_current():
+                return False, None
+            try:
+                admitted = self._commit_for_generation(
+                    0,
+                    _finalize_force_abandon,
+                    allow_cancelled=True,
+                    allow_soft_close_preparing=True,
+                    allow_workstream_gone=True,
+                    allow_tool_structural_debt=True,
+                )
+            except ConversationPersistenceError as exc:
+                # The structural rows were journaled and the exact slot was
+                # already cleared before the FIFO batch observed its poisoned
+                # predecessor. Preserve the typed result for the route/log and
+                # let the normal retry/conflict state own later reconciliation.
+                persistence_error = exc
+            else:
+                if not admitted:
+                    return False, None
+            if abandoned:
+                try:
+                    publish_abandoned()
+                except Exception:
+                    # Structural and slot ownership are already settled. The
+                    # terminal event remains best-effort, but attempting it on
+                    # this side of generation admission preserves ordering.
+                    log.debug(
+                        "session.force_abandon.terminal_publish_failed ws=%s",
+                        self._ws_id[:8],
+                        exc_info=True,
+                    )
+        return abandoned, persistence_error
+
     def _commit_for_generation(
         self,
         origin_generation: int,
         commit: Callable[[list[Callable[[], None]]], None],
         *,
         allow_cancelled: bool = True,
+        allow_persistence_poison: bool = False,
+        allow_soft_close_preparing: bool = False,
+        allow_tool_structural_debt: bool = False,
+        allow_workstream_gone: bool = False,
     ) -> bool:
         """Commit live state atomically, then run its durable batch in FIFO order.
 
@@ -7959,19 +9470,65 @@ class ChatSession:
         The caller retains the historical synchronous durability contract: it
         returns only after its batch finishes (or raises), but Stop/close/claim
         remain free to acquire the lifecycle locks while storage is blocked.
+        ``allow_soft_close_preparing`` and ``allow_tool_structural_debt`` are
+        reserved for force-abandon's exact structural finalizer. Ordinary
+        origin-zero mutations remain fenced by both latches.
+
+        ``allow_workstream_gone`` marks the convergence lanes (the
+        cancel/interrupt/failure finalizers and force-abandon) that must still
+        run after a keyed save observed the durable parent hard-deleted; every
+        other admission refuses so a deleted workstream cannot keep accepting
+        turns whose rows silently discard.
         """
         durable: list[Callable[[], None]] = []
         ticket: int | None = None
-        with self._generation_lock:
+        commit_error: BaseException | None = None
+        # This method and the terminal drain below are the two ChatSession
+        # entry points BORROWED UNBOUND by resource shells that own only the
+        # durability lane and none of the admission fields, so their lifecycle
+        # reads stay defensive where the rest of the file reads directly.
+        truncation_condition = getattr(self, "_history_truncation_condition", None)
+        commit_guard = truncation_condition or self._generation_lock
+        with commit_guard:
+            if truncation_condition is not None:
+                truncation_condition.wait_for(lambda: not self._history_truncation_active)
             if (
                 self._publication_shutdown
+                or (
+                    not origin_generation
+                    and getattr(self, "_soft_close_preparing", False)
+                    and not allow_soft_close_preparing
+                )
+                or (
+                    not origin_generation
+                    and getattr(self, "_tool_structural_debt", None) is not None
+                    and not allow_tool_structural_debt
+                )
                 or (origin_generation and self._generation != origin_generation)
                 or (not allow_cancelled and self._cancel_event.is_set())
+                or (
+                    not allow_workstream_gone
+                    and getattr(self, "_workstream_gone_ws", None) is not None
+                    and self._workstream_gone_ws == self._ws_id
+                )
             ):
                 return False
             owner_token = _active_commit_origin_generation.set(origin_generation)
             try:
                 commit(durable)
+            except BaseException as exc:
+                # Journal admission can precede a later callback failure. Its
+                # already-collected persistence closures still own a place in
+                # the FIFO; dropping them here leaves a pending-only overlay
+                # with no due retry and can expose an invalid durable prefix.
+                commit_error = exc
+                if getattr(self, "_tool_structural_debt", None) is not None:
+                    # Poison dispatcher admission before releasing the same
+                    # generation lock that protects structural debt. Relying
+                    # on send()'s later _consume_cancel finally leaves a race
+                    # where another request captures a nominal worker claim
+                    # against an invalid ASSISTANT-without-TOOL prefix.
+                    self._poison_tool_structural_debt_locked()
             finally:
                 _active_commit_origin_generation.reset(owner_token)
             if durable:
@@ -7979,21 +9536,49 @@ class ChatSession:
                 self._durability_next_ticket += 1
 
         if ticket is None:
+            if commit_error is not None:
+                raise commit_error
             return True
 
         with self._durability_cond:
             self._durability_cond.wait_for(lambda: self._durability_serving_ticket == ticket)
+        durability_error: BaseException | None = None
         try:
+            history_lock = getattr(self, "_history_handoff_lock", None)
+            if history_lock is None:
+                poison = None
+            else:
+                with history_lock:
+                    poison = self._conversation_persistence_error
+            if poison is not None and not allow_persistence_poison:
+                # Tickets admitted behind an unresolved conversation boundary
+                # must settle without executing.  Waiting for a future repair
+                # would pin their owner threads indefinitely; executing would
+                # persist a causal suffix after a missing assistant row.
+                raise poison
             for persist in durable:
                 persist()
+        except BaseException as exc:
+            # ConversationPersistenceError needs no special arm: the retrying
+            # and conflict classifiers latch ``_conversation_persistence_error``
+            # before raising, and the workstream-gone discard returns without
+            # raising — re-latching here could only recreate a phantom error
+            # over an empty journal.
+            durability_error = exc
         finally:
             with self._durability_cond:
                 self._durability_serving_ticket += 1
                 self._durability_cond.notify_all()
+        if durability_error is not None:
+            if commit_error is not None:
+                raise durability_error from commit_error
+            raise durability_error
+        if commit_error is not None:
+            raise commit_error
         return True
 
     def shutdown_publication_and_drain_durability(self) -> None:
-        """Close durable admission and wait for every accepted batch.
+        """Close admission, cancel resources, and drain admitted batches.
 
         Hard deletion needs a stronger boundary than cooperative worker
         cancellation: a generation commit may already have published its
@@ -8009,14 +9594,50 @@ class ChatSession:
         after the lifecycle outcome is known.
         """
         with self._generation_lock:
+            structural_debt = getattr(self, "_tool_structural_debt", None)
+            # Install the terminal latch before cooperative cancellation.
+            # A worker that observes the cancel edge must not synthesize a
+            # new ws-id-only TOOL storage closure: the authorized durable
+            # incarnation may already have been replaced on another node.
+            # Successful exact deletion erases the debt; an ambiguous
+            # same/unknown outcome retains it in the manager tombstone.
             self._publication_shutdown = True
             self._cancel_event.set()
+            self._approval_cancel_epoch = getattr(self, "_approval_cancel_epoch", 0) + 1
+            self._soft_close_preparing = False
+            structural_condition = getattr(self, "_tool_structural_condition", None)
+            if structural_condition is not None:
+                structural_condition.notify_all()
             durability_high_water = self._durability_next_ticket
+
+        terminal_error: BaseException | None = None
+        if structural_debt is not None:
+            try:
+                # Abort provider streams, task scopes, judges, and subprocesses
+                # after the latch. Their owner can unwind but cannot publish a
+                # fresh TOOL suffix across a remote same-id replacement.
+                self.cancel()
+            except BaseException as exc:
+                # The terminal admission edge above remains authoritative.
+                terminal_error = exc
 
         with self._durability_cond:
             self._durability_cond.wait_for(
                 lambda: self._durability_serving_ticket >= durability_high_water
             )
+
+        # Un-ticketed lost-ACK reconciliation uses the visibility lane.  Take
+        # it once after the terminal latch and ticket drain: a repair that won
+        # before the latch completes first, while a waiter that lost the latch
+        # rechecks publication shutdown and exits without writing.  The caller
+        # may now delete storage without a late reconciliation resurrecting a
+        # conversation row.
+        history_visibility_lock = getattr(self, "_history_visibility_lock", None)
+        if history_visibility_lock is not None:
+            with history_visibility_lock:
+                pass
+        if terminal_error is not None:
+            raise terminal_error
 
     def _consume_cancel(self, my_generation: int) -> bool:
         """Clear this generation's cancel signal on exit; report if one landed.
@@ -8031,6 +9652,13 @@ class ChatSession:
         with self._generation_transition_lock, self._generation_lock:
             if self._generation != my_generation:
                 return False
+            if self._poison_tool_structural_debt_locked(my_generation):
+                # An abnormal structural finalizer can itself fail (for
+                # example, journal admission rejects its TOOL receipt). Keep
+                # this generation poisoned at the dispatcher boundary: a new
+                # worker must not report successful admission only to fail its
+                # later generation claim behind the still-incomplete prefix.
+                return True
             landed = self._cancel_event.is_set()
             if not self._publication_shutdown:
                 self._cancel_event.clear()
@@ -8061,6 +9689,33 @@ class ChatSession:
             raise GenerationCancelled() from None
         self._check_cancelled(my_generation)
 
+    def _direct_commit_reentry(
+        self,
+        closed_error: str,
+        reenter: Callable[[list[Callable[[], None]]], Any],
+    ) -> Any:
+        """THE direct-mutation admission frame, expressed once.
+
+        Wraps a re-entrant call in the full direct-commit discipline:
+        ``_prepare_direct_conversation_mutation`` (the reconcile poison
+        gate), admission through ``_commit_for_generation(0, ...)``, and
+        the closed-session refusal (``closed_error`` verbatim).  Every
+        direct path (``deferred_persistence is None``) takes this frame,
+        so an admission precondition added here reaches ALL direct
+        mutations at once instead of three of four hand-synced copies —
+        a path skipping a tightened gate would mutate conversation state
+        outside the discipline.  Returns the re-entrant call's value.
+        """
+        self._prepare_direct_conversation_mutation(None)
+        result: list[Any] = []
+
+        def _admit_direct(durable: list[Callable[[], None]]) -> None:
+            result.append(reenter(durable))
+
+        if not self._commit_for_generation(0, _admit_direct):
+            raise RuntimeError(closed_error)
+        return result[0] if result else None
+
     def _append_user_turn(
         self,
         user_input: str,
@@ -8070,7 +9725,9 @@ class ChatSession:
         from_wake: bool = False,
         source: str | None = None,
         deferred_persistence: list[Callable[[], None]] | None = None,
-    ) -> int:
+        sender_user_id: str | None = None,
+        client_send_ids: tuple[str, ...] = (),
+    ) -> None:
         """Append a user turn (plain or multipart) and persist it.
 
         When ``attachments`` is non-empty the in-memory message carries
@@ -8079,17 +9736,31 @@ class ChatSession:
         bytes are written content-addressed + reference-counted into
         ``workstream_attachments`` (``attachment_id`` = the content hash) and
         the ordered id-list is recorded on the row's ``attachments`` ref-list
-        column — the sole message->blob link.  Returns the saved conversations
-        row id (0 on save failure, per the storage wrapper's no-raise
-        contract).
+        column — the sole message->blob link.  An unresolved save raises
+        :class:`ConversationPersistenceError` while the exact row remains in
+        the live handoff journal.
 
-        ``send_id`` (when provided) is the end-to-end send token; it no longer
-        gates a DB reservation (the upload buffer is the pending store — the
-        bytes were already drained from it before this call).
+        ``send_id`` identifies a web-staged attachment send. Its scoped buffer
+        references transfer atomically at journal admission, after every
+        pre-admission rejection boundary and before any later send can select
+        them again. Direct/internal callers without ``send_id`` may supply
+        immutable unstaged attachments.
         """
-        # New user content invalidates the per-turn memory-search cache
-        # (composition will see a different recent-context string).
-        self._invalidate_memory_cache()
+        if deferred_persistence is None:
+            self._direct_commit_reentry(
+                "Cannot append a user turn to a closed session",
+                lambda durable: self._append_user_turn(
+                    user_input,
+                    attachments,
+                    send_id=send_id,
+                    from_wake=from_wake,
+                    source=source,
+                    deferred_persistence=durable,
+                    sender_user_id=sender_user_id,
+                    client_send_ids=client_send_ids,
+                ),
+            )
+            return
         user_content: str | list[dict[str, Any]]
         if attachments:
             # Attachments ride by reference (``{type: kind, attachment_id}`` →
@@ -8117,6 +9788,10 @@ class ChatSession:
         else:
             user_content = user_input
 
+        # Every live user row receives the same idempotent storage identity as
+        # an accepted assistant row.  It is independent of ``send_id`` (a UI
+        # tracking token) and survives ambiguous storage acknowledgement.
+        commit_key = uuid.uuid4().hex
         user_msg: dict[str, Any] = {"role": "user", "content": user_content}
         if from_wake and self._wake_source_tag:
             # Sibling tag for audit / replay: the synthetic empty user
@@ -8143,9 +9818,17 @@ class ChatSession:
         # / ``from_wake`` and stay unstamped so they never get a speaker label.
         # Rides the wire-invisible ``_sender`` side channel and, below, the
         # persisted ``meta`` column so history replay re-attributes correctly.
-        sender = "" if (from_wake or source) else (self._mcp_effective_user_id or "").strip()
+        effective_sender = (
+            (self._mcp_effective_user_id or "") if sender_user_id is None else sender_user_id
+        )
+        sender = "" if (from_wake or source) else effective_sender.strip()
         if sender:
             user_msg["_sender"] = sender
+        stable_client_send_ids = tuple(
+            client_send_id for client_send_id in client_send_ids if client_send_id
+        )
+        if stable_client_send_ids:
+            user_msg["_client_send_ids"] = list(stable_client_send_ids)
         if attachments:
             # Sibling metadata so live history replay has the same shape
             # as reloaded-from-DB (filenames are not recoverable from an
@@ -8153,6 +9836,7 @@ class ChatSession:
             # underscore keys before the wire call so this is safe.
             user_msg["_attachments_meta"] = [
                 {
+                    "attachment_id": a.attachment_id,
                     "kind": a.kind,
                     "filename": a.filename,
                     "mime_type": a.mime_type,
@@ -8162,18 +9846,17 @@ class ChatSession:
                 }
                 for a in attachments
             ]
-        self.messages.append(turn_from_dict(user_msg))
-        if sender:
-            # A newly recorded sender can change shared-workstream state; let
-            # the next system-prompt compose re-derive it (memoized otherwise).
-            self._invalidate_shared_state()
-        self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
+        user_turn = turn_from_dict(user_msg)
+        user_token_estimate = max(
+            1,
+            int(self._msg_char_count(user_msg) / self._chars_per_token),
+        )
         # DB row stores the raw text only; attachment bytes are written
         # content-addressed into workstream_attachments and the ordered id-list
         # is recorded on this row's ``attachments`` ref-list column (the sole
-        # message->blob link), joined back in on load.  ``send_id`` no longer
-        # gates a reservation — the bytes were drained from the upload buffer
-        # before this call.
+        # message->blob link), joined back in on load. A web-staged send moves
+        # the matching upload-buffer ownership into this immutable closure at
+        # admission; direct/internal calls may supply unstaged bytes.
         #
         # The wake's synthesised empty turn carries ``_source`` onto the
         # row so reconnecting tabs render the marker instead of an
@@ -8185,78 +9868,123 @@ class ChatSession:
         # column already carries opaque per-row metadata). ``reconstruct_turns``
         # restores it to ``Turn.meta.extra["sender"]`` so a worker rehydrating a
         # shared workstream re-attributes each user turn.
-        meta_json = json.dumps({"sender": sender}) if sender else None
+        meta_envelope: dict[str, Any] = {}
+        if sender:
+            meta_envelope["sender"] = sender
+        if stable_client_send_ids:
+            meta_envelope["client_send_ids"] = list(stable_client_send_ids)
+        meta_json = json.dumps(meta_envelope) if meta_envelope else None
         persist_ws_id = self._ws_id
         persist_user_id = self._user_id
-        persist_event_id = self._ui_event_id()
-        persist_attachments = tuple(attachments)
+        attachment_writes = _attachment_writes(attachments)
+        persist_event_id: int | None = None
 
         def _persist_user_turn() -> int:
-            message_id = save_message(
-                persist_ws_id,
-                "user",
-                user_input,
-                source=source if isinstance(source, str) and source else None,
-                event_id=persist_event_id,
-                meta=meta_json,
-            )
-            if persist_attachments and message_id:
-                self._persist_attachment_refs(
-                    message_id,
-                    persist_attachments,
-                    ws_id=persist_ws_id,
+            persist_source = source if isinstance(source, str) and source else None
+            if attachment_writes:
+                message_id = save_user_message_with_attachments(
+                    persist_ws_id,
+                    user_input,
+                    attachment_writes,
+                    source=persist_source,
+                    event_id=persist_event_id,
+                    meta=meta_json,
+                    commit_key=commit_key,
                 )
-                # Drain the now-committed handles from the per-node upload
-                # buffer.  Capture both identities at admission: a force
-                # successor or resume may rebind the live session before this
-                # ordered durable closure runs.
-                buffer = get_attachment_buffer()
-                for att in persist_attachments:
-                    buffer.discard(
-                        att.attachment_id,
-                        ws_id=persist_ws_id,
-                        user_id=persist_user_id,
-                    )
+            else:
+                message_id = save_message(
+                    persist_ws_id,
+                    "user",
+                    user_input,
+                    source=persist_source,
+                    event_id=persist_event_id,
+                    meta=meta_json,
+                    commit_key=commit_key,
+                )
             return message_id
 
-        if deferred_persistence is not None:
+        event_attachments = [
+            {
+                "attachment_id": write.attachment_id,
+                "kind": write.kind,
+                "filename": write.filename,
+                "mime_type": write.mime_type,
+            }
+            for write in attachment_writes
+        ]
 
-            def _persist_user_turn_deferred() -> None:
-                _persist_user_turn()
-
-            deferred_persistence.append(_persist_user_turn_deferred)
-            return 0
-        return _persist_user_turn()
-
-    def _persist_attachment_refs(
-        self,
-        message_id: int,
-        attachments: list[Attachment] | tuple[Attachment, ...],
-        *,
-        origin: str = "upload",
-        ws_id: str | None = None,
-    ) -> None:
-        """Write each attachment's bytes content-addressed and record the ref-list.
-
-        ``attachment_id`` is the content hash, so identical bytes dedupe to one
-        blob and each reference bumps its refcount; the ordered id-list is
-        recorded on the conversations row's ``attachments`` column.  Used by
-        the user-turn commit (``origin='upload'``) and the tool-image persist
-        (``origin='tool'``).
-        """
-        ref_ids: list[str] = []
-        for att in attachments:
-            save_attachment(
-                att.attachment_id,
-                att.filename,
-                att.mime_type,
-                len(att.content),
-                att.kind,
-                att.content,
-                origin,
+        # Admission, journal/revision advance, and event publication are one atomic
+        # REST-history -> SSE transition.  A listener registered before this
+        # lock receives ``user_turn``; an old-token registration after it is
+        # rejected.  Journal the immutable accepted row before making it
+        # externally visible, then stamp that same row with the event cursor.
+        with self._history_handoff_lock:
+            # The buffer transfer and all accepted-row mutations share this
+            # admission point. A failed claim leaves both staging and history
+            # untouched; a successful claim is backed by the immutable writes
+            # captured in ``_persist_user_turn``.
+            self._invalidate_memory_cache()
+            history_revision_before = self._history_handoff_revision
+            self.messages.append(user_turn)
+            if sender:
+                # A newly recorded sender can change shared-workstream state;
+                # let the next system-prompt compose re-derive it.
+                self._invalidate_shared_state()
+            self._msg_tokens.append(user_token_estimate)
+            try:
+                pending = self._journal_conversation_row_locked(
+                    commit_key=commit_key,
+                    message=user_msg,
+                    persist=_persist_user_turn,
+                    event_id=None,
+                )
+            except BaseException:
+                self._rollback_live_journal_admission_locked(
+                    turn=user_turn,
+                    commit_key=commit_key,
+                    history_revision_before=history_revision_before,
+                    reason="user_turn_admission_rolled_back",
+                )
+                raise
+            if send_id and attachment_writes:
+                # Drain staging only AFTER the journal claim succeeded:
+                # ``attachment_writes`` already carries the resolved bytes; the
+                # staged buffer is only the double-spend guard for a second
+                # send racing this one, and both sends serialize on this lock.
+                # A raise above therefore leaves the handles staged, so the
+                # client's retry of the same send resolves them again instead
+                # of being rejected as unknown/expired (round-3 review).
+                # Entries can legitimately be gone by now (TTL expiry while
+                # queued behind the durability fence), so a missing handle
+                # must not fail a turn whose payload is fully in hand — but
+                # every surviving sibling is still consumed so no staged owner
+                # outlives this admission.
+                unique_ids = tuple(
+                    dict.fromkeys(write.attachment_id for write in attachment_writes)
+                )
+                transferred = get_attachment_buffer().consume_all(
+                    unique_ids,
+                    ws_id=persist_ws_id,
+                    user_id=persist_user_id,
+                )
+                if len(transferred) < len(unique_ids):
+                    log.debug(
+                        "session.user_turn.staged_attachments_partially_released ws=%s missing=%d",
+                        persist_ws_id[:8],
+                        len(unique_ids) - len(transferred),
+                    )
+            persist_event_id = self._publish_user_turn_locked(
+                content=user_input,
+                attachments=event_attachments,
+                sender=sender or None,
+                source=source if isinstance(source, str) and source else None,
+                client_send_ids=list(stable_client_send_ids),
             )
-            ref_ids.append(att.attachment_id)
-        set_message_attachments(ws_id or self._ws_id, message_id, ref_ids)
+            user_msg["_event_id"] = persist_event_id
+            user_turn.meta.event_id = persist_event_id
+            pending.message["_event_id"] = persist_event_id
+
+        self._schedule_conversation_persistence(pending, deferred_persistence)
 
     @staticmethod
     def _decode_image_part(part: Any, tool_name: str) -> Attachment | None:
@@ -8355,40 +10083,77 @@ class ChatSession:
         live mirror both rebuild the same per-kind bubble.  It is stripped before
         the LLM wire (``_source_meta`` is a ``_``-prefixed key).
         """
-        turn = make_system_turn(source, content, **meta)
-        self.messages.append(turn_from_dict(turn))
-        self._msg_tokens.append(max(1, int(self._msg_char_count(turn) / self._chars_per_token)))
-        meta_json = json.dumps(meta) if meta else None
-        # Fire the live SSE hook BEFORE persisting so the row carries the SAME
-        # event_id its ``system_turn`` event carries.  ``on_system_turn``
-        # returns the id ``_enqueue`` assigned (``None`` for non-SSE UIs / test
-        # doubles).  The hook stays best-effort: on failure the persist below
-        # still runs and the row falls back to the current cursor (no live
-        # event was delivered to double anyway).
-        emitted_event_id: int | None = None
-        try:
-            emitted_event_id = _coerce_event_id(
-                self.ui.on_system_turn(content, source, meta or None)
+        if deferred_persistence is None:
+            self._direct_commit_reentry(
+                "Cannot append a system turn to a closed session",
+                lambda durable: self._append_system_turn(
+                    source,
+                    content,
+                    deferred_persistence=durable,
+                    **meta,
+                ),
             )
-        except Exception:
-            log.warning("ui.on_system_turn failed; system turn still appended", exc_info=True)
+            return
+        turn = make_system_turn(source, content, **meta)
+        system_turn = turn_from_dict(turn)
+        token_estimate = max(1, int(self._msg_char_count(turn) / self._chars_per_token))
+        meta_json = json.dumps(meta) if meta else None
         persist_ws_id = self._ws_id
-        persist_event_id = emitted_event_id if emitted_event_id is not None else self._ui_event_id()
+        commit_key = uuid.uuid4().hex
+        persist_event_id: int | None = None
 
-        def _persist_system_turn() -> None:
-            save_message(
+        def _persist_system_turn() -> int:
+            return save_message(
                 persist_ws_id,
                 "system",
                 content,
                 source=source,
                 event_id=persist_event_id,
                 meta=meta_json,
+                commit_key=commit_key,
             )
 
-        if deferred_persistence is None:
-            _persist_system_turn()
-        else:
-            deferred_persistence.append(_persist_system_turn)
+        # The semantic event and row admission are one handoff transition. A
+        # throwing hook falls back to an explicit history repair before the
+        # revision changes, so already-connected panes cannot miss the row.
+        with self._history_handoff_lock:
+            history_revision_before = self._history_handoff_revision
+            self.messages.append(system_turn)
+            self._msg_tokens.append(token_estimate)
+            hook_completed = False
+            emitted_event_id: int | None = None
+            try:
+                emitted_event_id = _coerce_event_id(
+                    self.ui.on_system_turn(content, source, meta or None)
+                )
+                hook_completed = True
+            except Exception:
+                log.warning(
+                    "ui.on_system_turn failed; requesting authoritative history",
+                    exc_info=True,
+                )
+            if not hook_completed:
+                self._request_history_resync_locked("system_turn_accepted")
+            persist_event_id = (
+                emitted_event_id if emitted_event_id is not None else self._ui_event_id()
+            )
+            try:
+                pending = self._journal_conversation_row_locked(
+                    commit_key=commit_key,
+                    message=turn,
+                    persist=_persist_system_turn,
+                    event_id=persist_event_id,
+                )
+            except BaseException:
+                self._rollback_live_journal_admission_locked(
+                    turn=system_turn,
+                    commit_key=commit_key,
+                    history_revision_before=history_revision_before,
+                    reason="system_turn_admission_rolled_back",
+                )
+                raise
+
+        self._schedule_conversation_persistence(pending, deferred_persistence)
 
     # -- Main generation loop ------------------------------------------------
 
@@ -8492,6 +10257,39 @@ class ChatSession:
         return self._acting_user_id or self._user_id or None
 
     def bind_acting_user(self, user_id: str) -> None:
+        """Bind directly, or defer a worker-thread bind until generation claim.
+
+        HTTP/coordinator worker closures historically call this immediately
+        before :meth:`send`.  A slot-time :class:`WorkerClaim` is authoritative
+        in that window: applying the bind here would let an abandoned worker
+        overwrite its successor before the old claim is rejected.  ``send``
+        performs the generation-owned bind after validating that claim.
+
+        Direct CLI/tests have no active worker claim and retain the synchronous
+        behavior.
+        """
+
+        requested = user_id.strip()
+        claim = current_worker_claim(self)
+        if claim is not None:
+            if claim.principal_id and requested and requested != claim.principal_id:
+                raise RuntimeError("Worker principal does not match acting user")
+            return
+        with self._acting_user_bind_lock:
+            self._bind_acting_user_unfenced(requested)
+
+    def _bind_acting_user_for_generation(self, user_id: str, my_generation: int) -> None:
+        """Install one actor projection while *my_generation* still owns it."""
+
+        with self._acting_user_bind_lock:
+            self._check_generation_admission(my_generation)
+            self._bind_acting_user_unfenced(user_id)
+            # A force successor can claim while the listener/catalog work above
+            # runs.  It waits on this bind lock and will install the final actor;
+            # the stale worker must stop before any model/tool work of its own.
+            self._check_generation_admission(my_generation)
+
+    def _bind_acting_user_unfenced(self, user_id: str) -> None:
         """Bind the authenticated initiator of the current turn.
 
         Called from the HTTP send path with the caller's authenticated
@@ -8566,6 +10364,8 @@ class ChatSession:
         send_id: str | None,
         from_wake: bool,
         turn_principal_id: str,
+        client_send_ids: tuple[str, ...] = (),
+        acting_principal_id: str | None = None,
         wire_part_cache: dict[
             tuple[str, tuple[bool, bool, bool]],
             dict[str, Any] | list[dict[str, Any]],
@@ -8589,9 +10389,14 @@ class ChatSession:
             else 0
         )
         shared_state_plan = self._plan_shared_state()
+        acting_principal = (
+            (self._mcp_effective_user_id or "").strip()
+            if acting_principal_id is None
+            else acting_principal_id.strip()
+        )
         participant_name: str | None = None
         if not from_wake:
-            participant_id = (self._mcp_effective_user_id or "").strip()
+            participant_id = acting_principal
             owner_id = (self._mcp_user_id or "").strip()
             if participant_id and participant_id != owner_id:
                 participant_name = self._resolve_display_name(participant_id)
@@ -8622,10 +10427,12 @@ class ChatSession:
                 send_id=send_id,
                 from_wake=from_wake,
                 deferred_persistence=durable,
+                sender_user_id=acting_principal,
+                client_send_ids=client_send_ids,
             )
             if not from_wake:
                 became_shared = self._maybe_note_new_participant(
-                    self._mcp_effective_user_id,
+                    acting_principal,
                     deferred_persistence=durable,
                     recompose_system=False,
                     resolved_name=participant_name,
@@ -8682,7 +10489,7 @@ class ChatSession:
         ):
             raise GenerationCancelled()
         if recompose_out and recompose_out[0]:
-            self._check_cancelled(my_generation)
+            self._check_generation_admission(my_generation)
             if not self._init_system_messages(origin_generation=my_generation):
                 raise GenerationCancelled()
 
@@ -8694,6 +10501,7 @@ class ChatSession:
         *,
         from_wake: bool = False,
         acting_user_id: str | None = None,
+        client_send_ids: tuple[str, ...] = (),
     ) -> None:
         """Send user input and handle the response loop (including tool calls).
 
@@ -8705,56 +10513,98 @@ class ChatSession:
         column.
 
         ``send_id`` is an end-to-end tracking token only; it no longer gates a
-        DB reservation (the upload buffer is the pending store, and the bytes
-        in ``attachments`` were already drained/peeked from it by the caller).
+        DB reservation. The caller only peeks at the upload buffer; admission
+        of the immutable pending user row atomically transfers staged bytes.
 
         ``acting_user_id`` is the authenticated caller who initiated this
         turn (HTTP send / retry paths). It rebinds per-user MCP credential
         resolution to that user for this and subsequent turns — see
         :meth:`bind_acting_user`. ``None`` (internal callers: wake nudges,
         auto-resume, CLI) leaves the current binding untouched.
+
+        ``client_send_ids`` are browser-generated correlation tokens for the
+        accepted user-row event. They are deliberately not idempotency keys:
+        two sends carrying the same token remain two distinct conversation
+        rows and are distinguished by their monotonic event ids.
         """
-        if acting_user_id is not None:
-            self.bind_acting_user(acting_user_id)
-        turn_principal_id = (self._mcp_effective_user_id or "").strip()
-        # A dead binding diagnosed by the refresh does NOT fail fast here:
-        # the send proceeds so the fallback chain can carry the turn, and
-        # ``_format_backend_error`` surfaces the latched cause if it cannot.
-        self._refresh_model_from_registry()
-        # Token budget approval gate
-        if self._budget_exhausted:
-            budget_cancel_witness = _ApprovalCancelWitness(self)
-            approved, _ = self.ui.approve_tools(
-                [
-                    {
-                        "func_name": "__budget_override__",
-                        "preview": (
-                            f"Token budget ({self._token_budget:,}) exhausted. Approve to continue."
-                        ),
-                        "needs_approval": True,
-                        # Synchronization-only state.  SessionUIBase projects
-                        # approval items through an explicit wire allowlist, so
-                        # this witness never crosses SSE / persistence.
-                        "_approval_cancel_witness": budget_cancel_witness,
-                    }
-                ]
-            )
-            if not approved:
-                # A Stop is not a budget-policy rejection.  The approval cycle
-                # already emitted its cancelled resolution; return quietly and
-                # let the worker's normal convergence restore idle state.
-                if budget_cancel_witness.aborted:
-                    return
-                self.ui.on_error("Token budget exhausted. Approval required to continue.")
-                return
-            self._budget_exhausted = False
-            self._budget_warned = False
-        my_generation = self._claim_generation()
+        worker_claim = current_worker_claim(self)
+        requested_principal = (acting_user_id or "").strip()
+        if worker_claim is not None and worker_claim.principal_id:
+            if requested_principal and requested_principal != worker_claim.principal_id:
+                raise RuntimeError("Worker principal does not match acting user")
+            turn_principal_id = worker_claim.principal_id
+        else:
+            turn_principal_id = requested_principal or (self._mcp_effective_user_id or "").strip()
+        # Worker-slot admission is the first lifecycle action.  In particular,
+        # do not bind an actor, refresh a registry, or enter an approval gate
+        # before validating the slot-time cancellation edge: a force successor
+        # may already own this same ChatSession.
+        my_generation = self._claim_generation(
+            principal_id=turn_principal_id or None,
+            expected_cancel_epoch=(worker_claim.cancel_epoch if worker_claim is not None else None),
+        )
         wire_part_cache: dict[
             tuple[str, tuple[bool, bool, bool]],
             dict[str, Any] | list[dict[str, Any]],
         ] = {}
         try:
+            with self._generation_lock:
+                if self._generation != my_generation:
+                    raise GenerationCancelled()
+                generation_cancel_event = self._cancel_event
+            if turn_principal_id:
+                self._bind_acting_user_for_generation(turn_principal_id, my_generation)
+            self._check_generation_admission(my_generation)
+            # A dead binding diagnosed by the refresh does NOT fail fast here:
+            # the send proceeds so the fallback chain can carry the turn, and
+            # ``_format_backend_error`` surfaces the latched cause if it cannot.
+            self._refresh_model_from_registry()
+            self._check_generation_admission(my_generation)
+            # Context checks and the user-row estimate below must use the primary
+            # binding's tokenizer even when the preceding accepted turn came from
+            # a fallback lane.
+            self._activate_token_calibration(self._primary_lane())
+            self._check_generation_admission(my_generation)
+            # Token budget approval gate.  The generation-local event is captured
+            # at claim time; consulting ``self._cancel_event`` here could pick up a
+            # force successor's fresh event and strand this stale approval.
+            if self._budget_exhausted:
+                budget_cancel_witness = _ApprovalCancelWitness(
+                    self,
+                    generation_cancel_event,
+                )
+                approved, _ = self.ui.approve_tools(
+                    [
+                        {
+                            "func_name": "__budget_override__",
+                            "preview": (
+                                f"Token budget ({self._token_budget:,}) exhausted. "
+                                "Approve to continue."
+                            ),
+                            "needs_approval": True,
+                            # Synchronization-only state. SessionUIBase projects
+                            # approval items through an explicit wire allowlist,
+                            # so this witness never crosses SSE / persistence.
+                            "_approval_cancel_witness": budget_cancel_witness,
+                        }
+                    ]
+                )
+                if not approved:
+                    # A Stop is not a budget-policy rejection. The approval cycle
+                    # already emitted its cancelled resolution; return quietly.
+                    if budget_cancel_witness.aborted:
+                        return
+                    self.ui.on_error("Token budget exhausted. Approval required to continue.")
+                    return
+                self._budget_exhausted = False
+                self._budget_warned = False
+            # A force successor may claim while its predecessor's accepted
+            # assistant row is still waiting on storage.  Claim/cancel remains
+            # responsive, but the successor may not append its user row until
+            # that causal boundary is durably reconciled.  Otherwise a failed
+            # assistant save can leave a later user/tool row behind a permanent
+            # hole in the transcript.
+            self._await_prior_conversation_persistence(my_generation)
             # Install every post-claim, pre-stream mutation only after this
             # cleanup bracket is live.  The helper publishes the user turn,
             # nudges/context, principal, and send-owned attachment cache as one
@@ -8766,6 +10616,8 @@ class ChatSession:
                 send_id=send_id,
                 from_wake=from_wake,
                 turn_principal_id=turn_principal_id,
+                client_send_ids=client_send_ids,
+                acting_principal_id=turn_principal_id,
                 wire_part_cache=wire_part_cache,
             )
             # Bail an orphaned/superseded send BEFORE the pre-send compaction below
@@ -8851,73 +10703,78 @@ class ChatSession:
                 ):
                     raise GenerationCancelled()
                 try:
-                    try:
-                        result = self._stream_response(my_generation)
-                    except Exception as ctx_err:
-                        # Context overflow recovery: if the API rejects the
-                        # request due to exceeding the context window, compact
-                        # the conversation and retry once.
-                        if not _is_ctx_overflow(ctx_err):
-                            raise
-                        log.warning(
-                            "Context overflow detected (%s), compacting and retrying",
-                            type(ctx_err).__name__,
-                        )
-                        # The notice and spinner handoff are one generation
-                        # publication.  A force successor/close/Stop that wins
-                        # after the overflow must not let this old worker paint
-                        # over the live UI before compaction's own owner fence.
-                        with self._generation_lock:
-                            if (
-                                self._publication_shutdown
-                                or self._generation != my_generation
-                                or self._cancel_event.is_set()
-                            ):
-                                raise GenerationCancelled() from None
-                            self.ui.on_info("\n[Context overflow — auto-compacting and retrying]")
-                            # Stop thinking indicator before compact (which has
-                            # its own start/stop) to avoid nested spinners.
-                            self.ui.on_thinking_stop()
-                        try:
-                            # my_generation: without it a stale send that hits
-                            # overflow here could compact-and-swap the LIVE
-                            # generation's history after a force-cancel started
-                            # a newer one — the same race every other compaction
-                            # site already guards.
-                            self._compact_messages(auto=True, my_generation=my_generation)
-                        except Exception:
-                            # RECOVERY-machinery failure: the overflow error
-                            # is still the actionable one, and its wording
-                            # already anticipates this case ("compaction
-                            # could not reduce it enough").
-                            log.warning(
-                                "Compact-and-retry failed, raising original error",
-                                exc_info=True,
-                            )
-                            raise ctx_err from None
-                        if not self._publish_for_generation(
-                            my_generation,
-                            self.ui.on_thinking_start,
-                            allow_cancelled=False,
-                        ):
-                            raise GenerationCancelled() from None
+                    with self._recovered_serving_failures() as recovered_failures:
                         try:
                             result = self._stream_response(my_generation)
-                        except Exception as retry_err:
-                            if not _is_ctx_overflow(retry_err):
-                                # A post-compaction failure that is NOT a
-                                # recurring overflow surfaces as ITSELF
-                                # (implicitly chained to ctx_err): masking
-                                # a dead wire or bad credentials behind
-                                # "Context window exceeded" sends the
-                                # operator to shrink a conversation that
-                                # already compacted fine.
+                        except Exception as ctx_err:
+                            recovered_failures.append(ctx_err)
+                            # Context overflow recovery: if the API rejects the
+                            # request due to exceeding the context window, compact
+                            # the conversation and retry once.
+                            if not _is_ctx_overflow(ctx_err):
                                 raise
                             log.warning(
-                                "Compact-and-retry re-overflowed, raising original error",
-                                exc_info=True,
+                                "Context overflow detected (%s), compacting and retrying",
+                                type(ctx_err).__name__,
                             )
-                            raise ctx_err from None
+                            # The notice and spinner handoff are one generation
+                            # publication.  A force successor/close/Stop that wins
+                            # after the overflow must not let this old worker paint
+                            # over the live UI before compaction's own owner fence.
+                            with self._generation_lock:
+                                if (
+                                    self._publication_shutdown
+                                    or self._generation != my_generation
+                                    or self._cancel_event.is_set()
+                                ):
+                                    raise GenerationCancelled() from None
+                                self.ui.on_info(
+                                    "\n[Context overflow — auto-compacting and retrying]"
+                                )
+                                # Stop thinking indicator before compact (which has
+                                # its own start/stop) to avoid nested spinners.
+                                self.ui.on_thinking_stop()
+                            try:
+                                # my_generation: without it a stale send that hits
+                                # overflow here could compact-and-swap the LIVE
+                                # generation's history after a force-cancel started
+                                # a newer one — the same race every other compaction
+                                # site already guards.
+                                self._compact_messages(auto=True, my_generation=my_generation)
+                            except Exception:
+                                # RECOVERY-machinery failure: the overflow error
+                                # is still the actionable one, and its wording
+                                # already anticipates this case ("compaction
+                                # could not reduce it enough").
+                                log.warning(
+                                    "Compact-and-retry failed, raising original error",
+                                    exc_info=True,
+                                )
+                                raise ctx_err from None
+                            if not self._publish_for_generation(
+                                my_generation,
+                                self.ui.on_thinking_start,
+                                allow_cancelled=False,
+                            ):
+                                raise GenerationCancelled() from None
+                            try:
+                                result = self._stream_response(my_generation)
+                            except Exception as retry_err:
+                                recovered_failures.append(retry_err)
+                                if not _is_ctx_overflow(retry_err):
+                                    # A post-compaction failure that is NOT a
+                                    # recurring overflow surfaces as ITSELF
+                                    # (implicitly chained to ctx_err): masking
+                                    # a dead wire or bad credentials behind
+                                    # "Context window exceeded" sends the
+                                    # operator to shrink a conversation that
+                                    # already compacted fine.
+                                    raise
+                                log.warning(
+                                    "Compact-and-retry re-overflowed, raising original error",
+                                    exc_info=True,
+                                )
+                                raise ctx_err from None
                 finally:
                     # Only clear if this generation is still active —
                     # an orphaned thread must not clobber a newer stream.
@@ -8966,31 +10823,29 @@ class ChatSession:
                     self._update_token_table(
                         msgs=completed_result.wire_msgs,
                         tool_def_chars=completed_result.tool_def_chars,
+                        provenance=completed_result.provenance,
                     )
                     # Report usage for every completed API call that this
                     # generation still owns.
                     self._print_status_line(
-                        model=completed_result.serving_model or None,
+                        model=(
+                            completed_result.provenance.backend_model_id
+                            or completed_result.serving_model
+                            or None
+                        ),
                         deferred_persistence=durable,
                     )
                     # The canonical Turn: minted tool ids, finalized native
                     # lane, and the SERVING lane's producer, so a
                     # fallback-served turn is not labeled with the primary's.
-                    self.messages.append(completed_result.turn)
-                    # Clear per-turn inflight buffers — the assistant message
-                    # is now in history, so the next execution/stream window
-                    # must not replay the same in-progress text.
-                    self.ui.on_turn_committed()
-                    self._msg_tokens.append(
-                        self._assistant_pending_tokens
-                        or max(
-                            1,
-                            int(
-                                self._msg_char_count(completed_result.turn) / self._chars_per_token
-                            ),
-                        )
+                    accepted_tool_call_ids = tuple(
+                        call.id for call in completed_result.turn.tool_calls if call.id
                     )
 
+                    assistant_token_estimate = self._assistant_pending_tokens or max(
+                        1,
+                        int(self._msg_char_count(completed_result.turn) / self._chars_per_token),
+                    )
                     # Save assistant message atomically (content + tool_calls
                     # in one row).  The persisted mirror and executed call list
                     # are derived from the same completed result above.
@@ -9000,20 +10855,125 @@ class ChatSession:
                         or completed_tool_calls_json
                     ):
                         persist_ws_id = self._ws_id
-                        persist_event_id = self._ui_event_id()
+                        persist_producer = completed_result.producer or None
+                        provenance = TurnProvenance.from_meta(
+                            completed_result.turn.meta.extra.get(PROVENANCE_META_KEY)
+                        )
+                        persist_meta = (
+                            json.dumps({PROVENANCE_META_KEY: provenance.to_meta()})
+                            if provenance is not None
+                            else None
+                        )
+                        commit_key = uuid.uuid4().hex
+                        # The journal takes the one isolating copy and stamps
+                        # it: its pending-durability mark is what keeps the
+                        # history orphan trimmer from dropping a complete
+                        # tool-call-only row whose storage write is still in
+                        # flight (the ring does not carry its native structure
+                        # until later tool-info events).
+                        pending_message = turn_to_dict(completed_result.turn)
 
-                        def _persist_assistant_turn() -> None:
-                            save_message(
-                                persist_ws_id,
-                                "assistant",
-                                completed_content,
-                                provider_data=completed_provider_data,
-                                tool_calls=completed_tool_calls_json,
-                                event_id=persist_event_id,
-                                producer=completed_result.producer or None,
+                        # Journal admission, accepted-revision advance, and
+                        # inflight-buffer clear are one bootstrap transition.
+                        # An initial SSE registration sharing this lock either
+                        # precedes the transition (and receives the live tail)
+                        # or observes the new token/pending row.
+                        with self._history_handoff_lock:
+                            try:
+                                self.ui.on_turn_committed()
+                            except Exception:
+                                log.warning(
+                                    "ui.on_turn_committed failed; requesting authoritative history",
+                                    exc_info=True,
+                                )
+                                self._request_history_resync_locked("assistant_turn_accepted")
+                            # ``on_turn_committed`` flushes a final pending
+                            # content batch before clearing the inflight
+                            # buffers. Stamp the row *after* that flush so its
+                            # durable cursor covers every event representing
+                            # this assistant turn.
+                            persist_event_id = self._ui_event_id()
+
+                            def _save_assistant_turn() -> int:
+                                return save_message(
+                                    persist_ws_id,
+                                    "assistant",
+                                    completed_content,
+                                    provider_data=completed_provider_data,
+                                    tool_calls=completed_tool_calls_json,
+                                    event_id=persist_event_id,
+                                    producer=persist_producer,
+                                    meta=persist_meta,
+                                    commit_key=commit_key,
+                                )
+
+                            # Structural acceptance is inseparable from journal
+                            # admission. If the in-memory journal itself rejects
+                            # the assistant row, roll back both the live turn and
+                            # its TOOL debt before generic exception cleanup can
+                            # manufacture a durable suffix without its parent.
+                            history_revision_before = self._history_handoff_revision
+                            self._admit_tool_structural_debt_locked(
+                                my_generation,
+                                accepted_tool_call_ids,
                             )
+                            self.messages.append(completed_result.turn)
+                            self._msg_tokens.append(assistant_token_estimate)
+                            try:
+                                pending = self._journal_conversation_row_locked(
+                                    commit_key=commit_key,
+                                    message=pending_message,
+                                    persist=_save_assistant_turn,
+                                    event_id=persist_event_id,
+                                )
+                            except BaseException:
+                                # The shared rollback undoes the live tail; the
+                                # structural-debt admission above is the one
+                                # assistant-specific extra it cannot know about.
+                                self._rollback_live_journal_admission_locked(
+                                    turn=completed_result.turn,
+                                    commit_key=commit_key,
+                                    history_revision_before=history_revision_before,
+                                    reason="assistant_turn_admission_rolled_back",
+                                )
+                                if accepted_tool_call_ids:
+                                    expected_debt = _ToolStructuralDebt(
+                                        generation=my_generation,
+                                        call_ids=accepted_tool_call_ids,
+                                    )
+                                    if self._tool_structural_debt != expected_debt:
+                                        raise RuntimeError(
+                                            "Assistant journal rollback lost structural-debt "
+                                            "ownership"
+                                        ) from None
+                                    self._tool_structural_debt = None
+                                    self._tool_structural_condition.notify_all()
+                                raise
 
-                        durable.append(_persist_assistant_turn)
+                            def _persist_assistant_turn() -> None:
+                                self._persist_pending_conversation_commit(pending)
+
+                            durable.append(_persist_assistant_turn)
+                    else:
+                        # No durable assistant row exists for a structurally
+                        # empty result, but the live inflight buffers still end
+                        # at this accepted turn boundary. Record that decision
+                        # on the turn itself: a later tail cut must not count
+                        # this live-only row when translating removed turns
+                        # into durable rows (a raw count would delete an older
+                        # committed row in its place).
+                        completed_result.turn.meta.extra["no_durable_row"] = True
+                        with self._history_handoff_lock:
+                            self._admit_tool_structural_debt_locked(
+                                my_generation,
+                                accepted_tool_call_ids,
+                            )
+                            self.messages.append(completed_result.turn)
+                            self._msg_tokens.append(assistant_token_estimate)
+                            try:
+                                self.ui.on_turn_committed()
+                            except Exception:
+                                log.warning("ui.on_turn_committed failed", exc_info=True)
                     if not completed_tool_calls:
                         compaction_stop_out.append(self._compaction_advised)
                         self._compaction_advised = False
@@ -9034,6 +10994,11 @@ class ChatSession:
                     allow_cancelled=True,
                 ):
                     return
+                # Fallback B produced the accepted result, but every new
+                # agentic round starts at primary A.  Restore A's estimator
+                # before tool-result admission or end-of-turn compaction reads
+                # the remaining budget.
+                self._activate_token_calibration(self._primary_lane())
                 stopped_to_compact = stopped_to_compact_out[0] if stopped_to_compact_out else False
 
                 if not tool_calls:
@@ -9128,6 +11093,25 @@ class ChatSession:
                         continue
                     break
 
+                # Keyed executor/guard side maps intentionally model one live
+                # occurrence per provider call id. Same-batch duplicate
+                # non-empty ids would cross-attribute names, output guards,
+                # effects, and previews. Fail before state publication or any
+                # executor can populate those maps; the generic structural
+                # finalizer below emits one definitely-unstarted TOOL receipt
+                # per assistant-call occurrence.
+                call_id_counts = collections.Counter(
+                    call.get("id", "") for call in tool_calls if call.get("id")
+                )
+                duplicate_call_ids = sorted(
+                    call_id for call_id, count in call_id_counts.items() if count > 1
+                )
+                if duplicate_call_ids:
+                    raise _MalformedToolBatchError(
+                        "Provider emitted duplicate tool call ids in one assistant batch: "
+                        + ", ".join(duplicate_call_ids)
+                    )
+
                 # Execute tool calls (potentially in parallel)
                 def _start_tools(durable: list[Callable[[], None]]) -> None:
                     self._emit_state(
@@ -9150,6 +11134,30 @@ class ChatSession:
                 # Bail if generation was superseded during tool execution.
                 if self._generation != my_generation:
                     return
+
+                # Same construction as the duplicate-id gate above; one
+                # comprehension serves both so the two checks can never
+                # disagree about the batch.
+                expected_result_counts = call_id_counts
+                observed_result_counts = collections.Counter(call_id for call_id, _ in results)
+                unexpected_results = observed_result_counts - expected_result_counts
+                if unexpected_results:
+                    # An executor receipt may answer only an occurrence in the
+                    # accepted assistant block. Fail before any TOOL row is
+                    # admitted; generic structural cleanup will conservatively
+                    # close every expected call. Clear keyed side maps so an
+                    # internal malformed receipt cannot bleed into a later
+                    # provider generation that reuses the same id.
+                    for unexpected_id in unexpected_results:
+                        self._cancelled_tool_results.pop(unexpected_id, None)
+                        self._tool_error_flags.pop(unexpected_id, None)
+                        self._tool_status.pop(unexpected_id, None)
+                        self._tool_previews.pop(unexpected_id, None)
+                    unexpected_ids = ", ".join(sorted(unexpected_results.elements()))
+                    raise RuntimeError(
+                        f"Tool executor returned receipts outside the accepted block: "
+                        f"{unexpected_ids}"
+                    )
 
                 # Repeat-detection + tool-error nudge.  Mutates *results*
                 # in place to inject inline warning text on identical
@@ -9401,6 +11409,7 @@ class ChatSession:
                     tc_names: dict[str, Any],
                     last_idx: int,
                     feedback: str,
+                    accepted_call_id_counts: collections.Counter[str],
                     durable: list[Callable[[], None]],
                 ) -> None:
                     # Operator-context system turns are accumulated across the
@@ -9446,8 +11455,8 @@ class ChatSession:
                         # provider tool-call could still need cancellation
                         # repair; otherwise a reused call id in a later loop
                         # could inherit stale output.
-                        self._cancelled_tool_results.pop(tc_id, None)
-                        self.messages.append(turn_from_dict(tool_msg))
+                        staged_result = self._cancelled_tool_results.pop(tc_id, None)
+                        tool_turn = turn_from_dict(tool_msg)
 
                         # Token estimation — image content uses a fixed
                         # heuristic while text follows the calibrated ratio.
@@ -9460,7 +11469,11 @@ class ChatSession:
                                 1,
                                 int(text_chars / self._chars_per_token) + image_count * 1000,
                             )
-                            store_text = " ".join(
+                            # One scalar is shared by pending /history,
+                            # accepted SSE, and the durable TEXT column. The
+                            # history projector joins multipart text blocks
+                            # with newlines, so use the same delimiter here.
+                            store_text = "\n".join(
                                 p.get("text", "")
                                 for p in output
                                 if isinstance(p, dict) and p.get("type") == "text"
@@ -9468,50 +11481,75 @@ class ChatSession:
                         else:
                             tok_est = max(1, int(len(output) / self._chars_per_token))
                             store_text = output
-                        self._msg_tokens.append(tok_est)
-
                         tool_atts = list(tool_image_atts)
                         if tool_preview is not None:
                             tool_atts.append(tool_preview[1])
                         persist_ws_id = self._ws_id
-                        persist_event_id = self._ui_event_id()
+                        commit_key = uuid.uuid4().hex
+                        event_id_ref: list[int | None] = [None]
                         persist_meta = _tool_turn_meta(
                             tool_status,
                             tool_preview[0] if tool_preview else None,
+                            acting_principal=self._generation_principals.get(my_generation, ""),
                         )
-                        persist_atts = tuple(tool_atts)
+                        attachment_writes = _attachment_writes(tool_atts)
 
-                        def _persist_tool_result(
-                            *,
-                            ws_id: str = persist_ws_id,
-                            event_id: int | None = persist_event_id,
-                            text: str = store_text,
-                            tool_name: str = _tname,
-                            call_id: str = tc_id,
-                            is_error: bool = tool_is_error,
-                            meta_json: str | None = persist_meta,
-                            attachments: tuple[Attachment, ...] = persist_atts,
-                        ) -> None:
-                            tool_message_id = save_message(
-                                ws_id,
-                                "tool",
-                                text,
-                                tool_name,
-                                tool_call_id=call_id,
-                                event_id=event_id,
-                                is_error=is_error,
-                                meta=meta_json,
-                            )
-                            if attachments and tool_message_id:
-                                self._persist_attachment_refs(
-                                    tool_message_id,
-                                    attachments,
-                                    origin="tool",
-                                    ws_id=ws_id,
-                                )
+                        restore_tool_side_state = functools.partial(
+                            self._restore_tool_side_maps,
+                            call_id=tc_id,
+                            staged=staged_result,
+                            was_error=tool_is_error,
+                            status=tool_status,
+                            preview=tool_preview,
+                        )
 
-                        durable.append(_persist_tool_result)
+                        # The detailed live result was emitted before output
+                        # evaluation. Publish the final guarded scalar while
+                        # sharing the handoff lock with row admission so a
+                        # listener joining after the receipt still sees the
+                        # accepted row. Duplicate ids within this assistant
+                        # batch cannot key a browser upsert and retain strong
+                        # repair instead.
+                        pending = self._admit_and_publish_tool_row(
+                            turn=tool_turn,
+                            message=tool_msg,
+                            token_estimate=tok_est,
+                            commit_key=commit_key,
+                            persist=self._tool_row_persist_closure(
+                                ws_id=persist_ws_id,
+                                text=store_text,
+                                tool_name=_tname,
+                                call_id=tc_id,
+                                is_error=tool_is_error,
+                                meta_json=persist_meta,
+                                attachments=attachment_writes,
+                                commit_key=commit_key,
+                                event_id_ref=event_id_ref,
+                            ),
+                            restore_on_rollback=restore_tool_side_state,
+                            event_id_ref=event_id_ref,
+                            call_id=tc_id,
+                            name=_tname,
+                            output=store_text,
+                            is_error=tool_is_error,
+                            preview=tool_preview[0] if tool_preview else None,
+                            effect_status=(tool_status.value if tool_status is not None else None),
+                            projection_safe=(bool(tc_id) and accepted_call_id_counts[tc_id] == 1),
+                        )
+                        self._schedule_conversation_persistence(pending, durable)
                         pending_system_turns.extend(result_advisories)
+
+                    # Every ordinary result row above is now present in both
+                    # the live trajectory and handoff journal. A malformed
+                    # executor result set is completed conservatively here;
+                    # the shared synthesizer then retires the exact assistant
+                    # block before this callback returns and the durability
+                    # ticket is reserved. Storage may still fail, but the
+                    # accepted overlay cannot expose an unmatched prefix.
+                    self._synthesize_cancelled_results(
+                        "Tool execution returned no observable outcome.",
+                        deferred_persistence=durable,
+                    )
 
                     # Emit accumulated operator context only after the complete
                     # tool block, preserving the native-system placement rule.
@@ -9535,6 +11573,7 @@ class ChatSession:
                     _tc_names,
                     _last_idx,
                     user_feedback or "",
+                    expected_result_counts,
                 )
 
                 if not self._commit_for_generation(
@@ -9558,6 +11597,46 @@ class ChatSession:
                 # re-checks.
                 if not pre_attempted_compact:
                     self._maybe_compact_midturn(my_generation)
+        except ConversationPersistenceError as exc:
+            # Do not run the generic failed-generation cleanup here: it drains
+            # queued user messages into a new conversation row, which would
+            # persist *after* the unresolved assistant boundary.  Keep queued
+            # input queued, prevent tool/provider continuation, and surface a
+            # bounded error/state update only. The pending full assistant row
+            # and any synthesized unstarted TOOL suffix remain visible through
+            # /history and reconcile in order before a later send can mutate
+            # history.
+            def _finalize_persistence_failure(
+                error: BaseException,
+                durable: list[Callable[[], None]],
+            ) -> None:
+                # The assistant turn is already accepted in memory before its
+                # durable closure runs. If it contains tool calls, the failed
+                # closure prevents control from ever reaching _execute_tools;
+                # complete that provider-visible block with definitive
+                # unstarted TOOL rows. Keep their scheduled wrappers in a
+                # scratch list: each journal entry retains its own persistence
+                # closure for the manager's later ordered reconciliation, while
+                # executing a wrapper here would bypass the retry due time and
+                # stop the fatal-state closure behind the existing poison.
+                deferred_tool_repairs: list[Callable[[], None]] = []
+                self._synthesize_cancelled_results(
+                    "Cancelled before tool execution because conversation persistence "
+                    "was interrupted; no side effects.",
+                    deferred_persistence=deferred_tool_repairs,
+                    definitely_unstarted=True,
+                )
+                self._drain_pending_advisories()
+                self._record_fatal_error(error, deferred_persistence=durable)
+
+            self._commit_for_generation(
+                my_generation,
+                functools.partial(_finalize_persistence_failure, exc),
+                allow_cancelled=True,
+                allow_persistence_poison=True,
+                allow_workstream_gone=True,
+            )
+            raise
         except GenerationCancelled:
 
             def _finalize_cancelled_generation(
@@ -9595,24 +11674,42 @@ class ChatSession:
                     else:
                         msg["content"] = "[generation cancelled before completion]"
                     persist_ws_id = self._ws_id
-                    persist_event_id = self._ui_event_id()
+                    commit_key = uuid.uuid4().hex
+                    persist_event_id: int | None = None
                     persist_content = msg["content"]
+                    partial_provenance = TurnProvenance.from_meta(msg.get("_provenance"))
+                    persist_meta = (
+                        json.dumps({PROVENANCE_META_KEY: partial_provenance.to_meta()})
+                        if partial_provenance is not None
+                        else None
+                    )
 
-                    def _persist_cancelled_partial() -> None:
-                        save_message(
+                    def _persist_cancelled_partial() -> int:
+                        return save_message(
                             persist_ws_id,
                             "assistant",
                             persist_content,
                             event_id=persist_event_id,
+                            meta=persist_meta,
+                            commit_key=commit_key,
                         )
 
-                    durable.append(_persist_cancelled_partial)
-                    self.messages.append(turn_from_dict(msg))
                     tok_est = max(
                         1,
                         int(self._msg_char_count(msg) / self._chars_per_token),
                     )
-                    self._msg_tokens.append(tok_est)
+                    with self._history_handoff_lock:
+                        self.messages.append(turn_from_dict(msg))
+                        self._msg_tokens.append(tok_est)
+                        self._request_history_resync_locked("cancelled_assistant_turn_accepted")
+                        persist_event_id = self._ui_event_id()
+                        pending = self._journal_conversation_row_locked(
+                            commit_key=commit_key,
+                            message=msg,
+                            persist=_persist_cancelled_partial,
+                            event_id=persist_event_id,
+                        )
+                    self._schedule_conversation_persistence(pending, durable)
                 else:
                     # Cancelled during tool execution — synthesize cancelled
                     # tool_result for any tool_calls that lack a matching result.
@@ -9638,6 +11735,7 @@ class ChatSession:
             if not self._commit_for_generation(
                 my_generation,
                 _finalize_cancelled_generation,
+                allow_workstream_gone=True,
             ):
                 return
             # Do NOT re-raise — return normally so server worker thread
@@ -9661,6 +11759,7 @@ class ChatSession:
             self._commit_for_generation(
                 my_generation,
                 functools.partial(_finalize_interrupted_generation, exc),
+                allow_workstream_gone=True,
             )
             raise
         except Exception as exc:
@@ -9675,6 +11774,21 @@ class ChatSession:
                 error: BaseException,
                 durable: list[Callable[[], None]],
             ) -> None:
+                # Any exception after assistant acceptance still owes the
+                # provider one TOOL receipt per call. The central synthesizer
+                # is a no-op when this generation has no structural debt.
+                definitely_unstarted = isinstance(error, _MalformedToolBatchError)
+                repair_reason = (
+                    "Tool batch was rejected before execution because provider tool call "
+                    "ids were duplicated; no side effects."
+                    if definitely_unstarted
+                    else "Tool execution ended before the outcome could be observed."
+                )
+                self._synthesize_cancelled_results(
+                    repair_reason,
+                    deferred_persistence=durable,
+                    definitely_unstarted=definitely_unstarted,
+                )
                 self._flush_queued_messages(deferred_persistence=durable)
                 self._drain_pending_advisories()
                 self._record_fatal_error(error, deferred_persistence=durable)
@@ -9682,6 +11796,7 @@ class ChatSession:
             self._commit_for_generation(
                 my_generation,
                 functools.partial(_finalize_failed_generation, exc),
+                allow_workstream_gone=True,
             )
             raise
         finally:
@@ -9761,6 +11876,8 @@ class ChatSession:
         reason: str,
         *,
         deferred_persistence: list[Callable[[], None]] | None = None,
+        definitely_unstarted: bool = False,
+        structural_generation: int | None = None,
     ) -> None:
         """Synthesize tool_result messages for orphaned tool_calls after cancel.
 
@@ -9769,7 +11886,23 @@ class ChatSession:
         cancelled results for any that don't.  This keeps the conversation
         valid (both providers require matching tool_results) while preserving
         the full tool call structure so the model knows what was attempted.
+
+        ``definitely_unstarted`` is reserved for the assistant-persistence
+        failure seam, which runs before tool execution is reachable. It records
+        a definitive ``NONE`` disposition instead of the ordinary conservative
+        ``UNKNOWN`` cancellation outcome.
         """
+        if deferred_persistence is None:
+            self._direct_commit_reentry(
+                "Cannot append cancelled results to a closed session",
+                lambda durable: self._synthesize_cancelled_results(
+                    reason,
+                    deferred_persistence=durable,
+                    definitely_unstarted=definitely_unstarted,
+                    structural_generation=structural_generation,
+                ),
+            )
+            return
         # Find the last assistant message with tool_calls
         assistant_idx = None
         for i in range(len(self.messages) - 1, -1, -1):
@@ -9780,11 +11913,30 @@ class ChatSession:
         if assistant_idx is None:
             return
 
-        # Collect tool_call IDs that already have results
-        answered_ids: set[str] = set()
+        # Count matching results by occurrence, not just by ID. Provider IDs
+        # are normally unique, but compatibility servers may repeat a
+        # non-empty ID (``ensure_tool_call_ids`` repairs blanks only). In that
+        # case one observed TOOL row answers exactly one call; every remaining
+        # occurrence still needs its own structural receipt.
+        remaining_answered = collections.Counter[str]()
         for msg in self.messages[assistant_idx + 1 :]:
             if msg.role is Role.TOOL:
-                answered_ids.add(msg.tool_call_id or "")
+                remaining_answered[msg.tool_call_id or ""] += 1
+        assistant_call_id_counts = collections.Counter(
+            tc.id for tc in self.messages[assistant_idx].tool_calls if tc.id
+        )
+        # The generation these receipts belong to: the exact one force-abandon's
+        # structural finalizer names, otherwise the bounded live commit staging
+        # on this thread.  One derivation feeds both the acting principal
+        # stamped on every synthesized row and the structural debt completed
+        # below, so a synthesized receipt and the ordinary fold that shares its
+        # batch can never disagree about whose turn executed it.
+        origin_generation = (
+            structural_generation
+            if structural_generation is not None
+            else _active_commit_origin_generation.get()
+        )
+        acting_principal = self._generation_principals.get(origin_generation, "")
 
         # An orphaned tool_call usually has no observable result when cancel
         # lands, so the generic disposition is UNKNOWN rather than a bare
@@ -9796,12 +11948,17 @@ class ChatSession:
         for tc in self.messages[assistant_idx].tool_calls:
             tc_id = tc.id
             func_name = tc.name
-            if tc_id and tc_id not in answered_ids:
+            if tc_id and remaining_answered[tc_id]:
+                remaining_answered[tc_id] -= 1
+                continue
+            if tc_id:
                 staged_cancel = self._cancelled_tool_results.pop(tc_id, None)
                 effect_status: EffectStatus | None
                 if staged_cancel is None:
-                    detail = generic_detail
-                    effect_status = EffectStatus.UNKNOWN
+                    detail = reason if definitely_unstarted else generic_detail
+                    effect_status = (
+                        EffectStatus.NONE if definitely_unstarted else EffectStatus.UNKNOWN
+                    )
                     result_is_error = True
                     live_preview = None
                     live_result_already_emitted = False
@@ -9815,8 +11972,8 @@ class ChatSession:
                 # tool may have self-reported an error/status immediately
                 # before Stop; leaving either keyed by a reusable provider id
                 # would stamp it onto a later generation's unrelated result.
-                self._tool_error_flags.pop(tc_id, None)
-                self._tool_status.pop(tc_id, None)
+                prior_error_flag = self._tool_error_flags.pop(tc_id, False)
+                prior_tool_status = self._tool_status.pop(tc_id, None)
                 # A staged preview means _exec_open_preview COMPLETED and its
                 # descriptor already reached the frontend (live SSE at exec
                 # time) — the pane is open on it.  Discarding the blob here
@@ -9834,63 +11991,50 @@ class ChatSession:
                 )
                 if preview_entry is not None:
                     cancelled_turn.meta.extra["preview"] = preview_entry[0]
-                self.messages.append(cancelled_turn)
-                self._msg_tokens.append(1)
                 persist_ws_id = self._ws_id
-                persist_event_id = self._ui_event_id()
+                commit_key = uuid.uuid4().hex
+                event_id_ref: list[int | None] = [None]
                 persist_meta = _tool_turn_meta(
                     effect_status,
                     preview_entry[0] if preview_entry else None,
+                    acting_principal=acting_principal,
                 )
-                persist_preview = preview_entry[1] if preview_entry is not None else None
+                attachment_writes = _attachment_writes(
+                    () if preview_entry is None else (preview_entry[1],)
+                )
 
-                def _persist_cancelled_result(
+                restore_cancelled_side_state = functools.partial(
+                    self._restore_tool_side_maps,
+                    call_id=tc_id,
+                    staged=staged_cancel,
+                    was_error=prior_error_flag,
+                    status=prior_tool_status,
+                    preview=preview_entry,
+                )
+
+                # Complete the in-DOM tool batch when Stop won before the
+                # ordinary result publication. The accepted projection
+                # follows even when an executor receipt was already sent:
+                # a listener may have registered after that receipt, and a
+                # committed preview must remain reopenable on an error row.
+                def _emit_live_result_once(
                     *,
-                    ws_id: str = persist_ws_id,
-                    event_id: int | None = persist_event_id,
-                    result_detail: str = detail,
-                    tool_name: str = func_name,
-                    call_id: str = tc_id,
-                    is_error: bool = result_is_error,
-                    meta_json: str | None = persist_meta,
-                    preview_attachment: Attachment | None = persist_preview,
+                    _already_emitted: bool = live_result_already_emitted,
+                    _call_id: str = tc_id,
+                    _name: str = func_name,
+                    _detail: str = detail,
+                    _was_error: bool = result_is_error,
+                    _preview: Any = live_preview,
                 ) -> None:
-                    cancelled_row_id = save_message(
-                        ws_id,
-                        "tool",
-                        result_detail,
-                        tool_name,
-                        tool_call_id=call_id,
-                        event_id=event_id,
-                        is_error=is_error,
-                        meta=meta_json,
-                    )
-                    if preview_attachment is not None and cancelled_row_id:
-                        self._persist_attachment_refs(
-                            cancelled_row_id,
-                            [preview_attachment],
-                            origin="tool",
-                            ws_id=ws_id,
-                        )
-
-                if deferred_persistence is None:
-                    _persist_cancelled_result()
-                else:
-                    deferred_persistence.append(_persist_cancelled_result)
-                # Emit synthetic tool_result so live SSE listeners can
-                # complete the in-DOM tool batch — without this the
-                # coord ``--running`` indicator (added by SSE
-                # tool_info) would spin forever on cancelled batches.
-                # Defensive: we're already on a cancel/error path, so
-                # a UI hook failure must not compound the problem.
-                if not live_result_already_emitted:
+                    if _already_emitted:
+                        return
                     try:
                         self.ui.on_tool_result(
-                            tc_id,
-                            func_name,
-                            detail,
-                            is_error=result_is_error,
-                            preview=live_preview,
+                            _call_id,
+                            _name,
+                            _detail,
+                            is_error=_was_error,
+                            preview=_preview,
                         )
                     except Exception:
                         log.debug(
@@ -9898,6 +12042,192 @@ class ChatSession:
                             self._ws_id[:8],
                             exc_info=True,
                         )
+
+                pending_message = turn_to_dict(cancelled_turn)
+                pending = self._admit_and_publish_tool_row(
+                    turn=cancelled_turn,
+                    message=pending_message,
+                    token_estimate=1,
+                    commit_key=commit_key,
+                    persist=self._tool_row_persist_closure(
+                        ws_id=persist_ws_id,
+                        text=detail,
+                        tool_name=func_name,
+                        call_id=tc_id,
+                        is_error=result_is_error,
+                        meta_json=persist_meta,
+                        attachments=attachment_writes,
+                        commit_key=commit_key,
+                        event_id_ref=event_id_ref,
+                    ),
+                    restore_on_rollback=restore_cancelled_side_state,
+                    event_id_ref=event_id_ref,
+                    call_id=tc_id,
+                    name=func_name,
+                    output=detail,
+                    is_error=result_is_error,
+                    preview=preview_entry[0] if preview_entry else None,
+                    effect_status=(effect_status.value if effect_status is not None else None),
+                    projection_safe=(assistant_call_id_counts[tc_id] == 1),
+                    pre_publish=_emit_live_result_once,
+                )
+                self._schedule_conversation_persistence(
+                    pending,
+                    deferred_persistence,
+                )
+
+        if origin_generation:
+            completed_ids = [
+                msg.tool_call_id or ""
+                for msg in self.messages[assistant_idx + 1 :]
+                if msg.role is Role.TOOL
+            ]
+            self._complete_tool_structural_debt_locked(
+                origin_generation,
+                completed_ids,
+            )
+
+    def _restore_tool_side_maps(
+        self,
+        *,
+        call_id: str,
+        staged: _CancelledToolResult | None,
+        was_error: bool,
+        status: EffectStatus | None,
+        preview: tuple[dict[str, Any], Attachment] | None,
+    ) -> None:
+        """Re-stage one call's popped side channels after a rolled-back row.
+
+        Both accepted-TOOL-row paths pop the same four per-call maps while
+        building their row, so a failed journal admission has to put back
+        exactly what the fold consumed.  Shared so the two rollbacks cannot
+        drift.
+        """
+        if staged is not None:
+            self._cancelled_tool_results[call_id] = staged
+        if was_error:
+            self._tool_error_flags[call_id] = True
+        if status is not None:
+            self._tool_status[call_id] = status
+        if preview is not None:
+            self._tool_previews[call_id] = preview
+
+    @staticmethod
+    def _tool_row_persist_closure(
+        *,
+        ws_id: str,
+        text: str,
+        tool_name: str,
+        call_id: str,
+        is_error: bool,
+        meta_json: str | None,
+        attachments: tuple[AttachmentWrite, ...],
+        commit_key: str,
+        event_id_ref: list[int | None],
+    ) -> Callable[[], int]:
+        """Build the keyed durable write for one accepted TOOL row.
+
+        Shared by the ordinary result path and cancelled-result synthesis so
+        the two accepted-row shapes cannot drift.
+        """
+
+        def _persist() -> int:
+            if attachments:
+                return save_tool_message_with_attachments(
+                    ws_id,
+                    text,
+                    tool_name,
+                    call_id,
+                    attachments,
+                    event_id=event_id_ref[0],
+                    is_error=is_error,
+                    meta=meta_json,
+                    commit_key=commit_key,
+                )
+            return save_message(
+                ws_id,
+                "tool",
+                text,
+                tool_name,
+                tool_call_id=call_id,
+                event_id=event_id_ref[0],
+                is_error=is_error,
+                meta=meta_json,
+                commit_key=commit_key,
+            )
+
+        return _persist
+
+    def _admit_and_publish_tool_row(
+        self,
+        *,
+        turn: Turn,
+        message: dict[str, Any],
+        token_estimate: int,
+        commit_key: str,
+        persist: Callable[[], int],
+        restore_on_rollback: Callable[[], None],
+        event_id_ref: list[int | None],
+        call_id: str,
+        name: str,
+        output: str,
+        is_error: bool,
+        preview: dict[str, Any] | None,
+        effect_status: str | None,
+        projection_safe: bool,
+        pre_publish: Callable[[], None] | None = None,
+    ) -> _PendingConversationCommit:
+        """Append, journal, and publish one accepted TOOL row atomically.
+
+        The handoff lock spans live append, journal admission, and event
+        publication so a listener joining mid-batch still sees the accepted
+        row.  A failed journal admission rolls the live list and revision
+        back, restores the caller's per-call side maps, and re-raises,
+        leaving no half-admitted receipt behind.  Shared by the ordinary
+        result path and cancelled-result synthesis so the admission and
+        rollback choreography cannot drift.
+        """
+        with self._history_handoff_lock:
+            history_revision_before = self._history_handoff_revision
+            self.messages.append(turn)
+            self._msg_tokens.append(token_estimate)
+            try:
+                # pre_publish sits inside the rollback envelope: its supplier
+                # catches Exception only, so a BaseException (a second Ctrl-C
+                # landing in ui.on_tool_result during cancelled-result
+                # synthesis on the CLI main thread) must roll the live append
+                # back rather than leave a turn no journal entry or durable
+                # row will ever represent (round-4 review).
+                if pre_publish is not None:
+                    pre_publish()
+                pending = self._journal_conversation_row_locked(
+                    commit_key=commit_key,
+                    message=message,
+                    persist=persist,
+                    event_id=None,
+                )
+            except BaseException:
+                self._rollback_live_journal_admission_locked(
+                    turn=turn,
+                    commit_key=commit_key,
+                    history_revision_before=history_revision_before,
+                    reason="tool_turn_admission_rolled_back",
+                )
+                restore_on_rollback()
+                raise
+            event_id_ref[0] = self._publish_tool_turn_locked(
+                call_id=call_id,
+                name=name,
+                output=output,
+                is_error=is_error,
+                preview=preview,
+                effect_status=effect_status,
+                projection_safe=projection_safe,
+            )
+            message["_event_id"] = event_id_ref[0]
+            turn.meta.event_id = event_id_ref[0]
+            pending.message["_event_id"] = event_id_ref[0]
+        return pending
 
     # -- Rewind / retry -------------------------------------------------------
 
@@ -9920,65 +12250,182 @@ class ChatSession:
             if m.role is Role.USER and m.source != COMPACTION_SOURCE
         ]
 
-    def _persist_truncation(self, removed_count: int) -> None:
-        """Mirror a rewind/retry tail-trim into storage, compaction-safe.
+    def _persist_truncation(self, removed_count: int) -> int:
+        """Atomically remove a compaction-floored durable tail.
 
-        rewind/retry remove turns from the in-memory TAIL, which map 1:1 to the
-        most recent storage rows.  Deleting by *removed-row count* from the
-        storage end — rather than keeping the first ``len(self.messages)`` rows —
-        stays correct after a compaction, where ``self.messages`` holds synthetic
-        summary turns with no 1:1 storage rows while storage still holds the full
-        pre-compaction transcript plus the checkpoint marker.  The keep-count is
-        floored at the compaction boundary (:func:`get_compaction_floor`) so the
-        summary's backing rows and the marker are never deleted.  Identical to the
-        old ``keep = len(self.messages)`` when the ws never compacted (floor 0,
-        total == in-memory length).
-
-        Residual: an over-deep rewind that would cross the summary boundary clamps
-        at the floor in storage, so the in-memory trim can drop more than storage
-        does; a later resume rehydrates ``[summary] + [surviving tail]`` and the
-        two reconcile.
+        The backend owns parent locking, row-count/floor calculation, exact
+        deletion, and attachment reference release in one transaction.  It
+        raises on a missing parent or storage failure; callers must not publish
+        the corresponding live cut until this returns successfully.
         """
         if removed_count <= 0:
-            return
-        # The caller already truncated self.messages (rewind/retry both trim
-        # before calling this), so any sender that only appeared in the
-        # dropped tail is no longer derivable from live history — unlike
-        # compaction narrowing (which keeps the full transcript in storage,
-        # exactly why _recompute_shared_state unions in a persisted-sender
-        # read), a rewind/retry deletes those very rows below. Force a full,
-        # fresh re-derivation on the next compose rather than let the
-        # monotonic union/latch keep a departed sender "known" and the
-        # workstream stuck "shared" forever after the only evidence of a
-        # second participant is gone.
-        self._reset_shared_state()
-        total = count_messages(self._ws_id)
-        if total <= 0:
-            # Count unavailable (storage error) — skip the delete rather than risk
-            # a wrong truncation; the in-memory trim holds and resume reconciles.
-            return
-        floor = get_compaction_floor(self._ws_id)
-        if floor < 0:
-            # Floor unavailable (storage error). A 0 here is indistinguishable from
-            # "never compacted", so an over-deep trim could delete the marker and
-            # summarized prefix — skip rather than risk it; resume reconciles.
-            return
-        delete_messages_after(self._ws_id, max(floor, total - removed_count))
-        # History generation (#894/#884 seam): every truncation bumps the
-        # counter the /history single-flight folds into its flight key, so
-        # a request dispatched AFTER a rewind/retry can never join a flight
-        # whose load_messages ran BEFORE it (a joined pre-rewind payload
-        # rendered as fresh truth on the coordinator and reopened the
-        # over-rewind window the #894 client latch closes).  Bumped AFTER
-        # the storage delete: flights rebuild from storage, so a flight
-        # keyed with the OLD generation that reads post-delete rows is the
-        # harmless spuriously-fresh direction, while a NEW-generation
-        # flight reading pre-delete rows would be the wrongly-joined one —
-        # and the early-return error paths above (count/floor unavailable,
-        # delete skipped) correctly leave the generation unbumped.
-        self._history_generation += 1
+            return 0
+        return get_storage().truncate_messages_tail(self._ws_id, removed_count)
 
-    def rewind(self, n: int) -> int:
+    def _commit_history_truncation(
+        self,
+        admit: Callable[[list[Callable[[], None]]], None],
+    ) -> None:
+        """Admit a destructive cut only when no older durability ticket runs.
+
+        The truncation latch intentionally stays clear while an older ticket is
+        draining.  A deferred UI/storage callback in that ticket may itself
+        need a bounded generation commit; closing admission first would make
+        the callback wait for truncation while truncation waits for its ticket.
+        The generation lock makes the final idle-check, latch, callback, and
+        new ticket reservation indivisible from every ordinary commit.
+        """
+
+        def _durability_reached(high_water: int) -> bool:
+            return self._durability_serving_ticket >= high_water
+
+        while True:
+            wait_high_water: int | None = None
+
+            def _admit_if_idle(durable: list[Callable[[], None]]) -> None:
+                nonlocal wait_high_water
+                with self._durability_cond:
+                    if self._durability_serving_ticket != self._durability_next_ticket:
+                        wait_high_water = self._durability_next_ticket
+                        return
+                admit(durable)
+
+            if not self._commit_for_generation(
+                0,
+                _admit_if_idle,
+                allow_persistence_poison=True,
+            ):
+                raise GenerationCancelled()
+            if wait_high_water is None:
+                return
+            high_water = wait_high_water
+            with self._durability_cond:
+                self._durability_cond.wait_for(functools.partial(_durability_reached, high_water))
+
+    def _stage_history_truncation(
+        self,
+        durable: list[Callable[[], None]],
+        cut_index: int,
+        publish_reset: Callable[[], None] | None = None,
+    ) -> int:
+        """Reserve and stage one failure-atomic live/durable tail cut.
+
+        Called only from a ``_commit_for_generation`` callback while the
+        generation lock and truncation condition are held.  The active latch
+        prevents every later generation/direct commit from changing the live
+        list before the durability ticket commits and applies this exact slice.
+        """
+        removed_turns = tuple(self.messages[cut_index:])
+        removed_count = len(removed_turns)
+        original_length = len(self.messages)
+        if removed_count <= 0:
+            return 0
+        if self._history_truncation_active:
+            raise RuntimeError("history truncation admitted while another cut is active")
+        self._history_truncation_active = True
+        # Live turns and durable rows are not one-to-one: a structurally empty
+        # assistant result lives only in ``self.messages`` (stamped
+        # ``no_durable_row`` at admission). The durable cut must count only
+        # turns that own a storage row, else each live-only turn in the span
+        # deletes one older committed row in its place.
+        durable_removed = sum(
+            1 for turn in removed_turns if not turn.meta.extra.get("no_durable_row")
+        )
+
+        def _persist_and_publish_truncation() -> None:
+            try:
+                # This ticket was admitted before any terminal latch. Repair an
+                # older ambiguous row in FIFO order even if close/delete began
+                # while the ticket was waiting; terminal deletion waits for us.
+                # Deliberately NOT ``_force_retry``: a destructive mutation
+                # inside the transient backoff fails fast on the stored poison
+                # instead of hammering storage (soft close differs — it forces
+                # one last probe because refusing it keeps the session loaded).
+                # Pinned by ``test_unresolved_prefix_repair_failure_refuses_
+                # truncation_without_cut_publication``.
+                self._reconcile_pending_conversation_commits(_terminal_admitted_repair=True)
+                with self._history_visibility_lock:
+                    # No later commit can mutate the list while the active latch
+                    # is set. Validate nevertheless so a future unguarded history
+                    # replacement fails before touching durable state.
+                    with self._generation_lock:
+                        current = self.messages[cut_index : cut_index + removed_count]
+                        if len(current) != removed_count or any(
+                            actual is not expected
+                            for actual, expected in zip(
+                                current,
+                                removed_turns,
+                                strict=True,
+                            )
+                        ):
+                            raise RuntimeError("conversation changed outside truncation admission")
+
+                    self._persist_truncation(durable_removed)
+
+                    # Storage has committed.  From this point onward only
+                    # infallible list/field updates and best-effort UI repair
+                    # remain: raising on a second validation could leave the DB
+                    # cut committed while the old live tail stayed visible.
+                    # Publish the matching live cut, token revision, and repair
+                    # event as one bounded transition. History readers remain
+                    # behind visibility until both representations agree.
+                    with self._generation_lock, self._history_handoff_lock:
+                        del self.messages[cut_index:original_length]
+                        del self._msg_tokens[cut_index:original_length]
+                        self._last_usage = None
+                        self._invalidate_token_calibration_anchors()
+                        # A sender appearing only in the dropped tail is no
+                        # longer evidence that this workstream is shared.
+                        self._reset_shared_state()
+                        self._history_generation += 1
+                        self._history_handoff_revision += 1
+                        self._publish_history_truncation_reset_locked(publish_reset)
+
+                # Fence any generation that prepared provider/tool work against
+                # the removed trajectory.  Do not advance the Stop epoch: the
+                # retry command's already-captured worker claim must remain
+                # valid for its replacement send unless a real Stop occurred.
+                with self._generation_transition_lock, self._generation_lock:
+                    self._cancel_event.set()
+                    self._generation += 1
+            finally:
+                with self._history_truncation_condition:
+                    self._history_truncation_active = False
+                    self._history_truncation_condition.notify_all()
+
+        durable.append(_persist_and_publish_truncation)
+        return removed_count
+
+    def _publish_history_truncation_reset_locked(
+        self,
+        publish_reset: Callable[[], None] | None,
+    ) -> None:
+        """Publish exactly one structural-reset signal for a history cut.
+
+        HTTP callers supply their established ``clear_ui`` publisher: that
+        event owns the live-stream quiesce and edit-and-resend continuation in
+        both web clients.  Direct callers have no route-level follow-up, so the
+        stronger handoff repair remains their default.  A broken callback must
+        not turn an already-committed storage cut into a raised half-success;
+        fall back to the generic repair event instead.
+
+        Called with the history handoff lock held so the reset is ordered in
+        the same accepted revision as the live/durable cut.
+        """
+        if publish_reset is not None:
+            try:
+                publish_reset()
+                return
+            except Exception:
+                log.debug("history truncation reset publisher raised", exc_info=True)
+        self._request_history_resync_locked("history_truncated")
+
+    def rewind(
+        self,
+        n: int,
+        *,
+        publish_reset: Callable[[], None] | None = None,
+    ) -> int:
         """Drop the last *n* complete turns from the conversation.
 
         A turn = user message + all assistant/tool messages until the next
@@ -9987,39 +12434,61 @@ class ChatSession:
         """
         if n < 1:
             return 0
-        boundaries = self._find_turn_boundaries()
-        if not boundaries:
-            return 0
-        n = min(n, len(boundaries))
-        cut_index = boundaries[-n]
-        removed_count = len(self.messages) - cut_index
-        del self.messages[cut_index:]
-        del self._msg_tokens[cut_index:]
-        self._persist_truncation(removed_count)
+        removed_count = 0
+
+        def _admit_rewind(durable: list[Callable[[], None]]) -> None:
+            nonlocal removed_count
+            boundaries = self._find_turn_boundaries()
+            if not boundaries:
+                # Web rewind historically emits clear_ui even when there is
+                # nothing to remove (including an already-empty transcript).
+                # Direct callers pass no publisher and retain their no-event
+                # no-op behavior.
+                if publish_reset is not None:
+                    self._publish_history_truncation_reset_locked(publish_reset)
+                return
+            turn_count = min(n, len(boundaries))
+            removed_count = self._stage_history_truncation(
+                durable,
+                boundaries[-turn_count],
+                publish_reset,
+            )
+
+        self._commit_history_truncation(_admit_rewind)
         return removed_count
 
-    def retry(self) -> str | None:
+    def retry(
+        self,
+        *,
+        publish_reset: Callable[[], None] | None = None,
+    ) -> str | None:
         """Drop the last assistant response and return the user message to re-send.
 
         The caller is responsible for calling ``send()`` with the returned
         message.  Returns ``None`` if there is nothing to retry.
         """
-        boundaries = self._find_turn_boundaries()
-        if not boundaries:
-            return None
-        last_user_idx = boundaries[-1]
-        content = turn_to_dict(self.messages[last_user_idx]).get("content")
-        # Multipart messages (vision/images) have list-type content;
-        # retry only supports plain text.
-        if not isinstance(content, str) or not content:
-            return None
-        # Drop everything from (and including) the user message onward;
-        # send() will re-append the user message.
-        removed_count = len(self.messages) - last_user_idx
-        del self.messages[last_user_idx:]
-        del self._msg_tokens[last_user_idx:]
-        self._persist_truncation(removed_count)
-        return content
+        retry_content: str | None = None
+
+        def _admit_retry(durable: list[Callable[[], None]]) -> None:
+            nonlocal retry_content
+            boundaries = self._find_turn_boundaries()
+            if not boundaries:
+                if publish_reset is not None:
+                    self._publish_history_truncation_reset_locked(publish_reset)
+                return
+            last_user_idx = boundaries[-1]
+            content = turn_to_dict(self.messages[last_user_idx]).get("content")
+            # Multipart messages (vision/images) have list-type content;
+            # retry only supports plain text.
+            if not isinstance(content, str) or not content:
+                if publish_reset is not None:
+                    self._publish_history_truncation_reset_locked(publish_reset)
+                return
+            self._stage_history_truncation(durable, last_user_idx, publish_reset)
+            retry_content = content
+
+        self._commit_history_truncation(_admit_retry)
+        return retry_content
 
     def _ui_stream_discarded(self) -> None:
         """Best-effort dead-segment discard across UI generations.
@@ -10073,6 +12542,10 @@ class ChatSession:
         # phase fails with an unarmed error, the original death is the one
         # the operator needs to see, not the re-create's.
         last_stream_death: Exception | None = None
+        # Provenance of the attempt whose text ``dead_partial`` carries.  A
+        # zero-token re-death must not relabel preserved text from the prior
+        # attempt's lane.
+        dead_provenance: TurnProvenance | None = None
         consumer = _StreamTurnConsumer(self, my_generation)
         principal_id = self._generation_principals.get(my_generation)
 
@@ -10125,10 +12598,13 @@ class ChatSession:
                     return
                 cur = self._cancelled_partial_msg
                 if cur is None or (not cur.get("content") and dead_partial):
-                    self._cancelled_partial_msg = {
+                    promoted: dict[str, Any] = {
                         "role": "assistant",
                         "content": dead_partial,
                     }
+                    if dead_provenance is not None:
+                        promoted["_provenance"] = dead_provenance.to_meta()
+                    self._cancelled_partial_msg = promoted
 
             self._publish_for_generation(
                 my_generation,
@@ -10136,118 +12612,190 @@ class ChatSession:
                 allow_cancelled=True,
             )
 
-        while True:
-            try:
-                result = self._model_turn_with_fallback(
-                    consumer,
-                    _prepare,
-                    my_generation,
-                    principal_id=principal_id,
-                )
-                # A Stop that raced the trailing-metadata window: cancel()
-                # closed the stream and the drain's post-finish tolerance
-                # ended it CLEANLY, so without this re-check the turn
-                # commits as complete and its tool calls execute.
-                self._check_cancelled(my_generation)
-                consumer.finish_stream()
-                # Finalization emits terminal warnings/stream_end and may
-                # legalize a truncated result.  Keep that complete policy step
-                # on the same owner rail as the carry flush above so a force
-                # successor or close cannot receive the predecessor's terminal
-                # UI event in the gap between them.  A same-generation Stop
-                # after a completed stream preserves the historical completed-
-                # result boundary.
-                with self._generation_lock:
-                    if self._publication_shutdown or _generation_superseded(self, my_generation):
-                        raise GenerationCancelled()
-                    return self._finalize_stream_result(result)
-            except GenerationCancelled:
-                # A Stop during an attempt (incl. the re-create/TTFT window
-                # after a death) — finalize the streamed display if the
-                # attempt got a stream, then preserve the window's best
-                # partial.
-                if consumer.attempt_armed:
-                    consumer.record_cancelled_partial()
-                _promote_dead_partial()
-                raise
-            except KeyboardInterrupt:
-                # BaseException — the Exception arm below never sees it,
-                # but send() treats Ctrl-C as a survivable, recorded path,
-                # so the dead attempt still needs its client-side finalize
-                # (the CLI's markdown fence resets only in on_stream_end).
-                self._publish_for_generation(
-                    my_generation,
-                    self.ui.on_stream_end,
-                    allow_cancelled=True,
-                )
-                raise
-            except Exception as e:
-                armed = consumer.attempt_armed
-                new_dead = consumer.partial_content() if armed else ""
-                dead_partial = new_dead or dead_partial
-                if armed:
-                    # The partial is captured, so there is no live attempt
-                    # until the next ``begin_attempt``: without this, a
-                    # Stop or a walk-preamble failure landing in the
-                    # re-create window reads the DEAD attempt's armed
-                    # state (see ``end_attempt``).
-                    consumer.end_attempt()
-                if self._cancel_event.is_set():
-                    _promote_dead_partial()
-                    raise GenerationCancelled() from None
-                if _generation_superseded(self, my_generation) or self._publication_shutdown:
-                    # Superseded (force-cancel started a newer generation):
-                    # an orphaned thread must not touch the UI — a finalize
-                    # emitted here would clobber the NEW generation's
-                    # in-flight stream state.
-                    raise
-                if not armed:
-                    # Creation-phase failure: the walk already ran its full
-                    # ladder + fallbacks.  Mid re-issue it must not MASK
-                    # the original stream death (a closed-client re-create
-                    # surfaces as a retryable APIConnectionError and would
-                    # replace the operator-actionable wording) — EXCEPT
-                    # the classes carrying their own remediation: an
-                    # overflow surfaces as ITSELF so send()'s
-                    # compact-and-retry arm can recover the turn, and an
-                    # auth refusal or wire-preparation fault surfaces as
-                    # ITSELF so the fatal formatter's dedicated branch
-                    # renders.  Class name only in the log — a
-                    # ConnectError's text can carry a credential-bearing
-                    # base_url verbatim.
-                    if (
-                        last_stream_death is None
-                        or isinstance(e, _SELF_SURFACING_ERRORS)
-                        or _is_ctx_overflow(e)
-                    ):
-                        raise
-                    log.warning(
-                        "stream.retry.recreate_failed",
-                        error_type=type(e).__name__,
+        with self._recovered_serving_failures() as recovered_failures:
+            while True:
+                try:
+                    result = self._model_turn_with_fallback(
+                        consumer,
+                        _prepare,
+                        my_generation,
+                        principal_id=principal_id,
                     )
-                    raise last_stream_death from None
-                # The terminal predicate is the SHARED _stop_retrying,
-                # capped at _MID_STREAM_RETRIES, judged by the lane that
-                # ACTUALLY armed this stream (a fallback's retryable set
-                # can differ, e.g. ResponsesStreamFailedError).  The
-                # overflow arm applies here too — an overflow can surface
-                # mid-consumption (error-frame lanes), and it must fall
-                # through to send()'s compact-and-retry arm rather than
-                # burn re-issues on a deterministic failure.
-                serving_lane = consumer.lane
-                if serving_lane is None:
-                    raise RuntimeError("armed stream has no serving model lane") from e
-                if self._stop_retrying(
-                    e, attempt, serving_lane, max_retries=self._MID_STREAM_RETRIES
-                ):
-                    # Terminal: finalize AND discard, exactly like the
-                    # retry arm.  Keeping the buffers bought nothing — the
-                    # fatal path's _emit_state("error") drains and wipes
-                    # them anyway on every SessionUIBase lane — and an
-                    # overflow that send()'s compact-and-retry RECOVERS
-                    # re-streams into buffers that would otherwise still
-                    # hold the dead attempt's text, concatenating the two
-                    # in the idle payload.
+                    # A Stop that raced the trailing-metadata window: cancel()
+                    # closed the stream and the drain's post-finish tolerance
+                    # ended it CLEANLY, so without this re-check the turn
+                    # commits as complete and its tool calls execute.
+                    self._check_cancelled(my_generation)
+                    consumer.finish_stream()
+                    # Finalization emits terminal warnings/stream_end and may
+                    # legalize a truncated result.  Keep that complete policy step
+                    # on the same owner rail as the carry flush above so a force
+                    # successor or close cannot receive the predecessor's terminal
+                    # UI event in the gap between them.  A same-generation Stop
+                    # after a completed stream preserves the historical completed-
+                    # result boundary.
+                    with self._generation_lock:
+                        if self._publication_shutdown or _generation_superseded(
+                            self, my_generation
+                        ):
+                            raise GenerationCancelled()
+                        return self._finalize_stream_result(result)
+                except GenerationCancelled:
+                    # A Stop during an attempt (incl. the re-create/TTFT window
+                    # after a death) — finalize the streamed display if the
+                    # attempt got a stream, then preserve the window's best
+                    # partial.
+                    if consumer.attempt_armed:
+                        consumer.record_cancelled_partial()
+                    _promote_dead_partial()
+                    raise
+                except KeyboardInterrupt:
+                    # BaseException — the Exception arm below never sees it,
+                    # but send() treats Ctrl-C as a survivable, recorded path,
+                    # so the dead attempt still needs its client-side finalize
+                    # (the CLI's markdown fence resets only in on_stream_end).
+                    self._publish_for_generation(
+                        my_generation,
+                        self.ui.on_stream_end,
+                        allow_cancelled=True,
+                    )
+                    raise
+                except Exception as e:
+                    attempt_provenance = None
+                    armed = consumer.attempt_armed
+                    failed_lane = consumer.lane if armed else None
+                    if failed_lane is not None:
+                        self._remember_serving_failure_context(e, failed_lane)
+                        recovered_failures.append(e)
+                    new_dead = consumer.partial_content() if armed else ""
+                    if failed_lane is not None:
+                        attempt_provenance = TurnProvenance(
+                            model_alias=failed_lane.alias,
+                            backend_model_id=failed_lane.model,
+                            registry_generation=failed_lane.registry_generation,
+                            acting_principal_id=principal_id or "",
+                        )
+                    dead_partial = new_dead or dead_partial
+                    if attempt_provenance is not None and (new_dead or dead_provenance is None):
+                        dead_provenance = attempt_provenance
+                    if armed:
+                        # The partial is captured, so there is no live attempt
+                        # until the next ``begin_attempt``: without this, a
+                        # Stop or a walk-preamble failure landing in the
+                        # re-create window reads the DEAD attempt's armed
+                        # state (see ``end_attempt``).
+                        consumer.end_attempt()
+                    if self._cancel_event.is_set():
+                        _promote_dead_partial()
+                        raise GenerationCancelled() from None
+                    if _generation_superseded(self, my_generation) or self._publication_shutdown:
+                        # Superseded (force-cancel started a newer generation):
+                        # an orphaned thread must not touch the UI — a finalize
+                        # emitted here would clobber the NEW generation's
+                        # in-flight stream state.  send()'s orphan gate absorbs
+                        # the re-raise without recording it, so this snapshot
+                        # has no reader even though its exception escapes.
+                        self._forget_serving_failure_context(e)
+                        raise
+                    if not armed:
+                        # Creation-phase failure: the walk already ran its full
+                        # ladder + fallbacks.  Mid re-issue it must not MASK
+                        # the original stream death (a closed-client re-create
+                        # surfaces as a retryable APIConnectionError and would
+                        # replace the operator-actionable wording) — EXCEPT
+                        # the classes carrying their own remediation: an
+                        # overflow surfaces as ITSELF so send()'s
+                        # compact-and-retry arm can recover the turn, and an
+                        # auth refusal or wire-preparation fault surfaces as
+                        # ITSELF so the fatal formatter's dedicated branch
+                        # renders.  Class name only in the log — a
+                        # ConnectError's text can carry a credential-bearing
+                        # base_url verbatim.
+                        if (
+                            last_stream_death is None
+                            or isinstance(e, _SELF_SURFACING_ERRORS)
+                            or _is_ctx_overflow(e)
+                        ):
+                            raise
+                        log.warning(
+                            "stream.retry.recreate_failed",
+                            error_type=type(e).__name__,
+                        )
+                        raise last_stream_death from None
+                    # The terminal predicate is the SHARED _stop_retrying,
+                    # capped at _MID_STREAM_RETRIES, judged by the lane that
+                    # ACTUALLY armed this stream (a fallback's retryable set
+                    # can differ, e.g. ResponsesStreamFailedError).  The
+                    # overflow arm applies here too — an overflow can surface
+                    # mid-consumption (error-frame lanes), and it must fall
+                    # through to send()'s compact-and-retry arm rather than
+                    # burn re-issues on a deterministic failure.
+                    serving_lane = consumer.lane
+                    if serving_lane is None:
+                        raise RuntimeError("armed stream has no serving model lane") from e
+                    if self._stop_retrying(
+                        e, attempt, serving_lane, max_retries=self._MID_STREAM_RETRIES
+                    ):
+                        # Terminal: finalize AND discard, exactly like the
+                        # retry arm.  Keeping the buffers bought nothing — the
+                        # fatal path's _emit_state("error") drains and wipes
+                        # them anyway on every SessionUIBase lane — and an
+                        # overflow that send()'s compact-and-retry RECOVERS
+                        # re-streams into buffers that would otherwise still
+                        # hold the dead attempt's text, concatenating the two
+                        # in the idle payload.
+                        with self._generation_lock:
+                            if (
+                                self._publication_shutdown
+                                or _generation_superseded(self, my_generation)
+                                or self._cancel_event.is_set()
+                            ):
+                                _promote_dead_partial()
+                                raise GenerationCancelled() from None
+                            self.ui.on_stream_end()
+                            self._ui_stream_discarded()
+                        raise  # fatal path otherwise unchanged
+                    # This death supersedes the previous one: drop the older
+                    # snapshot here rather than at the ladder's exit, so a long
+                    # re-issue run holds one entry in the bounded map, not one
+                    # per attempt.
+                    self._forget_serving_failure_context(last_stream_death)
+                    last_stream_death = e
+                    # Delay from the PRE-increment attempt index — the same
+                    # convention as the sibling ladders' range loops.
+                    delay = self._RETRY_BASE_DELAY * (2**attempt)
+                    attempt += 1
+                    cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
+                    log.warning(
+                        "stream.retry",
+                        error_type=cause,
+                        attempt=attempt,
+                        model=serving_lane.model,
+                        alias=serving_lane.alias,
+                        registry_generation=serving_lane.registry_generation,
+                        retry_in=delay,
+                        # Spend trace for the abandoned generation: the wire
+                        # reports usage only at stream end, so a dead attempt's
+                        # billed tokens are otherwise invisible — dead_usage
+                        # carries what the wire DID deliver (Anthropic's early
+                        # prompt tokens; None on the OpenAI chat lane, whose
+                        # usage chunk trails the finish), and the char count
+                        # lets an operator estimate the discarded completion.
+                        # THIS death's flushed text only — a pre-token re-death
+                        # logs 0, never the Stop-preservation carry from a
+                        # prior attempt (that would double-count spend).
+                        dead_usage=self._last_usage,
+                        dead_content_chars=len(new_dead),
+                    )
+                    # Finalize the dead attempt client-side, then WAIT before
+                    # discarding: stream_end (browser bubble, CLI markdown
+                    # flush/fence reset) -> notice -> backoff.  The
+                    # server-buffer discard runs only AFTER the backoff
+                    # survives the Stop window — a Stop during backoff persists
+                    # the promoted partial to history, and the idle payload
+                    # (drained from the turn buffer) must carry the same text,
+                    # or the dashboard renders the cancelled turn empty while
+                    # the transcript has it.
                     with self._generation_lock:
                         if (
                             self._publication_shutdown
@@ -10257,98 +12805,53 @@ class ChatSession:
                             _promote_dead_partial()
                             raise GenerationCancelled() from None
                         self.ui.on_stream_end()
-                        self._ui_stream_discarded()
-                    raise  # fatal path otherwise unchanged
-                last_stream_death = e
-                # Delay from the PRE-increment attempt index — the same
-                # convention as the sibling ladders' range loops.
-                delay = self._RETRY_BASE_DELAY * (2**attempt)
-                attempt += 1
-                cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
-                log.warning(
-                    "stream.retry",
-                    error_type=cause,
-                    attempt=attempt,
-                    model=serving_lane.model,
-                    retry_in=delay,
-                    # Spend trace for the abandoned generation: the wire
-                    # reports usage only at stream end, so a dead attempt's
-                    # billed tokens are otherwise invisible — dead_usage
-                    # carries what the wire DID deliver (Anthropic's early
-                    # prompt tokens; None on the OpenAI chat lane, whose
-                    # usage chunk trails the finish), and the char count
-                    # lets an operator estimate the discarded completion.
-                    # THIS death's flushed text only — a pre-token re-death
-                    # logs 0, never the Stop-preservation carry from a
-                    # prior attempt (that would double-count spend).
-                    dead_usage=self._last_usage,
-                    dead_content_chars=len(new_dead),
-                )
-                # Finalize the dead attempt client-side, then WAIT before
-                # discarding: stream_end (browser bubble, CLI markdown
-                # flush/fence reset) -> notice -> backoff.  The
-                # server-buffer discard runs only AFTER the backoff
-                # survives the Stop window — a Stop during backoff persists
-                # the promoted partial to history, and the idle payload
-                # (drained from the turn buffer) must carry the same text,
-                # or the dashboard renders the cancelled turn empty while
-                # the transcript has it.
-                with self._generation_lock:
-                    if (
-                        self._publication_shutdown
-                        or _generation_superseded(self, my_generation)
-                        or self._cancel_event.is_set()
-                    ):
+                        self.ui.on_info(
+                            f"[stream died mid-response ({cause}) — retrying in "
+                            f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
+                        )
+                    try:
+                        self._backoff_or_cancelled(delay, my_generation)
+                        # Retry preparation is one generation publication.  A
+                        # successor can claim immediately after the backoff check;
+                        # without this lock the abandoned worker could discard the
+                        # successor's buffer, restart its spinner, and clear its
+                        # newly registered provider handle before noticing it was
+                        # stale on the next loop iteration.
+                        with self._generation_lock:
+                            if (
+                                self._publication_shutdown
+                                or _generation_superseded(self, my_generation)
+                                or self._cancel_event.is_set()
+                            ):
+                                raise GenerationCancelled()
+                            # Retry is proceeding: truncate the dead segment from
+                            # the multi-segment turn buffer (the IDLE payload's
+                            # source) and reset the inflight snapshot BEFORE any
+                            # retried token lands, or every consumer appends the
+                            # retried text onto the dead attempt's.
+                            self._ui_stream_discarded()
+                            # Spinner for the recreate+TTFT window, and the fresh
+                            # segment watermark — AFTER the truncate, so a later
+                            # discard cannot resurrect this dead segment.  A
+                            # pre-first-token death leaves the spinner RUNNING
+                            # (_stop_spinner_once never fired) — on_thinking_start
+                            # is idempotent at the callee.
+                            self.ui.on_thinking_start()
+                            self._cancel_stream = None  # drop the dead SDK handle
+                        # A concurrent ModelRegistry.reload() closes cached
+                        # clients whose connection config changed — the
+                        # in-flight read then dies with a ReadError and
+                        # the old lane's client is CLOSED. Generation-gated (two compares
+                        # when nothing changed); the next attempt's
+                        # ``prepare_wire`` closure re-prepares against whatever
+                        # binding the walk resolves.
+                        self._refresh_model_from_registry()
+                    except GenerationCancelled:
+                        # A Stop landing in the backoff window aborts the turn
+                        # with the dead attempt's partial preserved — the same
+                        # disposition a cancel DURING the attempt gets.
                         _promote_dead_partial()
-                        raise GenerationCancelled() from None
-                    self.ui.on_stream_end()
-                    self.ui.on_info(
-                        f"[stream died mid-response ({cause}) — retrying in "
-                        f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
-                    )
-                try:
-                    self._backoff_or_cancelled(delay, my_generation)
-                    # Retry preparation is one generation publication.  A
-                    # successor can claim immediately after the backoff check;
-                    # without this lock the abandoned worker could discard the
-                    # successor's buffer, restart its spinner, and clear its
-                    # newly registered provider handle before noticing it was
-                    # stale on the next loop iteration.
-                    with self._generation_lock:
-                        if (
-                            self._publication_shutdown
-                            or _generation_superseded(self, my_generation)
-                            or self._cancel_event.is_set()
-                        ):
-                            raise GenerationCancelled()
-                        # Retry is proceeding: truncate the dead segment from
-                        # the multi-segment turn buffer (the IDLE payload's
-                        # source) and reset the inflight snapshot BEFORE any
-                        # retried token lands, or every consumer appends the
-                        # retried text onto the dead attempt's.
-                        self._ui_stream_discarded()
-                        # Spinner for the recreate+TTFT window, and the fresh
-                        # segment watermark — AFTER the truncate, so a later
-                        # discard cannot resurrect this dead segment.  A
-                        # pre-first-token death leaves the spinner RUNNING
-                        # (_stop_spinner_once never fired) — on_thinking_start
-                        # is idempotent at the callee.
-                        self.ui.on_thinking_start()
-                        self._cancel_stream = None  # drop the dead SDK handle
-                    # A concurrent ModelRegistry.reload() closes cached
-                    # clients whose connection config changed — the
-                    # in-flight read then dies with a ReadError and
-                    # the old lane's client is CLOSED. Generation-gated (two compares
-                    # when nothing changed); the next attempt's
-                    # ``prepare_wire`` closure re-prepares against whatever
-                    # binding the walk resolves.
-                    self._refresh_model_from_registry()
-                except GenerationCancelled:
-                    # A Stop landing in the backoff window aborts the turn
-                    # with the dead attempt's partial preserved — the same
-                    # disposition a cancel DURING the attempt gets.
-                    _promote_dead_partial()
-                    raise
+                        raise
 
     def _finalize_stream_result(self, result: ModelTurnResult) -> ModelTurnResult:
         """Post-drain policies for a COMPLETED interactive turn.
@@ -10392,7 +12895,7 @@ class ChatSession:
                         native = ProviderNative(producer=old_native.producer, blocks=tuple(blocks))
                 result = dataclasses.replace(
                     result,
-                    turn=Turn.assistant(result.turn.text, native=native),
+                    turn=dataclasses.replace(result.turn, tool_calls=(), native=native),
                     tool_calls=[],
                 )
         elif finish_reason == "content_filter":
@@ -10420,12 +12923,16 @@ class ChatSession:
                 tools=[tc["function"]["name"] for tc in result.tool_calls],
             )
 
+        provenance = result.provenance
         log.debug(
             "stream.finished",
             finish_reason=finish_reason,
             has_content=bool(result.content),
             tool_call_count=len(result.tool_calls),
             content_length=len(result.content),
+            alias=provenance.model_alias,
+            model=provenance.backend_model_id,
+            registry_generation=provenance.registry_generation,
         )
         self.ui.on_stream_end()
         return result
@@ -10586,6 +13093,7 @@ class ChatSession:
         *,
         msgs: list[dict[str, Any]] | None = None,
         tool_def_chars: int | None = None,
+        provenance: TurnProvenance | None = None,
     ) -> None:
         """Update per-message token estimates using API usage data.
 
@@ -10632,6 +13140,19 @@ class ChatSession:
             )
         elif text_chars > 0:
             self._chars_per_token = text_chars / text_prompt_tok
+
+        calibration_key = (
+            self._provenance_calibration_key(provenance)
+            or self._active_token_calibration_key
+            or self._token_calibration_key(self._primary_lane())
+        )
+        self._active_token_calibration_key = calibration_key
+        self._last_usage_calibration_key = calibration_key
+        self._token_calibrations[calibration_key] = _TokenCalibration(
+            chars_per_token=self._chars_per_token,
+            prompt_tokens=prompt_tok,
+            message_prefix_ids=tuple(id(message) for message in self.messages),
+        )
 
         # Compute system_tokens (stable after first call)
         sys_chars = sum(self._msg_char_count(m) for m in self.system_messages)
@@ -11039,7 +13560,13 @@ class ChatSession:
             self._compaction_event(
                 my_generation, {"phase": "progress", "warning": "summary_truncated"}
             )
-        return _SummaryResult(text=summary, producer=result.producer)
+        return _SummaryResult(
+            text=summary,
+            producer=result.producer,
+            # Lightweight seam fakes predating provenance remain valid; every
+            # production ModelTurnResult carries the field.
+            provenance=getattr(result, "provenance", TurnProvenance()),
+        )
 
     def _summarize_blocks(
         self,
@@ -11423,6 +13950,14 @@ class ChatSession:
             raise GenerationCancelled()
         try:
             return self._compact_messages_impl(auto, preserve_tail, my_generation, carry_spill)
+        except ConversationPersistenceError:
+            # The compaction state swap and successful END were already
+            # accepted atomically with a pending marker row. Durability poison
+            # must propagate to stop causal suffixes, but it is not a second
+            # compaction outcome: emitting a failed END here would violate the
+            # exactly-one terminal event contract and contradict the pending
+            # successful history card.
+            raise
         except BaseException as e:
             # GenerationCancelled is a BaseException — the except above the
             # message swap lets it propagate so history stays untouched; the
@@ -11875,6 +14410,7 @@ class ChatSession:
             "role": "assistant",
             "content": summary,
             "_source": COMPACTION_SOURCE,
+            "_provenance": summary_result.provenance.to_meta(),
         }
         su_tok = max(1, int(self._msg_char_count(summary_user) / self._chars_per_token))
         sa_tok = max(1, int(self._msg_char_count(summary_asst) / self._chars_per_token))
@@ -11903,60 +14439,134 @@ class ChatSession:
                     "prompt_tokens": after_tokens,
                     "total_tokens": after_tokens,
                 }
+            active_key = self._active_token_calibration_key
+            if active_key is not None:
+                active = self._token_calibrations.get(active_key)
+                self._token_calibrations[active_key] = _TokenCalibration(
+                    chars_per_token=(
+                        active.chars_per_token if active is not None else self._chars_per_token
+                    ),
+                    prompt_tokens=after_tokens,
+                    message_prefix_ids=tuple(id(message) for message in compacted_messages),
+                )
+                if self._last_usage is not None:
+                    self._last_usage_calibration_key = active_key
 
-            # The successful end event carries everything a UI needs to paint
-            # the result card; its id stamps the marker row below so /history
-            # and the live stream stay aligned.
-            end_event_id = self._compaction_event(
-                my_generation,
-                {
-                    "phase": "end",
-                    "ok": True,
-                    "trigger": trigger,
-                    "before_tokens": before_tokens,
-                    "after_tokens": after_tokens,
-                    "summary": summary,
-                },
-            )
-            # Persist a checkpoint so reopen rehydrates [summary]+[tail] rather
-            # than the full transcript.  Storage retains the complete audit
-            # history; this marker governs only the resume slice.
+            # Persist a checkpoint so reopen rehydrates [summary]+[tail]
+            # rather than the full transcript. Storage retains the complete
+            # audit history; this marker governs only the resume slice. The
+            # live display projection is the same SYSTEM/source=compaction
+            # shape produced by ``include_compaction=True`` while storage
+            # retains the canonical ASSISTANT marker role.
             if self._ws_id:
                 persist_ws_id = self._ws_id
-                persist_event_id = end_event_id if end_event_id is not None else self._ui_event_id()
+                commit_key = uuid.uuid4().hex
+                event_id_ref: list[int | None] = [None]
+                marker_meta: dict[str, Any] = {
+                    "before_tokens": before_tokens,
+                    "after_tokens": after_tokens,
+                    "trigger": trigger,
+                }
+                if summary_result.producer:
+                    marker_meta["summary_producer"] = summary_result.producer
+                marker_meta[PROVENANCE_META_KEY] = summary_result.provenance.to_meta()
+                # The public card keeps checkpoint/display fields but never
+                # exposes the private provenance/principal envelope.
+                display_meta = {
+                    key: copy.deepcopy(value)
+                    for key, value in marker_meta.items()
+                    if key != PROVENANCE_META_KEY
+                }
+                pending_marker = {
+                    "role": "system",
+                    "content": summary,
+                    "_source": COMPACTION_SOURCE,
+                    "_source_meta": display_meta,
+                }
 
-                def _persist_compaction_marker() -> None:
-                    # This read is part of the same ordered durable batch as
-                    # the marker insert.  Every earlier generation batch has
-                    # completed and no later batch can overtake it, so the
-                    # watermark names exactly the prefix summarized above.
-                    watermark = get_compaction_watermark(persist_ws_id, preserve_tail)
-                    if watermark is None:
-                        return
-                    marker_meta: dict[str, Any] = {
-                        "watermark": watermark,
-                        "before_tokens": before_tokens,
-                        "after_tokens": after_tokens,
-                        "trigger": trigger,
-                    }
-                    # Compaction has no provider-native block lane, so the
-                    # generic ``producer=`` storage envelope cannot carry this
-                    # attribution.  Persist the final merge producer in the
-                    # checkpoint marker's metadata instead; #964 owns the
-                    # broader accepted-turn provenance tuple.
-                    if summary_result.producer:
-                        marker_meta["summary_producer"] = summary_result.producer
-                    save_message(
-                        persist_ws_id,
+                meta_json_cell: list[str | None] = [None]
+
+                def _persist_compaction_marker(
+                    *,
+                    ws_id: str = persist_ws_id,
+                    row_commit_key: str = commit_key,
+                    row_event_id: list[int | None] = event_id_ref,
+                ) -> int:
+                    # The watermark is read inside the ordered durable batch:
+                    # every earlier generation batch has completed and no
+                    # later batch can overtake it, so the boundary names
+                    # exactly the prefix summarized above — including rows
+                    # that were still pending in the journal when compaction
+                    # was admitted. Memoized because the marker is a KEYED
+                    # save: a lost-ACK retry must present byte-identical meta
+                    # to the conflict validator, and a re-read after the first
+                    # attempt could observe this marker's own row. The read
+                    # deliberately bypasses the memory wrapper's error-to-None
+                    # coercion: a failed read must abort THIS attempt (no
+                    # bytes fixed, no save tried — the journal classifies it
+                    # retrying and the retry re-reads) rather than memoize
+                    # "absent" and durably commit a checkpoint-less marker on
+                    # the first healthy retry. ``None`` from a healthy read is
+                    # the legitimate no-rows case and persists a display-only
+                    # marker; reopen then resumes from full history.
+                    if meta_json_cell[0] is None:
+                        watermark = get_storage().get_compaction_watermark(ws_id, preserve_tail)
+                        persisted_meta = dict(marker_meta)
+                        if watermark is not None:
+                            persisted_meta["watermark"] = watermark
+                        meta_json_cell[0] = json.dumps(persisted_meta)
+                    return save_message(
+                        ws_id,
                         "assistant",
                         summary,
                         source=COMPACTION_SOURCE,
-                        meta=json.dumps(marker_meta),
-                        event_id=persist_event_id,
+                        meta=meta_json_cell[0],
+                        event_id=row_event_id[0],
                         producer=summary_result.producer,
+                        commit_key=row_commit_key,
                     )
 
-                durable.append(_persist_compaction_marker)
+                # END publication, fallback repair, marker admission, and
+                # revision advance are one REST/SSE handoff transition. Stamp
+                # after every emitted event so the row cursor covers it.
+                with self._history_handoff_lock:
+                    end_event_id = self._compaction_event(
+                        my_generation,
+                        {
+                            "phase": "end",
+                            "ok": True,
+                            "trigger": trigger,
+                            "before_tokens": before_tokens,
+                            "after_tokens": after_tokens,
+                            "summary": summary,
+                        },
+                    )
+                    if end_event_id is None and _active_task_agent_cancel_scope.get() is None:
+                        self._request_history_resync_locked("compaction_checkpoint_accepted")
+                    event_id_ref[0] = (
+                        end_event_id if end_event_id is not None else self._ui_event_id()
+                    )
+                    pending = self._journal_conversation_row_locked(
+                        commit_key=commit_key,
+                        message=pending_marker,
+                        persist=_persist_compaction_marker,
+                        event_id=event_id_ref[0],
+                    )
+                self._schedule_conversation_persistence(pending, durable)
+            else:
+                # Unscoped CLI/eval sessions have no history row, but retain
+                # the successful lifecycle event.
+                self._compaction_event(
+                    my_generation,
+                    {
+                        "phase": "end",
+                        "ok": True,
+                        "trigger": trigger,
+                        "before_tokens": before_tokens,
+                        "after_tokens": after_tokens,
+                        "summary": summary,
+                    },
+                )
 
         if not self._commit_for_generation(
             my_generation,
@@ -13248,6 +15858,8 @@ class ChatSession:
         attachment_ids: list[str] | tuple[str, ...] | None = None,
         queue_msg_id: str | None = None,
         interjector_user_id: str = "",
+        turn_principal_id: str | None = None,
+        client_send_id: str = "",
     ) -> tuple[str, str, str]:
         """Queue a user message for injection at the next tool-result seam.
 
@@ -13271,9 +15883,19 @@ class ChatSession:
         credentials and be misattributed to them.  The interjector must
         wait and send a fresh turn under their own identity.
 
+        ``turn_principal_id`` is the immutable owner captured with the active
+        worker-slot claim.  HTTP/coordinator queue paths pass it during the
+        short window before ``bind_acting_user`` updates the mutable session
+        actor.  Omitting it preserves the direct/CLI behavior and compares
+        against the current effective actor.
+
         ``queue_msg_id`` lets the caller supply the id (so it matches the
         ``send_id`` tracking token threaded through the send) — when
         omitted, an id is generated.
+
+        ``client_send_id`` is retained independently as one-shot browser
+        correlation.  It follows the text through a combined queue flush but
+        never affects queue/storage identity or delivery semantics.
         """
         from turnstone.core.tool_advisory import parse_priority
 
@@ -13284,10 +15906,21 @@ class ChatSession:
             )
 
         interjector = (interjector_user_id or "").strip()
-        if interjector and interjector != self._mcp_effective_user_id:
+        active_principal = (
+            (self._mcp_effective_user_id or "").strip()
+            if turn_principal_id is None
+            else (turn_principal_id or "").strip()
+        )
+        if interjector and interjector != active_principal:
             # Only an authenticated non-acting participant is blocked: the
             # acting user interjecting their own in-flight turn is fine, and
-            # unauthenticated lanes (empty id) keep the pre-existing behaviour.
+            # an unauthenticated interjector (empty id) keeps the pre-existing
+            # internal-lane behaviour. An EMPTY turn principal fails closed:
+            # folding an authenticated send into an unowned in-flight turn
+            # (init worker, internal wake on an ownerless session) would run
+            # the words under the ambient credential context and misattribute
+            # them to that turn's initiator — exactly what this guard exists
+            # to prevent.
             raise CrossUserInterjectionError(
                 "Another participant's turn is in flight — wait for it to "
                 "finish, then send your message so it runs under your own "
@@ -13307,23 +15940,97 @@ class ChatSession:
         with self._queued_lock:
             if len(self._queued_messages) >= self._QUEUE_MAX:
                 raise queue.Full()
-            self._queued_messages[msg_id] = (cleaned, priority)
+            owner = interjector or (active_principal if turn_principal_id is not None else "")
+            self._queued_messages[msg_id] = (
+                (cleaned, priority, owner, client_send_id)
+                if client_send_id
+                else (cleaned, priority, owner)
+            )
         return cleaned, priority, msg_id
+
+    def has_foreign_queued_messages(self, principal_id: str) -> bool:
+        """Whether retained queued text belongs to another participant.
+
+        Called under the workstream worker-slot lock before a fresh worker is
+        claimed.  Empty owners are legacy/internal entries and remain
+        compatible with every principal; authenticated entries are exact.
+        """
+        principal = (principal_id or "").strip()
+        if not principal:
+            return False
+        with self._queued_lock:
+            return self._has_foreign_queued_messages_locked(principal)
+
+    def claim_pending_interjection_wake(
+        self,
+        *,
+        exclude_signature: object | None = None,
+    ) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
+        """Return one compatible queue snapshot token for an automatic wake.
+
+        Called only from a worker's ownership-clear backstop.  Budget refusal,
+        an abandoned generation, and unresolved durable/structural state all
+        require a later explicit user seam rather than an unattended retry.
+        ``exclude_signature`` belongs to the exact wake worker now exiting: if
+        its failed preamble restored the same popped rows, that attempt is not
+        immediately repeated.  The token is otherwise stateless until a wake
+        runner successfully spawns, so a deferred/refused dispatch cannot
+        suppress the competing real worker's own exit handoff.
+
+        The workstream-gone latch is its own blocker arm: the gone
+        discovery CLEARS the pending-commit journal, so the unresolved-
+        persistence check reads False exactly when the workstream can no
+        longer accept any turn — without this arm the claim admits a wake
+        that is structurally guaranteed to fail, burning wake nudges (and,
+        via send()'s internally-converged cancel, destroying the popped
+        rows) at every subsequent worker exit.  Refusal keeps the rows
+        retained; their disposition on a deleted workstream is #1001's.
+        Checked before ``_queued_lock`` like the persistence probe — both
+        take other locks and must not nest inside the queue lock.
+        """
+        if (
+            self._budget_exhausted
+            or self._generation_abandoned
+            or self.is_workstream_gone()
+            or self.has_unresolved_conversation_persistence()
+        ):
+            return None
+        principal = (self._mcp_effective_user_id or "").strip()
+        with self._queued_lock:
+            if not self._queued_messages:
+                return None
+            if principal and self._has_foreign_queued_messages_locked(principal):
+                return None
+            signature = tuple(
+                (message_id, tuple(row)) for message_id, row in self._queued_messages.items()
+            )
+            return None if signature == exclude_signature else signature
+
+    def _has_foreign_queued_messages_locked(self, principal_id: str) -> bool:
+        """Locked half of :meth:`has_foreign_queued_messages`."""
+        return any(
+            (owner := _queued_row_owner(row)) and owner != principal_id
+            for row in self._queued_messages.values()
+        )
 
     def dequeue_message(self, msg_id: str) -> bool:
         """Remove a queued message by ID.  Returns True if removed.
 
-        A miss is RECORDED, not just reported: during the wake handoff's
-        in-flight send the items live in the dispatcher's hands, so the
-        user's retraction cannot reach the queue — the ledger lets a
-        failure-path restore honour it instead of resurrecting a message
-        the user cancelled.  (A miss for an id that was simply already
-        delivered records harmlessly: the ledger is cleared at each pop
-        and consulted only by the restore.)
+        A miss for an id an OPEN pop window holds in flight is RECORDED,
+        not just reported: during the wake handoff's in-flight send the
+        items live in the dispatcher's hands, so the user's retraction
+        cannot reach the queue — the ledger lets a failure-path restore
+        honour it instead of resurrecting a message the user cancelled.
+        A miss for any other id (already delivered, never queued at all)
+        records NOTHING: under per-id ledger discipline no pop, restore,
+        or sweep would ever prune such an entry, so unconditional
+        recording grew the set for the session's whole lifetime — one
+        permanent entry per retract-after-delivery, unbounded for any
+        authenticated writer looping DELETEs with invented ids.
         """
         with self._queued_lock:
             popped = self._queued_messages.pop(msg_id, None)
-            if popped is None:
+            if popped is None and msg_id in self._popped_in_flight:
                 self._retracted_while_popped.add(msg_id)
         return popped is not None
 
@@ -13340,6 +16047,80 @@ class ChatSession:
         worker slot — it mutates ``self.messages``.
         """
         return self._flush_queued_messages()
+
+    def _drain_queue_for_identity_swap(self) -> None:
+        """Settle the queue before /new or /resume swaps this session's ws_id.
+
+        TOTAL: it must be impossible for the escape commands to raise out of
+        here — the CLI dispatches them uncaught, and an unhealthy journal
+        must never block leaving a workstream (round-5 review). Stranded OWN
+        text persists into the CURRENT workstream when the journal can accept
+        it; everything that cannot land is discarded WITH an accurate notice,
+        never carried across the swap. The except arm is deliberately
+        ``(GenerationCancelled, Exception)`` rather than a curated tuple —
+        the direct-flush raise surface (reconcile poison gate, commit
+        refusal, journal admission internals, storage drivers) is open-ended,
+        and a curated tuple is exactly how the last "never raises" version
+        ended up raising.
+        """
+        with self._queued_lock:
+            if not self._queued_messages:
+                # Skip even the flush's direct-mode preamble: the reconcile
+                # poison gate can raise with nothing queued at all.
+                self._retracted_while_popped.clear()
+                self._popped_in_flight.clear()
+                return
+        if self.is_workstream_gone():
+            with self._queued_lock:
+                dropped = len(self._queued_messages)
+                self._queued_messages.clear()
+                self._retracted_while_popped.clear()
+                self._popped_in_flight.clear()
+            if dropped:
+                self.ui.on_info(
+                    f"Discarded {dropped} queued message(s) — the workstream was "
+                    "deleted and can no longer save them."
+                )
+            return
+        flushed_ok = True
+        try:
+            self._flush_queued_messages()
+        except (GenerationCancelled, Exception):
+            flushed_ok = False
+            log.warning("session.identity_swap_flush_failed ws=%s", self._ws_id[:8], exc_info=True)
+        principal = (self._mcp_effective_user_id or "").strip()
+        with self._queued_lock:
+            own = 0
+            foreign = 0
+            for row in self._queued_messages.values():
+                owner = _queued_row_owner(row)
+                if principal and owner and owner != principal:
+                    foreign += 1
+                else:
+                    own += 1
+            self._queued_messages.clear()
+            self._retracted_while_popped.clear()
+            # No pop window can be open here (CLI-only path, single REPL
+            # thread, no CLI wake lane), so this is a belt-and-braces
+            # invariant, not a live close: a stale in-flight id must not
+            # outlive the identity swap and suppress a legitimate later
+            # message on the NEW workstream.
+            self._popped_in_flight.clear()
+        # Per-partition notices: after a SUCCESSFUL flush the leftovers are
+        # provably another participant's; after a failed flush the actor's
+        # own unsaved rows must never be counted as someone else's.
+        if own:
+            self.ui.on_info(
+                f"Discarded {own} of your queued message(s) — they could not be "
+                "saved before leaving this workstream."
+            )
+        if foreign:
+            self.ui.on_info(
+                f"Discarded {foreign} queued message(s) from another participant — "
+                "they cannot follow into a different workstream."
+            )
+        if not flushed_ok and not own and not foreign:
+            self.ui.on_info("Queued messages could not be saved and were discarded.")
 
     def compact_now(self, *, principal_id: str | None = None) -> bool:
         """Manual compaction with send()'s full generation discipline.
@@ -13374,10 +16155,20 @@ class ChatSession:
         pass it explicitly; local/direct callers capture the session's current
         effective user once before claiming the compaction generation.
         """
+        worker_claim = current_worker_claim(self)
         compact_principal = (
-            (self._mcp_effective_user_id or "") if principal_id is None else principal_id
+            (
+                worker_claim.principal_id
+                if worker_claim is not None
+                else (self._mcp_effective_user_id or "")
+            )
+            if principal_id is None
+            else principal_id
         ).strip()
-        my_generation = self._claim_generation(principal_id=compact_principal)
+        my_generation = self._claim_generation(
+            principal_id=compact_principal,
+            expected_cancel_epoch=(worker_claim.cancel_epoch if worker_claim is not None else None),
+        )
         cancel_landed = False
         try:
             compacted = self._compact_messages(my_generation=my_generation)
@@ -13433,48 +16224,122 @@ class ChatSession:
         Returns ``True`` when any user row was appended (prefix or
         items), ``False`` when both were empty.
         """
-        queued_text = self._pop_queued_messages_text()
-        if not queued_text and not prefix:
-            return False
+        if deferred_persistence is None:
+            return bool(
+                self._direct_commit_reentry(
+                    "Cannot flush queued messages on a closed session",
+                    lambda durable: self._flush_queued_messages(
+                        prefix,
+                        deferred_persistence=durable,
+                    ),
+                )
+            )
+        queued_items = self._pop_queued_messages()
+        try:
+            queued_text = self._render_queued_messages(queued_items)
+            client_send_ids = self._client_send_ids_from_queued(queued_items)
+            if not queued_text and not prefix:
+                return False
 
-        if prefix and queued_text:
-            content = prefix + "\n\n" + queued_text
-        elif prefix:
-            content = prefix
-        else:
-            content = queued_text
-        self._append_user_turn(
-            content,
-            (),
-            deferred_persistence=deferred_persistence,
-        )
-        return True
+            if prefix and queued_text:
+                content = prefix + "\n\n" + queued_text
+            elif prefix:
+                content = prefix
+            else:
+                content = queued_text
+            self._append_user_turn(
+                content,
+                (),
+                deferred_persistence=deferred_persistence,
+                client_send_ids=client_send_ids,
+            )
+            return True
+        finally:
+            # Every flush exit closes its window: appended (committed),
+            # husks-only (deliberately discarded), or a raise out of the
+            # append (no restore path exists on the flush seams).  No
+            # restore happens in this frame, so the unconditional close
+            # cannot strip a marker a restore re-armed.
+            self._close_pop_window(queued_items)
 
-    def _pop_queued_messages(self) -> dict[str, tuple[str, str]]:
-        """Atomically drain ``_queued_messages``, returning the raw items.
+    def _pop_queued_messages(
+        self,
+    ) -> dict[str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]]:
+        """Partition-pop ``_queued_messages`` by owner, returning the raw items.
 
-        The pop happens under ``_queued_lock`` and is destructive: the
-        caller owns delivery of whatever comes back, and a caller whose
-        delivery can fail restores the SAME mapping via
-        :meth:`_restore_queued_messages` — ids and priorities intact, so
-        the queued-id / send-id correspondence the delete route and the
-        pending rows rely on survives a failed dispatch.
+        Pops entries owned by the CURRENT effective actor plus unowned/legacy
+        entries (``owner == ""`` or a pre-owner 2-tuple); another
+        participant's entries are STRUCTURALLY retained in place — they can
+        never leave the queue under a different actor's credentials, which is
+        the security property the deleted pop-side ownership assert enforced
+        by raising.  Every consumer therefore does the right thing on a
+        mixed-ownership queue with no per-site mode flag: own text flows,
+        foreign text waits for its owner's next turn.  With an EMPTY current
+        principal everything pops — an owned row cannot coexist with an empty
+        actor (admission fails closed on empty principals and the effective
+        id is sticky), so that arm only ever sees all-unowned queues.
+
+        The pop is destructive for the popped subset: the caller owns
+        delivery, and a caller whose delivery can fail restores the SAME
+        mapping via :meth:`_restore_queued_messages` — ids and priorities
+        intact, so the queued-id / send-id correspondence the delete route
+        and the pending rows rely on survives a failed dispatch.
+
+        Retraction-ledger discipline is PER-ID, never wholesale: this pop
+        discards suppression records only for the ids it pops (a fresh pop
+        of a re-queued id starts a clean window), leaving records that guard
+        an OUTER pop window intact — the wake handoff holds its popped items
+        across a full ``send()`` whose own flush seams pop again, and a
+        wholesale clear here would destroy the outer window's retraction and
+        resurrect a message the user cancelled.
         """
+        principal = (self._mcp_effective_user_id or "").strip()
         with self._queued_lock:
-            items = dict(self._queued_messages)
-            self._queued_messages.clear()
-            self._retracted_while_popped.clear()
-        return items
+            popped: dict[
+                str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]
+            ] = {}
+            for mid, row in self._queued_messages.items():
+                owner = _queued_row_owner(row)
+                if principal and owner and owner != principal:
+                    continue
+                popped[mid] = row
+            for mid in popped:
+                del self._queued_messages[mid]
+                self._retracted_while_popped.discard(mid)
+                # Window OPEN, atomic with the delete: a gap would let a
+                # DELETE race in, see the id in neither structure, record
+                # nothing — and the restore would resurrect the retracted
+                # message.  Exactly one close per window: the restore (for
+                # the ids it considered) or ``_close_pop_window`` on every
+                # success / deliberate-discard / exception exit.
+                self._popped_in_flight.add(mid)
+        return popped
 
-    def _restore_queued_messages(self, items: dict[str, tuple[str, str]]) -> None:
+    def _restore_queued_messages(
+        self,
+        items: dict[str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]],
+    ) -> None:
         """Put popped items back at the FRONT of ``_queued_messages``.
 
         The undo half of :meth:`_pop_queued_messages`, for a dispatcher
         whose delivery failed before any turn was appended.  Restores
         unconditionally — the items were already admitted, so
         ``_QUEUE_MAX`` (an admission gate, not a storage invariant) does
-        not re-apply — and ahead of anything queued meanwhile, keeping
-        arrival order.
+        not re-apply — and ahead of anything queued meanwhile.  With
+        partitioned pops "meanwhile" can include another participant's
+        RETAINED rows that arrived earlier; restored rows still merge to the
+        front (bounded: different owners never render in the same turn, so
+        cross-owner order is presentation-free).  Ledger discipline is
+        per-id: only the suppression records this restore consumed (the ids
+        it considered) are discarded, never records guarding another pop
+        window.  The restore IS this window's close: the in-flight
+        removal covers every id it CONSIDERED (including the retracted
+        subset it did not re-insert — a restored-subset-only removal
+        would leak one in-flight id per honoured retraction), atomically
+        with the ledger consume under one lock acquisition, so a re-pop
+        by a new window cannot be stripped by the old window's later
+        cleanup.  A caller whose restore ran must NOT also run
+        ``_close_pop_window`` for the same ids.
         """
         with self._queued_lock:
             merged = {
@@ -13483,10 +16348,33 @@ class ChatSession:
             merged.update(self._queued_messages)
             self._queued_messages.clear()
             self._queued_messages.update(merged)
-            self._retracted_while_popped.clear()
+            self._retracted_while_popped.difference_update(items.keys())
+            self._popped_in_flight.difference_update(items.keys())
+
+    def _close_pop_window(
+        self,
+        items: dict[str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]],
+    ) -> None:
+        """Close a pop window that ends WITHOUT a restore.
+
+        Success-commit, deliberate-discard (gone latch, cancel
+        no-restore, content-free husks), and exception escapes all end
+        here — per-id, so a nested window's close never touches an outer
+        window's ids.  Callers whose failure arm restored must skip this
+        for the restored window: the restore already closed those ids,
+        and a later blanket discard could strip a marker a NEW window
+        now owns (re-enabling the resurrection bug the ledger exists to
+        prevent).
+        """
+        if not items:
+            return
+        with self._queued_lock:
+            self._popped_in_flight.difference_update(items.keys())
 
     @staticmethod
-    def _render_queued_messages(items: dict[str, tuple[str, str]]) -> str:
+    def _render_queued_messages(
+        items: dict[str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]],
+    ) -> str:
         """The one rendering of popped interjection items as USER-turn
         content — ``[IMPORTANT]``-prefixed per item priority, items
         joined by blank lines — shared by :meth:`_flush_queued_messages`
@@ -13503,16 +16391,17 @@ class ChatSession:
         from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
         return "\n\n".join(
-            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg
-            for msg, pri in items.values()
-            if msg.strip()
+            f"[IMPORTANT] {row[0]}" if row[1] == PRIORITY_IMPORTANT else row[0]
+            for row in items.values()
+            if row[0].strip()
         )
 
-    def _pop_queued_messages_text(self) -> str:
-        """Pop-and-render in one step, for the flush seams whose delivery
-        cannot fail between pop and append (:meth:`_flush_queued_messages`
-        appends the turn immediately)."""
-        return self._render_queued_messages(self._pop_queued_messages())
+    @staticmethod
+    def _client_send_ids_from_queued(
+        items: dict[str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]],
+    ) -> tuple[str, ...]:
+        """Return non-empty browser correlation ids in queue arrival order."""
+        return tuple(csid for row in items.values() if (csid := _queued_row_client_send_id(row)))
 
     def _collect_advisories(
         self,
@@ -13565,26 +16454,51 @@ class ChatSession:
         # and tool/any-channel metacog nudges.  Both fire once per batch so a
         # parallel fan-out doesn't paint the same advisory N times.
         if is_last_in_batch:
-            with self._queued_lock:
-                queued_items = list(self._queued_messages.values())
-                self._queued_messages.clear()
-            for text, priority in queued_items:
-                # Drop empty/whitespace interjections (e.g. a bare "!!!" whose
-                # priority prefix ``parse_priority`` strips to "") — an empty
-                # operator turn would fold to an empty fence / paint a blank
-                # bubble.  Frame the rest as the user's words so the turn keeps
-                # user (not operator) authority, including on the native path
-                # where it enters as a real role=system message.
-                if not text.strip():
-                    continue
-                # ``framed`` (preamble + "User message: …") is the model-facing
-                # content — it keeps the user's authority framing on the wire.
-                # The structured meta carries the user's RAW words + priority so
-                # the FE renders a clean "queued message" bubble (the operator
-                # reads the message, not the model-directed preamble) with
-                # priority emphasis.  Both derive from ``(text, priority)``.
-                framed = render_user_interjection(text, priority)
-                specs.append(("user_interjection", framed, {"priority": priority, "message": text}))
+            # THE partitioned pop — not an inline copy of it: only the acting
+            # principal's (and unowned) rows become advisory specs; another
+            # participant's retained rows stay queued and produce NO spec —
+            # an advisory is a model-facing turn, and announcing another
+            # participant's pending text would leak their activity into this
+            # actor's transcript with no sender-scoped rendering on the
+            # model side.  Silence + retention is the correct exit.  Sharing
+            # the method keeps the security-relevant partition predicate and
+            # the ledger/window bookkeeping single-sourced.
+            popped = self._pop_queued_messages()
+            try:
+                for row in popped.values():
+                    text, priority = row[:2]
+                    # Drop empty/whitespace interjections (e.g. a bare "!!!"
+                    # whose priority prefix ``parse_priority`` strips to "")
+                    # — an empty operator turn would fold to an empty fence /
+                    # paint a blank bubble.  Frame the rest as the user's
+                    # words so the turn keeps user (not operator) authority,
+                    # including on the native path where it enters as a real
+                    # role=system message.
+                    if not text.strip():
+                        continue
+                    # ``framed`` (preamble + "User message: …") is the
+                    # model-facing content — it keeps the user's authority
+                    # framing on the wire.  The structured meta carries the
+                    # user's RAW words + priority so the FE renders a clean
+                    # "queued message" bubble (the operator reads the
+                    # message, not the model-directed preamble) with priority
+                    # emphasis.  Both derive from ``(text, priority)``.
+                    framed = render_user_interjection(text, priority)
+                    interjection_meta = {"priority": priority, "message": text}
+                    sender = _queued_row_owner(row)
+                    if sender:
+                        interjection_meta["sender"] = sender
+                    client_send_id = _queued_row_client_send_id(row)
+                    if client_send_id:
+                        interjection_meta["client_send_id"] = client_send_id
+                    specs.append(("user_interjection", framed, interjection_meta))
+            finally:
+                # The advisory lane has NO restore path — a raise between
+                # here and the caller's ``_append_system_turn`` loses the
+                # specs with the closure — so the window closes at this
+                # seam's exit: a longer window buys nothing and only lets
+                # retractions accumulate against ids nothing will restore.
+                self._close_pop_window(popped)
 
             # Metacognitive tool-channel drain.  Queued by
             # ``_queue_tool_advisory`` from the tool_error / repeat
@@ -16000,19 +18914,47 @@ class ChatSession:
         # queued for the user's next real send, where the approval
         # prompt has someone in front of it, and falls through to the
         # wake drain so this worker's exit keeps its convergence.
-        if not self._budget_exhausted:
+        # The gone latch takes the same rule for the same reason: the
+        # admission refusal surfaces as GenerationCancelled, which
+        # send()'s own cancel finalizer converges INTERNALLY (no
+        # re-raise), so neither except arm below would run and the
+        # popped rows would be destroyed with no restore, no log, no
+        # notice.  This delivery-site gate must be at least as strong as
+        # the claim gate that normally protects it — a nudge-driven wake
+        # reaches here without ever consulting the claim.
+        if not self._budget_exhausted and not self.is_workstream_gone():
+            # Partitioned pop: only the wake lane's effective principal's
+            # (and unowned) rows fold into the interjection send; another
+            # participant's retained rows stay queued for their owner and the
+            # wake falls through to the nudge drain below.
             popped = self._pop_queued_messages()
             interjection = self._render_queued_messages(popped)
+            client_send_ids = self._client_send_ids_from_queued(popped)
             if interjection:
-                dropped = self._nudge_queue.clear_channels({WAKE_CHANNEL})
-                log.info(
-                    "wake_nudge.interjection_owns_seam ws=%s dropped_wake_nudges=%d",
-                    self._ws_id[:8],
-                    dropped,
-                )
+                # ``appended_before`` first, then EVERYTHING that can raise
+                # inside the try: a raise out of ``clear_channels`` lands in
+                # the BaseException arm with nothing appended and restores —
+                # outside the try it would destroy the popped rows AND leak
+                # the open window.
                 appended_before = len(self.messages)
+                window_closed = False
                 try:
-                    self.send(interjection)
+                    dropped = self._nudge_queue.clear_channels({WAKE_CHANNEL})
+                    log.info(
+                        "wake_nudge.interjection_owns_seam ws=%s dropped_wake_nudges=%d",
+                        self._ws_id[:8],
+                        dropped,
+                    )
+                    # Queued items that predate browser correlation ids keep
+                    # the established plain ``send(text)`` handoff: some
+                    # embedded session adapters expose exactly that surface
+                    # and do not accept a redundant empty keyword.  Building
+                    # the keyword only when there is something to correlate
+                    # keeps that promise with one call shape.
+                    send_kwargs: dict[str, Any] = (
+                        {"client_send_ids": client_send_ids} if client_send_ids else {}
+                    )
+                    self.send(interjection, **send_kwargs)
                 except GenerationCancelled:
                     # Same containment as the wake send below: this
                     # method IS the wake worker's run() closure and
@@ -16048,18 +18990,33 @@ class ChatSession:
                     # items); a worker-exit re-check of the interjection
                     # queue would close that window structurally.
                     if len(self.messages) == appended_before:
+                        # The restore is this window's close — it removes
+                        # the in-flight markers for every id it considered,
+                        # atomically with its ledger consume.  The finally
+                        # below must then SKIP: a blanket close after the
+                        # restore could strip a marker a new window already
+                        # re-popped (the resurrection re-enabler).
                         self._restore_queued_messages(popped)
+                        window_closed = True
                     raise
+                finally:
+                    if not window_closed:
+                        # Success-commit, the deliberate no-restore cancel
+                        # arm, and appended-then-raised all end the window
+                        # without a restore.
+                        self._close_pop_window(popped)
                 return
             if popped:
                 # Everything queued was content-free (a bare priority
                 # marker) — nothing to dispatch, nothing worth a turn.
-                # Fall through to the normal wake drain below.
+                # Deliberate discard: close the window, then fall through
+                # to the normal wake drain below.
                 log.info(
                     "wake_nudge.interjection_empty ws=%s discarded=%d",
                     self._ws_id[:8],
                     len(popped),
                 )
+                self._close_pop_window(popped)
 
         # Two-pass drain: wake-eligible channels first.  ``"quiet"`` entries
         # (external events demoted by a user cancel) ride a wake earned by
@@ -22755,25 +25712,27 @@ class ChatSession:
             self._read_files.clear()
             self._repeat_detector.clear()
             self._last_usage = None
-            self._calibrated_msg_count = 0
+            self._invalidate_token_calibration_anchors()
             self._msg_tokens = []
+            self._activate_token_calibration(self._primary_lane())
             self.ui.on_info("Context cleared (messages preserved in database).")
 
         elif cmd == "/new":
             from turnstone.core.memory import register_workstream
 
-            # Flush any stranded queued text BEFORE the identity swap so it
-            # is persisted into the workstream it was ADDRESSED to.  Sends
-            # during the command window itself defer in the /send route
+            # Settle stranded queued text BEFORE the identity swap so it is
+            # persisted into the workstream it was ADDRESSED to (or discarded
+            # with a notice when it cannot land — gone latch / foreign owner).
+            # Sends during the command window itself defer in the /send route
             # (ws._pending_sends) and never queue; this covers only a
             # message stranded by a dying send worker's closing race
             # before this command started.
-            self._flush_queued_messages()
+            self._drain_queue_for_identity_swap()
             self.messages.clear()
             self._read_files.clear()
             self._repeat_detector.clear()
             self._last_usage = None
-            self._calibrated_msg_count = 0
+            self._invalidate_token_calibration_anchors()
             self._msg_tokens = []
             old_ws_id = self._ws_id
             self._ws_id = uuid.uuid4().hex
@@ -22790,6 +25749,7 @@ class ChatSession:
             self._sender_label_nonce = fence.mint_nonce()
             self._follow_watch_registration(old_ws_id)
             self._title_generated = False
+            self._activate_token_calibration(self._primary_lane())
             # The session keeps its persona across /new (the stamp is
             # re-written by _save_config below) — carry the display slug
             # onto the fresh row so projections agree with the config.
@@ -22831,10 +25791,10 @@ class ChatSession:
                 elif target_id == self._ws_id:
                     self.ui.on_info("Already in that workstream.")
                 else:
-                    # Same pre-swap flush as /new: stranded queued text is
-                    # persisted into the CURRENT workstream before resume()
-                    # swaps this session's identity to the target.
-                    self._flush_queued_messages()
+                    # Same pre-swap settlement as /new: stranded queued text
+                    # persists into the CURRENT workstream (or is discarded
+                    # with a notice) before resume() swaps identities.
+                    self._drain_queue_for_identity_swap()
                     try:
                         resumed: bool | None = self.resume(target_id)
                     except ValueError as exc:
@@ -22962,6 +25922,7 @@ class ChatSession:
                         else (cs.get("model.max_tokens") if cs else self.max_tokens)
                     )
                     self._init_system_messages()
+                    self._activate_token_calibration(self._primary_lane())
                     self._save_config()
                     self.ui.on_info(f"Switched to {cyan(arg)}: {self.model}")
                 elif construction_error is not None:
@@ -23070,12 +26031,26 @@ class ChatSession:
                     self.ui.on_info("\n".join(mcp_lines))
 
         elif cmd == "/retry":
-            user_msg = self.retry()
-            if user_msg is None:
-                self.ui.on_info("Nothing to retry.")
+            # retry() raises since the durable truncation became raising:
+            # GenerationCancelled (BaseException) on a refused admission
+            # (gone latch, racing close) and storage errors from the tail
+            # delete. The REPL dispatches commands uncaught, so convert to
+            # messages here instead of killing the process (round-4 review).
+            try:
+                user_msg = self.retry()
+            except GenerationCancelled:
+                self.ui.on_error(
+                    "Retry refused — the workstream is busy or no longer accepts history changes."
+                )
+            except Exception as exc:
+                log.warning("cli.retry_failed ws=%s", self._ws_id[:8], exc_info=True)
+                self.ui.on_error(f"Retry failed: {exc}")
             else:
-                self._pending_retry = user_msg
-                self.ui.on_info(f"Retrying: {user_msg[:80]}...")
+                if user_msg is None:
+                    self.ui.on_info("Nothing to retry.")
+                else:
+                    self._pending_retry = user_msg
+                    self.ui.on_info(f"Retrying: {user_msg[:80]}...")
 
         elif cmd == "/rewind":
             if not arg:
@@ -23091,14 +26066,25 @@ class ChatSession:
                     else:
                         turns_available = len(self._find_turn_boundaries())
                         actual_n = min(n, turns_available)
-                        removed = self.rewind(n)
-                        if removed == 0:
-                            self.ui.on_info("No turns to rewind.")
-                        else:
-                            self.ui.on_info(
-                                f"Rewound {actual_n} turn(s) ({removed} messages removed). "
-                                f"{len(self.messages)} messages remain."
+                        # Same raising contract as /retry above.
+                        try:
+                            removed = self.rewind(n)
+                        except GenerationCancelled:
+                            self.ui.on_error(
+                                "Rewind refused — the workstream is busy or "
+                                "no longer accepts history changes."
                             )
+                        except Exception as exc:
+                            log.warning("cli.rewind_failed ws=%s", self._ws_id[:8], exc_info=True)
+                            self.ui.on_error(f"Rewind failed: {exc}")
+                        else:
+                            if removed == 0:
+                                self.ui.on_info("No turns to rewind.")
+                            else:
+                                self.ui.on_info(
+                                    f"Rewound {actual_n} turn(s) ({removed} messages "
+                                    f"removed). {len(self.messages)} messages remain."
+                                )
 
         elif cmd == "/help":
             self.ui.on_info(

@@ -1225,6 +1225,30 @@ def test_interjection_handoff_dispatches_exactly_one_real_send(tmp_db):
     assert session._wake_source_tag == ""
 
 
+def test_interjection_handoff_forwards_nonempty_client_send_ids(tmp_db):
+    """Correlated queued rows retain every browser token in queue order."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    session.queue_message("first", client_send_id="browser-first")
+    session.queue_message("second", client_send_id="browser-second")
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def _recording_send(*args: Any, **kwargs: Any) -> None:
+        calls.append((args, kwargs))
+
+    session.send = _recording_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()
+
+    assert calls == [
+        (
+            ("first\n\nsecond",),
+            {"client_send_ids": ("browser-first", "browser-second")},
+        )
+    ]
+
+
 def test_interjection_handoff_contains_generation_cancelled(tmp_db):
     """A Stop landing inside the handed-off interjection send must not
     escape the wake worker: ``GenerationCancelled`` is a BaseException
@@ -1270,7 +1294,7 @@ def test_interjection_handoff_restores_the_queue_when_send_raises(tmp_db):
 
     # Restored verbatim: same id, same cleaned text, same priority.
     assert msg_id in session._queued_messages
-    text, priority = session._queued_messages[msg_id]
+    text, priority = session._queued_messages[msg_id][:2]
     assert text == "do not lose this"
     assert priority == "important"
 
@@ -1348,6 +1372,33 @@ def test_interjection_handoff_skips_the_pop_when_budget_exhausted(tmp_db):
     assert msg_id in session._queued_messages
     assert all(args != ("held message",) for args, _k in sends)
     assert any(a == ("",) for a, _k in sends)
+
+
+def test_interjection_handoff_skips_the_pop_on_a_gone_workstream(tmp_db):
+    """The delivery-site gate must be at least as strong as the claim gate:
+    a nudge-driven wake reaches this method without ever consulting
+    ``claim_pending_interjection_wake``, and under the gone latch send's
+    admission refusal is converged INTERNALLY (no re-raise), so a pop here
+    would destroy the user's words with no restore arm running.  No pop,
+    rows retained — their disposition on a deleted workstream is #1001's."""
+    from tests._helpers import make_chat_session
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
+    _c, _p, msg_id = session.queue_message("held message")
+    session._workstream_gone_ws = session._ws_id
+
+    sends: list[tuple[Any, ...]] = []
+
+    def _recording_send(*a: Any, **k: Any) -> None:
+        sends.append((a, k))
+
+    session.send = _recording_send  # type: ignore[method-assign]
+    session.deliver_wake_nudge_from_queue()
+
+    assert msg_id in session._queued_messages
+    assert session._popped_in_flight == set()
+    assert all(args != ("held message",) for args, _k in sends)
 
 
 def test_interjection_handoff_falls_through_on_content_free_items(tmp_db):

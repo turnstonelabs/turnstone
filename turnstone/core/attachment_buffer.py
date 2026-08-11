@@ -170,6 +170,47 @@ class AttachmentBuffer:
                 del self._blobs[handle]
             return True
 
+    def consume_all(
+        self,
+        handles: list[str] | tuple[str, ...],
+        *,
+        ws_id: str,
+        user_id: str,
+    ) -> frozenset[str]:
+        """Atomically transfer every present scoped reference to a send.
+
+        Returns the set of handles actually consumed. A handle no longer
+        staged for ``(ws_id, user_id)`` (TTL expiry, an earlier drain) is
+        simply absent from the result — the survivors are still consumed in
+        the same critical section, so no reference outlives the admission
+        that owns its bytes. Duplicate handles represent repeated ordered
+        message references, but consume the one staged ownership reference
+        only once. Blobs with no remaining scope are evicted.
+
+        The accepted conversation journal already owns immutable copies of
+        the bytes when this is called. Any staged owner surviving admission
+        would let a rapid omitted-id send attach the same upload again
+        before durable acknowledgement — including when a sibling handle
+        already expired, which is why this is per-handle, never
+        all-or-nothing.
+        """
+        unique_handles = tuple(dict.fromkeys(handles))
+        if not unique_handles:
+            return frozenset()
+        scope = (ws_id, user_id)
+        consumed: set[str] = set()
+        with self._lock:
+            self._evict_expired_locked()
+            for handle in unique_handles:
+                blob = self._blobs.get(handle)
+                if blob is None or scope not in blob.refs:
+                    continue
+                del blob.refs[scope]
+                if not blob.refs:
+                    del self._blobs[handle]
+                consumed.add(handle)
+        return frozenset(consumed)
+
     def clear(self) -> None:
         """Drop all pending uploads (every reference and blob).
 

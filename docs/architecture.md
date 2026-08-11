@@ -336,6 +336,36 @@ that fuel the SSE refresh-resume `in_progress_snapshot` event — see
 the per-workstream events stream in
 [`docs/api-reference.md`](api-reference.md#get-v1apiworkstreamsws_idevents).
 
+For web-backed sessions, every accepted live conversation row enters one
+ordered history handoff journal before durability. This includes user,
+assistant, tool, and system rows, compaction checkpoints, partial-assistant
+cancellation markers, and synthesized cancellation tool receipts. Admission
+shares the short handoff lock with the row's live UI transition or a
+`history_resync` repair event, so a row either changes the history token before
+listener registration or reaches the listener registered under the old token.
+Each journal entry has a stable per-workstream `commit_key`; the storage
+backends insert it idempotently, so an acknowledgement lost after commit can be
+resolved without duplicating the row. Attachment-bearing user and tool rows
+commit their conversation row, content-addressed blobs, reference counts, and
+ordered attachment list in one transaction.
+
+`/history` loads the durable prefix and overlays unacknowledged journal entries
+under a separate visibility lane. Its `messages` is the requested tail
+projection of one total accepted row prefix; an opaque token names that exact
+prefix. The initial SSE connection validates the token while registering its
+listener. A changed revision or session epoch emits `history_resync`, closes the
+stream, and requires another history read rather than assuming numeric
+event-ring coverage can reconstruct a complete row. A durable-history load
+failure returns 503 and supplies no usable token, so clients retain their
+current transcript and keep the repair latch closed.
+
+Storage acknowledgement removes the journal representation without advancing
+the accepted revision: durable and pending forms are the same logical row. An
+unresolved save fail-stops every later conversation-row suffix, remains visible
+through the live journal, and prevents soft close, idle eviction, or capacity
+eviction from discarding that recovery state. Soft close returns 409 and leaves
+the workstream loaded; hard delete remains the explicit discard boundary.
+
 `on_stream_discarded` removes a failed attempt's partial projection before a
 mid-stream retry. `on_system_turn` and `on_compaction` return the assigned SSE
 event ID when the frontend has one; persistence stamps the corresponding row
@@ -607,6 +637,10 @@ non-idle background workstreams above the input prompt.
   `_state_incarnation` and `StateWriter` prevent close/reopen ABA writes.
 - `ChatSession._generation_lock` fences one turn's live mutations;
   `_durability_cond` tickets its deferred storage batches in admission order.
+- `ChatSession._history_handoff_lock` owns the total accepted conversation-row
+  journal, revision, and initial listener registration. The separate
+  `_history_visibility_lock` linearizes a storage history load with keyed row
+  save/ack; neither is held across generation admission or model/tool work.
 - `SessionUIBase._ws_lock` protects concurrent approval cycles, verdict caches,
   and SSE projection state; approval admission uses a separate condition so
   Stop never waits on database I/O.
@@ -979,6 +1013,22 @@ Fallback is a lane change, so retry classification and result provenance come
 from the lane that actually served the call. A recursive compaction pins one
 lane for all leaf summaries and the merge; a hot reload never splices two model
 definitions into one summary transaction.
+
+Every accepted model turn carries an immutable provenance envelope captured
+from that successful serving attempt: model alias, backend model ID, registry
+generation, and the generation-pinned acting principal. It is stamped before
+the result leaves `model_turn()` and persisted in the assistant row's existing
+`meta` JSON, so a later fallback, hot reload, user rebind, or ambiguous storage
+acknowledgement cannot relabel the output at commit time. The principal-bearing
+envelope is internal audit metadata: ordinary history/SSE, coordinator
+inspection, exports, and provider lowering do not expose it.
+
+For browser-driven turns the principal is the authenticated initiator pinned to
+the generation. Headless session-backed turns (CLI, eval, scheduled, and
+internal work) stamp the effective owner credential principal they actually use;
+only a truly ownerless direct model call records an empty principal. This fourth
+axis remains private even where the three serving-kernel axes are logged for
+retry and completion diagnostics.
 
 **Model-backend authentication:** A model definition's `auth_mode` is one of
 `static`, `entra_obo`, `entra_app`, or `rfc8693_obo`. Dynamic modes keep only
@@ -1374,7 +1424,10 @@ conversations
   event_id      BIGINT               -- per-workstream SSE resume cursor
   is_error      BOOLEAN
   attachments   TEXT                 -- ordered content-addressed refs
-  meta          TEXT                 -- source, effect, preview side metadata
+  meta          TEXT                 -- source/effect/preview/model provenance
+  commit_key    TEXT                 -- nullable idempotent live-row identity
+
+  UNIQUE (ws_id, commit_key) WHERE commit_key IS NOT NULL
 
 workstream_config
   ws_id       TEXT NOT NULL          -- composite PK with key
@@ -1495,11 +1548,16 @@ startup) are invisible until a message is sent.
 at startup (CLI and server). It deliberately excludes internal `creating`
 reservations, which belong to the crash-recovery path above. It removes:
 
-- Published workstreams with no messages (orphaned registrations)
+- Unnamed workstreams with no messages (orphaned registrations) whose
+  `updated` timestamp is older than a two-hour grace — a just-created
+  workstream is a user mid-first-turn (its first rows may still be held in a
+  serving node's in-memory commit journal, invisible to other nodes), never
+  housekeeping debris
 - Unnamed workstreams (`alias IS NULL`) older than `retention_days` days (default 90)
 
-Named (aliased) workstreams are never age-pruned. Configure with
-`--retention-days N` (0 = disable age pruning).
+Named (aliased) workstreams are never pruned by either category. Configure
+with `--retention-days N` (0 = disable age pruning; the orphan sweep still
+runs, grace-gated).
 
 ---
 
@@ -1561,6 +1619,14 @@ warns if the summary was truncated.
 - **SSE reconnect**: both `connectContentSSE()` and `connectGlobalSSE()` use
   exponential backoff on `onerror` -- starting at 1 second, doubling on each
   failure, capped at 30 seconds. On successful message, delay resets to 1s.
+- **Conversation history handoff**: a pane renders REST `/history`, then opens
+  its initial per-workstream SSE with that response's cursor and one-shot
+  handoff token. The token is present exactly when the session is live on the
+  serving node; a rendered token-less 200 is the cold storage-only read and
+  downgrades the pane to the token-less bootstrap (the server converges it
+  via `clear_ui`). `history_resync` closes the transport and latches a fresh
+  history read; a 503 retains the stale-but-real transcript and cannot fall
+  through to a cursorless stream.
 - **Disconnection indicator**: `#status-bar.disconnected` class turns the
   status text red and shows "Reconnecting..."
 - **Fetch error handling**: all `fetch()` calls use `.catch()` to prevent

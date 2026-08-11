@@ -44,13 +44,21 @@ running --> error : Exception during\ntool execution
 
 error --> thinking : New send() call\n_emit_state("thinking")
 
-idle --> closed : close / eviction
-error --> closed : close
-thinking --> closed : close
-running --> closed : close
-attention --> closed : close
+idle --> closed : close / eviction\n[journal reconciled]
+error --> closed : close\n[journal reconciled]
+thinking --> closed : close\n[journal reconciled]
+running --> closed : close\n[journal reconciled]
+attention --> closed : close\n[journal reconciled]
 closed --> [*] : hard delete
 closed --> idle : open / rehydrate
+
+note right of closed
+  Before every soft-close / eviction transition,
+  the total accepted conversation-row journal must
+  be durably reconciled. An unresolved row makes an
+  explicit close return HTTP 409 (eviction refuses),
+  and the workstream remains loaded in its live state.
+end note
 
 thinking --> idle : cancel() called\nstream aborted\n_emit_state("idle")
 

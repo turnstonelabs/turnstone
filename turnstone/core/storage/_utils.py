@@ -6,17 +6,20 @@ import base64
 import json
 import re
 from collections import Counter
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
 from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
 from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
+    AttachmentWrite,
+    ConversationCommitConflictError,
     ForkCloneExpectation,
     ForkCloneSnapshot,
     ForkDestinationConflictError,
@@ -35,6 +38,7 @@ from turnstone.core.storage._schema import (
     workstreams,
 )
 from turnstone.core.trajectory import (
+    PROVENANCE_META_KEY,
     AttachmentRef,
     ContentBlock,
     ProviderNative,
@@ -43,8 +47,10 @@ from turnstone.core.trajectory import (
     ToolCall,
     Turn,
     TurnMeta,
+    TurnProvenance,
     dicts_from_turns,
     resolve_attachment_parts,
+    sanitize_client_send_ids,
     turn_to_dict,
 )
 
@@ -158,6 +164,303 @@ def prepare_provider_data_for_save(
     )
 
 
+def prepare_attachment_writes(
+    attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+) -> tuple[list[str], dict[str, AttachmentWrite]]:
+    """Validate an atomic write and retain one blob payload per distinct id.
+
+    The returned list preserves every reference (including duplicates).  The
+    mapping is only for inserting/validating the globally deduplicated blob.
+    Filenames are intentionally not part of duplicate compatibility: the blob
+    store historically keeps the filename of the first global reference, while
+    identity and rendering semantics are carried by content, MIME, and kind.
+    """
+    if not attachments:
+        raise ValueError("atomic attachment commit requires at least one attachment")
+
+    ordered_ids: list[str] = []
+    unique: dict[str, AttachmentWrite] = {}
+    for attachment in attachments:
+        if not attachment.attachment_id:
+            raise ValueError("attachment_id must be non-empty")
+        if not isinstance(attachment.content, bytes):
+            raise TypeError("attachment content must be bytes")
+        if attachment.size_bytes != len(attachment.content):
+            raise ValueError(
+                f"attachment {attachment.attachment_id!r} size does not match its content"
+            )
+        if not attachment.mime_type or not attachment.kind:
+            raise ValueError("attachment MIME type and kind must be non-empty")
+
+        prior = unique.get(attachment.attachment_id)
+        if prior is not None and (
+            prior.content != attachment.content
+            or prior.size_bytes != attachment.size_bytes
+            or prior.mime_type != attachment.mime_type
+            or prior.kind != attachment.kind
+        ):
+            raise ConversationCommitConflictError(
+                f"attachment {attachment.attachment_id!r} has conflicting blob payloads"
+            )
+        unique.setdefault(attachment.attachment_id, attachment)
+        ordered_ids.append(attachment.attachment_id)
+    return ordered_ids, unique
+
+
+# The immutable identity of a keyed conversation commit: every column the
+# conflict re-read projects and :func:`assert_conversation_commit_matches`
+# compares.  ``id`` rides along as the row the retry is acknowledged with;
+# ``timestamp`` is database-generated and deliberately absent.
+_COMMIT_IDENTITY_COLUMNS = (
+    conversations.c.id,
+    conversations.c.role,
+    conversations.c.content,
+    conversations.c.tool_name,
+    conversations.c.tool_call_id,
+    conversations.c.provider_data,
+    conversations.c.tool_calls,
+    conversations.c._source,
+    conversations.c.event_id,
+    conversations.c.is_error,
+    conversations.c.attachments,
+    conversations.c.meta,
+    conversations.c.commit_key,
+)
+
+
+def select_conversation_commit_row(conn: Any, ws_id: str, commit_key: str) -> Any:
+    """Re-read the row a keyed insert conflicted with, or ``None`` if it vanished.
+
+    Every keyed save path — plain and attachment-bearing, on both dialects —
+    reads the conflicting row through here, so the identity column list exists
+    once.  A vanished row is the caller's signal never to re-insert: a
+    concurrent hard delete may have removed it.
+    """
+    return conn.execute(
+        sa.select(*_COMMIT_IDENTITY_COLUMNS).where(
+            conversations.c.ws_id == ws_id,
+            conversations.c.commit_key == commit_key,
+        )
+    ).fetchone()
+
+
+def assert_conversation_commit_matches(
+    row: Any,
+    *,
+    role: str,
+    content: str | None,
+    tool_name: str | None,
+    tool_call_id: str | None,
+    source: str | None,
+    event_id: int | None,
+    is_error: bool,
+    meta: str | None,
+    commit_key: str,
+    provider_data: str | None = None,
+    tool_calls: str | None = None,
+    attachment_ids: list[str] | None = None,
+) -> int:
+    """Validate an existing row against one normalized keyed commit.
+
+    ``id`` and ``timestamp`` are database-generated and intentionally excluded.
+    A plain commit (``attachment_ids`` omitted) requires a NULL ``attachments``
+    column, because attachment-bearing USER/TOOL writes use the dedicated atomic
+    seams; those pass their ordered reference list, which is compared decoded so
+    a re-ordered retry conflicts while an equivalent encoding does not.
+
+    Every other column compares byte-identically on purpose: the durability
+    journal reads a mismatch as a permanent conflict, so normalization added
+    here would turn benign retries into spurious failures.
+    """
+    values = row._mapping
+    expected = {
+        "role": role,
+        "content": content,
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "provider_data": provider_data,
+        "tool_calls": tool_calls,
+        "_source": source,
+        "event_id": event_id,
+        "is_error": is_error,
+        **({} if attachment_ids is not None else {"attachments": None}),
+        "meta": meta,
+        "commit_key": commit_key,
+    }
+    mismatched = [
+        field
+        for field, expected_value in expected.items()
+        if values[field] != expected_value
+        and not (field == "is_error" and bool(values[field]) is expected_value)
+    ]
+    if (
+        attachment_ids is not None
+        and parse_attachment_refs(values["attachments"]) != attachment_ids
+    ):
+        mismatched.append("attachments")
+    if mismatched:
+        kind = "attachment" if attachment_ids is not None else "conversation"
+        raise ConversationCommitConflictError(
+            f"commit_key already identifies a different {kind} commit "
+            f"(mismatched fields: {', '.join(mismatched)})"
+        )
+    return int(values["id"])
+
+
+class KeyedAttachmentSaveWrappers:
+    """Public keyed attachment-save wrappers shared by both dialects.
+
+    Each dialect implements ``_save_message_with_attachments`` (its lock
+    prologue, insert constructor, and FTS hook differ); these wrappers own
+    only the role-shaped public signatures, so the storage API cannot drift
+    between backends.
+    """
+
+    def _save_message_with_attachments(self, *args: Any, **kwargs: Any) -> int:
+        raise NotImplementedError
+
+    def save_user_message_with_attachments(
+        self,
+        ws_id: str,
+        content: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        source: str | None = None,
+        event_id: int | None = None,
+        meta: str | None = None,
+        commit_key: str,
+    ) -> int:
+        """Commit a keyed USER row and all attachment ownership atomically."""
+        return self._save_message_with_attachments(
+            ws_id,
+            "user",
+            content,
+            attachments,
+            source=source,
+            event_id=event_id,
+            meta=meta,
+            commit_key=commit_key,
+            origin="upload",
+            exact_blob_metadata=False,
+        )
+
+    def save_tool_message_with_attachments(
+        self,
+        ws_id: str,
+        content: str,
+        tool_name: str,
+        tool_call_id: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        event_id: int | None = None,
+        is_error: bool = False,
+        meta: str | None = None,
+        commit_key: str,
+    ) -> int:
+        """Commit a keyed TOOL row and all attachment ownership atomically."""
+        return self._save_message_with_attachments(
+            ws_id,
+            "tool",
+            content,
+            attachments,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            event_id=event_id,
+            is_error=is_error,
+            meta=meta,
+            commit_key=commit_key,
+            origin="tool",
+            exact_blob_metadata=True,
+        )
+
+
+def resolve_keyed_commit_conflict(
+    conn: Any,
+    ws_id: str,
+    values: dict[str, Any],
+    *,
+    attachment_ids: list[str] | None = None,
+    vanished_message: str = "save_message: conflicting commit_key row vanished",
+) -> int:
+    """Recover a keyed insert whose ``ON CONFLICT DO NOTHING`` matched a row.
+
+    Re-selects by commit key and validates byte-identity, driven from the
+    SAME ``values`` dict the insert used — a column added to the commit
+    identity is threaded once, so every idempotent-retry validation (both
+    dialects' plain saves AND the shared attachment-commit body) compares
+    every field or none. A conflicting row that vanished must not be
+    silently re-created (that could resurrect a hard-deleted workstream):
+    raise instead.
+    """
+    commit_key = values["commit_key"]
+    row = select_conversation_commit_row(conn, ws_id, commit_key)
+    if row is None:
+        raise RuntimeError(vanished_message)
+    return assert_conversation_commit_matches(
+        row,
+        role=values["role"],
+        content=values["content"],
+        tool_name=values["tool_name"],
+        tool_call_id=values["tool_call_id"],
+        provider_data=values.get("provider_data"),
+        tool_calls=values.get("tool_calls"),
+        source=values["_source"],
+        event_id=values["event_id"],
+        is_error=values["is_error"],
+        meta=values["meta"],
+        commit_key=commit_key,
+        attachment_ids=attachment_ids,
+    )
+
+
+def assert_attachment_blobs_match(
+    conn: Any,
+    attachments: dict[str, AttachmentWrite],
+    *,
+    exact_metadata: bool = False,
+) -> None:
+    """Require every referenced CAS row to contain the requested bytes.
+
+    The USER path preserves the global store's historical first-writer MIME and
+    kind behavior. The TOOL path passes ``exact_metadata=True`` because its
+    replay contract requires bytes, length, MIME, and kind to match exactly.
+    Filename and origin remain first-writer metadata for both paths.
+    """
+    ids = list(attachments)
+    rows = conn.execute(
+        sa.select(
+            workstream_attachments.c.attachment_id,
+            workstream_attachments.c.mime_type,
+            workstream_attachments.c.size_bytes,
+            workstream_attachments.c.kind,
+            workstream_attachments.c.content,
+        ).where(workstream_attachments.c.attachment_id.in_(ids))
+    ).fetchall()
+    stored = {str(row._mapping["attachment_id"]): row._mapping for row in rows}
+    missing = set(ids) - set(stored)
+    if missing:
+        raise RuntimeError(f"atomic attachment insert lost blobs: {sorted(missing)!r}")
+
+    for attachment_id, requested in attachments.items():
+        row = stored[attachment_id]
+        raw_content = row["content"]
+        content = bytes(raw_content) if not isinstance(raw_content, bytes) else raw_content
+        if (
+            content != requested.content
+            or int(row["size_bytes"]) != requested.size_bytes
+            or (
+                exact_metadata
+                and (
+                    str(row["mime_type"]) != requested.mime_type
+                    or str(row["kind"]) != requested.kind
+                )
+            )
+        ):
+            raise ConversationCommitConflictError(
+                f"attachment {attachment_id!r} conflicts with its content-addressed blob"
+            )
+
+
 def retain_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
     """Increment existing blobs for a newly inserted batch of references.
 
@@ -227,6 +530,187 @@ def release_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
             )
         )
     )
+
+
+def prepare_attachment_commit(
+    ws_id: str,
+    role: str,
+    content: str,
+    attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+    *,
+    tool_name: str | None,
+    tool_call_id: str | None,
+    source: str | None,
+    event_id: int | None,
+    is_error: bool,
+    meta: str | None,
+    commit_key: str,
+    now: str,
+) -> tuple[list[str], dict[str, AttachmentWrite], dict[str, Any]]:
+    """Validate one keyed attachment commit and build its conversation row.
+
+    Pure by design: a malformed write is refused before either backend opens
+    its writer transaction, so an invalid payload never holds SQLite's
+    database-wide writer slot or a PostgreSQL parent row lock.  Returns the
+    ordered reference list, the deduplicated blob payloads, and the row values
+    both dialects insert.
+    """
+    if not commit_key:
+        raise ValueError("atomic attachment commit requires a commit_key")
+    attachment_ids, blobs = prepare_attachment_writes(attachments)
+    stored_content = sanitize_text(content)
+    if stored_content is None:  # ``content`` is typed str; defensive at the boundary.
+        raise TypeError("atomic attachment content must be text")
+    values = {
+        "ws_id": ws_id,
+        "timestamp": now,
+        "role": role,
+        "content": stored_content,
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "provider_data": None,
+        "tool_calls": None,
+        "_source": sanitize_text(source),
+        "event_id": event_id,
+        "is_error": is_error,
+        "attachments": json.dumps(attachment_ids),
+        "meta": meta,
+        "commit_key": commit_key,
+    }
+    return attachment_ids, blobs, values
+
+
+def prepare_conversation_row_values(
+    ws_id: str,
+    role: str,
+    content: str | None,
+    *,
+    tool_name: str | None,
+    tool_call_id: str | None,
+    provider_data: str | None,
+    tool_calls: str | None,
+    source: str | None,
+    event_id: int | None,
+    is_error: bool,
+    producer: str | None,
+    meta: str | None,
+    commit_key: str | None,
+    now: str,
+) -> dict[str, Any]:
+    """Build the ``save_message`` row values both dialects insert.
+
+    This dict IS the commit identity that ``resolve_keyed_commit_conflict``
+    re-reads and compares on an idempotent retry, so a column added to the
+    commit identity must thread through here exactly once and reach both
+    dialects' insert AND both rechecks together.  A per-dialect copy lets
+    one backend's retry validation compare a stale field set — every
+    legitimate retry false-conflicts (journal latched at "conflict"), or a
+    genuinely different commit is silently acknowledged — on one backend
+    only, invisible to single-backend tests.
+    """
+    if commit_key == "":
+        raise ValueError("conversation commit_key must be non-empty")
+    return {
+        "ws_id": ws_id,
+        "timestamp": now,
+        "role": role,
+        "content": sanitize_text(content),
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "provider_data": prepare_provider_data_for_save(
+            role, sanitize_text(provider_data), tool_calls, producer
+        ),
+        "tool_calls": tool_calls,
+        "_source": sanitize_text(source),
+        "event_id": event_id,
+        "is_error": is_error,
+        "meta": meta,
+        "commit_key": commit_key,
+    }
+
+
+def save_attachment_commit_transaction(
+    conn: Any,
+    dialect_insert: Callable[[Any], Any],
+    *,
+    values: dict[str, Any],
+    attachment_ids: list[str],
+    blobs: dict[str, AttachmentWrite],
+    now: str,
+    origin: str,
+    exact_blob_metadata: bool,
+    index_content: Callable[[int], None] | None = None,
+) -> int:
+    """Execute the backend-neutral body of a keyed USER/TOOL attachment commit.
+
+    The caller owns the connection, the transaction, and its dialect-specific
+    locking prologue: SQLite enters under ``BEGIN IMMEDIATE``, PostgreSQL under
+    the parent row's ``FOR UPDATE``, and both refuse a missing parent before
+    calling.  ``dialect_insert`` is that dialect's INSERT constructor —
+    ``ON CONFLICT DO NOTHING`` only exists on the dialect-specific construct.
+    ``index_content`` is SQLite's external-content FTS refresh, run where the
+    row id first exists; PostgreSQL passes nothing.
+    """
+    ws_id = values["ws_id"]
+    inserted = conn.execute(
+        dialect_insert(conversations)
+        .values(**values)
+        .on_conflict_do_nothing(
+            index_elements=[conversations.c.ws_id, conversations.c.commit_key],
+            index_where=conversations.c.commit_key.is_not(None),
+        )
+        .returning(conversations.c.id)
+    ).scalar_one_or_none()
+    if inserted is None:
+        row_id = resolve_keyed_commit_conflict(
+            conn,
+            ws_id,
+            values,
+            attachment_ids=attachment_ids,
+            vanished_message="atomic attachment commit conflict row vanished",
+        )
+        # A matching row is the transaction's durable witness.  Also reject
+        # latent CAS corruption instead of acknowledging a history row whose
+        # blob materialization will fail later.
+        assert_attachment_blobs_match(conn, blobs, exact_metadata=exact_blob_metadata)
+        return row_id
+
+    row_id = int(inserted)
+    written = set(
+        conn.execute(
+            dialect_insert(workstream_attachments)
+            .values(
+                [
+                    {
+                        "attachment_id": attachment.attachment_id,
+                        "filename": attachment.filename,
+                        "mime_type": attachment.mime_type,
+                        "size_bytes": attachment.size_bytes,
+                        "kind": attachment.kind,
+                        "content": attachment.content,
+                        "created": now,
+                        "refcount": 0,
+                        "origin": origin,
+                    }
+                    for attachment in blobs.values()
+                ]
+            )
+            .on_conflict_do_nothing(index_elements=["attachment_id"])
+            .returning(workstream_attachments.c.attachment_id)
+        ).scalars()
+    )
+    # Only ids this statement did NOT write can disagree with the request; the
+    # rest are the bytes we just supplied.  Re-reading those too would pull the
+    # whole upload back out of the database inside the write transaction,
+    # doubling its I/O and extending the parent row's lock hold.
+    conflicted = {aid: blob for aid, blob in blobs.items() if aid not in written}
+    if conflicted:
+        assert_attachment_blobs_match(conn, conflicted, exact_metadata=exact_blob_metadata)
+    retain_attachment_refs(conn, attachment_ids)
+    if index_content is not None:
+        index_content(row_id)
+    conn.execute(sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now))
+    return row_id
 
 
 def find_orphan_conversations(conn: Any) -> list[dict[str, Any]]:
@@ -488,6 +972,7 @@ def _reconstruct_attachment_refs(
         )
         meta.append(
             {
+                "attachment_id": str(att.get("attachment_id") or ""),
                 "kind": str(att.get("kind") or ""),
                 "filename": str(att.get("filename") or ""),
                 "mime_type": str(att.get("mime_type") or ""),
@@ -969,17 +1454,19 @@ def reconstruct_messages(
 ) -> list[dict[str, Any]]:
     """Reconstruct OpenAI message format from stored conversation rows.
 
-    Each *row* is an 8-to-11-tuple ``(id, role, content, tool_name,
+    Each *row* is an 8-to-13-tuple ``(id, role, content, tool_name,
     tool_call_id, provider_data, tool_calls_json, source [, event_id [, is_error
-    [, meta]]])``, ordered chronologically by row id.  ``source`` is rehydrated
+    [, meta [, attachments [, commit_key]]]]])``, ordered chronologically by
+    row id. ``source`` is rehydrated
     as the ``_source`` side channel.  (The legacy ``_reminders`` column that used
     to ride here was dropped in migration 060 — operator context lives in
     first-class ``system`` turns now.)  The trailing optional elements —
     ``event_id`` (migration 059, the per-ws SSE ``Last-Event-ID`` resume cursor →
     ``_event_id``), ``is_error`` (migration 060, the persisted tool-result error
     flag), and ``meta`` (migration 060, an operator-context turn's structured
-    ``_source_meta``) — are handled by the defensive unpack so shorter legacy
-    fixtures stay valid.
+    ``_source_meta``), raw attachment identities, and storage idempotency
+    identity are handled by the defensive unpack so shorter legacy fixtures
+    stay valid. The last two remain internal side channels.
 
     When ``attachments_by_msg`` is provided (keyed by row id, each value an
     ordered list of content-addressed attachment rows resolved from the
@@ -1015,7 +1502,23 @@ def reconstruct_messages(
     # counts) and the frontend renders its compaction card at the point in
     # the transcript where the compaction actually happened.
     if include_compaction:
-        rows = [(r[0], "system", *r[2:]) if _is_compaction_marker(r) else r for r in rows]
+        display_rows: list[Any] = []
+        for row in rows:
+            if not _is_compaction_marker(row):
+                display_rows.append(row)
+                continue
+            rewritten = list(row)
+            rewritten[1] = "system"
+            if len(rewritten) > 10:
+                marker_meta = _source_meta_from_json(rewritten[10])
+                if marker_meta is not None:
+                    # The internal checkpoint turn retains the acting
+                    # principal, but /history's display card is a public
+                    # projection and must not expose audit identity.
+                    marker_meta.pop(PROVENANCE_META_KEY, None)
+                    rewritten[10] = json.dumps(marker_meta) if marker_meta else None
+            display_rows.append(tuple(rewritten))
+        rows = display_rows
     else:
         rows = [r for r in rows if not _is_compaction_marker(r)]
     turns = reconstruct_turns(rows, ws_id, attachments_by_msg)
@@ -1094,13 +1597,13 @@ def _native_from_provider_data(
 
 
 def _source_meta_from_json(meta_json: str | None) -> dict[str, Any] | None:
-    """Decode the stored ``meta`` column into an operator-context meta dict.
+    """Decode the stored ``meta`` column into a conversation metadata object.
 
-    The persisted twin of ``Turn.meta.extra["source_meta"]`` — a first-class
-    ``system`` turn's structured per-kind fields (e.g. ``watch_triggered``'s
-    ``watch_name`` / ``command`` / poll counters).  A decode failure or a
-    non-object payload yields ``None`` (the meta is dropped — the human-readable
-    body still lives in ``content``).
+    Role-specific routing happens in :func:`reconstruct_turns`: system rows
+    carry ``source_meta``, tool rows carry effect/preview fields plus the
+    acting principal their turn executed under, user rows carry their sender,
+    and assistant rows carry the well-known provenance envelope.  A decode
+    failure or non-object payload yields ``None``.
     """
     if not meta_json:
         return None
@@ -1159,23 +1662,48 @@ def reconstruct_turns(
         raw_meta = _source_meta_from_json(row[10]) if len(row) > 10 else None
         if raw_meta is not None:
             # The ``meta`` column is role-exclusive: a TOOL row carries the
-            # typed ``{"effect_status": ..., "preview": ...}`` envelope (each
-            # key optional); a SYSTEM row carries operator-context
-            # ``source_meta``. Route so a tool's disposition doesn't land
-            # under source_meta (and vice versa). Legacy SYSTEM rows (bare
+            # typed ``{"effect_status": ..., "preview": ...,
+            # "acting_principal": ...}`` envelope (each key optional); a SYSTEM
+            # row carries operator-context ``source_meta``. Route so a tool's
+            # disposition doesn't land under source_meta (and vice versa) —
+            # ``source_meta`` IS a public projection, so an unrouted tool key
+            # would surface as display metadata. Legacy SYSTEM rows (bare
             # source_meta dict, no tool keys) fall through.
-            if role == "tool" and ("effect_status" in raw_meta or "preview" in raw_meta):
+            if role == "assistant":
+                assistant_meta = dict(raw_meta)
+                provenance = TurnProvenance.from_meta(assistant_meta.pop(PROVENANCE_META_KEY, None))
+                if provenance is not None:
+                    meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
+                # A compaction marker carries checkpoint metadata beside the
+                # producing model's provenance. Preserve both envelopes.
+                if assistant_meta:
+                    meta.extra["source_meta"] = assistant_meta
+            elif role == "tool" and (
+                "effect_status" in raw_meta
+                or "preview" in raw_meta
+                or "acting_principal" in raw_meta
+            ):
                 if "effect_status" in raw_meta:
                     meta.extra["effect_status"] = raw_meta["effect_status"]
                 if "preview" in raw_meta:
                     meta.extra["preview"] = raw_meta["preview"]
-            elif role == "user" and "sender" in raw_meta:
-                # Per-message sender identity (shared-workstream attribution).
-                # A USER row's meta blob carries only ``{"sender": ...}`` — route
-                # it to its own key so history replay re-attributes each turn to
-                # the human who sent it (source_meta rides SYSTEM turns, never
-                # user turns, so there is no collision).
-                meta.extra["sender"] = raw_meta["sender"]
+                # The principal whose turn executed this effect — an audit
+                # identity kept OFF the dict bridge (``turn_to_dict`` projects
+                # no key for it), so it cannot reach /history, export, SSE, or
+                # a provider payload. Fork reads it from here directly.
+                acting_principal = raw_meta.get("acting_principal")
+                if isinstance(acting_principal, str) and acting_principal:
+                    meta.extra["acting_principal"] = acting_principal
+            elif role == "user":
+                # User-row metadata is its own role-exclusive envelope. Sender
+                # attribution and browser send-correlation both survive reload
+                # and fork; absent keys remain compatible with historical rows.
+                sender = raw_meta.get("sender")
+                if isinstance(sender, str) and sender:
+                    meta.extra["sender"] = sender
+                stable_client_send_ids = sanitize_client_send_ids(raw_meta.get("client_send_ids"))
+                if stable_client_send_ids:
+                    meta.extra["client_send_ids"] = stable_client_send_ids
             else:
                 meta.extra["source_meta"] = raw_meta
         # Canonical storage loads retain the exact ordered ref-list captured
@@ -1190,6 +1718,8 @@ def reconstruct_turns(
             # cannot fall back to a workstream-wide ownership query and borrow
             # a blob referenced by some other row.
             meta.extra["storage_attachment_ids"] = parse_attachment_refs(row[11])
+        if len(row) > 12 and isinstance(row[12], str) and row[12]:
+            meta.commit_key = row[12]
         src = str(source) if source else None
 
         if role == "user":
@@ -1355,6 +1885,186 @@ def parse_checkpoint_watermark(meta_json: str | None) -> int | None:
 def _compaction_watermark(row: Any) -> int | None:
     """Read a marker row's checkpoint watermark from its ``meta`` column (row index 10)."""
     return parse_checkpoint_watermark(row[10] if len(row) > 10 else None)
+
+
+# A workstream registered moments ago is a user mid-first-turn, not debris —
+# its first rows may still be held in a serving node's in-memory pending
+# journal, which no other node's prune can see. The grace makes youth a
+# storage-visible proxy for "possibly live"; 2 h matches the deferred-create
+# reaper's STALE_CREATE_GRACE_SECONDS precedent (session_manager.py).
+ORPHAN_PRUNE_GRACE_SECONDS = 2 * 60 * 60
+
+
+def prune_workstreams_shared(
+    retention_days: int,
+    *,
+    select_ids: Callable[[tuple[Any, ...]], list[str]],
+    delete_candidate: Callable[[str, tuple[Any, ...]], bool],
+) -> tuple[int, int]:
+    """Orchestrate both prune categories; dialects supply only the hooks.
+
+    ``select_ids`` runs one lock-free discovery SELECT over a predicate
+    tuple; ``delete_candidate`` is the dialect's
+    ``_delete_prune_candidate`` (PostgreSQL: ``FOR UPDATE SKIP LOCKED`` +
+    separate-statement recheck; SQLite: ``BEGIN IMMEDIATE`` recheck).  The
+    same predicate tuple drives discovery AND recheck, so every conjunct
+    must be a pure SQLAlchemy expression with no per-call state.
+
+    Orphan category — zero conversation rows — carries two guards beyond
+    ``state != 'creating'``:
+
+    - ``alias IS NULL``: a named workstream is explicit user intent and is
+      never auto-pruned, mirroring the stale category.  (Consequence,
+      accepted: an aliased workstream with zero rows is excluded from both
+      categories and lives until explicitly deleted.)
+    - ``updated`` older than :data:`ORPHAN_PRUNE_GRACE_SECONDS`.
+
+    Both cutoffs are formatted ONCE at discovery and ride the tuple into the
+    recheck as literals.  That is the safe direction: eligibility can only
+    shrink between discovery and recheck (an ``updated`` bump makes the row
+    ineligible under either reading), whereas recomputing ``now`` at recheck
+    would admit rows discovery never saw.  Do not "freshen" the cutoff.
+
+    A candidate whose delete raises aborts the remaining run (the caller's
+    wrapper logs and reports ``(0, 0)``) — preserved from the pre-shared
+    bodies; per-candidate continuation would need its own design pass.
+    """
+    orphans = stale = 0
+    orphan_cutoff = (datetime.now(UTC) - timedelta(seconds=ORPHAN_PRUNE_GRACE_SECONDS)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    orphan_predicate = (
+        workstreams.c.state != "creating",
+        ~sa.exists(
+            sa.select(conversations.c.id).where(conversations.c.ws_id == workstreams.c.ws_id)
+        ),
+        workstreams.c.alias.is_(None),
+        workstreams.c.updated < orphan_cutoff,
+    )
+    for ws_id in select_ids(orphan_predicate):
+        if delete_candidate(ws_id, orphan_predicate):
+            orphans += 1
+
+    # 2. Remove old unnamed workstreams.  Discover after orphan deletion so
+    # the two categories retain their established disjoint accounting.
+    if retention_days > 0:
+        stale_cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        stale_predicate = (
+            workstreams.c.state != "creating",
+            workstreams.c.alias.is_(None),
+            workstreams.c.updated < stale_cutoff,
+        )
+        for ws_id in select_ids(stale_predicate):
+            if delete_candidate(ws_id, stale_predicate):
+                stale += 1
+    return (orphans, stale)
+
+
+def get_compaction_floor_on_connection(conn: Any, ws_id: str) -> int:
+    """Latest compaction floor inside the caller's transaction.
+
+    The count of rows with ``id <= the latest marker's id`` — the summarized
+    prefix plus the marker itself — or ``0`` when the workstream never
+    compacted.  Dialect-neutral; the caller owns the surrounding
+    transaction/lock discipline.
+    """
+    marker_id = conn.execute(
+        sa.select(sa.func.max(conversations.c.id)).where(
+            sa.and_(
+                conversations.c.ws_id == ws_id,
+                conversations.c._source == COMPACTION_SOURCE,
+            )
+        )
+    ).scalar()
+    if marker_id is None:
+        return 0
+    n = conn.execute(
+        sa.select(sa.func.count())
+        .select_from(conversations)
+        .where(
+            sa.and_(
+                conversations.c.ws_id == ws_id,
+                conversations.c.id <= marker_id,
+            )
+        )
+    ).scalar()
+    return int(n or 0)
+
+
+def truncate_messages_tail_core(
+    conn: Any,
+    ws_id: str,
+    remove_count: int,
+    *,
+    delete_after: Callable[[Any, str, int], int],
+) -> int:
+    """Count → floor → keep → delete body shared by both dialects.
+
+    The caller owns the transaction and has already taken its dialect's
+    parent lock (``SELECT … FOR UPDATE`` vs ``BEGIN IMMEDIATE``) and raised
+    on a missing parent, so a keyed commit cannot inflate ``total`` between
+    the count and the delete.  ``delete_after`` is the dialect's
+    ``_delete_messages_after_on_connection`` hook.
+    """
+    total = int(
+        conn.execute(
+            sa.select(sa.func.count())
+            .select_from(conversations)
+            .where(conversations.c.ws_id == ws_id)
+        ).scalar()
+        or 0
+    )
+    floor = get_compaction_floor_on_connection(conn, ws_id)
+    keep_count = max(floor, total - remove_count)
+    return delete_after(conn, ws_id, keep_count)
+
+
+def delete_messages_after_core(
+    conn: Any,
+    ws_id: str,
+    keep_count: int,
+    *,
+    pre_delete: Callable[[Any, str, Any], None] | None = None,
+) -> int:
+    """Cutoff → dialect pre-delete hook → DELETE..RETURNING → ref release.
+
+    Shared by both dialects; the caller owns the parent lock / writer
+    transaction. ``pre_delete(conn, ws_id, cutoff_id)`` is SQLite's FTS5
+    external-content cleanup slot. GC ownership derives from the DELETE's
+    RETURNING rows, never a prior SELECT, so a row inserted between the two
+    statements cannot be released without being deleted (PostgreSQL READ
+    COMMITTED takes a new snapshot per statement; SQLite >= 3.35 RETURNING
+    is already required by orphan purging).
+    """
+    cutoff_row = conn.execute(
+        sa.select(conversations.c.id)
+        .where(conversations.c.ws_id == ws_id)
+        .order_by(conversations.c.id)
+        .limit(1)
+        .offset(keep_count)
+    ).fetchone()
+    if cutoff_row is None:
+        return 0
+    cutoff_id = cutoff_row[0]
+    if pre_delete is not None:
+        pre_delete(conn, ws_id, cutoff_id)
+    deleted = conn.execute(
+        sa.delete(conversations)
+        .where(
+            sa.and_(
+                conversations.c.ws_id == ws_id,
+                conversations.c.id >= cutoff_id,
+            )
+        )
+        .returning(conversations.c.attachments)
+    ).fetchall()
+    doomed_ids: list[str] = []
+    for (refs,) in deleted:
+        doomed_ids.extend(parse_attachment_refs(refs))
+    release_attachment_refs(conn, doomed_ids)
+    return len(deleted)
 
 
 def reconstruct_turns_checkpointed(
@@ -1527,18 +2237,32 @@ def _fork_turn_insert_row(
         fork_preview = preview
 
     meta_envelope: dict[str, Any] = {}
-    if turn.role is Role.TOOL:
+    if turn.role is Role.ASSISTANT:
+        source_meta = turn.meta.extra.get("source_meta")
+        if isinstance(source_meta, dict) and source_meta:
+            meta_envelope.update(source_meta)
+        provenance = TurnProvenance.from_meta(turn.meta.extra.get(PROVENANCE_META_KEY))
+        if provenance is not None:
+            meta_envelope[PROVENANCE_META_KEY] = provenance.to_meta()
+    elif turn.role is Role.TOOL:
         if turn.effect_status is not None:
             meta_envelope["effect_status"] = turn.effect_status.value
         if fork_preview is not None:
             meta_envelope["preview"] = fork_preview
+        acting_principal = turn.meta.extra.get("acting_principal")
+        if isinstance(acting_principal, str) and acting_principal:
+            meta_envelope["acting_principal"] = acting_principal
     else:
         source_meta = turn.meta.extra.get("source_meta")
         sender = turn.meta.extra.get("sender")
         if isinstance(source_meta, dict) and source_meta:
             meta_envelope = source_meta
-        elif turn.role is Role.USER and isinstance(sender, str) and sender:
-            meta_envelope = {"sender": sender}
+        elif turn.role is Role.USER:
+            if isinstance(sender, str) and sender:
+                meta_envelope["sender"] = sender
+            client_send_ids = turn.meta.extra.get("client_send_ids")
+            if isinstance(client_send_ids, list) and client_send_ids:
+                meta_envelope["client_send_ids"] = list(client_send_ids)
     meta_json = json.dumps(meta_envelope) if meta_envelope else None
 
     source = msg.get("_source")

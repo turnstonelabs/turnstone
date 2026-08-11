@@ -30,6 +30,8 @@ export type {
   ClusterEvent,
   ConnectedEvent,
   HistoryEvent,
+  HistoryResyncEvent,
+  UserTurnEvent,
   ThinkingStartEvent,
   ThinkingStopEvent,
   ContentEvent,
@@ -71,10 +73,13 @@ export {
   isApproveRequestEvent,
   isApprovalResolvedEvent,
   isCancelledEvent,
+  isHistoryResyncEvent,
+  isUserTurnEvent,
 } from "./events.js";
 
 // Request/response types
 export type {
+  ConversationPersistenceState,
   SendRequest,
   SendResponse,
   ApproveRequest,
@@ -87,6 +92,8 @@ export type {
   CloseWorkstreamRequest,
   WorkstreamInfo,
   ListWorkstreamsResponse,
+  WorkstreamHistoryResponse,
+  StreamEventsOptions,
   DashboardWorkstream,
   DashboardAggregate,
   DashboardResponse,

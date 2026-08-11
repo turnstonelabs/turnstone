@@ -15,18 +15,14 @@ from pathlib import Path
 
 import pytest
 
+from tests._js_harness_helpers import strip_js_comments as _strip_comments
+
 _ROOT = Path(__file__).resolve().parent.parent
 _INTERACTIVE = _ROOT / "turnstone/shared_static/interactive.js"
 _COMPOSER = _ROOT / "turnstone/shared_static/composer.js"
 _AUTH = _ROOT / "turnstone/shared_static/auth.js"
 _APP = _ROOT / "turnstone/ui/static/app.js"
 _UI_INDEX = _ROOT / "turnstone/ui/static/index.html"
-
-
-def _strip_comments(js: str) -> str:
-    js = re.sub(r"/\*.*?\*/", "", js, flags=re.S)
-    js = re.sub(r"//[^\n]*", "", js)
-    return js
 
 
 def test_interactive_is_esm_imported_by_the_shell() -> None:
@@ -308,10 +304,12 @@ def test_rebuild_quiesces_live_events_and_releases_agent_tracking() -> None:
     # _loadHistoryThenConnect; terminal cleanup in the factory's destroy().
     assert "this._agentCards.delete(callId);" not in body
     disc = body.index("disconnectSSE() {")
-    disc_seg = body[disc : body.index("_loadHistoryThenConnect(wsId) {", disc)]
+    disc_seg = body[
+        disc : body.index("_loadHistoryThenConnect(wsId, manualAttempt = false) {", disc)
+    ]
     assert "this._clearAgentTracking();" not in disc_seg
     assert "this._replayQueue = null;" not in disc_seg
-    load = body.index("_loadHistoryThenConnect(wsId) {")
+    load = body.index("_loadHistoryThenConnect(wsId, manualAttempt = false) {")
     load_seg = body[load : body.index("async _refetchHistory(", load)]
     assert "this._clearAgentTracking();" in load_seg
     assert "this._replayQueue = null;" in load_seg
@@ -384,7 +382,7 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
     # again.  The gate must be seedless-SCOPED — _loadHistoryThenConnect
     # disconnects first, so its evtSource is null for its whole fetch and
     # gating it would break every first paint, ws switch and resync.
-    ref = body.index("async _refetchHistory(wsId, token, seedCursor = false) {")
+    ref = body.index("async _refetchHistory(")
     ref_seg = body[ref : body.index("\n  _beginReplayQuiesce(token) {", ref)]
     gate = ref_seg.index("const cursorSafe =")
     gate_seg = ref_seg[gate : ref_seg.index(";", gate)]
@@ -487,7 +485,7 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
     # survive a reload only when an armed truncation cursor lets the
     # reconnect resume into them; every other flavor (ws switch,
     # unarmed re-auth reload) resets.
-    lh = body.index("_loadHistoryThenConnect(wsId) {")
+    lh = body.index("_loadHistoryThenConnect(wsId, manualAttempt = false) {")
     lh_seg = body[lh : body.index("async _refetchHistory(", lh)]
     assert "if (this._truncatedFromCursor == null) this._resetStreamingRefs();" in lh_seg, (
         "reload must reset streaming refs unless a truncation resync is armed (#890)"
@@ -529,17 +527,29 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
         "the idle edge must backstop the latch behind the truncated branch, "
         "skipping edges with a quiesced fetch already in flight"
     )
-    # The backstop must be TRANSPORT-FREE: a quiesced same-token refetch,
-    # never _loadHistoryThenConnect — the reload's fresh reconnect draws
-    # the server's synthetic state_change:idle back into this branch's
-    # own trigger (the round-5 storm).
+    # The backstop must defer to the current event-backlog tail, then remain
+    # TRANSPORT-FREE: a quiesced same-token refetch, never
+    # _loadHistoryThenConnect.  A synchronous refetch here lets replay_ok's
+    # leading synthetic idle split the canonical backlog around a /history
+    # repaint; a transport reload draws another synthetic idle into this
+    # branch's own trigger (the round-5 storm).
     backstop = body.index("} else if (this._historyStale && !this._replayQueue) {")
-    backstop_seg = body[backstop : backstop + 2200]
-    assert "this._refetchHistory(this.wsId, staleToken);" in backstop_seg, (
-        "the staleness backstop must heal via a quiesced REST refetch"
+    backstop_seg = body[backstop : body.index("// Only steal focus", backstop)]
+    assert "this._deferStaleHistoryBackstop();" in backstop_seg, (
+        "the idle edge must defer its stale heal to the event-backlog tail"
     )
     assert "this._loadHistoryThenConnect(" not in backstop_seg, (
         "the staleness backstop must never touch the transport (#890 r5)"
+    )
+    deferred = body.index("_deferStaleHistoryBackstop() {")
+    deferred_seg = body[deferred : body.index("\n  _clearAgentTracking() {", deferred)]
+    assert "queueMicrotask(() => {" in deferred_seg
+    assert "this._beginReplayQuiesce(staleToken);" in deferred_seg
+    assert "this._refetchHistory(staleWs, staleToken);" in deferred_seg, (
+        "the deferred staleness backstop must heal via a quiesced REST refetch"
+    )
+    assert "this._loadHistoryThenConnect(" not in deferred_seg, (
+        "the deferred staleness backstop must remain transport-free (#890 r5)"
     )
     # The retry yields to an in-flight quiesce (no same-token stomp).
     retry = cl_seg.index("this._staleRetryTimer = setTimeout(")
@@ -668,21 +678,31 @@ def test_pane_gates_send_on_cross_user_busy() -> None:
     # ...and drives the composer's hard block, re-run on every busy edge.
     assert "this.composer.setSendBlocked(" in body
     stripped = _strip_comments(body)
+    # The shared stripper is offset-preserving (comments become spaces), so
+    # slice to the method's real closing brace instead of a fixed byte
+    # window a comment edit could silently outgrow.
     setbusy = stripped.index("setBusy(b, source) {")
-    assert "this._reconcileSendBlock();" in stripped[setbusy : setbusy + 800]
+    setbusy_end = stripped.index("\n  }", setbusy)
+    assert "this._reconcileSendBlock();" in stripped[setbusy:setbusy_end]
 
 
 def test_pane_handles_cross_user_409() -> None:
     """The reactive fallback: a 409 (button not yet disabled) surfaces a clean
-    message, not the generic 'Connection error' catch.  The pane converts
-    the 409 body at the fetch stage; the status ARM itself lives in the
-    shared settle helper (composer_queue.settleSendResponse) with the rest
-    of the response matrix."""
-    body = _INTERACTIVE.read_text(encoding="utf-8")
-    assert "r.status === 409" in body
-    assert 'status: "cross_user_interjection"' in body
+    message, not the generic 'Connection error' catch.  Both the fetch-stage
+    conversion and the status ARM now live in the shared helper
+    (composer_queue.postAndSettleSend / settleSendResponse), so the pane owns
+    only the request — every send flow it has reaches the conversion by
+    construction instead of re-deriving it (the edit-and-resend flow used to
+    lack it and reported a refused resend as a connection error)."""
     helper = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(encoding="utf-8")
+    assert "response.status === 409" in helper
+    assert 'status: "cross_user_interjection"' in helper
     assert 'status === "cross_user_interjection"' in helper
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert "cross_user_interjection" not in body, (
+        "the 409 conversion must not be re-derived per pane"
+    )
+    assert body.count("postAndSettleSend(") == 2, "composer send + edit-and-resend"
 
 
 def test_sync_approval_state_prunes_orphan_cycles() -> None:
@@ -860,7 +880,7 @@ def test_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
         r"this\._truncatedFromCursor = this\._lastEventId;",
         t,
     ), "the truncated case must record the truncation-time cursor keep-oldest"
-    load = body.index("_loadHistoryThenConnect(wsId) {")
+    load = body.index("_loadHistoryThenConnect(wsId, manualAttempt = false) {")
     load_seg = body[load : body.index("async _refetchHistory(", load)]
     assert "if (this.wsId !== wsId) this._truncatedFromCursor = null;" in load_seg, (
         "a ws switch must drop the old ws's truncation record"
@@ -1202,8 +1222,15 @@ def test_deferred_send_settle_protocol_pins() -> None:
     # consume the pane-tier settle event; the busy stamp is centralized in
     # each pane's setBusy (source defaults to "server" — only the send
     # flow's optimistic flip may ever be undone).
+    # postAndSettleSend wraps settleSendResponse with the fetch stage (rejected
+    # -body normalization, the 409 conversion, the accepted-guarded transport
+    # catch), so a pane reaching the settle matrix at all now proves it reached
+    # the whole choreography — the panes must not call settleSendResponse
+    # directly, which is how the edit-and-resend flows drifted.
+    assert "export function postAndSettleSend(queue, sendRequest, ctx)" in composer_queue
     for name, src in (("interactive.js", interactive), ("coordinator.js", coordinator)):
-        assert "settleSendResponse(" in src, f"{name}: settle matrix must be the shared helper"
+        assert "postAndSettleSend(" in src, f"{name}: settle matrix must be the shared helper"
+        assert "settleSendResponse(" not in src, f"{name}: must not bypass the fetch stage"
         assert "busyIsOptimistic" in src, name
         assert "paneIsBusy" in src, f"{name}: the missed-edge settle needs the live flag"
         assert 'setBusy(true, "optimistic")' in src, f"{name}: optimistic flip must stamp"
@@ -1303,3 +1330,19 @@ console.log("settle matrix OK");
         timeout=15,
     )
     assert proc.returncode == 0, f"settle harness failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+def test_accepted_tool_event_recorded_only_when_painted() -> None:
+    """An unpainted accepted tool_result must stay replayable.
+
+    appendToolOutput returns false on every no-target path (transcript wiped
+    by clear_ui with the refetch in flight, a fresh mid-turn join); recording
+    the event id anyway would dedupe the ring's later replay and permanently
+    lose the tool's final guarded output.
+    """
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    case_start = body.index('case "tool_result"')
+    case = body[case_start : body.index("case ", case_start + 20)]
+    gate = case.index("if (\n          this.appendToolOutput(")
+    record = case.index("recordAcceptedToolEvent(this._renderedToolEventIds, evt)")
+    assert gate < record

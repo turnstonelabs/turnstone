@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from turnstone.core.memory import register_workstream
 from turnstone.core.session import ChatSession
 from turnstone.core.trajectory import turn_to_dict, turns_from_dicts
 
@@ -78,7 +79,7 @@ class NullUI:
 
 
 def _make_session(tmp_db, ws_id: str | None = None) -> ChatSession:
-    return ChatSession(
+    session = ChatSession(
         client=MagicMock(),
         model="test-model",
         ui=NullUI(),
@@ -88,6 +89,10 @@ def _make_session(tmp_db, ws_id: str | None = None) -> ChatSession:
         tool_timeout=30,
         ws_id=ws_id,
     )
+    # Production creates the durable parent before exposing a live session.
+    # Strict tail truncation shares that parent boundary with keyed commits.
+    register_workstream(session.ws_id, user_id="test-user")
+    return session
 
 
 def _populate_simple(session: ChatSession) -> None:
@@ -325,6 +330,35 @@ class TestHandleCommand:
         ui.on_info.assert_called_once()
         assert "Nothing" in ui.on_info.call_args[0][0]
 
+    def test_rewind_refusal_reports_instead_of_killing_the_repl(self, tmp_db):
+        """Round-4 review pin: rewind()'s raising contract (GenerationCancelled
+        on a refused admission, e.g. the workstream-gone latch) converts to an
+        on_error message in the CLI arm — the REPL dispatches commands
+        uncaught, so a raise here previously killed the whole process."""
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        ui = session.ui
+        ui.on_error = MagicMock()
+        session._workstream_gone_ws = session._ws_id
+        session.handle_command("/rewind 1")
+        ui.on_error.assert_called_once()
+        assert "refused" in ui.on_error.call_args[0][0].lower()
+
+    def test_retry_storage_failure_reports_instead_of_killing_the_repl(self, tmp_db):
+        """Round-4 review pin: a storage error escaping retry() (the durable
+        truncation batch is raising now) becomes an on_error message, never an
+        uncaught REPL death."""
+        from unittest.mock import patch
+
+        session = _make_session(tmp_db)
+        _populate_simple(session)
+        ui = session.ui
+        ui.on_error = MagicMock()
+        with patch.object(session, "retry", side_effect=RuntimeError("database is locked")):
+            session.handle_command("/retry")
+        ui.on_error.assert_called_once()
+        assert "Retry failed" in ui.on_error.call_args[0][0]
+
 
 # ---------------------------------------------------------------------------
 # Storage integration — delete_messages_after
@@ -467,13 +501,13 @@ def test_truncation_bumps_history_generation(tmp_db) -> None:
         "a storage-deleting retry must bump the history generation"
     )
 
-    # Error-path arm: an in-memory-only session (no persisted rows — the
-    # count<=0 early return skips the delete) must NOT bump.
+    # A registered workstream with no durable rows is still a successful
+    # atomic cut of the live trajectory, so its handoff revision advances.
     bare = _make_session(tmp_db)
     _populate_simple(bare)
     g2 = bare._history_generation
     assert bare.rewind(1) > 0
-    assert bare._history_generation == g2, (
-        "a truncation that could not delete storage rows must leave the "
-        "generation unbumped (fail-safe direction)"
+    assert bare._history_generation == g2 + 1, (
+        "a successful live truncation must invalidate history even when the "
+        "durable tail is already empty"
     )

@@ -18,11 +18,14 @@ if TYPE_CHECKING:
     from turnstone.core.trajectory import Turn
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
 from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     USER_SCOPED_AUTH_TYPES,
+    AttachmentWrite,
+    ConversationCommitWorkstreamGoneError,
     ForkCloneExpectation,
     ForkCloneSnapshot,
     MCPOAuthPendingState,
@@ -137,6 +140,9 @@ from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    KeyedAttachmentSaveWrappers as _KeyedAttachmentSaveWrappers,
+)
+from turnstone.core.storage._utils import (
     assert_single_default_persona as _assert_single_default_persona,
 )
 from turnstone.core.storage._utils import (
@@ -146,15 +152,24 @@ from turnstone.core.storage._utils import (
     clone_workstream_transaction,
     find_orphan_conversations,
     parse_checkpoint_watermark,
+    prepare_attachment_commit,
+    prepare_conversation_row_values,
     prepare_provider_data_for_save,
     purge_orphan_conversations,
     release_attachment_refs,
     retain_attachment_refs,
     sanitize_text,
+    save_attachment_commit_transaction,
     senders_from_user_meta,
 )
 from turnstone.core.storage._utils import (
+    delete_messages_after_core as _delete_messages_after_core,
+)
+from turnstone.core.storage._utils import (
     escape_like as _escape_like,
+)
+from turnstone.core.storage._utils import (
+    get_compaction_floor_on_connection as _get_compaction_floor_shared,
 )
 from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
@@ -166,6 +181,9 @@ from turnstone.core.storage._utils import (
     persona_row_to_dict as _persona_row_to_dict,
 )
 from turnstone.core.storage._utils import (
+    prune_workstreams_shared as _prune_workstreams_shared,
+)
+from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
 )
 from turnstone.core.storage._utils import (
@@ -173,6 +191,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     recover_trajectory as _recover_trajectory,
+)
+from turnstone.core.storage._utils import (
+    resolve_keyed_commit_conflict as _resolve_keyed_commit_conflict,
 )
 from turnstone.core.storage._utils import (
     row_to_dict as _row_to_dict,
@@ -185,6 +206,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     split_perms as _split_perms,
+)
+from turnstone.core.storage._utils import (
+    truncate_messages_tail_core as _truncate_messages_tail_core,
 )
 from turnstone.core.storage._utils import (
     validate_and_clear_default_persona as _validate_and_clear_default_persona,
@@ -289,7 +313,7 @@ class _PostgreSQLNotifyStream:
             conn.close()
 
 
-class PostgreSQLBackend:
+class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
     """PostgreSQL implementation of the StorageBackend protocol."""
 
     def __init__(
@@ -365,38 +389,142 @@ class PostgreSQLBackend:
         is_error: bool = False,
         producer: str | None = None,
         meta: str | None = None,
+        commit_key: str | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        content = sanitize_text(content)
-        provider_data = prepare_provider_data_for_save(
-            role, sanitize_text(provider_data), tool_calls, producer
+        values = prepare_conversation_row_values(
+            ws_id,
+            role,
+            content,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            provider_data=provider_data,
+            tool_calls=tool_calls,
+            source=source,
+            event_id=event_id,
+            is_error=is_error,
+            producer=producer,
+            meta=meta,
+            commit_key=commit_key,
+            now=now,
         )
-        source = sanitize_text(source)
         with self._conn() as conn:
-            result = conn.execute(
-                sa.insert(conversations)
-                .values(
-                    ws_id=ws_id,
-                    timestamp=now,
-                    role=role,
-                    content=content,
-                    tool_name=tool_name,
-                    tool_call_id=tool_call_id,
-                    provider_data=provider_data,
-                    tool_calls=tool_calls,
-                    _source=source,
-                    event_id=event_id,
-                    is_error=is_error,
-                    meta=meta,
+            inserted = True
+            parent_observed = None
+            if commit_key is None:
+                # A non-locking MVCC observation distinguishes a call that
+                # genuinely began parentless from one that arrived while prune
+                # held (and would shortly delete) an existing parent. At READ
+                # COMMITTED an uncommitted delete remains visible here.
+                parent_observed = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
+                ).fetchone()
+            # Hard delete and every conditional delete lock this durable row
+            # before scanning/deleting conversations. Every writer takes the
+            # same parent-first order when the row exists. This closes the
+            # PostgreSQL READ COMMITTED anomaly where prune's earlier
+            # NOT EXISTS snapshot could delete the parent while an unlocked
+            # NULL-key insert became visible only afterwards.
+            #
+            # A call that genuinely begins without a parent remains a
+            # deliberate legacy/offline seam for NULL keys. A call that saw a
+            # parent but wakes after prune deleted it is refused below rather
+            # than reclassified as a parentless import. Keyed live admission
+            # always refuses a missing parent.
+            parent = conn.execute(
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
+            ).fetchone()
+            if commit_key is None and parent_observed is not None and parent is None:
+                raise RuntimeError("legacy conversation append crossed workstream deletion")
+            if parent is None and commit_key is not None:
+                raise ConversationCommitWorkstreamGoneError(
+                    "keyed conversation commit workstream no longer exists"
                 )
-                .returning(conversations.c.id)
-            )
-            rowid = int(result.scalar_one())
-            conn.execute(
-                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
-            )
+            statement = postgresql_insert(conversations).values(**values)
+            if commit_key is not None:
+                statement = statement.on_conflict_do_nothing(
+                    index_elements=[conversations.c.ws_id, conversations.c.commit_key],
+                    index_where=conversations.c.commit_key.is_not(None),
+                )
+            result = conn.execute(statement.returning(conversations.c.id))
+            resolved = result.scalar_one_or_none()
+            if resolved is None:
+                if commit_key is None:
+                    raise RuntimeError("save_message: row id missing after insert")
+                inserted = False
+                rowid = _resolve_keyed_commit_conflict(conn, ws_id, values)
+            else:
+                rowid = int(resolved)
+            if inserted:
+                conn.execute(
+                    sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
+                )
             conn.commit()
             return rowid
+
+    def _save_message_with_attachments(
+        self,
+        ws_id: str,
+        role: str,
+        content: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        source: str | None = None,
+        event_id: int | None = None,
+        is_error: bool = False,
+        meta: str | None = None,
+        commit_key: str,
+        origin: str,
+        exact_blob_metadata: bool,
+    ) -> int:
+        """Dialect-local transaction shared by keyed USER and TOOL rows."""
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        attachment_ids, blobs, values = prepare_attachment_commit(
+            ws_id,
+            role,
+            content,
+            attachments,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            source=source,
+            event_id=event_id,
+            is_error=is_error,
+            meta=meta,
+            commit_key=commit_key,
+            now=now,
+        )
+        with self._conn() as conn:
+            try:
+                # Match hard-delete's durable-row-first lock order so no
+                # attachment-bearing insert can commit behind deletion.  Holding
+                # it for the shared body below makes the parent check and every
+                # row/blob/refcount mutation one indivisible transaction.
+                parent = conn.execute(
+                    sa.select(workstreams.c.ws_id)
+                    .where(workstreams.c.ws_id == ws_id)
+                    .with_for_update()
+                ).fetchone()
+                if parent is None:
+                    raise ConversationCommitWorkstreamGoneError(
+                        "keyed conversation commit workstream no longer exists"
+                    )
+                row_id = save_attachment_commit_transaction(
+                    conn,
+                    postgresql_insert,
+                    values=values,
+                    attachment_ids=attachment_ids,
+                    blobs=blobs,
+                    now=now,
+                    origin=origin,
+                    exact_blob_metadata=exact_blob_metadata,
+                )
+                conn.commit()
+                return row_id
+            except Exception:
+                conn.rollback()
+                raise
 
     def list_message_senders(self, ws_id: str) -> list[str]:
         # DISTINCT on the raw meta blob: a user row's meta carries only
@@ -452,21 +580,58 @@ class PostgreSQLBackend:
                 }
             )
         with self._conn() as conn:
+            self._lock_parents_refusing_crossed_deletion(conn, ws_ids)
             retain_attachment_refs(conn, attachment_ids)
             conn.execute(sa.insert(conversations), insert_rows)
-            for wid in ws_ids:
-                conn.execute(
-                    sa.update(workstreams).where(workstreams.c.ws_id == wid).values(updated=now)
-                )
+            conn.execute(
+                sa.update(workstreams)
+                .where(workstreams.c.ws_id.in_(sorted(ws_ids)))
+                .values(updated=now)
+            )
             conn.commit()
+
+    def _lock_parents_refusing_crossed_deletion(
+        self,
+        conn: sa.engine.Connection,
+        ws_ids: set[str],
+    ) -> None:
+        """Batched READ COMMITTED anomaly gate for the bulk import path.
+
+        The set-shaped twin of ``save_message``'s single-row
+        observed→lock→refuse sequence (its NULL-commit-key arm) — keep the
+        two semantically in lockstep. Matches prune/delete's parent-first
+        order; the ``ORDER BY ws_id`` on the locking read preserves the
+        sorted lock order that keeps concurrent bulk writers from
+        deadlocking one another. Missing parents retain the historical
+        import behavior and do not abort the batch; a parent OBSERVED but
+        not lockable crossed a concurrent deletion and refuses.
+        """
+        ordered = sorted(ws_ids)
+        observed = {
+            row[0]
+            for row in conn.execute(
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id.in_(ordered))
+            ).fetchall()
+        }
+        locked = {
+            row[0]
+            for row in conn.execute(
+                sa.select(workstreams.c.ws_id)
+                .where(workstreams.c.ws_id.in_(ordered))
+                .order_by(workstreams.c.ws_id)
+                .with_for_update()
+            ).fetchall()
+        }
+        if observed - locked:
+            raise RuntimeError("legacy conversation append crossed workstream deletion")
 
     def _conversation_rows(
         self, ws_id: str, limit: int | None
     ) -> tuple[list[tuple[Any, ...]], dict[int, list[dict[str, Any]]] | None]:
         """Fetch a ws's conversation rows + resolved attachment map (shared by
-        :meth:`load_messages` and :meth:`load_message_turns`).  The trailing
-        ``attachments`` ref-list column is split off and is NOT part of the
-        positional tuple ``reconstruct_*`` unpacks (id..meta)."""
+        :meth:`load_messages` and :meth:`load_message_turns`). The trailing
+        ``attachments`` ref-list and ``commit_key`` columns stay internal to
+        reconstruction."""
         _cols = (
             conversations.c.id,
             conversations.c.role,
@@ -480,6 +645,7 @@ class PostgreSQLBackend:
             conversations.c.is_error,
             conversations.c.meta,
             conversations.c.attachments,
+            conversations.c.commit_key,
         )
         with self._conn() as conn:
             if limit is not None and limit > 0:
@@ -650,27 +816,7 @@ class PostgreSQLBackend:
         twin).  ``0`` when the ws never compacted.
         """
         with self._conn() as conn:
-            marker_id = conn.execute(
-                sa.select(sa.func.max(conversations.c.id)).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c._source == _COMPACTION_SOURCE,
-                    )
-                )
-            ).scalar()
-            if marker_id is None:
-                return 0
-            n = conn.execute(
-                sa.select(sa.func.count())
-                .select_from(conversations)
-                .where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.id <= marker_id,
-                    )
-                )
-            ).scalar()
-        return int(n or 0)
+            return _get_compaction_floor_shared(conn, ws_id)
 
     def get_compaction_checkpoint(self, ws_id: str) -> int | None:
         """Latest persisted marker's watermark — see the protocol docstring.
@@ -689,45 +835,65 @@ class PostgreSQLBackend:
             ).fetchone()
         return parse_checkpoint_watermark(row[0]) if row is not None else None
 
+    def _delete_messages_after_on_connection(
+        self,
+        conn: sa.engine.Connection,
+        ws_id: str,
+        keep_count: int,
+    ) -> int:
+        """Delete one conversation tail; caller owns the parent lock."""
+        return _delete_messages_after_core(conn, ws_id, keep_count)
+
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
         with self._conn() as conn:
-            cutoff_row = conn.execute(
-                sa.select(conversations.c.id)
-                .where(conversations.c.ws_id == ws_id)
-                .order_by(conversations.c.id)
-                .limit(1)
-                .offset(keep_count)
+            # Keyed commits, hard delete, and prune all lock the durable parent
+            # before touching conversation rows. Take the same lock for a tail
+            # truncation. A missing legacy parent has no row to lock; continue
+            # for orphan-truncation compatibility. Fencing same-id recreation
+            # across that gap requires a separate incarnation boundary.
+            conn.execute(
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
             ).fetchone()
-            if cutoff_row is None:
-                return 0
-            cutoff_id = cutoff_row[0]
-            # Refcount GC: read the doomed rows' content-addressed ref-lists,
-            # decrement each blob's refcount once per reference, and prune
-            # blobs that hit 0 — so a deduped blob still referenced by a kept
-            # turn survives.  Replaces the old message_id-cascade delete.
-            doomed = conn.execute(
-                sa.select(conversations.c.attachments).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.id >= cutoff_id,
-                        conversations.c.attachments.is_not(None),
-                    )
-                )
-            ).fetchall()
-            doomed_ids: list[str] = []
-            for (refs,) in doomed:
-                doomed_ids.extend(_parse_attachment_refs(refs))
-            release_attachment_refs(conn, doomed_ids)
-            result = conn.execute(
-                sa.delete(conversations).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.id >= cutoff_id,
-                    )
-                )
-            )
+            deleted = self._delete_messages_after_on_connection(conn, ws_id, keep_count)
             conn.commit()
-            return result.rowcount
+            return deleted
+
+    def truncate_messages_tail(self, ws_id: str, remove_count: int) -> int:
+        """Atomically remove a compaction-floored number of newest rows."""
+        if remove_count < 0:
+            raise ValueError("remove_count must be non-negative")
+        with self._conn() as conn:
+            try:
+                # A truncation runs on a non-abandonable worker slot: operator
+                # force-cancel deliberately refuses to supersede it, so an
+                # unbounded FOR UPDATE wait here would pin the workstream until
+                # node restart. Bound the wait; timing out surfaces as an
+                # ordinary persist failure the rewind route reports as
+                # retryable while the slot is released.
+                conn.execute(sa.text("SET LOCAL lock_timeout = '10s'"))
+                # Every keyed conversation commit takes this row lock first.
+                # Hold it across both count queries and the exact tail delete so
+                # another process cannot turn ``remove_count`` into an
+                # over-delete by committing in between them.
+                parent = conn.execute(
+                    sa.select(workstreams.c.ws_id)
+                    .where(workstreams.c.ws_id == ws_id)
+                    .with_for_update()
+                ).fetchone()
+                if parent is None:
+                    raise RuntimeError("tail truncation workstream no longer exists")
+
+                deleted = _truncate_messages_tail_core(
+                    conn,
+                    ws_id,
+                    remove_count,
+                    delete_after=self._delete_messages_after_on_connection,
+                )
+                conn.commit()
+                return deleted
+            except Exception:
+                conn.rollback()
+                raise
 
     # -- Workstream management -------------------------------------------------
 
@@ -788,61 +954,73 @@ class PostgreSQLBackend:
                 ).fetchall()
             )
 
-    def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
-        orphans = stale = 0
+    def _delete_prune_candidate(
+        self,
+        ws_id: str,
+        predicates: tuple[Any, ...],
+    ) -> bool:
+        """Recheck and delete one prune candidate in its own transaction.
+
+        Candidate admission takes the same durable-row-first lock as all
+        conversation writers and hard deletion.  ``SKIP LOCKED`` leaves a
+        workstream a writer already owns to the next prune; a writer that
+        arrives after admission waits for this transaction instead: keyed
+        admission then fails closed, and a NULL-key writer that observed the
+        pre-delete parent also refuses rather than becoming an invisible
+        orphan.
+
+        The exact predicate is rechecked as a second statement so it reads a
+        fresh READ COMMITTED snapshot rather than the lock statement's — a
+        commit that landed while this transaction waited for the row is
+        therefore visible, and its workstream is no longer a candidate.  One
+        transaction per candidate keeps that lock and the per-workstream
+        attachment GC off every unrelated keyed commit for the rest of the run.
+        """
         with self._conn() as conn:
-            # 1. Remove workstreams with no messages
-            orphan_rows = conn.execute(
-                sa.text(
-                    "SELECT ws_id FROM workstreams "
-                    "WHERE state != 'creating' AND NOT EXISTS "
-                    "  (SELECT 1 FROM conversations c "
-                    "   WHERE c.ws_id = workstreams.ws_id)"
-                )
-            ).fetchall()
-            orphan_ids = [r[0] for r in orphan_rows]
-            if orphan_ids:
-                chunk_size = 10_000
-                for i in range(0, len(orphan_ids), chunk_size):
-                    chunk = orphan_ids[i : i + chunk_size]
+            try:
+                locked = conn.execute(
+                    sa.select(workstreams.c.ws_id)
+                    .where(workstreams.c.ws_id == ws_id)
+                    .with_for_update(skip_locked=True)
+                ).fetchone()
+                exact = (
                     conn.execute(
-                        sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(chunk))
-                    )
-                    result = conn.execute(
-                        sa.delete(workstreams).where(workstreams.c.ws_id.in_(chunk))
-                    )
-                    orphans += result.rowcount
-
-            # 2. Remove old unnamed workstreams
-            if retention_days > 0:
-                cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime(
-                    "%Y-%m-%dT%H:%M:%S"
+                        sa.select(workstreams.c.ws_id).where(
+                            workstreams.c.ws_id == ws_id,
+                            *predicates,
+                        )
+                    ).fetchone()
+                    if locked is not None
+                    else None
                 )
-                stale_rows = conn.execute(
-                    sa.select(workstreams.c.ws_id).where(
-                        workstreams.c.state != "creating",
-                        workstreams.c.alias.is_(None),
-                        workstreams.c.updated < cutoff,
-                    )
-                ).fetchall()
-                stale_ids = [r[0] for r in stale_rows]
-                if stale_ids:
-                    chunk_size = 10_000
-                    for i in range(0, len(stale_ids), chunk_size):
-                        chunk = stale_ids[i : i + chunk_size]
-                        conn.execute(
-                            sa.delete(conversations).where(conversations.c.ws_id.in_(chunk))
-                        )
-                        conn.execute(
-                            sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(chunk))
-                        )
-                        result = conn.execute(
-                            sa.delete(workstreams).where(workstreams.c.ws_id.in_(chunk))
-                        )
-                        stale += result.rowcount
+                deleted = bool(
+                    exact is not None and self._delete_workstream_on_connection(conn, ws_id)
+                )
+                conn.commit()
+                return deleted
+            except Exception:
+                conn.rollback()
+                raise
 
-            conn.commit()
-        return (orphans, stale)
+    def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
+        # Discovery holds no row locks: every candidate is relocked and
+        # rechecked in its own bounded transaction by
+        # ``_delete_prune_candidate``, so a long prune never blocks keyed
+        # commits to workstreams it has not reached yet.
+        def _select_ids(predicates: tuple[Any, ...]) -> list[str]:
+            with self._conn() as conn:
+                return [
+                    str(row[0])
+                    for row in conn.execute(
+                        sa.select(workstreams.c.ws_id).where(*predicates)
+                    ).fetchall()
+                ]
+
+        return _prune_workstreams_shared(
+            retention_days,
+            select_ids=_select_ids,
+            delete_candidate=self._delete_prune_candidate,
+        )
 
     def resolve_workstream(self, alias_or_id: str) -> str | None:
         with self._conn() as conn:

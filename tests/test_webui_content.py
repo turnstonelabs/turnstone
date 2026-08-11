@@ -127,6 +127,50 @@ class TestContentAccumulation:
         assert ui._ws_turn_content == []
         assert ui._ws_turn_content_size == 0
 
+    def test_persistence_refresh_is_operator_only_and_non_consuming(self):
+        ui = _make_ui()
+        ui._ws_turn_content = ["preserve me"]
+        ui._ws_turn_content_size = len("preserve me")
+        session = MagicMock()
+        session.conversation_persistence_status = lambda: {"state": "conflict"}
+        ui.bind_session(session)
+        ws = MagicMock()
+        ws.state.value = "error"
+        # The registry row deliberately disagrees: the persistence field
+        # must come from the BOUND session (an id-reuse replacement row
+        # reporting healthy must not launder the badge).
+        ws.session.conversation_persistence_status = lambda: {"state": "healthy"}
+        mgr = MagicMock()
+        mgr.get.return_value = ws
+        WebUI._workstream_mgr = mgr
+        try:
+            ui.on_persistence_state_changed()
+        finally:
+            WebUI._workstream_mgr = None
+
+        event = _drain_global()[0]
+        assert event["type"] == "ws_state"
+        assert event["state"] == "error"
+        assert event["persistence_state"] == "conflict"
+        assert "content" not in event
+        assert ui._ws_turn_content == ["preserve me"]
+        assert ui._ws_turn_content_size == len("preserve me")
+
+    def test_persistence_state_derives_from_bound_session_not_registry(self):
+        """The badge keeps telling the truth while the row is out of the
+        map: failed-delete tombstone retention and retirement pop the
+        registry entry exactly when the journal needs the operator, and
+        the old by-id lookup laundered that window into "healthy"."""
+        ui = _make_ui()
+        session = MagicMock()
+        session.conversation_persistence_status = lambda: {"state": "conflict"}
+        ui.bind_session(session)
+        # No manager wired at all — the registry cannot be consulted.
+        assert WebUI._workstream_mgr is None
+        assert ui._current_persistence_state() == "conflict"
+        # Unbound (or collected) still fails closed to healthy.
+        assert _make_ui()._current_persistence_state() == "healthy"
+
     def test_thinking_broadcast_does_not_touch_accumulator(self):
         """_broadcast_state('thinking') should not affect the accumulator."""
         ui = _make_ui()

@@ -94,6 +94,32 @@ def test_sync_server_list_workstreams():
         server.close()
 
 
+def test_sync_server_get_history():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["limit"] == "25"
+        return _json_response(
+            {
+                "ws_id": "ws1",
+                "messages": [],
+                "cursor": None,
+                "handoff_token": "epoch.1",
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    hc = httpx.AsyncClient(transport=transport, base_url="http://test")
+    async_client = AsyncTurnstoneServer(httpx_client=hc)
+    server = TurnstoneServer.__new__(TurnstoneServer)
+    server._runner = _SyncRunner()
+    server._async = async_client
+
+    try:
+        history = server.get_history("ws1", limit=25)
+        assert history.handoff_token == "epoch.1"
+    finally:
+        server.close()
+
+
 def test_sync_server_context_manager():
     """TurnstoneServer can be used as a context manager."""
 

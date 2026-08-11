@@ -9,6 +9,7 @@ participant "HTTP / CLI\ncaller" as User
 participant "SessionManager" as Manager
 participant "ChatSession" as Session
 participant "SessionUIBase" as UI
+participant "Accepted-row handoff\n(total live prefix)" as Handoff
 participant "model_turn()\n+ lowering" as Plant
 participant "ModelAdmission\n(per alias)" as Admission
 participant "LLM provider" as Provider
@@ -33,13 +34,22 @@ end
 
 Session -> Session : _claim_generation() → generation N\ninstall fresh cancel event
 Session -> Session : plan memory / participant context
+Session -> Handoff : admit USER row\ncommit_key + prefix revision
 Session -> Storage : ordered durable batch:\nappend canonical user Turn + metadata
 
-note over Session, Storage
+note over Session, Handoff
+  Every accepted conversation row enters this lane before durability:
+  USER, ASSISTANT, TOOL, SYSTEM, compaction checkpoints, and cancellation
+  markers. Admission shares the handoff lock with its live UI transition
+  or history_resync repair event.
+end note
+
+note over Handoff, Storage
   _commit_for_generation(N) admits bounded live mutations under the
   generation lock, then executes immutable persistence closures in FIFO
   ticket order. A force successor either follows the whole commit or
-  prevents it; storage I/O never holds the lifecycle lock.
+  prevents it. /history projects durable prefix + pending journal suffix;
+  durable ACK removes the pending copy without changing the prefix revision.
 end note
 
 opt already over the hard context ceiling
@@ -80,21 +90,25 @@ loop until final answer and no queued input
   Session -> UI : on_stream_end()
   Session -> Session : generation-fenced result commit:\nappend assistant Turn + token accounting
   Session -> UI : on_turn_committed()
+  Session -> Handoff : admit ASSISTANT row\ncommit_key + prefix revision
   Session -> Storage : ordered durable assistant row\n(content + tool mirror + native lane)
 
   alt no tool calls
     opt over soft threshold
       Session -> Session : cooperative / end-of-turn compaction
+      Session -> Handoff : admit SYSTEM/source=compaction\ncheckpoint projection
       Session -> Storage : append checkpoint summary marker\nwith source watermark
       note right of Storage
         Full history remains durable. Resume loads
         [summary] + rows after the checkpoint.
       end note
       opt model stopped for compaction
+        Session -> Handoff : admit USER/source=compaction_resume row
         Session -> Storage : append synthetic compaction_resume Turn
       end
     end
     alt queued messages drained
+      Session -> Handoff : admit combined queued USER row
       Session -> Storage : append combined queued user Turn
     else truly complete
       Session -> UI : state = idle
@@ -123,10 +137,12 @@ loop until final answer and no queued input
 
     opt compaction owed before result sizing
       Session -> Session : compact, preserving assistant tool-call Turn
+      Session -> Handoff : admit SYSTEM/source=compaction checkpoint
       Session -> Storage : append checkpoint marker
     end
 
     Session -> Session : one generation-fenced batch:\nappend all Tool Turns, advisories, feedback
+    Session -> Handoff : admit FIFO TOOL rows\ncommit keys + prefix revisions
     Session -> Storage : FIFO durable tool rows + metadata
   end
 end
@@ -138,6 +154,10 @@ Session -> Session : atomically set generation event; snapshot\nmain stream, chi
 Session -> Provider : close live stream handle
 Session -> Tools : abort child scopes + kill subprocess groups
 Session -> UI : resolve only cancelled operation's\napproval cycles
+opt cancellation produced accepted conversation rows
+  Session -> Handoff : admit partial ASSISTANT and/or\nsynthesized TOOL cancellation markers
+  Session -> Storage : idempotent keyed cancellation rows
+end
 
 note over Session, Storage
   Every later publish/commit checks generation ownership. An abandoned

@@ -38,6 +38,57 @@ const STATE_DISPLAY = {
   error: { symbol: "\u2716", label: "err" },
 };
 
+const PERSISTENCE_DISPLAY = {
+  pending: {
+    label: "History save pending",
+    tooltip:
+      "An accepted conversation turn has not reached durable history yet.",
+  },
+  retrying: {
+    label: "History save retrying",
+    tooltip:
+      "An accepted conversation turn has not reached durable history yet. Automatic recovery is in progress.",
+  },
+  conflict: {
+    label: "History save blocked",
+    tooltip:
+      "An accepted conversation turn cannot reach durable history automatically. Operator intervention is required.",
+  },
+};
+
+function appendPersistenceStatus(container, ws) {
+  const display = PERSISTENCE_DISPLAY[ws.persistence_state];
+  if (!display) return;
+  const badge = document.createElement("span");
+  badge.className = "dash-persistence-badge";
+  badge.dataset.state = ws.persistence_state;
+  badge.textContent = display.label;
+  badge.title = display.tooltip;
+  badge.setAttribute("role", "status");
+  badge.setAttribute("aria-label", display.label + ". " + display.tooltip);
+  container.appendChild(badge);
+}
+
+function renderDashboardSubline(container, ws) {
+  container.replaceChildren();
+  container.classList.toggle("sub-attention", ws.activity_state === "approval");
+  appendPersistenceStatus(container, ws);
+  if (ws.activity) {
+    if (container.childNodes.length) container.append(" \u00b7 ");
+    container.append(ws.activity);
+  }
+}
+
+function setPersistenceRowAria(row, persistenceState) {
+  const base =
+    row.dataset.baseAriaLabel || row.getAttribute("aria-label") || "";
+  const display = PERSISTENCE_DISPLAY[persistenceState];
+  row.setAttribute(
+    "aria-label",
+    base + (display ? ", " + display.label.toLowerCase() : ""),
+  );
+}
+
 // ===========================================================================
 //  5. Health polling
 // ===========================================================================
@@ -874,14 +925,22 @@ function closeWorkstream(wsId) {
     body: "{}",
   })
     .then(function (r) {
-      return r.json();
+      return r.json().then(function (data) {
+        return { data: data, status: r.status };
+      });
     })
-    .then(function (data) {
+    .then(function (result) {
+      const data = result.data;
       if (data.status === "ok") {
         delete workstreams[wsId];
         closeSessionPane(wsId);
         fireRender();
         if (!Object.keys(workstreams).length) showDashboard();
+      } else if (result.status === 409) {
+        showToast(
+          "Conversation history is still being saved. Try ending the session again shortly.",
+          "warning",
+        );
       } else if (data.error) {
         showToast(data.error, "warning");
       }
@@ -983,6 +1042,15 @@ function renderDashboardTable(wsList, agg) {
     return;
   }
   wsList.forEach(function (ws) {
+    // The REST dashboard row is the authoritative initial projection for
+    // operator-only journal state. Keep the Tier-1 roster copy aligned so a
+    // later activity-only delta cannot repaint the sub-line from stale data.
+    if (workstreams[ws.ws_id]) {
+      workstreams[ws.ws_id].persistence_state =
+        ws.persistence_state || "healthy";
+      workstreams[ws.ws_id].activity = ws.activity || "";
+      workstreams[ws.ws_id].activity_state = ws.activity_state || "";
+    }
     const liveState =
       (workstreams[ws.ws_id] && workstreams[ws.ws_id].state) ||
       ws.state ||
@@ -1006,7 +1074,8 @@ function renderDashboardTable(wsList, agg) {
     if (ws.tokens) ariaLabel += ", " + formatTokens(ws.tokens) + " tokens";
     if (ws.context_ratio > 0)
       ariaLabel += ", " + Math.round(ws.context_ratio * 100) + "% context";
-    row.setAttribute("aria-label", ariaLabel);
+    row.dataset.baseAriaLabel = ariaLabel;
+    setPersistenceRowAria(row, ws.persistence_state);
 
     const main = document.createElement("div");
     main.className = "dash-row-main";
@@ -1080,8 +1149,7 @@ function renderDashboardTable(wsList, agg) {
 
     const sub = document.createElement("div");
     sub.className = "dash-row-sub";
-    if (ws.activity_state === "approval") sub.classList.add("sub-attention");
-    sub.textContent = ws.activity || "";
+    renderDashboardSubline(sub, ws);
     row.appendChild(sub);
 
     row.onclick = function () {
@@ -1848,19 +1916,23 @@ function connectGlobalSSE() {
         context_ratio: data.context_ratio,
         activity: data.activity,
         activity_state: data.activity_state,
+        persistence_state: data.persistence_state,
       });
     } else if (data.type === "ws_activity") {
-      const row = document.querySelector(
-        '#dash-ws-table .dash-row[data-ws-id="' + data.ws_id + '"]',
-      );
-      if (row) {
-        const sub = row.querySelector(".dash-row-sub");
-        if (sub) {
-          sub.textContent = data.activity || "";
-          if (data.activity_state === "approval")
-            sub.classList.add("sub-attention");
-          else sub.classList.remove("sub-attention");
-        }
+      // Membership-gated like ws_rename below: a trailing activity event
+      // for a closed workstream (its dashboard row can outlive ws_closed
+      // until the next REST-driven repaint) must not re-insert a skeletal
+      // roster entry — that ghost suppresses the empty-state transition
+      // and paints a nameless rail tab until a full resync.
+      const roster = workstreams[data.ws_id];
+      if (roster) {
+        roster.activity = data.activity || "";
+        roster.activity_state = data.activity_state || "";
+        const row = document.querySelector(
+          '#dash-ws-table .dash-row[data-ws-id="' + data.ws_id + '"]',
+        );
+        const sub = row && row.querySelector(".dash-row-sub");
+        if (sub) renderDashboardSubline(sub, roster);
       }
     } else if (data.type === "ws_rename") {
       if (workstreams[data.ws_id]) workstreams[data.ws_id].name = data.name;
@@ -1875,6 +1947,7 @@ function connectGlobalSSE() {
       // without waiting for a roster refetch (null = unattached).
       workstreams[data.ws_id].project_id = data.project_id || null;
       workstreams[data.ws_id].persona = data.persona || "";
+      workstreams[data.ws_id].persistence_state = "healthy";
       renderTabBar();
     } else if (data.type === "ws_closed") {
       const wsId = data.ws_id;
@@ -2406,6 +2479,8 @@ function applyRosterSnapshot(list, opts) {
     // workstreams, and that authoritative empty must not be masked by a
     // stale in-memory value.
     cur.persona = "persona" in ws ? ws.persona || "" : cur.persona || "";
+    cur.persistence_state =
+      "persistence_state" in ws ? ws.persistence_state || "healthy" : "healthy";
     workstreams[ws.id] = cur;
   });
   if (evict) {
@@ -2680,7 +2755,17 @@ function renderTabBar() {
   fireRender();
 }
 function updateTabIndicator(wsId, state, extra) {
-  if (workstreams[wsId]) workstreams[wsId].state = state;
+  const roster = workstreams[wsId];
+  if (roster) {
+    roster.state = state;
+    if (extra) {
+      if (extra.activity !== undefined) roster.activity = extra.activity || "";
+      if (extra.activity_state !== undefined)
+        roster.activity_state = extra.activity_state || "";
+      if (extra.persistence_state !== undefined)
+        roster.persistence_state = extra.persistence_state || "healthy";
+    }
+  }
   fireRender(); // rail glyph (the only surface fireRender repaints)
   // Patch the Dashboard row in place — fireRender fans out to the rail, NOT the
   // #dash-ws-table cells, so without this a watched row's STATE/TOKENS/CTX go
@@ -2715,15 +2800,12 @@ function updateTabIndicator(wsId, state, extra) {
           : "";
     }
   }
-  if (extra.activity !== undefined) {
+  if (extra.activity !== undefined || extra.persistence_state !== undefined) {
     const sub = row.querySelector(".dash-row-sub");
-    if (sub) {
-      sub.textContent = extra.activity || "";
-      if (extra.activity_state === "approval")
-        sub.classList.add("sub-attention");
-      else sub.classList.remove("sub-attention");
-    }
+    if (sub) renderDashboardSubline(sub, roster || extra);
   }
+  if (extra.persistence_state !== undefined)
+    setPersistenceRowAria(row, (roster || extra).persistence_state);
 }
 
 // Synthesize the one-node clusterState shape the rail consumes

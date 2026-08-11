@@ -387,6 +387,50 @@ class TestCollectorSnapshot:
         assert event["type"] == "cluster_state"
         assert event["ws_id"] == "ws1"
         assert event["state"] == "running"
+        assert event["persistence_state"] == "healthy"
+        assert c._nodes["node-a"].workstreams["ws1"]["persistence_state"] == "healthy"
+
+    def test_apply_snapshot_emits_persistence_change_without_state_change(self):
+        """A journal recovery refresh must reach the cluster UI while idle."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={
+                "ws1": {
+                    "id": "ws1",
+                    "name": "same",
+                    "state": "idle",
+                    "persistence_state": "retrying",
+                }
+            },
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_snapshot(
+            "node-a",
+            {
+                "type": "node_snapshot",
+                "node_id": "node-a",
+                "workstreams": [
+                    {
+                        "id": "ws1",
+                        "name": "same",
+                        "state": "idle",
+                        "persistence_state": "healthy",
+                    }
+                ],
+                "health": {},
+                "aggregate": {},
+            },
+        )
+
+        event = q.get_nowait()
+        assert event["type"] == "cluster_state"
+        assert event["state"] == "idle"
+        assert event["persistence_state"] == "healthy"
+        assert c._nodes["node-a"].workstreams["ws1"]["persistence_state"] == "healthy"
 
     def test_apply_snapshot_state_change_does_not_carry_pending_approval_detail(self):
         """Stage 3 cleanup — the snapshot-resync cluster_state event no
@@ -472,6 +516,30 @@ class TestCollectorDelta:
         assert event["state"] == "running"
         # Verify in-memory state was updated
         assert c._nodes["node-a"].workstreams["ws1"]["state"] == "running"
+
+    def test_apply_delta_ws_state_projects_persistence_state(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "test", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta(
+            "node-a",
+            {
+                "type": "ws_state",
+                "ws_id": "ws1",
+                "state": "error",
+                "persistence_state": "conflict",
+            },
+        )
+
+        event = q.get_nowait()
+        assert event["persistence_state"] == "conflict"
+        assert c._nodes["node-a"].workstreams["ws1"]["persistence_state"] == "conflict"
 
     def test_apply_delta_ws_state_does_not_carry_pending_approval_detail(self):
         """Stage 3 cleanup — ``cluster_state`` no longer carries the

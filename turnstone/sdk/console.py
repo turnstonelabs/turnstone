@@ -363,6 +363,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         message: str,
         *,
         attachment_ids: list[str] | None = None,
+        client_send_id: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a coordinator workstream.
 
@@ -373,6 +374,8 @@ class AsyncTurnstoneConsole(_BaseClient):
         body: dict[str, Any] = {"message": message}
         if attachment_ids is not None:
             body["attachment_ids"] = attachment_ids
+        if client_send_id is not None:
+            body["client_send_id"] = client_send_id
         return await self._request("POST", f"/v1/api/workstreams/{ws_id}/send", json_body=body)
 
     async def coordinator_upload_attachment(
@@ -1346,9 +1349,15 @@ class TurnstoneConsole:
         message: str,
         *,
         attachment_ids: list[str] | None = None,
+        client_send_id: str | None = None,
     ) -> dict[str, Any]:
         return self._runner.run(
-            self._async.coordinator_send(ws_id, message, attachment_ids=attachment_ids)
+            self._async.coordinator_send(
+                ws_id,
+                message,
+                attachment_ids=attachment_ids,
+                client_send_id=client_send_id,
+            )
         )
 
     def coordinator_upload_attachment(

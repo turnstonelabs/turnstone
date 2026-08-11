@@ -22,11 +22,18 @@ from tests._proc_helpers import pid_alive as _pid_alive
 from tests._proc_helpers import poll_until as _wait_until
 from tests._session_helpers import make_session
 from turnstone.core.session import _active_shell_owner
+from turnstone.core.storage import get_storage
 
 
 @pytest.fixture
-def session():
+def session(tmp_db):
     s = make_session()
+    get_storage().register_workstream(
+        s.ws_id,
+        user_id=s._user_id,
+        kind=s._kind,
+        parent_ws_id=s._parent_ws_id,
+    )
     yield s
     s.close()
 

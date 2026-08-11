@@ -522,6 +522,26 @@ body {
   line-height: 1;
 }
 
+.dash-persistence-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  border: 1px solid var(--yellow);
+  border-radius: 2px;
+  background: var(--yellow-glow);
+  color: var(--yellow);
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.dash-persistence-badge[data-state="conflict"] {
+  border-color: var(--red);
+  background: var(--red-glow);
+  color: var(--red);
+}
+
 /* Inline "create a project" widget (project_creator.js) — a name input + Save +
    Cancel that replaces the native prompt across every "+ New project…" picker.
    grid-column lets it span both columns when mounted inside the composer's

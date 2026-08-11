@@ -276,6 +276,48 @@ class ConsoleCoordinatorUI(SessionUIBase):
             evt["acting_user_id"] = self._acting_user_id
         self._enqueue(evt)
 
+    def on_persistence_state_changed(self) -> None:
+        """Refresh the cluster row after journal failure or recovery.
+
+        The update stays on the operator cluster bus; it does not enter the
+        coordinator conversation event stream. It snapshots counters without
+        consuming terminal turn content and does not persist a synthetic
+        workstream-state transition.
+        """
+        # The registry read serves ONLY the row-state field (``ws.state``
+        # lives on the manager's row); the persistence field derives through
+        # the session bound at construction, so a miss — or an id-reuse
+        # replacement — can no longer report another session's journal.  A
+        # miss means the row left the cluster roster: nothing to refresh.
+        mgr = ConsoleCoordinatorUI._coord_mgr
+        collector = ConsoleCoordinatorUI._collector
+        if mgr is None or collector is None:
+            return
+        ws = mgr.get(self.ws_id)
+        if ws is None:
+            return
+        with self._ws_lock:
+            tokens = self._ws_prompt_tokens + self._ws_completion_tokens
+            context_ratio = self._ws_context_ratio
+            activity = self._ws_current_activity
+            activity_state = self._ws_activity_state
+        try:
+            collector.emit_console_ws_state(
+                self.ws_id,
+                ws.state.value,
+                tokens=tokens,
+                context_ratio=context_ratio,
+                activity=activity,
+                activity_state=activity_state,
+                persistence_state=self._current_persistence_state(),
+            )
+        except Exception:
+            log.debug(
+                "coord_ui.persistence_state_fanout_failed ws=%s",
+                self.ws_id,
+                exc_info=True,
+            )
+
     def on_state_change_deferred(
         self,
         state: str,

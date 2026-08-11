@@ -451,15 +451,13 @@ class TestCreateMultipart:
         # Drained from the buffer post-commit.
         assert get_attachment_buffer().get(aid, ws_id=ws_id, user_id="userA") is None
 
-    def test_create_drains_staged_synchronously(self, app_client, monkeypatch):
-        """A create-time attachment dispatched on the first turn must be drained
-        by the create handler itself, not only by the async dispatch worker —
-        else the freshly-opened pane's rehydrate races the worker's write-time
-        drain and paints the image as a still-pending composer chip.
+    def test_create_keeps_staging_until_user_row_admission(self, app_client, monkeypatch):
+        """Create dispatch may not consume bytes before the USER row accepts.
 
-        Neuter the worker's drain (stub ``send``) so only the synchronous
-        post-install drain can clear the buffer, then assert it's empty right
-        after the response with NO polling."""
+        Neuter ``send`` so the worker never reaches journal admission. The
+        staged upload must remain retryable after the create response; the real
+        session transfers ownership atomically with its accepted USER row.
+        """
         from turnstone.core.attachment_buffer import get_attachment_buffer
 
         client, _sessions, _gq = app_client
@@ -474,9 +472,7 @@ class TestCreateMultipart:
         assert resp.status_code == 200, resp.text
         ws_id = resp.json()["ws_id"]
         aid = resp.json()["attachment_ids"][0]
-        # No poll: the create handler drained it before returning, so the new
-        # pane's rehydrate can't observe it as still-staged.
-        assert get_attachment_buffer().get(aid, ws_id=ws_id, user_id="userA") is None
+        assert get_attachment_buffer().get(aid, ws_id=ws_id, user_id="userA") is not None
 
     def test_create_raced_by_live_worker_keeps_attachments_staged(self, app_client, monkeypatch):
         """The enqueue branch (caller-supplied ws_id raced by a concurrent
@@ -496,7 +492,8 @@ class TestCreateMultipart:
 
         monkeypatch.setattr(_FakeSession, "queue_message", _record_queue)
 
-        def _live_worker_send(ws, *, enqueue, run, thread_name=None):
+        def _live_worker_send(ws, *, enqueue, run, expected_session=None, thread_name=None):
+            assert expected_session is ws.session
             enqueue()  # a worker already owns the ws — reuse path
             return True
 
@@ -538,7 +535,8 @@ class TestCreateMultipart:
 
         monkeypatch.setattr(_FakeSession, "queue_message", _full_queue)
 
-        def _live_worker_send(ws, *, enqueue, run, thread_name=None):
+        def _live_worker_send(ws, *, enqueue, run, expected_session=None, thread_name=None):
+            assert expected_session is ws.session
             # Mirror the real send()'s reuse-path backpressure contract:
             # queue.Full → False, never a raise to the caller.
             try:
@@ -776,44 +774,3 @@ class TestInitialWorkerFailureState:
         assert events, "init worker never emitted"
         assert all(e.get("state") != "error" for e in events)
         assert all(e.get("type") != "error" for e in events)
-
-
-def test_retry_closure_sanitizes_error_display(monkeypatch):
-    """The retry (_run) closure sanitizes the exception text before on_error, so
-    a credential-bearing base-URL in a backend error can't cross into the
-    dashboard SSE.  It deliberately does NOT route through ensure_error_recorded
-    (the reused-session stale-flag hazard — #865); the display-sanitize half of
-    that hygiene is fixed at the site.  Driven via the capture pattern: patch the
-    dispatcher to hand back the run closure, then run it inline as the owner."""
-    import threading
-    from types import SimpleNamespace
-
-    from turnstone.core import session_worker
-    from turnstone.server import _interactive_dispatch_retry
-
-    ui = _FakeUI(ws_id="ws-retry")
-
-    def _boom(_msg):
-        raise RuntimeError("cannot reach https://user:pass@host:8000/v1 for model=x")
-
-    ws = SimpleNamespace(
-        id="ws-retry", session=SimpleNamespace(send=_boom), ui=ui, worker_thread=None
-    )
-    captured: dict = {}
-
-    def _capture(_ws, *, enqueue, run, thread_name=None, **_kw):
-        captured["run"] = run
-        return True
-
-    monkeypatch.setattr(session_worker, "send", _capture)
-    _interactive_dispatch_retry(ws, "retry this")
-    assert "run" in captured, "retry did not dispatch through session_worker.send"
-    # The owner guard reads ws.worker_thread is the executing thread; run the
-    # captured closure inline as that owner.
-    ws.worker_thread = threading.current_thread()
-    captured["run"]()
-
-    errors = [e["message"] for e in ui.events if e.get("type") == "error"]
-    assert errors, "retry closure emitted no on_error"
-    assert all("user:pass" not in m for m in errors), errors  # credential redacted
-    assert any("REDACTED" in m for m in errors)  # the sanitizer ran, not a no-op

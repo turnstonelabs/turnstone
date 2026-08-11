@@ -107,7 +107,8 @@ class TestTranscriptChip:
         path auto-opens only while the originating pane is focused; the chip
         is the deliberate reopen everywhere else."""
         body = _read(_INTERACTIVE_JS)
-        assert "if (this._host.isFocused(this)) this._host.onPreview(preview);" in body
+        assert "!accepted && !isError && this._host.isFocused(this)" in body
+        assert "this._host.onPreview(preview);" in body
 
     def test_replay_path_renders_chip_without_auto_open(self) -> None:
         body = _read(_INTERACTIVE_JS)

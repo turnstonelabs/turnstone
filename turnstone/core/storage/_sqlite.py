@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
@@ -23,6 +24,8 @@ from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     USER_SCOPED_AUTH_TYPES,
+    AttachmentWrite,
+    ConversationCommitWorkstreamGoneError,
     ForkCloneExpectation,
     ForkCloneSnapshot,
     MCPOAuthPendingState,
@@ -137,6 +140,9 @@ from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    KeyedAttachmentSaveWrappers as _KeyedAttachmentSaveWrappers,
+)
+from turnstone.core.storage._utils import (
     assert_single_default_persona as _assert_single_default_persona,
 )
 from turnstone.core.storage._utils import (
@@ -146,15 +152,24 @@ from turnstone.core.storage._utils import (
     clone_workstream_transaction,
     find_orphan_conversations,
     parse_checkpoint_watermark,
+    prepare_attachment_commit,
+    prepare_conversation_row_values,
     prepare_provider_data_for_save,
     purge_orphan_conversations,
     release_attachment_refs,
     retain_attachment_refs,
     sanitize_text,
+    save_attachment_commit_transaction,
     senders_from_user_meta,
 )
 from turnstone.core.storage._utils import (
+    delete_messages_after_core as _delete_messages_after_core,
+)
+from turnstone.core.storage._utils import (
     escape_like as _escape_like,
+)
+from turnstone.core.storage._utils import (
+    get_compaction_floor_on_connection as _get_compaction_floor_shared,
 )
 from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
@@ -166,6 +181,9 @@ from turnstone.core.storage._utils import (
     persona_row_to_dict as _persona_row_to_dict,
 )
 from turnstone.core.storage._utils import (
+    prune_workstreams_shared as _prune_workstreams_shared,
+)
+from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
 )
 from turnstone.core.storage._utils import (
@@ -173,6 +191,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     recover_trajectory as _recover_trajectory,
+)
+from turnstone.core.storage._utils import (
+    resolve_keyed_commit_conflict as _resolve_keyed_commit_conflict,
 )
 from turnstone.core.storage._utils import (
     row_to_dict as _row_to_dict,
@@ -185,6 +206,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     split_perms as _split_perms,
+)
+from turnstone.core.storage._utils import (
+    truncate_messages_tail_core as _truncate_messages_tail_core,
 )
 from turnstone.core.storage._utils import (
     validate_and_clear_default_persona as _validate_and_clear_default_persona,
@@ -288,7 +312,7 @@ class _SQLiteNotifyStream:
             self._backend._notify_unregister(self._channels, self._queue)
 
 
-class SQLiteBackend:
+class SQLiteBackend(_KeyedAttachmentSaveWrappers):
     """SQLite implementation of the StorageBackend protocol."""
 
     def __init__(self, path: str, *, create_tables: bool = True) -> None:
@@ -378,6 +402,22 @@ class SQLiteBackend:
 
     # -- Core conversation operations ------------------------------------------
 
+    def _index_conversation_fts(self, conn: Any, row_id: int, content: str | None) -> None:
+        """Mirror one freshly inserted conversation row into the FTS5 index.
+
+        Search is best-effort: a failing index write disables FTS for the
+        process rather than failing the durable commit that carries it.
+        """
+        if not self._fts5_available or not content:
+            return
+        try:
+            conn.execute(
+                sa.text("INSERT INTO conversations_fts(rowid, content) VALUES (:rowid, :content)"),
+                {"rowid": row_id, "content": content},
+            )
+        except Exception:
+            self._fts5_available = False
+
     def save_message(
         self,
         ws_id: str,
@@ -392,52 +432,139 @@ class SQLiteBackend:
         is_error: bool = False,
         producer: str | None = None,
         meta: str | None = None,
+        commit_key: str | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        content = sanitize_text(content)
-        provider_data = prepare_provider_data_for_save(
-            role, sanitize_text(provider_data), tool_calls, producer
+        values = prepare_conversation_row_values(
+            ws_id,
+            role,
+            content,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            provider_data=provider_data,
+            tool_calls=tool_calls,
+            source=source,
+            event_id=event_id,
+            is_error=is_error,
+            producer=producer,
+            meta=meta,
+            commit_key=commit_key,
+            now=now,
         )
-        source = sanitize_text(source)
         with self._conn() as conn:
-            result = conn.execute(
-                sa.insert(conversations),
-                {
-                    "ws_id": ws_id,
-                    "timestamp": now,
-                    "role": role,
-                    "content": content,
-                    "tool_name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "provider_data": provider_data,
-                    "tool_calls": tool_calls,
-                    "_source": source,
-                    "event_id": event_id,
-                    "is_error": is_error,
-                    "meta": meta,
-                },
-            )
-            if result.lastrowid is None:
-                # Should be unreachable under SQLite + autoincrement PKs.
-                raise RuntimeError("save_message: lastrowid missing after insert")
-            rowid = int(result.lastrowid)
-            # FTS5 indexing
-            if self._fts5_available and content:
-                try:
-                    conn.execute(
-                        sa.text(
-                            "INSERT INTO conversations_fts(rowid, content) VALUES (:rowid, :content)"
-                        ),
-                        {"rowid": rowid, "content": content},
+            inserted = True
+            if commit_key is None:
+                result = conn.execute(sa.insert(conversations), values)
+                if result.lastrowid is None:
+                    # Should be unreachable under SQLite + autoincrement PKs.
+                    raise RuntimeError("save_message: lastrowid missing after insert")
+                rowid = int(result.lastrowid)
+            else:
+                # Keyed commits are live-session writes, not the legacy
+                # append-without-parent path.  Acquire the same writer
+                # reservation hard delete uses before checking the durable
+                # parent, so delete and save have a total order: save first is
+                # removed by delete; delete first makes this attempt fail.
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                parent = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
+                ).fetchone()
+                if parent is None:
+                    raise ConversationCommitWorkstreamGoneError(
+                        "keyed conversation commit workstream no longer exists"
                     )
-                except Exception:
-                    self._fts5_available = False
-            # Bump workstream updated timestamp
-            conn.execute(
-                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
-            )
+                # ``RETURNING`` is load-bearing: SQLite leaves lastrowid at a
+                # previous insert after DO NOTHING, which could acknowledge the
+                # wrong conversation row on an idempotent retry.
+                result = conn.execute(
+                    sqlite_insert(conversations)
+                    .values(**values)
+                    .on_conflict_do_nothing(
+                        index_elements=[conversations.c.ws_id, conversations.c.commit_key],
+                        index_where=conversations.c.commit_key.is_not(None),
+                    )
+                    .returning(conversations.c.id)
+                )
+                resolved = result.scalar_one_or_none()
+                if resolved is None:
+                    inserted = False
+                    rowid = _resolve_keyed_commit_conflict(conn, ws_id, values)
+                else:
+                    rowid = int(resolved)
+            if inserted:
+                self._index_conversation_fts(conn, rowid, values["content"])
+                # Bump workstream updated timestamp
+                conn.execute(
+                    sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
+                )
             conn.commit()
             return rowid
+
+    def _save_message_with_attachments(
+        self,
+        ws_id: str,
+        role: str,
+        content: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        source: str | None = None,
+        event_id: int | None = None,
+        is_error: bool = False,
+        meta: str | None = None,
+        commit_key: str,
+        origin: str,
+        exact_blob_metadata: bool,
+    ) -> int:
+        """Dialect-local transaction shared by keyed USER and TOOL rows."""
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        attachment_ids, blobs, values = prepare_attachment_commit(
+            ws_id,
+            role,
+            content,
+            attachments,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            source=source,
+            event_id=event_id,
+            is_error=is_error,
+            meta=meta,
+            commit_key=commit_key,
+            now=now,
+        )
+        with self._conn() as conn:
+            try:
+                # Match delete_workstream's BEGIN IMMEDIATE ordering.  The
+                # parent check and every row/blob/refcount mutation in the
+                # shared body below are therefore one indivisible SQLite
+                # writer transaction.
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                parent = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
+                ).fetchone()
+                if parent is None:
+                    raise ConversationCommitWorkstreamGoneError(
+                        "keyed conversation commit workstream no longer exists"
+                    )
+                row_id = save_attachment_commit_transaction(
+                    conn,
+                    sqlite_insert,
+                    values=values,
+                    attachment_ids=attachment_ids,
+                    blobs=blobs,
+                    now=now,
+                    origin=origin,
+                    exact_blob_metadata=exact_blob_metadata,
+                    index_content=lambda inserted_id: self._index_conversation_fts(
+                        conn, inserted_id, values["content"]
+                    ),
+                )
+                conn.commit()
+                return row_id
+            except Exception:
+                conn.rollback()
+                raise
 
     def list_message_senders(self, ws_id: str) -> list[str]:
         # DISTINCT on the raw meta blob: a user row's meta carries only
@@ -517,9 +644,9 @@ class SQLiteBackend:
         """Fetch a ws's conversation rows + resolved attachment map.
 
         Shared by :meth:`load_messages` (→ dicts, resolved for display) and
-        :meth:`load_message_turns` (→ canonical Turns for resume).  The trailing
-        ``attachments`` ref-list column is split off to resolve blobs and is NOT
-        part of the positional tuple ``reconstruct_*`` unpacks (id..meta).
+        :meth:`load_message_turns` (→ canonical Turns for resume). The trailing
+        ``attachments`` ref-list and ``commit_key`` columns stay internal to
+        reconstruction and never reach provider/public projections.
         """
         _cols = (
             conversations.c.id,
@@ -534,6 +661,7 @@ class SQLiteBackend:
             conversations.c.is_error,
             conversations.c.meta,
             conversations.c.attachments,
+            conversations.c.commit_key,
         )
         with self._conn() as conn:
             if limit is not None and limit > 0:
@@ -722,27 +850,7 @@ class SQLiteBackend:
         backing intact.
         """
         with self._conn() as conn:
-            marker_id = conn.execute(
-                sa.select(sa.func.max(conversations.c.id)).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c._source == _COMPACTION_SOURCE,
-                    )
-                )
-            ).scalar()
-            if marker_id is None:
-                return 0
-            n = conn.execute(
-                sa.select(sa.func.count())
-                .select_from(conversations)
-                .where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.id <= marker_id,
-                    )
-                )
-            ).scalar()
-        return int(n or 0)
+            return _get_compaction_floor_shared(conn, ws_id)
 
     def get_compaction_checkpoint(self, ws_id: str) -> int | None:
         """Latest persisted marker's watermark — see the protocol docstring.
@@ -761,59 +869,71 @@ class SQLiteBackend:
             ).fetchone()
         return parse_checkpoint_watermark(row[0]) if row is not None else None
 
+    def _delete_messages_after_on_connection(
+        self,
+        conn: sa.engine.Connection,
+        ws_id: str,
+        keep_count: int,
+    ) -> int:
+        """Delete one conversation tail; caller owns the writer transaction."""
+        return _delete_messages_after_core(
+            conn, ws_id, keep_count, pre_delete=self._delete_fts_tail
+        )
+
+    def _delete_fts_tail(self, conn: sa.engine.Connection, ws_id: str, cutoff_id: Any) -> None:
+        """Remove FTS5 entries first (external content table doesn't auto-sync)."""
+        if not self._fts5_available:
+            return
+        try:
+            conn.execute(
+                sa.text(
+                    "DELETE FROM conversations_fts WHERE rowid IN "
+                    "(SELECT id FROM conversations "
+                    " WHERE ws_id = :ws_id AND id >= :cutoff_id)"
+                ),
+                {"ws_id": ws_id, "cutoff_id": cutoff_id},
+            )
+        except Exception:
+            self._fts5_available = False
+
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
         with self._conn() as conn:
-            # Find the id of the first row to delete (the row at offset keep_count)
-            cutoff_row = conn.execute(
-                sa.select(conversations.c.id)
-                .where(conversations.c.ws_id == ws_id)
-                .order_by(conversations.c.id)
-                .limit(1)
-                .offset(keep_count)
-            ).fetchone()
-            if cutoff_row is None:
-                return 0  # nothing to delete
-            cutoff_id = cutoff_row[0]
-            # Refcount GC: read the doomed rows' content-addressed ref-lists,
-            # decrement each blob's refcount once per reference, and prune
-            # blobs that hit 0 — so a deduped blob still referenced by a kept
-            # turn survives.  Replaces the old message_id-cascade delete.
-            doomed = conn.execute(
-                sa.select(conversations.c.attachments).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.id >= cutoff_id,
-                        conversations.c.attachments.is_not(None),
-                    )
-                )
-            ).fetchall()
-            doomed_ids: list[str] = []
-            for (refs,) in doomed:
-                doomed_ids.extend(_parse_attachment_refs(refs))
-            release_attachment_refs(conn, doomed_ids)
-            # Remove FTS5 entries first (external content table doesn't auto-sync)
-            if self._fts5_available:
-                try:
-                    conn.execute(
-                        sa.text(
-                            "DELETE FROM conversations_fts WHERE rowid IN "
-                            "(SELECT id FROM conversations "
-                            " WHERE ws_id = :ws_id AND id >= :cutoff_id)"
-                        ),
-                        {"ws_id": ws_id, "cutoff_id": cutoff_id},
-                    )
-                except Exception:
-                    self._fts5_available = False
-            result = conn.execute(
-                sa.delete(conversations).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.id >= cutoff_id,
-                    )
-                )
-            )
+            # Share the keyed-commit / hard-delete writer boundary. BEGIN
+            # IMMEDIATE orders the complete cutoff + delete + ref-release
+            # transaction before or after every keyed commit.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            deleted = self._delete_messages_after_on_connection(conn, ws_id, keep_count)
             conn.commit()
-            return result.rowcount
+            return deleted
+
+    def truncate_messages_tail(self, ws_id: str, remove_count: int) -> int:
+        """Atomically remove a compaction-floored number of newest rows."""
+        if remove_count < 0:
+            raise ValueError("remove_count must be non-negative")
+        with self._conn() as conn:
+            try:
+                # Own the writer slot before observing either count. A keyed
+                # commit therefore lands wholly before this snapshot or after
+                # the deletion commits; it cannot inflate ``total`` and then be
+                # included in a stale caller-computed keep count.
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                parent = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
+                ).fetchone()
+                if parent is None:
+                    raise RuntimeError("tail truncation workstream no longer exists")
+
+                deleted = _truncate_messages_tail_core(
+                    conn,
+                    ws_id,
+                    remove_count,
+                    delete_after=self._delete_messages_after_on_connection,
+                )
+                conn.commit()
+                return deleted
+            except Exception:
+                conn.rollback()
+                raise
 
     # -- Workstream management -------------------------------------------------
 
@@ -885,77 +1005,56 @@ class SQLiteBackend:
                 ).fetchall()
             )
 
-    def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
-        orphans = stale = 0
-        with self._conn() as conn:
-            # 1. Remove workstreams with no messages
-            orphan_ids = [
-                row[0]
-                for row in conn.execute(
-                    sa.text(
-                        "SELECT ws_id FROM workstreams "
-                        "WHERE state != 'creating' AND NOT EXISTS "
-                        "  (SELECT 1 FROM conversations c "
-                        "   WHERE c.ws_id = workstreams.ws_id)"
-                    )
-                ).fetchall()
-            ]
-            if orphan_ids:
-                chunk_size = 500
-                for i in range(0, len(orphan_ids), chunk_size):
-                    chunk = orphan_ids[i : i + chunk_size]
-                    placeholders = ",".join([":p" + str(j) for j in range(len(chunk))])
-                    params = {f"p{j}": oid for j, oid in enumerate(chunk)}
-                    conn.execute(
-                        sa.text(f"DELETE FROM workstream_config WHERE ws_id IN ({placeholders})"),
-                        params,
-                    )
-                    result = conn.execute(
-                        sa.text(f"DELETE FROM workstreams WHERE ws_id IN ({placeholders})"),
-                        params,
-                    )
-                    orphans += result.rowcount
+    def _delete_prune_candidate(
+        self,
+        ws_id: str,
+        predicates: tuple[Any, ...],
+    ) -> bool:
+        """Recheck and delete one prune candidate under a short writer txn.
 
-            # 2. Remove old unnamed workstreams
-            if retention_days > 0:
-                cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime(
-                    "%Y-%m-%dT%H:%M:%S"
+        SQLite has no row-level writer lock.  One ``BEGIN IMMEDIATE`` around
+        the complete candidate list would therefore stop every unrelated write
+        while per-workstream attachment GC runs.  Candidate discovery is only
+        a hint; this exact predicate recheck is the admission point.  A keyed
+        commit either lands before it and makes the row ineligible, or blocks
+        behind it and observes the parent deletion when it resumes.
+        """
+        with self._conn() as conn:
+            try:
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                exact = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(
+                        workstreams.c.ws_id == ws_id,
+                        *predicates,
+                    )
+                ).fetchone()
+                deleted = bool(
+                    exact is not None and self._delete_workstream_on_connection(conn, ws_id)
                 )
-                stale_ids = [
-                    row[0]
+                conn.commit()
+                return deleted
+            except Exception:
+                conn.rollback()
+                raise
+
+    def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
+        # Do not reserve SQLite's database-wide writer slot for discovery.
+        # Every candidate is rechecked in its own bounded writer transaction
+        # by ``_delete_prune_candidate``.
+        def _select_ids(predicates: tuple[Any, ...]) -> list[str]:
+            with self._conn() as conn:
+                return [
+                    str(row[0])
                     for row in conn.execute(
-                        sa.text(
-                            "SELECT ws_id FROM workstreams "
-                            "WHERE state != 'creating' "
-                            "AND alias IS NULL AND updated < :cutoff"
-                        ),
-                        {"cutoff": cutoff},
+                        sa.select(workstreams.c.ws_id).where(*predicates)
                     ).fetchall()
                 ]
-                if stale_ids:
-                    chunk_size = 500
-                    for i in range(0, len(stale_ids), chunk_size):
-                        chunk = stale_ids[i : i + chunk_size]
-                        placeholders = ",".join([":p" + str(j) for j in range(len(chunk))])
-                        params = {f"p{j}": sid for j, sid in enumerate(chunk)}
-                        conn.execute(
-                            sa.text(
-                                f"DELETE FROM workstream_config WHERE ws_id IN ({placeholders})"
-                            ),
-                            params,
-                        )
-                        conn.execute(
-                            sa.text(f"DELETE FROM conversations WHERE ws_id IN ({placeholders})"),
-                            params,
-                        )
-                        result = conn.execute(
-                            sa.text(f"DELETE FROM workstreams WHERE ws_id IN ({placeholders})"),
-                            params,
-                        )
-                        stale += result.rowcount
 
-            conn.commit()
-        return (orphans, stale)
+        return _prune_workstreams_shared(
+            retention_days,
+            select_ids=_select_ids,
+            delete_candidate=self._delete_prune_candidate,
+        )
 
     def resolve_workstream(self, alias_or_id: str) -> str | None:
         with self._conn() as conn:

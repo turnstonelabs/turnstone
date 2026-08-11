@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core import fence
 from turnstone.core.log import get_logger
+from turnstone.core.trajectory import sanitize_client_send_ids
 
 log = get_logger(__name__)
 
@@ -537,6 +538,7 @@ def project_history_messages(
                     d = part.get("document", {})
                     attachments_meta.append(
                         {
+                            "attachment_id": str(part.get("attachment_id") or ""),
                             "kind": "text",
                             "filename": str(d.get("name", "")),
                             "mime_type": str(d.get("media_type", "")),
@@ -551,6 +553,7 @@ def project_history_messages(
         if isinstance(side_meta, list) and side_meta:
             attachments_meta = [
                 {
+                    "attachment_id": str(m.get("attachment_id") or ""),
                     "kind": str(m.get("kind") or ""),
                     "filename": str(m.get("filename") or ""),
                     "mime_type": str(m.get("mime_type") or ""),
@@ -583,6 +586,17 @@ def project_history_messages(
         #     user_interjection / tool_error / ...) for the operator bubble.
         if msg.get("_source"):
             entry["source"] = str(msg["_source"])
+
+        # Ordinary accepted user rows additionally carry participant
+        # attribution and one-shot optimistic-send correlation.  Both are
+        # role-local metadata and never enter the provider wire payload.
+        if role == "user":
+            sender = msg.get("_sender")
+            if isinstance(sender, str) and sender:
+                entry["sender"] = sender
+            stable_client_send_ids = sanitize_client_send_ids(msg.get("_client_send_ids"))
+            if stable_client_send_ids:
+                entry["client_send_ids"] = stable_client_send_ids
 
         # (3b) ``_source_meta`` side-channel → top-level ``meta``.  The
         #      operator turn's structured per-kind fields (``watch_triggered``'s

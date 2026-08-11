@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._js_harness_helpers import strip_js_comments
+
 _ROOT = Path(__file__).resolve().parent.parent
 _SHARED = _ROOT / "turnstone/shared_static"
 _SHELL_JS = _SHARED / "shell.js"
@@ -53,6 +55,7 @@ _ESM_BUNDLES = [
     _SHARED / "redact_credentials.js",
     _SHARED / "mcp_error.js",
     _SHARED / "copy_actions.js",
+    _SHARED / "tool_projection.js",
 ]
 
 # Sink scan: everything except renderer.js — the one sanctioned HTML-string
@@ -76,6 +79,7 @@ _ESM_NO_VAR_BUNDLES = [
     _SHARED / "redact_credentials.js",
     _SHARED / "mcp_error.js",
     _SHARED / "copy_actions.js",
+    _SHARED / "tool_projection.js",
 ]
 
 # The same unsafe DOM-write / dynamic-code sink set that ``test_app_js.py``
@@ -646,6 +650,19 @@ def test_step7_tab_menu_wired_per_kind() -> None:
     )
 
 
+def test_node_proxied_close_409_uses_plain_retry_copy() -> None:
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    start = shell.index('typeof window.closeWorkstream === "function"')
+    end = shell.index("return convTabMenu", start)
+    close = shell[start:end]
+
+    assert "r.status === 409" in close
+    assert (
+        "Conversation history is still being saved. Try ending the session again shortly." in close
+    )
+    assert "pm.close(pane.id)" in close, "successful and already-closed cases still drop the tab"
+
+
 def test_coordinator_tab_menu_enables_title_verbs() -> None:
     """Coordinators carry LLM/auto titles like interactive workstreams, so
     their tab dropdown must surface Refresh/Edit title — convTabMenu's
@@ -1136,54 +1153,14 @@ def test_popup_menu_shared_helper() -> None:
     )
 
 
-def _strip_js_comments_local(src: str) -> str:
-    """Copy-local of ``tests/test_app_js.py``'s helper (house convention:
-    these guard files stay import-independent of each other).
-
-    Needed because a bare ``"brand-home" in body`` substring test is a FALSE
-    guard -- that string also appears in prose comments, so it would stay
-    green after the class it names was renamed away.
-    """
-    out: list[str] = []
-    n = len(src)
-    i = 0
-    in_str: str | None = None
-    while i < n:
-        ch = src[i]
-        if in_str:
-            out.append(ch)
-            if ch == "\\" and i + 1 < n:
-                out.append(src[i + 1])
-                i += 2
-                continue
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        # Line comment: replace with spaces up to newline (preserve
-        # length so downstream offset math still works).
-        if ch == "/" and i + 1 < n and src[i + 1] == "/":
-            j = src.find("\n", i)
-            if j == -1:
-                j = n
-            out.append(" " * (j - i))
-            i = j
-            continue
-        # Block comment: replace with spaces up to closing */.
-        if ch == "/" and i + 1 < n and src[i + 1] == "*":
-            j = src.find("*/", i + 2)
-            if j == -1:
-                out.append(" " * (n - i))
-                i = n
-                continue
-            out.append(" " * (j + 2 - i))
-            i = j + 2
-            continue
-        if ch in ('"', "'", "`"):
-            in_str = ch
-        out.append(ch)
-        i += 1
-    return "".join(out)
+# Comment stripping comes from the shared string-aware helper in
+# tests/_js_harness_helpers (imported at module top) — the old
+# copy-local's "import-independent" house convention is defunct: several
+# harness suites already import the shared module, and per-suite copies
+# are how the strippers diverged into two semantics in the first place.
+# A bare ``"brand-home" in body`` substring test is a FALSE guard — the
+# string also appears in prose comments — so a stripped body is still
+# required for those pins.
 
 
 def test_proxy_shim_selectors_still_exist_in_shell_js() -> None:
@@ -1216,7 +1193,7 @@ def test_proxy_shim_selectors_still_exist_in_shell_js() -> None:
         "update this guard to match the new one -- do not delete it."
     )
 
-    body = _strip_js_comments_local(_SHELL_JS.read_text(encoding="utf-8"))
+    body = strip_js_comments(_SHELL_JS.read_text(encoding="utf-8"))
 
     # Names alone are NOT enough.  The shim's selector is a DESCENDANT
     # selector, so shell.js emitting all three classes while re-parenting

@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core import session_worker
 from turnstone.core.log import get_logger
 from turnstone.core.nudge_queue import WAKE_PENDING, NudgeQueue
-from turnstone.core.workstream import WorkstreamState
+from turnstone.core.workstream import WorkstreamState, concrete_method
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -38,7 +38,13 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
-def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") -> bool:
+def wake_workstream_if_pending(
+    ws: Workstream,
+    *,
+    trigger: str = "unspecified",
+    include_interjections: bool = False,
+    exclude_interjection_signature: object | None = None,
+) -> bool:
     """Spawn a wake send for *ws* when it is idle with drainable nudges.
 
     The shared gate behind both wake triggers:
@@ -52,6 +58,13 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
     *trigger* is a short label naming which path requested the wake
     (``"idle-transition"``, ``"watch-fire"``, ``"worker-exit"``); it is
     used only to tag the log lines below and never affects control flow.
+    ``include_interjections`` is reserved for the ownership-clear worker-exit
+    backstop.  It lets a user row enqueued after the outgoing turn's final
+    flush claim the existing wake delivery path; ordinary idle/watch/drain
+    calls retain their nudge-only gate.
+    ``exclude_interjection_signature`` is carried only by a queue-only wake
+    worker: if its failed preamble restored that exact queue snapshot, its own
+    exit does not immediately retry it.  A changed snapshot remains eligible.
 
     Gates, in order:
 
@@ -81,11 +94,14 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
       exit backstops (or the drain's clean exit when everything was
       retracted).  See the predicate's docstring for the staleness
       argument.
-    * nothing gate-eligible under ``WAKE_PENDING`` — tool-only/quiet entries
-      belong to the next tool-result seam, not a synthetic empty user
+    * nothing gate-eligible under ``WAKE_PENDING`` and no compatible
+      interjection claimed by the worker-exit backstop — tool-only/quiet
+      entries belong to the next tool-result seam, not a synthetic empty user
       turn (``deliver_wake_nudge_from_queue`` would no-op on them).
       ``"wake"``-channel entries (the coordinator idle nudges) ARE
-      gate-eligible: the wake is the only seam that can deliver them.
+      gate-eligible: the wake is the only seam that can deliver them.  The
+      interjection claim is session-owned and lock-safe; it refuses budget,
+      abandonment, persistence-poison, and repeated restored-queue attempts.
 
     Past the gates, exactly one info line is emitted per call:
 
@@ -109,6 +125,19 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
     session = ws.session
     if session is None or ws._closed or ws.state is not WorkstreamState.IDLE:
         return False
+    gone_probe = concrete_method(session, "is_workstream_gone")
+    if gone_probe is not None and gone_probe():
+        # A hard-deleted workstream (the terminal gone latch) cannot accept
+        # ANY unattended turn: send admission refuses under the latch and
+        # the cancel finalizer converges that refusal internally, so a wake
+        # spawned past this point burns its drained nudges for nothing —
+        # and the latch does not paint ERROR, so the IDLE gate above stays
+        # open without this arm.  Refuse the spawn; queued interjections
+        # stay retained (their disposition on a deleted workstream is
+        # #1001's).  Logged because every other refusal on this lane is
+        # silent and "my queued message never delivered" needs one trace.
+        log.info("nudge_wake.refused_workstream_gone ws=%s trigger=%s", ws.id[:8], trigger)
+        return False
     if ws.send_barrier_active():
         # Order-barrier yield: deferred sends (acknowledged "queued" —
         # see _PendingSend) are older than any nudge, and a wake worker
@@ -130,7 +159,29 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
     # Gate on WAKE_PENDING, not USER_DRAIN: ``"quiet"`` entries (external
     # events demoted by a user cancel) deliver at the next legitimate seam
     # but must never themselves wake the workstream the user just stopped.
-    if not isinstance(nudge_queue, NudgeQueue) or not nudge_queue.has_pending(WAKE_PENDING):
+    if not isinstance(nudge_queue, NudgeQueue):
+        return False
+    nudge_pending = nudge_queue.has_pending(WAKE_PENDING)
+    interjection_signature: object | None = None
+    if include_interjections and not nudge_pending:
+        # Concrete-hook lookup keeps this extension on the real ChatSession
+        # queue contract.  The method owns its queue lock and returns an
+        # exact-snapshot retry token; no queue state is read or interpreted by
+        # this orchestration module.
+        claim_interjection = concrete_method(session, "claim_pending_interjection_wake")
+        if claim_interjection is not None:
+            try:
+                interjection_signature = claim_interjection(
+                    exclude_signature=exclude_interjection_signature,
+                )
+            except Exception:
+                log.warning(
+                    "nudge_wake.interjection_claim_failed ws=%s trigger=%s",
+                    ws.id[:8],
+                    trigger,
+                    exc_info=True,
+                )
+    if not nudge_pending and interjection_signature is None:
         return False
 
     deferred = False
@@ -143,7 +194,9 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
         ws,
         enqueue=_noop_enqueue,
         run=session.deliver_wake_nudge_from_queue,
+        expected_session=session,
         thread_name=f"wake-nudge-{ws.id[:8]}",
+        interjection_wake_signature=interjection_signature,
     )
     if deferred:
         log.info("nudge_wake.deferred_worker_busy ws=%s trigger=%s", ws.id[:8], trigger)

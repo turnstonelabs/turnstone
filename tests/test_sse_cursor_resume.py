@@ -21,17 +21,15 @@ from __future__ import annotations
 import collections
 import os
 import tempfile
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 os.environ.setdefault("TURNSTONE_JWT_SECRET", "x" * 32)
 
 from tests._session_helpers import make_session
 from turnstone.core.session_routes import _resume_cursor_and_trim
 from turnstone.core.session_ui_base import SessionUIBase
+from turnstone.core.storage import get_storage
 from turnstone.core.storage._sqlite import SQLiteBackend
-
-if TYPE_CHECKING:
-    import pytest
 
 
 class _ConcreteUI(SessionUIBase):
@@ -216,7 +214,7 @@ def test_on_system_turn_returns_buffered_event_id() -> None:
 
 
 def test_append_system_turn_stamps_row_with_its_sse_event_id(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_db: str,
 ) -> None:
     """Regression: a system turn's persisted row carries the SAME ``event_id``
     as its live ``on_system_turn`` event.  Stamping the row with the pre-emit
@@ -225,19 +223,22 @@ def test_append_system_turn_stamps_row_with_its_sse_event_id(
     and the operator bubble rendered twice (the metacognition-nudge double)."""
     session = make_session()
     ui = session.ui  # NullUI is a real SessionUIBase → increments _event_id
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr(
-        "turnstone.core.session.save_message",
-        lambda *a, **k: captured.update(event_id=k.get("event_id")),
+    storage = get_storage()
+    storage.register_workstream(
+        session.ws_id,
+        user_id=session._user_id,
+        kind=session._kind,
+        parent_ws_id=session._parent_ws_id,
     )
     ui._enqueue({"type": "content"})  # advance past the prior turn
     session._append_system_turn("start", "ground yourself")
-    assert captured["event_id"] == ui._event_buffer[-1][0]
+    row = storage.load_messages(session.ws_id, repair=False)[-1]
+    assert row["_event_id"] == ui._event_buffer[-1][0]
     assert ui._event_buffer[-1][1]["type"] == "system_turn"
 
 
 def test_system_turn_bool_hook_return_falls_back_to_counter(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_db: str,
 ) -> None:
     """A duck-typed ``on_system_turn`` returning ``True`` (bool ⊂ int) must
     never stamp a boolean into the persisted row: PostgreSQL fails the
@@ -246,15 +247,18 @@ def test_system_turn_bool_hook_return_falls_back_to_counter(
     bools at the shared chokepoint and the stamp falls back to the
     ring-buffer counter (same guard class as ``parse_checkpoint_watermark``)."""
     session = make_session()
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr(
-        "turnstone.core.session.save_message",
-        lambda *a, **k: captured.update(event_id=k.get("event_id")),
+    storage = get_storage()
+    storage.register_workstream(
+        session.ws_id,
+        user_id=session._user_id,
+        kind=session._kind,
+        parent_ws_id=session._parent_ws_id,
     )
     session.ui.on_system_turn = lambda *_a, **_k: True
     session._append_system_turn("start", "ground yourself")
-    assert not isinstance(captured["event_id"], bool)
-    assert captured["event_id"] == session._ui_event_id()
+    row = storage.load_messages(session.ws_id, repair=False)[-1]
+    assert not isinstance(row["_event_id"], bool)
+    assert row["_event_id"] == session._ui_event_id()
 
 
 # ---------------------------------------------------------------------------

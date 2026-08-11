@@ -27,7 +27,8 @@ import pytest
 
 from tests._session_helpers import make_session
 from turnstone.core.session import _SummaryResult
-from turnstone.core.trajectory import turns_from_dicts
+from turnstone.core.storage._utils import _fork_turn_insert_row
+from turnstone.core.trajectory import PROVENANCE_META_KEY, TurnProvenance, turns_from_dicts
 
 
 def _marker_meta(watermark: int | None) -> str | None:
@@ -268,16 +269,76 @@ def test_compaction_persists_checkpoint_and_resume_is_bounded(tmp_db, mock_opena
     assert not any(t.startswith("turn ") for t in texts)  # full history NOT reloaded
 
 
+def test_marker_watermark_read_blip_recovers_on_retry(tmp_db, mock_openai_client):
+    """Round-3 review pin: a transient watermark-read failure aborts that
+    persist attempt — the journal classifies the marker row retrying with NO
+    meta bytes memoized — so the healthy retry re-reads and commits WITH a
+    watermark.  Memoizing the failed read as "absent" would durably commit a
+    permanently checkpoint-less marker: full-history rehydration and an
+    immediate re-compaction on every reopen."""
+    from unittest.mock import patch
+
+    from turnstone.core.memory import register_workstream, save_message
+    from turnstone.core.storage._registry import get_storage
+
+    ws = "wsBLIP"
+    register_workstream(ws, user_id="u1", name="t")
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"} for i in range(6)
+    ]
+    for h in history:
+        save_message(ws, h["role"], h["content"])
+
+    sess = make_session(client=mock_openai_client, context_window=10_000, max_tokens=1_000)
+    sess._ws_id = ws
+    sess.messages = turns_from_dicts(history)
+    sess._msg_tokens = [1] * len(history)
+
+    st = get_storage()
+    real_watermark = st.get_compaction_watermark
+    reads: list[int] = []
+
+    def _flaky_watermark(ws_id: str, preserve_tail: int = 0) -> int | None:
+        reads.append(preserve_tail)
+        if len(reads) == 1:
+            raise RuntimeError("transient watermark blip")
+        return real_watermark(ws_id, preserve_tail)
+
+    from turnstone.core.session import ConversationPersistenceError
+
+    with (
+        patch.object(
+            sess,
+            "_summarize_blocks",
+            return_value=_SummaryResult(text="DENSE SUMMARY", producer="summary-producer"),
+        ),
+        patch.object(st, "get_compaction_watermark", side_effect=_flaky_watermark),
+    ):
+        # The first persist attempt dies at the read and surfaces like any
+        # initial durability failure; the in-memory compaction stays applied
+        # and the marker row is retained in the journal, nothing durable yet.
+        with pytest.raises(ConversationPersistenceError):
+            sess._compact_messages(auto=False)
+        assert sess.conversation_persistence_status()["state"] == "retrying"
+        assert st.get_compaction_checkpoint(ws) is None
+        sess._reconcile_pending_conversation_commits(_force_retry=True)
+
+    assert sess.conversation_persistence_status()["state"] == "healthy"
+    checkpoint = st.get_compaction_checkpoint(ws)
+    assert checkpoint is not None
+    assert checkpoint == real_watermark(ws, 0)
+
+
 def test_compaction_summary_producer_survives_storage_round_trip(
     storage_backend, mock_openai_client
 ):
-    """The final summary producer is durable checkpoint metadata.
+    """Final summary producer and model provenance are durable metadata.
 
     A compaction marker has no provider-native payload, so its producer belongs
     in the marker's ``summary_producer`` meta field.  Checkpoint reconstruction
-    maps that object to the summary Turn's
-    ``meta.extra["source_meta"]``.  This intentionally pins only the producer;
-    the broader durable model/config/principal provenance tuple is #964 scope.
+    maps that object to the summary Turn's ``meta.extra["source_meta"]`` while
+    retaining the accepted model alias/backend/generation/principal tuple in
+    the well-known provenance envelope.
     """
     st = storage_backend
     ws = _register(st, "ws-summary-producer")
@@ -291,12 +352,20 @@ def test_compaction_summary_producer_survives_storage_round_trip(
     sess._ws_id = ws
     sess.messages = turns_from_dicts(history)
     sess._msg_tokens = [1] * len(history)
+    provenance = TurnProvenance(
+        model_alias="summary-alias",
+        backend_model_id="summary-kernel",
+        registry_generation=12,
+        acting_principal_id="user-alice",
+    )
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
             sess,
             "_summarize_blocks",
             lambda *_args, **_kwargs: _SummaryResult(
-                text="DENSE SUMMARY", producer="final-summary-producer"
+                text="DENSE SUMMARY",
+                producer="final-summary-producer",
+                provenance=provenance,
             ),
         )
         assert sess._compact_messages(auto=False) is True
@@ -307,11 +376,22 @@ def test_compaction_summary_producer_survives_storage_round_trip(
         if message.get("_source") == "compaction"
     )
     assert marker["_source_meta"]["summary_producer"] == "final-summary-producer"
+    assert "_provenance" not in marker
+    assert "user-alice" not in json.dumps(marker)
 
     loaded = st.load_message_turns(ws)
     assert [turn.text for turn in loaded[:2]] == ["[Conversation summary]", "DENSE SUMMARY"]
     assert "source_meta" not in loaded[0].meta.extra
     assert loaded[1].meta.extra["source_meta"]["summary_producer"] == "final-summary-producer"
+    assert loaded[1].meta.extra[PROVENANCE_META_KEY] == provenance.to_meta()
+    fork_row, _attachment_ids = _fork_turn_insert_row(
+        loaded[1],
+        "compaction-provenance-fork",
+        "2026-08-09T00:00:00",
+    )
+    fork_meta = json.loads(fork_row["meta"])
+    assert fork_meta["summary_producer"] == "final-summary-producer"
+    assert fork_meta[PROVENANCE_META_KEY] == provenance.to_meta()
 
     reopened = make_session(client=mock_openai_client, context_window=10_000, max_tokens=1_000)
     assert reopened.resume(ws) is True
@@ -320,6 +400,7 @@ def test_compaction_summary_producer_survives_storage_round_trip(
         reopened.messages[1].meta.extra["source_meta"]["summary_producer"]
         == "final-summary-producer"
     )
+    assert reopened.messages[1].meta.extra[PROVENANCE_META_KEY] == provenance.to_meta()
 
 
 # ---------------------------------------------------------------------------
@@ -505,10 +586,11 @@ def test_persist_truncation_uncompacted_matches_plain_tail_delete(tmp_db, mock_o
     assert st.count_messages(ws) == 3
 
 
-def test_persist_truncation_skips_delete_when_count_unavailable(tmp_db, mock_openai_client):
-    """count_messages==0 (the storage-error sentinel) must NOT delete — a wrong
-    truncation would lose user history."""
+def test_persist_truncation_propagates_atomic_storage_failure(tmp_db, mock_openai_client):
+    """The strict backend error must reach the failure-atomic session caller."""
     from unittest.mock import patch
+
+    import pytest
 
     from turnstone.core.memory import get_storage, register_workstream, save_message
 
@@ -519,25 +601,98 @@ def test_persist_truncation_skips_delete_when_count_unavailable(tmp_db, mock_ope
     st = get_storage()
     sess = make_session(client=mock_openai_client)
     sess._ws_id = ws
-    with patch("turnstone.core.session.count_messages", return_value=0):
+    with (
+        patch.object(
+            st,
+            "truncate_messages_tail",
+            side_effect=RuntimeError("injected atomic truncation failure"),
+        ),
+        pytest.raises(RuntimeError, match="injected atomic truncation failure"),
+    ):
         sess._persist_truncation(2)
     assert st.count_messages(ws) == 4  # nothing deleted
 
 
-def test_persist_truncation_skips_delete_when_floor_unavailable(tmp_db, mock_openai_client):
-    """get_compaction_floor==-1 (the storage-error sentinel) must NOT delete — a 0
-    floor on a compacted ws could otherwise drop the marker on an over-deep trim."""
+def test_persist_truncation_zero_is_a_storage_noop(tmp_db, mock_openai_client):
+    """A no-op plan never opens the strict backend transaction."""
     from unittest.mock import patch
 
-    from turnstone.core.memory import get_storage, register_workstream, save_message
+    from turnstone.core.memory import get_storage, register_workstream
 
     ws = "wsFloor"
     register_workstream(ws, user_id="u1", name="t")
-    for i in range(4):
-        save_message(ws, "user", f"m{i}")
     st = get_storage()
     sess = make_session(client=mock_openai_client)
     sess._ws_id = ws
-    with patch("turnstone.core.session.get_compaction_floor", return_value=-1):
-        sess._persist_truncation(2)
-    assert st.count_messages(ws) == 4  # nothing deleted
+    with patch.object(st, "truncate_messages_tail") as truncate:
+        assert sess._persist_truncation(0) == 0
+    truncate.assert_not_called()
+
+
+def test_watermark_reads_inside_the_marker_persist_not_before_the_commit(
+    tmp_db, mock_openai_client
+):
+    """The boundary is cut in the ordered durable batch, at persist time.
+
+    A pre-commit snapshot can undercount the durable prefix whenever accepted
+    rows are still pending in the journal when compaction is admitted (they
+    land, FIFO, before the marker's persist executes). Reading inside the
+    persist closure names exactly the summarized prefix; memoization keeps a
+    keyed lost-ACK retry byte-identical.
+    """
+    from unittest.mock import patch
+
+    from turnstone.core.memory import register_workstream, save_message
+    from turnstone.core.storage._registry import get_storage
+
+    ws = "wsWatermarkOrder"
+    register_workstream(ws, user_id="u1", name="t")
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"} for i in range(6)
+    ]
+    for h in history:
+        save_message(ws, h["role"], h["content"])
+
+    sess = make_session(client=mock_openai_client, context_window=10_000, max_tokens=1_000)
+    sess._ws_id = ws
+    sess.messages = turns_from_dicts(history)
+    sess._msg_tokens = [1] * len(history)
+
+    order: list[str] = []
+    real_journal = sess._journal_conversation_row_locked
+    # The persist closure reads the backend directly (bypassing the memory
+    # wrapper's error-to-None coercion), so the spy sits on the storage method.
+    st = get_storage()
+    real_watermark = st.get_compaction_watermark
+
+    def _journal_spy(**kwargs):
+        order.append("journal")
+        return real_journal(**kwargs)
+
+    def _watermark_spy(ws_id, preserve_tail=0):
+        order.append("watermark")
+        return real_watermark(ws_id, preserve_tail)
+
+    with (
+        patch.object(sess, "_journal_conversation_row_locked", side_effect=_journal_spy),
+        patch.object(st, "get_compaction_watermark", side_effect=_watermark_spy),
+        patch.object(
+            sess,
+            "_summarize_blocks",
+            return_value=_SummaryResult(text="DENSE SUMMARY", producer="summary-producer"),
+        ),
+    ):
+        assert sess._compact_messages(auto=False) is True
+
+    assert order == ["journal", "watermark"], order
+
+    # The durable marker's boundary covers every row persisted before it.
+    from turnstone.core.storage import get_storage
+
+    rows = get_storage().load_messages(ws, repair=False, include_compaction=True)
+    marker = next(r for r in rows if r.get("_source") == "compaction")
+    watermark = (marker.get("_source_meta") or {}).get("watermark")
+    plain_ids = [r["id"] for r in rows if r.get("_source") != "compaction" if "id" in r]
+    assert isinstance(watermark, int)
+    if plain_ids:
+        assert watermark >= max(plain_ids)

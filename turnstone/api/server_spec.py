@@ -97,9 +97,15 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/{ws_id}/close",
         "POST",
         "Close a workstream",
+        description=(
+            "Unloads the live workstream while preserving storage. Returns 409 "
+            "when any accepted live conversation row still requires persistence "
+            "reconciliation; the workstream remains loaded and its history journal "
+            "is retained."
+        ),
         request_model=CloseWorkstreamRequest,
         response_model=StatusResponse,
-        error_codes=[400, 404],
+        error_codes=[400, 404, 409],
         tags=["Workstreams"],
     ),
     # --- Chat ---
@@ -163,17 +169,27 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/{ws_id}/rewind",
         "POST",
         "Drop the last N conversation turns (emits clear_ui)",
+        description=(
+            "Claims the workstream mutation slot, durably truncates the requested "
+            "tail, then emits clear_ui. Concurrent sends are ordered after the "
+            "cut; a storage failure returns 503 without changing live history."
+        ),
         request_model=RewindRequest,
         response_model=StatusResponse,
-        error_codes=[400, 404],
+        error_codes=[400, 404, 503],
         tags=["Chat"],
     ),
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/retry",
         "POST",
         "Drop the last response and re-send the last user message",
+        description=(
+            "Uses one workstream worker claim for the durable truncation and the "
+            "replacement generation, so another send cannot enter between them. "
+            "A storage failure returns 503 without changing live history."
+        ),
         response_model=StatusResponse,
-        error_codes=[400, 404],
+        error_codes=[400, 404, 503],
         tags=["Chat"],
     ),
     # --- Streaming ---
@@ -182,7 +198,37 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "GET",
         "Per-workstream SSE event stream",
         description="Opens a Server-Sent Events stream scoped to a single workstream. "
-        "Returns text/event-stream. See API reference for event types.",
+        "After rendering REST history, pass its opaque handoff_token once as "
+        "?history_token=; it names the exact accepted conversation-row prefix used "
+        "for that render. A history_resync event closes this stream and requires a "
+        "fresh history read; numeric event replay is not a substitute. Native "
+        "Last-Event-ID reconnects take priority. Pass ?user_turn=1 to opt into "
+        "typed accepted-user events; otherwise those rows become a backward-compatible "
+        "strong-repair frame. Pass ?tool_turn=1 to receive the final accepted tool row "
+        "as a typed tool_result with accepted=true; without it, accepted tool rows use "
+        "the same pre-row strong-repair projection. Returns "
+        "text/event-stream. See API reference for event types.",
+        query_params=[
+            QueryParam(
+                "last_event_id",
+                "Numeric per-workstream event cursor for manual reconnects.",
+                schema_type="integer",
+            ),
+            QueryParam(
+                "history_token",
+                "Opaque one-shot token naming the accepted prefix rendered from REST history.",
+            ),
+            QueryParam(
+                "user_turn",
+                "Set to 1 to receive typed user_turn events instead of history-repair frames.",
+                schema_type="integer",
+            ),
+            QueryParam(
+                "tool_turn",
+                "Set to 1 to receive final accepted tool_result projections.",
+                schema_type="integer",
+            ),
+        ],
         error_codes=[404],
         tags=["Streaming"],
     ),
@@ -254,10 +300,20 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         description=(
             "Returns the tail of the conversation in OpenAI-like message "
             "format. Persisted-but-not-loaded workstreams (closed / "
-            "evicted) serve history without rehydrating. Lifted from "
+            "evicted) are rehydrated before history is served so every "
+            "successful response participates in the REST-to-SSE handoff. Lifted from "
             "the coord-only surface in the Stage 2 history/detail verb "
             "lift — interactive previously only exposed history through "
-            "the SSE replay on ``/events``."
+            "the SSE replay on ``/events``. Messages are the "
+            "requested limit-bounded tail of one authoritative total accepted "
+            "conversation-row prefix: "
+            "user, assistant, tool, and system rows, including projected compaction "
+            "checkpoints and cancellation markers. The opaque handoff_token names "
+            "the exact prefix used for the render and is passed once on initial SSE "
+            "registration. Admission of a later row changes the token; durable "
+            "acknowledgement does not. If the durable prefix cannot be loaded, the "
+            "endpoint returns 503 with `History temporarily unavailable`; that "
+            "response is not authoritative and supplies no usable handoff token."
         ),
         response_model=WorkstreamHistoryResponse,
         query_params=[

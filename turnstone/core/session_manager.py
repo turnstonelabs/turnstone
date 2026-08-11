@@ -17,10 +17,16 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
+from turnstone.core.adapters._ui_cleanup import _broadcast_ws_closed_to_listeners
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import ModelClientConstructionError, UnknownModelAliasError
 from turnstone.core.personas import snapshot_from_config
-from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
+from turnstone.core.workstream import (
+    Workstream,
+    WorkstreamKind,
+    WorkstreamState,
+    concrete_method,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -31,6 +37,78 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = get_logger(__name__)
+
+
+def _session_has_unresolved_persistence(session: Any) -> bool:
+    """Read the concrete ChatSession hook without MagicMock auto-vivification.
+
+    Blocking probe — callable only from contexts holding no workstream or
+    manager lock (it acquires the session's generation and handoff locks).
+    Retirement scans use :func:`_session_persistence_blocks_retirement`.
+    """
+    check = concrete_method(session, "has_unresolved_conversation_persistence")
+    return bool(check()) if check is not None else False
+
+
+def _session_persistence_blocks_retirement(session: Any) -> bool:
+    """Non-blocking retirement gate: unresolved OR momentarily unprobeable.
+
+    The idle-close and eviction scans call this while holding ``ws._lock``
+    (and, for the eviction comprehension, the manager lock). The probe must
+    therefore never block on the session's generation/handoff locks — that
+    inverts the generation→workstream/manager order force-cancel's finalizer
+    and deferred state publication hold, an AB/BA deadlock (round-4 review).
+    ``None`` (locks busy) reads as True: a busy session is simply not
+    retirable this sweep; the next sweep re-probes.
+    """
+    probe = concrete_method(session, "has_unresolved_conversation_persistence_nowait")
+    if probe is None:
+        # Compatibility/test doubles carry no real locks; the blocking read
+        # is safe and preserves their scripted answers.
+        return _session_has_unresolved_persistence(session)
+    state = probe()
+    return state is None or bool(state)
+
+
+def _session_prepare_soft_close(session: Any) -> bool:
+    """Run the concrete close fence; compatibility/test doubles have no hook."""
+    prepare = concrete_method(session, "prepare_soft_close")
+    if prepare is None:
+        return not _session_has_unresolved_persistence(session)
+    return bool(prepare())
+
+
+def _session_reconcile_unresolved_persistence_if_due(session: Any, now: float) -> bool:
+    """Call the concrete retry seam without MagicMock auto-vivification."""
+    reconcile = concrete_method(session, "reconcile_unresolved_persistence_if_due")
+    return bool(reconcile(now=now)) if reconcile is not None else False
+
+
+def _session_conversation_persistence_fatal_revision(session: Any) -> int | None:
+    """Return a concrete session's exact persistence-owned fatal revision."""
+    read_revision = concrete_method(session, "conversation_persistence_fatal_revision")
+    revision = read_revision() if read_revision is not None else None
+    return revision if isinstance(revision, int) and not isinstance(revision, bool) else None
+
+
+def _session_acknowledge_conversation_persistence_recovery(
+    session: Any,
+    revision: int,
+) -> bool:
+    """Retire only the exact fatal latch that a manager repair recovered."""
+    acknowledge = concrete_method(session, "acknowledge_conversation_persistence_state_recovery")
+    return bool(acknowledge(revision)) if acknowledge is not None else False
+
+
+def _notify_persistence_state_changed(ui: Any) -> None:
+    """Refresh a concrete UI projection after manager-owned ERROR recovery."""
+    callback = concrete_method(ui, "on_persistence_state_changed")
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        log.debug("session_mgr.persistence_state_refresh_failed", exc_info=True)
 
 
 class WorkstreamAlreadyExistsError(RuntimeError):
@@ -60,6 +138,7 @@ _KIND_SERVICE_TYPE: dict[WorkstreamKind, str] = {
 # reservations abandoned for two hours qualify.
 STALE_CREATE_GRACE_SECONDS = 2 * 60 * 60
 STALE_CREATE_SWEEP_INTERVAL_SECONDS = 5 * 60
+PERSISTENCE_RECONCILE_INTERVAL_SECONDS = 1.0
 
 
 class SessionKindAdapter(Protocol):
@@ -230,6 +309,12 @@ class SessionManager:
         self._model_validator = model_validator
         self._node_id = node_id
         self._workstreams: dict[str, Workstream] = {}
+        # A hard-delete whose storage outcome is ambiguous may be the sole
+        # owner of an accepted conversation repair journal. Keep that exact
+        # terminal object off every user/capacity surface until maintenance or
+        # an explicit delete retry proves it safe to retire.
+        self._failed_delete_tombstones: dict[str, Workstream] = {}
+        self._failed_delete_unadvertised: set[str] = set()
         # Deferred creates are addressable internally before their pre-commit
         # transaction finishes. Keep the exact reservation object beyond a
         # racing close/delete so the rollback cannot ABA-delete a successor
@@ -970,7 +1055,7 @@ class SessionManager:
         try:
             with open_lock:
                 with self._lock:
-                    if ws_id in self._retiring_ids:
+                    if ws_id in self._retiring_ids or ws_id in self._failed_delete_tombstones:
                         return None
                     existing = self._workstreams.get(ws_id)
                     if existing is not None and self._pending_creates.get(ws_id) is existing:
@@ -1482,7 +1567,11 @@ class SessionManager:
         token, so a delete/re-register ABA cannot erase the replacement row.
         """
         with self._lock:
-            candidate = self._workstreams.get(ws_id) or self._pending_creates.get(ws_id)
+            candidate = (
+                self._workstreams.get(ws_id)
+                or self._pending_creates.get(ws_id)
+                or self._failed_delete_tombstones.get(ws_id)
+            )
             if candidate is not None and (
                 candidate._create_publication_active
                 and candidate._create_publication_thread == threading.get_ident()
@@ -1497,7 +1586,10 @@ class SessionManager:
 
         with candidate._lifecycle_lock:
             with self._lock:
-                if self._workstreams.get(ws_id) is not candidate:
+                if (
+                    self._workstreams.get(ws_id) is not candidate
+                    and self._failed_delete_tombstones.get(ws_id) is not candidate
+                ):
                     return False
                 token_direction_needed = bool(
                     expected_reservation_token
@@ -1510,6 +1602,7 @@ class SessionManager:
             # Resolve that direction without the global manager mutex: the
             # per-id + object lifecycle lanes stabilize ``candidate`` while a
             # database row lock may legitimately block.
+            current_row: dict[str, Any] | None = None
             current_token = ""
             if token_direction_needed:
                 current_row = self._storage.ensure_workstream_incarnation_snapshot(ws_id)
@@ -1520,7 +1613,10 @@ class SessionManager:
                 )
 
             with self._lock:
-                if self._workstreams.get(ws_id) is not candidate:
+                if (
+                    self._workstreams.get(ws_id) is not candidate
+                    and self._failed_delete_tombstones.get(ws_id) is not candidate
+                ):
                     return False
                 # * durable == local: request is stale; leave local untouched
                 # * durable == expected: local is stale; retire it, then let
@@ -1531,7 +1627,22 @@ class SessionManager:
                         return False
                     if current_token != expected_reservation_token:
                         return False
-                was_unadvertised = self._pending_creates.get(ws_id) is candidate
+                deleting_authorized_successor = bool(
+                    token_direction_needed and current_token == expected_reservation_token
+                )
+                was_unadvertised = (
+                    False
+                    if deleting_authorized_successor
+                    else (
+                        self._pending_creates.get(ws_id) is candidate
+                        or ws_id in self._failed_delete_unadvertised
+                    )
+                )
+                delete_event_name = name or (
+                    str(current_row.get("name") or "")
+                    if deleting_authorized_successor and current_row is not None
+                    else candidate.name
+                )
                 candidate._lifecycle_terminal_active = True
                 self._retain_state_tail_locked(candidate)
 
@@ -1552,7 +1663,18 @@ class SessionManager:
                     None,
                 )
                 if callable(drain_durability):
-                    drain_durability()
+                    try:
+                        drain_durability()
+                    except BaseException:
+                        # A successful exact delete makes an unresolved
+                        # conversation repair irrelevant. Continue to that
+                        # authoritative operation; an ambiguous outcome below
+                        # retains the journal tombstone.
+                        log.warning(
+                            "session_mgr.delete_persisted.terminal_repair_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
 
                 # Drain every admitted predecessor state write before the hard
                 # delete. The per-id lifecycle lane prevents a successor from
@@ -1568,22 +1690,29 @@ class SessionManager:
                     deleted = delete_fn()
 
                 if not deleted:
-                    # Exact deletion can fail only when the durable row/token
-                    # no longer matches the authorized snapshot. This local
-                    # object is therefore a stale incarnation; reopening it
-                    # would leave the manager serving predecessor state over a
-                    # same-id replacement. Retire it silently (the replacement
-                    # was not deleted, so no terminal event is ours to emit).
-                    self._retire_failed_persisted_delete(candidate)
+                    # A conforming exact-delete false normally proves a
+                    # missing/replaced incarnation. Treat it as an ambiguous
+                    # storage outcome nevertheless: a transient implementation
+                    # or wrapper may return false while the same durable row
+                    # survives. Never discard that row's only structural or
+                    # conversation repair owner in the latter case.
+                    self._dispose_ambiguous_failed_delete(
+                        candidate,
+                        was_unadvertised=was_unadvertised,
+                    )
                     return False
 
                 with self._lock:
-                    if self._workstreams.get(ws_id) is not candidate:
+                    if (
+                        self._workstreams.get(ws_id) is not candidate
+                        and self._failed_delete_tombstones.get(ws_id) is not candidate
+                    ):
                         # The id + object lifecycle lanes make this impossible
                         # for conforming paths; never emit against a replacement.
                         candidate._lifecycle_terminal_active = False
                         return False
                     self._workstreams.pop(ws_id, None)
+                    self._drop_delete_tombstone_locked(ws_id)
                     if self._pending_creates.get(ws_id) is candidate:
                         self._pending_creates.pop(ws_id, None)
                     if ws_id in self._order:
@@ -1603,19 +1732,87 @@ class SessionManager:
                     self._event_emitter.emit_closed(
                         ws_id,
                         reason="deleted",
-                        name=name or candidate.name,
+                        name=delete_event_name,
                     )
                 return True
             except BaseException:
-                # The terminal claim and publication latch cannot safely be
-                # rolled back: a concurrent worker may already have observed
-                # them. Retire this exact local object without publishing a
-                # false deleted event; if the durable row survived, a later
-                # open rehydrates a fresh object/incarnation cleanly.
-                self._retire_failed_persisted_delete(candidate)
+                self._dispose_ambiguous_failed_delete(
+                    candidate,
+                    was_unadvertised=was_unadvertised,
+                )
                 raise
             finally:
                 self._release_state_tail(candidate)
+
+    def _dispose_ambiguous_failed_delete(
+        self,
+        candidate: Workstream,
+        *,
+        was_unadvertised: bool,
+    ) -> None:
+        """One disposition for every ambiguous exact-delete outcome.
+
+        The false-return and raise paths of ``_delete_persisted`` must
+        stay behaviorally identical: a policy edit applied to one fork
+        only would let the rarer path silently retire a tombstone that is
+        the sole owner of an accepted repair journal.
+        """
+        disposition = self._failed_delete_durable_disposition(candidate)
+        if disposition in {"missing", "different"}:
+            # Missing/different proves this object's journal can no
+            # longer repair the durable row. Retire silently: the
+            # probe is not atomic with lifecycle fan-out, so a remote
+            # same-id successor could be created before a tokenless
+            # close event and be erased from collector/client caches.
+            self._retire_failed_persisted_delete(candidate)
+        elif _session_has_unresolved_persistence(candidate.session):
+            # Same or unreadable durable incarnation plus unresolved
+            # journal is the one lossless failure state: hide it from
+            # open/create/capacity, retain it for an idempotent exact-
+            # delete retry, and emit no false close. Its ws-id-only row
+            # closures must never background-replay across an ABA.
+            self._retain_failed_persisted_delete_tombstone(
+                candidate,
+                was_unadvertised=was_unadvertised,
+            )
+        else:
+            # The durable prefix is complete, so the historical
+            # retire-and-rehydrate behavior remains safe.
+            self._retire_failed_persisted_delete(candidate)
+
+    def _drop_delete_tombstone_locked(
+        self,
+        ws_id: str,
+        *,
+        candidate: Workstream | None = None,
+    ) -> bool:
+        """Retire the (tombstone, unadvertised-flag) PAIR under ``self._lock``.
+
+        The two structures are only ever mutated together: a pop that missed
+        the flag discard would leave a stale unadvertised marker that
+        suppresses a later same-id delete's ``ws_closed`` event, and a
+        discard that outlived an identity-gated pop would strip a REPLACEMENT
+        tombstone's flag (round-5 review — both halves of the drift). When
+        ``candidate`` is supplied and a different object holds the tombstone,
+        neither half is touched.
+        """
+        if candidate is not None and self._failed_delete_tombstones.get(ws_id) is not candidate:
+            return False
+        self._failed_delete_tombstones.pop(ws_id, None)
+        self._failed_delete_unadvertised.discard(ws_id)
+        return True
+
+    def _retain_delete_tombstone_locked(
+        self,
+        ws_id: str,
+        candidate: Workstream,
+        *,
+        was_unadvertised: bool,
+    ) -> None:
+        """Install the (tombstone, unadvertised-flag) PAIR under ``self._lock``."""
+        self._failed_delete_tombstones[ws_id] = candidate
+        if was_unadvertised:
+            self._failed_delete_unadvertised.add(ws_id)
 
     def _retire_failed_persisted_delete(self, candidate: Workstream) -> None:
         """Silently retire the exact object after a failed hard-delete."""
@@ -1624,6 +1821,8 @@ class SessionManager:
         with self._lock:
             if self._workstreams.get(ws_id) is candidate:
                 self._workstreams.pop(ws_id, None)
+                retired = True
+            if self._drop_delete_tombstone_locked(ws_id, candidate=candidate):
                 retired = True
             if self._pending_creates.get(ws_id) is candidate:
                 self._pending_creates.pop(ws_id, None)
@@ -1641,6 +1840,56 @@ class SessionManager:
                 ws_id[:8],
                 exc_info=True,
             )
+
+    def _retain_failed_persisted_delete_tombstone(
+        self,
+        candidate: Workstream,
+        *,
+        was_unadvertised: bool,
+    ) -> None:
+        """Hide an exact terminal object while preserving its repair journal."""
+        ws_id = candidate.id
+        with self._lock:
+            if self._workstreams.get(ws_id) is candidate:
+                self._workstreams.pop(ws_id, None)
+            if self._pending_creates.get(ws_id) is candidate:
+                self._pending_creates.pop(ws_id, None)
+            if ws_id in self._order:
+                self._order.remove(ws_id)
+            if self._active_id == ws_id:
+                self._active_id = self._first_visible_id_locked()
+            self._retain_delete_tombstone_locked(
+                ws_id, candidate, was_unadvertised=was_unadvertised
+            )
+        ui = candidate.ui
+        if ui is not None and hasattr(ui, "_listeners_lock"):
+            # A retained tombstone is terminal to every user-facing surface,
+            # but cleanup_ui would destroy the session/journal that makes the
+            # ambiguous delete lossless. Quiesce only its per-workstream SSE
+            # transports; the sentinel is consumed internally and is not a
+            # false lifecycle ws_closed event.
+            _broadcast_ws_closed_to_listeners(ui)
+
+    def _failed_delete_durable_disposition(self, candidate: Workstream) -> str:
+        """Classify the exact durable incarnation after an ambiguous delete."""
+        snapshot = getattr(self._storage, "ensure_workstream_incarnation_snapshot", None)
+        if not callable(snapshot):
+            return "unknown"
+        try:
+            row = snapshot(candidate.id)
+        except Exception:
+            log.warning(
+                "session_mgr.delete_persisted.snapshot_failed ws=%s",
+                candidate.id[:8],
+                exc_info=True,
+            )
+            return "unknown"
+        if row is None:
+            return "missing"
+        durable_token = str(row.get("fork_reservation_token") or "")
+        if durable_token != candidate._fork_reservation_token:
+            return "different"
+        return "same"
 
     # ------------------------------------------------------------------
     # close / set_state / close_idle
@@ -1671,6 +1920,41 @@ class SessionManager:
             with self._lock:
                 if self._workstreams.get(ws_id) is not ws:
                     return False
+            # Close admission must become terminal to dispatch before the
+            # session fence begins. ``prepare_soft_close`` may wait for an
+            # admitted durability batch; leaving ``_closed`` false across that
+            # wait lets a racing session_worker claim a fresh slot and report
+            # the send accepted even though ChatSession will reject its later
+            # generation claim. Both sides serialize on ``ws._lock``, making
+            # this the linearization point for close versus dispatch.
+            with ws._lock:
+                if ws._closed:
+                    return False
+                ws._closed = True
+                ws._state_revision += 1
+
+            prepared = False
+            try:
+                if not _session_prepare_soft_close(ws.session):
+                    # An accepted conversation row is still unresolved.
+                    # Removing the sole live handoff journal would make that
+                    # row disappear on reopen; retain the exact workstream so
+                    # storage recovery can reconcile it idempotently.
+                    return False
+                prepared = True
+            finally:
+                if not prepared:
+                    # The session refused (or raised during) preparation, so
+                    # this incarnation remains live. Advance rather than
+                    # restoring the old revision: a deferred state write that
+                    # observed the temporary tombstone must not regain
+                    # ownership through a revision ABA.
+                    with ws._lock:
+                        ws._closed = False
+                        ws._state_revision += 1
+            with self._lock:
+                if self._workstreams.get(ws_id) is not ws:
+                    return False
                 self._workstreams.pop(ws_id, None)
                 was_unadvertised = self._pending_creates.get(ws_id) is ws
                 if was_unadvertised:
@@ -1681,11 +1965,9 @@ class SessionManager:
                 if self._active_id == ws_id:
                     self._active_id = self._first_visible_id_locked()
 
-            # Publish the in-memory tombstone immediately. Storage and cleanup
-            # may block, but unrelated workstreams and manager lookups do not.
-            with ws._lock:
-                ws._closed = True
-                ws._state_revision += 1
+            # The dispatch tombstone was published before session preparation.
+            # Storage and cleanup may block, but unrelated workstreams and
+            # manager lookups do not.
             try:
                 self._adapter.cleanup_ui(ws)
             finally:
@@ -2124,6 +2406,133 @@ class SessionManager:
             )
         return reaped
 
+    def reconcile_unresolved_persistence(self, *, now: float | None = None) -> list[str]:
+        """Attempt every due transient conversation repair without manager locks.
+
+        The maintenance owner is shared per process; sessions retain only a
+        monotonic due timestamp. Permanent commit conflicts deliberately stay
+        fail-stopped until explicit deletion instead of consuming retry work.
+        Returns ids whose prefix became durable this pass or whose previously
+        reconciled persistence-owned ``ERROR`` state was retired, plus hidden
+        delete tombstones retired after a probe proved their durable
+        incarnation missing or different.
+        """
+        check_at = time.monotonic() if now is None else now
+        with self._lock:
+            candidates = [
+                ws
+                for ws in self._workstreams.values()
+                if ws.session is not None and self._pending_creates.get(ws.id) is not ws
+            ]
+            delete_tombstones = list(self._failed_delete_tombstones.values())
+
+        repaired: list[str] = []
+        for ws in candidates:
+            with ws._lock:
+                session = ws.session
+                if (
+                    session is None
+                    or ws._closed
+                    or ws._worker_running
+                    or ws._lifecycle_terminal_active
+                ):
+                    continue
+                error_state_revision = (
+                    ws._state_revision if ws.state is WorkstreamState.ERROR else None
+                )
+            fatal_revision = (
+                _session_conversation_persistence_fatal_revision(session)
+                if error_state_revision is not None
+                else None
+            )
+            unresolved = _session_has_unresolved_persistence(session)
+            attempted = False
+            if unresolved:
+                try:
+                    attempted = _session_reconcile_unresolved_persistence_if_due(
+                        session,
+                        check_at,
+                    )
+                except Exception:
+                    log.warning(
+                        "session_mgr.persistence_reconcile_failed ws=%s",
+                        ws.id[:8],
+                        exc_info=True,
+                    )
+                    continue
+            recovery_ready = (attempted and not _session_has_unresolved_persistence(session)) or (
+                not unresolved and fatal_revision is not None
+            )
+            if recovery_ready:
+                repaired.append(ws.id)
+                idle_revision: int | None = None
+                if fatal_revision is not None:
+                    # A persistence failure is a fatal turn outcome and leaves
+                    # the workstream ERROR. Once its exact journal boundary is
+                    # repaired, retire only that unchanged error state. A new
+                    # worker, successor session, lifecycle tombstone, or any
+                    # intervening state revision wins and keeps its state.
+                    with self._lock:
+                        still_owned = (
+                            self._workstreams.get(ws.id) is ws
+                            and self._pending_creates.get(ws.id) is not ws
+                            and not ws._lifecycle_terminal_active
+                        )
+                    if (
+                        still_owned
+                        and _session_conversation_persistence_fatal_revision(session)
+                        == fatal_revision
+                    ):
+                        with ws._lock:
+                            if (
+                                ws.session is session
+                                and not ws._closed
+                                and not ws._worker_running
+                                and ws.state is WorkstreamState.ERROR
+                                and ws._state_revision == error_state_revision
+                            ):
+                                self._apply_live_state(ws, WorkstreamState.IDLE, "")
+                                idle_revision = ws._state_revision
+                if idle_revision is not None:
+                    assert fatal_revision is not None
+                    _session_acknowledge_conversation_persistence_recovery(
+                        session,
+                        fatal_revision,
+                    )
+                    try:
+                        published = self._run_state_tail(
+                            ws,
+                            idle_revision,
+                            WorkstreamState.IDLE,
+                        )
+                    except Exception:
+                        log.warning(
+                            "session_mgr.persistence_recovery_state_failed ws=%s",
+                            ws.id[:8],
+                            exc_info=True,
+                        )
+                    else:
+                        if published:
+                            _notify_persistence_state_changed(ws.ui)
+
+        # Ambiguous hard-delete objects are intentionally absent from the
+        # ordinary candidate list. A missing/different durable incarnation is
+        # proof that their predecessor journal can never be applied and may be
+        # retired. A same/unknown incarnation remains hidden for an explicit
+        # token-guarded delete retry: captured row closures are keyed only by
+        # ws_id, so a snapshot-then-background-save would race a remote same-id
+        # replacement and write predecessor history into it.
+        for tombstone in delete_tombstones:
+            with self._id_lifecycle(tombstone.id), tombstone._lifecycle_lock:
+                with self._lock:
+                    if self._failed_delete_tombstones.get(tombstone.id) is not tombstone:
+                        continue
+                disposition = self._failed_delete_durable_disposition(tombstone)
+                if disposition in {"missing", "different"}:
+                    self._retire_failed_persisted_delete(tombstone)
+                    repaired.append(tombstone.id)
+        return repaired
+
     def close_idle(self, max_age_seconds: float) -> list[str]:
         """Close IDLE workstreams inactive for more than ``max_age_seconds``.
 
@@ -2267,6 +2676,7 @@ class SessionManager:
                     ws._closed
                     or ws.state is not WorkstreamState.IDLE
                     or ws._worker_running
+                    or _session_persistence_blocks_retirement(ws.session)
                     or (now - ws.last_active) <= max_age_seconds
                 ):
                     return False
@@ -2334,9 +2744,10 @@ class SessionManager:
         same lock, so an IDLE workstream whose turn/command was admitted cannot
         be evicted between the hint and the terminal claim.
         """
+        persistence_recovery_attempted = False
         while True:
             with self._lock:
-                if ws_id in self._retiring_ids:
+                if ws_id in self._retiring_ids or ws_id in self._failed_delete_tombstones:
                     raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} is retiring")
                 if ws_id in self._workstreams or ws_id in self._pending_creates:
                     raise WorkstreamAlreadyExistsError(
@@ -2365,10 +2776,15 @@ class SessionManager:
                         and candidate.state is WorkstreamState.IDLE
                         and not candidate._worker_running
                         and not candidate.send_barrier_active()
+                        and not _session_persistence_blocks_retirement(candidate.session)
                     ),
                     key=lambda candidate: candidate.last_active,
                 )
             if not candidates:
+                if not persistence_recovery_attempted:
+                    persistence_recovery_attempted = True
+                    self.reconcile_unresolved_persistence()
+                    continue
                 raise RuntimeError(f"All {self._max_active} slots are active")
 
             for victim in candidates:
@@ -2389,6 +2805,7 @@ class SessionManager:
                             or victim.state is not WorkstreamState.IDLE
                             or victim._worker_running
                             or victim.send_barrier_active()
+                            or _session_persistence_blocks_retirement(victim.session)
                         ):
                             worker_free_idle = False
                         else:

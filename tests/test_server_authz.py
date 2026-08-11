@@ -254,6 +254,9 @@ class _FakeSession:
         # When set, queue_message records the attempt and then raises it
         # (e.g. CrossUserInterjectionError for the drain's re-park arm).
         self.queue_raises: BaseException | None = None
+        # Principals for whom the fake models a retained queue item owned by
+        # somebody else.  The real session checks this at fresh-slot admission.
+        self.foreign_queue_principals: set[str] = set()
         self.fork_calls: list[tuple[str, str, bool]] = []
         # DELETE /send fall-through: ids the route asked this session to
         # dequeue (the fake never holds interjections, so it returns
@@ -273,13 +276,18 @@ class _FakeSession:
         attachment_ids: Any = None,
         queue_msg_id: str | None = None,
         interjector_user_id: str = "",
+        turn_principal_id: str | None = None,
     ) -> tuple[str, str, str]:
+        del turn_principal_id
         self.queue_calls.append(text)
         if self.queue_raises is not None:
             raise self.queue_raises
         cap = INTERJECTION_CAP_CHARS
         cleaned = text[:cap] + "..." if len(text) > cap else text
         return cleaned, "notice", queue_msg_id or "m1"
+
+    def has_foreign_queued_messages(self, principal_id: str) -> bool:
+        return principal_id in self.foreign_queue_principals
 
     def dequeue_message(self, msg_id: str) -> bool:
         self.dequeues.append(msg_id)
@@ -950,9 +958,11 @@ class TestListWorkstreamsTrustedTeamVisibility:
             "user_id",
             "project_id",
             "persona",
+            "persistence_state",
         }
         assert row["kind"] == "interactive"
         assert row["user_id"] == "user-shape"
+        assert row["persistence_state"] == "healthy"
         # parent_ws_id is None for top-level interactive workstreams
         # (only coord-spawned children carry it).
         assert row["parent_ws_id"] is None
@@ -989,6 +999,26 @@ class TestDashboardTrustedTeamVisibility:
         # The 1.6 singular field is GONE, not null — a consumer still
         # reading it should break loudly, not read None forever.
         assert "pending_approval_detail" not in rows[0]
+
+    def test_dashboard_projects_only_sanitized_persistence_state(self, app_client):
+        client, mgr = app_client
+        created = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "needs-history-repair"},
+            headers=_auth("user-a"),
+        )
+        ws = mgr.get(created.json()["ws_id"])
+        ws.session.conversation_persistence_status = lambda: {
+            "state": "retrying",
+            "attempts": 2,
+            "last_failure_at": "not-public",
+        }
+
+        row = client.get("/v1/api/dashboard", headers=_auth("user-a")).json()["workstreams"][0]
+
+        assert row["persistence_state"] == "retrying"
+        assert "attempts" not in row
+        assert "last_failure_at" not in row
 
     def test_dashboard_pending_approval_details_merge_judge_verdict(self, app_client):
         """When _pending_approval is set on a ws's UI, /dashboard
@@ -1223,10 +1253,12 @@ class TestPerWsSseGate:
         assert storage is not None
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.get(
-            "/v1/api/workstreams/ws-victim/events",
+            "/v1/api/workstreams/ws-victim/events?user_turn=1",
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
+        assert "user_turn" not in resp.text
+        assert "projection" not in resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -1317,6 +1349,51 @@ class TestInteractiveCancelLifted:
         # (worker_thread, _worker_running) pair").
         assert ws.worker_thread is None
         assert ws._worker_running is False
+
+    def test_force_cancel_never_abandons_successor_that_replaces_pinned_target(
+        self,
+        app_client,
+    ):
+        """A exits and B spawns after Stop starts but before force cleanup."""
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None and ws.session is not None and ws.ui is not None
+        predecessor = threading.Thread(target=lambda: None, name="cancel-target-a")
+        successor = threading.Thread(target=lambda: None, name="fresh-successor-b")
+        with ws._lock:
+            ws._worker_running = True
+            ws.worker_thread = predecessor
+            ws._worker_principal_id = "alice"
+
+        def _cancel_and_replace_target() -> None:
+            # Deterministically occupy the exact window between the handler's
+            # target snapshot and its later force-ownership decision.
+            with ws._lock:
+                assert ws.worker_thread is predecessor
+                ws._worker_running = False
+                ws.worker_thread = None
+                ws._worker_principal_id = ""
+                ws._worker_running = True
+                ws.worker_thread = successor
+                ws._worker_principal_id = "bob"
+
+        ws.session.cancel = _cancel_and_replace_target  # type: ignore[method-assign]
+        resp = client.post(
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={"force": True},
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 200
+        assert ws.worker_thread is successor
+        assert ws._worker_running is True
+        assert ws._worker_principal_id == "bob"
+        event_types = [event.get("type") for event in ws.ui._enqueued]
+        assert "cancelled" in event_types
+        assert "stream_end" not in event_types
+        assert "idle" not in ws.ui.states
 
     def test_cancel_returns_400_when_session_missing(self, app_client):
         """Parity with coord: a placeholder workstream (session=None)
@@ -1623,6 +1700,35 @@ class TestCompactCommandDispatch:
         # Never ran inline, never queued a phantom compaction.
         assert ws.session.compacts == 0
         assert ws.session.commands == []
+
+    def test_foreign_retained_queue_refuses_fresh_send_before_worker_spawn(self, app_client):
+        """A persistence-retained interjection keeps its original owner.
+
+        The foreign-owner check runs inside the atomic fresh-slot admission,
+        but ``session_worker.send`` reports that refusal as ``False``.  The
+        route must preserve the typed conflict outcome instead of falling
+        through to its generic queue-full response, and no worker may bind or
+        append the later participant's turn.
+        """
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        ws.session.foreign_queue_principals.add("user-1")
+
+        response = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "must wait for the retained owner"},
+            headers=_auth("user-1"),
+        )
+
+        assert response.status_code == 409
+        assert response.json()["status"] == "cross_user_interjection"
+        assert ws.session.sends == []
+        assert ws.session.queue_calls == []
+        assert ws.worker_thread is None
+        assert ws._worker_running is False
 
     def test_non_compact_commands_complete_before_response(self, app_client):
         """Quick commands dispatch through the same worker slot (mutual
@@ -2354,6 +2460,7 @@ class TestCompactCommandDispatch:
         msg_id = r.json()["msg_id"]
         queued_events = [e for e in ws.ui._enqueued if e.get("type") == "message_queued"]
         assert [e["msg_id"] for e in queued_events] == [msg_id]
+        assert [e["sender"] for e in queued_events] == ["user-1"]
         gate.set()
         wait_until(
             lambda: any(e.get("type") == "message_dispatched" for e in ws.ui._enqueued),

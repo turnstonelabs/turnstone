@@ -20,6 +20,7 @@ The browser-side guard for the ``onerror`` close pattern lives in
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import threading
 from types import SimpleNamespace as SimpleNS
@@ -189,14 +190,32 @@ def test_replay_empty_buffer_cursor_at_counter_is_lossless_replay_ok() -> None:
     assert lost == 0
 
 
-def test_replay_empty_buffer_negative_cursor_cold_start_stays_replay_ok() -> None:
-    """A malformed negative cursor (``?last_event_id=-1`` parses as an
-    int) on a brand-new ws must not manufacture a truncated envelope —
-    the ``snap_seq > 0`` guard keeps cold start on ``replay_ok``."""
+def test_replay_empty_buffer_negative_cursor_reports_truncated() -> None:
+    """A negative cursor was never issued by the per-workstream stream.
+
+    Even on a cold workstream it must fail closed to the authoritative
+    recovery floor, not claim that an empty ring covered the cursor.
+    """
     ui = _make_ui()
     lq, replay, status, lost, earliest, _ = ui.register_listener_with_replay(-1)
-    assert status == "replay_ok"
+    assert status == "truncated"
     assert replay == []
+    assert lost == 1
+    assert earliest == 1
+
+
+def test_replay_future_cursor_reports_truncated() -> None:
+    """A cursor beyond the captured high-water mark cannot be server-issued."""
+    ui = _make_ui()
+    ui._enqueue({"type": "tool_started", "name": "only-event"})
+
+    _, replay, status, lost, earliest, snapshot = ui.register_listener_with_replay(99)
+
+    assert status == "truncated"
+    assert replay == []
+    assert lost == 0  # unknown/corrupt future gap: conservative lower bound
+    assert earliest == 1
+    assert snapshot["seq"] == 1
 
 
 def test_can_replay_from_stays_false_on_empty_ring_despite_seeded_counter() -> None:
@@ -540,7 +559,14 @@ def test_snap_seq_high_water_mark_holds_under_writer_race() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _wire_events_handler(ui: _ConcreteUI, *, state: str = "idle") -> Any:
+def _wire_events_handler(
+    ui: _ConcreteUI,
+    *,
+    state: str = "idle",
+    session: Any = None,
+    events_replay: Any = None,
+    events_preamble: Any = None,
+) -> Any:
     """Build a minimal ``make_events_handler`` closure that returns
     yields suitable for the EventSourceResponse generator.
 
@@ -551,7 +577,7 @@ def _wire_events_handler(ui: _ConcreteUI, *, state: str = "idle") -> Any:
     exercise the error-state branch (the persisted ``last_error``
     surface) without a real session.
     """
-    ws = SimpleNS(id=ui.ws_id, ui=ui, state=SimpleNS(value=state))
+    ws = SimpleNS(id=ui.ws_id, ui=ui, state=SimpleNS(value=state), session=session)
     mgr = MagicMock()
     mgr.get.return_value = ws
 
@@ -561,7 +587,8 @@ def _wire_events_handler(ui: _ConcreteUI, *, state: str = "idle") -> Any:
         tenant_check=None,
         not_found_label="Workstream not found",
         audit_action_prefix="workstream",
-        events_replay=None,
+        events_replay=events_replay,
+        events_preamble=events_preamble,
     )
     return make_events_handler(cfg)
 
@@ -573,6 +600,9 @@ def _drain_handler_yields(
     query: dict[str, str] | None = None,
     max_yields: int = 10,
     state: str = "idle",
+    session: Any = None,
+    events_replay: Any = None,
+    events_preamble: Any = None,
 ) -> tuple[list[Any], str]:
     """Synchronous helper: spin up the handler, drain up to N yields,
     return ``(raw_yields, decoded_blob)``.  Uses ``asyncio.run`` so
@@ -583,7 +613,13 @@ def _drain_handler_yields(
     returned for shape-level assertions (e.g. the first-yield
     ``retry`` check).
     """
-    handler = _wire_events_handler(ui, state=state)
+    handler = _wire_events_handler(
+        ui,
+        state=state,
+        session=session,
+        events_replay=events_replay,
+        events_preamble=events_preamble,
+    )
     req = _fake_request(headers=headers, query=query, path_params={"ws_id": ui.ws_id})
 
     async def _run() -> list[Any]:
@@ -691,15 +727,14 @@ def test_handler_truncated_emits_envelope_then_snapshot(monkeypatch: Any) -> Non
     )
 
 
-def test_handler_fresh_path_skips_replay_truncated() -> None:
-    """No ``Last-Event-ID`` → fresh-connect behaviour (today's path
-    unchanged: state_change + in_progress_snapshot + live).  No
-    replay_truncated envelope should ever appear on a fresh
-    connect."""
+def test_handler_tokenless_fresh_path_forces_old_client_history_repair() -> None:
+    """A pre-handoff browser repairs in place without a reconnect loop."""
     ui = _make_ui()
     ui.on_content_token("hello ")
     _, blob = _drain_handler_yields(ui, max_yields=5)
 
+    assert '"type": "clear_ui"' in blob
+    assert "tokenless_history_bootstrap" in blob
     assert "replay_truncated" not in blob
     # Fresh connect emits the snapshot.
     assert "in_progress_snapshot" in blob
@@ -716,7 +751,53 @@ def test_handler_malformed_last_event_id_falls_back_to_fresh() -> None:
         headers={"Last-Event-ID": "abc-not-an-int"},
         max_yields=3,
     )
+    assert "tokenless_history_bootstrap" in blob
+    assert '"type": "clear_ui"' in blob
+
+
+def test_handler_cursor_zero_fresh_bootstrap_does_not_repair_loop() -> None:
+    """An explicit cursor 0 is numeric proof, never tokenless bootstrap."""
+
+    ui = _make_ui()
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=4,
+    )
+
+    assert "tokenless_history_bootstrap" not in blob
     assert "replay_truncated" not in blob
+    assert "state_change" in blob
+
+
+def test_handler_negative_last_event_id_emits_truncated_recovery() -> None:
+    """A parsed-but-invalid negative cursor must not take replay_ok-empty."""
+    ui = _make_ui()
+
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "-1"},
+        max_yields=4,
+    )
+
+    assert "replay_truncated" in blob
+    assert '"earliest_available_id": 1' in blob
+
+
+def test_handler_future_last_event_id_emits_truncated_recovery() -> None:
+    """A cursor beyond the stream high-water mark forces a resync floor."""
+    ui = _make_ui()
+    ui._enqueue({"type": "tool_started", "name": "only-event"})
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "99"},
+        max_yields=5,
+    )
+
+    assert "replay_truncated" in blob
+    assert '"lost_count": 0' in blob
+    assert "only-event" not in blob
 
 
 def test_handler_query_param_fallback_is_honoured() -> None:
@@ -731,6 +812,304 @@ def test_handler_query_param_fallback_is_honoured() -> None:
     # Replay path: in_progress_snapshot SKIPPED, id:1 present.
     assert "in_progress_snapshot" not in blob
     assert "id: 1" in blob
+
+
+def test_user_turn_capability_projects_canonical_or_pre_row_repair_cursor() -> None:
+    """Typed listeners get the row; incapable listeners retain repair intent."""
+
+    ui = _make_ui()
+    event_id = ui.on_user_turn(
+        "shared prompt",
+        attachments=[],
+        sender="alice",
+        source=None,
+        client_send_ids=["send-1"],
+    )
+    assert event_id == 1
+
+    capable_yields, capable_blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0", "user_turn": "1"},
+        max_yields=3,
+    )
+    capable_payloads = [
+        json.loads(item["data"])
+        for item in capable_yields
+        if isinstance(item, dict) and "data" in item
+    ]
+    user_turn = next(item for item in capable_payloads if item.get("type") == "user_turn")
+    assert user_turn == {
+        "type": "user_turn",
+        "content": "shared prompt",
+        "client_send_ids": ["send-1"],
+        "sender": "alice",
+        "ws_id": ui.ws_id,
+        "_event_id": 1,
+    }
+    user_wire = next(
+        item
+        for item in capable_yields
+        if isinstance(item, dict) and '"type": "user_turn"' in item.get("data", "")
+    )
+    assert user_wire["id"] == "1"
+    assert "user_turn_projection_unsupported" not in capable_blob
+
+    # A later frame may advance the live cursor, but replay_truncated records
+    # the first frame's explicit pre-row cursor (0). A failed history repair
+    # reconnects from that frozen cursor and must receive the same repair
+    # projection again rather than skip canonical row 1.
+    ui._enqueue({"type": "content", "text": "later assistant bytes"})
+    incapable_yields, incapable_blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=4,
+    )
+    repair_wire = next(
+        item
+        for item in incapable_yields
+        if isinstance(item, dict) and "user_turn_projection_unsupported" in item.get("data", "")
+    )
+    assert repair_wire["id"] == "0"
+    repair_payload = json.loads(repair_wire["data"])
+    assert repair_payload == {
+        "type": "replay_truncated",
+        "ws_id": ui.ws_id,
+        "reason": "user_turn_projection_unsupported",
+    }
+    assert "shared prompt" not in incapable_blob
+    assert "id: 2" in incapable_blob
+
+    retry_yields, _ = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=3,
+    )
+    retry_repair = next(
+        item
+        for item in retry_yields
+        if isinstance(item, dict) and "user_turn_projection_unsupported" in item.get("data", "")
+    )
+    assert retry_repair["id"] == "0"
+
+
+def test_tool_turn_capability_projects_canonical_or_redacted_pre_row_repair() -> None:
+    """Accepted TOOL data reaches capable panes and never leaks to legacy ones."""
+
+    ui = _make_ui()
+    preview = {"attachment_id": "preview-secret", "kind": "html"}
+    event_id = ui.on_tool_turn_accepted(
+        "call-capability",
+        "secret_tool_name",
+        "secret final output",
+        is_error=True,
+        preview=preview,
+        effect_status="unknown",
+    )
+    assert event_id == 1
+
+    capable_yields, capable_blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0", "tool_turn": "1"},
+        max_yields=3,
+    )
+    accepted_wire = next(
+        item
+        for item in capable_yields
+        if isinstance(item, dict) and '"accepted": true' in item.get("data", "")
+    )
+    assert accepted_wire["id"] == "1"
+    assert json.loads(accepted_wire["data"]) == {
+        "type": "tool_result",
+        "accepted": True,
+        "call_id": "call-capability",
+        "name": "secret_tool_name",
+        "output": "secret final output",
+        "is_error": True,
+        "preview": preview,
+        "effect_status": "unknown",
+        "ws_id": ui.ws_id,
+        "_event_id": 1,
+    }
+    assert "tool_turn_projection_unsupported" not in capable_blob
+
+    # Advance the ring after the accepted row. A legacy reconnect is anchored
+    # at N-1 and receives the same repair again if its REST heal fails.
+    ui._enqueue({"type": "content", "text": "later assistant bytes"})
+    incapable_yields, incapable_blob = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=4,
+    )
+    repair_wire = next(
+        item
+        for item in incapable_yields
+        if isinstance(item, dict) and "tool_turn_projection_unsupported" in item.get("data", "")
+    )
+    assert repair_wire["id"] == "0"
+    assert json.loads(repair_wire["data"]) == {
+        "type": "replay_truncated",
+        "ws_id": ui.ws_id,
+        "reason": "tool_turn_projection_unsupported",
+    }
+    for secret in ("secret final output", "secret_tool_name", "preview-secret"):
+        assert secret not in incapable_blob
+    assert "id: 2" in incapable_blob
+
+    retry_yields, _ = _drain_handler_yields(
+        ui,
+        query={"last_event_id": "0"},
+        max_yields=3,
+    )
+    retry_repair = next(
+        item
+        for item in retry_yields
+        if isinstance(item, dict) and "tool_turn_projection_unsupported" in item.get("data", "")
+    )
+    assert retry_repair["id"] == "0"
+
+
+class _HandoffSession:
+    """Route-seam double for ChatSession's atomic history registration."""
+
+    def __init__(self, ui: _ConcreteUI, token: str = "revision-7") -> None:
+        self.ui = ui
+        self.token = token
+        self.calls: list[tuple[str, int | None]] = []
+
+    def register_listener_for_history_handoff(
+        self,
+        token: str,
+        *,
+        last_event_id: int | None = None,
+        maxsize: int = 500,
+    ) -> Any:
+        self.calls.append((token, last_event_id))
+        if token != self.token:
+            return None
+        if last_event_id is None:
+            listener, snap = self.ui.register_listener_with_in_progress_snapshot(maxsize=maxsize)
+            return listener, [], "fresh", 0, 0, snap
+        return self.ui.register_listener_with_replay(last_event_id, maxsize=maxsize)
+
+
+def test_valid_history_handoff_fresh_connect_skips_legacy_repair_floor() -> None:
+    """Current clients present a token and incur no compatibility refetch."""
+
+    ui = _make_ui()
+    session = _HandoffSession(ui)
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"history_token": session.token},
+        session=session,
+        max_yields=4,
+    )
+
+    assert session.calls == [(session.token, None)]
+    assert "tokenless_history_bootstrap" not in blob
+    assert "replay_truncated" not in blob
+
+
+def test_history_handoff_mismatch_forces_resync_without_numeric_replay() -> None:
+    """A stale history revision cannot fall through to a coverable ring slice."""
+    ui = _make_ui()
+    ui.on_content_token("ring data that must not be used")
+    session = _HandoffSession(ui)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"history_token": "stale-revision", "last_event_id": "0"},
+        session=session,
+        max_yields=4,
+    )
+
+    assert session.calls == [("stale-revision", 0)]  # cursor 0 survives parsing
+    assert "history_resync" in blob
+    assert "handoff_mismatch" in blob
+    assert "ring data that must not be used" not in blob
+    assert "id: 1" not in blob
+
+
+def test_malformed_native_header_retains_initial_handoff_validation() -> None:
+    """A mangled native header cannot suppress a crossed-token mismatch.
+
+    The initial URL still carries both its REST handoff token and cursor.  If
+    the native header is unusable, those URL bootstrap hints remain
+    authoritative and the stale token must produce ``history_resync``.
+    """
+    ui = _make_ui()
+    ui.on_content_token("ring data that must not bridge the crossed token")
+    session = _HandoffSession(ui)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "mangled-by-proxy"},
+        query={"history_token": "stale-revision", "last_event_id": "0"},
+        session=session,
+        max_yields=4,
+    )
+
+    assert session.calls == [("stale-revision", 0)]
+    assert "history_resync" in blob
+    assert "handoff_mismatch" in blob
+    assert "ring data that must not bridge the crossed token" not in blob
+    assert "id: 1" not in blob
+
+
+def test_native_last_event_id_ignores_stale_initial_history_token() -> None:
+    """Native reconnect headers take priority over the one-shot URL token."""
+    ui = _make_ui()
+    ui.on_content_token("native replay")
+    session = _HandoffSession(ui)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "0"},
+        query={"history_token": "stale-revision", "last_event_id": "999"},
+        session=session,
+        max_yields=8,
+    )
+
+    assert session.calls == []
+    assert "history_resync" not in blob
+    assert "native replay" in blob
+    assert "id: 1" in blob
+
+
+def test_handoff_cursor_replay_keeps_preamble_without_pending_control_duplicate() -> None:
+    """Initial cursor replay retains idempotent bootstrap fields only.
+
+    The full replay callback includes pending operator controls and must not run
+    on replay_ok; the ring delta is the single owner of any such controls.
+    """
+    ui = _make_ui()
+    ui.on_content_token("covered delta")
+    session = _HandoffSession(ui)
+
+    def _preamble(_ws: Any, _ui: Any, _request: Any) -> Any:
+        yield {"type": "connected", "model": "test"}
+        yield {"type": "status", "total_tokens": 12}
+
+    def _full_replay(_ws: Any, _ui: Any, _request: Any) -> Any:
+        yield from _preamble(_ws, _ui, _request)
+        yield {"type": "approve_request", "items": [{"call_id": "duplicate"}]}
+
+    _, blob = _drain_handler_yields(
+        ui,
+        query={"history_token": session.token, "last_event_id": "0"},
+        session=session,
+        events_replay=_full_replay,
+        events_preamble=_preamble,
+        max_yields=10,
+        state="running",
+    )
+
+    assert session.calls == [(session.token, 0)]
+    assert '"type": "connected"' in blob
+    assert '"type": "status"' in blob
+    assert '"type": "state_change"' in blob
+    assert "covered delta" in blob
+    assert "approve_request" not in blob
+    assert "in_progress_snapshot" not in blob
 
 
 # ---------------------------------------------------------------------------
@@ -815,7 +1194,11 @@ def test_handler_replay_ok_does_not_resurface_last_error(monkeypatch: Any) -> No
 # holes -> permanent gap even after a "successful" reconnect.
 
 
-def _fake_live_request(*, path_params: dict[str, str] | None = None) -> Request:
+def _fake_live_request(
+    *,
+    path_params: dict[str, str] | None = None,
+    query: dict[str, str] | None = None,
+) -> Request:
     """A request whose ``receive()`` never resolves, so
     ``is_disconnected()`` stays ``False`` — the poison check, not
     disconnect detection, must be what terminates the drain loop."""
@@ -825,7 +1208,9 @@ def _fake_live_request(*, path_params: dict[str, str] | None = None) -> Request:
         "headers": [],
         "path": "/events",
         "raw_path": b"/events",
-        "query_string": b"",
+        "query_string": (
+            "&".join(f"{key}={value}" for key, value in query.items()).encode() if query else b""
+        ),
         "path_params": path_params or {},
         "app": MagicMock(),
     }
@@ -835,6 +1220,144 @@ def _fake_live_request(*, path_params: dict[str, str] | None = None) -> Request:
         return {"type": "http.disconnect"}  # unreachable
 
     return Request(scope, receive=_recv)
+
+
+def test_live_user_turn_projection_is_per_listener_and_ring_stays_canonical() -> None:
+    """One enqueue fans out typed and compatibility views without mutating the ring."""
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+
+    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
+        capable = await handler(
+            _fake_live_request(
+                path_params={"ws_id": ui.ws_id},
+                query={"last_event_id": "0", "user_turn": "1"},
+            )
+        )
+        incapable = await handler(
+            _fake_live_request(
+                path_params={"ws_id": ui.ws_id},
+                query={"last_event_id": "0"},
+            )
+        )
+        capable_gen = capable.body_iterator
+        incapable_gen = incapable.body_iterator
+        try:
+            # replay_ok preamble: retry then current state. Both listeners are
+            # now atomically registered and waiting at the same live boundary.
+            await capable_gen.__anext__()
+            await capable_gen.__anext__()
+            await incapable_gen.__anext__()
+            await incapable_gen.__anext__()
+            capable_next = asyncio.create_task(capable_gen.__anext__())
+            incapable_next = asyncio.create_task(incapable_gen.__anext__())
+            await asyncio.sleep(0)
+
+            event_id = ui.on_user_turn(
+                "one canonical row",
+                attachments=[],
+                sender="alice",
+                source=None,
+                client_send_ids=["live-send"],
+            )
+            assert event_id == 1
+            return (
+                await asyncio.wait_for(capable_next, timeout=2),
+                await asyncio.wait_for(incapable_next, timeout=2),
+            )
+        finally:
+            await capable_gen.aclose()
+            await incapable_gen.aclose()
+
+    capable_frame, incapable_frame = asyncio.run(_run())
+    assert capable_frame["id"] == "1"
+    assert json.loads(capable_frame["data"]) == {
+        "type": "user_turn",
+        "content": "one canonical row",
+        "client_send_ids": ["live-send"],
+        "sender": "alice",
+        "ws_id": ui.ws_id,
+        "_event_id": 1,
+    }
+    assert incapable_frame["id"] == "0"
+    assert json.loads(incapable_frame["data"]) == {
+        "type": "replay_truncated",
+        "ws_id": ui.ws_id,
+        "reason": "user_turn_projection_unsupported",
+    }
+    assert len(ui._event_buffer) == 1
+    assert ui._event_buffer[0][1]["type"] == "user_turn"
+    assert ui._event_buffer[0][1]["content"] == "one canonical row"
+
+
+def test_live_tool_turn_projection_is_per_listener_and_ring_stays_canonical() -> None:
+    """Capability projection is listener-local; the replay ring keeps truth."""
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+
+    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
+        capable = await handler(
+            _fake_live_request(
+                path_params={"ws_id": ui.ws_id},
+                query={"last_event_id": "0", "tool_turn": "1"},
+            )
+        )
+        incapable = await handler(
+            _fake_live_request(
+                path_params={"ws_id": ui.ws_id},
+                query={"last_event_id": "0"},
+            )
+        )
+        capable_gen = capable.body_iterator
+        incapable_gen = incapable.body_iterator
+        try:
+            await capable_gen.__anext__()
+            await capable_gen.__anext__()
+            await incapable_gen.__anext__()
+            await incapable_gen.__anext__()
+            capable_next = asyncio.create_task(capable_gen.__anext__())
+            incapable_next = asyncio.create_task(incapable_gen.__anext__())
+            await asyncio.sleep(0)
+
+            event_id = ui.on_tool_turn_accepted(
+                "call-live",
+                "bash",
+                "final output",
+                effect_status="none",
+            )
+            assert event_id == 1
+            return (
+                await asyncio.wait_for(capable_next, timeout=2),
+                await asyncio.wait_for(incapable_next, timeout=2),
+            )
+        finally:
+            await capable_gen.aclose()
+            await incapable_gen.aclose()
+
+    capable_frame, incapable_frame = asyncio.run(_run())
+    assert capable_frame["id"] == "1"
+    assert json.loads(capable_frame["data"]) == {
+        "type": "tool_result",
+        "accepted": True,
+        "call_id": "call-live",
+        "name": "bash",
+        "output": "final output",
+        "effect_status": "none",
+        "ws_id": ui.ws_id,
+        "_event_id": 1,
+    }
+    assert incapable_frame["id"] == "0"
+    assert json.loads(incapable_frame["data"]) == {
+        "type": "replay_truncated",
+        "ws_id": ui.ws_id,
+        "reason": "tool_turn_projection_unsupported",
+    }
+    assert len(ui._event_buffer) == 1
+    assert ui._event_buffer[0][1]["type"] == "tool_result"
+    assert ui._event_buffer[0][1]["accepted"] is True
+    assert ui._event_buffer[0][1]["output"] == "final output"
 
 
 def test_listener_queue_poisons_at_first_full_and_refuses_after() -> None:
@@ -921,7 +1444,10 @@ def test_drain_loop_closes_with_overflow_frame_on_poison() -> None:
 
     ui = _make_ui()
     handler = _wire_events_handler(ui)
-    req = _fake_live_request(path_params={"ws_id": ui.ws_id})
+    req = _fake_live_request(
+        path_params={"ws_id": ui.ws_id},
+        query={"last_event_id": "0"},
+    )
 
     async def _run() -> list[Any]:
         resp = await handler(req)
@@ -962,7 +1488,10 @@ def test_drain_loop_delivers_until_poison_then_stops_before_backlog() -> None:
 
     ui = _make_ui()
     handler = _wire_events_handler(ui)
-    req = _fake_live_request(path_params={"ws_id": ui.ws_id})
+    req = _fake_live_request(
+        path_params={"ws_id": ui.ws_id},
+        query={"last_event_id": "0"},
+    )
 
     async def _run() -> tuple[list[Any], Any, Any]:
         resp = await handler(req)
@@ -1064,7 +1593,10 @@ def test_closing_queue_unwinds_clean_not_overflow_when_poisoned() -> None:
     tripping its reconnect limiter on a ws that is simply gone)."""
     ui = _make_ui()
     handler = _wire_events_handler(ui)
-    req = _fake_live_request(path_params={"ws_id": ui.ws_id})
+    req = _fake_live_request(
+        path_params={"ws_id": ui.ws_id},
+        query={"last_event_id": "0"},
+    )
 
     async def _run() -> tuple[Any, bool]:
         resp = await handler(req)

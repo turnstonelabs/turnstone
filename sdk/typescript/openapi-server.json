@@ -167,6 +167,7 @@
         "tags": [
           "Workstreams"
         ],
+        "description": "Unloads the live workstream while preserving storage. Returns 409 when any accepted live conversation row still requires persistence reconciliation; the workstream remains loaded and its history journal is retained.",
         "parameters": [
           {
             "name": "ws_id",
@@ -210,6 +211,16 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
             "content": {
               "application/json": {
                 "schema": {
@@ -552,6 +563,7 @@
         "tags": [
           "Chat"
         ],
+        "description": "Claims the workstream mutation slot, durably truncates the requested tail, then emits clear_ui. Concurrent sends are ordered after the cut; a storage failure returns 503 without changing live history.",
         "parameters": [
           {
             "name": "ws_id",
@@ -602,6 +614,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -613,6 +635,7 @@
         "tags": [
           "Chat"
         ],
+        "description": "Uses one workstream worker claim for the durable truncation and the replacement generation, so another send cannot enter between them. A storage failure returns 503 without changing live history.",
         "parameters": [
           {
             "name": "ws_id",
@@ -653,6 +676,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -664,7 +697,7 @@
         "tags": [
           "Streaming"
         ],
-        "description": "Opens a Server-Sent Events stream scoped to a single workstream. Returns text/event-stream. See API reference for event types.",
+        "description": "Opens a Server-Sent Events stream scoped to a single workstream. After rendering REST history, pass its opaque handoff_token once as ?history_token=; it names the exact accepted conversation-row prefix used for that render. A history_resync event closes this stream and requires a fresh history read; numeric event replay is not a substitute. Native Last-Event-ID reconnects take priority. Pass ?user_turn=1 to opt into typed accepted-user events; otherwise those rows become a backward-compatible strong-repair frame. Pass ?tool_turn=1 to receive the final accepted tool row as a typed tool_result with accepted=true; without it, accepted tool rows use the same pre-row strong-repair projection. Returns text/event-stream. See API reference for event types.",
         "parameters": [
           {
             "name": "ws_id",
@@ -673,6 +706,42 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "last_event_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Numeric per-workstream event cursor for manual reconnects."
+          },
+          {
+            "name": "history_token",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque one-shot token naming the accepted prefix rendered from REST history."
+          },
+          {
+            "name": "user_turn",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Set to 1 to receive typed user_turn events instead of history-repair frames."
+          },
+          {
+            "name": "tool_turn",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Set to 1 to receive final accepted tool_result projections."
           }
         ],
         "responses": {
@@ -972,7 +1041,7 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Returns the tail of the conversation in OpenAI-like message format. Persisted-but-not-loaded workstreams (closed / evicted) serve history without rehydrating. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously only exposed history through the SSE replay on ``/events``.",
+        "description": "Returns the tail of the conversation in OpenAI-like message format. Persisted-but-not-loaded workstreams (closed / evicted) are rehydrated before history is served so every successful response participates in the REST-to-SSE handoff. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously only exposed history through the SSE replay on ``/events``. Messages are the requested limit-bounded tail of one authoritative total accepted conversation-row prefix: user, assistant, tool, and system rows, including projected compaction checkpoints and cancellation markers. The opaque handoff_token names the exact prefix used for the render and is passed once on initial SSE registration. Admission of a later row changes the token; durable acknowledgement does not. If the durable prefix cannot be loaded, the endpoint returns 503 with `History temporarily unavailable`; that response is not authoritative and supplies no usable handoff token.",
         "parameters": [
           {
             "name": "ws_id",
@@ -2324,6 +2393,22 @@
             "title": "Message",
             "type": "string"
           },
+          "client_send_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Opaque browser correlation token echoed in the accepted `user_turn` event and history row. It is not an idempotency key; repeated sends with the same value remain distinct turns.",
+            "title": "Client Send Id"
+          },
           "attachment_ids": {
             "anyOf": [
               {
@@ -2860,6 +2945,18 @@
             ],
             "default": null,
             "title": "Project Id"
+          },
+          "persistence_state": {
+            "default": "healthy",
+            "description": "Sanitized durable-history status for the loaded workstream: healthy, pending its first save, retrying automatically, or blocked by a permanent commit conflict. Older servers and unloaded rows default to healthy.",
+            "enum": [
+              "healthy",
+              "pending",
+              "retrying",
+              "conflict"
+            ],
+            "title": "Persistence State",
+            "type": "string"
           }
         },
         "required": [
@@ -2892,6 +2989,18 @@
           "kind": {
             "$ref": "#/components/schemas/WorkstreamKind",
             "default": "interactive"
+          },
+          "persistence_state": {
+            "default": "healthy",
+            "description": "Sanitized durable-history status: healthy, pending its first save, retrying automatically, or blocked by a permanent commit conflict.",
+            "enum": [
+              "healthy",
+              "pending",
+              "retrying",
+              "conflict"
+            ],
+            "title": "Persistence State",
+            "type": "string"
           },
           "pending_approval": {
             "default": false,
@@ -3032,7 +3141,7 @@
             "type": "string"
           },
           "messages": {
-            "description": "Tail of the workstream's message history, projected to the canonical render shape (``role`` may be ``system`` for operator-context turns; flat tool_calls with verdict / output_assessment; top-level source / attachments / reasoning; derived denied / is_error / pending). Bounded by the ``limit`` query parameter (default 100, max 500).",
+            "description": "Requested limit-bounded tail of one authoritative total accepted conversation-row prefix, projected to the canonical render shape. Roles include ``user``, ``assistant``, ``tool``, and ``system``; compaction checkpoints project as ``role=system, source=compaction`` and cancellation-generated assistant/tool markers appear when present. The projection also carries flat tool_calls with verdict / output_assessment; top-level source / attachments / reasoning; and derived denied / is_error / pending. Bounded by the ``limit`` query parameter (default 100, max 500).",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -3052,6 +3161,19 @@
             "default": null,
             "description": "SSE resume cursor (a ``Last-Event-ID`` value). Non-null only when the trailing turn is an executing in-flight tool batch that the live ring buffer can replay: ``messages`` then omits that turn and the client opens its initial SSE with this cursor so the existing delta replay fast-forwards the in-flight turn (tool calls, results, prompts) instead of the lossy synthetic snapshot. Null on every other read \u2014 the client connects fresh.",
             "title": "Cursor"
+          },
+          "handoff_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Opaque token naming the exact accepted conversation-row prefix used for this render. Present only while the workstream is loaded. A client that renders this response passes the token once as the initial event stream's ``history_token`` query parameter; the server atomically validates it while registering the listener. Admission of a later row changes the token; durable acknowledgement does not. Clients must not inspect, persist, or reuse it for later reconnects.",
+            "title": "Handoff Token"
           }
         },
         "required": [
@@ -3208,6 +3330,18 @@
             ],
             "default": null,
             "title": "Project Id"
+          },
+          "persistence_state": {
+            "default": "healthy",
+            "description": "Sanitized durable-history status for this live row. Contains no storage error, commit key, retry count, or conversation content.",
+            "enum": [
+              "healthy",
+              "pending",
+              "retrying",
+              "conflict"
+            ],
+            "title": "Persistence State",
+            "type": "string"
           },
           "pending_approval_details": {
             "description": "Inline approval payload for the coordinator children-tree UI: EVERY live approval cycle, oldest first \u2014 parallel task agents gate concurrently, so a workstream can hold several prompts at once.  Each entry carries the cycle's items + per-call_id LLM verdict cache so a coord can render approve/deny buttons + judge pill without a separate per-child round-trip; resolve each with its ``cycle_id``.  Empty when no approval is pending.  Also surfaced (verbatim) on ``GET /v1/api/cluster/ws/live`` via the ``_CLUSTER_WS_LIVE_KEYS`` projection.  Replaces 1.6's ``pending_approval_detail`` single-object field (breaking, 1.7).",

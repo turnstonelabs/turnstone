@@ -74,11 +74,41 @@ class TestServerSpec:
         assert "ws_id" in param_names
         assert "limit" in param_names
 
+    def test_history_handoff_and_failure_contract_is_public(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        history = spec["paths"]["/v1/api/workstreams/{ws_id}/history"]["get"]
+        events = spec["paths"]["/v1/api/workstreams/{ws_id}/events"]["get"]
+        close = spec["paths"]["/v1/api/workstreams/{ws_id}/close"]["post"]
+        history_schema = spec["components"]["schemas"]["WorkstreamHistoryResponse"]
+
+        assert "authoritative total accepted conversation-row prefix" in history["description"]
+        assert "History temporarily unavailable" in history["description"]
+        assert "history_resync" in events["description"]
+        assert "numeric event replay is not a substitute" in events["description"]
+        assert "accepted live conversation row" in close["description"]
+        assert "handoff_token" in history_schema["properties"]
+        assert (
+            "Admission of a later row changes the token"
+            in history_schema["properties"]["handoff_token"]["description"]
+        )
+
     def test_schemas_not_empty(self):
         from turnstone.api.server_spec import build_server_spec
 
         spec = build_server_spec()
         assert len(spec["components"]["schemas"]) > 0
+
+    def test_operator_workstream_schemas_publish_sanitized_persistence_state(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        schemas = build_server_spec()["components"]["schemas"]
+        expected = ["healthy", "pending", "retrying", "conflict"]
+        for name in ("WorkstreamInfo", "WorkstreamDetailResponse", "DashboardWorkstream"):
+            field = schemas[name]["properties"]["persistence_state"]
+            assert field["enum"] == expected
+            assert field["default"] == "healthy"
 
     def test_json_serializable(self):
         from turnstone.api.server_spec import build_server_spec
@@ -159,6 +189,15 @@ class TestConsoleSpec:
         result = json.dumps(spec)
         assert len(result) > 100
 
+    def test_cluster_workstream_schema_publishes_sanitized_persistence_state(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        field = build_console_spec()["components"]["schemas"]["ClusterWorkstreamInfo"][
+            "properties"
+        ]["persistence_state"]
+        assert field["enum"] == ["healthy", "pending", "retrying", "conflict"]
+        assert field["default"] == "healthy"
+
     def test_nodes_endpoint_has_query_params(self):
         from turnstone.api.console_spec import build_console_spec
 
@@ -197,6 +236,20 @@ class TestConsoleSpec:
             "/v1/api/cluster/ws/{ws_id}/detail",
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
+
+    def test_coordinator_history_handoff_and_failure_contract_is_public(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        history = spec["paths"]["/v1/api/workstreams/{ws_id}/history"]["get"]
+        events = spec["paths"]["/v1/api/workstreams/{ws_id}/events"]["get"]
+        close = spec["paths"]["/v1/api/workstreams/{ws_id}/close"]["post"]
+
+        assert "authoritative total accepted conversation-row prefix" in history["description"]
+        assert "History temporarily unavailable" in history["description"]
+        assert "history_resync" in events["description"]
+        assert "numeric replay is not a substitute" in events["description"]
+        assert "accepted live conversation row" in close["description"]
 
     def test_routing_paths_and_extended_response_contracts(self):
         from turnstone.api.console_spec import build_console_spec

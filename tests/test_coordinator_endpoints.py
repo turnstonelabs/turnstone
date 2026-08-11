@@ -12,7 +12,7 @@ the lifted ``approve`` and ``close`` handlers from
 from __future__ import annotations
 
 import hashlib
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 import httpx
@@ -73,6 +73,9 @@ from turnstone.core.session_routes import (
     make_set_title_handler,
 )
 from turnstone.core.workstream import WorkstreamKind
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -535,6 +538,7 @@ def test_active_list_row_shape_includes_unified_fields(storage):
         "user_id",
         "project_id",
         "persona",
+        "persistence_state",
     }
     assert row["name"] == "lifted-coord"
     assert row["kind"] == "coordinator"
@@ -1112,6 +1116,19 @@ def test_close_records_audit_and_removes_from_mgr(storage):
     assert "coordinator.close" in actions
 
 
+def test_close_returns_409_when_unresolved_persistence_refuses_unload(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    ws.session.prepare_soft_close = MagicMock(return_value=False)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/close", headers=_COORD_HEADERS)
+
+    assert resp.status_code == 409
+    assert resp.json() == {"error": "workstream has unresolved persistence"}
+    assert mgr.get(ws.id) is ws
+
+
 def test_approve_resolves_ui_event(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
@@ -1393,8 +1410,36 @@ def test_detail_correlation_id_on_unexpected_rehydrate_failure(storage):
 # ---------------------------------------------------------------------------
 
 
+class _HistoryHandoffSession:
+    """Minimal concrete session for token-bearing history endpoint tests."""
+
+    def __init__(self) -> None:
+        self._history_generation = 0
+
+    def capture_history_handoff(
+        self,
+        load_messages: Callable[[int], list[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        return load_messages(0), f"test-history.{self._history_generation}"
+
+    def resume(self, _ws_id: str) -> None:
+        return None
+
+
+def _build_history_mgr(storage: Any):
+    def session_factory(
+        _ui: Any,
+        _model_alias: str | None = None,
+        _ws_id: str | None = None,
+        **_kwargs: Any,
+    ) -> _HistoryHandoffSession:
+        return _HistoryHandoffSession()
+
+    return _build_mgr_with_factory(storage, session_factory)
+
+
 def test_history_returns_messages(storage):
-    mgr = _build_mgr(storage)
+    mgr = _build_history_mgr(storage)
     ws = mgr.create(user_id="user-1")
     # Seed a message in storage.
     storage.save_message(ws.id, "user", "hello")
@@ -1403,13 +1448,14 @@ def test_history_returns_messages(storage):
     assert resp.status_code == 200
     body = resp.json()
     assert body["ws_id"] == ws.id
+    assert body["handoff_token"]
     assert any(m.get("role") == "user" and m.get("content") == "hello" for m in body["messages"])
 
 
 def test_history_any_admin_coordinator_caller_can_read(storage):
     # Trusted-team visibility: history is readable by any
     # ``admin.coordinator`` caller.
-    mgr = _build_mgr(storage)
+    mgr = _build_history_mgr(storage)
     ws = mgr.create(user_id="owner")
     storage.save_message(ws.id, "user", "hello")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
@@ -1445,7 +1491,8 @@ def test_history_private_project_visible_to_member(storage):
         "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
     )
     storage.save_message("c" * 32, "user", "secret plan")
-    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    mgr = _build_history_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
         f"/v1/api/workstreams/{'c' * 32}/history",
         headers={"X-Test-User": "member-bob", "X-Test-Perms": "admin.coordinator"},
@@ -1526,11 +1573,15 @@ def test_coord_attachments_private_project_visible_to_member(storage):
 
 
 def test_history_serves_storage_only_workstream(storage):
-    """Persisted-but-not-loaded coordinators (closed / evicted) are still
-    readable via /history without rehydrating. Mirrors the pre-lift
-    ``_resolve_coordinator_or_404`` ladder: storage-row + kind check
-    is sufficient when ``mgr.get`` returns None."""
-    mgr = _build_mgr(storage)
+    """Closed coordinators are still readable via /history without rehydrating.
+
+    Deliberate pin update (back to the pre-handoff assertion, plus the token
+    contract): a cold row has no live writer and no splice to witness, so the
+    read is storage-only and tokenless — never constructing a session into
+    the bounded pool. The tokenless 200 seeds a render plus the tokenless
+    stream bootstrap.
+    """
+    mgr = _build_history_mgr(storage)
     storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
     storage.save_message("storage-only-coord", "user", "from cold storage")
     # Confirm precondition: row is in storage, NOT in the manager's pool.
@@ -1542,8 +1593,10 @@ def test_history_serves_storage_only_workstream(storage):
         headers=_COORD_HEADERS,
     )
     assert resp.status_code == 200
-    assert any(m.get("content") == "from cold storage" for m in resp.json()["messages"])
-    # History does NOT rehydrate (unlike detail) — pool stays cold.
+    body = resp.json()
+    assert any(m.get("content") == "from cold storage" for m in body["messages"])
+    assert body["handoff_token"] is None
+    # The read verb leaves the pool untouched.
     assert mgr.get("storage-only-coord") is None
 
 
@@ -1562,25 +1615,24 @@ def test_history_404_when_kind_interactive(storage):
     assert "interactive content" not in resp.text
 
 
-def test_history_swallows_load_messages_exception_returns_empty(storage):
-    """``storage.load_messages`` raising mid-call (transient DB outage,
-    corrupted row, etc.) must not 5xx the page-load handshake — coord
-    pre-lift logged at debug and returned 200 with ``messages == []``.
-    The lifted body preserves that contract on both kinds; pin it
-    explicitly so a future reader doesn't remove the bare-except as
-    dead code."""
+def test_history_load_messages_exception_returns_non_authoritative_503(storage):
+    """A transient history-load failure must not masquerade as empty truth.
+
+    The browser retains its prior transcript and repair latch on a non-2xx.
+    The failure body therefore carries neither projected messages nor a
+    handoff token that could authorize an SSE connection from an incomplete
+    durable prefix.
+    """
     from unittest.mock import patch
 
-    mgr = _build_mgr(storage)
+    mgr = _build_history_mgr(storage)
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
     with patch.object(storage, "load_messages", side_effect=RuntimeError("db gone")):
         resp = client.get(f"/v1/api/workstreams/{ws.id}/history", headers=_COORD_HEADERS)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ws_id"] == ws.id
-    assert body["messages"] == []
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "History temporarily unavailable"}
 
 
 def test_history_clamps_limit_query_param(storage):
@@ -1588,7 +1640,7 @@ def test_history_clamps_limit_query_param(storage):
     preserves the same bounds. Out-of-range / unparseable values
     fall back to defaults instead of erroring — coord's page-load
     handshake should never 4xx on a malformed limit param."""
-    mgr = _build_mgr(storage)
+    mgr = _build_history_mgr(storage)
     ws = mgr.create(user_id="user-1")
     # Seed enough messages to exercise the upper bound. SQLite's INSERT
     # is fast enough that 6 inserts in a tight loop is fine.
@@ -2534,6 +2586,42 @@ def test_cluster_inspect_coordinator_self_path(storage):
     assert body["live"]["pending_approval"] is False
     assert body["live"]["activity_state"] == ""
     assert isinstance(body["messages"], list)
+
+
+def test_cluster_inspect_scrubs_private_assistant_provenance(storage):
+    """Cluster inspection never exposes the durable audit principal."""
+    import json
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    storage.save_message(
+        ws.id,
+        "assistant",
+        "accepted",
+        meta=json.dumps(
+            {
+                "provenance": {
+                    "model_alias": "main",
+                    "backend_model_id": "kernel",
+                    "registry_generation": 8,
+                    "acting_principal_id": "private-user-id",
+                }
+            }
+        ),
+        commit_key="private-commit-key",
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    response = client.get(f"/v1/api/cluster/ws/{ws.id}/detail", headers=_CLUSTER_HEADERS)
+
+    assert response.status_code == 200
+    [message] = response.json()["messages"]
+    assert message["role"] == "assistant"
+    assert message["content"] == "accepted"
+    assert "_provenance" not in message
+    assert "_commit_key" not in message
+    assert "private-user-id" not in response.text
+    assert "private-commit-key" not in response.text
 
 
 def test_cluster_inspect_unloaded_coordinator_live_null(storage):

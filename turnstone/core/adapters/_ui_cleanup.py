@@ -83,6 +83,12 @@ def _broadcast_ws_closed_to_listeners(ui: SessionUI) -> None:
     if listeners is None or listeners_lock is None:
         return
     with listeners_lock:
+        # Fence stale events requests that already captured the Workstream/UI
+        # but have not yet reached listener registration. SessionUIBase's
+        # registration helpers observe this under the same lock and return a
+        # pre-closed, non-retained queue.
+        ui_any: Any = ui
+        ui_any._listeners_terminal = True
         for lq in listeners:
             # Mark the stream closing BEFORE attempting the sentinel: a
             # poisoned/full ``_ListenerQueue`` rejects every put (the

@@ -22,7 +22,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import httpx_sse
 
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import (
+    WorkstreamKind,
+    normalize_conversation_persistence_state,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -539,6 +542,9 @@ class ClusterCollector:
                 continue
             ws["node"] = node_id
             ws["server_url"] = node.server_url
+            ws["persistence_state"] = normalize_conversation_persistence_state(
+                ws.get("persistence_state")
+            )
             new_ws[ws_id] = ws
         new_ids = set(new_ws.keys())
         # Additions
@@ -555,6 +561,7 @@ class ClusterCollector:
                     "parent_ws_id": ws.get("parent_ws_id"),
                     "project_id": ws.get("project_id", "") or "",
                     "persona": ws.get("persona", "") or "",
+                    "persistence_state": ws["persistence_state"],
                     # Mirror the SSE-relay path: the tenancy filter's
                     # ws-creator shortcut reads this.
                     "user_id": ws.get("user_id", "") or "",
@@ -569,7 +576,11 @@ class ClusterCollector:
             new_w = new_ws[ws_id]
             old_state = old_ws.get("state", "")
             new_state = new_w.get("state", "")
-            if old_state != new_state:
+            old_persistence = normalize_conversation_persistence_state(
+                old_ws.get("persistence_state")
+            )
+            new_persistence = new_w["persistence_state"]
+            if old_state != new_state or old_persistence != new_persistence:
                 pending.append(
                     {
                         "type": "cluster_state",
@@ -581,6 +592,7 @@ class ClusterCollector:
                         "kind": WorkstreamKind.from_raw(new_w.get("kind")),
                         "parent_ws_id": new_w.get("parent_ws_id"),
                         "activity_state": new_w.get("activity_state", ""),
+                        "persistence_state": new_persistence,
                     }
                 )
             old_name = old_ws.get("title", "") or old_ws.get("name", "")
@@ -632,6 +644,10 @@ class ClusterCollector:
                     ws["context_ratio"] = data.get("context_ratio", ws.get("context_ratio", 0))
                     ws["activity"] = data.get("activity", ws.get("activity", ""))
                     ws["activity_state"] = data.get("activity_state", ws.get("activity_state", ""))
+                    if "persistence_state" in data:
+                        ws["persistence_state"] = normalize_conversation_persistence_state(
+                            data["persistence_state"]
+                        )
                     # kind/parent_ws_id: defensive update from ws_state event.
                     # These rarely change but the event carries them so the
                     # collector's entry stays authoritative even if a delta
@@ -651,6 +667,9 @@ class ClusterCollector:
                             "kind": WorkstreamKind.from_raw(ws.get("kind")),
                             "parent_ws_id": ws.get("parent_ws_id"),
                             "activity_state": ws.get("activity_state", ""),
+                            "persistence_state": normalize_conversation_persistence_state(
+                                ws.get("persistence_state")
+                            ),
                         }
                     )
 
@@ -694,6 +713,9 @@ class ClusterCollector:
                         "user_id": ws_user,
                         "project_id": ws_project,
                         "persona": ws_persona,
+                        "persistence_state": normalize_conversation_persistence_state(
+                            data.get("persistence_state")
+                        ),
                     }
                 pending_events.append(
                     {
@@ -1233,6 +1255,7 @@ class ClusterCollector:
                     # gates on this — a missing project_id fails open.
                     "project_id": project_id or "",
                     "persona": persona or "",
+                    "persistence_state": "healthy",
                     "updated": now,
                 }
             pending.append(
@@ -1247,6 +1270,7 @@ class ClusterCollector:
                     "user_id": user_id or "",
                     "project_id": project_id or "",
                     "persona": persona or "",
+                    "persistence_state": "healthy",
                 }
             )
         for event in pending:
@@ -1271,6 +1295,7 @@ class ClusterCollector:
         activity: str = "",
         activity_state: str = "",
         content: str = "",
+        persistence_state: str = "healthy",
     ) -> None:
         """Update the coordinator row's state on the console pseudo-node + fan out.
 
@@ -1303,6 +1328,7 @@ class ClusterCollector:
             entry["context_ratio"] = context_ratio
             entry["activity"] = activity
             entry["activity_state"] = activity_state
+            entry["persistence_state"] = normalize_conversation_persistence_state(persistence_state)
         self._fanout(
             {
                 "type": "cluster_state",
@@ -1314,6 +1340,7 @@ class ClusterCollector:
                 "kind": WorkstreamKind.COORDINATOR.value,
                 "parent_ws_id": None,
                 "activity_state": activity_state,
+                "persistence_state": normalize_conversation_persistence_state(persistence_state),
             }
         )
 

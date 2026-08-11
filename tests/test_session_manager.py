@@ -35,6 +35,7 @@ from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
     WorkstreamState,
+    concrete_method,
 )
 
 # ---------------------------------------------------------------------------
@@ -2543,3 +2544,65 @@ class TestStateSubscribers:
         fired.clear()
         mgr.set_state(ws.id, WorkstreamState.IDLE)
         assert fired == ["first:idle", "late:idle"]
+
+
+# ---------------------------------------------------------------------------
+# concrete_method — the shared optional-hook probe
+# ---------------------------------------------------------------------------
+
+
+class TestConcreteMethod:
+    """Both halves of the shared guard every optional-hook caller drives.
+
+    Manager persistence hooks, ``workstream_persistence_state``, the route
+    layer's cancel / history-handoff / cross-user probes, the nudge watcher's
+    interjection claim and the coordinator adapter's spawn gate all resolve
+    their hook through this one helper, so the two semantics below are pinned
+    once here rather than eleven times at the call sites.
+    """
+
+    def test_type_defined_method_is_concrete(self) -> None:
+        class Real:
+            def hook(self) -> str:
+                return "real"
+
+        found = concrete_method(Real(), "hook")
+        assert found is not None
+        assert found() == "real"
+
+    def test_missing_method_is_none(self) -> None:
+        assert concrete_method(object(), "hook") is None
+
+    def test_magicmock_auto_vivification_is_not_a_hook(self) -> None:
+        """An unconfigured mock answers every attribute with a callable child.
+
+        Treating that as a production hook is what the guard exists to stop:
+        it would make every optional seam look implemented under unit tests.
+        """
+        assert concrete_method(MagicMock(), "hook") is None
+
+    def test_instance_dict_hook_is_concrete(self) -> None:
+        """A deliberately installed per-instance hook still counts.
+
+        This is the half ``session_manager`` had and the route layer's
+        type-only copies had lost: an explicitly assigned attribute lands in
+        the instance ``__dict__``, unlike an auto-vivified mock child, so it
+        is distinguishable and must be honored.
+        """
+        target = MagicMock()
+        target.hook = lambda: "installed"
+        found = concrete_method(target, "hook")
+        assert found is not None
+        assert found() == "installed"
+
+    def test_non_callable_attribute_is_not_a_hook(self) -> None:
+        class Shadowed:
+            hook = "not callable"
+
+        assert concrete_method(Shadowed(), "hook") is None
+
+    def test_slots_object_without_dict_is_supported(self) -> None:
+        class Slotted:
+            __slots__ = ()
+
+        assert concrete_method(Slotted(), "hook") is None

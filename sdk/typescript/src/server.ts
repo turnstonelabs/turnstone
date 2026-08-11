@@ -25,8 +25,10 @@ import type {
   SendResponse,
   SkillSummary,
   StatusResponse,
+  StreamEventsOptions,
   TurnResult,
   UploadAttachmentResponse,
+  WorkstreamHistoryResponse,
 } from "./types.js";
 
 function generateWsId(): string {
@@ -113,11 +115,14 @@ export class TurnstoneServer extends BaseClient {
   async send(
     message: string,
     wsId: string,
-    opts?: { attachmentIds?: string[] },
+    opts?: { attachmentIds?: string[]; clientSendId?: string },
   ): Promise<SendResponse> {
     const body: Record<string, unknown> = { message };
     if (opts?.attachmentIds !== undefined) {
       body.attachment_ids = opts.attachmentIds;
+    }
+    if (opts?.clientSendId !== undefined) {
+      body.client_send_id = opts.clientSendId;
     }
     return this.request(
       "POST",
@@ -231,11 +236,45 @@ export class TurnstoneServer extends BaseClient {
     );
   }
 
+  // -- History ---------------------------------------------------------------
+
+  /**
+   * Return the requested tail of the authoritative total accepted row prefix.
+   * A 503 is non-authoritative and must not replace an existing transcript.
+   */
+  async getHistory(
+    wsId: string,
+    opts?: { limit?: number },
+  ): Promise<WorkstreamHistoryResponse> {
+    return this.request(
+      "GET",
+      `/v1/api/workstreams/${encodeURIComponent(wsId)}/history`,
+      { params: { limit: opts?.limit ?? 100 } },
+    );
+  }
+
   // -- Streaming ------------------------------------------------------------
 
-  async *streamEvents(wsId: string): AsyncIterableIterator<ServerEvent> {
+  /**
+   * Open one caller-managed event stream. Pass history hints only after fully
+   * rendering the corresponding `getHistory()` response. On `history_resync`,
+   * stop this iterator, refetch and render history, then open a new stream with
+   * the new hints. No automatic reconnect or transcript repair is performed.
+   */
+  async *streamEvents(
+    wsId: string,
+    opts?: StreamEventsOptions,
+  ): AsyncIterableIterator<ServerEvent> {
+    const params: Record<string, string | number> = { user_turn: 1 };
+    if (opts?.lastEventId !== undefined) {
+      params.last_event_id = opts.lastEventId;
+    }
+    if (opts?.historyToken) {
+      params.history_token = opts.historyToken;
+    }
     yield* this.streamSSE<ServerEvent>(
       `/v1/api/workstreams/${encodeURIComponent(wsId)}/events`,
+      params,
     );
   }
 
@@ -277,7 +316,7 @@ export class TurnstoneServer extends BaseClient {
       // Start consuming the per-workstream SSE stream first
       const events = this.streamSSE<ServerEvent>(
         `/v1/api/workstreams/${encodeURIComponent(wsId)}/events`,
-        undefined,
+        { user_turn: 1 },
         controller.signal,
       );
 
