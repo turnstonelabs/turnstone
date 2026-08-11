@@ -2065,18 +2065,17 @@ def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None,
     is True both when the opt-in cleared the target and when the absence of the
     opt-in refused it.  Callers use it for the "(private network)" header.
 
-    ``private_origin`` is True when the operator opted in and the target is in
-    the PRIVATE lane, including a hostname that answers with a mix of private
-    and public records — split-horizon and hairpin DNS are ordinary
-    self-hosting, and refusing them would make a common setup permanently
-    unreachable with no remedy the operator could act on.  Public origins never
-    set it, keeping the public→private redirect bounce blocked regardless of
-    the opt-in.
+    ``private_origin`` is True when the operator opted in and EVERY address the
+    target resolves to is private.  A hostname answering with both a private
+    and a public record is refused instead, naming the remedy: the connection
+    may land on either record, so approving it would not describe where the
+    fetch actually goes.  Public origins never set it, keeping the
+    public→private redirect bounce blocked regardless of the opt-in.
 
-    A mixed origin is safe to admit because the permission does not survive the
-    chain: ``fetch_with_ssrf_guard`` screens every hop and revokes private-hop
-    permission after any hop that is not WHOLLY private, so a mixed origin buys
-    exactly one request and cannot be walked further into the network.
+    Because a granted chain therefore starts wholly private,
+    ``fetch_with_ssrf_guard`` never has to make an exception for the origin —
+    it revokes private-hop permission after any hop that is not wholly private
+    and needs no notion of an "approved host".
     """
     screen = screen_url(url)
     if screen.error is None:
@@ -2087,14 +2086,21 @@ def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None,
     is_private_block = screen.lane is AddressLane.PRIVATE
     ssrf_err = screen.error
     if is_private_block and allow_private_network:
-        # A split-horizon or hairpin-DNS host answering with both a LAN and a
-        # WAN address is approved like any other private target — refusing it
-        # would make a common self-hosting setup permanently unreachable with
-        # no remediation the operator could act on. The chain is still safe:
-        # ``fetch_with_ssrf_guard`` revokes private-hop permission after any
-        # hop that is not wholly private, so a mixed origin buys exactly one
-        # hop and cannot be used to walk further into the network.
-        return None, True, True
+        if screen.all_private:
+            return None, True, True
+        # A hostname answering with BOTH a private and a public address cannot
+        # be approved as a private-network target: the connection may land on
+        # either, so the approval would not describe where the fetch goes, and
+        # granting the chain private-hop permission on that basis let an
+        # attacker-controlled public record steer the fetcher into the network.
+        # Refused with the remedy, rather than silently narrowed.
+        return (
+            f"Error: {ssrf_err}. That hostname also resolves to a public address, so it"
+            " cannot be approved as a private-network target — point the tool at the"
+            " LAN address directly.",
+            False,
+            True,
+        )
     hint = ""
     if is_private_block:
         hint = (

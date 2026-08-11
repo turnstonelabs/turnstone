@@ -883,39 +883,49 @@ class TestAllowPrivateNetwork:
             fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5)
         assert _FakeClient.calls == []
 
-    def test_dual_stack_private_origin_can_redirect_to_itself(self, monkeypatch):
-        """A home-lab host with both a LAN and a public record must still work.
+    def test_public_bounce_cannot_return_to_the_origin_host(self, monkeypatch):
+        """``private -> public -> back to the origin`` must not be re-admitted.
 
-        The operator approved that HOST, so its own ``302 /login`` stays
-        covered even though the chain-wide permission is revoked the moment
-        the origin turns out not to be wholly private. Revoking on the origin
-        without this refused the approved host on its very first redirect.
+        An origin-host exemption (added to let a dual-stack host redirect to
+        itself) made this reachable: the permission was keyed on the hostname
+        and never cleared, so a public hop could send the fetcher back to the
+        approved host at a path of its choosing. Mixed-record origins are now
+        refused before the fetch instead, so the guard needs no exemption.
         """
         import socket
+
+        import pytest
 
         from turnstone.core.web import fetch_with_ssrf_guard
 
         _FakeClient.calls = []
         _FakeClient.table = {
-            "http://grafana.home.arpa/": _FakeHop(
-                302, {"location": "http://grafana.home.arpa/login"}
-            ),
-            "http://grafana.home.arpa/login": _FakeHop(200, {}),
+            "http://home.example/": _FakeHop(302, {"location": "http://attacker.example/"}),
+            "http://attacker.example/": _FakeHop(302, {"location": "http://home.example/admin"}),
+            "http://home.example/admin": _FakeHop(200, {}),
         }
         monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
-        infos = [
-            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("10.0.0.5", 0)),
-            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 0)),
-        ]
-        monkeypatch.setattr("socket.getaddrinfo", lambda *a, **kw: infos)
-        resp = fetch_with_ssrf_guard(
-            "http://grafana.home.arpa/", timeout=5, allow_private_origin=True
-        )
-        assert resp.status_code == 200
-        assert _FakeClient.calls == [
-            "http://grafana.home.arpa/",
-            "http://grafana.home.arpa/login",
-        ]
+
+        def _resolve(host, port=None, *a, **kw):
+            if host == "home.example":
+                return [
+                    (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("10.0.0.5", 0)),
+                    (
+                        socket.AF_INET,
+                        socket.SOCK_STREAM,
+                        socket.IPPROTO_TCP,
+                        "",
+                        ("93.184.216.34", 0),
+                    ),
+                ]
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 0))
+            ]
+
+        monkeypatch.setattr("socket.getaddrinfo", _resolve)
+        with pytest.raises(ValueError, match="private/internal"):
+            fetch_with_ssrf_guard("http://home.example/", timeout=5, allow_private_origin=True)
+        assert _FakeClient.calls == ["http://home.example/", "http://attacker.example/"]
 
     def test_dual_stack_origin_cannot_redirect_to_another_private_host(self, monkeypatch):
         """The approval covers that host, not the rest of the network."""

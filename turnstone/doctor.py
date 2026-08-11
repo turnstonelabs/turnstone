@@ -260,14 +260,10 @@ def _assert_safe_http_url(url: str) -> None:
 
     try:
         parts = urllib.parse.urlsplit(url)
-        host = (parts.hostname or "").lower()
     except ValueError as exc:
         raise ValueError(f"refusing malformed URL: {url!r}") from exc
     if parts.scheme not in ("http", "https"):
         raise ValueError(f"refusing non-http(s) URL: {url!r}")
-    if host == "metadata.google.internal":
-        raise ValueError(f"refusing link-local/metadata host: {host!r}")
-
     # One screen, shared with the fetch tools: parse, resolve, classify, fold.
     # This guard accepts the PRIVATE lane where they gate it behind an operator
     # opt-in — probing a private node URL is the job — so only NEVER refuses.

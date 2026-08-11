@@ -85,9 +85,10 @@ _LOWEST_ROUTABLE_V4 = ipaddress.IPv4Address("1.0.0.0")
 # here — this is the single list, shared by every guard.
 _VENDOR_METADATA: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
     ipaddress.IPv6Network("fd00:ec2::/32"),  # AWS Nitro IMDS / ECS task metadata
-    # The rest sit in ordinary unicast space, so the stdlib reports them as
-    # globally routable and they would be reachable with NO opt-in at all —
-    # a worse position than the RFC 1918 host next to them.
+    # Alibaba's sits in CGNAT, so it would land in the operator-approvable
+    # lane; Azure's and Oracle's are ordinary global unicast, so without an
+    # entry they are reachable with NO opt-in at all — a worse position than
+    # the RFC 1918 host beside them.
     ipaddress.IPv4Network("100.100.100.200/32"),  # Alibaba Cloud ECS metadata
     ipaddress.IPv4Network("168.63.129.16/32"),  # Azure host agent / wire server
     ipaddress.IPv4Network("192.0.0.192/32"),  # Oracle Cloud metadata
@@ -127,6 +128,16 @@ def _rfc6052_ipv4(addr: ipaddress.IPv6Address, prefix_len: int) -> ipaddress.IPv
     high = (value >> (128 - prefix_len - high_bits)) & ((1 << high_bits) - 1)
     low = ((value >> (56 - low_bits)) & ((1 << low_bits) - 1)) if low_bits else 0
     return ipaddress.IPv4Address((high << low_bits) | low)
+
+
+BLOCKED_HOSTNAMES = frozenset({"metadata.google.internal"})
+"""Metadata endpoints reached by NAME rather than by address.
+
+Resolution would classify these correctly on most clouds, but the name is
+stable while the address it answers with is not, so the guards refuse it
+outright. Shared for the same reason the prefixes are: a per-caller copy is
+how they drifted before.
+"""
 
 
 def embedded_ipv4(addr: IPAddress) -> tuple[ipaddress.IPv4Address, ...]:
@@ -275,6 +286,7 @@ def parse_resolved_address(raw: str) -> IPAddress:
 
 
 __all__ = [
+    "BLOCKED_HOSTNAMES",
     "AddressLane",
     "IPAddress",
     "ResolutionError",

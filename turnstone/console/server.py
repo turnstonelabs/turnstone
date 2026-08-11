@@ -4851,41 +4851,49 @@ def _probe_url_is_safe(url: str) -> bool:
     from turnstone.core.ip_classify import AddressLane
     from turnstone.core.web import screen_url
 
-    parsed = urllib.parse.urlparse(url)
-    if (parsed.hostname or "").lower() == "metadata.google.internal":
-        return False
     return screen_url(url).lane is not AddressLane.NEVER
 
 
 _PROBE_RESOLVE_TIMEOUT_SECONDS = 2.0
-_PROBE_MAX_CANDIDATES = 3
 
 
-async def _first_safe_candidate(services: list[dict[str, Any]] | None) -> tuple[str, str]:
+async def _first_safe_candidate(services: list[dict[str, Any]] | None) -> tuple[str, str, int]:
     """Return the first registry entry that passes the safety screen.
 
-    Tries several candidates: one unresolvable entry must not abandon the
-    collector-scope probe for the whole cluster, nor make a healthy registry
-    log as malformed.  Each resolution runs off the event loop under a
-    deadline, because this is awaited before the console lifespan yields and
-    ``getaddrinfo`` has no timeout of its own — a blackholed resolver would
-    otherwise stall startup for glibc's full retry budget.
+    Returns ``(url, node_id, refused)``.  ``refused`` counts entries that were
+    selectable but screened out, so the caller can tell "registry is malformed"
+    (an operator-actionable alarm) from "the entries are fine, none is reachable
+    right now" — logging the former for the latter sends operators to audit a
+    healthy registry.
+
+    Walks the WHOLE registry rather than a fixed prefix: capping the walk meant
+    a cluster whose first few entries were briefly unresolvable skipped the boot
+    check entirely and still raised the malformed alarm.
+
+    Each resolution runs off the event loop under a deadline, because this is
+    awaited before the console lifespan yields and ``getaddrinfo`` has no
+    timeout of its own.  A deadline bounds the AWAIT, not the work — the thread
+    stays parked until the resolver gives up — so a timeout stops the walk
+    rather than starting another one, keeping at most one thread parked on the
+    shared executor.
     """
     remaining = list(services or [])
-    for _ in range(_PROBE_MAX_CANDIDATES):
+    refused = 0
+    while True:
         url, nid = _probe_candidate_url(remaining)
         if not url:
-            return "", ""
+            return "", "", refused
         remaining = [s for s in remaining if s.get("service_id") != nid]
         try:
             async with asyncio.timeout(_PROBE_RESOLVE_TIMEOUT_SECONDS):
                 safe = await asyncio.to_thread(_probe_url_is_safe, url)
         except TimeoutError:
-            safe = False
+            log.warning("collector_scope_probe.resolver_timeout node=%s", nid)
+            return "", "", refused + 1
         if safe:
-            return url, nid
+            return url, nid, refused
+        refused += 1
         log.warning("collector_scope_probe.candidate_refused node=%s", nid)
-    return "", ""
 
 
 async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncClient) -> None:
@@ -4928,13 +4936,19 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
             exc_info=True,
         )
         return
-    probe_url, probe_node = await _first_safe_candidate(services)
+    probe_url, probe_node, refused = await _first_safe_candidate(services)
     if not probe_url:
-        # Distinguish "registry empty" (normal pre-discovery) from
-        # "registry populated but every entry malformed" (operator-
-        # actionable drift) so the two aren't both logged as INFO
-        # silent-skips.
-        if services:
+        # Three distinct states, three distinct log lines: an empty registry is
+        # normal pre-discovery, entries that screened out are a reachability
+        # problem, and entries that could not even be selected are the
+        # operator-actionable drift the malformed alarm is for.
+        if refused:
+            log.warning(
+                "collector_scope_probe.no_reachable_candidate count=%d refused=%d",
+                len(services or []),
+                refused,
+            )
+        elif services:
             log.warning(
                 "collector_scope_probe.registry_malformed count=%d",
                 len(services),

@@ -476,27 +476,29 @@ class TestResolutionFailureFailsClosed:
         assert err is not None and private_origin is False
 
 
-class TestMixedRecordsAreNotAPrivateOrigin:
-    """``private_origin`` needs EVERY record private, not just the worst one.
+class TestMixedRecordOrigins:
+    """A host answering with both a private and a public record is refused.
 
     The worst-lane fold is right for refusing and wrong for deciding that a
     chain sits inside the operator's network: the connection may land on the
     public record, so the approval would describe somewhere the fetch is not.
+    Granting the chain private-hop permission on that basis is what let a
+    public record steer the fetcher back into the network.
     """
 
-    def test_dual_record_host_is_fetchable_but_grants_no_chain_permission(self) -> None:
-        """Split-horizon and hairpin DNS are ordinary self-hosting, not an attack.
+    def test_dual_record_host_is_refused_with_a_remedy(self) -> None:
+        """Refused, and told what to do instead.
 
-        The host is approved like any other private target — refusing it would
-        make that setup permanently unreachable with no operator remedy. The
-        chain stays safe because ``fetch_with_ssrf_guard`` revokes private-hop
-        permission after any hop that is not wholly private, so a mixed origin
-        buys exactly one hop.
+        Admitting it and relying on the fetch guard to contain the chain was
+        tried and failed: the containment needed an origin exemption, and that
+        exemption let a public record steer the fetcher back into the network.
+        Refusing here is what lets the guard stay a single unconditional rule.
         """
         err, private_origin, block = _screen_tool("10.0.0.1", "1.2.3.4", allow_private_network=True)
-        assert err is None and private_origin is True and block is True
-        with _resolving_to("10.0.0.1", "1.2.3.4"):
-            assert screen_url("http://dual.example/x").all_private is False
+        assert err is not None
+        assert private_origin is False
+        assert block is True
+        assert "LAN address directly" in err
 
     def test_wholly_private_host_still_qualifies(self) -> None:
         err, private_origin, _block = _screen_tool(
