@@ -143,7 +143,7 @@ def screen_url(url: str) -> UrlScreen:
         parsed = urlparse(url)
         hostname = parsed.hostname
         # ``urlsplit.port`` parses lazily and raises for an out-of-range value.
-        port = parsed.port or 80
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
     except ValueError:
         return UrlScreen(AddressLane.NEVER, f"Blocked: malformed URL ({url})", False)
     if not hostname:
@@ -229,6 +229,7 @@ def fetch_with_ssrf_guard(
     """
     current = url
     private_allowed = allow_private_origin
+    approved_host = (urlparse(url).hostname or "").lower() if allow_private_origin else ""
     with httpx.Client(
         headers={"User-Agent": user_agent},
         timeout=timeout,
@@ -238,14 +239,21 @@ def fetch_with_ssrf_guard(
             screen = screen_url(current)
             if screen.lane is AddressLane.NEVER:
                 raise ValueError(screen.error)
-            if screen.lane is AddressLane.PRIVATE and not private_allowed:
+            # The operator approved a specific HOST, so redirects that stay on
+            # it remain covered even once the chain-wide permission is gone —
+            # otherwise a dual-stack home-lab service answering with both a LAN
+            # and a public record would be refused on its own ``302 /login``.
+            on_approved_host = bool(approved_host) and (
+                (urlparse(current).hostname or "").lower() == approved_host
+            )
+            if screen.lane is AddressLane.PRIVATE and not (private_allowed or on_approved_host):
                 raise ValueError(screen.error)
             if not screen.all_private:
                 # The chain can no longer be shown to be inside the operator's
                 # network — either the hop is public, or it merely CONTAINS a
                 # private record and the connection may land on a public one.
                 # Their approval covered their own hosts, not whatever a public
-                # site picks next, so private hops stop being allowed here on.
+                # site picks next, so private hops on OTHER hosts stop here.
                 private_allowed = False
             with client.stream("GET", current) as resp:
                 if resp.status_code in _REDIRECT_STATUSES:

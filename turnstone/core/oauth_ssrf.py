@@ -189,7 +189,7 @@ def validate_url_no_ssrf(
     try:
         classified = resolve_and_classify(hostname)
     except ResolutionError as exc:
-        raise OAuthSSRFError(f"endpoint hostname {exc}: {url}") from exc
+        raise OAuthSSRFError(f"endpoint {exc}: {url}") from exc
 
     for lane, addr in classified:
         # Ordered so the refusal names the real problem. Deciding the scheme

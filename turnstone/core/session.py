@@ -2054,22 +2054,29 @@ def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None,
     ``allow_private_network`` is the live ``tools.allow_private_network``
     setting (admin Settings → Tools; DB-backed, hot-toggleable — the caller
     reads it per prepare).  Returns ``(error, private_origin, private_block)``.
-    ``error`` is the rejection text (``None`` = proceed); ``private_block`` says
-    the refusal is one the opt-in COULD clear, so callers can label it without
-    re-deriving that from the wording.  A private-address rejection names
-    the setting so a self-hosted operator learns the knob from the refusal
-    itself.  ``private_origin`` is True when EVERY address the target resolves
-    to is private and the operator opted in: the approval header tags it, and
-    the guarded fetch accepts private hops on that chain — the gate approved a
-    private URL, so its redirects are the operator's own network.  Public
-    origins never set it, keeping the public→private redirect bounce blocked
-    regardless of the opt-in.
 
-    "Every address", not "the worst address": a hostname answering with both a
-    private and a public record folds to the private lane, but the connection
-    may land on the public record, so the operator would be approving a LAN
-    fetch that actually reaches an attacker's server with private hops enabled
-    for the rest of the chain.
+    ``error`` is the rejection text, or ``None`` to proceed.  A private-address
+    rejection names the setting so a self-hosted operator learns the knob from
+    the refusal itself.
+
+    ``private_block`` means the target is in the PRIVATE lane — the lane the
+    opt-in governs — so callers can label the request without re-deriving that
+    from the refusal wording.  It is about the LANE, not about the outcome: it
+    is True both when the opt-in cleared the target and when the absence of the
+    opt-in refused it.  Callers use it for the "(private network)" header.
+
+    ``private_origin`` is True when the operator opted in and the target is in
+    the PRIVATE lane, including a hostname that answers with a mix of private
+    and public records — split-horizon and hairpin DNS are ordinary
+    self-hosting, and refusing them would make a common setup permanently
+    unreachable with no remedy the operator could act on.  Public origins never
+    set it, keeping the public→private redirect bounce blocked regardless of
+    the opt-in.
+
+    A mixed origin is safe to admit because the permission does not survive the
+    chain: ``fetch_with_ssrf_guard`` screens every hop and revokes private-hop
+    permission after any hop that is not WHOLLY private, so a mixed origin buys
+    exactly one request and cannot be walked further into the network.
     """
     screen = screen_url(url)
     if screen.error is None:

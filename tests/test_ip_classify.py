@@ -506,20 +506,32 @@ class TestMixedRecordsAreNotAPrivateOrigin:
 
 
 class TestSiteLocalAndVendorMetadata:
+    @pytest.mark.parametrize(
+        "addr,who",
+        [
+            ("fd00:ec2::254", "AWS Nitro IMDS over IPv6"),
+            ("100.100.100.200", "Alibaba Cloud ECS"),
+            ("168.63.129.16", "Azure host agent / wire server"),
+            ("192.0.0.192", "Oracle Cloud"),
+        ],
+    )
+    def test_vendor_metadata_is_never(self, addr: str, who: str) -> None:
+        """These sit in ordinary unicast space, so the stdlib calls them routable.
+
+        Without an explicit entry they are reachable with NO opt-in at all —
+        a worse position than the RFC 1918 host next to them — and the docs
+        and settings help promise the opposite.
+        """
+        assert classify_address(ipaddress.ip_address(addr)) is AddressLane.NEVER, who
+        err, private_origin, _block = _screen_tool(addr, allow_private_network=True)
+        assert err is not None and private_origin is False
+
     def test_deprecated_site_local_is_not_public(self) -> None:
         """CPython reports fec0::/10 as is_global, so it needs an explicit rule."""
         assert ipaddress.ip_address("fec0::1").is_global, "precondition"
         assert classify_address(ipaddress.ip_address("fec0::1")) is AddressLane.PRIVATE
         assert not _oauth_allows("fec0::1")
         assert _oauth_allows("fec0::1", allow_private=True)
-
-    def test_cgnat_hosted_vendor_metadata_is_never(self) -> None:
-        """Alibaba's endpoint sits in CGNAT, so the lane rules alone put it in PRIVATE."""
-        addr = ipaddress.ip_address("100.100.100.200")
-        assert not addr.is_link_local and not addr.is_reserved, "precondition"
-        assert classify_address(addr) is AddressLane.NEVER
-        err, private_origin, _block = _screen_tool("100.100.100.200", allow_private_network=True)
-        assert err is not None and private_origin is False
 
 
 class TestCleartextRequiresProvenLoopback:

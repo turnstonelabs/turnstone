@@ -255,31 +255,25 @@ def _assert_safe_http_url(url: str) -> None:
     any IPv6 transition address wrapping it, e.g.
     ``::ffff:169.254.169.254`` — walked straight through.
     """
-    from turnstone.core.ip_classify import (
-        AddressLane,
-        ResolutionError,
-        describe_address,
-        resolve_and_classify,
-    )
+    from turnstone.core.ip_classify import AddressLane
+    from turnstone.core.web import screen_url
 
     try:
         parts = urllib.parse.urlsplit(url)
         host = (parts.hostname or "").lower()
-        port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError as exc:
         raise ValueError(f"refusing malformed URL: {url!r}") from exc
     if parts.scheme not in ("http", "https"):
         raise ValueError(f"refusing non-http(s) URL: {url!r}")
-    if not host or host == "metadata.google.internal":
+    if host == "metadata.google.internal":
         raise ValueError(f"refusing link-local/metadata host: {host!r}")
 
-    try:
-        classified = resolve_and_classify(host, port)
-    except ResolutionError as exc:
-        raise ValueError(f"refusing unresolvable host: {host!r}") from exc
-    for lane, addr in classified:
-        if lane is AddressLane.NEVER:
-            raise ValueError(f"refusing link-local/metadata host: {describe_address(addr)}")
+    # One screen, shared with the fetch tools: parse, resolve, classify, fold.
+    # This guard accepts the PRIVATE lane where they gate it behind an operator
+    # opt-in — probing a private node URL is the job — so only NEVER refuses.
+    screen = screen_url(url)
+    if screen.lane is AddressLane.NEVER:
+        raise ValueError(f"refusing unsafe URL: {screen.error}")
 
 
 def _http_get_json(url: str, timeout: float = 5.0) -> Any:

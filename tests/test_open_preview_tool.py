@@ -42,9 +42,14 @@ class _RecordingUI:
         self.tool_results.append((call_id, name, output, kwargs))
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _no_network_screen(monkeypatch):
     """Keep prepare-time SSRF screening off the network.
+
+    Opt-in, NOT autouse: as a module-wide fixture it also stubbed the tests
+    whose whole point is the screen, so ``test_screen_public_url_passes``
+    asserted on the stub and would have passed even if screen_url refused
+    every hostname. Request it only where the hostname is incidental.
 
     Screening fails closed on a resolution failure, so a test naming a
     third-party host (``example.com``) would otherwise depend on live public
@@ -120,7 +125,7 @@ class TestPrepareOpenPreview:
         item = s._prepare_open_preview("c1", {"target": "a.txt", "kind": "hologram"})
         assert "kind must be one of" in item["error"]
 
-    def test_url_target_needs_approval(self):
+    def test_url_target_needs_approval(self, _no_network_screen):
         s = _make_session()
         item = s._prepare_open_preview("c1", {"target": "https://example.com/x"})
         assert item["needs_approval"] is True
@@ -157,7 +162,7 @@ class TestPrepareOpenPreview:
 
 
 class TestExecOpenPreview:
-    def test_url_html_builds_web_descriptor(self, monkeypatch):
+    def test_url_html_builds_web_descriptor(self, _no_network_screen, monkeypatch):
         s = _make_session()
         body = b"<html><head><title>Acme Pricing</title></head><body>x</body></html>"
         monkeypatch.setattr(
@@ -180,7 +185,7 @@ class TestExecOpenPreview:
         results = s.ui.tool_results
         assert results and results[-1][3].get("preview") == descriptor
 
-    def test_url_userinfo_stripped_from_descriptor(self, monkeypatch):
+    def test_url_userinfo_stripped_from_descriptor(self, _no_network_screen, monkeypatch):
         s = _make_session()
         body = b"<html><head></head><body>x</body></html>"
         monkeypatch.setattr(
@@ -194,7 +199,7 @@ class TestExecOpenPreview:
         assert "sekret" not in descriptor["title"]
         assert b"sekret" not in att.content  # the injected <base href>
 
-    def test_redirect_into_private_space_blocked(self, monkeypatch):
+    def test_redirect_into_private_space_blocked(self, _no_network_screen, monkeypatch):
         s = _make_session()
 
         # The guarded fetch raises BEFORE requesting a private hop — the
@@ -212,7 +217,7 @@ class TestExecOpenPreview:
         assert msg.startswith("Error: fetch failed: Blocked")
         assert "c1" not in s._tool_previews
 
-    def test_oversized_web_content_errors(self, monkeypatch):
+    def test_oversized_web_content_errors(self, _no_network_screen, monkeypatch):
         s = _make_session()
         big = b"<html>" + b"x" * (4 * 1024 * 1024 + 16) + b"</html>"
         monkeypatch.setattr(
@@ -224,7 +229,7 @@ class TestExecOpenPreview:
         assert msg.startswith("Error:")
         assert "too large" in msg
 
-    def test_url_pdf_over_10mb_previews_to_kind_cap(self, monkeypatch):
+    def test_url_pdf_over_10mb_previews_to_kind_cap(self, _no_network_screen, monkeypatch):
         # Review finding (PR #800): a flat 10 MB URL pre-check rejected PDFs
         # the 32 MiB pdf kind cap allows — the fetch ceiling must track the
         # widest kind cap and leave the per-kind caps as the authority.
@@ -772,7 +777,7 @@ class TestAllowPrivateNetwork:
     def test_screen_public_url_passes(self):
         from turnstone.core.session import _screen_tool_url
 
-        err, private, _block = _screen_tool_url("https://example.com/x", False)
+        err, private, _block = _screen_tool_url("https://93.184.216.34/x", False)
         assert err is None and private is False
 
     def test_screen_private_blocked_with_discoverable_hint(self):
@@ -877,6 +882,63 @@ class TestAllowPrivateNetwork:
         with pytest.raises(ValueError, match="private/internal"):
             fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5)
         assert _FakeClient.calls == []
+
+    def test_dual_stack_private_origin_can_redirect_to_itself(self, monkeypatch):
+        """A home-lab host with both a LAN and a public record must still work.
+
+        The operator approved that HOST, so its own ``302 /login`` stays
+        covered even though the chain-wide permission is revoked the moment
+        the origin turns out not to be wholly private. Revoking on the origin
+        without this refused the approved host on its very first redirect.
+        """
+        import socket
+
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        _FakeClient.calls = []
+        _FakeClient.table = {
+            "http://grafana.home.arpa/": _FakeHop(
+                302, {"location": "http://grafana.home.arpa/login"}
+            ),
+            "http://grafana.home.arpa/login": _FakeHop(200, {}),
+        }
+        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        infos = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("10.0.0.5", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 0)),
+        ]
+        monkeypatch.setattr("socket.getaddrinfo", lambda *a, **kw: infos)
+        resp = fetch_with_ssrf_guard(
+            "http://grafana.home.arpa/", timeout=5, allow_private_origin=True
+        )
+        assert resp.status_code == 200
+        assert _FakeClient.calls == [
+            "http://grafana.home.arpa/",
+            "http://grafana.home.arpa/login",
+        ]
+
+    def test_dual_stack_origin_cannot_redirect_to_another_private_host(self, monkeypatch):
+        """The approval covers that host, not the rest of the network."""
+        import socket
+
+        import pytest
+
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        _FakeClient.calls = []
+        _FakeClient.table = {
+            "http://grafana.home.arpa/": _FakeHop(302, {"location": "http://10.0.0.1/admin"}),
+            "http://10.0.0.1/admin": _FakeHop(200, {}),
+        }
+        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        infos = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("10.0.0.5", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 0)),
+        ]
+        monkeypatch.setattr("socket.getaddrinfo", lambda *a, **kw: infos)
+        with pytest.raises(ValueError, match="private/internal"):
+            fetch_with_ssrf_guard("http://grafana.home.arpa/", timeout=5, allow_private_origin=True)
+        assert _FakeClient.calls == ["http://grafana.home.arpa/"]
 
     def test_mixed_record_hop_revokes_the_private_permission(self, monkeypatch):
         """A hop that merely CONTAINS a private record must not keep the permission.

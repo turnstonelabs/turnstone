@@ -85,10 +85,12 @@ _LOWEST_ROUTABLE_V4 = ipaddress.IPv4Address("1.0.0.0")
 # here — this is the single list, shared by every guard.
 _VENDOR_METADATA: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
     ipaddress.IPv6Network("fd00:ec2::/32"),  # AWS Nitro IMDS / ECS task metadata
-    # Alibaba Cloud ECS metadata. Sits in CGNAT space, so it is neither private
-    # nor global nor link-local — without this entry it lands in the
-    # operator-approvable lane and the opt-in hands out RAM-role STS credentials.
-    ipaddress.IPv4Network("100.100.100.200/32"),
+    # The rest sit in ordinary unicast space, so the stdlib reports them as
+    # globally routable and they would be reachable with NO opt-in at all —
+    # a worse position than the RFC 1918 host next to them.
+    ipaddress.IPv4Network("100.100.100.200/32"),  # Alibaba Cloud ECS metadata
+    ipaddress.IPv4Network("168.63.129.16/32"),  # Azure host agent / wire server
+    ipaddress.IPv4Network("192.0.0.192/32"),  # Oracle Cloud metadata
 )
 
 # RFC 6052 §2.2 embeds the IPv4 at a position that depends on the translation
