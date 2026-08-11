@@ -225,6 +225,7 @@ class TestContextOverflowRecovery:
             patch.object(session, "_stream_response", side_effect=mock_stream_response),
             patch.object(session, "_compact_messages", compact_mock),
             patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_over_soft", return_value=False),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
