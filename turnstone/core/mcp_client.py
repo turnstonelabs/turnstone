@@ -2856,23 +2856,17 @@ class MCPClientManager:
                 call.cancel()
             await asyncio.gather(call, return_exceptions=True)
             raise ConnectionError("MCP transport owner died during discovery")
-        if call.done():
-            if call.cancelled():
-                # The discovery future was cancelled out from under us (an
-                # SDK-internal cancellation shape, not this method's own reap)
-                # — the transport can no longer answer, which is the same
-                # failure class as the owner dying. Convert instead of leaking
-                # a bare CancelledError the caller would misread as its own
-                # cancellation.
-                raise ConnectionError("MCP discovery request cancelled by transport failure")
-            return call.result()  # normal result, or the real discovery error
-        # Owner finished first — the transport died under discovery. Reap the
-        # discovery future (gather absorbs its cancellation outcome; a caller
-        # cancellation arriving DURING the reap propagates instead — honoring
-        # the cancel beats reporting the dead transport).
-        call.cancel()
-        await asyncio.gather(call, return_exceptions=True)
-        raise ConnectionError("MCP transport owner died during discovery")
+        # FIRST_COMPLETED returned normally and the owner is not done, so the
+        # discovery future is necessarily the completed member of the pair.
+        if call.cancelled():
+            # The discovery future was cancelled out from under us (an
+            # SDK-internal cancellation shape, not this method's own reap)
+            # — the transport can no longer answer, which is the same
+            # failure class as the owner dying. Convert instead of leaking
+            # a bare CancelledError the caller would misread as its own
+            # cancellation.
+            raise ConnectionError("MCP discovery request cancelled by transport failure")
+        return call.result()  # normal result, or the real discovery error
 
     async def _connect_one_pool(
         self,
