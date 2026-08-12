@@ -232,7 +232,7 @@ class HeadlessSession(ChatSession):
     - auto_approve is always True
     - Tool calls are recorded into a structured log
     - All stdout output is suppressed
-    - send_headless() uses non-streaming API
+    - send_headless() drains the production streaming provider path
     """
 
     def __init__(
@@ -307,8 +307,8 @@ class HeadlessSession(ChatSession):
     ) -> list[dict[str, Any]]:
         """Run a complete conversation turn headlessly.
 
-        Uses non-streaming API calls. Captures all tool calls into
-        self.tool_call_log.
+        Drains production streaming provider calls into single-shot results.
+        Captures all tool calls into ``self.tool_call_log``.
 
         Returns the tool call log: list of dicts with keys:
             tool: str, args: dict, result: str (truncated), ok: bool,
@@ -533,9 +533,9 @@ def run_with_lifecycle(
       past the teardown (which closes only the last one built).
     * *drive* (returned by ``build_session``) — submitted to a
       one-worker executor and bounded by ``future.result(test_timeout)``.
-      The per-request httpx timeout cannot bound a STREAM: a trickling
-      response resets the read timeout indefinitely, so without the
-      wall clock a hung generation occupies a run slot forever.  On
+      The per-request HTTP transport timeout cannot bound a STREAM: a
+      trickling response resets the read timeout indefinitely, so without
+      the wall clock a hung generation occupies a run slot forever.  On
       timeout the session is DROPPED, not closed: the shutdown did not
       wait, so the worker is still inside the drive, and ``close()``'s
       bounded shell-join would trade a bounded leak for a blocked
@@ -736,8 +736,8 @@ def _run_single_test(
             )
 
     def _build_client() -> Any:
-        # Per-attempt client with request-level timeout so httpx aborts
-        # the HTTP request itself — no zombie connections on the server.
+        # Per-attempt client with a per-read timeout. The executor wall clock
+        # above separately bounds a trickling stream that keeps resetting it.
         return OpenAI(
             base_url=client.base_url,
             api_key=client.api_key,

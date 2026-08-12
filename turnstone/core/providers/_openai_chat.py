@@ -452,11 +452,11 @@ class OpenAIChatCompletionsProvider:
         # operator-declared ``finish_reason_optional`` capability: on a
         # server that never sends finish reasons, a stream that ended
         # CLEANLY — the SDK ends iteration on [DONE]; an abrupt connection
-        # death raises httpx.TransportError out of this generator — after
-        # delivering output is a completed generation.  Everywhere else a
-        # clean finish-less end is indistinguishable from a generation
-        # that died behind a clean-closing proxy/ASGI layer, so the shim
-        # stays DISARMED and the drain's complete-or-error gate raises
+        # death raises the active HTTP client's TransportError out of this
+        # generator — after delivering output is a completed generation.
+        # Everywhere else a clean finish-less end is indistinguishable
+        # from a generation that died behind a clean-closing proxy/ASGI layer,
+        # so the shim stays DISARMED and the drain's complete-or-error gate raises
         # (retryable) instead of blessing possibly-truncated text.
         # Reasoning counts as delivered output — a thinking model that
         # spent its budget before emitting content is still a completed

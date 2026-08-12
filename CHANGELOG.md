@@ -152,6 +152,16 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Changed
 
+- **OpenAI SDK v3 and its HTTPX2 default transport are now supported (#1009).**
+  Chat Completions and Responses streams normalize native HTTPX2 connection
+  deaths through the same retry boundary as legacy HTTPX-backed providers,
+  including failures observed after safe cross-thread client closure during a
+  model-registry reload. The OpenAI v3 runtime escape hatch for explicitly
+  injected legacy HTTPX clients remains supported. OpenAI connections now
+  follow HTTPX2's operating-system trust store by default; deployments that
+  relied on a modified `certifi` bundle must install that CA in the system
+  store or set `SSL_CERT_FILE` / `SSL_CERT_DIR`.
+
 - **Log event rename: `drain_stream.post_finish_blip` is now
   `stream.post_finish_blip`; its `usage_captured` field is retained.** The
   single-shot drain normalizes mid-body transport deaths through the same

@@ -2753,7 +2753,7 @@ class TestRunResourceLifecycle:
         assert not is_storage_initialized()
 
     def test_a_hung_generation_is_bounded_by_the_wall_clock(self, monkeypatch):
-        """The per-request httpx timeout cannot bound a STREAM — a
+        """The per-request HTTP transport timeout cannot bound a STREAM — a
         trickling response resets the read timeout indefinitely — so
         without the executor wall clock a hung generation occupies a run
         slot forever and is scored as a body regression when the sweep

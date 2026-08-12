@@ -1,6 +1,6 @@
 """Tests for :meth:`ChatSession._format_backend_error`.
 
-The helper turns bare backend-boundary exceptions (httpx ``ReadTimeout``,
+The helper turns bare backend-boundary exceptions (HTTPX/HTTPX2 ``ReadTimeout``,
 OpenAI SDK ``APITimeoutError`` / ``APIConnectionError`` /
 ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``) into
 operator-actionable messages that include the provider, base URL, and
@@ -225,7 +225,7 @@ def test_rate_limit_with_overflow_phrasing_is_not_mislabeled_overflow():
 
 def _stream_death_exemplars() -> list[BaseException]:
     """One realistic instance per name in ``_BACKEND_STREAM_EXC_NAMES``:
-    the normalized shape the guarded iterators raise, plus the raw httpx
+    the normalized shape the guarded iterators raise, plus the raw HTTPX-family
     names for any future unguarded path."""
     from turnstone.core.providers import IncompleteStreamError
 

@@ -55,7 +55,7 @@
     {
       "description": "LLM SDKs — always review manually",
       "groupName": "LLM SDKs",
-      "matchPackageNames": ["openai", "anthropic", "mcp"],
+      "matchPackageNames": ["openai", "httpx2", "anthropic", "mcp"],
       "schedule": ["before 9am on Monday"],
       "automerge": false
     },

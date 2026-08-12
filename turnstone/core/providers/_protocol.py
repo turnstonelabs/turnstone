@@ -228,10 +228,12 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     Streaming moves the body read out of the SDK's
     ``APIConnectionError``-wrapped request into raw iteration, so a
     mid-body wire death (connection drop, TLS record failure, read
-    timeout) surfaces as a bare ``httpx.TransportError`` no retry
-    predicate recognizes.  This wrapper is that conversion rule made
-    reusable for consumers that keep streaming semantics (the
-    interactive loop); :func:`drain_stream` applies the same rule for
+    timeout) surfaces as a bare transport error no retry predicate
+    recognizes.  OpenAI v3's default client raises ``httpx2`` errors;
+    Anthropic, Turnstone's own HTTP clients, and the OpenAI v3 legacy-client
+    escape hatch raise ``httpx`` errors.  This wrapper is the one conversion
+    rule for both families, reusable by consumers that keep streaming
+    semantics (the interactive loop); :func:`drain_stream` applies it for
     the single-shot lanes.
 
     - A ``TransportError`` BEFORE any finish reason re-raises (chained)
@@ -243,7 +245,11 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     - Everything else — chunks, exhaustion, non-transport exceptions —
       passes through untouched.
     """
-    import httpx  # noqa: PLC0415 — heavyweight; deferred off the type-module import path
+    # Both libraries are heavyweight; keep them off this module's dataclass-
+    # only import path. ``httpx`` remains Turnstone's application transport,
+    # while ``httpx2`` is the OpenAI v3 default transport.
+    import httpx  # noqa: PLC0415
+    import httpx2  # noqa: PLC0415
 
     finish_seen = False
     usage_seen = False
@@ -253,7 +259,7 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
             sc = next(iterator)
         except StopIteration:
             return
-        except httpx.TransportError as exc:
+        except (httpx.TransportError, httpx2.TransportError) as exc:
             if finish_seen:
                 # usage_captured distinguishes "completed result kept but
                 # its spend went missing from usage accounting" (the chat
@@ -348,7 +354,7 @@ def drain_stream(
 
     Raises whatever the underlying stream raises — retry/deadline/fallback
     policy stays with the caller, exactly as with the old non-streaming
-    transport — EXCEPT httpx transport failures, normalized by
+    transport — EXCEPT HTTPX/HTTPX2 transport failures, normalized by
     :func:`transport_guarded` (the one conversion rule, shared with the
     interactive loop): a mid-body death before the finish reason is
     re-raised (chained) as :class:`IncompleteStreamError`, restoring the

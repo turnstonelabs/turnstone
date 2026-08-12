@@ -177,7 +177,8 @@ Runs a complete multi-turn conversation:
 
 1. Appends the user message.
 2. Checks `_cancelled` event — stops if set (timeout cleanup).
-3. Calls the model API (non-streaming).
+3. Calls the model through the production streaming provider path and drains
+   the result.
 4. If tool calls are returned, executes them (with stdout suppressed) and
    logs each call to `self.tool_call_log`.
 5. Repeats up to `max_turns` or until the model responds without tool calls.
@@ -190,14 +191,15 @@ Parallel tool calls are capped at 10 per turn to prevent degenerate repetition.
 
 Each test runs in a `ThreadPoolExecutor(max_workers=1)` with a per-test
 timeout (`--test-timeout`). Each attempt gets its own `OpenAI` client with
-a matching httpx read timeout. On timeout, three layers of defense prevent
-zombie connections:
+a matching per-read HTTP transport timeout. Because a trickling stream can
+continually reset that read timeout, three layers bound the harness and stop
+follow-on work:
 
-1. **httpx timeout**: Per-request read timeout aborts the HTTP call and
-   releases the server slot.
+1. **Executor wall clock**: The harness stops waiting after `--test-timeout`.
 2. **`_cancelled` event**: Prevents the orphan thread from starting new turns.
-3. **`run_client.close()`**: Closes the connection pool to abort any
-   in-flight request.
+3. **`run_client.close()`**: Retires the connection pool and prevents reuse.
+   HTTPX2 does not promise that cross-thread client closure immediately aborts
+   an active body read; that read unwinds on its next wire event or read timeout.
 
 ### Retry Logic
 
@@ -214,7 +216,8 @@ Each test case runs in isolation:
 1. A fresh temp directory is created.
 2. Setup files are written to the temp directory.
 3. The working directory is changed to the temp directory.
-4. A per-attempt `OpenAI` client is created with httpx timeout matching `--test-timeout`.
+4. A per-attempt `OpenAI` client is created with an HTTP transport timeout
+   matching `--test-timeout`.
 5. A new `HeadlessSession` is created with the current developer prompt.
 6. `send_headless()` runs the user prompt through the conversation loop.
 7. The tool log is scored against expected actions.

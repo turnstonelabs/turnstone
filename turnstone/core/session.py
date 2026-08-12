@@ -1935,11 +1935,11 @@ _BACKEND_AUTH_EXC_NAMES: frozenset[str] = frozenset(
 _BACKEND_RATE_LIMIT_EXC_NAMES: frozenset[str] = frozenset({"RateLimitError"})
 # Mid-response stream deaths: the normalized shape every guarded iterator
 # raises (``IncompleteStreamError`` from ``drain_stream`` /
-# ``transport_guarded``) plus the raw httpx names for any future unguarded
-# path (defense in depth).  Unioning them into ``_BACKEND_KNOWN_EXC_NAMES``
-# is required — ``_format_backend_error`` gates on that set before the
-# branch lookups — and makes these three names ineligible for
-# ``_is_ctx_overflow``'s text-based overflow detection (its class
+# ``transport_guarded``) plus the raw HTTPX/HTTPX2 names for any future
+# unguarded path (defense in depth).  Unioning them into
+# ``_BACKEND_KNOWN_EXC_NAMES`` is required — ``_format_backend_error`` gates
+# on that set before the branch lookups — and makes these three names
+# ineligible for ``_is_ctx_overflow``'s text-based overflow detection (its class
 # self-gate): harmless, since their texts are fixed transport/SSL strings
 # that never carry overflow phrases.
 _BACKEND_STREAM_EXC_NAMES: frozenset[str] = frozenset(
@@ -7456,7 +7456,7 @@ class ChatSession:
         can arrive as several exception classes); everything else is matched by
         class name (see the ``_BACKEND_*_EXC_NAMES`` sets above) so the same
         helper covers
-        httpx ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
+        HTTPX/HTTPX2 ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
         ``APITimeoutError`` / ``APIConnectionError`` /
         ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``,
         and the Anthropic SDK equivalents (which share names).
