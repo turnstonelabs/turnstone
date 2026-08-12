@@ -15,6 +15,20 @@ from unittest.mock import MagicMock
 import pytest
 
 
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Resolve MCP v1's generic FastMCP settings model for test servers.
+
+    MCP 1.29.0 defines ``Settings`` before ``FastMCP``, so its ``lifespan``
+    annotation remains an unresolved forward reference after import. Rebuild
+    once, after the module is fully loaded, before any integration fixture
+    constructs a FastMCP server. Pydantic's public hook is a no-op once the SDK
+    ships a complete model.
+    """
+    from mcp.server.fastmcp.server import Settings as FastMCPSettings
+
+    FastMCPSettings.model_rebuild()
+
+
 def stop_loop_thread(loop: asyncio.AbstractEventLoop, thread: threading.Thread) -> None:
     """Fully tear down a ``loop.run_forever``-in-a-thread test loop.
 
