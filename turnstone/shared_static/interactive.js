@@ -52,6 +52,7 @@ import {
   acceptUserTurnEvent,
   clientSendMaySettleForViewer,
   createQueueController,
+  mergeRejectedComposerText,
   mintClientSendId,
   parsePriority,
   postAndSettleSend,
@@ -2887,6 +2888,12 @@ class Pane {
                 busyIsOptimistic: () =>
                   this.busy && this.busySource === "optimistic",
                 paneIsBusy: () => this.busy,
+                restoreInput: () => {
+                  this.composer.value = mergeRejectedComposerText(
+                    editText,
+                    this.composer.value,
+                  );
+                },
                 renderError: (message) => this.addErrorMessage(message),
                 consumeAttachments: () => {},
               },
@@ -4708,7 +4715,12 @@ class Pane {
 
   sendMessage() {
     const text = this.inputEl.value.trim();
-    if (!text) return;
+    if (!text) {
+      if (!this.attachments.isEmpty()) {
+        this.addInfoMessage("Add a message to send with this attachment.");
+      }
+      return;
+    }
 
     if (text.startsWith("/")) {
       if (this.busy) {
@@ -4798,11 +4810,27 @@ class Pane {
       return;
     }
 
+    // Attachments cannot ride the live turn's text-only interjection queue.
+    // Refuse before the optimistic clear so the user's companion text and
+    // staged chips remain ready to send once the worker is idle.
+    if (this.busy && !this.attachments.isEmpty()) {
+      this.addInfoMessage(
+        "Attachments can't be sent while the assistant is working. Wait for it to finish, then send again.",
+      );
+      return;
+    }
+
     const isBusy = this.busy;
     let queuedEl = null;
     let optimisticEl = null;
     const clientSendId = mintClientSendId();
     const snap = this.attachments.snapshot();
+    if (snap.uploading) {
+      this.addInfoMessage(
+        "Wait for attachments to finish uploading before sending.",
+      );
+      return;
+    }
 
     // Display-only strip of the !!! prefix (the server re-parses it
     // authoritatively); shared parse so the settle helper's retro-convert
@@ -4874,6 +4902,12 @@ class Pane {
       setBusy: (b) => this.setBusy(b),
       busyIsOptimistic: () => this.busy && this.busySource === "optimistic",
       paneIsBusy: () => this.busy,
+      restoreInput: () => {
+        this.composer.value = mergeRejectedComposerText(
+          text,
+          this.composer.value,
+        );
+      },
       renderError: (msg) => this.addErrorMessage(msg),
       consumeAttachments: (attached, droppedIds) =>
         this.attachments.consume(attached, droppedIds),

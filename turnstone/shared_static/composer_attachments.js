@@ -23,9 +23,10 @@
  *   clearChips()            — drop all chips + map entries (no DELETE).
  *   rehydrate()             — pull the server-side pending list (page
  *                             reload / tab switch).
- *   snapshot()              — {attachments, attachment_ids} of stable
- *                             chips only (skips in-flight placeholders),
- *                             ready to feed into a /send body.
+ *   snapshot()              — {attachments, attachment_ids, uploading}; the
+ *                             arrays contain stable chips only, while the flag
+ *                             lets senders refuse before an in-flight
+ *                             placeholder is silently omitted.
  *   consume(attached_ids,
  *           dropped_ids?)    — strip chips for ids the server reserved;
  *                             surface a toast if any were dropped.
@@ -327,6 +328,14 @@ export function createAttachmentController(opts) {
     // user dismissed would attach an untracked element (not in the
     // map, so coordSend wouldn't include it) and confuse them.
     if (!pending.has(placeholderId)) return;
+    // Content-addressed uploads are idempotent. If this response resolves to
+    // an attachment already represented by another chip, discard only this
+    // upload's placeholder so identical pastes visibly deduplicate too.
+    if (pending.has(info.attachment_id)) {
+      _removeChipDom(placeholderId);
+      pending.delete(placeholderId);
+      return;
+    }
     _replaceMapKey(pending, placeholderId, info.attachment_id, info);
 
     var chip = _findChip(placeholderId);
@@ -454,13 +463,20 @@ export function createAttachmentController(opts) {
   function snapshot() {
     var attachments = [];
     var ids = [];
+    var uploading = false;
     pending.forEach(function (info, id) {
       if (info && !info.uploading) {
         attachments.push(info);
         ids.push(id);
+      } else if (info && info.uploading) {
+        uploading = true;
       }
     });
-    return { attachments: attachments, attachment_ids: ids };
+    return {
+      attachments: attachments,
+      attachment_ids: ids,
+      uploading: uploading,
+    };
   }
 
   function consume(attachedIds, droppedIds) {

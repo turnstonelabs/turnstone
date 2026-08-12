@@ -507,6 +507,18 @@ export function parsePriority(text) {
   return { displayText: text, priority: "notice" };
 }
 
+// Restore a server-refused send without overwriting text entered during the
+// POST round-trip. The rejected message stays first (its original chronology).
+// Settlement is one-shot, so never infer duplicate restoration from content:
+// the user may independently type the same text while the request is pending.
+export function mergeRejectedComposerText(rejectedText, currentText) {
+  var rejected = rejectedText == null ? "" : String(rejectedText);
+  var current = currentText == null ? "" : String(currentText);
+  if (!rejected) return current;
+  if (!current) return rejected;
+  return rejected + "\n" + current;
+}
+
 // Mint one opaque browser correlation token. This is deliberately not a
 // delivery/idempotency key; the server may accept the same value on multiple
 // distinct turns, whose event ids remain authoritative.
@@ -678,6 +690,8 @@ export function acceptUserTurnEvent(evt, host) {
 //                 has since asserted it (see the panes' busySource stamp)
 //   paneIsBusy(): the pane's LIVE busy flag (not the send-time snapshot)
 //                 — drives the missed-edge settle below
+//   restoreInput(): restore rejected companion text without overwriting input
+//                 entered during the POST round-trip
 //   renderError(msg): pane error row
 //   consumeAttachments(attached_ids, dropped_ids): composer chip sync
 //
@@ -693,11 +707,15 @@ export function acceptUserTurnEvent(evt, host) {
 //     post-bind settle promotes it (see the inline contract).
 //   queue_full — the send was NEVER accepted (interjection cap, deferred-
 //     list saturation, or drain-spawn failure): remove the optimistic
-//     bubble too — leaving it renders loss as delivery — and restore busy
-//     under the same guard (no worker and no drain may exist to ever emit
-//     a state event; leaving busy strands the composer in Stop mode).
-//   busy / attachments_busy / cross_user_interjection / unknown-ok —
-//     the panes' historical shapes, verbatim.
+//     bubble too — leaving it renders loss as delivery — restore the input,
+//     and restore busy under the same guard (no worker and no drain may exist
+//     to ever emit a state event; leaving busy strands the composer in Stop
+//     mode).
+//   attachments_busy / cross_user_interjection — remove the false sent bubble,
+//     restore the companion text, and preserve attachment chips. The former
+//     proves server busy; the latter can also be a retained-input refusal with
+//     no worker, so it clears only this send's still-optimistic busy stamp.
+//   busy / unknown-ok — historical behavior.
 export function settleSendResponse(queue, data, ctx) {
   // Normalize a null / non-object 2xx body once, here at the shared
   // chokepoint, so neither pane's call site has to guard it (interactive
@@ -787,11 +805,19 @@ export function settleSendResponse(queue, data, ctx) {
         ctx.optimisticEl.remove();
       if (ctx.busyIsOptimistic()) ctx.setBusy(false);
     }
+    if (typeof ctx.restoreInput === "function") ctx.restoreInput();
     ctx.renderError("Message queue full. Please wait.");
     return;
   }
   if (status === "attachments_busy") {
     if (ctx.queuedEl) queue.remove(ctx.queuedEl);
+    if (ctx.optimisticEl && ctx.optimisticEl.isConnected)
+      ctx.optimisticEl.remove();
+    if (typeof ctx.restoreInput === "function") ctx.restoreInput();
+    // The server just proved a worker owns the slot. Replace this send's
+    // optimistic source stamp with a server stamp; an idle SSE that already
+    // arrived would have cleared it and therefore fails this guard.
+    if (ctx.busyIsOptimistic()) ctx.setBusy(true);
     ctx.renderError(
       "Attachments can't be sent while the assistant is working. " +
         "Send a text-only message now, or wait and resend with attachments.",
@@ -800,12 +826,18 @@ export function settleSendResponse(queue, data, ctx) {
   }
   if (status === "cross_user_interjection") {
     if (ctx.queuedEl) queue.remove(ctx.queuedEl);
+    if (ctx.optimisticEl && ctx.optimisticEl.isConnected)
+      ctx.optimisticEl.remove();
+    if (typeof ctx.restoreInput === "function") ctx.restoreInput();
+    // A 409 can also come from retained foreign queued input with no live
+    // worker, so it does not prove busy. Undo only this send's optimistic
+    // stamp; a newer SSE state remains authoritative in either direction.
+    if (ctx.busyIsOptimistic()) ctx.setBusy(false);
     ctx.renderError(
       data.error ||
         "Another participant's turn is in progress. Wait for it to " +
           "finish, then send your message.",
     );
-    if (!ctx.isBusy) ctx.setBusy(false);
     return;
   }
   // Unknown / "ok" status (e.g. the stale-busy race: the client

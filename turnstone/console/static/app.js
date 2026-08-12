@@ -1491,12 +1491,20 @@ function _homeRenderChips() {
 }
 
 function _homeStageFile(file) {
-  if (!file) return;
+  if (!file) return false;
+  const paste = window.TurnstonePasteText;
+  if (
+    paste &&
+    paste.isDuplicatePastedTextFile &&
+    paste.isDuplicatePastedTextFile(file, _homeStagedFiles)
+  ) {
+    return true;
+  }
   if (_homeStagedFiles.length >= _HOME_MAX_FILES) {
     _homeShowError(
       "At most " + _HOME_MAX_FILES + " attachments per coordinator",
     );
-    return;
+    return false;
   }
   if (!_homeIsAttachmentAllowed(file)) {
     _homeShowError(
@@ -1504,17 +1512,18 @@ function _homeStageFile(file) {
         file.name +
         " (allowed: png/jpeg/gif/webp images, text)",
     );
-    return;
+    return false;
   }
   const isImage = (file.type || "").indexOf("image/") === 0;
   const cap = isImage ? _HOME_IMAGE_CAP : _HOME_TEXT_CAP;
   if (file.size > cap) {
     _homeShowError(file.name + " exceeds the " + _homeFormatSize(cap) + " cap");
-    return;
+    return false;
   }
   _homeShowError("");
   _homeStagedFiles.push(file);
   _homeRenderChips();
+  return true;
 }
 
 function _homeClearStagedFiles() {
@@ -1807,7 +1816,7 @@ function _mountHomeCoordComposer() {
     },
     attachments: {
       onAttach: function (file) {
-        _homeStageFile(file);
+        return _homeStageFile(file);
       },
     },
     dragDrop: { targetEl: mount, dropClass: "home-coord-drop" },
@@ -1962,9 +1971,7 @@ function submitHomeCoord(textFromComposer) {
   // pending storage rows until the GC sweep.  Require text whenever
   // attachments are staged so the first turn always picks them up.
   if (files.length > 0 && !(task || "").trim()) {
-    _homeShowError(
-      "Add a task message — attachments need an initial turn to dispatch on.",
-    );
+    _homeShowError("Add a message to send with this attachment.");
     return;
   }
   const shared = {

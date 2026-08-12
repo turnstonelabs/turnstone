@@ -18,6 +18,12 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **Large plain-text pastes become attachments.** Pasting text longer than the
+  fixed 2,000-character threshold stages `pasted-text.txt` across all five
+  attachment-capable create/send composers. Clipboard files retain priority,
+  text above the 512 KiB upload ceiling stays inline, identical synthesized
+  pastes collapse to one chip, and rejected attachment sends keep the staged
+  message and files so they can be corrected or retried.
 - **`server_parses_reasoning` model capability.** Declare it on a model
   definition whose backend segregates reasoning into its own channel (a
   vLLM launched with a reasoning parser, a commercial provider): the

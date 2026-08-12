@@ -50,6 +50,7 @@ import {
   acceptUserTurnEvent,
   clientSendMaySettleForViewer,
   createQueueController,
+  mergeRejectedComposerText,
   mintClientSendId,
   parsePriority,
   postAndSettleSend,
@@ -2656,9 +2657,34 @@ function createCoordinatorPane(root, wsId, opts) {
   function coordSend() {
     const text = composer.value;
     const trimmed = (text || "").trim();
-    if (!trimmed) return false;
+    if (!trimmed) {
+      if (!attachments.isEmpty()) {
+        appendText("info", "Add a message to send with this attachment.", {
+          label: "info",
+        });
+      }
+      return false;
+    }
+    // The live-turn interjection queue is text-only. Keep the input and chips
+    // intact instead of optimistically clearing them before attachments_busy.
+    if (busy && !attachments.isEmpty()) {
+      appendText(
+        "info",
+        "Attachments can't be sent while the assistant is working. Wait for it to finish, then send again.",
+        { label: "info" },
+      );
+      return false;
+    }
 
     const snap = attachments.snapshot();
+    if (snap.uploading) {
+      appendText(
+        "info",
+        "Wait for attachments to finish uploading before sending.",
+        { label: "info" },
+      );
+      return false;
+    }
 
     let queuedEl = null;
     let optimisticEl = null;
@@ -2734,6 +2760,9 @@ function createCoordinatorPane(root, wsId, opts) {
       setBusy: (b) => setBusy(b),
       busyIsOptimistic: () => busy && busySource === "optimistic",
       paneIsBusy: () => busy,
+      restoreInput: () => {
+        composer.value = mergeRejectedComposerText(trimmed, composer.value);
+      },
       renderError: (msg) => appendText("error", msg, { label: "error" }),
       consumeAttachments: (attached, droppedIds) =>
         attachments.consume(attached, droppedIds),
@@ -4278,6 +4307,12 @@ function createCoordinatorPane(root, wsId, opts) {
                 setBusy: (value) => setBusy(value),
                 busyIsOptimistic: () => busy && busySource === "optimistic",
                 paneIsBusy: () => busy,
+                restoreInput: () => {
+                  composer.value = mergeRejectedComposerText(
+                    editText,
+                    composer.value,
+                  );
+                },
                 renderError: (message) =>
                   appendText("error", message, { label: "error" }),
                 consumeAttachments: () => {},

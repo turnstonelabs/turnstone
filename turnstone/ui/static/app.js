@@ -329,6 +329,35 @@ function _isAttachmentAllowed(file) {
   return false;
 }
 
+// File clipboard items preserve their existing priority. Only when none were
+// staged do we consider synthesizing a text attachment through the shared
+// module bridge. Returns true when the native paste was handled.
+function _handleComposerPaste(event, addFiles) {
+  if (!event.clipboardData) return false;
+  const items = event.clipboardData.items || [];
+  const files = [];
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].kind === "file") {
+      const file = items[i].getAsFile();
+      if (file) files.push(file);
+    }
+  }
+  if (files.length > 0) {
+    event.preventDefault();
+    addFiles(files);
+    return true;
+  }
+
+  const paste = window.TurnstonePasteText;
+  if (!paste || !paste.pasteTextToFile) return false;
+  const textFile = paste.pasteTextToFile(
+    event.clipboardData.getData("text/plain"),
+  );
+  if (!textFile || addFiles([textFile]) === false) return false;
+  event.preventDefault();
+  return true;
+}
+
 // In-dialog error strip (sh-alert).  Empty message clears + hides; a set
 // message also scrolls into view — the alert sits at the top of the
 // scrollable body while the submit lives in the pinned foot.
@@ -344,13 +373,23 @@ function _newWsError(msg) {
 }
 
 function _newWsAddFiles(files) {
+  let handled = false;
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
+    const paste = window.TurnstonePasteText;
+    if (
+      paste &&
+      paste.isDuplicatePastedTextFile &&
+      paste.isDuplicatePastedTextFile(f, _newWsStagedFiles)
+    ) {
+      handled = true;
+      continue;
+    }
     if (_newWsStagedFiles.length >= _NEW_WS_MAX_FILES) {
       _newWsError(
         "At most " + _NEW_WS_MAX_FILES + " attachments per workstream",
       );
-      return;
+      return handled;
     }
     if (!_isAttachmentAllowed(f)) {
       _newWsError(
@@ -358,18 +397,20 @@ function _newWsAddFiles(files) {
           f.name +
           " (allowed: png/jpeg/gif/webp images, text)",
       );
-      return;
+      return handled;
     }
     const isImage = (f.type || "").indexOf("image/") === 0;
     const cap = isImage ? _NEW_WS_IMAGE_CAP : _NEW_WS_TEXT_CAP;
     if (f.size > cap) {
       _newWsError(f.name + " exceeds the " + _formatAttachSize(cap) + " cap");
-      return;
+      return handled;
     }
     _newWsStagedFiles.push(f);
+    handled = true;
   }
   _newWsError("");
   _newWsRenderChips();
+  return handled;
 }
 
 function newWorkstream() {
@@ -465,7 +506,14 @@ function showNewWsModal(forkFromWsId) {
 
   document.getElementById("new-ws-name").value = "";
   const initEl = document.getElementById("new-ws-initial-message");
-  if (initEl) initEl.value = "";
+  if (initEl) {
+    initEl.value = "";
+    initEl.onpaste = function (event) {
+      // Forks inherit history and intentionally have no attachment lane.
+      if (_forkFromWsId) return;
+      _handleComposerPaste(event, _newWsAddFiles);
+    };
+  }
   _newWsError("");
 
   // Reset attachment staging.  Forks don't carry attachments —
@@ -827,6 +875,11 @@ function submitNewWs() {
   const persona = personaEl ? personaEl.value : "";
   const initEl = document.getElementById("new-ws-initial-message");
   const initial_message = initEl ? initEl.value.trim() : "";
+  const staged = _forkFromWsId ? [] : _newWsStagedFiles.slice();
+  if (staged.length > 0 && !initial_message) {
+    _newWsError("Add a message to send with this attachment.");
+    return;
+  }
   if (name) body.name = name;
   // Forks DELIBERATELY inherit their source's model + judge: the selects are
   // hidden for a fork (showNewWsModal) and never sent here — matching the
@@ -855,7 +908,6 @@ function submitNewWs() {
   window.TurnstoneHatch.setBusy(dlg, true);
 
   let fetchOpts;
-  const staged = _forkFromWsId ? [] : _newWsStagedFiles.slice();
   if (staged.length > 0) {
     const form = new FormData();
     form.append("meta", JSON.stringify(body));
@@ -1567,13 +1619,23 @@ function _renderDashboardChips() {
 }
 
 function _addDashboardFiles(files) {
+  let handled = false;
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
+    const paste = window.TurnstonePasteText;
+    if (
+      paste &&
+      paste.isDuplicatePastedTextFile &&
+      paste.isDuplicatePastedTextFile(f, _dashboardStagedFiles)
+    ) {
+      handled = true;
+      continue;
+    }
     if (_dashboardStagedFiles.length >= _DASH_MAX_FILES) {
       _dashboardError(
         "At most " + _DASH_MAX_FILES + " attachments per workstream",
       );
-      return;
+      return handled;
     }
     // Drag-drop bypasses the <input accept="..."> filter, so re-check
     // against the server's allowlist before the upload roundtrip.
@@ -1583,7 +1645,7 @@ function _addDashboardFiles(files) {
           f.name +
           " (allowed: png/jpeg/gif/webp images, text)",
       );
-      return;
+      return handled;
     }
     const isImage = (f.type || "").indexOf("image/") === 0;
     const cap = isImage ? _DASH_IMAGE_CAP : _DASH_TEXT_CAP;
@@ -1591,12 +1653,14 @@ function _addDashboardFiles(files) {
       _dashboardError(
         f.name + " exceeds the " + _formatAttachSize(cap) + " cap",
       );
-      return;
+      return handled;
     }
     _dashboardStagedFiles.push(f);
+    handled = true;
   }
   _renderDashboardChips();
   _refreshDashboardSubmitLabel();
+  return handled;
 }
 
 let _dashboardErrorTimer = null;
@@ -1772,6 +1836,10 @@ function dashboardSubmit() {
   const btn = document.getElementById("dashboard-submit-btn");
   const text = input.value.trim();
   const staged = _dashboardStagedFiles.slice();
+  if (staged.length > 0 && !text) {
+    _dashboardError("Add a message to send with this attachment.");
+    return;
+  }
 
   const body = {};
   const model = document.getElementById("dashboard-model").value.trim();
@@ -2131,19 +2199,7 @@ function _announce(text) {
   });
   input.addEventListener("input", _refreshDashboardSubmitLabel);
   input.addEventListener("paste", function (e) {
-    if (!e.clipboardData) return;
-    const items = e.clipboardData.items || [];
-    const pasted = [];
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].kind === "file") {
-        const f = items[i].getAsFile();
-        if (f) pasted.push(f);
-      }
-    }
-    if (pasted.length) {
-      e.preventDefault();
-      _addDashboardFiles(pasted);
-    }
+    _handleComposerPaste(e, _addDashboardFiles);
   });
 
   if (attachBtn && attachInput) {

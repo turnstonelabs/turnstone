@@ -74,6 +74,21 @@ Attachments harness (/attachments/livepass.html): the composer attachment
   thumbnail crop/size, the native audio-control fit at the constrained
   height, the snippet contrast, and how a long filename behaves at the
   340px chip cap.
+Paste-over-HTTP harness (/paste/livepass.html): the REAL Composer's
+  large-text paste path, exercised with a browser-generated, trusted paste
+  event on an explicitly non-secure HTTP origin.  No
+  ``navigator.clipboard`` stub, synthetic ``ClipboardEvent``, or
+  secure-context override is involved.  The page requires
+  ``window.isSecureContext === false``, ``event.isTrusted``, a ``text/plain``
+  clipboard item, canceled inline insertion, and an exact
+  ``pasted-text.txt`` File round-trip before stamping ``PASTE-HTTP-READY``.
+  It fails closed as ``PASTE-HTTP-FAILED-<reason>``.  Serve beyond loopback,
+  open the page by a LAN address (localhost and 127.0.0.1 are treated as
+  trustworthy origins by browsers), then use the browser's normal Copy and
+  Paste commands:
+
+    python3 scripts/livepass.py --serve 8950 --bind 0.0.0.0
+
 Task-agent harness (/taskagent/livepass.html): the task_agent card — a task
   agent's sub-tool steps nested under its conversation row, driven through the
   REAL InteractivePane.handleEvent (parent tool_pending/tool_info -> child
@@ -1032,6 +1047,165 @@ ATTACH_TEMPLATE = """<!doctype html>
 
 
 # --------------------------------------------------------------------------
+# Native paste-over-HTTP harness.  Unlike the copy-affordance harness, this
+# must never stub clipboard access or dispatch a script-created paste event:
+# its purpose is to prove that the production ClipboardEvent path still sees
+# user-agent clipboard data on a non-secure origin.
+# --------------------------------------------------------------------------
+PASTE_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PASTE-HTTP-BOOTING</title>
+    <link rel="stylesheet" href="shared/base.css" />
+    <link rel="stylesheet" href="shared/ui-base.css" />
+    <link rel="stylesheet" href="shared/chat.css" />
+    <style>
+      body {
+        margin: 0; padding: 32px;
+        background: var(--bg); color: var(--fg);
+        font-family: var(--font-sans, system-ui, sans-serif);
+      }
+      main { width: min(760px, 100%); margin: 0 auto; }
+      #paste-source {
+        box-sizing: border-box; width: 100%; height: 80px;
+      }
+      #composer-mount, #probe-status { margin-top: 16px; }
+      #probe-status { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Native paste on plain HTTP</h1>
+      <p>
+        This passes only when a trusted paste exposes clipboard text to the
+        real Composer on a non-secure HTTP origin.
+      </p>
+      <p>1. Select this 2001-character fixture, then copy it normally.</p>
+      <textarea id="paste-source" aria-label="Paste test source"></textarea>
+      <button id="select-source" type="button">Select source text</button>
+      <p>2. Focus the composer and paste normally.</p>
+      <div id="composer-mount"></div>
+      <pre id="probe-status" role="status" aria-live="polite">Booting…</pre>
+    </main>
+    <script type="module">
+      import { Composer } from "./shared/composer.js";
+      import { PASTE_ATTACHMENT_CHARS } from "./shared/composer_paste_text.js";
+
+      const prefix = "TURNSTONE-PASTE-HTTP:";
+      const seedText =
+        prefix + "x".repeat(PASTE_ATTACHMENT_CHARS + 1 - prefix.length);
+      const source = document.getElementById("paste-source");
+      const status = document.getElementById("probe-status");
+      source.value = seedText;
+
+      let copyTrusted = false;
+      let paste = null;
+      let attachment = null;
+      let fileSettled = false;
+      let failed = false;
+
+      function paint() {
+        status.textContent = document.title + "\\n" + JSON.stringify({
+          origin: location.origin,
+          secureContext: window.isSecureContext,
+          copyTrusted: copyTrusted,
+          paste: paste,
+          attachment: attachment,
+        }, null, 2);
+      }
+
+      function fail(reason) {
+        if (failed) return;
+        failed = true;
+        document.title = "PASTE-HTTP-FAILED-" + reason;
+        paint();
+      }
+
+      function finish() {
+        if (failed || !paste || !fileSettled) return;
+        const checks = [
+          ["copy-untrusted", copyTrusted],
+          ["paste-untrusted", paste.trusted],
+          ["no-clipboard-data", paste.hasClipboardData],
+          ["no-text-plain", paste.hasPlainText],
+          ["paste-not-canceled", paste.defaultPrevented],
+          ["attach-count", attachment.calls === 1],
+          ["filename", attachment.name === "pasted-text.txt"],
+          ["mime", attachment.type === "text/plain"],
+          ["size", attachment.size === new Blob([seedText]).size],
+          ["content", attachment.contentMatches],
+          ["inline-insert", paste.inputValue === ""],
+        ];
+        const firstFailure = checks.find(function (entry) { return !entry[1]; });
+        if (firstFailure) return fail(firstFailure[0]);
+        document.title = "PASTE-HTTP-READY";
+        paint();
+      }
+
+      document.addEventListener("copy", function (event) {
+        copyTrusted = event.isTrusted;
+        paint();
+      }, true);
+
+      document.addEventListener("paste", function (event) {
+        const observed = {
+          trusted: event.isTrusted,
+          hasClipboardData: !!event.clipboardData,
+          hasPlainText: !!event.clipboardData &&
+            Array.from(event.clipboardData.types || []).includes("text/plain"),
+        };
+        setTimeout(function () {
+          paste = Object.assign(observed, {
+            defaultPrevented: event.defaultPrevented,
+            inputValue: composer.inputEl.value,
+          });
+          if (!attachment) fail("no-attachment");
+          else finish();
+        }, 0);
+      });
+
+      const composer = new Composer(document.getElementById("composer-mount"), {
+        onSend: function () {},
+        placeholder: "Paste the copied fixture here…",
+        attachments: {
+          onAttach: function (file) {
+            attachment = {
+              calls: attachment ? attachment.calls + 1 : 1,
+              name: file.name,
+              type: file.type,
+              size: file.size,
+              contentMatches: false,
+            };
+            file.text().then(function (text) {
+              attachment.contentMatches = text === seedText;
+              fileSettled = true;
+              finish();
+            }, function () { fail("file-read"); });
+            return true;
+          },
+        },
+      });
+
+      document.getElementById("select-source").addEventListener("click", function () {
+        source.focus();
+        source.select();
+      });
+
+      if (location.protocol !== "http:") fail("not-http");
+      else if (window.isSecureContext) fail("secure-context");
+      else {
+        document.title = "PASTE-HTTP-WAITING";
+        paint();
+      }
+    </script>
+  </body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------
 # Task-agent harness — the task_agent card: a task agent's sub-tool steps
 # nested under its conversation row.  Driven through the REAL
 # InteractivePane.handleEvent so the SSE->card ROUTING (_routeAgentItems /
@@ -1958,6 +2132,12 @@ def build(out: Path) -> None:
     (att / "livepass.html").write_text(ATTACH_TEMPLATE, encoding="utf-8")
     print(f"{att}/livepass.html — composer chips + message attachment pills")
 
+    paste = out / "paste"
+    paste.mkdir(parents=True, exist_ok=True)
+    symlink(paste / "shared", ROOT / "turnstone/shared_static")
+    (paste / "livepass.html").write_text(PASTE_TEMPLATE, encoding="utf-8")
+    print(f"{paste}/livepass.html — trusted native paste on insecure HTTP")
+
     ta = out / "taskagent"
     ta.mkdir(parents=True, exist_ok=True)
     symlink(ta / "shared", ROOT / "turnstone/shared_static")
@@ -2218,6 +2398,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", type=Path, default=Path("/tmp/livepass"))
     ap.add_argument("--serve", type=int, metavar="PORT")
+    ap.add_argument(
+        "--bind",
+        default="127.0.0.1",
+        metavar="HOST",
+        help="listen address for --serve (use 0.0.0.0 for a manual insecure-origin pass)",
+    )
     ap.add_argument("--perf", action="store_true", help="run the perf baseline and exit")
     ap.add_argument(
         "--perf-n",
@@ -2235,8 +2421,9 @@ def main() -> None:
         import functools
 
         handler = functools.partial(_HarnessHandler, directory=str(args.out))
-        print(f"serving {args.out} on http://localhost:{args.serve}/ — Ctrl+C stops")
-        http.server.ThreadingHTTPServer(("127.0.0.1", args.serve), handler).serve_forever()
+        display_host = "localhost" if args.bind == "127.0.0.1" else args.bind
+        print(f"serving {args.out} on http://{display_host}:{args.serve}/ — Ctrl+C stops")
+        http.server.ThreadingHTTPServer((args.bind, args.serve), handler).serve_forever()
 
 
 if __name__ == "__main__":

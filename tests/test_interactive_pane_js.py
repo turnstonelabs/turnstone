@@ -1209,8 +1209,8 @@ def test_deferred_send_settle_protocol_pins() -> None:
     assert "deferred: !!data.deferred" in composer_queue
     assert "attachedCount: (data.attached_ids || []).length" in composer_queue
     assert "ctx.busyIsOptimistic()" in composer_queue
-    assert composer_queue.count("ctx.optimisticEl.remove()") >= 2, (
-        "both the retro-convert and queue_full arms must clear the optimistic bubble"
+    assert composer_queue.count("ctx.optimisticEl.remove()") >= 3, (
+        "retro-convert, queue_full, and attachments_busy must clear false optimistic bubbles"
     )
     # The missed-edge settle: a non-deferred chip binding onto an
     # already-idle pane missed its only sweep — the post-bind promote
@@ -1233,6 +1233,10 @@ def test_deferred_send_settle_protocol_pins() -> None:
         assert "settleSendResponse(" not in src, f"{name}: must not bypass the fetch stage"
         assert "busyIsOptimistic" in src, name
         assert "paneIsBusy" in src, f"{name}: the missed-edge settle needs the live flag"
+        assert "mergeRejectedComposerText" in src, f"{name}: refused text must be restored"
+        assert src.count("restoreInput:") == 2, (
+            f"{name}: composer send and edit-resend both need refusal restoration"
+        )
         assert 'setBusy(true, "optimistic")' in src, f"{name}: optimistic flip must stamp"
         assert "parsePriority(" in src, f"{name}: shared !!! parse"
         assert 'case "message_dispatched"' in src, f"{name}: settle event not consumed"
@@ -1330,6 +1334,89 @@ console.log("settle matrix OK");
         timeout=15,
     )
     assert proc.returncode == 0, f"settle harness failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+def test_stale_idle_refusals_restore_input(tmp_path) -> None:
+    """A stale local idle state must not render either busy refusal as
+    delivered or discard its companion text. Text entered during the POST is
+    retained after the rejected text, and an SSE idle that already arrived
+    prevents the old optimistic busy state from being reasserted."""
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+    helper = _ROOT / "turnstone/shared_static/composer_queue.js"
+    script = tmp_path / "attachments_busy_harness.mjs"
+    script.write_text(
+        rf"""const {{ mergeRejectedComposerText, settleSendResponse }} =
+  await import("file://{helper}");
+
+function run(status, optimisticBusy) {{
+  const calls = [];
+  let composerValue = "typed during request";
+  const optimisticEl = {{
+    isConnected: true,
+    dataset: {{}},
+    remove: () => calls.push("remove-optimistic"),
+  }};
+  settleSendResponse(
+    {{ remove: () => calls.push("remove-queued") }},
+    {{ status }},
+    {{
+      queuedEl: null,
+      optimisticEl,
+      isBusy: false,
+      setBusy: (value) => calls.push("busy:" + value),
+      busyIsOptimistic: () => optimisticBusy,
+      paneIsBusy: () => optimisticBusy,
+      restoreInput: () => {{
+        composerValue = mergeRejectedComposerText("rejected", composerValue);
+        calls.push("restore");
+      }},
+      renderError: () => calls.push("error"),
+      consumeAttachments: () => calls.push("consume"),
+    }},
+  );
+  return {{ calls, composerValue }};
+}}
+
+for (const [status, expectedBusy] of [
+  ["attachments_busy", "busy:true"],
+  ["cross_user_interjection", "busy:false"],
+  ["queue_full", "busy:false"],
+]) {{
+  let result = run(status, true);
+  if (result.composerValue !== "rejected\ntyped during request")
+    throw new Error(status + " companion/current text merge drifted: " + result.composerValue);
+  for (const call of ["remove-optimistic", "restore", expectedBusy, "error"]) {{
+    if (!result.calls.includes(call))
+      throw new Error(status + " missing stale-idle settlement " + call + ": " + result.calls);
+  }}
+  if (result.calls.includes("consume") || result.calls.includes("remove-queued"))
+    throw new Error(status + " attachments/chip state was consumed: " + result.calls);
+
+  result = run(status, false);
+  if (result.calls.some((call) => call.startsWith("busy:")))
+    throw new Error(status + " overwrote a raced SSE state: " + result.calls);
+}}
+if (
+  mergeRejectedComposerText("rejected", "rejected\nlater") !==
+  "rejected\nrejected\nlater"
+)
+  throw new Error("independently typed matching text was discarded");
+if (mergeRejectedComposerText("rejected", "") !== "rejected")
+  throw new Error("empty composer did not restore rejected text");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, f"attachments_busy harness failed:\n{proc.stderr}\n{proc.stdout}"
 
 
 def test_accepted_tool_event_recorded_only_when_painted() -> None:

@@ -429,6 +429,20 @@ Files require a non-empty initial task so the first turn consumes the staged
 attachments. The console shell does not currently expose a fork action; use the
 node's standalone workstream UI or the create API's `resume_ws` field.
 
+### Large pasted text
+
+Browser composers turn plain text longer than 2,000 Unicode code points into a
+`text/plain` attachment named `pasted-text.txt`. A paste exactly at the
+threshold stays inline. This applies to the interactive and coordinator send
+boxes, the console home launcher, and the node dashboard and new-workstream
+composers.
+
+Clipboard files take priority over clipboard text. Text larger than the 512 KiB
+attachment ceiling also stays inline, so the browser does not discard it before
+a rejected upload. Attachments require a companion message and cannot be sent
+as live-turn interjections; a busy composer preserves its message and chips for
+an idle retry.
+
 ### Saved and filtered sessions
 
 Saved coordinator and interactive sessions share one list with kind and persona
