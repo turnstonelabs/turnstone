@@ -507,6 +507,45 @@ def _cap_server_prompts(server_name: str, prompts: list[Any]) -> list[Any]:
     return prompts[:_MAX_PROMPTS_PER_SERVER]
 
 
+async def _list_resources_compatible(session: Any, server_name: str) -> Any:
+    """List concrete resources, treating an unsupported method as empty.
+
+    MCP exposes one aggregate ``resources`` capability for both concrete
+    resources and resource templates. Servers may legitimately implement only
+    one of the two list methods, so the capability bit alone cannot tell us
+    which request is supported. Only the protocol's exact METHOD_NOT_FOUND code
+    is normalized; every other error remains a real discovery failure.
+    """
+    try:
+        return await session.list_resources()
+    except McpError as exc:
+        if exc.error.code != mcp_types.METHOD_NOT_FOUND:
+            raise
+        log.debug(
+            "MCP server '%s' does not implement resources/list; treating it as empty",
+            server_name,
+        )
+        return mcp_types.ListResourcesResult(resources=[])
+
+
+async def _list_resource_templates_compatible(session: Any, server_name: str) -> Any:
+    """List resource templates, treating an unsupported method as empty.
+
+    See :func:`_list_resources_compatible` for why the aggregate capability
+    requires per-method probing and exact JSON-RPC error classification.
+    """
+    try:
+        return await session.list_resource_templates()
+    except McpError as exc:
+        if exc.error.code != mcp_types.METHOD_NOT_FOUND:
+            raise
+        log.debug(
+            "MCP server '%s' does not implement resources/templates/list; treating it as empty",
+            server_name,
+        )
+        return mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+
+
 # ---------------------------------------------------------------------------
 # Per-server state containers
 # ---------------------------------------------------------------------------
@@ -2336,95 +2375,132 @@ class MCPClientManager:
         state.close_requested = close_requested
         state.session = session
 
-        # Check push notification support for each capability
-        caps = session.get_server_capabilities()
+        # Capability flags and all three catalogs are STAGED until discovery
+        # succeeds in full. A later resource/prompt failure must not publish a
+        # callable tool backed by a registration that add_server_sync reports
+        # as failed. The live owner/session must likewise be torn down before
+        # the error escapes.
+        try:
+            caps = session.get_server_capabilities()
 
-        tools_cap = getattr(caps, "tools", None) if caps else None
-        state.supports_list_changed = bool(getattr(tools_cap, "listChanged", False))
+            tools_cap = getattr(caps, "tools", None) if caps else None
+            supports_list_changed = bool(getattr(tools_cap, "listChanged", False))
 
-        resources_cap = getattr(caps, "resources", None) if caps else None
-        state.supports_resources = resources_cap is not None
-        state.supports_resource_list_changed = bool(getattr(resources_cap, "listChanged", False))
+            resources_cap = getattr(caps, "resources", None) if caps else None
+            supports_resources = resources_cap is not None
+            supports_resource_list_changed = bool(getattr(resources_cap, "listChanged", False))
 
-        prompts_cap = getattr(caps, "prompts", None) if caps else None
-        state.supports_prompts = prompts_cap is not None
-        state.supports_prompt_list_changed = bool(getattr(prompts_cap, "listChanged", False))
+            prompts_cap = getattr(caps, "prompts", None) if caps else None
+            supports_prompts = prompts_cap is not None
+            supports_prompt_list_changed = bool(getattr(prompts_cap, "listChanged", False))
 
-        # Discover tools. Discovery runs in THIS caller task while the
-        # transport is hosted by the owner, so a transport collapse
-        # mid-discovery cancels the OWNER, not us — ``_await_owner_discovery``
-        # races the owner so that death surfaces as a prompt ConnectionError
-        # instead of hanging to the caller-side attempt timeout.
-        result = await self._await_owner_discovery(owner, session.list_tools())
-        capped = _cap_server_tools(name, result.tools)
-        server_tools: list[dict[str, Any]] = [_mcp_to_openai(name, tool) for tool in capped]
+            # Discover tools. Discovery runs in THIS caller task while the
+            # transport is hosted by the owner, so a transport collapse
+            # mid-discovery cancels the OWNER, not us — ``_await_owner_discovery``
+            # races the owner so that death surfaces as a prompt ConnectionError
+            # instead of hanging to the caller-side attempt timeout.
+            result = await self._await_owner_discovery(owner, session.list_tools())
+            capped = _cap_server_tools(name, result.tools)
+            server_tools: list[dict[str, Any]] = [_mcp_to_openai(name, tool) for tool in capped]
 
-        state.tools = server_tools
-        self._rebuild_tools()
-
-        # Discover resources
-        resource_count = 0
-        if resources_cap is not None:
+            # Discover resources. The protocol advertises the pair with one
+            # aggregate capability, but either list method may independently be
+            # absent; the compatibility wrappers normalize only -32601.
             server_resources: list[dict[str, Any]] = []
-            res_result = await self._await_owner_discovery(owner, session.list_resources())
-            # Capped like the tools list above (and like the pool twins): a
-            # misbehaving server must not balloon the shared node's merged
-            # catalogs.
-            for r in _cap_server_resources(name, res_result.resources):
-                server_resources.append(
-                    {
-                        "uri": str(r.uri),
-                        "name": r.name or "",
-                        "description": r.description or "",
-                        "mimeType": r.mimeType or "",
-                        "server": name,
-                    }
+            if resources_cap is not None:
+                res_result = await self._await_owner_discovery(
+                    owner, _list_resources_compatible(session, name)
                 )
-            # Also include resource templates (catalog-only — not directly
-            # readable via read_resource since they contain URI placeholders)
-            tmpl_result = await self._await_owner_discovery(
-                owner, session.list_resource_templates()
-            )
-            for t in _cap_server_resource_templates(name, tmpl_result.resourceTemplates):
-                server_resources.append(
-                    {
-                        "uri": str(t.uriTemplate),
-                        "name": t.name or "",
-                        "description": t.description or "",
-                        "mimeType": t.mimeType or "",
-                        "server": name,
-                        "template": True,
-                    }
+                # Capped like the tools list above (and like the pool twins): a
+                # misbehaving server must not balloon the shared node's merged
+                # catalogs.
+                for r in _cap_server_resources(name, res_result.resources):
+                    server_resources.append(
+                        {
+                            "uri": str(r.uri),
+                            "name": r.name or "",
+                            "description": r.description or "",
+                            "mimeType": r.mimeType or "",
+                            "server": name,
+                        }
+                    )
+                # Templates are catalog-only — not directly readable via
+                # read_resource since they contain URI placeholders.
+                tmpl_result = await self._await_owner_discovery(
+                    owner, _list_resource_templates_compatible(session, name)
                 )
-            resource_count = len(server_resources)
-            state.resources = server_resources
-            self._rebuild_resources()
+                for t in _cap_server_resource_templates(name, tmpl_result.resourceTemplates):
+                    server_resources.append(
+                        {
+                            "uri": str(t.uriTemplate),
+                            "name": t.name or "",
+                            "description": t.description or "",
+                            "mimeType": t.mimeType or "",
+                            "server": name,
+                            "template": True,
+                        }
+                    )
 
-        # Discover prompts
-        prompt_count = 0
-        if prompts_cap is not None:
+            # Discover prompts.
             server_prompts: list[dict[str, Any]] = []
-            prompt_result = await self._await_owner_discovery(owner, session.list_prompts())
-            for p in _cap_server_prompts(name, prompt_result.prompts):
-                server_prompts.append(
-                    {
-                        "name": f"mcp__{name}__{p.name}",
-                        "original_name": p.name,
-                        "server": name,
-                        "description": p.description or "",
-                        "arguments": [
-                            {
-                                "name": a.name,
-                                "description": a.description or "",
-                                "required": a.required or False,
-                            }
-                            for a in (p.arguments or [])
-                        ],
-                    }
+            if prompts_cap is not None:
+                prompt_result = await self._await_owner_discovery(owner, session.list_prompts())
+                for p in _cap_server_prompts(name, prompt_result.prompts):
+                    server_prompts.append(
+                        {
+                            "name": f"mcp__{name}__{p.name}",
+                            "original_name": p.name,
+                            "server": name,
+                            "description": p.description or "",
+                            "arguments": [
+                                {
+                                    "name": a.name,
+                                    "description": a.description or "",
+                                    "required": a.required or False,
+                                }
+                                for a in (p.arguments or [])
+                            ],
+                        }
+                    )
+
+            # The owner done-callback can evict the session in the same loop
+            # turn that the final discovery call completes. Revalidate the
+            # exact wiring immediately before commit; there are no awaits from
+            # this check through publication, so a callable catalog can never
+            # be installed behind a dead/replaced transport.
+            if (
+                owner.done()
+                or state.owner_task is not owner
+                or state.session is not session
+            ):
+                raise ConnectionError(
+                    f"MCP server '{name}' transport died before catalog commit"
                 )
-            prompt_count = len(server_prompts)
-            state.prompts = server_prompts
+        except BaseException:
+            await self._teardown_static_session(name)
+            raise
+
+        # Publish the staged connection and catalogs only after every enabled
+        # discovery method succeeded. Successful reconnects also clear a stale
+        # resource/prompt catalog when the server drops that capability.
+        resources_changed = state.resources != server_resources
+        prompts_changed = state.prompts != server_prompts
+        state.supports_list_changed = supports_list_changed
+        state.supports_resources = supports_resources
+        state.supports_resource_list_changed = supports_resource_list_changed
+        state.supports_prompts = supports_prompts
+        state.supports_prompt_list_changed = supports_prompt_list_changed
+        state.tools = server_tools
+        state.resources = server_resources
+        state.prompts = server_prompts
+        self._rebuild_tools()
+        if resources_changed:
+            self._rebuild_resources()
+        if prompts_changed:
             self._rebuild_prompts()
+
+        resource_count = len(server_resources)
+        prompt_count = len(server_prompts)
 
         push_parts: list[str] = []
         if state.supports_list_changed:
@@ -2776,6 +2852,16 @@ class MCPClientManager:
             call.cancel()
             await asyncio.gather(call, return_exceptions=True)
             raise
+        # If both futures completed in the same scheduling turn, owner death
+        # wins. Returning a successful list result after its backing transport
+        # has already exited would let the caller publish a catalog with no
+        # live session. Gathering a completed call also retrieves any exception
+        # it carried, avoiding an unobserved-task warning.
+        if owner.done():
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+            raise ConnectionError("MCP transport owner died during discovery")
         if call.done():
             if call.cancelled():
                 # The discovery future was cancelled out from under us (an
@@ -2985,10 +3071,7 @@ class MCPClientManager:
                     # ordering is irrelevant.
                     res_result, tmpl_result = await self._await_owner_discovery(
                         owner,
-                        asyncio.gather(
-                            session.list_resources(),
-                            session.list_resource_templates(),
-                        ),
+                        self._list_resource_pair(session, server_name),
                     )
             except asyncio.CancelledError:
                 task = asyncio.current_task()
@@ -3067,6 +3150,19 @@ class MCPClientManager:
                         ],
                     }
                 )
+
+        # Mirror the static commit guard. A transport owner can finish in the
+        # same scheduling turn as the final discovery response; never publish
+        # that response into the per-user maps after its session was evicted.
+        if (
+            owner.done()
+            or entry.owner_task is not owner
+            or entry.session is not session
+        ):
+            await self._teardown_pool_entry(key)
+            raise ConnectionError(
+                f"MCP pool server '{server_name}' transport died before catalog commit"
+            )
 
         entry.tools = server_tools
         entry.resources = server_resources if resources_cap is not None else None
@@ -4320,7 +4416,7 @@ class MCPClientManager:
             )
         return added, removed
 
-    async def _list_resource_pair(self, session: Any) -> tuple[Any, Any]:
+    async def _list_resource_pair(self, session: Any, server_name: str) -> tuple[Any, Any]:
         """``list_resources`` + ``list_resource_templates`` in one bounded RTT.
 
         The ONE copy of the paired-list protocol for both refresh twins
@@ -4329,8 +4425,10 @@ class MCPClientManager:
         timeout budget and target disjoint catalogs (resources vs.
         templates), so ordering is irrelevant.
 
-        Fail-FAST on the first real error — a fast, meaningful failure
-        (an auth or method rejection) must surface as ITSELF, not be
+        Each method independently treats an exact JSON-RPC METHOD_NOT_FOUND as
+        an empty half-catalog. Fail-FAST on the first remaining real error — a
+        fast, meaningful failure (for example auth or invalid params) must
+        surface as ITSELF, not be
         masked behind a hung sibling's eventual ``TimeoutError`` — but
         with the surviving sibling CANCELLED and REAPED inside this
         scope before the error re-raises: bare fail-fast ``gather``
@@ -4350,8 +4448,10 @@ class MCPClientManager:
         task, GC-reaped) rather than held onto.
         """
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
-            res_task = asyncio.create_task(session.list_resources())
-            tmpl_task = asyncio.create_task(session.list_resource_templates())
+            res_task = asyncio.create_task(_list_resources_compatible(session, server_name))
+            tmpl_task = asyncio.create_task(
+                _list_resource_templates_compatible(session, server_name)
+            )
             try:
                 res_result, tmpl_result = await asyncio.gather(res_task, tmpl_task)
             except BaseException:
@@ -4424,7 +4524,7 @@ class MCPClientManager:
         user_id, server_name = key
         old_uris = {r["uri"] for r in (entry.resources or []) if not r.get("template")}
 
-        res_result, tmpl_result = await self._list_resource_pair(session)
+        res_result, tmpl_result = await self._list_resource_pair(session, server_name)
         if self._user_pool_entries.get(key) is not entry:
             # Entry replaced mid-flight — stale result, discard.
             return [], []
@@ -5035,7 +5135,7 @@ class MCPClientManager:
         # turn the second list_resource_templates() call into AttributeError.
         session = state.session
 
-        res_result, tmpl_result = await self._list_resource_pair(session)
+        res_result, tmpl_result = await self._list_resource_pair(session, name)
 
         server_resources: list[dict[str, Any]] = []
         # Capped like the pool twin — a misbehaving server's push must not
@@ -5687,15 +5787,78 @@ class MCPClientManager:
                 "error": "MCP event loop not running",
             }
 
-        # Add to config so _refresh_all can reconnect on failure
+        # Add to config so _refresh_all can reconnect on failure.
         self._server_configs[name] = cfg
 
-        future = asyncio.run_coroutine_threadsafe(self._connect_one(name, cfg), self._loop)
+        def _clear_failed_add_state() -> None:
+            """Remove this registration's config and every public catalog."""
+            if self._server_configs.get(name) is cfg:
+                self._server_configs.pop(name, None)
+            failed_state = self._static_servers.get(name)
+            tools_changed = bool(failed_state and failed_state.tools)
+            resources_changed = bool(failed_state and failed_state.resources)
+            prompts_changed = bool(failed_state and failed_state.prompts)
+            if failed_state is not None:
+                failed_state.tools = []
+                failed_state.resources = []
+                failed_state.prompts = []
+                failed_state.supports_list_changed = False
+                failed_state.supports_resources = False
+                failed_state.supports_resource_list_changed = False
+                failed_state.supports_prompts = False
+                failed_state.supports_prompt_list_changed = False
+            if tools_changed:
+                self._rebuild_tools()
+            if resources_changed:
+                self._rebuild_resources()
+            if prompts_changed:
+                self._rebuild_prompts()
+
+        async def _add() -> None:
+            # Keep failure rollback under the SAME per-name lock as connect.
+            # The timeout is loop-owned: the sync bridge waits for a definitive
+            # outcome instead of racing a second wall-clock deadline against
+            # rollback. If the loop is temporarily blocked, this may report a
+            # late success, but it can never report failure while a published
+            # session/catalog remains live.
+            async with self._static_connect_lock_for(name):
+                try:
+                    async with asyncio.timeout(timeout):
+                        await self._connect_one_locked(name, cfg)
+                except BaseException as exc:
+                    try:
+                        await self._teardown_static_session(name)
+                    finally:
+                        # A newer concurrent add may already have replaced the
+                        # config while waiting on this lock. Remove only the
+                        # registration this coroutine owns; its successor will
+                        # run after this cleanup releases the lock.
+                        _clear_failed_add_state()
+                    if isinstance(exc, TimeoutError):
+                        raise TimeoutError(
+                            f"MCP server '{name}' registration timed out"
+                        ) from None
+                    raise
+
+        future = asyncio.run_coroutine_threadsafe(_add(), self._loop)
         try:
-            future.result(timeout=timeout)
+            # ``_add`` owns both its deadline and rollback. A caller-side
+            # timeout here could return a failed result while cleanup is merely
+            # queued on a stalled loop, exposing a live unconfigured tool.
+            future.result()
+        except concurrent.futures.TimeoutError:
+            return {
+                "connected": False,
+                "tools": 0,
+                "resources": 0,
+                "prompts": 0,
+                "error": f"MCP server '{name}' registration timed out",
+            }
         except Exception as exc:
-            # Remove from configs on failure
-            self._server_configs.pop(name, None)
+            # The loop-side rollback normally removed this exact registration;
+            # retain a defensive cleanup for failures before _add could start.
+            if self._server_configs.get(name) is cfg:
+                self._server_configs.pop(name, None)
             return {"connected": False, "tools": 0, "resources": 0, "prompts": 0, "error": str(exc)}
 
         state = self._static_servers.get(name)

@@ -26,7 +26,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mcp.types as mcp_types
 import pytest
+from mcp import McpError
 
 from turnstone.core.mcp_client import MCPClientManager
 
@@ -155,6 +157,352 @@ class TestTransportOwnerLifecycle:
         assert state.owner_task is None
         assert state.close_requested is None
 
+    def test_tools_only_connect_skips_unchanged_catalog_listeners(
+        self, running_loop_mgr
+    ) -> None:
+        """A tools-only registration must not rebuild every live chat twice."""
+        mgr, loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        _fake_transport_and_session(patches)
+        notifications: list[str] = []
+        mgr.add_listener(lambda: notifications.append("tools"))
+        mgr.add_resource_listener(lambda: notifications.append("resources"))
+        mgr.add_prompt_listener(lambda: notifications.append("prompts"))
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            _run(loop, mgr._connect_one_locked("srv", mgr._server_configs["srv"]))
+            assert notifications == ["tools"]
+            _run(loop, mgr._teardown_static_session("srv"))
+
+    def test_connect_notifies_when_dropped_capability_clears_stale_catalog(
+        self, running_loop_mgr
+    ) -> None:
+        """Capability loss clears and broadcasts genuinely stale catalogs."""
+        mgr, loop, _ = running_loop_mgr
+        state = mgr._ensure_static_state("srv")
+        state.resources = [
+            {
+                "uri": "res://stale",
+                "name": "stale",
+                "description": "",
+                "mimeType": "text/plain",
+                "server": "srv",
+            }
+        ]
+        state.prompts = [
+            {
+                "name": "mcp__srv__stale",
+                "original_name": "stale",
+                "server": "srv",
+                "description": "",
+                "arguments": [],
+            }
+        ]
+        mgr._rebuild_resources()
+        mgr._rebuild_prompts()
+
+        patches: dict[str, Any] = {}
+        _fake_transport_and_session(patches)
+        notifications: list[str] = []
+        mgr.add_listener(lambda: notifications.append("tools"))
+        mgr.add_resource_listener(lambda: notifications.append("resources"))
+        mgr.add_prompt_listener(lambda: notifications.append("prompts"))
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            _run(loop, mgr._connect_one_locked("srv", mgr._server_configs["srv"]))
+            assert state.resources == []
+            assert state.prompts == []
+            assert mgr.get_resources() == []
+            assert mgr.get_prompts() == []
+            assert notifications == ["tools", "resources", "prompts"]
+            _run(loop, mgr._teardown_static_session("srv"))
+
+    def test_static_connect_accepts_resources_without_template_method(
+        self, running_loop_mgr
+    ) -> None:
+        """The aggregate resources capability does not require both list methods.
+
+        A server with concrete resources but no templates still publishes its
+        tools/resources and retains a usable live session when the unsupported
+        half returns the protocol's exact METHOD_NOT_FOUND code.
+        """
+        mgr, loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+        session = fake["session"]
+        session.get_server_capabilities = MagicMock(
+            return_value=mcp_types.ServerCapabilities(
+                tools=mcp_types.ToolsCapability(listChanged=False),
+                resources=mcp_types.ResourcesCapability(listChanged=False),
+            )
+        )
+        session.list_tools = AsyncMock(
+            return_value=mcp_types.ListToolsResult(
+                tools=[
+                    mcp_types.Tool(
+                        name="echo",
+                        description="Echo input",
+                        inputSchema={"type": "object", "properties": {}},
+                    )
+                ]
+            )
+        )
+        session.list_resources = AsyncMock(
+            return_value=mcp_types.ListResourcesResult(
+                resources=[
+                    mcp_types.Resource(
+                        uri="res://one",
+                        name="one",
+                        mimeType="text/plain",
+                    )
+                ]
+            )
+        )
+        session.list_resource_templates = AsyncMock(
+            side_effect=McpError(
+                mcp_types.ErrorData(
+                    code=mcp_types.METHOD_NOT_FOUND,
+                    message="templates disabled",
+                )
+            )
+        )
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            _run(loop, mgr._connect_one_locked("srv", mgr._server_configs["srv"]))
+            state = mgr._static_servers["srv"]
+
+            assert state.session is session
+            assert state.owner_task is not None and not state.owner_task.done()
+            assert mgr.is_mcp_tool("mcp__srv__echo") is True
+            assert {r["uri"] for r in mgr.get_resources()} == {"res://one"}
+
+            _run(loop, mgr._teardown_static_session("srv"))
+
+    def test_failed_add_is_atomic_and_rejects_message_only_method_match(
+        self, running_loop_mgr
+    ) -> None:
+        """A later discovery failure cannot leave a callable ghost tool.
+
+        The error deliberately says ``Method not found`` but carries
+        INVALID_PARAMS: compatibility is classified by JSON-RPC code only.
+        """
+        mgr, _loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+        session = fake["session"]
+        session.get_server_capabilities = MagicMock(
+            return_value=mcp_types.ServerCapabilities(
+                tools=mcp_types.ToolsCapability(listChanged=False),
+                resources=mcp_types.ResourcesCapability(listChanged=False),
+            )
+        )
+        session.list_tools = AsyncMock(
+            return_value=mcp_types.ListToolsResult(
+                tools=[
+                    mcp_types.Tool(
+                        name="ghost",
+                        description="Must never publish",
+                        inputSchema={"type": "object", "properties": {}},
+                    )
+                ]
+            )
+        )
+        session.list_resources = AsyncMock(
+            side_effect=McpError(
+                mcp_types.ErrorData(
+                    code=mcp_types.INVALID_PARAMS,
+                    message="Method not found",
+                )
+            )
+        )
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            result = mgr.add_server_sync(
+                "new",
+                {"type": "stdio", "command": "fake-cmd"},
+                timeout=5,
+            )
+
+        assert result["connected"] is False
+        assert "Method not found" in result["error"]
+        assert "new" not in mgr._server_configs
+        state = mgr._static_servers["new"]
+        assert state.session is None
+        assert state.owner_task is None
+        assert state.close_requested is None
+        assert mgr.is_mcp_tool("mcp__new__ghost") is False
+        assert mgr.get_tools() == []
+        assert mgr.get_resources() == []
+        assert fake["events"] == [
+            "transport_enter",
+            "session_enter",
+            "session_exit",
+            "transport_exit",
+        ]
+
+    def test_timed_out_add_waits_for_atomic_rollback(self, running_loop_mgr) -> None:
+        """Returning timeout must not strand an unconfigured live transport."""
+        mgr, _loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+        session = fake["session"]
+        session.get_server_capabilities = MagicMock(
+            return_value=mcp_types.ServerCapabilities(
+                tools=mcp_types.ToolsCapability(listChanged=False),
+                resources=mcp_types.ResourcesCapability(listChanged=False),
+            )
+        )
+        session.list_tools = AsyncMock(
+            return_value=mcp_types.ListToolsResult(
+                tools=[
+                    mcp_types.Tool(
+                        name="ghost",
+                        description="Must never publish",
+                        inputSchema={"type": "object", "properties": {}},
+                    )
+                ]
+            )
+        )
+
+        async def _park_resources() -> Any:
+            await asyncio.sleep(3600)
+
+        session.list_resources = _park_resources
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            result = mgr.add_server_sync(
+                "new",
+                {"type": "stdio", "command": "fake-cmd"},
+                timeout=0.05,
+            )
+
+        assert result == {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "MCP server 'new' registration timed out",
+        }
+        assert "new" not in mgr._server_configs
+        state = mgr._static_servers["new"]
+        assert state.session is None
+        assert state.owner_task is None
+        assert state.close_requested is None
+        assert state.tools == []
+        assert state.resources == []
+        assert state.prompts == []
+        assert mgr.is_mcp_tool("mcp__new__ghost") is False
+        assert fake["events"] == [
+            "transport_enter",
+            "session_enter",
+            "session_exit",
+            "transport_exit",
+        ]
+
+    def test_add_reports_late_success_when_connect_suppresses_timeout(
+        self, running_loop_mgr
+    ) -> None:
+        """The sync result reflects the definitive loop-side outcome.
+
+        A dependency can suppress cancellation. In that case ``asyncio.timeout``
+        cannot honestly report a timeout, so the registration is a late success
+        rather than a failed result with a live ghost catalog.
+        """
+        mgr, _loop, _ = running_loop_mgr
+
+        async def _late_success(name: str, _cfg: dict[str, Any]) -> None:
+            # Model the completion-vs-timeout race: the connect finishes and
+            # commits after the sync caller's deadline but before its
+            # cancellation can make the operation fail.
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.sleep(3600)
+            state = mgr._ensure_static_state(name)
+            state.session = MagicMock()
+            state.tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": f"mcp__{name}__late",
+                        "description": "late",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+            mgr._rebuild_tools()
+
+        with patch.object(mgr, "_connect_one_locked", side_effect=_late_success):
+            result = mgr.add_server_sync(
+                "new",
+                {"type": "stdio", "command": "fake-cmd"},
+                timeout=0.05,
+            )
+
+        assert result == {
+            "connected": True,
+            "tools": 1,
+            "resources": 0,
+            "prompts": 0,
+            "error": "",
+        }
+        assert mgr._server_configs["new"] == {"type": "stdio", "command": "fake-cmd"}
+        state = mgr._static_servers["new"]
+        assert state.session is not None
+        assert len(state.tools) == 1
+        assert mgr.is_mcp_tool("mcp__new__late") is True
+
+    def test_blocked_loop_cannot_return_failure_before_add_outcome(
+        self, running_loop_mgr
+    ) -> None:
+        """A synchronous listener stall may delay success, never expose a ghost."""
+        mgr, _loop, _ = running_loop_mgr
+
+        async def _publish_then_notify(name: str, _cfg: dict[str, Any]) -> None:
+            state = mgr._ensure_static_state(name)
+            state.session = MagicMock()
+            state.tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": f"mcp__{name}__live",
+                        "description": "live",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+            mgr._rebuild_tools()
+
+        mgr.add_listener(lambda: time.sleep(0.1))
+        started = time.monotonic()
+        with patch.object(mgr, "_connect_one_locked", side_effect=_publish_then_notify):
+            result = mgr.add_server_sync(
+                "new",
+                {"type": "stdio", "command": "fake-cmd"},
+                timeout=0.01,
+            )
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= 0.08
+        assert result["connected"] is True
+        assert result["error"] == ""
+        assert "new" in mgr._server_configs
+        assert mgr._static_servers["new"].session is not None
+        assert mgr.is_mcp_tool("mcp__new__live") is True
+
     def test_owner_death_evicts_session(self, running_loop_mgr) -> None:
         """Trigger-A observer: the transport collapsing under a live session
         (owner task dies without a requested close) evicts the session so the
@@ -234,6 +582,54 @@ class TestTransportOwnerLifecycle:
         assert elapsed < 5.0  # prompt fail — not the attempt-timeout hang
         assert mgr._static_servers["srv"].session is None
         # The owner unwound its cms despite dying mid-discovery.
+        assert fake["events"][-2:] == ["session_exit", "transport_exit"]
+
+    def test_owner_death_same_turn_as_discovery_cannot_publish_catalog(
+        self, running_loop_mgr
+    ) -> None:
+        """When discovery and owner death tie, transport death wins."""
+        mgr, _loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+
+        async def _cancel_owner_and_return_tool() -> mcp_types.ListToolsResult:
+            owner = mgr._static_servers["new"].owner_task
+            assert owner is not None
+            owner.cancel()
+            # Let the owner consume cancellation before this discovery task
+            # returns, putting both futures in the completed set observed by
+            # ``_await_owner_discovery``.
+            await asyncio.sleep(0)
+            return mcp_types.ListToolsResult(
+                tools=[
+                    mcp_types.Tool(
+                        name="ghost",
+                        description="Must never publish",
+                        inputSchema={"type": "object", "properties": {}},
+                    )
+                ]
+            )
+
+        fake["session"].list_tools = AsyncMock(side_effect=_cancel_owner_and_return_tool)
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            result = mgr.add_server_sync(
+                "new",
+                {"type": "stdio", "command": "fake-cmd"},
+                timeout=5,
+            )
+
+        assert result["connected"] is False
+        assert "died during discovery" in result["error"]
+        assert "new" not in mgr._server_configs
+        state = mgr._static_servers["new"]
+        assert state.session is None
+        assert state.owner_task is None
+        assert state.tools == []
+        assert mgr.is_mcp_tool("mcp__new__ghost") is False
         assert fake["events"][-2:] == ["session_exit", "transport_exit"]
 
     def test_base_exception_escape_resolves_waiter_and_propagates(self, running_loop_mgr) -> None:

@@ -217,6 +217,16 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Fixed
 
+- **MCP servers may expose resources without resource templates, or templates
+  without concrete resources (#993).** The MCP handshake has one aggregate
+  `resources` capability, but implementations are not required to support both
+  list methods. An exact JSON-RPC `Method not found` response from either
+  method is now treated as an empty half-catalog during static and per-user
+  discovery and refresh, while every other error still fails closed. A failed
+  static registration also tears down its transport and publishes none of its
+  staged tools/resources/prompts, eliminating the live callable “ghost” tools
+  that could remain after the UI reported registration failure.
+
 - **A cancelled judge, guard, or compaction call can now stop before its
   request goes out (#972).** Previously it could not: `model_turn` refused
   to *re-issue* an abandoned call after a mid-stream death, but nothing

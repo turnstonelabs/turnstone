@@ -4069,6 +4069,75 @@ class TestStaticNotificationRefresh:
             "the hung sibling must be cancelled and reaped inside the scope"
         )
 
+    def test_resources_refresh_accepts_missing_template_method(self) -> None:
+        """Push/manual refresh shares the per-method compatibility behavior."""
+        from mcp import McpError
+
+        mgr = MCPClientManager({})
+        session = MagicMock()
+        session.list_resources = AsyncMock(
+            return_value=mcp_types.ListResourcesResult(
+                resources=[
+                    mcp_types.Resource(
+                        uri="res://fresh",
+                        name="fresh",
+                        mimeType="text/plain",
+                    )
+                ]
+            )
+        )
+        session.list_resource_templates = AsyncMock(
+            side_effect=McpError(
+                mcp_types.ErrorData(
+                    code=mcp_types.METHOD_NOT_FOUND,
+                    message="templates disabled",
+                )
+            )
+        )
+        state = _seed_static_state(
+            mgr,
+            "srv",
+            session=session,
+            supports_resources=True,
+            resources=[{"uri": "res://old", "server": "srv"}],
+        )
+        mgr._rebuild_resources()
+
+        asyncio.run(mgr._refresh_server_resources("srv"))
+
+        assert [r["uri"] for r in state.resources] == ["res://fresh"]
+        assert [r["uri"] for r in mgr.get_resources()] == ["res://fresh"]
+
+    def test_resources_refresh_rejects_message_only_method_match(self) -> None:
+        """Only -32601 is normalized; a lookalike error leaves catalog intact."""
+        from mcp import McpError
+
+        mgr = MCPClientManager({})
+        session = MagicMock()
+        session.list_resources = AsyncMock(return_value=mcp_types.ListResourcesResult(resources=[]))
+        session.list_resource_templates = AsyncMock(
+            side_effect=McpError(
+                mcp_types.ErrorData(
+                    code=mcp_types.INVALID_PARAMS,
+                    message="Method not found",
+                )
+            )
+        )
+        old_resources = [{"uri": "res://old", "server": "srv"}]
+        state = _seed_static_state(
+            mgr,
+            "srv",
+            session=session,
+            supports_resources=True,
+            resources=old_resources,
+        )
+
+        with pytest.raises(McpError) as raised:
+            asyncio.run(mgr._refresh_server_resources("srv"))
+
+        assert raised.value.error.code == mcp_types.INVALID_PARAMS
+        assert state.resources is old_resources
+
     def test_reap_bounded_reraises_external_cancel(self) -> None:
         """An EXTERNAL cancel delivered during the reap window must be
         HONOURED (re-raised), not swallowed — else a shutdown/cancel of

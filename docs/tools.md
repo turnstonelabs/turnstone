@@ -871,6 +871,13 @@ capabilities for the `resources` capability. For servers that declare it:
 2. `list_resource_templates` fetches URI templates (parameterized patterns like
    `db://tables/{table}/rows/{id}`).
 
+The protocol advertises both lists through one aggregate `resources`
+capability, so a server may implement only one of them. If either request
+returns the JSON-RPC `Method not found` code (`-32601`), turnstone treats that
+half of the catalog as empty and keeps the other half; authentication,
+validation, transport, and all other discovery errors still fail the
+connection or refresh.
+
 Both are stored as `{uri, name, description, mimeType, server}` dicts and
 merged into a unified catalog.
 

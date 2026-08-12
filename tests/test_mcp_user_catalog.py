@@ -1414,6 +1414,67 @@ def test_pool_resource_discovery_on_connect_via_real_streamable_http(
     assert {r["uri"] for r in mgr._user_resources["user-1"]} == {"res://test/1", "res://test/2"}
 
 
+@pytest.mark.parametrize(
+    ("unsupported_method", "expected_uri", "is_template"),
+    [
+        ("templates", "res://concrete", False),
+        ("resources", "res://items/{id}", True),
+    ],
+)
+def test_pool_resource_discovery_accepts_either_list_method_unsupported(
+    running_loop_mgr: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    unsupported_method: str,
+    expected_uri: str,
+    is_template: bool,
+) -> None:
+    """Real SDK boundary: either half of resource discovery may be absent.
+
+    The server advertises the aggregate resources capability and exposes a
+    tool plus exactly one resource-list method. A wire-level -32601 from the
+    other method is an empty half-catalog, not a failed pool registration.
+    """
+    mgr, loop, _ = running_loop_mgr
+    unsupported = {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "error": {"code": -32601, "message": "Method not found"},
+    }
+    concrete = _list_resources_payload([_resource_spec("res://concrete")])
+    templates = {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "result": {
+            "resourceTemplates": [
+                {
+                    "uriTemplate": "res://items/{id}",
+                    "name": "item",
+                    "mimeType": "text/plain",
+                }
+            ]
+        },
+    }
+    handler = _make_jsonrpc_handler(
+        init_response=_init_response_with_caps(resources=True),
+        list_tools_response=_list_tools_payload([_tool_spec("echo")]),
+        list_resources_response=unsupported if unsupported_method == "resources" else concrete,
+        list_resource_templates_response=(
+            unsupported if unsupported_method == "templates" else templates
+        ),
+    )
+    _build_mock_transport_factory(mgr, monkeypatch, handler)
+    _patch_tcp_probe(mgr, monkeypatch)
+
+    entry = _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
+
+    assert entry.session is not None
+    assert mgr.is_mcp_tool("mcp__pool-srv__echo", user_id="user-1") is True
+    assert entry.resources is not None
+    assert [(r["uri"], bool(r.get("template"))) for r in entry.resources] == [
+        (expected_uri, is_template)
+    ]
+
+
 def test_pool_prompt_discovery_on_connect_via_real_streamable_http(
     running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
