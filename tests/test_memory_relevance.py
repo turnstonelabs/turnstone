@@ -1,7 +1,9 @@
 """Tests for turnstone.core.memory_relevance — scoring, formatting, context extraction."""
 
+from typing import Any
 from unittest.mock import patch
 
+from turnstone.core import auth
 from turnstone.core.memory_relevance import (
     MemoryConfig,
     build_memory_context,
@@ -298,6 +300,11 @@ def _make_session(fetch_limit: int = 5, relevance_k: int = 3, **kwargs: object):
     )
 
 
+def _execute_prepared_tool(session: Any, item: dict[str, Any]) -> tuple[str, str]:
+    item.setdefault("_principal_id", session._tool_prepare_principal_id())
+    return item["execute"](item)
+
+
 class TestCompositionCandidateSelection:
     """Verify the query-aware candidate set in _init_system_messages."""
 
@@ -520,9 +527,11 @@ class TestMemorySearchToolExecution:
         """Multi-word query returns rows where ANY term matches — not all."""
         from turnstone.core.memory import save_structured_memory
 
-        save_structured_memory("postgres_notes", "host=localhost port=5432")
-        save_structured_memory("redis_notes", "host=redis port=6379")
-        save_structured_memory("unrelated", "completely different")
+        save_structured_memory(
+            "postgres_notes", "host=localhost port=5432", description="Postgres notes"
+        )
+        save_structured_memory("redis_notes", "host=redis port=6379", description="Redis notes")
+        save_structured_memory("unrelated", "completely different", description="Unrelated notes")
 
         session = _make_session()
         item = session._prepare_memory(
@@ -532,11 +541,38 @@ class TestMemorySearchToolExecution:
         # Sanity: prepare returned a search-ready dispatch (not an error item)
         assert item.get("action") == "search"
 
-        call_id, msg = session._exec_memory(item)
+        call_id, msg = _execute_prepared_tool(session, item)
         assert call_id == "call-1"
         assert "postgres_notes" in msg
         # Other memories don't match any query term
         assert "unrelated" not in msg
+
+    def test_search_and_list_guidance_carries_the_displayed_scope(self, tmp_db, monkeypatch):
+        """Follow-up guidance must not drop a project result's scope."""
+        from turnstone.core.memory import save_structured_memory
+
+        save_structured_memory(
+            "july_digest",
+            "project day digest",
+            description="July project digest",
+            scope="project",
+            scope_id="p1",
+        )
+        monkeypatch.setattr(
+            auth,
+            "resolve_project_access",
+            lambda *_a, **_k: auth.ProjectAccess(True, True, "P", "active"),
+        )
+        session = _make_session(user_id="u1", project_id="p1")
+
+        for args in (
+            {"action": "search", "query": "digest"},
+            {"action": "list"},
+        ):
+            item = session._prepare_memory("call-1", args)
+            _, msg = _execute_prepared_tool(session, item)
+            assert "[general:project] july_digest" in msg
+            assert "call memory(action='get') with the displayed name and scope" in msg
 
 
 class TestPerTurnSearchCache:
@@ -545,7 +581,7 @@ class TestPerTurnSearchCache:
     def test_repeated_search_in_same_turn_hits_cache(self, tmp_db):
         from turnstone.core.memory import save_structured_memory
 
-        save_structured_memory("hello_mem", "alpha beta gamma")
+        save_structured_memory("hello_mem", "alpha beta gamma", description="Greeting memory")
         session = _make_session()
         with patch(
             "turnstone.core.session.search_visible_structured_memories",
@@ -560,7 +596,7 @@ class TestPerTurnSearchCache:
     def test_user_turn_invalidates_cache(self, tmp_db):
         from turnstone.core.memory import save_structured_memory
 
-        save_structured_memory("hello_mem", "alpha")
+        save_structured_memory("hello_mem", "alpha", description="Greeting memory")
         session = _make_session()
         with patch(
             "turnstone.core.session.search_visible_structured_memories",

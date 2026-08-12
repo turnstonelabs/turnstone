@@ -6,6 +6,7 @@ hint pattern, and the skill catalog disclosure in system messages.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -1375,15 +1376,14 @@ class TestSkillCatalogDisclosure:
         session._tools = []
         session._client_type = ClientType.CLI
         session._username = ""
-        # _init_system_messages renders the attached project into the Session
-        # Context; this __new__-built session skips __init__'s project resolution,
-        # so seed the (unattached) defaults it reads.
-        session._project_name = ""
-        session._project_id = ""
-        session._project_writable = False
+        # This __new__-built session skips __init__'s attachment setup.
+        session._memory_attached_project_id = ""
+        session._system_prefix_lock = threading.RLock()
+        session._system_prefix_dirty = True
+        session._system_prefix_signature = None
         session._kind = "interactive"
-        # Persona snapshot attrs (set by __init__, bypassed here) — legacy
-        # defaults: no override, unrestricted tools, MCP + memory on.
+        # Persona snapshot attrs (set by __init__, bypassed here): open
+        # defaults with no override, unrestricted tools, MCP + memory on.
         session._persona_name = ""
         session._persona_prompt = ""
         session._persona_tools = None
@@ -1393,6 +1393,7 @@ class TestSkillCatalogDisclosure:
         session._memory_config = MagicMock()
         session._memory_config.fetch_limit = 0
         session._user_id = "test-user"
+        session._acting_user_id = ""
         # _init_system_messages -> _recompute_shared_state reads the session
         # owner (_mcp_user_id) to decide shared-workstream framing; __init__
         # normally sets it from user_id, so seed it here for the __new__ build.

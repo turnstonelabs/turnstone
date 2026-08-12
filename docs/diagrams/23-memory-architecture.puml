@@ -20,58 +20,61 @@ participant "SDK Client\n(sdk/)" as SDK <<sdk>>
 
 == Phase 1: Tool Path (session.send) ==
 
-Session -> Session : _prepare_tool_calls()\nparse memory(action=...)
+Session -> Session : pin acting principal\nparse memory(action=...)
 note right
-  Tool schema: 4 actions
-  save, search, delete, list
+  Tool schema: 5 actions
+  save, get, search, delete, list
   Auto-approved (no approval needed)
 end note
+
+Session -> Session : resolve live project access\nselect exact/inherited scope
 
 Session -> Session : _exec_memory(item)
 
 alt action = save
-    Session -> Facade : save_structured_memory(\nname, content, description,\nmem_type, scope, scope_id)
+    Session -> Session : require non-empty description
+    Session -> Facade : save_structured_memory_strict(\n..., require_active_project)
     Facade -> Facade : normalize_key(name)
-    Facade -> Storage : create_structured_memory()
-    alt unique constraint violation
-        Storage --> Facade : IntegrityError
-        Facade -> Storage : get_structured_memory_by_name()
-        Storage --> Facade : existing row
-        Facade -> Storage : update_structured_memory()
-    end
-    Storage --> Facade : memory_id
-    Facade --> Session : (memory_id, old_content)
-    Session -> Session : _init_system_messages()\nrefresh BM25 context
+    Facade -> Storage : guarded atomic upsert\nON CONFLICT ... RETURNING
+    Storage --> Facade : (saved row, was_update)
+    Facade --> Session : saved row
+    Session -> Session : invalidate prefix/cache\naudit acting principal
+end
+
+alt action = get
+    Session -> Facade : get_structured_memory_by_name_strict()
+    Facade -> Storage : exact scoped-name lookup
+    Storage --> Session : full row / not found
 end
 
 alt action = search
-    Session -> Facade : search_structured_memories(\nquery, mem_type, scope,\nscope_id, limit)
-    Facade -> Storage : search_structured_memories()
+    Session -> Storage : search exact scope or\nactor-visible scope union
     Storage --> Session : matched rows
 end
 
 alt action = delete
-    Session -> Facade : delete_structured_memory(\nname, scope, scope_id)
-    Facade -> Storage : delete_structured_memory()
-    Storage --> Session : bool (existed)
-    Session -> Session : _init_system_messages()\nrefresh BM25 context
+    Session -> Facade : delete_structured_memory_returning_strict()
+    Facade -> Storage : DELETE ... RETURNING
+    Storage --> Session : deleted row / not found
+    Session -> Session : invalidate + audit\nmark prefix dirty
 end
 
 == Phase 2: BM25 Relevance Injection ==
 
 Session -> Session : _init_system_messages()\nevery conversation turn
 
+Session -> Session : resolve acting principal\nand live project ACL
 Session -> Session : _list_visible_memories(\nlimit=fetch_limit)
 note right
   **Scope resolution:**
-  1. global scope (always)
-  2. workstream scope (ws_id)
-  3. user scope (user_id, if auth)
-  Combined and deduplicated.
+  Interactive: global + workstream
+  + acting user + readable project
+  Coordinator: acting user's coordinator
+  + readable project
 end note
 
-Session -> Facade : list_structured_memories()\nper scope
-Facade -> Storage : list_structured_memories()
+Session -> Facade : list_visible_structured_memories()
+Facade -> Storage : one visibility-union query
 Storage --> Session : up to fetch_limit rows
 
 Session -> Relevance : extract_recent_context(\nmessages, max_messages=3)
@@ -103,28 +106,31 @@ Session -> Session : inject into\nsystem message
 
 == Phase 3: Server API Path ==
 
-SDK -> API : GET /v1/api/memories\n?type=project&limit=20
-API -> Facade : list_structured_memories()
-Facade -> Storage : list_structured_memories()
+SDK -> API : GET /v1/api/memories\n?type=general&limit=20
+API -> API : bind scope to caller\ndefault global + caller user
+API -> Storage : list visible rows
 Storage --> API : rows
 API --> SDK : {"memories": [...], "total": N}
 
-SDK -> API : POST /v1/api/memories\n{name, content, ...}
-API -> API : validate type, scope,\nname length, content length
-API -> Facade : save_structured_memory()
-Facade -> Storage : create / update
+SDK -> API : POST /v1/api/memories\n{name, content, description, ...}
+API -> API : validate type, scope,\nname/content/description
+API -> API : reject internal scopes\nowner-bind workstream scope
+API -> Facade : save_structured_memory_strict()
+Facade -> Storage : atomic upsert
 Storage --> API : memory row
+API -> API : record_audit(actor)
 API --> SDK : 201 (created) / 200 (updated)
 
 SDK -> API : POST /v1/api/memories/search\n{query, type, ...}
-API -> Facade : search_structured_memories()
-Facade -> Storage : search_structured_memories()
+API -> API : bind scope to caller
+API -> Storage : search visible rows
 Storage --> API : matched rows
 API --> SDK : {"memories": [...], "total": N}
 
 SDK -> API : DELETE /v1/api/memories/{name}\n?scope=global
-API -> Facade : delete_structured_memory()
-Facade -> Storage : delete row
+API -> Facade : delete_structured_memory_returning_strict()
+Facade -> Storage : DELETE ... RETURNING
+API -> API : record_audit(actor)
 API --> SDK : {"status": "ok"}
 
 == Phase 4: Console Admin Path ==
@@ -141,7 +147,7 @@ Storage --> Admin : memory row
 Admin --> SDK : memory JSON
 
 SDK -> Admin : DELETE /v1/api/admin/memories/{id}
-Admin -> Storage : delete_structured_memory_by_id()
+Admin -> Storage : delete_structured_memory_by_id_returning()
 Admin -> Admin : record_audit(\n"memory.delete")
 Admin --> SDK : {"status": "ok"}
 

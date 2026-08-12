@@ -36,7 +36,7 @@ import traceback
 import uuid
 from datetime import UTC, datetime, timedelta
 from html import escape as _html_escape
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, cast
 
 import httpx
 
@@ -79,16 +79,16 @@ from turnstone.core.lowering import (
 from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.memory import (
     count_structured_memories,
-    delete_structured_memory_by_id,
+    delete_structured_memory_returning_strict,
     delete_workstream,
+    find_structured_memory_scopes,
     get_attachments,
     get_compaction_checkpoint,
     get_skill_by_name,
-    get_structured_memory_by_name,
+    get_structured_memory_by_name_strict,
     get_workstream_display_name,
     list_default_skills,
     list_skills_by_activation,
-    list_structured_memories,
     list_visible_structured_memories,
     list_workstreams_with_history,
     load_message_turns,
@@ -97,13 +97,12 @@ from turnstone.core.memory import (
     resolve_workstream,
     save_message,
     save_messages_bulk,
-    save_structured_memory,
+    save_structured_memory_strict,
     save_tool_message_with_attachments,
     save_user_message_with_attachments,
     save_workstream_config,
     search_history,
     search_history_recent,
-    search_structured_memories,
     search_visible_structured_memories,
     set_workstream_alias,
     touch_structured_memories,
@@ -1182,6 +1181,9 @@ _active_task_agent_cancel_scope: contextvars.ContextVar[_ParallelModelCancelScop
 _active_tool_origin_generation: contextvars.ContextVar[int] = contextvars.ContextVar(
     "turnstone_active_tool_origin_generation", default=0
 )
+_active_tool_prepare_principal: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "turnstone_active_tool_prepare_principal", default=""
+)
 
 # Generation whose bounded live commit is currently staging durable closures
 # on this thread.  State UIs use the captured value to refuse a delayed tail
@@ -1562,12 +1564,49 @@ _VALID_MEMORY_SCOPES: tuple[str, ...] = (
     "project",
 )
 
-# Implicit-scope walk for INTERACTIVE ``memory(action='get'/'delete')``
-# when no scope is specified.  Narrowest → widest so the most
-# session-specific row wins on a name collision.  Coord sessions use a
-# different walk (just ``("coordinator",)``) — see
-# :meth:`ChatSession._implicit_scope_walk`.
-_IMPLICIT_SCOPE_WALK: tuple[str, ...] = ("workstream", "user", "global")
+_MEMORY_MIXED_BATCH_ERROR = (
+    "Error: memory read and write actions cannot run in the same tool batch. "
+    "Split the mutation and the follow-up read across separate assistant turns."
+)
+
+
+def _batch_policy(
+    group: str,
+    access: Literal["read", "write"],
+    mixed_access_error: str,
+    *,
+    serialize: bool = False,
+) -> dict[str, str | bool]:
+    """Declare action-dependent execution constraints on a prepared tool item."""
+    return {
+        "group": group,
+        "access": access,
+        "mixed_access_error": mixed_access_error,
+        "serialize": serialize,
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class _MemoryAccess:
+    """One actor-specific, live memory authorization snapshot."""
+
+    principal_id: str
+    attached_project_id: str
+    project_id: str
+    project_name: str
+    project_writable: bool
+
+    @property
+    def signature(self) -> tuple[str, str, str, str, bool]:
+        """Cache witness for actor/project visibility and prompt metadata."""
+        return (
+            self.principal_id,
+            self.attached_project_id,
+            self.project_id,
+            self.project_name,
+            self.project_writable,
+        )
+
 
 # ``list_nodes`` reserves four top-level kwargs for control parameters
 # (filters / paging / output verbosity / liveness toggle).  Anything
@@ -1584,6 +1623,13 @@ _LIST_NODES_RESERVED_ARGS: frozenset[str] = frozenset(
 # result; all reads can't race) and reject only the mixed read+write
 # shape where ``tasks(list)`` paralleled with ``tasks(add=...)`` has
 # unspecified ordering inside ``_execute_tools``'s ThreadPoolExecutor.
+_TASKS_MIXED_BATCH_ERROR = (
+    "Error: tasks(...) read (`list`) and write "
+    "(`add` / `update` / `remove` / `reorder`) actions cannot run in the "
+    "same parallel tool batch — the read-after-write ordering is not guaranteed. "
+    "All-reads or all-writes are fine; mix only by splitting them across separate "
+    "assistant turns."
+)
 _TASKS_READ_ACTIONS: frozenset[str] = frozenset({"list"})
 _TASKS_WRITE_ACTIONS: frozenset[str] = frozenset({"add", "update", "remove", "reorder"})
 
@@ -2588,11 +2634,24 @@ class ChatSession:
         # fires many times within one turn (state transitions, MCP refresh,
         # tool results) and the recent-context string is identical across
         # them.  Invalidated on user-turn append and on memory write/delete.
-        self._mem_search_cache: dict[tuple[str, str, int], list[dict[str, str]]] = {}
+        self._mem_search_cache: dict[
+            tuple[str, str, int, tuple[tuple[str, str], ...]],
+            list[dict[str, str]],
+        ] = {}
         # Per-turn dedup for composition touches: ``_init_system_messages`` runs
         # many times within a turn, so the injected set is touched at most once
         # per memory per turn.  Cleared alongside the search cache.
         self._touched_memory_keys: set[tuple[str, str, str]] = set()
+        # Prefix publication and memory mutations share a short critical
+        # section. Composition itself stays outside the lock because storage,
+        # MCP, and relevance lookups may block; each attempt carries an epoch
+        # and only the newest still-current attempt may publish. A memory write
+        # bumps the epoch before releasing the lane, so an older composition
+        # can never reinstall a row the write changed or deleted.
+        self._system_prefix_lock = threading.RLock()
+        self._system_prefix_epoch = 0
+        self._system_prefix_dirty = True
+        self._system_prefix_signature: tuple[str, str, str, str, bool] | None = None
         # Per-send memo for the wire attachment resolver (set in send(), None
         # outside a send).  _resolve_attachments re-runs on every agentic
         # round-trip, so this caches the materialized part by
@@ -2605,28 +2664,9 @@ class ChatSession:
         # Internal destination-incarnation witness installed by
         # SessionManager after construction for HTTP fork creates.
         self._fork_reservation_token = fork_reservation_token
-        # Project attachment + access, resolved ONCE here (mid-session attach or
-        # access-revoke takes effect on the next session load — same contract as
-        # user_id / coordinator scope).  ``_project_id`` is set only when the user
-        # can READ the project, so it gates recall in ``_visible_scopes``;
-        # ``_project_writable`` additionally gates the memory(save) path so a
-        # non-member of a *public* project can read but not write its memory.
-        self._project_id = ""
-        self._project_name = ""
-        self._project_writable = False
-        if project_id and self._user_id:
-            from turnstone.core.auth import resolve_project_access
-
-            # One fetch resolves read access, write access, the display name, and
-            # the project state (vs three round-trips).  Recall is gated on READ
-            # access AND a non-archived project: an archived project is "not
-            # recalled" per the schema contract, even though its owner can still
-            # reach it through the management routes (to rename / unarchive).
-            acc = resolve_project_access(self._user_id, project_id)
-            if acc.can_read and acc.state != "archived":
-                self._project_id = project_id
-                self._project_writable = acc.can_write
-                self._project_name = acc.name
+        # Keep only the durable attachment. Authorization and display metadata
+        # are resolved live for the acting principal at each security boundary.
+        self._memory_attached_project_id = (project_id or "").strip()
         # Persona snapshot — the four levers, resolved ONCE at workstream
         # creation and immutable for the session's lifetime.  Everything
         # below (tool merge, MCP gate, composition, memory) reads these
@@ -5524,13 +5564,14 @@ class ChatSession:
         if storage is None:
             raise RuntimeError("storage is not initialized")
         persona = self._current_persona_snapshot()
+        project_access = self._memory_access(principal_id)
         expected_session = ForkCloneExpectation(
             persona_config=(
                 tuple(sorted(persona.to_config().items())) if persona is not None else ()
             ),
-            project_id=self._project_id,
-            project_name=self._project_name,
-            project_writable=self._project_writable,
+            project_id=project_access.project_id,
+            project_name=project_access.project_name,
+            project_writable=project_access.project_writable,
             destination_reservation_token=self._fork_reservation_token,
             source_reservation_token=source_reservation_token,
         )
@@ -5591,9 +5632,7 @@ class ChatSession:
             if _fork_snapshot is not None
             else load_workstream_config(ws_id)
         )
-        resumed_project_id = ""
-        resumed_project_name = ""
-        resumed_project_writable = False
+        resumed_attached_project_id = ""
         if not fork:
             storage = get_storage()
             target_row = storage.get_workstream(ws_id) if storage is not None else None
@@ -5603,18 +5642,7 @@ class ChatSession:
                 if isinstance(raw_project_id, str) and raw_project_id.strip()
                 else ""
             )
-            if target_project_id and self._user_id:
-                from turnstone.core.auth import resolve_project_access
-
-                access = resolve_project_access(
-                    self._user_id,
-                    target_project_id,
-                    storage=storage,
-                )
-                if access.can_read and access.state != "archived":
-                    resumed_project_id = target_project_id
-                    resumed_project_name = access.name
-                    resumed_project_writable = access.can_write
+            resumed_attached_project_id = target_project_id
         # Parse every scalar that can reject persisted input before either
         # identity/history adoption or a fork's durable bulk copy. A corrupt
         # value must not leave a half-adopted live session, nor committed fork
@@ -5657,9 +5685,7 @@ class ChatSession:
                     "construction — open the workstream fresh instead"
                 )
             self._ws_id = ws_id
-            self._project_id = resumed_project_id
-            self._project_name = resumed_project_name
-            self._project_writable = resumed_project_writable
+            self._memory_attached_project_id = resumed_attached_project_id
             # A non-fork resume repoints this session at a DIFFERENT existing
             # workstream's identity (fork keeps self._ws_id, so its nonces stay
             # correctly scoped to the ws they were minted for). The sender-label
@@ -5961,7 +5987,29 @@ class ChatSession:
         }
         return messages
 
-    def _init_system_messages(self, *, origin_generation: int = 0) -> bool:
+    def _init_system_messages(
+        self,
+        *,
+        origin_generation: int = 0,
+        principal_id: str | None = None,
+    ) -> bool:
+        """Compose and atomically publish the newest system-prefix attempt."""
+        with self._system_prefix_lock:
+            self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+            composition_epoch = self._system_prefix_epoch
+        return self._compose_system_messages(
+            origin_generation=origin_generation,
+            principal_id=principal_id,
+            composition_epoch=composition_epoch,
+        )
+
+    def _compose_system_messages(
+        self,
+        *,
+        origin_generation: int = 0,
+        principal_id: str | None = None,
+        composition_epoch: int | None = None,
+    ) -> bool:
         """Build the system/developer prefix messages.
 
         Developer message contains the composed system message (persona
@@ -5972,7 +6020,13 @@ class ChatSession:
         atomically so concurrent readers (e.g. background thread
         callbacks) never see a partially-built system message.
         """
+        if composition_epoch is None:
+            with self._system_prefix_lock:
+                self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+                composition_epoch = self._system_prefix_epoch
+
         new_system_messages: list[dict[str, Any]] = []
+        memory_access = self._memory_access(principal_id)
         shared_state_plan = self._plan_shared_state()
         owner = (self._mcp_user_id or "").strip()
         planned_senders = set(self._known_senders) | shared_state_plan[1]
@@ -5983,7 +6037,7 @@ class ChatSession:
         )
         planned_shared = self._shared_workstream or any(s != owner for s in planned_senders)
         memory_cache_updates: dict[
-            tuple[str, str, int],
+            tuple[str, str, int, tuple[tuple[str, str], ...]],
             list[dict[str, str]],
         ] = {}
         planned_touch_keys: list[tuple[str, str, str]] = []
@@ -6018,10 +6072,10 @@ class ChatSession:
             current_datetime=now.strftime("%Y-%m-%dT%H:00"),
             timezone=now.tzname() or "UTC",
             username=self._username or self._user_id or "unknown",
-            project=self._project_name,
+            project=memory_access.project_name,
             shared=planned_shared,
             ws_id=self._ws_id,
-            project_id=self._project_id,
+            project_id=memory_access.project_id,
         )
         composed = compose_system_message(
             client_type=self._client_type,
@@ -6210,6 +6264,7 @@ class ChatSession:
         visible_mems, candidate_source = (
             self._select_memory_candidates(
                 context,
+                access=memory_access,
                 cache_updates=memory_cache_updates,
             )
             if self._persona_memory
@@ -6260,22 +6315,31 @@ class ChatSession:
         if skill_context:
             new_system_messages.append({"role": "user", "content": skill_context})
 
+        installed = False
+
         def _install() -> None:
-            self._apply_shared_state_plan(*shared_state_plan)
-            self._mem_search_cache.update(memory_cache_updates)
-            fresh_touch_keys = [
-                key for key in planned_touch_keys if key not in self._touched_memory_keys
-            ]
-            self._touched_memory_keys.update(fresh_touch_keys)
-            accepted_touch_keys.extend(fresh_touch_keys)
-            # Atomic swaps — readers see either old or new, never partial.
-            self._agent_system_messages = new_agent_system_messages
-            self.system_messages = new_system_messages
-            if composed_with_context:
-                # Composed against a real user-message query at least once;
-                # send() uses this to know the deferred first-turn recompose is
-                # done.  Publish this latch with the prefix it describes.
-                self._system_composed_with_context = True
+            nonlocal installed
+            with self._system_prefix_lock:
+                if composition_epoch != getattr(self, "_system_prefix_epoch", 0):
+                    return
+                self._apply_shared_state_plan(*shared_state_plan)
+                self._mem_search_cache.update(memory_cache_updates)
+                self._system_prefix_signature = memory_access.signature
+                fresh_touch_keys = [
+                    key for key in planned_touch_keys if key not in self._touched_memory_keys
+                ]
+                self._touched_memory_keys.update(fresh_touch_keys)
+                accepted_touch_keys.extend(fresh_touch_keys)
+                # Atomic swaps — readers see either old or new, never partial.
+                self._agent_system_messages = new_agent_system_messages
+                self.system_messages = new_system_messages
+                self._system_prefix_dirty = False
+                if composed_with_context:
+                    # Composed against a real user-message query at least once;
+                    # send() uses this to know the deferred first-turn recompose is
+                    # done.  Publish this latch with the prefix it describes.
+                    self._system_composed_with_context = True
+                installed = True
 
         if origin_generation:
             published = self._publish_for_generation(
@@ -6286,9 +6350,40 @@ class ChatSession:
         else:
             _install()
             published = True
+        published = published and installed
         if published and accepted_touch_keys:
             touch_structured_memories(accepted_touch_keys)
         return published
+
+    def _ensure_system_prefix_fresh(
+        self,
+        *,
+        principal_id: str | None = None,
+        origin_generation: int = 0,
+    ) -> None:
+        """Refresh the cached prefix when its actor/project witness changed."""
+        for _attempt in range(2):
+            access = self._memory_access(principal_id)
+            with self._system_prefix_lock:
+                if (
+                    not self._system_prefix_dirty
+                    and self._system_prefix_signature == access.signature
+                ):
+                    return
+                self._system_prefix_dirty = True
+            if not self._init_system_messages(
+                origin_generation=origin_generation,
+                principal_id=principal_id,
+            ):
+                break
+            current_signature = self._memory_access(principal_id).signature
+            with self._system_prefix_lock:
+                if (
+                    not self._system_prefix_dirty
+                    and self._system_prefix_signature == current_signature
+                ):
+                    return
+        raise RuntimeError("memory context could not be refreshed safely")
 
     def _full_messages(self) -> list[dict[str, Any]]:
         """System messages + conversation history as wire dicts.
@@ -10256,6 +10351,15 @@ class ChatSession:
         """
         return self._acting_user_id or self._user_id or None
 
+    def _tool_prepare_principal_id(self) -> str:
+        """Principal pinned for the current tool-preparation batch."""
+        return (
+            _active_tool_prepare_principal.get()
+            or getattr(self, "_acting_user_id", "")
+            or getattr(self, "_user_id", "")
+            or ""
+        ).strip()
+
     def bind_acting_user(self, user_id: str) -> None:
         """Bind directly, or defer a worker-thread bind until generation claim.
 
@@ -10315,7 +10419,9 @@ class ChatSession:
         if not user_id or user_id == (self._acting_user_id or self._user_id):
             self._acting_user_id = self._acting_user_id or user_id
             return
-        self._acting_user_id = user_id
+        with self._system_prefix_lock:
+            self._acting_user_id = user_id
+            self._invalidate_memory_cache()
         mcp = self._mcp_client
         # Coordinators participate fully (#725): they are multi-sender by
         # design (any admin.coordinator operator with project visibility
@@ -10339,21 +10445,14 @@ class ChatSession:
                 mcp.add_prompt_listener(self._mcp_prompt_cb, user_id=new_listener_uid)
             self._mcp_listener_user_id = new_listener_uid
         try_prime_user_pools(mcp, new_listener_uid, context="acting-user-change")
-        # Rebuild the merged tool list and resource/prompt-dependent
-        # state under the new identity NOW — the prime above completes
+        # Rebuild the merged tool list under the new identity now — the prime above completes
         # asynchronously and only notifies on catalog changes, while
         # already-warm pool entries for this user produce no
-        # notification at all.  ONE _init_system_messages() covers both
-        # the resource and prompt catalogs: the _on_mcp_resources_changed
-        # / _on_mcp_prompts_changed wrappers are pure passthroughs to it
-        # (they exist for the manager's separate notification channels,
-        # which still fire them independently), and it rebuilds the full
-        # system message copy-on-write — calling it twice per handoff was
-        # a redundant list_prompt_policies() read + compose per rebind.
+        # notification at all.  The next provider boundary rebuilds the
+        # actor-sensitive prefix after the new user turn has been appended.
         # The persona-catalog read inside the tools rebuild stays as-is:
         # sender-independent but handoff-frequency, not worth memoizing.
         self._on_mcp_tools_changed()
-        self._init_system_messages()
 
     def _initialize_send_generation(
         self,
@@ -12533,6 +12632,11 @@ class ChatSession:
         ``_api_call`` documents the equivalent 2-way stack); every layer
         stops immediately on a non-retryable class.
         """
+        principal_id = self._generation_principals.get(my_generation)
+        self._ensure_system_prefix_fresh(
+            principal_id=principal_id,
+            origin_generation=my_generation,
+        )
         attempt = 0
         # The latest non-empty dead attempt's flushed text.  Wrapper-LOCAL
         # (read off the frame's consumer, never a session slot), so an
@@ -12547,8 +12651,6 @@ class ChatSession:
         # attempt's lane.
         dead_provenance: TurnProvenance | None = None
         consumer = _StreamTurnConsumer(self, my_generation)
-        principal_id = self._generation_principals.get(my_generation)
-
         debug_printed = False
 
         def _prepare(lowered: list[dict[str, Any]], lane: ModelLane) -> list[dict[str, Any]]:
@@ -13854,6 +13956,9 @@ class ChatSession:
         """
         if not rows or budget <= 0:
             return ""
+        complete = heading + "".join(rows)
+        if len(complete) <= budget:
+            return complete
         kept: list[str] = []
         used = len(heading)
         for i, row in enumerate(rows):
@@ -16606,62 +16711,51 @@ class ChatSession:
                 allow_cancelled=True,
             )
 
+        execution_principal = (
+            (self._mcp_effective_user_id or "") if principal_id is None else principal_id
+        ).strip()
+        prepare_principal_token = _active_tool_prepare_principal.set(execution_principal)
         try:
             items = [self._safe_prepare_tool(tc) for tc in tool_calls]
             self._check_cancelled(my_generation)
         except GenerationCancelled:
             _stage_unstarted_tool_calls()
             raise
-        execution_principal = (
-            (self._mcp_effective_user_id or "") if principal_id is None else principal_id
-        ).strip()
+        finally:
+            _active_tool_prepare_principal.reset(prepare_principal_token)
         for item in items:
             item["_principal_id"] = execution_principal
             item["_approval_cancel_witness"] = approval_cancel_witness
 
-        # Reject the read+write mix on ``tasks`` within a single
-        # parallel batch.  ``tasks`` mutates an ordered planning
-        # list and supports a ``list`` read; a batch like
-        # ``[tasks(add=...), tasks(list)]`` has unspecified
-        # ordering inside ``_execute_tools.run_one``'s
-        # ThreadPoolExecutor — the read can land before or after
-        # the write and produce inconsistent state to the model.
-        #
-        # All-write and all-read batches are SAFE:
-        #   - Writes serialise under the per-ws lock in
-        #     ``CoordinatorClient.tasks_*``, AND a batch containing
-        #     any ``tasks`` write runs serially in input order (see
-        #     the run-loop branch below) so the final task list
-        #     ordering matches what the model emitted, not the
-        #     scheduler's acquisition order.
-        #   - Reads can't race against anything.
-        #
-        # The rule below only fires on the MIX, so the natural
-        # batch shapes ("add four tasks at once", "list nodes +
-        # list skills + tasks(list) for a planning snapshot") are
-        # both permitted; only the genuinely-broken shape gets
-        # rejected.  Non-tasks siblings paralleled with tasks()
-        # are unaffected — they don't touch the tasks state.
+        # Apply action-dependent consistency rules declared by each preparer.
+        # The executor deliberately knows nothing about tool names: a future
+        # stateful tool opts into the same read/write and serialization policy
+        # by attaching ``_batch_policy`` to its prepared item.
         if len(items) > 1:
-            tasks_items = [
-                it
-                for it in items
-                if it.get("func_name") == "tasks" and not it.get("error") and not it.get("denied")
-            ]
-            if tasks_items:
-                has_read = any(it.get("action") in _TASKS_READ_ACTIONS for it in tasks_items)
-                has_write = any(it.get("action") in _TASKS_WRITE_ACTIONS for it in tasks_items)
-                if has_read and has_write:
-                    for it in tasks_items:
-                        it["error"] = (
-                            "Error: tasks(...) read (`list`) and write "
-                            "(`add` / `update` / `remove` / `reorder`) actions "
-                            "cannot run in the same parallel tool batch — the "
-                            "read-after-write ordering is not guaranteed. "
-                            "All-reads or all-writes are fine; mix only by "
-                            "splitting them across separate assistant turns."
-                        )
-                        it["needs_approval"] = False
+            policy_groups: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+            for item in items:
+                policy = item.get("_batch_policy")
+                if item.get("error") or item.get("denied") or not isinstance(policy, dict):
+                    continue
+                group = str(policy.get("group") or "")
+                access = str(policy.get("access") or "")
+                if group and access in {"read", "write"}:
+                    policy_groups.setdefault(group, []).append((item, policy))
+            for grouped_items in policy_groups.values():
+                accesses = {str(policy["access"]) for _item, policy in grouped_items}
+                if accesses != {"read", "write"}:
+                    continue
+                error = next(
+                    (
+                        str(policy.get("mixed_access_error") or "")
+                        for _item, policy in grouped_items
+                        if policy.get("mixed_access_error")
+                    ),
+                    "Error: read and write actions cannot run in the same tool batch.",
+                )
+                for item, _policy in grouped_items:
+                    item["error"] = error
+                    item["needs_approval"] = False
 
         # Intent validation (advisory, non-blocking).  Detach the prior main
         # generation under the same lifecycle lock used by callback delivery
@@ -16874,7 +16968,7 @@ class ChatSession:
                         raise GenerationCancelled()
                     started_call_ids.add(str(item.get("call_id") or ""))
                 execute_item = item
-                if item.get("func_name") in {"task_agent", "web_fetch"}:
+                if item.get("_needs_origin_context"):
                     # Synchronization objects are execution-only state.  Keep
                     # them out of the prepared item that crosses the intent
                     # judge, approval UI, and any serialization boundary.
@@ -16883,6 +16977,11 @@ class ChatSession:
                         "_origin_cancel_event": execution_cancel_event,
                         "_origin_generation": my_generation,
                     }
+                if item.get("_requires_fresh_system_prefix"):
+                    self._ensure_system_prefix_fresh(
+                        principal_id=str(item.get("_principal_id") or "").strip(),
+                        origin_generation=my_generation,
+                    )
                 result: tuple[str, str | list[dict[str, Any]]] = item["execute"](execute_item)
                 return result
             except (KeyboardInterrupt, GenerationCancelled):
@@ -16930,22 +17029,16 @@ class ChatSession:
             if len(items) == 1:
                 results = [run_one(items[0])]
             else:
-                # When the batch contains any ``tasks`` write, run every
-                # item serially in input order.  ``tasks_add`` appends
-                # under a per-ws lock; a parallel ThreadPoolExecutor's
-                # scheduler-dependent acquisition order would otherwise
-                # produce a final task list whose ordering varies
-                # run-to-run, even though the SET of tasks is consistent.
-                # The model emitted the writes in a particular order;
-                # respecting that is the deterministic shape both
-                # operators and the model expect.  Other batches stay
-                # parallel — the perf payoff is real and there's no
-                # ordering hazard against state outside ``tasks``.
-                has_tasks_write = any(
-                    it.get("func_name") == "tasks" and it.get("action") in _TASKS_WRITE_ACTIONS
-                    for it in items
+                # A preparer can require model-order execution for a write whose
+                # observable result depends on sibling ordering. Serialize the
+                # whole batch so unrelated siblings cannot interleave between
+                # those writes; ordinary batches retain parallel execution.
+                serialize_batch = any(
+                    isinstance(policy := item.get("_batch_policy"), dict)
+                    and bool(policy.get("serialize"))
+                    for item in items
                 )
-                if has_tasks_write:
+                if serialize_batch:
                     results = [run_one(it) for it in items]
                 else:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -17021,6 +17114,12 @@ class ChatSession:
             }
 
     def _prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
+        """Prepare one tool call and stamp its immutable acting principal."""
+        item = self._prepare_tool_item(tc)
+        item["_principal_id"] = self._tool_prepare_principal_id()
+        return item
+
+    def _prepare_tool_item(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Parse a tool call and prepare preview info for display."""
         call_id = tc["id"]
         func_name = tc["function"]["name"].strip()
@@ -17174,13 +17273,14 @@ class ChatSession:
         }
         preparer = preparers.get(func_name)
         if not preparer:
+            prepare_user_id = self._tool_prepare_principal_id() or None
             # Check if this is an MCP tool. Pass the effective ``user_id``
             # (acting user on shared workstreams) so per-user pool tools
             # become reachable here — without this kwarg the gate stays
             # static-only and pool dispatch is structurally unreachable
             # from ``ChatSession._prepare_tool`` (RFC §3, invariant 8).
             if self._mcp_client and self._mcp_client.is_mcp_tool(
-                func_name, user_id=self._mcp_effective_user_id
+                func_name, user_id=prepare_user_id
             ):
                 return self._prepare_mcp_tool(call_id, func_name, args)
             self.ui.on_error(f"Model called unknown tool: {func_name!r}")
@@ -17189,7 +17289,7 @@ class ChatSession:
                 available.extend(
                     sorted(
                         t["function"]["name"]
-                        for t in self._mcp_client.get_tools(user_id=self._mcp_effective_user_id)
+                        for t in self._mcp_client.get_tools(user_id=prepare_user_id)
                     )
                 )
             return {
@@ -17872,6 +17972,7 @@ class ChatSession:
             "url": url,
             "question": question,
             "allow_private_origin": private_origin,
+            "_needs_origin_context": True,
         }
 
     def _prepare_open_preview(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -18283,192 +18384,173 @@ class ChatSession:
             "persona_tools": persona_tools,
             "persona_mcp": persona_mcp,
             "persona_memory": persona_memory,
+            "_needs_origin_context": True,
+            "_requires_fresh_system_prefix": True,
         }
 
-    def _resolve_scope_id(self, scope: str) -> str:
-        """Map a scope name to its scope_id.
+    def _memory_principal_id(self, principal_id: str | None = None) -> str:
+        """Resolve the actor for memory authorization."""
+        if principal_id is not None:
+            return principal_id.strip()
+        return (self._acting_user_id or self._user_id or "").strip()
 
-        ``coordinator`` is COORDINATOR-only \u2014 the coord can save and
-        read memories in its own private namespace, but its child
-        interactive workstreams cannot see or write the row.  This
-        closes the cross-session prompt-injection lane that an
-        adversarially-steered child would otherwise have through the
-        coord's system message: the coord's children consume external
-        content (MCP tool output, attachments) which can be steered to
-        plant instructions, and the new scope must not become a
-        delivery channel back into the parent's prompt.
+    def _memory_access(self, principal_id: str | None = None) -> _MemoryAccess:
+        """Resolve live project access for one immutable acting principal."""
+        actor = self._memory_principal_id(principal_id)
+        attached = self._memory_attached_project_id
+        project_id = ""
+        project_name = ""
+        project_writable = False
+        if actor and attached:
+            from turnstone.core.auth import resolve_project_access
 
-        The containment gate is the session KIND (children are always
-        INTERACTIVE \u2014 :meth:`_validate_scope` rejects them before this
-        resolver runs), not secrecy of the scope_id value.  That is
-        what lets the coord scope key on the durable ``user_id``
-        (shared with children, visible cluster-wide as display
-        metadata) without widening the write surface: no lane \u2014 memory
-        tool or REST (``_VALID_MEMORY_SCOPES`` in ``server.py`` omits
-        ``coordinator``) \u2014 accepts a caller-supplied coordinator
-        scope_id.
-        """
+            project_access = resolve_project_access(actor, attached)
+            if project_access.can_read and project_access.state == "active":
+                project_id = attached
+                project_name = project_access.name
+                project_writable = project_access.can_write
+        return _MemoryAccess(
+            principal_id=actor,
+            attached_project_id=attached,
+            project_id=project_id,
+            project_name=project_name,
+            project_writable=project_writable,
+        )
+
+    def _resolve_scope_id(self, scope: str, access: _MemoryAccess | None = None) -> str:
+        """Map a validated scope to the actor-specific storage key."""
+        resolved = access or self._memory_access()
         if scope == "workstream":
             return self._ws_id
         if scope == "user":
-            return self._user_id
+            return resolved.principal_id
         if scope == "coordinator":
-            return self._coordinator_scope_id()
+            return self._coordinator_scope_id(resolved)
         if scope == "project":
-            return self._project_id
+            return resolved.project_id
         return ""
 
-    def _coordinator_scope_id(self) -> str:
-        """Return the user_id anchoring the ``coordinator`` memory scope, or ``""``.
+    def _coordinator_scope_id(self, access: _MemoryAccess | None = None) -> str:
+        """Return this coordinator actor's private memory namespace."""
+        if self._kind != WorkstreamKind.COORDINATOR:
+            return ""
+        return (access or self._memory_access()).principal_id
 
-        Only a coordinator session has a coord scope \u2014 returns
-        ``self._user_id`` for ``kind == COORDINATOR``, ``""`` otherwise.
-        Keying on the user (not the ws_id) makes the namespace durable:
-        every coordinator session the same user runs shares one
-        orchestration memory, so notes survive close/reopen.  Children
-        of a coord get an empty scope_id, which :meth:`_validate_scope`
-        translates into an explicit reject \u2014 children must use
-        ``workstream`` or ``user`` scope for their own memories.
+    @staticmethod
+    def _memory_prepare_error(call_id: str, header: str, error: str) -> dict[str, Any]:
+        return {
+            "call_id": call_id,
+            "func_name": "memory",
+            "header": header,
+            "preview": "",
+            "needs_approval": False,
+            "error": error,
+        }
 
-        ``""`` for an unauthenticated coordinator is unreachable in
-        practice (``__init__`` refuses to construct one) but kept
-        fail-closed: an empty scope_id never resolves to a readable or
-        writable namespace.
-
-        See :meth:`_resolve_scope_id`'s docstring for the security
-        rationale (cross-session prompt-injection containment).
-        """
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return self._user_id
-        return ""
-
-    def _validate_scope(self, scope: str, call_id: str) -> dict[str, Any] | None:
-        """Return an error dict if scope is invalid, None if OK.
-
-        Coord sessions are isolated to coord-scope: they reject every
-        other scope (``global`` / ``workstream`` / ``user``) so the
-        coord's memory namespace stays focused on orchestration and
-        doesn't accidentally mutate or read user-context rows.
-
-        Interactive sessions reject ``coordinator`` for the symmetric
-        reason \u2014 coord-scope rows belong to a per-user namespace read
-        only by that user's COORDINATOR sessions, and an IC writer
-        (children share the parent's user_id, so the kind check is the
-        gate) could otherwise be a cross-session prompt-injection lane
-        into the parent coord's system message.
-        """
-        if scope == "user" and not self._user_id:
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": "\u2717 memory: user scope requires authentication",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: 'user' scope requires authenticated user identity",
-            }
-        if scope == "project" and not self._project_id:
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": "✗ memory: not attached to an accessible project",
-                "preview": "",
-                "needs_approval": False,
-                "error": (
-                    "Error: 'project' scope requires this workstream to be "
-                    "attached to a project you can access."
-                ),
-            }
-        if (
-            scope == "coordinator"
-            and self._kind == WorkstreamKind.COORDINATOR
-            and not self._user_id
-        ):
-            # Backstop for the save lane: search/list reject empty
-            # scope_ids in _exec_memory, but save would otherwise write
-            # a ("coordinator", "") row shared by every unauthenticated
-            # session. Unreachable through real hosts (__init__ refuses
-            # COORDINATOR without a user_id); guards test doubles and
-            # future hosts. Kind-scoped so non-coordinator callers keep
-            # the clearer kind-mismatch error below regardless of their
-            # auth state.
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": "\u2717 memory: coordinator scope requires authentication",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: 'coordinator' scope requires authenticated user identity",
-            }
-        if self._kind == WorkstreamKind.COORDINATOR and scope not in (
-            "coordinator",
-            "project",
-        ):
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": f"\u2717 memory: scope '{scope}' unavailable to coordinator",
-                "preview": "",
-                "needs_approval": False,
-                "error": (
-                    f"Error: '{scope}' scope is not available to coordinator "
-                    "sessions. Coord sessions only see and write the "
-                    "'coordinator' scope \u2014 their orchestration namespace is "
-                    "isolated from the user's interactive memory. Use "
-                    "scope='coordinator' or omit scope (it defaults to "
-                    "'coordinator' for coord sessions)."
-                ),
-            }
-        if scope == "coordinator" and self._kind != WorkstreamKind.COORDINATOR:
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": "\u2717 memory: coordinator scope unavailable",
-                "preview": "",
-                "needs_approval": False,
-                "error": (
-                    "Error: 'coordinator' scope is only valid for coordinator "
-                    "sessions. This is an interactive workstream \u2014 use "
-                    "'workstream' or 'user' scope for context private to this "
-                    "session, or ask the parent coordinator to manage shared "
-                    "context on your behalf."
-                ),
-            }
+    def _validate_scope(
+        self,
+        scope: str,
+        call_id: str,
+        *,
+        access: _MemoryAccess | None = None,
+        write: bool = False,
+    ) -> dict[str, Any] | None:
+        """Validate one exact scope against kind, actor identity, and live ACL."""
+        resolved = access or self._memory_access()
+        allowed = (
+            {"coordinator", "project"}
+            if self._kind == WorkstreamKind.COORDINATOR
+            else {"global", "workstream", "user", "project"}
+        )
+        if scope not in allowed:
+            guidance = (
+                "Use coordinator, project, or omit scope to inherit the active target."
+                if self._kind == WorkstreamKind.COORDINATOR
+                else "Use global, workstream, user, or an accessible attached project."
+            )
+            return self._memory_prepare_error(
+                call_id,
+                f"✗ memory: scope '{scope}' unavailable",
+                f"Error: scope '{scope}' is unavailable to this workstream kind. {guidance}",
+            )
+        if scope in {"user", "coordinator"} and not resolved.principal_id:
+            return self._memory_prepare_error(
+                call_id,
+                f"✗ memory: {scope} scope requires authentication",
+                f"Error: '{scope}' scope requires an authenticated acting user",
+            )
+        if scope == "project":
+            if not resolved.attached_project_id:
+                reason = "this workstream is not attached to a project"
+            elif not resolved.project_id:
+                reason = "the acting user cannot access the active attached project"
+            elif write and not resolved.project_writable:
+                reason = "the acting user has read-only access to the attached project"
+            else:
+                reason = ""
+            if reason:
+                operation = "changed" if write else "read"
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory: project scope unavailable",
+                    f"Error: {reason}; project-scoped memory cannot be {operation}.",
+                )
         return None
 
-    def _default_memory_scope(self) -> str:
-        """Default ``scope`` for a memory(action='save') with no explicit scope.
-
-        An attached, WRITABLE project wins for both kinds: work done inside a
-        project lands in the project bucket by default instead of leaking into
-        the kind default (``global`` / ``coordinator``).  The model can still
-        target another scope explicitly (a genuine cross-project ``user`` fact,
-        say).  A read-only project session keeps the kind default — it can't
-        write the project anyway, so defaulting there would only hit the
-        write-gate.
-
-        Otherwise: coord sessions default to ``coordinator`` (the only scope
-        they can write); interactive sessions default to ``global``.
-        """
-        if self._project_id and self._project_writable:
+    def _inherited_memory_scope(self, access: _MemoryAccess | None = None) -> str:
+        """Return the single target inherited by unscoped save/get/delete."""
+        resolved = access or self._memory_access()
+        if resolved.attached_project_id:
             return "project"
         if self._kind == WorkstreamKind.COORDINATOR:
             return "coordinator"
         return "global"
 
-    def _implicit_scope_walk(self) -> tuple[str, ...]:
-        """Walk for memory(action='get'/'delete') with no explicit scope.
+    def _default_memory_scope(self) -> str:
+        """Compatibility name for the single inherited target."""
+        return self._inherited_memory_scope()
 
-        Coord sessions only walk ``coordinator`` \u2014 anything else would
-        search namespaces the coord can't write to.  Interactive sessions
-        keep the narrowest-first walk (workstream \u2192 user \u2192 global); a
-        ``coordinator`` step there would always resolve to empty
-        scope_id and be a wasted lookup.
-        """
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return ("coordinator",)
-        return _IMPLICIT_SCOPE_WALK
+    def _memory_scope_miss_hint(
+        self,
+        name: str,
+        scopes: list[tuple[str, str]],
+        *,
+        action: str,
+        access: _MemoryAccess | None = None,
+    ) -> str:
+        """Point a wrong-scope miss at visible same-name rows."""
+        resolved = access or self._memory_access()
+        attempted = set(scopes)
+        visible = self._visible_scopes(resolved)
+        matches = set(find_structured_memory_scopes(name, visible))
+        matching_scopes = [
+            scope
+            for scope, scope_id in visible
+            if (scope, scope_id) not in attempted and (scope, scope_id) in matches
+        ]
+        if not matching_scopes:
+            return ""
+        if len(matching_scopes) == 1:
+            scope = matching_scopes[0]
+            if action == "delete" and scope == "project" and not resolved.project_writable:
+                return (
+                    "\nHint: a memory with this name exists in scope='project', "
+                    "but your project access is read-only."
+                )
+            return (
+                f"\nHint: a memory with this name exists in scope='{scope}'; "
+                f"retry with scope='{scope}'."
+            )
+        rendered_scopes = ", ".join(f"'{scope}'" for scope in matching_scopes)
+        hint = (
+            "\nHint: memories with this name exist in visible scopes: "
+            f"{rendered_scopes}; retry with the intended scope explicitly."
+        )
+        if action == "delete" and "project" in matching_scopes and not resolved.project_writable:
+            hint += " Project scope is read-only."
+        return hint
 
-    def _visible_memory_count(self) -> int:
+    def _visible_memory_count(self, access: _MemoryAccess | None = None) -> int:
         """Count memories visible to this session.
 
         Coord sessions are isolated to their own coord-scope namespace —
@@ -18478,32 +18560,22 @@ class ChatSession:
         (same user, different workstream) into the coord's system
         message, which the coord shouldn't be reasoning over.
         """
-        if self._kind == WorkstreamKind.COORDINATOR:
-            scope_id = self._coordinator_scope_id()
-            n = 0
-            if scope_id:
-                n += count_structured_memories(scope="coordinator", scope_id=scope_id)
-            if self._project_id:
-                n += count_structured_memories(scope="project", scope_id=self._project_id)
-            return n
-        n = count_structured_memories(scope="global")
-        n += count_structured_memories(scope="workstream", scope_id=self._ws_id)
-        if self._user_id:
-            n += count_structured_memories(scope="user", scope_id=self._user_id)
-        if self._project_id:
-            n += count_structured_memories(scope="project", scope_id=self._project_id)
-        return n
+        return sum(
+            count_structured_memories(scope=scope, scope_id=scope_id)
+            for scope, scope_id in self._visible_scopes(access)
+        )
 
-    def _visible_scopes(self) -> list[tuple[str, str]]:
+    def _visible_scopes(self, access: _MemoryAccess | None = None) -> list[tuple[str, str]]:
         """Return the (scope, scope_id) pairs visible to this session.
 
         Coord sessions see their coord-scope; interactive sessions see global +
         their workstream + their user (when uid present).  Either kind also sees
-        its attached ``project`` scope when the session resolved read access to a
-        project at construction.  Drives the single-query visibility helpers.
+        its attached ``project`` scope when the acting principal currently has
+        read access. Drives the single-query visibility helpers.
         """
+        resolved = access or self._memory_access()
         if self._kind == WorkstreamKind.COORDINATOR:
-            scope_id = self._coordinator_scope_id()
+            scope_id = self._coordinator_scope_id(resolved)
             # Fail-closed on an empty scope_id (unreachable through real hosts —
             # __init__ refuses anonymous coordinators): the storage helpers treat
             # a falsy scope_id as "no scope_id filter" (that's how ``global``
@@ -18514,24 +18586,30 @@ class ChatSession:
                 coord_scopes.append(("coordinator", scope_id))
             # A coordinator attached to a project also recalls the shared project
             # bucket (read + write), alongside its isolated coordinator scope.
-            if self._project_id:
-                coord_scopes.append(("project", self._project_id))
+            if resolved.project_id:
+                coord_scopes.append(("project", resolved.project_id))
             return coord_scopes
         scopes: list[tuple[str, str]] = [("global", ""), ("workstream", self._ws_id)]
-        if self._user_id:
-            scopes.append(("user", self._user_id))
-        if self._project_id:
-            scopes.append(("project", self._project_id))
+        if resolved.principal_id:
+            scopes.append(("user", resolved.principal_id))
+        if resolved.project_id:
+            scopes.append(("project", resolved.project_id))
         return scopes
 
-    def _list_visible_memories(self, mem_type: str = "", limit: int = 50) -> list[dict[str, str]]:
+    def _list_visible_memories(
+        self,
+        mem_type: str = "",
+        limit: int = 50,
+        *,
+        access: _MemoryAccess | None = None,
+    ) -> list[dict[str, str]]:
         """List memories visible to this session with optional type filter.
 
         Single SQL round-trip — collapses the prior per-scope fan-out.
         See :meth:`_visible_memory_count` for the coord-isolation rule.
         """
         return list_visible_structured_memories(
-            self._visible_scopes(), mem_type=mem_type, limit=limit
+            self._visible_scopes(access), mem_type=mem_type, limit=limit
         )
 
     def _search_visible_memories(
@@ -18540,7 +18618,12 @@ class ChatSession:
         mem_type: str = "",
         limit: int = 20,
         *,
-        cache_updates: dict[tuple[str, str, int], list[dict[str, str]]] | None = None,
+        access: _MemoryAccess | None = None,
+        cache_updates: dict[
+            tuple[str, str, int, tuple[tuple[str, str], ...]],
+            list[dict[str, str]],
+        ]
+        | None = None,
     ) -> list[dict[str, str]]:
         """Search memories visible to this session (scope-filtered).
 
@@ -18550,7 +18633,8 @@ class ChatSession:
         Cache is cleared on each new user turn and after memory writes/deletes.
         See :meth:`_visible_memory_count` for the coord-isolation rule.
         """
-        cache_key = (query, mem_type, limit)
+        scopes = tuple(self._visible_scopes(access))
+        cache_key = (query, mem_type, limit, scopes)
         cached = self._mem_search_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -18559,7 +18643,7 @@ class ChatSession:
             if planned is not None:
                 return planned
         rows = search_visible_structured_memories(
-            query, self._visible_scopes(), mem_type=mem_type, limit=limit
+            query, list(scopes), mem_type=mem_type, limit=limit
         )
         if cache_updates is None:
             self._mem_search_cache[cache_key] = rows
@@ -18569,14 +18653,22 @@ class ChatSession:
 
     def _invalidate_memory_cache(self) -> None:
         """Drop the per-turn search cache; call on user-turn append + memory writes."""
-        self._mem_search_cache.clear()
-        self._touched_memory_keys.clear()
+        with self._system_prefix_lock:
+            self._mem_search_cache.clear()
+            self._touched_memory_keys.clear()
+            self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+            self._system_prefix_dirty = True
 
     def _select_memory_candidates(
         self,
         context: str,
         *,
-        cache_updates: dict[tuple[str, str, int], list[dict[str, str]]] | None = None,
+        access: _MemoryAccess | None = None,
+        cache_updates: dict[
+            tuple[str, str, int, tuple[tuple[str, str], ...]],
+            list[dict[str, str]],
+        ]
+        | None = None,
     ) -> tuple[list[dict[str, str]], str]:
         """Pick the candidate set fed into BM25 ranking.
 
@@ -18602,15 +18694,16 @@ class ChatSession:
         """
         fetch_limit = self._mem_cfg.fetch_limit
         if not context:
-            return self._list_visible_memories(limit=fetch_limit), "recency"
+            return self._list_visible_memories(limit=fetch_limit, access=access), "recency"
         search_hits = self._search_visible_memories(
             context,
             limit=fetch_limit,
+            access=access,
             cache_updates=cache_updates,
         )
         if len(search_hits) >= fetch_limit:
             return search_hits, "search"
-        recency = self._list_visible_memories(limit=fetch_limit)
+        recency = self._list_visible_memories(limit=fetch_limit, access=access)
         seen = {m["memory_id"] for m in search_hits}
         extra = [m for m in recency if m["memory_id"] not in seen]
         if not search_hits:
@@ -21360,13 +21453,13 @@ class ChatSession:
         if self._coord_client is None:
             return self._coord_tool_error(call_id, "tasks", "coordinator client unavailable")
         action = self._coord_str_arg(args, "action").strip().lower()
-        if action not in {"add", "update", "remove", "reorder", "list"}:
+        if action not in _TASKS_READ_ACTIONS | _TASKS_WRITE_ACTIONS:
             return self._coord_tool_error(
                 call_id,
                 "tasks",
                 "action must be one of: add, update, remove, reorder, list",
             )
-        if action == "list":
+        if action in _TASKS_READ_ACTIONS:
             return {
                 "call_id": call_id,
                 "func_name": "tasks",
@@ -21375,6 +21468,11 @@ class ChatSession:
                 "needs_approval": False,
                 "execute": self._exec_tasks,
                 "action": "list",
+                "_batch_policy": _batch_policy(
+                    "tasks",
+                    "read",
+                    _TASKS_MIXED_BATCH_ERROR,
+                ),
             }
         # --- mutating actions -------------------------------------------------
         item: dict[str, Any] = {
@@ -21383,6 +21481,12 @@ class ChatSession:
             "needs_approval": True,
             "execute": self._exec_tasks,
             "action": action,
+            "_batch_policy": _batch_policy(
+                "tasks",
+                "write",
+                _TASKS_MIXED_BATCH_ERROR,
+                serialize=True,
+            ),
         }
 
         # Deferred import shared by every mutating branch below — ONE site,
@@ -21928,6 +22032,7 @@ class ChatSession:
     def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a memory tool action (save/get/search/delete/list)."""
         action = (args.get("action") or "").strip().lower()
+        access = self._memory_access(self._tool_prepare_principal_id() or None)
 
         if action == "save":
             name = (args.get("name") or args.get("key") or "").strip()
@@ -21942,6 +22047,12 @@ class ChatSession:
                     "needs_approval": False,
                     "error": "Error: 'name' is required for save",
                 }
+            if len(name) > 256:
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory save: name too long",
+                    "Error: memory name exceeds 256 characters",
+                )
             if not content:
                 return {
                     "call_id": call_id,
@@ -21960,43 +22071,34 @@ class ChatSession:
                     "needs_approval": False,
                     "error": f"Error: content exceeds {self._mem_cfg.max_content} character limit",
                 }
-            # None (field omitted) means "leave unset": the upsert keeps the
-            # stored value on update and defaults on insert; an explicit value
-            # (including "" / "general") overwrites.
-            description = args.get("description")
-            if description is not None:
-                description = str(description).strip()
+            description = str(args.get("description") or "").strip()
+            if not description:
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory save: missing description",
+                    "Error: 'description' must be non-empty for save",
+                )
             mem_type = args.get("type")
             if mem_type is not None:
                 mem_type = str(mem_type).strip().lower()
                 if mem_type not in ("user", "general", "feedback", "reference"):
-                    # An unrecognized type (e.g. a typo) is treated as unset
-                    # (preserve the stored type on update / default on insert)
-                    # rather than silently overwriting it with "general".
-                    mem_type = None
-            # Default scope is kind-aware: coord sessions default to
-            # ``coordinator`` (their only writable scope); IC sessions
-            # default to ``global`` (matches pre-fix behaviour).
-            default_scope = self._default_memory_scope()
-            scope = (args.get("scope") or default_scope).strip().lower()
+                    return self._memory_prepare_error(
+                        call_id,
+                        "✗ memory save: invalid type",
+                        f"Error: invalid memory type '{mem_type}'",
+                    )
+            default_scope = self._inherited_memory_scope(access)
+            scope = str(args.get("scope") or default_scope).strip().lower()
             if scope not in _VALID_MEMORY_SCOPES:
-                scope = default_scope
-            scope_err = self._validate_scope(scope, call_id)
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory save: invalid scope",
+                    f"Error: invalid scope '{scope}'. Valid: {', '.join(_VALID_MEMORY_SCOPES)}",
+                )
+            scope_err = self._validate_scope(scope, call_id, access=access, write=True)
             if scope_err:
                 return scope_err
-            if scope == "project" and not self._project_writable:
-                return {
-                    "call_id": call_id,
-                    "func_name": "memory",
-                    "header": "\u2717 memory save: project is read-only for you",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": (
-                        "Error: you have read-only access to this project; you "
-                        "cannot save project-scoped memory."
-                    ),
-                }
-            scope_id = self._resolve_scope_id(scope)
+            scope_id = self._resolve_scope_id(scope, access)
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -22011,6 +22113,12 @@ class ChatSession:
                 "mem_type": mem_type,
                 "scope": scope,
                 "scope_id": scope_id,
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "write",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                    serialize=True,
+                ),
             }
 
         if action == "get":
@@ -22024,6 +22132,12 @@ class ChatSession:
                     "needs_approval": False,
                     "error": "Error: 'name' is required for get",
                 }
+            if len(name) > 256:
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory get: name too long",
+                    "Error: memory name exceeds 256 characters",
+                )
             explicit_scope = (args.get("scope") or "").strip().lower()
             valid_scopes = _VALID_MEMORY_SCOPES
             if explicit_scope and explicit_scope not in valid_scopes:
@@ -22035,21 +22149,11 @@ class ChatSession:
                     "needs_approval": False,
                     "error": f"Error: invalid scope '{explicit_scope}'. Valid: {', '.join(valid_scopes)}",
                 }
-            if explicit_scope:
-                scope_err = self._validate_scope(explicit_scope, call_id)
-                if scope_err:
-                    return scope_err
-                scopes_to_try = [(explicit_scope, self._resolve_scope_id(explicit_scope))]
-            else:
-                # Implicit fallback walk \u2014 kind-aware narrowest-to-widest.
-                # Coord sessions only walk ``coordinator``; IC sessions
-                # walk workstream \u2192 user \u2192 global.  See
-                # :meth:`_implicit_scope_walk`.
-                scopes_to_try = []
-                for s in self._implicit_scope_walk():
-                    sid = self._resolve_scope_id(s)
-                    if sid or s == "global":
-                        scopes_to_try.append((s, sid))
+            scope = explicit_scope or self._inherited_memory_scope(access)
+            scope_err = self._validate_scope(scope, call_id, access=access)
+            if scope_err:
+                return scope_err
+            scopes_to_try = [(scope, self._resolve_scope_id(scope, access))]
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -22060,6 +22164,11 @@ class ChatSession:
                 "action": "get",
                 "name": name,
                 "scopes_to_try": scopes_to_try,
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "read",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                ),
             }
 
         if action == "delete":
@@ -22073,6 +22182,12 @@ class ChatSession:
                     "needs_approval": False,
                     "error": "Error: name is required for delete",
                 }
+            if len(name) > 256:
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory delete: name too long",
+                    "Error: memory name exceeds 256 characters",
+                )
             explicit_scope = (args.get("scope") or "").strip().lower()
             valid_scopes = _VALID_MEMORY_SCOPES
             if explicit_scope and explicit_scope not in valid_scopes:
@@ -22087,38 +22202,11 @@ class ChatSession:
                         f"Valid scopes: {', '.join(valid_scopes)}"
                     ),
                 }
-            if explicit_scope:
-                scope_err = self._validate_scope(explicit_scope, call_id)
-                if scope_err:
-                    return scope_err
-                # _validate_scope gates on READ access (_project_id); deleting a
-                # shared project row is a WRITE, so gate it on _project_writable
-                # too — mirrors the save path so a read-only member of a public
-                # project can't destroy project-scoped memory.  (The implicit
-                # walk below never includes project scope, so it needs no gate.)
-                if explicit_scope == "project" and not self._project_writable:
-                    return {
-                        "call_id": call_id,
-                        "func_name": "memory",
-                        "header": "✗ memory delete: project is read-only for you",
-                        "preview": "",
-                        "needs_approval": False,
-                        "error": (
-                            "Error: you have read-only access to this project; you "
-                            "cannot delete project-scoped memory."
-                        ),
-                    }
-                scope_id = self._resolve_scope_id(explicit_scope)
-                scopes_to_try = [(explicit_scope, scope_id)]
-            else:
-                # Kind-aware implicit walk — coord sessions stay in coord-scope;
-                # IC sessions walk narrowest-to-widest (workstream → user → global).
-                # See :meth:`_implicit_scope_walk`.
-                scopes_to_try = []
-                for s in self._implicit_scope_walk():
-                    sid = self._resolve_scope_id(s)
-                    if sid or s == "global":
-                        scopes_to_try.append((s, sid))
+            scope = explicit_scope or self._inherited_memory_scope(access)
+            scope_err = self._validate_scope(scope, call_id, access=access, write=True)
+            if scope_err:
+                return scope_err
+            scopes_to_try = [(scope, self._resolve_scope_id(scope, access))]
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -22129,27 +22217,43 @@ class ChatSession:
                 "action": "delete",
                 "name": name,
                 "scopes_to_try": scopes_to_try,
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "write",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                    serialize=True,
+                ),
             }
 
         if action == "search":
             query = (args.get("query") or "").strip()
             mem_type = (args.get("type") or "").strip().lower()
             if mem_type and mem_type not in ("user", "general", "feedback", "reference"):
-                mem_type = ""
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory search: invalid type",
+                    f"Error: invalid memory type '{mem_type}'",
+                )
             scope = (args.get("scope") or "").strip().lower()
             if scope and scope not in _VALID_MEMORY_SCOPES:
-                scope = ""
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory search: invalid scope",
+                    f"Error: invalid scope '{scope}'. Valid: {', '.join(_VALID_MEMORY_SCOPES)}",
+                )
             if scope:
-                scope_err = self._validate_scope(scope, call_id)
+                scope_err = self._validate_scope(scope, call_id, access=access)
                 if scope_err:
                     return scope_err
-            scope_id = self._resolve_scope_id(scope) if scope else ""
-            limit = args.get("limit", 20)
-            if isinstance(limit, str):
-                try:
-                    limit = int(limit)
-                except ValueError:
-                    limit = 20
+            scope_id = self._resolve_scope_id(scope, access) if scope else ""
+            try:
+                limit = int(args.get("limit", 20))
+            except (TypeError, ValueError):
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory search: invalid limit",
+                    "Error: limit must be an integer",
+                )
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -22163,26 +22267,41 @@ class ChatSession:
                 "scope": scope,
                 "scope_id": scope_id,
                 "limit": max(1, min(limit, 50)),
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "read",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                ),
             }
 
         if action == "list":
             mem_type = (args.get("type") or "").strip().lower()
             if mem_type and mem_type not in ("user", "general", "feedback", "reference"):
-                mem_type = ""
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory list: invalid type",
+                    f"Error: invalid memory type '{mem_type}'",
+                )
             scope = (args.get("scope") or "").strip().lower()
             if scope and scope not in _VALID_MEMORY_SCOPES:
-                scope = ""
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory list: invalid scope",
+                    f"Error: invalid scope '{scope}'. Valid: {', '.join(_VALID_MEMORY_SCOPES)}",
+                )
             if scope:
-                scope_err = self._validate_scope(scope, call_id)
+                scope_err = self._validate_scope(scope, call_id, access=access)
                 if scope_err:
                     return scope_err
-            scope_id = self._resolve_scope_id(scope) if scope else ""
-            limit = args.get("limit", 20)
-            if isinstance(limit, str):
-                try:
-                    limit = int(limit)
-                except ValueError:
-                    limit = 20
+            scope_id = self._resolve_scope_id(scope, access) if scope else ""
+            try:
+                limit = int(args.get("limit", 20))
+            except (TypeError, ValueError):
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory list: invalid limit",
+                    "Error: limit must be an integer",
+                )
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -22195,6 +22314,11 @@ class ChatSession:
                 "scope": scope,
                 "scope_id": scope_id,
                 "limit": max(1, min(limit, 50)),
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "read",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                ),
             }
 
         return {
@@ -22240,7 +22364,7 @@ class ChatSession:
             # the queue must search as the user whose turn requested it,
             # not whoever binds the session later (same discipline as
             # ``mcp_user_id`` in ``_prepare_mcp_tool``).
-            "scope_user_id": self._history_scope_user_id(),
+            "scope_user_id": self._tool_prepare_principal_id() or None,
         }
 
     # -- skill prepare/execute -------------------------------------------------
@@ -22274,7 +22398,7 @@ class ChatSession:
             # Pin the credential identity at prepare time: an item that
             # sits pending approval must execute under the user whose
             # turn requested it, not whoever binds the session later.
-            "mcp_user_id": self._mcp_effective_user_id,
+            "mcp_user_id": self._tool_prepare_principal_id() or None,
         }
 
     def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -24436,6 +24560,7 @@ class ChatSession:
         scope: str,
         scope_id: str,
         mem_type: str,
+        principal_id: str,
     ) -> None:
         """Emit an audit row for a mutating memory tool action.
 
@@ -24468,7 +24593,7 @@ class ChatSession:
             }
             record_audit(
                 get_storage(),
-                self._user_id,
+                principal_id,
                 action,
                 "memory",
                 memory_id,
@@ -24481,113 +24606,134 @@ class ChatSession:
         """Execute a memory tool action."""
         call_id = item["call_id"]
         action = item["action"]
+        # Real dispatch stamps every prepared tool item generically. Never
+        # substitute the mutable session actor here: an unstamped item must not
+        # acquire whichever principal happens to be bound at execution time.
+        principal_id = str(item.get("_principal_id") or "").strip()
 
         try:
             if action == "save":
-                row, was_update = save_structured_memory(
-                    item["name"],
-                    item["content"],
-                    description=item["description"],
-                    mem_type=item["mem_type"],
-                    scope=item["scope"],
-                    scope_id=item["scope_id"],
-                )
-                if not row:
-                    msg = f"Error: failed to save memory '{item['name']}'"
-                    self._report_tool_result(call_id, "memory", msg, is_error=True)
-                    return call_id, msg
-                # Invalidate the per-turn search cache so an in-turn
-                # memory(search)/(list) reflects this write.  Deliberately do NOT
-                # recompose the system prefix here: injected memories ride in the
-                # cached system block, so re-initing on every save/update busts
-                # the prompt cache (a full system + history re-write) — for a
-                # memory the model already holds via this tool result.  The write
-                # folds into the prefix at the next natural recompose
-                # (skill/model/MCP/resume/compaction) or the next session.
-                self._invalidate_memory_cache()
-                self._audit_memory_event(
-                    "memory.update" if was_update else "memory.save",
-                    row["memory_id"],
-                    name=row["name"],
-                    scope=row["scope"],
-                    scope_id=row["scope_id"],
-                    mem_type=row["type"],
-                )
+                with self._system_prefix_lock:
+                    access = self._memory_access(principal_id)
+                    scope = str(item["scope"])
+                    scope_err = self._validate_scope(
+                        scope,
+                        call_id,
+                        access=access,
+                        write=True,
+                    )
+                    if scope_err:
+                        msg = str(scope_err["error"])
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
+                    scope_id = self._resolve_scope_id(scope, access)
+                    row, was_update = save_structured_memory_strict(
+                        item["name"],
+                        item["content"],
+                        description=item["description"],
+                        mem_type=item["mem_type"],
+                        scope=scope,
+                        scope_id=scope_id,
+                        require_active_project=scope == "project",
+                    )
+                    self._invalidate_memory_cache()
+                    self._audit_memory_event(
+                        "memory.update" if was_update else "memory.save",
+                        row["memory_id"],
+                        name=row["name"],
+                        scope=row["scope"],
+                        scope_id=row["scope_id"],
+                        mem_type=row["type"],
+                        principal_id=principal_id,
+                    )
                 verb = "Updated" if was_update else "Saved"
                 msg = f"{verb} memory '{row['name']}' (type={row['type']}, scope={row['scope']})"
                 self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
             if action == "get":
-                scopes = item["scopes_to_try"]
-                mem = None
-                found_scope = ""
-                for scope, scope_id in scopes:
-                    mem = get_structured_memory_by_name(item["name"], scope, scope_id)
-                    if mem:
-                        found_scope = scope
-                        break
+                access = self._memory_access(principal_id)
+                scope = str(item["scopes_to_try"][0][0])
+                scope_err = self._validate_scope(scope, call_id, access=access)
+                if scope_err:
+                    msg = str(scope_err["error"])
+                    self._report_tool_result(call_id, "memory", msg, is_error=True)
+                    return call_id, msg
+                scope_id = self._resolve_scope_id(scope, access)
+                scopes = [(scope, scope_id)]
+                mem = get_structured_memory_by_name_strict(item["name"], scope, scope_id)
                 if mem:
                     self._touch_read_memories([mem])
                     content = mem.get("content", "")
                     desc = mem.get("description", "")
                     mem_type = mem.get("type", "")
-                    header = f"[{mem_type}:{found_scope}] {item['name']}"
+                    header = f"[{mem_type}:{scope}] {item['name']}"
                     if desc:
                         header += f" — {desc}"
                     msg = f"{header}\n\n{content}"
                 else:
-                    tried = ", ".join(s for s, _ in scopes)
-                    msg = f"Error: memory '{item['name']}' not found (searched scopes: {tried})"
+                    msg = f"Error: memory '{item['name']}' not found (scope={scope})"
+                    msg += self._memory_scope_miss_hint(
+                        item["name"], scopes, action="get", access=access
+                    )
                 self._report_tool_result(call_id, "memory", msg, is_error=mem is None)
                 return call_id, msg
 
             if action == "delete":
-                scopes = item["scopes_to_try"]
-                deleted: dict[str, str] | None = None
-                deleted_scope = ""
-                deleted_scope_id = ""
-                # Look up first so the audit row can record the deleted
-                # memory_id + type (delete-by-name returns only a bool).
-                # Falling back through the scope walk keeps the current
-                # narrowest-first IC semantics; coord sessions only see
-                # ``coordinator`` here.
-                for scope, scope_id in scopes:
-                    existing = get_structured_memory_by_name(item["name"], scope, scope_id)
-                    if existing and delete_structured_memory_by_id(existing["memory_id"]):
-                        deleted = existing
-                        deleted_scope = scope
-                        deleted_scope_id = scope_id
-                        break
-                if deleted is None:
-                    tried = ", ".join(s for s, _ in scopes)
-                    msg = f"Error: memory '{item['name']}' not found (searched scopes: {tried})"
-                    self._report_tool_result(call_id, "memory", msg, is_error=True)
-                else:
+                with self._system_prefix_lock:
+                    access = self._memory_access(principal_id)
+                    scope = str(item["scopes_to_try"][0][0])
+                    scope_err = self._validate_scope(
+                        scope,
+                        call_id,
+                        access=access,
+                        write=True,
+                    )
+                    scope_id = self._resolve_scope_id(scope, access)
+                    scopes = [(scope, scope_id)]
+                    if scope_err:
+                        msg = str(scope_err["error"])
+                        msg += self._memory_scope_miss_hint(
+                            item["name"], scopes, action="delete", access=access
+                        )
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
+                    deleted = delete_structured_memory_returning_strict(
+                        item["name"], scope, scope_id
+                    )
+                    if deleted is None:
+                        msg = f"Error: memory '{item['name']}' not found (scope={scope})"
+                        msg += self._memory_scope_miss_hint(
+                            item["name"], scopes, action="delete", access=access
+                        )
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
                     self._invalidate_memory_cache()
-                    self._init_system_messages()
                     self._audit_memory_event(
                         "memory.delete",
                         deleted["memory_id"],
                         name=item["name"],
-                        scope=deleted_scope,
-                        scope_id=deleted_scope_id,
+                        scope=scope,
+                        scope_id=scope_id,
                         mem_type=deleted.get("type", ""),
+                        principal_id=principal_id,
                     )
-                    msg = f"Deleted memory '{item['name']}' (scope={deleted_scope})"
-                    self._report_tool_result(call_id, "memory", msg)
+                    msg = f"Deleted memory '{item['name']}' (scope={scope})"
+                self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
             if action == "search":
+                access = self._memory_access(principal_id)
                 scope = item.get("scope", "")
-                scope_id = item.get("scope_id", "")
-                # Defense-in-depth: reject scoped queries with empty scope_id
-                if scope in ("user", "workstream", "coordinator") and not scope_id:
-                    msg = f"Error: '{scope}' scope requires a valid identity"
-                    self._report_tool_result(call_id, "memory", msg, is_error=True)
-                    return call_id, msg
+                storage = get_storage()
                 if scope:
-                    rows = search_structured_memories(
+                    scope_err = self._validate_scope(scope, call_id, access=access)
+                    if scope_err:
+                        msg = str(scope_err["error"])
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
+                    scope_id = self._resolve_scope_id(scope, access)
+                    rows = storage.search_structured_memories(
                         item["query"],
                         mem_type=item.get("mem_type", ""),
                         scope=scope,
@@ -24595,8 +24741,9 @@ class ChatSession:
                         limit=item["limit"],
                     )
                 else:
-                    rows = self._search_visible_memories(
+                    rows = storage.search_visible_structured_memories(
                         item["query"],
+                        self._visible_scopes(access),
                         mem_type=item.get("mem_type", ""),
                         limit=item["limit"],
                     )
@@ -24618,7 +24765,10 @@ class ChatSession:
                             f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n    {preview}"
                         )
                     msg = f"Memories ({len(rows)} results):\n" + "\n".join(lines)
-                    msg += "\n\nUse memory(action='get', name='...') for full content."
+                    msg += (
+                        "\n\nFor full content, call memory(action='get') with the "
+                        "displayed name and scope."
+                    )
                 else:
                     msg = (
                         f"No memories found for '{item['query']}'."
@@ -24629,21 +24779,25 @@ class ChatSession:
                 return call_id, msg
 
             if action == "list":
+                access = self._memory_access(principal_id)
                 scope = item.get("scope", "")
-                scope_id = item.get("scope_id", "")
-                if scope in ("user", "workstream", "coordinator") and not scope_id:
-                    msg = f"Error: '{scope}' scope requires a valid identity"
-                    self._report_tool_result(call_id, "memory", msg, is_error=True)
-                    return call_id, msg
+                storage = get_storage()
                 if scope:
-                    rows = list_structured_memories(
+                    scope_err = self._validate_scope(scope, call_id, access=access)
+                    if scope_err:
+                        msg = str(scope_err["error"])
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
+                    scope_id = self._resolve_scope_id(scope, access)
+                    rows = storage.list_structured_memories(
                         mem_type=item.get("mem_type", ""),
                         scope=scope,
                         scope_id=scope_id,
                         limit=item["limit"],
                     )
                 else:
-                    rows = self._list_visible_memories(
+                    rows = storage.list_visible_structured_memories(
+                        self._visible_scopes(access),
                         mem_type=item.get("mem_type", ""),
                         limit=item["limit"],
                     )
@@ -24658,14 +24812,23 @@ class ChatSession:
                             f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n    {preview}"
                         )
                     msg = f"Memories ({len(rows)}):\n" + "\n".join(lines)
-                    msg += "\n\nUse memory(action='get', name='...') for full content."
+                    msg += (
+                        "\n\nFor full content, call memory(action='get') with the "
+                        "displayed name and scope."
+                    )
                 else:
                     msg = "No memories stored."
                 self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
-        except Exception as e:
-            msg = f"Error: {e}"
+        except Exception:
+            log.warning(
+                "memory.tool_storage_failed",
+                action=action,
+                principal_id=principal_id,
+                exc_info=True,
+            )
+            msg = "Error: memory storage operation failed; retry after storage recovers."
             self._report_tool_result(call_id, "memory", msg, is_error=True)
             return call_id, msg
 

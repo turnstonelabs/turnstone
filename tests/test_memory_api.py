@@ -121,13 +121,27 @@ def _seed_memory(storage, name="test_key", content="test content", **kw):
     storage.create_structured_memory(
         mid,
         name,
-        kw.get("description", ""),
+        kw.get("description", "Seeded memory"),
         kw.get("mem_type", "general"),
         kw.get("scope", "global"),
         kw.get("scope_id", ""),
         content,
     )
     return mid
+
+
+def _seed_workstream(storage, ws_id: str = "ws1", user_id: str = "test-user") -> None:
+    storage.register_workstream(ws_id, user_id=user_id)
+
+
+def _save_body(name: str, content: str, **overrides: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "name": name,
+        "content": content,
+        "description": f"Description for {name}",
+    }
+    body.update(overrides)
+    return body
 
 
 # ===========================================================================
@@ -158,6 +172,7 @@ class TestServerListMemories:
         assert r.json()["memories"][0]["name"] == "a"
 
     def test_filter_by_scope(self, server_client, storage):
+        _seed_workstream(storage)
         _seed_memory(storage, "a", "x", scope="global")
         _seed_memory(storage, "b", "y", scope="workstream", scope_id="ws1")
         r = server_client.get("/v1/api/memories?scope=workstream&scope_id=ws1")
@@ -174,12 +189,38 @@ class TestServerListMemories:
         r = server_client.get("/v1/api/memories?limit=abc")
         assert r.status_code == 400
 
+    def test_unscoped_list_is_caller_bound(self, server_client, storage):
+        _seed_memory(storage, "global_visible", "g")
+        _seed_memory(storage, "own_visible", "u", scope="user", scope_id="test-user")
+        _seed_memory(storage, "victim_user", "secret", scope="user", scope_id="victim")
+        _seed_memory(storage, "victim_coord", "secret", scope="coordinator", scope_id="victim")
+        _seed_memory(storage, "private_project", "secret", scope="project", scope_id="p1")
+
+        r = server_client.get("/v1/api/memories")
+
+        assert r.status_code == 200
+        assert {row["name"] for row in r.json()["memories"]} == {
+            "global_visible",
+            "own_visible",
+        }
+
+    def test_internal_scopes_are_rejected(self, server_client):
+        for scope in ("coordinator", "project", "bogus"):
+            r = server_client.get(f"/v1/api/memories?scope={scope}&scope_id=victim")
+            assert r.status_code == 400
+
+    def test_workstream_scope_is_owner_bound(self, server_client, storage):
+        _seed_workstream(storage, "victim-ws", "victim")
+        _seed_memory(storage, "secret", "x", scope="workstream", scope_id="victim-ws")
+        r = server_client.get("/v1/api/memories?scope=workstream&scope_id=victim-ws")
+        assert r.status_code == 403
+
 
 class TestServerSaveMemory:
     def test_create(self, server_client):
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "my_key", "content": "my content"},
+            json=_save_body("my_key", "my content"),
         )
         assert r.status_code == 201
         data = r.json()
@@ -191,21 +232,23 @@ class TestServerSaveMemory:
     def test_upsert(self, server_client):
         server_client.post(
             "/v1/api/memories",
-            json={"name": "key", "content": "v1"},
+            json=_save_body("key", "v1"),
         )
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "key", "content": "v2"},
+            json=_save_body("key", "v2", description="Updated key description"),
         )
         assert r.status_code == 200
         assert r.json()["content"] == "v2"
 
-    def test_with_type_and_scope(self, server_client):
+    def test_with_type_and_scope(self, server_client, storage):
+        _seed_workstream(storage)
         r = server_client.post(
             "/v1/api/memories",
             json={
                 "name": "feedback_key",
                 "content": "data",
+                "description": "Feedback memory",
                 "type": "feedback",
                 "scope": "workstream",
                 "scope_id": "ws1",
@@ -216,17 +259,30 @@ class TestServerSaveMemory:
         assert r.json()["scope"] == "workstream"
 
     def test_missing_name(self, server_client):
-        r = server_client.post("/v1/api/memories", json={"content": "data"})
+        r = server_client.post(
+            "/v1/api/memories", json={"content": "data", "description": "Missing name"}
+        )
         assert r.status_code == 400
 
     def test_missing_content(self, server_client):
-        r = server_client.post("/v1/api/memories", json={"name": "k"})
+        r = server_client.post(
+            "/v1/api/memories", json={"name": "k", "description": "Missing content"}
+        )
         assert r.status_code == 400
+
+    @pytest.mark.parametrize("description", [None, "", "   "])
+    def test_missing_or_empty_description(self, server_client, description):
+        r = server_client.post(
+            "/v1/api/memories",
+            json={"name": "k", "content": "c", "description": description},
+        )
+        assert r.status_code == 400
+        assert "description is required" in r.json()["error"]
 
     def test_invalid_type(self, server_client):
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "k", "content": "c", "type": "bogus"},
+            json=_save_body("k", "c", type="bogus"),
         )
         assert r.status_code == 400
         assert "invalid type" in r.json()["error"]
@@ -234,7 +290,7 @@ class TestServerSaveMemory:
     def test_invalid_scope(self, server_client):
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "k", "content": "c", "scope": "bogus"},
+            json=_save_body("k", "c", scope="bogus"),
         )
         assert r.status_code == 400
         assert "invalid scope" in r.json()["error"]
@@ -242,7 +298,7 @@ class TestServerSaveMemory:
     def test_content_too_large(self, server_client):
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "k", "content": "x" * 70000},
+            json=_save_body("k", "x" * 70000),
         )
         assert r.status_code == 400
         assert "limit" in r.json()["error"]
@@ -250,10 +306,24 @@ class TestServerSaveMemory:
     def test_name_normalisation(self, server_client):
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "My-Key Name", "content": "data"},
+            json=_save_body("My-Key Name", "data"),
         )
         assert r.status_code == 201
         assert r.json()["name"] == "my_key_name"
+
+    def test_create_and_update_are_audited(self, server_client, storage):
+        first = server_client.post(
+            "/v1/api/memories",
+            json=_save_body("audit_me", "v1"),
+        )
+        second = server_client.post(
+            "/v1/api/memories",
+            json=_save_body("audit_me", "v2", description="Updated audit memory"),
+        )
+        assert first.status_code == 201
+        assert second.status_code == 200
+        assert len(storage.list_audit_events(action="memory.save", user_id="test-user")) == 1
+        assert len(storage.list_audit_events(action="memory.update", user_id="test-user")) == 1
 
 
 class TestServerUserScopeSecurity:
@@ -261,7 +331,7 @@ class TestServerUserScopeSecurity:
         """User scope auto-resolves scope_id from authenticated user."""
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "priv", "content": "secret", "scope": "user"},
+            json=_save_body("priv", "secret", scope="user"),
         )
         assert r.status_code == 201
         assert r.json()["scope_id"] == "test-user"
@@ -270,7 +340,7 @@ class TestServerUserScopeSecurity:
         """Cannot access another user's memories via scope_id."""
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "x", "content": "y", "scope": "user", "scope_id": "other-user"},
+            json=_save_body("x", "y", scope="user", scope_id="other-user"),
         )
         assert r.status_code == 403
 
@@ -278,7 +348,7 @@ class TestServerUserScopeSecurity:
         """Passing own user_id as scope_id is allowed."""
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "x", "content": "y", "scope": "user", "scope_id": "test-user"},
+            json=_save_body("x", "y", scope="user", scope_id="test-user"),
         )
         assert r.status_code == 201
 
@@ -298,7 +368,7 @@ class TestServerScopeScopeIdValidation:
     def test_save_global_with_scope_id_rejected(self, server_client):
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "k", "content": "c", "scope": "global", "scope_id": "ws1"},
+            json=_save_body("k", "c", scope="global", scope_id="ws1"),
         )
         assert r.status_code == 400
         assert "scope_id" in r.json()["error"]
@@ -306,15 +376,16 @@ class TestServerScopeScopeIdValidation:
     def test_save_workstream_without_scope_id_rejected(self, server_client):
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "k", "content": "c", "scope": "workstream"},
+            json=_save_body("k", "c", scope="workstream"),
         )
         assert r.status_code == 400
         assert "scope_id is required" in r.json()["error"]
 
-    def test_save_workstream_with_scope_id_ok(self, server_client):
+    def test_save_workstream_with_scope_id_ok(self, server_client, storage):
+        _seed_workstream(storage)
         r = server_client.post(
             "/v1/api/memories",
-            json={"name": "k", "content": "c", "scope": "workstream", "scope_id": "ws1"},
+            json=_save_body("k", "c", scope="workstream", scope_id="ws1"),
         )
         assert r.status_code == 201
 
@@ -380,6 +451,21 @@ class TestServerSearchMemories:
         r = server_client.post("/v1/api/memories/search", json={})
         assert r.status_code == 400
 
+    def test_unscoped_search_is_caller_bound(self, server_client, storage):
+        _seed_memory(storage, "own", "needle", scope="user", scope_id="test-user")
+        _seed_memory(storage, "victim", "needle", scope="user", scope_id="victim")
+        _seed_memory(storage, "project", "needle", scope="project", scope_id="p1")
+        r = server_client.post("/v1/api/memories/search", json={"query": "needle"})
+        assert r.status_code == 200
+        assert {row["name"] for row in r.json()["memories"]} == {"own"}
+
+    def test_internal_scope_is_rejected(self, server_client):
+        r = server_client.post(
+            "/v1/api/memories/search",
+            json={"query": "x", "scope": "project", "scope_id": "p1"},
+        )
+        assert r.status_code == 400
+
 
 class TestServerDeleteMemory:
     def test_delete(self, server_client, storage):
@@ -393,6 +479,7 @@ class TestServerDeleteMemory:
         assert r.status_code == 404
 
     def test_delete_scoped(self, server_client, storage):
+        _seed_workstream(storage)
         _seed_memory(storage, "k", "data", scope="workstream", scope_id="ws1")
         # Wrong scope → not found
         r = server_client.delete("/v1/api/memories/k")
@@ -404,6 +491,14 @@ class TestServerDeleteMemory:
     def test_invalid_scope(self, server_client):
         r = server_client.delete("/v1/api/memories/k?scope=bogus")
         assert r.status_code == 400
+
+    def test_delete_is_audited(self, server_client, storage):
+        mid = _seed_memory(storage, "audited")
+        r = server_client.delete("/v1/api/memories/audited")
+        assert r.status_code == 200
+        events = storage.list_audit_events(action="memory.delete", user_id="test-user")
+        assert len(events) == 1
+        assert events[0]["resource_id"] == mid
 
 
 # ===========================================================================
@@ -491,6 +586,26 @@ class TestAdminDeleteMemory:
     def test_not_found(self, admin_client):
         r = admin_client.delete("/v1/api/admin/memories/nonexistent-id")
         assert r.status_code == 404
+
+    def test_no_audit_or_success_when_atomic_delete_misses(
+        self, admin_client, storage, monkeypatch
+    ):
+        mid = _seed_memory(storage, "still_here")
+        monkeypatch.setattr(storage, "delete_structured_memory_by_id_returning", lambda _mid: None)
+
+        r = admin_client.delete(f"/v1/api/admin/memories/{mid}")
+
+        assert r.status_code == 404
+        assert storage.get_structured_memory(mid) is not None
+        assert storage.list_audit_events(action="memory.delete") == []
+
+    def test_storage_failure_is_500(self, admin_client, storage, monkeypatch):
+        def _raise(_memory_id):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(storage, "delete_structured_memory_by_id_returning", _raise)
+        r = admin_client.delete("/v1/api/admin/memories/m1")
+        assert r.status_code == 500
 
 
 # ===========================================================================

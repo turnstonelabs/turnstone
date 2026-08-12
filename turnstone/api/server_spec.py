@@ -496,16 +496,17 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         "/v1/api/memories",
         "GET",
-        "List structured memories",
+        "List structured memories. Without a scope, returns global plus the authenticated user's memories; workstream scope is owner-bound.",
         response_model=ListMemoriesResponse,
         query_params=[
             QueryParam("type", "Filter by memory type"),
-            QueryParam("scope", "Filter by scope"),
+            QueryParam("scope", "Filter by public scope: global, workstream, or user"),
             QueryParam("scope_id", "Filter by scope identifier"),
             QueryParam(
                 "limit", "Max results (default 100, max 200)", schema_type="integer", default=100
             ),
         ],
+        error_codes=[400, 403, 404, 500],
         tags=["Memories"],
     ),
     EndpointSpec(
@@ -514,15 +515,16 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Save (upsert) a structured memory",
         request_model=SaveMemoryRequest,
         response_model=MemoryInfo,
-        error_codes=[400],
+        error_codes=[400, 403, 404, 500],
         tags=["Memories"],
     ),
     EndpointSpec(
         "/v1/api/memories/search",
         "POST",
-        "Search structured memories by query",
+        "Search structured memories by query. Without a scope, searches global plus the authenticated user's memories.",
         request_model=SearchMemoriesRequest,
         response_model=ListMemoriesResponse,
+        error_codes=[400, 403, 404, 500],
         tags=["Memories"],
     ),
     EndpointSpec(
@@ -534,7 +536,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             QueryParam("scope", "Scope (default: global)"),
             QueryParam("scope_id", "Scope identifier"),
         ],
-        error_codes=[404],
+        error_codes=[400, 403, 404, 500],
         tags=["Memories"],
     ),
     # --- Admin settings ---

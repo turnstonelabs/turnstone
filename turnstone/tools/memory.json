@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/general/feedback/reference) and a scope.",
+  "description": "Persistent memory across sessions. Actions: 'save' stores a memory and always requires a non-empty description, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/general/feedback/reference) and a scope. Save/get/delete inherit one target: an attached active project, otherwise the session-kind default. A read-only project permits get but makes inherited save/delete fail; they never fall back to another scope. Pass the displayed scope explicitly when following a search/list result from another scope.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,6 +11,7 @@
       },
       "name": {
         "type": "string",
+        "maxLength": 256,
         "description": "Memory identifier (required for 'save', 'get', and 'delete'). Short snake_case key."
       },
       "content": {
@@ -19,7 +20,8 @@
       },
       "description": {
         "type": "string",
-        "description": "Short description for relevance matching (recommended for 'save')."
+        "minLength": 1,
+        "description": "Required non-empty description for relevance matching on every 'save' (create or update)."
       },
       "type": {
         "type": "string",
@@ -29,7 +31,7 @@
       "scope": {
         "type": "string",
         "enum": ["global", "workstream", "user", "coordinator", "project"],
-        "description": "Memory scope. 'global' = shared across everything; 'workstream' = private to this workstream; 'user' = follows the user across workstreams; 'project' = the shared bucket of the project this session is attached to (available only when attached, writable only with project write access). Default: the attached project when you can write it, otherwise 'global'."
+        "description": "Memory scope. 'global' = shared across everything; 'workstream' = private to this workstream; 'user' = follows the acting user across workstreams; 'project' = the shared bucket of the active project this session is attached to. Save/get/delete without scope inherit exactly one target: project when attached, otherwise the session-kind default. A read-only project permits get but rejects save/delete without falling back. Search/list without scope use all visible scopes. A valid explicit scope selects exactly that scope."
       },
       "query": {
         "type": "string",
@@ -46,20 +48,20 @@
   "interactive": true,
   "kind_variants": {
     "interactive": {
-      "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/general/feedback/reference) and a scope: 'global' (shared everywhere), 'workstream' (this workstream only), 'user' (follows you across workstreams), and 'project' (the shared bucket of an attached project). When this workstream is attached to a project you can write, new memories default to the project; otherwise to 'global'.",
+      "description": "Persistent memory across sessions. Actions: 'save' stores a memory and always requires a non-empty description, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/general/feedback/reference) and a scope: 'global' (shared everywhere), 'workstream' (this workstream only), 'user' (follows the acting user across workstreams), and 'project' (the shared bucket of an attached project). Unscoped save/get/delete target project when attached, otherwise global. A read-only project permits get but rejects save/delete without falling back. Pass the displayed scope explicitly when following a search/list result from another scope.",
       "parameter_overrides": {
         "scope": {
           "enum": ["global", "workstream", "user", "project"],
-          "description": "Memory scope. 'global' = shared across everything; 'workstream' = private to this workstream; 'user' = follows the user across workstreams; 'project' = the shared bucket of the project this workstream is attached to (available only when attached, and writable only with project write access). Default: the attached project when you can write it, otherwise 'global'."
+          "description": "Memory scope. 'global' = shared across everything; 'workstream' = private to this workstream; 'user' = follows the acting user across workstreams; 'project' = the shared bucket of the active project this workstream is attached to. Save/get/delete without scope target project when attached, otherwise global. A read-only project permits get but rejects save/delete without falling back. Search/list without scope use all visible scopes. A valid explicit scope selects exactly that scope."
         }
       }
     },
     "coordinator": {
-      "description": "Persistent orchestration memory shared by all of your user's coordinator sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/general/feedback/reference). Coordinator memories survive across coordinator sessions — save orchestration knowledge worth keeping (recurring procedures, environment facts, lessons from past runs). They are NOT visible to child workstreams.",
+      "description": "Persistent orchestration memory for the acting user. Actions: 'save' stores a memory and always requires a non-empty description, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Coordinator memories survive across that user's coordinator sessions and are NOT visible to child workstreams. Unscoped save/get/delete target project when attached, otherwise coordinator. A read-only project permits get but rejects save/delete without falling back. Pass the displayed scope explicitly when following a search/list result from another scope.",
       "parameter_overrides": {
         "scope": {
           "enum": ["coordinator", "project"],
-          "description": "'coordinator' = the per-user orchestration namespace, durable across coordinator sessions; 'project' = the shared bucket of the project this coordinator is attached to (available only when attached, writable only with project write access). Default: the attached project when you can write it, otherwise 'coordinator'."
+          "description": "'coordinator' = the acting user's private orchestration namespace, durable across their coordinator sessions; 'project' = the shared bucket of the active project this coordinator is attached to. Save/get/delete without scope target project when attached, otherwise coordinator. A read-only project permits get but rejects save/delete without falling back. Search/list without scope use all visible scopes. A valid explicit scope selects exactly that scope."
         }
       }
     }

@@ -256,6 +256,7 @@ class TestWorldSeeding:
             "memory": [
                 {
                     "name": "proj-context",
+                    "description": "Project deployment context",
                     "content": "acme-api: staging tracks main.",
                     "type": "reference",
                 }

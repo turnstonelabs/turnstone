@@ -2261,6 +2261,7 @@ def test_prepare_and_write_path_refuse_in_the_same_words(coord_session):
         item = sess._prepare_tool(_tc("tasks", args))
         assert "error" in item, args
         expected = sess._coord_tool_error("call-1", "tasks", f"{action}: {authoritative['error']}")
+        expected["_principal_id"] = sess._tool_prepare_principal_id()
         assert item == expected, (args, item["error"])
 
 

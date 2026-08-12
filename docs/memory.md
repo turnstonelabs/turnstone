@@ -20,7 +20,7 @@ Each memory has three dimensions:
 | Type        | Purpose                                                    |
 |-------------|------------------------------------------------------------|
 | `user`      | User preferences, conventions, working style               |
-| `project`   | Project-specific knowledge, architecture, patterns         |
+| `general`   | General knowledge, architecture, patterns                  |
 | `feedback`  | Corrections, lessons learned, things to avoid              |
 | `reference` | Reference material, documentation, specifications         |
 
@@ -31,25 +31,37 @@ Each memory has three dimensions:
 | `global`      | Visible to all workstreams and users                            |
 | `workstream`  | Visible only within the originating workstream                  |
 | `user`        | Follows the authenticated user across workstreams               |
-| `coordinator` | Coordinator sessions only; follows the user across coordinators |
+| `coordinator` | Coordinator sessions only; follows the acting user              |
+| `project`     | Shared by workstreams attached to one active project             |
 
 A memory's identity is the tuple `(name, scope, scope_id)`. Saving a memory
 with the same identity upserts -- updating content while preserving the ID.
 
-### Coordinator scope
+### Inherited target and coordinator scope
 
-Coordinator sessions are isolated to a single scope: `coordinator`, keyed by
-the coordinator's creator `user_id`. It is durable -- every coordinator
-session the same user runs (including concurrent ones) shares one
-orchestration namespace, so procedures and lessons survive close/reopen.
+Name-based operations use one inherited target when `scope` is omitted:
+
+- An attached active project selects `project` for `save`, `get`, and
+  `delete`.
+- Read-only project access permits `get`, but `save` and `delete` fail. They do
+  not fall back to a broader namespace.
+- Without a project, interactive sessions select `global`; coordinator
+  sessions select `coordinator`.
+
+A valid explicit scope selects exactly that scope. `search` and `list` are the
+only actions that span every visible scope when `scope` is omitted.
+
+Each coordinator's private `coordinator` namespace is keyed by the acting
+user's `user_id`. It is durable -- every coordinator session that user runs
+(including concurrent ones) shares one orchestration namespace, so procedures
+and lessons survive close/reopen.
 
 Isolation is bidirectional and enforced by session kind, not by secrecy of
 the scope id:
 
-- A coordinator session can read and write **only** `coordinator`-scope rows.
-  It never sees `global`/`workstream`/`user` memories, so content written by
-  interactive sessions (which routinely ingest untrusted MCP/attachment
-  output) cannot reach a coordinator's system message.
+- A coordinator session sees its acting user's `coordinator` scope and, when
+  attached, the shared `project` scope. It never sees
+  `global`/`workstream`/`user` memories.
 - Interactive sessions -- including a coordinator's own children, which share
   its `user_id` -- are rejected from the `coordinator` scope on every memory
   action. Children cannot plant rows the parent coordinator would read.
@@ -64,12 +76,13 @@ coordinator cannot be constructed, so the scope id is always a real user.
 
 On every conversation turn, the system:
 
-1. Fetches up to `fetch_limit` memories visible in the current scope
-2. Extracts context from the last 3 user messages
-3. Scores memories against that context using a BM25 index
-4. Injects the top `relevance_k` memories into the system message as
+1. Resolves the acting principal and their live project access
+2. Fetches up to `fetch_limit` memories across that visibility envelope
+3. Extracts context from the last 3 user messages
+4. Scores memories against that context using a BM25 index
+5. Injects the top `relevance_k` memories into the system message as
    `<memories>` XML tags
-5. Appends a hint telling the model how many memories are in scope
+6. Appends a hint telling the model how many memories are in scope
 
 This means the model always has its most relevant memories available without
 explicit recall -- but can still use `memory(action='search')` for deeper
@@ -107,11 +120,15 @@ All fields are optional. Defaults are shown above.
 
 ## Tool Usage
 
-The `memory` tool supports four actions:
+The `memory` tool supports five actions:
 
 ### save
 
 Store or update a memory.
+
+Every save is a complete write for the relevance summary: `description` must
+be supplied and contain non-whitespace text on both creation and update.
+Content-only updates are rejected.
 
 ```json
 {
@@ -119,7 +136,7 @@ Store or update a memory.
   "name": "project_architecture",
   "content": "The project uses a hexagonal architecture with...",
   "description": "Core architecture patterns",
-  "type": "project",
+  "type": "general",
   "scope": "global"
 }
 ```
@@ -128,9 +145,26 @@ Store or update a memory.
 |---------------|----------|-------------|------------------------------------------|
 | `name`        | yes      | --          | Snake_case identifier (max 256 chars)    |
 | `content`     | yes      | --          | Memory content (max `max_content` chars) |
-| `description` | no       | `""`        | Short description for relevance matching |
-| `type`        | no       | `"project"` | One of: user, project, feedback, reference |
-| `scope`       | no       | `"global"`  | One of: global, workstream, user         |
+| `description` | yes      | --          | Non-empty relevance summary, required on create and update |
+| `type`        | no       | `"general"` | One of: user, general, feedback, reference |
+| `scope`       | no       | inherited   | Kind-valid scope; see inherited target above |
+
+### get
+
+Retrieve the full content of one memory by name.
+
+```json
+{
+  "action": "get",
+  "name": "project_architecture",
+  "scope": "project"
+}
+```
+
+| Parameter | Required | Default   | Description                |
+|-----------|----------|-----------|----------------------------|
+| `name`    | yes      | --        | Memory name to retrieve    |
+| `scope`   | no       | inherited | Exact scope to query       |
 
 ### search
 
@@ -140,7 +174,7 @@ Find memories by query (BM25 full-text search).
 {
   "action": "search",
   "query": "authentication patterns",
-  "type": "project",
+  "type": "general",
   "limit": 10
 }
 ```
@@ -167,7 +201,7 @@ Remove a memory by name.
 | Parameter  | Required | Default    | Description              |
 |------------|----------|------------|--------------------------|
 | `name`     | yes      | --         | Memory name to delete    |
-| `scope`    | no       | `"global"` | Scope of the memory      |
+| `scope`    | no       | inherited | Exact scope to delete    |
 
 ### list
 
@@ -197,6 +231,12 @@ Four endpoints on the server for programmatic memory access.
 
 List memories with optional filters.
 
+Without `scope`, the response is restricted to `global` plus the authenticated
+caller's `user` namespace. The public API accepts only `global`, `user`, and
+`workstream`; internal `project` and `coordinator` namespaces remain available
+through the session tool and admin API. Explicit `workstream` access requires
+its persisted owner (or a service token).
+
 **Query parameters:**
 
 | Parameter  | Type   | Required | Default | Description                  |
@@ -204,10 +244,10 @@ List memories with optional filters.
 | `type`     | string | no       | `""`    | Filter by memory type        |
 | `scope`    | string | no       | `""`    | Filter by scope              |
 | `scope_id` | string | no       | `""`    | Filter by scope ID           |
-| `limit`    | int    | no       | `100`   | Max results (capped at 200)  |
+| `limit`    | int    | no       | `100`   | Max results (1-200)          |
 
-When `scope=user` and `scope_id` is omitted, the authenticated user's ID is
-used automatically.
+When `scope=user`, the authenticated user's ID is used automatically and a
+different supplied ID is rejected. `scope=workstream` requires `scope_id`.
 
 **Response:** `200`
 
@@ -218,7 +258,7 @@ used automatically.
       "memory_id": "a1b2c3d4-e5f6-...",
       "name": "project_architecture",
       "description": "Core architecture patterns",
-      "type": "project",
+      "type": "general",
       "scope": "global",
       "scope_id": "",
       "content": "The project uses a hexagonal architecture...",
@@ -236,6 +276,9 @@ used automatically.
 
 Save or upsert a structured memory.
 
+`description` is mandatory for both creates and updates and must contain
+non-whitespace text. The API rejects content-only updates.
+
 **Request body:**
 
 ```json
@@ -243,7 +286,7 @@ Save or upsert a structured memory.
   "name": "deployment_process",
   "content": "Deploy via GitHub Actions. Staging auto-deploys on push to main.",
   "description": "CI/CD deployment workflow",
-  "type": "project",
+  "type": "general",
   "scope": "global",
   "scope_id": ""
 }
@@ -253,8 +296,8 @@ Save or upsert a structured memory.
 |--------------|--------|----------|-------------|--------------------------------------|
 | `name`       | string | yes      | --          | Memory name (max 256 chars)          |
 | `content`    | string | yes      | --          | Memory content (max 65536 chars)     |
-| `description`| string | no       | `""`        | Short description for search ranking |
-| `type`       | string | no       | `"project"` | One of: user, project, feedback, reference |
+| `description`| string | yes      | --          | Non-empty relevance summary, required on create and update |
+| `type`       | string | no       | unset       | user, general, feedback, or reference |
 | `scope`      | string | no       | `"global"`  | One of: global, workstream, user     |
 | `scope_id`   | string | no       | `""`        | Scope qualifier (auto-resolved for user scope) |
 
@@ -265,7 +308,7 @@ Save or upsert a structured memory.
   "memory_id": "a1b2c3d4-e5f6-...",
   "name": "deployment_process",
   "description": "CI/CD deployment workflow",
-  "type": "project",
+  "type": "general",
   "scope": "global",
   "scope_id": "",
   "content": "Deploy via GitHub Actions...",
@@ -281,7 +324,10 @@ same `(name, scope, scope_id)` already existed.
 
 | Status | Condition                          |
 |--------|------------------------------------|
-| 400    | Missing name, empty content, invalid type/scope, content too long |
+| 400    | Invalid input, scope, scope ID, or limit |
+| 403    | Cross-user or non-owner workstream access |
+| 404    | Explicit workstream does not exist |
+| 500    | Storage mutation failed |
 
 ---
 
@@ -290,12 +336,15 @@ same `(name, scope, scope_id)` already existed.
 Search memories by query. Uses POST for the request body but is non-mutating
 (requires only `read` scope).
 
+An omitted scope searches the same caller-bound `global` + `user` envelope as
+the list endpoint. It never means every row in the table.
+
 **Request body:**
 
 ```json
 {
   "query": "authentication",
-  "type": "project",
+  "type": "general",
   "scope": "",
   "scope_id": "",
   "limit": 20
@@ -308,7 +357,7 @@ Search memories by query. Uses POST for the request body but is non-mutating
 | `type`     | string | no       | `""`    | Filter by type                 |
 | `scope`    | string | no       | `""`    | Filter by scope                |
 | `scope_id` | string | no       | `""`    | Filter by scope ID             |
-| `limit`    | int    | no       | `20`    | Max results (capped at 50)     |
+| `limit`    | int    | no       | `20`    | Max results (1-50)             |
 
 **Response:** `200`
 
@@ -319,7 +368,7 @@ Search memories by query. Uses POST for the request body but is non-mutating
       "memory_id": "a1b2c3d4-e5f6-...",
       "name": "auth_patterns",
       "description": "Authentication architecture",
-      "type": "project",
+      "type": "general",
       "scope": "global",
       "scope_id": "",
       "content": "JWT tokens with HS256...",
@@ -336,6 +385,9 @@ Search memories by query. Uses POST for the request body but is non-mutating
 ### `DELETE /v1/api/memories/{name}`
 
 Delete a memory by name and scope.
+
+Deletes are atomic: the row used for the success result and audit event is the
+row actually removed. A storage failure returns `500`, not a false `404`.
 
 **Path parameters:**
 
@@ -391,7 +443,7 @@ List memories across all scopes (no automatic scope resolution).
       "memory_id": "a1b2c3d4-e5f6-...",
       "name": "project_architecture",
       "description": "Core architecture patterns",
-      "type": "project",
+      "type": "general",
       "scope": "global",
       "scope_id": "",
       "content": "The project uses...",
@@ -440,7 +492,7 @@ Get a single memory by ID.
   "memory_id": "a1b2c3d4-e5f6-...",
   "name": "project_architecture",
   "description": "Core architecture patterns",
-  "type": "project",
+  "type": "general",
   "scope": "global",
   "scope_id": "",
   "content": "The project uses...",
@@ -497,13 +549,13 @@ with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
         "api_conventions",
         "All endpoints use /v1/ prefix. JSON responses.",
         description="API design patterns",
-        mem_type="project",
+        mem_type="general",
         scope="global",
     )
     print(mem.memory_id)
 
     # Search memories
-    results = client.search_memories("authentication", mem_type="project", limit=10)
+    results = client.search_memories("authentication", mem_type="general", limit=10)
     for m in results.memories:
         print(f"{m['name']}: {m['description']}")
 
@@ -524,7 +576,7 @@ with TurnstoneConsole("http://localhost:9090", token="tok_xxx") as admin:
     result = admin.list_memories(scope="global", limit=100)
 
     # Search
-    result = admin.search_memories("architecture", mem_type="project")
+    result = admin.search_memories("architecture", mem_type="general")
 
     # Get by ID
     mem = admin.get_memory("a1b2c3d4-e5f6-...")
@@ -548,14 +600,14 @@ const mem = await client.saveMemory({
   name: "api_conventions",
   content: "All endpoints use /v1/ prefix. JSON responses.",
   description: "API design patterns",
-  type: "project",
+  type: "general",
   scope: "global",
 });
 
 // Search memories
 const results = await client.searchMemories({
   query: "authentication",
-  type: "project",
+  type: "general",
   limit: 10,
 });
 

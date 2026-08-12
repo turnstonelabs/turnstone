@@ -2,6 +2,15 @@
 
 
 class TestCreateAndGet:
+    def test_create_requires_non_empty_description(self, backend):
+        import pytest
+
+        for description in (None, "", "   "):
+            with pytest.raises(ValueError, match="description is required"):
+                backend.create_structured_memory(
+                    "m1", "test_key", description, "general", "global", "", "data"
+                )
+
     def test_create_and_get_by_id(self, backend):
         backend.create_structured_memory("m1", "test_key", "desc", "general", "global", "", "data")
         mem = backend.get_structured_memory("m1")
@@ -43,34 +52,44 @@ class TestSaveUpsert:
         import pytest
         import sqlalchemy as sa
 
-        backend.create_structured_memory("m1", "dup", "", "general", "global", "", "a")
+        backend.create_structured_memory("m1", "dup", "Test memory", "general", "global", "", "a")
         with pytest.raises(sa.exc.IntegrityError):
-            backend.create_structured_memory("m2", "dup", "", "general", "global", "", "b")
+            backend.create_structured_memory(
+                "m2", "dup", "Test memory", "general", "global", "", "b"
+            )
 
     def test_save_same_key_updates_in_place(self, backend):
         from turnstone.core.memory import save_structured_memory
 
-        row1, was_update1 = save_structured_memory("upsert_key", "v1", scope="global")
+        row1, was_update1 = save_structured_memory(
+            "upsert_key", "v1", description="first description", scope="global"
+        )
         assert row1 and was_update1 is False  # inserted
 
-        row2, was_update2 = save_structured_memory("upsert_key", "v2", scope="global")
+        row2, was_update2 = save_structured_memory(
+            "upsert_key", "v2", description="updated description", scope="global"
+        )
         assert row2 and was_update2 is True  # updated in place
         assert row2["memory_id"] == row1["memory_id"]  # same row, not a duplicate
         assert row2["content"] == "v2"
         names = [r["name"] for r in backend.list_structured_memories(scope="global")]
         assert names.count("upsert_key") == 1
 
-    def test_save_same_key_preserves_description_and_type_on_default_resave(self, backend):
-        from turnstone.core.memory import save_structured_memory
+    def test_save_same_key_requires_and_updates_description(self, backend):
+        from turnstone.core.memory import save_structured_memory, save_structured_memory_strict
 
         save_structured_memory(
             "meta_key", "c1", description="orig desc", mem_type="fact", scope="global"
         )
-        # A re-save that omits description/type (defaults) must not clobber them.
-        save_structured_memory("meta_key", "c2", scope="global")
+        # Every update must describe the revised memory; type can still be omitted.
+        import pytest
+
+        with pytest.raises(ValueError, match="description is required"):
+            save_structured_memory_strict("meta_key", "c2", description=None, scope="global")
+        save_structured_memory("meta_key", "c2", description="revised description", scope="global")
         row = backend.get_structured_memory_by_name("meta_key", "global", "")
         assert row["content"] == "c2"
-        assert row["description"] == "orig desc"
+        assert row["description"] == "revised description"
         assert row["type"] == "fact"
 
     def test_upsert_method_updates_in_place_no_raise(self, backend):
@@ -89,19 +108,74 @@ class TestSaveUpsert:
         names = [r["name"] for r in backend.list_structured_memories(scope="global")]
         assert names.count("k") == 1
 
-    def test_upsert_none_preserves_explicit_overwrites(self, backend):
-        """None description/type keep the stored value on conflict; an explicit
-        value (including "" / "general") overwrites it."""
+    def test_upsert_requires_description_and_preserves_omitted_type(self, backend):
+        """Description is mandatory; an omitted type keeps the stored value."""
+        import pytest
+
         backend.create_structured_memory("m1", "k", "keepdesc", "fact", "global", "", "v1")
-        # None -> preserve stored description/type (a content-only save).
-        row, _ = backend.upsert_structured_memory("m2", "k", None, None, "global", "", "v2")
+        with pytest.raises(ValueError, match="description is required"):
+            backend.upsert_structured_memory("m2", "k", None, None, "global", "", "v2")
+        with pytest.raises(ValueError, match="description is required"):
+            backend.upsert_structured_memory("m2", "k", "   ", None, "global", "", "v2")
+
+        row, _ = backend.upsert_structured_memory(
+            "m2", "k", "new description", None, "global", "", "v2"
+        )
         assert row["content"] == "v2"
-        assert row["description"] == "keepdesc"
+        assert row["description"] == "new description"
         assert row["type"] == "fact"
-        # Explicit "" / "general" -> overwrite.
-        row2, _ = backend.upsert_structured_memory("m3", "k", "", "general", "global", "", "v3")
-        assert row2["description"] == ""
+        row2, _ = backend.upsert_structured_memory(
+            "m3", "k", "final description", "general", "global", "", "v3"
+        )
+        assert row2["description"] == "final description"
         assert row2["type"] == "general"
+
+    def test_active_project_guard_accepts_only_active_project(self, backend):
+        import pytest
+
+        backend.create_project("active", "Active", "u1")
+        row, was_update = backend.upsert_structured_memory(
+            "m1",
+            "guarded",
+            "guarded description",
+            None,
+            "project",
+            "active",
+            "value",
+            require_active_project=True,
+        )
+        assert row["scope_id"] == "active"
+        assert was_update is False
+
+        backend.create_project("archived", "Archived", "u1", state="archived")
+        for project_id in ("archived", "missing"):
+            with pytest.raises(ValueError, match="missing, archived"):
+                backend.upsert_structured_memory(
+                    f"m-{project_id}",
+                    "guarded",
+                    "guarded description",
+                    None,
+                    "project",
+                    project_id,
+                    "value",
+                    require_active_project=True,
+                )
+            assert backend.get_structured_memory_by_name("guarded", "project", project_id) is None
+
+    def test_active_project_guard_rejects_non_project_scope(self, backend):
+        import pytest
+
+        with pytest.raises(ValueError, match="requires project scope"):
+            backend.upsert_structured_memory(
+                "m1",
+                "guarded",
+                "guarded description",
+                None,
+                "global",
+                "",
+                "value",
+                require_active_project=True,
+            )
 
 
 class TestDelete:
@@ -118,63 +192,119 @@ class TestDelete:
         assert not backend.delete_structured_memory("k", "global", "")
         assert backend.delete_structured_memory("k", "workstream", "ws1")
 
+    def test_delete_returning_is_atomic_and_truthful(self, backend):
+        backend.create_structured_memory(
+            "m1", "k", "description", "reference", "user", "u1", "data"
+        )
+
+        deleted = backend.delete_structured_memory_returning("k", "user", "u1")
+
+        assert deleted is not None
+        assert deleted["memory_id"] == "m1"
+        assert deleted["description"] == "description"
+        assert deleted["type"] == "reference"
+        assert backend.get_structured_memory("m1") is None
+        assert backend.delete_structured_memory_returning("k", "user", "u1") is None
+
+    def test_delete_by_id_returning_is_atomic_and_truthful(self, backend):
+        backend.create_structured_memory("m1", "k", "Test memory", "general", "global", "", "data")
+
+        deleted = backend.delete_structured_memory_by_id_returning("m1")
+
+        assert deleted is not None
+        assert deleted["name"] == "k"
+        assert backend.get_structured_memory("m1") is None
+        assert backend.delete_structured_memory_by_id_returning("m1") is None
+
+
+class TestFindScopes:
+    def test_finds_only_requested_same_name_scopes(self, backend):
+        backend.create_structured_memory("m1", "same", "Test memory", "general", "global", "", "g")
+        backend.create_structured_memory(
+            "m2", "same", "Test memory", "general", "user", "u1", "own"
+        )
+        backend.create_structured_memory(
+            "m3", "same", "Test memory", "general", "user", "victim", "secret"
+        )
+        backend.create_structured_memory(
+            "m4", "other", "Test memory", "general", "workstream", "ws1", "other"
+        )
+
+        found = backend.find_structured_memory_scopes(
+            "same", [("global", ""), ("user", "u1"), ("workstream", "ws1")]
+        )
+
+        assert set(found) == {("global", ""), ("user", "u1")}
+
 
 class TestList:
     def test_list_all(self, backend):
-        backend.create_structured_memory("m1", "a", "", "general", "global", "", "1")
-        backend.create_structured_memory("m2", "b", "", "user", "global", "", "2")
+        backend.create_structured_memory("m1", "a", "Test memory", "general", "global", "", "1")
+        backend.create_structured_memory("m2", "b", "Test memory", "user", "global", "", "2")
         mems = backend.list_structured_memories()
         assert len(mems) == 2
 
     def test_list_by_type(self, backend):
-        backend.create_structured_memory("m1", "a", "", "general", "global", "", "1")
-        backend.create_structured_memory("m2", "b", "", "user", "global", "", "2")
+        backend.create_structured_memory("m1", "a", "Test memory", "general", "global", "", "1")
+        backend.create_structured_memory("m2", "b", "Test memory", "user", "global", "", "2")
         mems = backend.list_structured_memories(mem_type="user")
         assert len(mems) == 1
         assert mems[0]["name"] == "b"
 
     def test_list_by_scope(self, backend):
-        backend.create_structured_memory("m1", "a", "", "general", "global", "", "1")
-        backend.create_structured_memory("m2", "b", "", "general", "workstream", "ws1", "2")
+        backend.create_structured_memory("m1", "a", "Test memory", "general", "global", "", "1")
+        backend.create_structured_memory(
+            "m2", "b", "Test memory", "general", "workstream", "ws1", "2"
+        )
         mems = backend.list_structured_memories(scope="workstream")
         assert len(mems) == 1
 
     def test_list_respects_limit(self, backend):
         for i in range(10):
-            backend.create_structured_memory(f"m{i}", f"k{i}", "", "general", "global", "", f"{i}")
+            backend.create_structured_memory(
+                f"m{i}", f"k{i}", "Test memory", "general", "global", "", f"{i}"
+            )
         mems = backend.list_structured_memories(limit=3)
         assert len(mems) == 3
 
 
 class TestSearch:
     def test_search_by_name(self, backend):
-        backend.create_structured_memory("m1", "database_config", "", "general", "global", "", "pg")
-        backend.create_structured_memory("m2", "api_key", "", "general", "global", "", "secret")
+        backend.create_structured_memory(
+            "m1", "database_config", "Test memory", "general", "global", "", "pg"
+        )
+        backend.create_structured_memory(
+            "m2", "api_key", "Test memory", "general", "global", "", "secret"
+        )
         results = backend.search_structured_memories("database")
         assert len(results) == 1
         assert results[0]["name"] == "database_config"
 
     def test_search_by_content(self, backend):
-        backend.create_structured_memory("m1", "a", "", "general", "global", "", "postgresql host")
+        backend.create_structured_memory(
+            "m1", "a", "Test memory", "general", "global", "", "postgresql host"
+        )
         results = backend.search_structured_memories("postgresql")
         assert len(results) == 1
 
     def test_search_empty_lists_all(self, backend):
-        backend.create_structured_memory("m1", "a", "", "general", "global", "", "1")
-        backend.create_structured_memory("m2", "b", "", "general", "global", "", "2")
+        backend.create_structured_memory("m1", "a", "Test memory", "general", "global", "", "1")
+        backend.create_structured_memory("m2", "b", "Test memory", "general", "global", "", "2")
         results = backend.search_structured_memories("")
         assert len(results) == 2
 
 
 class TestCount:
     def test_count_all(self, backend):
-        backend.create_structured_memory("m1", "a", "", "general", "global", "", "1")
-        backend.create_structured_memory("m2", "b", "", "general", "global", "", "2")
+        backend.create_structured_memory("m1", "a", "Test memory", "general", "global", "", "1")
+        backend.create_structured_memory("m2", "b", "Test memory", "general", "global", "", "2")
         assert backend.count_structured_memories() == 2
 
     def test_count_by_scope(self, backend):
-        backend.create_structured_memory("m1", "a", "", "general", "global", "", "1")
-        backend.create_structured_memory("m2", "b", "", "general", "workstream", "ws1", "2")
+        backend.create_structured_memory("m1", "a", "Test memory", "general", "global", "", "1")
+        backend.create_structured_memory(
+            "m2", "b", "Test memory", "general", "workstream", "ws1", "2"
+        )
         assert backend.count_structured_memories(scope="global") == 1
         assert backend.count_structured_memories(scope="workstream") == 1
 
@@ -184,8 +314,12 @@ class TestSearchOrOfTerms:
 
     def test_single_matching_term_in_multi_word_query(self, backend):
         """Memory with content 'apple' found when query is 'apple banana cherry'."""
-        backend.create_structured_memory("m1", "apple_mem", "", "general", "global", "", "apple")
-        backend.create_structured_memory("m2", "other_mem", "", "general", "global", "", "grape")
+        backend.create_structured_memory(
+            "m1", "apple_mem", "Test memory", "general", "global", "", "apple"
+        )
+        backend.create_structured_memory(
+            "m2", "other_mem", "Test memory", "general", "global", "", "grape"
+        )
 
         results = backend.search_structured_memories("apple banana cherry")
         names = {r["name"] for r in results}
@@ -194,10 +328,18 @@ class TestSearchOrOfTerms:
 
     def test_partial_overlap_across_memories(self, backend):
         """Each memory matches one of three terms; all three are returned."""
-        backend.create_structured_memory("m1", "alpha_doc", "", "general", "global", "", "alpha")
-        backend.create_structured_memory("m2", "beta_doc", "", "general", "global", "", "beta")
-        backend.create_structured_memory("m3", "gamma_doc", "", "general", "global", "", "gamma")
-        backend.create_structured_memory("m4", "unrelated", "", "general", "global", "", "delta")
+        backend.create_structured_memory(
+            "m1", "alpha_doc", "Test memory", "general", "global", "", "alpha"
+        )
+        backend.create_structured_memory(
+            "m2", "beta_doc", "Test memory", "general", "global", "", "beta"
+        )
+        backend.create_structured_memory(
+            "m3", "gamma_doc", "Test memory", "general", "global", "", "gamma"
+        )
+        backend.create_structured_memory(
+            "m4", "unrelated", "Test memory", "general", "global", "", "delta"
+        )
 
         results = backend.search_structured_memories("alpha beta gamma")
         names = {r["name"] for r in results}
@@ -209,12 +351,14 @@ class TestSearchOrOfTerms:
     def test_scope_filter_preserved(self, backend):
         """OR-of-terms search still respects scope / scope_id filters."""
         backend.create_structured_memory(
-            "m1", "ws1_note", "", "general", "workstream", "ws1", "info"
+            "m1", "ws1_note", "Test memory", "general", "workstream", "ws1", "info"
         )
         backend.create_structured_memory(
-            "m2", "ws2_note", "", "general", "workstream", "ws2", "info"
+            "m2", "ws2_note", "Test memory", "general", "workstream", "ws2", "info"
         )
-        backend.create_structured_memory("m3", "global_note", "", "general", "global", "", "info")
+        backend.create_structured_memory(
+            "m3", "global_note", "Test memory", "general", "global", "", "info"
+        )
 
         results = backend.search_structured_memories("info", scope="workstream", scope_id="ws1")
         names = {r["name"] for r in results}
@@ -224,9 +368,11 @@ class TestSearchOrOfTerms:
 
     def test_term_cap_normalizes_unbounded_query(self, backend):
         """A multi-KB query collapses to <= MAX terms (de-dupe + length filter)."""
-        backend.create_structured_memory("m1", "alpha_doc", "", "general", "global", "", "alpha")
         backend.create_structured_memory(
-            "m2", "other_doc", "", "general", "global", "", "irrelevant"
+            "m1", "alpha_doc", "Test memory", "general", "global", "", "alpha"
+        )
+        backend.create_structured_memory(
+            "m2", "other_doc", "Test memory", "general", "global", "", "irrelevant"
         )
 
         # Build a noisy query: same word repeated, plus 1-char tokens that
@@ -241,10 +387,18 @@ class TestVisibleStructuredMemories:
     """Single-query union helpers used by the composition path."""
 
     def test_list_visible_unions_global_workstream_user(self, backend):
-        backend.create_structured_memory("m1", "g_note", "", "general", "global", "", "g")
-        backend.create_structured_memory("m2", "ws_note", "", "general", "workstream", "ws1", "w")
-        backend.create_structured_memory("m3", "u_note", "", "general", "user", "u1", "u")
-        backend.create_structured_memory("m4", "other_ws", "", "general", "workstream", "ws2", "x")
+        backend.create_structured_memory(
+            "m1", "g_note", "Test memory", "general", "global", "", "g"
+        )
+        backend.create_structured_memory(
+            "m2", "ws_note", "Test memory", "general", "workstream", "ws1", "w"
+        )
+        backend.create_structured_memory(
+            "m3", "u_note", "Test memory", "general", "user", "u1", "u"
+        )
+        backend.create_structured_memory(
+            "m4", "other_ws", "Test memory", "general", "workstream", "ws2", "x"
+        )
 
         scopes = [("global", ""), ("workstream", "ws1"), ("user", "u1")]
         rows = backend.list_visible_structured_memories(scopes)
@@ -252,12 +406,14 @@ class TestVisibleStructuredMemories:
         assert names == {"g_note", "ws_note", "u_note"}  # ws2 excluded
 
     def test_search_visible_unions_scopes_and_terms(self, backend):
-        backend.create_structured_memory("m1", "g_alpha", "", "general", "global", "", "alpha")
         backend.create_structured_memory(
-            "m2", "ws_beta", "", "general", "workstream", "ws1", "beta"
+            "m1", "g_alpha", "Test memory", "general", "global", "", "alpha"
         )
         backend.create_structured_memory(
-            "m3", "ws_other", "", "general", "workstream", "ws2", "alpha"
+            "m2", "ws_beta", "Test memory", "general", "workstream", "ws1", "beta"
+        )
+        backend.create_structured_memory(
+            "m3", "ws_other", "Test memory", "general", "workstream", "ws2", "alpha"
         )
 
         scopes = [("global", ""), ("workstream", "ws1")]
@@ -268,7 +424,9 @@ class TestVisibleStructuredMemories:
         assert "ws_other" not in names  # ws2 -> outside visibility
 
     def test_visible_helpers_handle_empty_scopes(self, backend):
-        backend.create_structured_memory("m1", "anything", "", "general", "global", "", "x")
+        backend.create_structured_memory(
+            "m1", "anything", "Test memory", "general", "global", "", "x"
+        )
         assert backend.list_visible_structured_memories([]) == []
         assert backend.search_visible_structured_memories("x", []) == []
 
@@ -288,7 +446,7 @@ class TestStableOrderingOnTimestampTies:
         # batch lands them in the same second.
         for mid in ("zebra_id", "apple_id", "mango_id"):
             backend.create_structured_memory(
-                mid, f"name_{mid}", "", "general", "global", "", "shared content"
+                mid, f"name_{mid}", "Test memory", "general", "global", "", "shared content"
             )
         import sqlalchemy as sa
 

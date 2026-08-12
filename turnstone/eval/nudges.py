@@ -259,9 +259,8 @@ def _tasks_action_enum() -> frozenset[str]:
 #
 # Neither half is a literal here.  The action VOCABULARY comes from the
 # tool's own schema (:func:`_tasks_action_enum`) and the READ half is
-# ``ChatSession._TASKS_READ_ACTIONS``, production's own classifier —
-# the one its parallel-batch guard and approval path rule on.  Mutating
-# is the remainder, so an action added to the schema counts as a
+# ``_TASKS_READ_ACTIONS``, production's own preparer classifier.
+# Mutating is the remainder, so an action added to the schema counts as a
 # mutation until production classifies it as a read: a new write can
 # never be silently dropped from the bookkeeping test, and the drift
 # that IS possible (a new read) is caught statically by
@@ -824,7 +823,7 @@ def _seed_world(storage: Any, case: dict[str, Any]) -> None:
         saved, _was_update = save_structured_memory(
             row["name"],
             row["content"],
-            row.get("description"),
+            row["description"],
             row.get("type"),
             scope=row.get("scope", "global"),
             scope_id=row.get("scope_id", ""),
@@ -1969,7 +1968,7 @@ def _check_world_is_seedable(case: dict[str, Any]) -> str | None:
     Recognized keys only (``memory`` / ``nodes``) — an unrecognized key
     is a silent no-op seed, which reads as "seeded" while leaving the
     hollow world the block exists to fill.  Memory rows need non-empty
-    string ``name`` and ``content`` (the production upsert's own
+    string ``name``, ``description``, and ``content`` (the production upsert's own
     requirements, surfaced at authoring time); node rows need a
     non-empty string ``node_id``.
     """
@@ -1984,7 +1983,7 @@ def _check_world_is_seedable(case: dict[str, Any]) -> str | None:
     for i, row in enumerate(world.get("memory", ())):
         if not isinstance(row, dict):
             return f"world.memory[{i}] must be a dict"
-        for field in ("name", "content"):
+        for field in ("name", "content", "description"):
             v = row.get(field)
             if not isinstance(v, str) or not v.strip():
                 return f"world.memory[{i}].{field} must be a non-empty string"

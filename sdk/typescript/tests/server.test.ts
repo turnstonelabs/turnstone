@@ -75,6 +75,43 @@ describe("TurnstoneServer", () => {
     });
   });
 
+  it("saveMemory requires and normalizes the description", async () => {
+    const fetchFn = mockFetch({
+      memory_id: "m1",
+      name: "deployment_process",
+      description: "Production deployment workflow",
+      type: "general",
+      scope: "global",
+      scope_id: "",
+      content: "Deploy from main",
+      created: "2026-08-11T00:00:00",
+      updated: "2026-08-11T00:00:00",
+    });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    await client.saveMemory({
+      name: "deployment_process",
+      content: "Deploy from main",
+      description: "  Production deployment workflow  ",
+    });
+    const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toMatchObject({
+      description: "Production deployment workflow",
+    });
+
+    await expect(
+      client.saveMemory({
+        name: "deployment_process",
+        content: "Deploy from main",
+        description: "   ",
+      }),
+    ).rejects.toThrow("description is required");
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
   it("send posts correct payload", async () => {
     const fetchFn = mockFetch({ status: "ok" });
     const client = new TurnstoneServer({

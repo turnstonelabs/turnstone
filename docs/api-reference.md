@@ -1758,16 +1758,19 @@ Status code: `403`
 
 ### `GET /v1/api/memories`
 
-List structured memories with optional filters. Requires `read` scope.
+List structured memories with optional filters. Requires `read` scope. Without
+`scope`, returns only `global` plus the authenticated caller's `user`
+namespace. The public endpoint accepts `global`, `workstream`, and `user`;
+explicit workstream access is owner-bound.
 
 **Query parameters:**
 
 | Parameter  | Type   | Required | Default | Description                  |
 |------------|--------|----------|---------|------------------------------|
-| `type`     | string | no       | `""`    | Filter by memory type (user, project, feedback, reference) |
+| `type`     | string | no       | `""`    | Filter by memory type (user, general, feedback, reference) |
 | `scope`    | string | no       | `""`    | Filter by scope (global, workstream, user) |
 | `scope_id` | string | no       | `""`    | Scope qualifier. Auto-resolved for `scope=user` when auth is active. |
-| `limit`    | int    | no       | `100`   | Max results (capped at 200)  |
+| `limit`    | int    | no       | `100`   | Max results (1-200)          |
 
 **Response:**
 
@@ -1778,7 +1781,7 @@ List structured memories with optional filters. Requires `read` scope.
       "memory_id": "a1b2c3d4-e5f6-...",
       "name": "project_architecture",
       "description": "Core architecture patterns",
-      "type": "project",
+      "type": "general",
       "scope": "global",
       "scope_id": "",
       "content": "The project uses a hexagonal architecture...",
@@ -1795,7 +1798,8 @@ List structured memories with optional filters. Requires `read` scope.
 ### `POST /v1/api/memories`
 
 Save or upsert a structured memory. Requires `write` scope. Returns `201` on
-create, `200` on update.
+create, `200` on update. Every write must include a non-empty, non-whitespace
+`description`; content-only updates are rejected.
 
 **Request body:**
 
@@ -1804,7 +1808,7 @@ create, `200` on update.
   "name": "deployment_process",
   "content": "Deploy via GitHub Actions. Staging auto-deploys on push to main.",
   "description": "CI/CD deployment workflow",
-  "type": "project",
+  "type": "general",
   "scope": "global",
   "scope_id": ""
 }
@@ -1814,8 +1818,8 @@ create, `200` on update.
 |--------------|--------|----------|-------------|--------------------------------------|
 | `name`       | string | yes      | --          | Memory name (max 256 chars)          |
 | `content`    | string | yes      | --          | Memory content (max 65536 chars)     |
-| `description`| string | no       | `""`        | Short description for search ranking |
-| `type`       | string | no       | `"project"` | One of: user, project, feedback, reference |
+| `description`| string | yes      | --          | Non-empty relevance summary, required on create and update |
+| `type`       | string | no       | unset       | user, general, feedback, or reference |
 | `scope`      | string | no       | `"global"`  | One of: global, workstream, user     |
 | `scope_id`   | string | no       | `""`        | Scope qualifier (auto-resolved for user scope) |
 
@@ -1826,7 +1830,7 @@ create, `200` on update.
   "memory_id": "a1b2c3d4-e5f6-...",
   "name": "deployment_process",
   "description": "CI/CD deployment workflow",
-  "type": "project",
+  "type": "general",
   "scope": "global",
   "scope_id": "",
   "content": "Deploy via GitHub Actions...",
@@ -1839,21 +1843,25 @@ create, `200` on update.
 
 | Status | Condition                                              |
 |--------|--------------------------------------------------------|
-| 400    | Missing name, empty content, invalid type/scope, name too long, content too long |
+| 400    | Invalid input, public scope, scope ID, or limit |
+| 403    | Cross-user or non-owner workstream access |
+| 404    | Explicit workstream does not exist |
+| 500    | Storage mutation failed |
 
 ---
 
 ### `POST /v1/api/memories/search`
 
 Search memories by query. Uses POST for the request body but is non-mutating
-(requires only `read` scope).
+(requires only `read` scope). An omitted scope searches only `global` plus the
+authenticated caller's `user` namespace.
 
 **Request body:**
 
 ```json
 {
   "query": "authentication",
-  "type": "project",
+  "type": "general",
   "scope": "",
   "limit": 20
 }
@@ -1865,7 +1873,7 @@ Search memories by query. Uses POST for the request body but is non-mutating
 | `type`     | string | no       | `""`    | Filter by type                 |
 | `scope`    | string | no       | `""`    | Filter by scope                |
 | `scope_id` | string | no       | `""`    | Filter by scope ID             |
-| `limit`    | int    | no       | `20`    | Max results (capped at 50)     |
+| `limit`    | int    | no       | `20`    | Max results (1-50)             |
 
 **Response:**
 
@@ -1876,7 +1884,7 @@ Search memories by query. Uses POST for the request body but is non-mutating
       "memory_id": "a1b2c3d4-e5f6-...",
       "name": "auth_patterns",
       "description": "Authentication architecture",
-      "type": "project",
+      "type": "general",
       "scope": "global",
       "scope_id": "",
       "content": "JWT tokens with HS256...",
@@ -1894,7 +1902,9 @@ Search memories by query. Uses POST for the request body but is non-mutating
 
 ### `DELETE /v1/api/memories/{name}`
 
-Delete a memory by name and scope. Requires `write` scope.
+Delete a memory by name and scope. Requires `write` scope. The delete returns
+success only for the row atomically removed and records the authenticated
+actor in the audit log.
 
 **Path parameters:**
 
@@ -1978,7 +1988,7 @@ Get a single memory by ID. Requires `admin.memories` permission.
   "memory_id": "a1b2c3d4-e5f6-...",
   "name": "project_architecture",
   "description": "Core architecture patterns",
-  "type": "project",
+  "type": "general",
   "scope": "global",
   "scope_id": "",
   "content": "The project uses...",

@@ -4746,6 +4746,9 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         scope_id: str,
         content: str,
     ) -> None:
+        if description is None or not description.strip():
+            raise ValueError("memory description is required and must be non-empty")
+        description = description.strip()
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             conn.execute(
@@ -4770,19 +4773,24 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         self,
         memory_id: str,
         name: str,
-        description: str | None,
+        description: str,
         mem_type: str | None,
         scope: str,
         scope_id: str,
         content: str,
+        *,
+        require_active_project: bool = False,
     ) -> tuple[dict[str, str], bool]:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+        if description is None or not description.strip():
+            raise ValueError("memory description is required and must be non-empty")
+        description = description.strip()
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         insert_stmt = pg_insert(structured_memories).values(
             memory_id=memory_id,
             name=name,
-            description="" if description is None else description,
+            description=description,
             type="general" if mem_type is None else mem_type,
             scope=scope,
             scope_id=scope_id,
@@ -4792,16 +4800,14 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             last_accessed=now,
             access_count=0,
         )
-        # On conflict, refresh content + timestamps.  description/type are
-        # overwritten only when the caller supplied them; None means "unset" ->
-        # keep the stored value.  created and access_count are left untouched.
+        # On conflict, refresh content, description, and timestamps. A None type means
+        # "unset" -> keep the stored value. created/access_count stay untouched.
         set_: dict[str, Any] = {
             "content": insert_stmt.excluded.content,
             "updated": now,
             "last_accessed": now,
         }
-        if description is not None:
-            set_["description"] = insert_stmt.excluded.description
+        set_["description"] = insert_stmt.excluded.description
         if mem_type is not None:
             set_["type"] = insert_stmt.excluded.type
         stmt = insert_stmt.on_conflict_do_update(
@@ -4809,6 +4815,22 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             set_=set_,
         ).returning(structured_memories)
         with self._conn() as conn:
+            if require_active_project:
+                if scope != "project" or not scope_id:
+                    raise ValueError("active-project guard requires project scope")
+                project = conn.execute(
+                    sa.select(projects.c.project_id)
+                    .where(
+                        sa.and_(
+                            projects.c.project_id == scope_id,
+                            projects.c.state == "active",
+                        )
+                    )
+                    .with_for_update(read=True)
+                ).fetchone()
+                if project is None:
+                    conn.rollback()
+                    raise ValueError("project is missing, archived, or no longer writable")
             row = conn.execute(stmt).fetchone()
             conn.commit()
             if row is None:  # unreachable: ON CONFLICT DO UPDATE returns one row
@@ -4841,26 +4863,58 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
     def delete_structured_memory(
         self, name: str, scope: str = "global", scope_id: str = ""
     ) -> bool:
-        with self._conn() as conn:
-            result = conn.execute(
-                sa.delete(structured_memories).where(
-                    sa.and_(
-                        structured_memories.c.name == name,
-                        structured_memories.c.scope == scope,
-                        structured_memories.c.scope_id == scope_id,
-                    )
+        return self.delete_structured_memory_returning(name, scope, scope_id) is not None
+
+    def delete_structured_memory_returning(
+        self, name: str, scope: str = "global", scope_id: str = ""
+    ) -> dict[str, str] | None:
+        stmt = (
+            sa.delete(structured_memories)
+            .where(
+                sa.and_(
+                    structured_memories.c.name == name,
+                    structured_memories.c.scope == scope,
+                    structured_memories.c.scope_id == scope_id,
                 )
             )
+            .returning(structured_memories)
+        )
+        with self._conn() as conn:
+            row = conn.execute(stmt).fetchone()
             conn.commit()
-            return result.rowcount > 0
+            return dict(row._mapping) if row is not None else None
 
     def delete_structured_memory_by_id(self, memory_id: str) -> bool:
+        return self.delete_structured_memory_by_id_returning(memory_id) is not None
+
+    def delete_structured_memory_by_id_returning(self, memory_id: str) -> dict[str, str] | None:
         with self._conn() as conn:
-            result = conn.execute(
-                sa.delete(structured_memories).where(structured_memories.c.memory_id == memory_id)
-            )
+            row = conn.execute(
+                sa.delete(structured_memories)
+                .where(structured_memories.c.memory_id == memory_id)
+                .returning(structured_memories)
+            ).fetchone()
             conn.commit()
-            return result.rowcount > 0
+            return dict(row._mapping) if row is not None else None
+
+    def find_structured_memory_scopes(
+        self,
+        name: str,
+        scopes: list[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        if not scopes:
+            return []
+        with self._conn() as conn:
+            scope_clauses, params = self._build_scope_or_clause(scopes)
+            rows = conn.execute(
+                sa.text(
+                    "SELECT scope, scope_id FROM structured_memories "
+                    f"WHERE name = :name AND ({scope_clauses}) "
+                    "ORDER BY scope, scope_id"
+                ),
+                {**params, "name": name},
+            ).fetchall()
+            return [(str(row.scope), str(row.scope_id)) for row in rows]
 
     def list_structured_memories(
         self,
@@ -5905,6 +5959,17 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
 
     def delete_project(self, project_id: str) -> bool:
         with self._conn() as conn:
+            # Serialize with guarded project-memory upserts.  If a writer got
+            # the row first, its memory is committed before our purge; if this
+            # delete wins, the later writer's active-project check finds no row.
+            project = conn.execute(
+                sa.select(projects.c.project_id)
+                .where(projects.c.project_id == project_id)
+                .with_for_update()
+            ).fetchone()
+            if project is None:
+                conn.rollback()
+                return False
             # No FK cascade in the schema family, so purge the project's scoped
             # memory + member rows explicitly (same transaction) before the
             # project row — honouring the "destroys the container AND its scoped

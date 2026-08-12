@@ -3495,31 +3495,157 @@ def _resolve_user_scope_id(
     return uid, None
 
 
+def _resolve_workstream_memory_scope_id(
+    request: Request,
+    scope_id: str,
+) -> tuple[str, JSONResponse | None]:
+    """Bind REST workstream-memory access to the authenticated owner."""
+    from turnstone.core.storage._registry import get_storage
+
+    resolved = scope_id.strip()
+    if not resolved:
+        return "", JSONResponse(
+            {"error": "scope_id is required for workstream scope"},
+            status_code=400,
+        )
+    owner = get_storage().get_workstream_owner(resolved)
+    if owner is None:
+        return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
+    caller = _auth_user_id(request)
+    if "service" not in _auth_scopes(request) and (not caller or owner != caller):
+        return "", JSONResponse(
+            {"error": "Cannot access another user's workstream memories"},
+            status_code=403,
+        )
+    return resolved, None
+
+
+def _resolve_rest_memory_scope(
+    request: Request,
+    scope: str,
+    scope_id: str,
+    *,
+    allow_empty: bool,
+) -> tuple[str, str, JSONResponse | None]:
+    """Validate a public memory scope and bind its caller-controlled id."""
+    normalized_scope = scope.strip().lower()
+    normalized_id = scope_id.strip()
+    if not normalized_scope and allow_empty:
+        err = _validate_scope_scope_id(normalized_scope, normalized_id)
+        return normalized_scope, normalized_id, err
+    if normalized_scope not in _VALID_MEMORY_SCOPES:
+        return (
+            "",
+            "",
+            JSONResponse(
+                {
+                    "error": (
+                        f"invalid scope: {normalized_scope}; "
+                        f"must be one of {sorted(_VALID_MEMORY_SCOPES)}"
+                    )
+                },
+                status_code=400,
+            ),
+        )
+    if normalized_scope == "user":
+        normalized_id, err = _resolve_user_scope_id(request, normalized_id)
+        if err:
+            return "", "", err
+    elif normalized_scope == "workstream":
+        normalized_id, err = _resolve_workstream_memory_scope_id(request, normalized_id)
+        if err:
+            return "", "", err
+    err = _validate_scope_scope_id(
+        normalized_scope,
+        normalized_id,
+        require_scope_id=True,
+    )
+    return normalized_scope, normalized_id, err
+
+
+def _rest_visible_memory_scopes(request: Request) -> list[tuple[str, str]]:
+    """Default public read envelope: global plus the caller's user scope."""
+    scopes = [("global", "")]
+    uid = _auth_user_id(request)
+    if uid:
+        scopes.append(("user", uid))
+    return scopes
+
+
+def _audit_rest_memory_mutation(
+    request: Request,
+    action: str,
+    row: dict[str, str],
+) -> None:
+    """Record one authenticated REST/SDK memory mutation."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.storage._registry import get_storage
+
+    uid, ip = _audit_context(request)
+    record_audit(
+        get_storage(),
+        uid,
+        action,
+        "memory",
+        row["memory_id"],
+        {
+            "name": row["name"],
+            "scope": row["scope"],
+            "scope_id": row["scope_id"],
+            "type": row["type"],
+            "surface": "rest",
+        },
+        ip,
+    )
+
+
 async def list_memories(request: Request) -> JSONResponse:
     """GET /v1/api/memories — list memories with optional filters."""
-    from turnstone.core.memory import list_structured_memories
+    from turnstone.core.storage._registry import get_storage
 
-    mem_type = request.query_params.get("type", "")
+    mem_type = request.query_params.get("type", "").strip().lower()
     scope = request.query_params.get("scope", "")
     scope_id = request.query_params.get("scope_id", "")
+    if mem_type and mem_type not in _VALID_MEMORY_TYPES:
+        return JSONResponse({"error": f"invalid type: {mem_type}"}, status_code=400)
     try:
-        limit = min(int(request.query_params.get("limit", "100")), 200)
+        limit = int(request.query_params.get("limit", "100"))
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
-    err = _validate_scope_scope_id(scope, scope_id)
+    if not 1 <= limit <= 200:
+        return JSONResponse({"error": "limit must be between 1 and 200"}, status_code=400)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=True,
+    )
     if err:
         return err
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    rows = list_structured_memories(mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    try:
+        storage = get_storage()
+        if scope:
+            rows = storage.list_structured_memories(
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
+            )
+        else:
+            rows = storage.list_visible_structured_memories(
+                _rest_visible_memory_scopes(request),
+                mem_type=mem_type,
+                limit=limit,
+            )
+    except Exception:
+        log.warning("memory.rest_list_failed", exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
     return JSONResponse({"memories": rows, "total": len(rows)})
 
 
 async def save_memory(request: Request) -> JSONResponse:
     """POST /v1/api/memories — save (upsert) a structured memory."""
-    from turnstone.core.memory import save_structured_memory
+    from turnstone.core.memory import save_structured_memory_strict
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
@@ -3536,12 +3662,15 @@ async def save_memory(request: Request) -> JSONResponse:
             {"error": f"content exceeds {_MAX_MEMORY_CONTENT} character limit"},
             status_code=400,
         )
-    # None (field omitted) means "leave unset": the upsert keeps the stored
-    # value on update and defaults on insert; an explicit value overwrites.
     raw_desc = body.get("description")
-    description = None if raw_desc is None else str(raw_desc)
+    description = "" if raw_desc is None else str(raw_desc).strip()
+    if not description:
+        return JSONResponse(
+            {"error": "description is required and must be non-empty"},
+            status_code=400,
+        )
     raw_type = body.get("type")
-    mem_type = None if raw_type is None else str(raw_type)
+    mem_type = None if raw_type is None else str(raw_type).strip().lower()
     scope = str(body.get("scope", "global"))
     scope_id = str(body.get("scope_id", ""))
     if mem_type is not None and mem_type not in _VALID_MEMORY_TYPES:
@@ -3549,24 +3678,31 @@ async def save_memory(request: Request) -> JSONResponse:
             {"error": f"invalid type: {mem_type}; must be one of {sorted(_VALID_MEMORY_TYPES)}"},
             status_code=400,
         )
-    if scope not in _VALID_MEMORY_SCOPES:
-        return JSONResponse(
-            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
-            status_code=400,
-        )
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    err = _validate_scope_scope_id(scope, scope_id, require_scope_id=True)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=False,
+    )
     if err:
         return err
-    # The upsert RETURNINGs the full saved row, so no follow-up read is needed.
-    row, was_update = save_structured_memory(
-        name, content, description=description, mem_type=mem_type, scope=scope, scope_id=scope_id
-    )
-    if not row:
+    try:
+        row, was_update = save_structured_memory_strict(
+            name,
+            content,
+            description=description,
+            mem_type=mem_type,
+            scope=scope,
+            scope_id=scope_id,
+        )
+    except Exception:
+        log.warning("memory.rest_save_failed", name=name, exc_info=True)
         return JSONResponse({"error": "Failed to save memory"}, status_code=500)
+    _audit_rest_memory_mutation(
+        request,
+        "memory.update" if was_update else "memory.save",
+        row,
+    )
     return JSONResponse(row, status_code=200 if was_update else 201)
 
 
@@ -3575,7 +3711,7 @@ async def search_memories(request: Request) -> JSONResponse:
 
     Uses POST for the request body but requires only read scope (non-mutating).
     """
-    from turnstone.core.memory import search_structured_memories as search_fn
+    from turnstone.core.storage._registry import get_storage
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
@@ -3584,46 +3720,72 @@ async def search_memories(request: Request) -> JSONResponse:
     query = str(body.get("query", "")).strip()
     if not query:
         return JSONResponse({"error": "query is required"}, status_code=400)
-    mem_type = str(body.get("type", ""))
+    mem_type = str(body.get("type", "")).strip().lower()
     scope = str(body.get("scope", ""))
     scope_id = str(body.get("scope_id", ""))
     try:
-        limit = min(int(body.get("limit", 20)), 50)
+        limit = int(body.get("limit", 20))
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
-    err = _validate_scope_scope_id(scope, scope_id)
+    if mem_type and mem_type not in _VALID_MEMORY_TYPES:
+        return JSONResponse({"error": f"invalid type: {mem_type}"}, status_code=400)
+    if not 1 <= limit <= 50:
+        return JSONResponse({"error": "limit must be between 1 and 50"}, status_code=400)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=True,
+    )
     if err:
         return err
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    rows = search_fn(query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    try:
+        storage = get_storage()
+        if scope:
+            rows = storage.search_structured_memories(
+                query,
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
+            )
+        else:
+            rows = storage.search_visible_structured_memories(
+                query,
+                _rest_visible_memory_scopes(request),
+                mem_type=mem_type,
+                limit=limit,
+            )
+    except Exception:
+        log.warning("memory.rest_search_failed", exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
     return JSONResponse({"memories": rows, "total": len(rows)})
 
 
 async def delete_memory_endpoint(request: Request) -> JSONResponse:
     """DELETE /v1/api/memories/{name} — delete a memory by name and scope."""
-    from turnstone.core.memory import delete_structured_memory, normalize_key
+    from turnstone.core.memory import delete_structured_memory_returning_strict, normalize_key
 
     name = normalize_key(request.path_params["name"])
     scope = request.query_params.get("scope", "global")
-    if scope not in _VALID_MEMORY_SCOPES:
-        return JSONResponse(
-            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
-            status_code=400,
-        )
     scope_id = request.query_params.get("scope_id", "")
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    err = _validate_scope_scope_id(scope, scope_id, require_scope_id=True)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=False,
+    )
     if err:
         return err
-    if delete_structured_memory(name, scope, scope_id):
-        return JSONResponse({"status": "ok", "name": name})
-    return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+    try:
+        deleted = delete_structured_memory_returning_strict(name, scope, scope_id)
+    except Exception:
+        log.warning("memory.rest_delete_failed", name=name, exc_info=True)
+        return JSONResponse({"error": "Failed to delete memory"}, status_code=500)
+    if deleted is None:
+        return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+    _audit_rest_memory_mutation(request, "memory.delete", deleted)
+    return JSONResponse({"status": "ok", "name": name})
 
 
 # ---------------------------------------------------------------------------

@@ -894,7 +894,7 @@ export interface WorkstreamsOptions {
 export interface SaveMemoryRequest {
   name: string;
   content: string;
-  description?: string;
+  description: string;
   type?: "user" | "general" | "feedback" | "reference";
   scope?: "global" | "workstream" | "user";
   scope_id?: string;

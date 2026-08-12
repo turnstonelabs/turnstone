@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.8.0a6",
+    "version": "1.8.0a7",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {

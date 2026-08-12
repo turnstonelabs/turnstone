@@ -64,12 +64,11 @@ def _apply_kind_variant(tool: dict[str, Any], kind: str, meta: dict[str, Any]) -
     """Return a kind-specific copy of ``tool`` with description / params overridden.
 
     Each kind sees only the surface it can actually use — for ``memory``,
-    coord sessions get a description + scope enum that mention only the
-    ``coordinator`` scope, while interactive sessions get a description
-    + scope enum that omit ``coordinator`` entirely.  This keeps the
-    LLM contract tight: the model never sees enum values it can't use,
-    and never reads description sentences explaining why a scope is
-    forbidden.
+    coord sessions get ``coordinator`` plus the attach-dependent ``project``
+    scope, while interactive sessions get global/workstream/user plus
+    ``project``.  This keeps the LLM contract tight: the model never sees enum
+    values it can't use, and never reads description sentences explaining why
+    a scope is forbidden.
 
     No-op (returns the input tool unchanged) when the tool has no
     ``kind_variants`` metadata or no entry for ``kind``.  Otherwise

@@ -394,7 +394,14 @@ export class TurnstoneServer extends BaseClient {
   }
 
   async saveMemory(opts: SaveMemoryRequest): Promise<MemoryInfo> {
-    return this.request("POST", "/v1/api/memories", { json: opts });
+    if (typeof opts.description !== "string" || !opts.description.trim()) {
+      throw new TypeError(
+        "memory description is required and must be non-empty",
+      );
+    }
+    return this.request("POST", "/v1/api/memories", {
+      json: { ...opts, description: opts.description.trim() },
+    });
   }
 
   async searchMemories(

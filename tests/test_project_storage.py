@@ -68,9 +68,9 @@ class TestProjectStore:
         # a sibling project's nor other scopes' rows.
         backend.create_project("p1", "A", "u1")
         backend.create_project("p2", "B", "u1")
-        backend.create_structured_memory("m1", "k", "", "general", "project", "p1", "v")
-        backend.create_structured_memory("m2", "k", "", "general", "project", "p2", "v")
-        backend.create_structured_memory("m3", "k", "", "general", "user", "u1", "v")
+        backend.create_structured_memory("m1", "k", "Test memory", "general", "project", "p1", "v")
+        backend.create_structured_memory("m2", "k", "Test memory", "general", "project", "p2", "v")
+        backend.create_structured_memory("m3", "k", "Test memory", "general", "user", "u1", "v")
         assert backend.delete_project("p1")
         assert backend.get_structured_memory("m1") is None  # purged
         assert backend.get_structured_memory("m2") is not None  # sibling project intact

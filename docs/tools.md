@@ -152,7 +152,7 @@ into its successor's trajectory.
 **Auto-approved** (no user confirmation needed at runtime):
 - `read_file` -- reads files, no side effects
 - `search` -- grep-style search, no side effects
-- `memory` -- structured persistent memory (save/search/delete/list)
+- `memory` -- structured persistent memory (save/get/search/delete/list)
 - `recall` -- searches conversation history
 - `notify` -- sends notifications to linked channels (time-sensitive, auto-approved for urgency)
 
@@ -433,7 +433,7 @@ Delegate a general-purpose task to an autonomous sub-agent.
 |-----------|--------|----------|-------------|
 | `prompt`  | string | yes      | Complete task description for the sub-agent. |
 
-- **What it does**: Spawns a sub-agent that inherits the `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, web tools, memory tools). The sub-agent runs autonomously to completion. Use for work that requires file modifications or command execution.
+- **What it does**: Spawns a sub-agent that inherits the `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, and web tools). The sub-agent runs autonomously to completion. Use for work that requires file modifications or command execution.
 - **Auto-approve**: No -- requires user confirmation.
 - **Agent availability**: Top-level only.
 
@@ -447,18 +447,26 @@ Structured persistent memory across sessions with typed, scoped entries.
 
 | Parameter     | Type    | Required | Description |
 |---------------|---------|----------|-------------|
-| `action`      | string  | yes      | `save`, `search`, `delete`, or `list`. |
-| `name`        | string  | save/delete | Short snake_case identifier for the memory. |
+| `action`      | string  | yes      | `save`, `get`, `search`, `delete`, or `list`. |
+| `name`        | string  | save/get/delete | Short snake_case identifier for the memory. |
 | `content`     | string  | save     | Memory content to store. |
-| `description` | string  | no       | Short description for relevance matching (recommended for `save`). |
-| `type`        | string  | no       | Memory type: `user`, `project`, `feedback`, or `reference`. Default: `project`. |
-| `scope`       | string  | no       | Memory scope: `global`, `workstream`, or `user`. Default: `global`. |
+| `description` | string  | save     | Non-empty description for relevance matching; required on create and update. |
+| `type`        | string  | no       | Memory type: `user`, `general`, `feedback`, or `reference`. Default: `general`. |
+| `scope`       | string  | no       | Memory scope: `global`, `workstream`, `user`, `coordinator`, or `project`. See defaults below. |
 | `query`       | string  | search   | Search query for finding memories. |
 | `limit`       | integer | no       | Max results for `search` or `list`. Default: 20. |
 
-- **What it does**: Manages structured persistent memories in the database. Memories persist across sessions, have a type classification (user preferences, project knowledge, feedback, reference material) and a scope (global across all workstreams, private to a workstream, or following a user). Relevant memories are included in the system prompt on startup.
+- **What it does**: Manages structured persistent memories in the database.
+  Memories persist across sessions, have a type classification, and live in a
+  role-specific visible scope. Unscoped `save`/`get`/`delete` resolve to one
+  target: the attached active project, otherwise `global` for an interactive
+  session or `coordinator` for a coordinator. Read-only project access permits
+  `get` but makes `save`/`delete` fail without falling back. A valid explicit
+  scope selects exactly that scope. Unscoped `search`/`list` cover all visible
+  scopes; use the displayed scope when following a result with `get` or
+  `delete`.
 - **Auto-approve**: Yes.
-- **Agent availability**: Not available to sub-agents (top-level only).
+- **Agent availability**: Not available to task agents.
 
 ---
 
@@ -473,7 +481,7 @@ Search conversation history for past messages and tool results.
 
 - **What it does**: Searches conversation history across sessions using FTS5 full-text search. Returns matching messages, tool calls, and tool results with timestamps and workstream context.
 - **Auto-approve**: Yes.
-- **Agent availability**: Not available to sub-agents (top-level only).
+- **Agent availability**: Not available to task agents.
 
 ---
 

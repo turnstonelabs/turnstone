@@ -829,34 +829,41 @@ class StorageBackend(Protocol):
         scope_id: str,
         content: str,
     ) -> None:
-        """Create a structured memory record."""
+        """Create a structured memory record with a non-empty description."""
         ...
 
     def upsert_structured_memory(
         self,
         memory_id: str,
         name: str,
-        description: str | None,
+        description: str,
         mem_type: str | None,
         scope: str,
         scope_id: str,
         content: str,
+        *,
+        require_active_project: bool = False,
     ) -> tuple[dict[str, str], bool]:
         """Insert a structured memory, or update it in place on a
         ``(name, scope, scope_id)`` conflict.
 
         Atomic ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` — no
         IntegrityError round-trip, race-safe under concurrent saves of the same
-        key.  ``description`` / ``mem_type`` of ``None`` mean "unset": the
-        column default ("" / "general") is used on insert and the stored value
-        is kept on conflict; a non-``None`` value (including "" or "general") is
-        written.
+        key. ``description`` must contain non-whitespace text on every insert
+        or update. A ``mem_type`` of ``None`` means "unset": the column default
+        is used on insert and the stored value is kept on conflict.
 
         Returns ``(row, was_update)`` (like Django's ``update_or_create``): the
         full saved row, and ``True`` when an existing row was updated rather
         than inserted.  Callers MUST supply a fresh unique ``memory_id`` — it is
         compared against the returned row's id to tell INSERT from UPDATE, so a
         reused id would report ``was_update=False`` on a real update.
+
+        When ``require_active_project`` is true, ``scope`` must be
+        ``"project"`` and the backend must verify that the referenced project
+        still exists and is active in the same transaction as the upsert.  The
+        project row is locked where the backend supports row locks so a
+        concurrent project delete cannot leave an orphaned memory behind.
         """
         ...
 
@@ -876,8 +883,26 @@ class StorageBackend(Protocol):
         """Delete a structured memory by (name, scope, scope_id). Returns True if existed."""
         ...
 
+    def delete_structured_memory_returning(
+        self, name: str, scope: str = "global", scope_id: str = ""
+    ) -> dict[str, str] | None:
+        """Atomically delete and return a memory selected by its scoped name."""
+        ...
+
     def delete_structured_memory_by_id(self, memory_id: str) -> bool:
         """Delete a structured memory by its primary key. Returns True if existed."""
+        ...
+
+    def delete_structured_memory_by_id_returning(self, memory_id: str) -> dict[str, str] | None:
+        """Atomically delete and return a memory selected by primary key."""
+        ...
+
+    def find_structured_memory_scopes(
+        self,
+        name: str,
+        scopes: list[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        """Return visible scope pairs containing ``name`` in one small query."""
         ...
 
     def list_structured_memories(

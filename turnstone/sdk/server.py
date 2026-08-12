@@ -525,19 +525,21 @@ class AsyncTurnstoneServer(_BaseClient):
         name: str,
         content: str,
         *,
-        description: str = "",
+        description: str,
         mem_type: str = "general",
         scope: str = "global",
         scope_id: str = "",
     ) -> MemoryInfo:
+        description = (description or "").strip()
+        if not description:
+            raise ValueError("memory description is required and must be non-empty")
         body: dict[str, Any] = {
             "name": name,
             "content": content,
+            "description": description,
             "type": mem_type,
             "scope": scope,
         }
-        if description:
-            body["description"] = description
         if scope_id:
             body["scope_id"] = scope_id
         return await self._request(
@@ -868,7 +870,7 @@ class TurnstoneServer:
         name: str,
         content: str,
         *,
-        description: str = "",
+        description: str,
         mem_type: str = "general",
         scope: str = "global",
         scope_id: str = "",

@@ -9544,11 +9544,13 @@ async def admin_delete_memory(request: Request) -> JSONResponse:
         return err
 
     memory_id = request.path_params["memory_id"]
-    existing = storage.get_structured_memory(memory_id)
+    try:
+        existing = storage.delete_structured_memory_by_id_returning(memory_id)
+    except Exception:
+        log.warning("memory.admin_delete_failed memory_id=%s", memory_id, exc_info=True)
+        return JSONResponse({"error": "Failed to delete memory"}, status_code=500)
     if not existing:
         return JSONResponse({"error": "Memory not found"}, status_code=404)
-
-    storage.delete_structured_memory_by_id(memory_id)
 
     audit_uid, ip = _audit_context(request)
     record_audit(

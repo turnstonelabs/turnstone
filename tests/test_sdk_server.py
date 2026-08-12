@@ -362,6 +362,62 @@ async def test_logout():
 
 
 # ---------------------------------------------------------------------------
+# Memories
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_save_memory_requires_and_sends_description():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return _json_response(
+            {
+                "memory_id": "m1",
+                "name": "deployment_process",
+                "description": captured["description"],
+                "type": "general",
+                "scope": "global",
+                "scope_id": "",
+                "content": "Deploy from main",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+            },
+            status=201,
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        memory = await client.save_memory(
+            "deployment_process",
+            "Deploy from main",
+            description="  Production deployment workflow  ",
+        )
+
+    assert captured["description"] == "Production deployment workflow"
+    assert memory.description == "Production deployment workflow"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("description", [None, "", "   "])
+async def test_save_memory_rejects_empty_description(description):
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("invalid memory must not reach the server")
+
+    transport = httpx.MockTransport(unexpected_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        with pytest.raises(ValueError, match="description is required"):
+            await client.save_memory(
+                "deployment_process",
+                "Deploy from main",
+                description=description,  # type: ignore[arg-type]
+            )
+
+
+# ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
 

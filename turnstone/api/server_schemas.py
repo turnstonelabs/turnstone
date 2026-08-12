@@ -753,10 +753,20 @@ MemoryScope = Literal["global", "workstream", "user"]
 
 
 class SaveMemoryRequest(BaseModel):
-    name: str = Field(description="Memory identifier (normalized to snake_case)")
-    content: str = Field(description="Memory content", max_length=65536)
-    description: str = Field(default="", description="Short description for relevance matching")
-    type: MemoryType = Field(default="general", description="Memory type")
+    name: str = Field(
+        description="Memory identifier (normalized to snake_case)",
+        min_length=1,
+        max_length=256,
+    )
+    content: str = Field(description="Memory content", min_length=1, max_length=65536)
+    description: str = Field(
+        description="Required non-empty description used for relevance matching",
+        min_length=1,
+    )
+    type: MemoryType | None = Field(
+        default=None,
+        description="Memory type; omission preserves it on update and defaults on insert",
+    )
     scope: MemoryScope = Field(default="global", description="Memory scope")
     scope_id: str = Field(
         default="",
@@ -765,6 +775,8 @@ class SaveMemoryRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_scope_scope_id(self) -> SaveMemoryRequest:
+        if not self.description.strip():
+            raise ValueError("description is required and must be non-empty")
         scope_id = self.scope_id.strip()
         if self.scope == "global" and scope_id:
             raise ValueError("scope_id is not allowed with global scope")
@@ -795,7 +807,7 @@ MemoryScopeFilter = Literal["", "global", "workstream", "user"]
 
 
 class SearchMemoriesRequest(BaseModel):
-    query: str = Field(description="Search query text")
+    query: str = Field(description="Search query text", min_length=1)
     type: MemoryTypeFilter = Field(default="", description="Filter by memory type")
     scope: MemoryScopeFilter = Field(default="", description="Filter by scope")
     scope_id: str = Field(default="", description="Filter by scope_id")
@@ -808,6 +820,8 @@ class SearchMemoriesRequest(BaseModel):
             raise ValueError("scope_id is not allowed with global scope")
         if scope_id and not self.scope:
             raise ValueError("scope is required when scope_id is provided")
+        if self.scope == "workstream" and not scope_id:
+            raise ValueError("scope_id is required for workstream scope")
         return self
 
 

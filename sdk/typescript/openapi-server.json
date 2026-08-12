@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.8.0a6",
+    "version": "1.8.0a7",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -1869,7 +1869,7 @@
     },
     "/v1/api/memories": {
       "get": {
-        "summary": "List structured memories",
+        "summary": "List structured memories. Without a scope, returns global plus the authenticated user's memories; workstream scope is owner-bound.",
         "operationId": "v1_api_memories_get",
         "tags": [
           "Memories"
@@ -1891,7 +1891,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "Filter by scope"
+            "description": "Filter by public scope: global, workstream, or user"
           },
           {
             "name": "scope_id",
@@ -1920,6 +1920,46 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ListMemoriesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -1962,13 +2002,43 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
     },
     "/v1/api/memories/search": {
       "post": {
-        "summary": "Search structured memories by query",
+        "summary": "Search structured memories by query. Without a scope, searches global plus the authenticated user's memories.",
         "operationId": "v1_api_memories_search_post",
         "tags": [
           "Memories"
@@ -1990,6 +2060,46 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ListMemoriesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -2043,8 +2153,38 @@
               }
             }
           },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
             "content": {
               "application/json": {
                 "schema": {
@@ -3854,32 +3994,42 @@
         "properties": {
           "name": {
             "description": "Memory identifier (normalized to snake_case)",
+            "maxLength": 256,
+            "minLength": 1,
             "title": "Name",
             "type": "string"
           },
           "content": {
             "description": "Memory content",
             "maxLength": 65536,
+            "minLength": 1,
             "title": "Content",
             "type": "string"
           },
           "description": {
-            "default": "",
-            "description": "Short description for relevance matching",
+            "description": "Required non-empty description used for relevance matching",
+            "minLength": 1,
             "title": "Description",
             "type": "string"
           },
           "type": {
-            "default": "general",
-            "description": "Memory type",
-            "enum": [
-              "user",
-              "general",
-              "feedback",
-              "reference"
+            "anyOf": [
+              {
+                "enum": [
+                  "user",
+                  "general",
+                  "feedback",
+                  "reference"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Type",
-            "type": "string"
+            "default": null,
+            "description": "Memory type; omission preserves it on update and defaults on insert",
+            "title": "Type"
           },
           "scope": {
             "default": "global",
@@ -3901,7 +4051,8 @@
         },
         "required": [
           "name",
-          "content"
+          "content",
+          "description"
         ],
         "title": "SaveMemoryRequest",
         "type": "object"
@@ -3995,6 +4146,7 @@
         "properties": {
           "query": {
             "description": "Search query text",
+            "minLength": 1,
             "title": "Query",
             "type": "string"
           },

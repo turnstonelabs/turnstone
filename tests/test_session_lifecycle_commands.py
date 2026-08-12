@@ -124,9 +124,10 @@ def test_nonfork_resume_rebinds_project_memory_context_before_recomposition(tmp_
     assert session.resume("target-ws") is True
 
     assert session.ws_id == "target-ws"
-    assert session._project_id == "target-project"
-    assert session._project_name == "Target Project"
-    assert session._project_writable is True
+    access = session._memory_access()
+    assert access.project_id == "target-project"
+    assert access.project_name == "Target Project"
+    assert access.project_writable is True
     assert ("project", "target-project") in session._visible_scopes()
     assert ("project", "source-project") not in session._visible_scopes()
     assert stale_cache_key not in session._mem_search_cache
