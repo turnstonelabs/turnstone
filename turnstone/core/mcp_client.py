@@ -2468,14 +2468,8 @@ class MCPClientManager:
             # exact wiring immediately before commit; there are no awaits from
             # this check through publication, so a callable catalog can never
             # be installed behind a dead/replaced transport.
-            if (
-                owner.done()
-                or state.owner_task is not owner
-                or state.session is not session
-            ):
-                raise ConnectionError(
-                    f"MCP server '{name}' transport died before catalog commit"
-                )
+            if owner.done() or state.owner_task is not owner or state.session is not session:
+                raise ConnectionError(f"MCP server '{name}' transport died before catalog commit")
         except BaseException:
             await self._teardown_static_session(name)
             raise
@@ -3154,11 +3148,7 @@ class MCPClientManager:
         # Mirror the static commit guard. A transport owner can finish in the
         # same scheduling turn as the final discovery response; never publish
         # that response into the per-user maps after its session was evicted.
-        if (
-            owner.done()
-            or entry.owner_task is not owner
-            or entry.session is not session
-        ):
+        if owner.done() or entry.owner_task is not owner or entry.session is not session:
             await self._teardown_pool_entry(key)
             raise ConnectionError(
                 f"MCP pool server '{server_name}' transport died before catalog commit"
@@ -5835,9 +5825,7 @@ class MCPClientManager:
                         # run after this cleanup releases the lock.
                         _clear_failed_add_state()
                     if isinstance(exc, TimeoutError):
-                        raise TimeoutError(
-                            f"MCP server '{name}' registration timed out"
-                        ) from None
+                        raise TimeoutError(f"MCP server '{name}' registration timed out") from None
                     raise
 
         future = asyncio.run_coroutine_threadsafe(_add(), self._loop)

@@ -157,9 +157,7 @@ class TestTransportOwnerLifecycle:
         assert state.owner_task is None
         assert state.close_requested is None
 
-    def test_tools_only_connect_skips_unchanged_catalog_listeners(
-        self, running_loop_mgr
-    ) -> None:
+    def test_tools_only_connect_skips_unchanged_catalog_listeners(self, running_loop_mgr) -> None:
         """A tools-only registration must not rebuild every live chat twice."""
         mgr, loop, _ = running_loop_mgr
         patches: dict[str, Any] = {}
@@ -465,9 +463,7 @@ class TestTransportOwnerLifecycle:
         assert len(state.tools) == 1
         assert mgr.is_mcp_tool("mcp__new__late") is True
 
-    def test_blocked_loop_cannot_return_failure_before_add_outcome(
-        self, running_loop_mgr
-    ) -> None:
+    def test_blocked_loop_cannot_return_failure_before_add_outcome(self, running_loop_mgr) -> None:
         """A synchronous listener stall may delay success, never expose a ghost."""
         mgr, _loop, _ = running_loop_mgr
 
