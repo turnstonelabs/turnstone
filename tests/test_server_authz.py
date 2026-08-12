@@ -1435,28 +1435,26 @@ class TestInteractiveEventsLifted:
     section.
     """
 
-    def test_events_replay_yields_connected_first(self):
-        """Pre-lift ``events_sse`` yielded a ``connected`` event
-        first (model + skip_permissions). The lifted callback
-        preserves the order so client SSE handlers that key on
-        the connected event for state setup keep working."""
-        from turnstone.server import _interactive_events_replay
+    def test_shared_preamble_yields_connected_first(self):
+        """The shared handler's preamble preserves connected-event shape."""
+        from turnstone.core.session_replay import session_replay_preamble
 
         ws, ui, request = _make_interactive_replay_mocks()
-        out = list(_interactive_events_replay(ws, ui, request))
+        out = list(session_replay_preamble(ws.session, ui, project_name="Visible Project"))
         assert out[0]["type"] == "connected"
         assert out[0]["model"] == "gpt-5"
         assert out[0]["model_alias"] == "default"
+        assert out[0]["project_name"] == "Visible Project"
         assert out[0]["skip_permissions"] is False
 
-    def test_events_replay_includes_status_only_when_last_usage_present(self):
+    def test_shared_preamble_includes_status_only_when_last_usage_present(self):
         """The ``status`` event populates the per-tab token-usage
         bar on resume. Skipped when ``session._last_usage`` is None
         (a freshly-created workstream that hasn't completed a turn)."""
-        from turnstone.server import _interactive_events_replay
+        from turnstone.core.session_replay import session_replay_preamble
 
-        ws, ui, request = _make_interactive_replay_mocks()
-        out = list(_interactive_events_replay(ws, ui, request))
+        ws, ui, _request = _make_interactive_replay_mocks()
+        out = list(session_replay_preamble(ws.session, ui))
         assert "status" not in {ev["type"] for ev in out}
 
     def test_events_replay_yields_pending_approval_then_verdicts(self):

@@ -78,7 +78,10 @@ from turnstone.core.session_manager import (
     STALE_CREATE_SWEEP_INTERVAL_SECONDS,
     SessionManager,
 )
-from turnstone.core.session_replay import session_replay_preamble
+from turnstone.core.session_replay import (
+    request_replay_project_name,
+    session_replay_preamble,
+)
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
     CreatePreCommitError,
@@ -801,12 +804,9 @@ def _interactive_events_replay(
 ) -> Iterable[dict[str, Any]]:
     """Initial SSE replay payload for interactive ``events`` connections.
 
-    Yields a ``connected`` event (model + skip_permissions), a
-    ``status`` event with the workstream's last token usage + context %
-    (when a turn has completed), and the pending approval prompt + cached
-    intent verdicts (if a prompt is pending). The lifted
-    ``make_events_handler`` body delegates that yield sequence to this
-    callback so the kind-specific shape stays in this module.
+    Yields the shared ``connected`` / ``status`` preamble, followed by pending
+    approval prompts and cached intent verdicts. The lifted handler resolves
+    viewer-specific project metadata off-loop before invoking this callback.
 
     Conversation history is NOT replayed over SSE: the frontend fetches
     it via ``GET /history`` on page load and re-fetches on the
@@ -821,10 +821,11 @@ def _interactive_events_replay(
         # session can still be detached on the close-then-reopen path.
         return
 
-    # Connected + status preamble — same shape coord replays and the
-    # lifted reconnect path use; one shared function, no per-kind
-    # wrapper, so a future field add cannot land on one surface only.
-    yield from session_replay_preamble(ws.session, ui)
+    yield from session_replay_preamble(
+        ws.session,
+        ui,
+        project_name=request_replay_project_name(request),
+    )
 
     # Pending approval re-injection (so a reconnecting tab sees the
     # prompt) + cached LLM verdicts received since the prompt fired.

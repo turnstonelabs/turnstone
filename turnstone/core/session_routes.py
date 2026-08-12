@@ -173,15 +173,11 @@ class EventsReplay(Protocol):
     live event loop starts. Each yielded dict gets JSON-serialised
     and sent as a single ``data:`` line to the client.
 
-    Interactive yields four things on connect: ``connected`` (model +
-    skip_permissions), ``status`` (token usage + context %, only when
-    ``session._last_usage`` exists), ``history`` (replayed conversation),
-    and ``pending_approval`` + cached intent verdicts. Coord yields
-    just one: ``pending_approval`` (the rest aren't needed because
-    coord's dashboard fetches history via a separate ``/history``
-    endpoint and doesn't render the per-tab status bar). Kinds that
-    don't need any pre-replay wire ``None`` and the live loop starts
-    immediately.
+    The shared handler pre-resolves viewer-specific project metadata onto the
+    request before calling this stable three-argument callback. Production
+    callbacks emit ``connected`` plus optional ``status``, then pending controls
+    and cached verdicts. Conversation history stays on the separate REST
+    endpoint. Kinds without replay wire ``None``.
     """
 
     def __call__(self, ws: Workstream, ui: Any, request: Request) -> Iterable[dict[str, Any]]:
@@ -444,13 +440,11 @@ class SessionEndpointConfig:
     # wires ``None`` and lets the cluster collector handle the
     # transition via ``CoordinatorAdapter.emit_rehydrated``.
     open_post_load: OpenPostLoad | None = None
-    # (ws, ui, request) -> Iterable[dict]. Kind-specific initial
-    # SSE replay payload the lifted ``events`` body yields after
-    # registering the per-UI listener queue but before the live
-    # event loop. Both production kinds yield connected + optional status,
-    # followed by pending approval controls and cached verdicts. Conversation
-    # history stays on the separate REST ``/history`` bootstrap. Kinds that
-    # don't need pre-replay wire ``None``.
+    # (ws, ui, request) -> Iterable[dict]. Kind-specific initial SSE replay
+    # payload the lifted ``events`` body yields before the live event loop.
+    # The shared handler pins viewer-specific project metadata on ``request``;
+    # production callbacks combine it with connected/status and pending
+    # controls. Conversation history stays on the separate REST bootstrap.
     events_replay: EventsReplay | None = None
     # (request) -> Executor for the SSE live-loop's blocking
     # ``queue.get`` wait. Interactive returns the dedicated
@@ -2298,15 +2292,15 @@ def make_open_handler(
 def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``GET {prefix}/{ws_id}/events`` — per-workstream SSE.
 
-    Both kinds share the SSE plumbing: register the per-UI listener
-    queue, run the kind-specific initial replay (``cfg.events_replay``,
-    typically ``connected`` + ``status`` + ``history`` + pending
-    approval / plan on interactive; just pending approval / plan on
-    coord), then drain the queue forever until either the workstream
-    closes (``ws_closed`` event) or the client disconnects.
+    Both kinds share the SSE plumbing: resolve viewer-specific project
+    metadata off-loop, register the per-UI listener queue, run the configured
+    initial replay (``cfg.events_replay``), then drain the queue forever until
+    either the workstream closes (``ws_closed`` event) or the client
+    disconnects. Cursor-only replay emits the shared connected/status preamble
+    directly because it deliberately skips kind-specific pending controls.
 
-    The kind-specific divergence is captured entirely by
-    ``cfg.events_replay``. The live-loop body, the listener
+    The kind-specific replay divergence is captured by
+    ``cfg.events_replay``. The cursor preamble, live-loop body, listener
     registration, the ``ws_closed`` exit, the disconnect detection,
     and the SSE-connect/disconnect metric recording are uniform.
 
@@ -2432,6 +2426,33 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
         # ``ui`` is a ``SessionUIBase`` subclass, so the cast is
         # tightening the type, not weakening it.
         ui_base = cast("SessionUIBase", ui)
+        from turnstone.core.web_helpers import auth_user_id
+
+        # Pin the authenticated viewer once per connection. Resolve optional
+        # project presentation metadata off the event loop and before listener
+        # registration, so database latency cannot stall unrelated async work
+        # or let this listener's queue accumulate while it waits.
+        replay_principal_id = auth_user_id(request).strip()
+        replay_project_name = ""
+        session = getattr(ws, "session", None)
+        project_name_for_principal = getattr(session, "project_name_for_principal", None)
+        if callable(project_name_for_principal):
+            try:
+                resolved_project_name = await asyncio.to_thread(
+                    project_name_for_principal,
+                    replay_principal_id,
+                )
+                if isinstance(resolved_project_name, str):
+                    replay_project_name = resolved_project_name
+            except Exception:
+                # Project metadata is optional presentation context. Fail
+                # closed to no badge without dropping the SSE bootstrap.
+                log.debug(
+                    "ws.events.project_name_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
+        request.state._session_replay_project_name = replay_project_name
         replay_status: str
         replay_events: list[dict[str, Any]] = []
         lost_count = 0
@@ -2675,7 +2696,11 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                     # contract lives in session_replay_preamble alone (it
                     # no-ops on a detached session internally).
                     try:
-                        for ev in session_replay_preamble(ws.session, ui):
+                        for ev in session_replay_preamble(
+                            ws.session,
+                            ui,
+                            project_name=replay_project_name,
+                        ):
                             yield {"data": json.dumps(ev)}
                     except Exception:
                         log.debug(
@@ -2745,8 +2770,8 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                             )
                         }
 
-                    # Replay phase — stream the kind-specific initial
-                    # payload one event at a time so the client sees
+                    # Replay phase — stream the kind-specific initial payload
+                    # one event at a time so the client sees
                     # the first byte immediately.  Pre-building into
                     # a list would block time-to-first-byte until the
                     # entire replay materialized AND let the listener

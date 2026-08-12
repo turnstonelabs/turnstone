@@ -118,6 +118,39 @@ class TestLiveProjectAccess:
         assert access.attached_project_id == "p1"
         assert access.project_id == ""
 
+    def test_project_display_name_uses_explicit_principal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[tuple[str, str]] = []
+
+        def _resolve(principal_id: str, project_id: str) -> object:
+            seen.append((principal_id, project_id))
+            return self._access(True, True)
+
+        monkeypatch.setattr(auth, "resolve_project_access", _resolve)
+        s = _session(user_id="owner", project_id="p1")
+        s._acting_user_id = "stale-turn-actor"
+        seen.clear()  # Ignore constructor-time system-context composition.
+
+        assert s.project_name_for_principal("reconnecting-viewer") == "P"
+        assert seen == [("reconnecting-viewer", "p1")]
+
+    def test_project_display_name_does_not_fallback_for_empty_principal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[tuple[str, str]] = []
+
+        def _resolve(principal_id: str, project_id: str) -> object:
+            seen.append((principal_id, project_id))
+            return self._access(True, True)
+
+        monkeypatch.setattr(auth, "resolve_project_access", _resolve)
+        s = _session(user_id="owner", project_id="p1")
+        seen.clear()
+
+        assert s.project_name_for_principal("") == ""
+        assert seen == []
+
 
 class TestProjectRecall:
     def test_interactive_visible_scopes_includes_project(

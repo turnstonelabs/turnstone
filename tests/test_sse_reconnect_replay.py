@@ -53,6 +53,7 @@ def _fake_request(
     headers: dict[str, str] | None = None,
     query: dict[str, str] | None = None,
     path_params: dict[str, str] | None = None,
+    user_id: str = "viewer-1",
 ) -> Request:
     """Construct a Starlette ``Request`` for the events handler.
 
@@ -80,7 +81,9 @@ def _fake_request(
     async def _recv() -> dict[str, Any]:  # noqa: RUF029 — async signature required
         return {"type": "http.disconnect"}
 
-    return Request(scope, receive=_recv)
+    request = Request(scope, receive=_recv)
+    request.state.auth_result = SimpleNS(user_id=user_id)
+    return request
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +676,87 @@ def test_handler_emits_retry_on_first_yield() -> None:
     assert 2500 <= retry <= 4500, f"retry {retry} outside jitter band [2500, 4500]"
 
 
+def test_handler_resolves_project_off_loop_and_preserves_legacy_replay_callback() -> None:
+    """Project metadata uses the viewer off-loop; replay keeps its 3-arg API."""
+    from turnstone.core.session_replay import (
+        request_replay_project_name,
+        session_replay_preamble,
+    )
+
+    event_loop_thread = threading.get_ident()
+    resolver_threads: list[int] = []
+    principals: list[str] = []
+    callback_calls: list[tuple[Any, Any, Any]] = []
+
+    session = MagicMock()
+    session.model = "test"
+    session.model_alias = ""
+    session._last_usage = None
+
+    def _project_name(principal_id: str) -> str:
+        resolver_threads.append(threading.get_ident())
+        principals.append(principal_id)
+        return "Visible Project"
+
+    session.project_name_for_principal.side_effect = _project_name
+
+    def _replay(ws: Any, ui: Any, request: Any) -> Any:
+        callback_calls.append((ws, ui, request))
+        yield from session_replay_preamble(
+            ws.session,
+            ui,
+            project_name=request_replay_project_name(request),
+        )
+        yield {"type": "tail"}
+
+    ui = _make_ui()
+    _, blob = _drain_handler_yields(
+        ui,
+        session=session,
+        events_replay=_replay,
+        max_yields=4,
+    )
+
+    assert principals == ["viewer-1"]
+    assert resolver_threads and resolver_threads[0] != event_loop_thread
+    assert len(callback_calls) == 1
+    assert '"type": "connected"' in blob
+    assert '"project_name": "Visible Project"' in blob
+    assert '"type": "tail"' in blob
+
+
+def test_handler_project_lookup_failure_keeps_connected_event() -> None:
+    """Optional project metadata fails closed without losing bootstrap."""
+    from turnstone.core.session_replay import (
+        request_replay_project_name,
+        session_replay_preamble,
+    )
+
+    session = MagicMock()
+    session.model = "test"
+    session.model_alias = ""
+    session._last_usage = None
+    session.project_name_for_principal.side_effect = RuntimeError("storage unavailable")
+
+    def _replay(ws: Any, ui: Any, request: Any) -> Any:
+        yield from session_replay_preamble(
+            ws.session,
+            ui,
+            project_name=request_replay_project_name(request),
+        )
+
+    ui = _make_ui()
+    _, blob = _drain_handler_yields(
+        ui,
+        session=session,
+        events_replay=_replay,
+        max_yields=3,
+    )
+
+    assert '"type": "connected"' in blob
+    assert '"project_name": ""' in blob
+
+
 def test_handler_replay_ok_skips_snapshot_emits_id(monkeypatch: Any) -> None:
     """``Last-Event-ID`` + buffer covers gap → emit buffered events
     with SSE ``id:`` field, SKIP the in-progress snapshot (it would
@@ -982,6 +1066,11 @@ class _HandoffSession:
         self.context_window = 1000
         self.reasoning_effort = "low"
         self._last_usage = {"prompt_tokens": 12, "completion_tokens": 0}
+        self.project_name_principals: list[str] = []
+
+    def project_name_for_principal(self, principal_id: str) -> str:
+        self.project_name_principals.append(principal_id)
+        return ""
 
     def register_listener_for_history_handoff(
         self,
@@ -1093,11 +1182,8 @@ def test_handoff_cursor_replay_keeps_preamble_without_pending_control_duplicate(
     session = _HandoffSession(ui)
 
     def _full_replay(_ws: Any, _ui: Any, _request: Any) -> Any:
-        # The full replay's own preamble half is what the replay_ok path
-        # must NOT re-run; the lifted body calls the shared
-        # session_replay_preamble directly instead (no per-kind hook).
-        yield {"type": "connected", "model": "test"}
-        yield {"type": "status", "total_tokens": 12}
+        # The kind-specific tail must NOT run on replay_ok; the lifted body
+        # calls the shared preamble directly and the ring owns controls.
         yield {"type": "approve_request", "items": [{"call_id": "duplicate"}]}
 
     _, blob = _drain_handler_yields(
@@ -1110,6 +1196,7 @@ def test_handoff_cursor_replay_keeps_preamble_without_pending_control_duplicate(
     )
 
     assert session.calls == [(session.token, 0)]
+    assert session.project_name_principals == ["viewer-1"]
     assert '"type": "connected"' in blob
     assert '"type": "status"' in blob
     assert '"type": "state_change"' in blob

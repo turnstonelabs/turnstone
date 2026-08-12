@@ -1,10 +1,8 @@
 """Shared mock factory for ``events_replay`` tests.
 
-Both interactive (:func:`turnstone.server._interactive_events_replay`)
-and coord (:func:`turnstone.console.server._coord_events_replay`) drive
-the same shared preamble at
-:func:`turnstone.core.session_replay.session_replay_preamble`.  Their
-test suites share the underlying mock surface (session.model,
+Interactive and coordinator replay tests exercise the same shared preamble at
+:func:`turnstone.core.session_replay.session_replay_preamble` plus their
+kind-specific tails. Their test suites share the underlying mock surface (session.model,
 session.model_alias, session._last_usage, ui._pending_*, ui._ws_lock,
 counters); this module is the single home for that shape so a future
 field add lands once.

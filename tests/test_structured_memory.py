@@ -20,10 +20,39 @@ def _save(name, content, **kwargs):
 
 
 class TestSaveStructuredMemory:
+    @pytest.mark.parametrize("save", [save_structured_memory, save_structured_memory_strict])
     @pytest.mark.parametrize("description", [None, "", "   "])
-    def test_description_is_required(self, tmp_db, description):
+    def test_description_is_required(self, tmp_db, description, save):
         with pytest.raises(ValueError, match="description is required"):
-            save_structured_memory_strict("test_key", "hello world", description=description)
+            save("test_key", "hello world", description=description)
+
+    def test_best_effort_save_still_swallows_storage_failures(self, tmp_db, monkeypatch):
+        from turnstone.core import memory as memory_mod
+
+        class _BoomStorage:
+            def upsert_structured_memory(self, *_args, **_kwargs):
+                raise RuntimeError("simulated storage failure")
+
+        monkeypatch.setattr(memory_mod, "get_storage", lambda: _BoomStorage())
+        assert save_structured_memory(
+            "test_key",
+            "hello world",
+            description="Test memory",
+        ) == (None, False)
+
+    def test_best_effort_save_does_not_misclassify_backend_value_error(self, tmp_db, monkeypatch):
+        from turnstone.core import memory as memory_mod
+
+        class _BoomStorage:
+            def upsert_structured_memory(self, *_args, **_kwargs):
+                raise ValueError("backend decode failure")
+
+        monkeypatch.setattr(memory_mod, "get_storage", lambda: _BoomStorage())
+        assert save_structured_memory(
+            "test_key",
+            "hello world",
+            description="Test memory",
+        ) == (None, False)
 
     def test_save_new(self, tmp_db):
         row, was_update = _save("test_key", "hello world")

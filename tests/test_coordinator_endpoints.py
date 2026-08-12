@@ -2102,39 +2102,35 @@ def test_coord_cancel_cascade_failure_does_not_fail_owner_cancel(storage):
 from tests._replay_helpers import make_replay_mocks as _make_coord_replay_mocks  # noqa: E402
 
 
-def test_coord_events_replay_yields_connected_first():
-    """Pre-status-bar coord replay only re-injected pending_approval +
-    pending_plan_review. Post-status-bar parity with interactive
-    yields ``connected`` first so the dashboard's status bar populates
-    the model cell before any history arrives — mirrors the
-    interactive replay (turnstone/server.py:_interactive_events_replay)."""
-    from turnstone.console.server import _coord_events_replay
+def test_coord_shared_preamble_yields_connected_first():
+    """The shared preamble gives coordinator streams the same bootstrap."""
+    from turnstone.core.session_replay import session_replay_preamble
 
-    ws, ui, request = _make_coord_replay_mocks()
-    out = list(_coord_events_replay(ws, ui, request))
+    ws, ui, _request = _make_coord_replay_mocks()
+    out = list(session_replay_preamble(ws.session, ui))
     assert out[0]["type"] == "connected"
     assert out[0]["model"] == "gpt-5"
     assert out[0]["model_alias"] == "default"
     assert out[0]["skip_permissions"] is False
 
 
-def test_coord_events_replay_includes_status_only_when_last_usage_present():
+def test_coord_shared_preamble_includes_status_only_when_last_usage_present():
     """The ``status`` event populates the per-tab token-usage bar on
     resume. Skipped when ``session._last_usage`` is None (a freshly-
     created coordinator that hasn't completed a turn) — matches
     interactive behaviour."""
-    from turnstone.console.server import _coord_events_replay
+    from turnstone.core.session_replay import session_replay_preamble
 
-    ws, ui, request = _make_coord_replay_mocks()
-    out = list(_coord_events_replay(ws, ui, request))
+    ws, ui, _request = _make_coord_replay_mocks()
+    out = list(session_replay_preamble(ws.session, ui))
     assert "status" not in {ev["type"] for ev in out}
 
 
-def test_coord_events_replay_status_payload_shape():
+def test_coord_shared_preamble_status_payload_shape():
     """When ``last_usage`` exists, the replayed ``status`` event carries
     every field the dashboard's updateStatusBar() reads — same shape
     SessionUI.on_status emits live."""
-    from turnstone.console.server import _coord_events_replay
+    from turnstone.core.session_replay import session_replay_preamble
 
     ws, ui, request = _make_coord_replay_mocks(
         last_usage={
@@ -2146,7 +2142,7 @@ def test_coord_events_replay_status_payload_shape():
         _ws_turn_tool_calls=3,
         _ws_messages=7,
     )
-    out = list(_coord_events_replay(ws, ui, request))
+    out = list(session_replay_preamble(ws.session, ui))
     status = next(ev for ev in out if ev["type"] == "status")
     assert status["prompt_tokens"] == 40000
     assert status["completion_tokens"] == 6310
@@ -2174,12 +2170,7 @@ def test_coord_events_replay_skips_session_block_when_no_session():
 
 
 def test_coord_events_replay_yields_pending_approval():
-    """The lifted coord ``events_replay`` callback yields, after the
-    connected preamble, the pending approval (if any). Pre-lift coord
-    pushed it onto the listener queue via ``put_nowait``; the lift
-    restructures as a generator the lifted body iterates and yields as
-    ``data:`` lines, but the payload identity is preserved. Pure-read —
-    never mutates ``ui``."""
+    """The coord replay tail yields pending approval without mutation."""
     from turnstone.console.server import _coord_events_replay
 
     ws, ui, request = _make_coord_replay_mocks(
@@ -2188,8 +2179,6 @@ def test_coord_events_replay_yields_pending_approval():
 
     out = list(_coord_events_replay(ws, ui, request))
     types = [ev["type"] for ev in out]
-    # Status preamble is yielded first (no last_usage → no status); the
-    # pending-approval re-injection then matches the pre-lift body.
     assert types[0] == "connected"
     assert "approve_request" in types
 
@@ -2246,9 +2235,7 @@ def test_coord_events_replay_skips_verdict_replay_without_pending_approval():
 
 
 def test_coord_events_replay_yields_only_connected_when_no_pending():
-    """A workstream with a session but no pending approval / plan
-    review and no last_usage yields just the ``connected`` preamble.
-    The lifted body falls through to the live loop immediately after."""
+    """Without controls or usage, replay contains only the preamble."""
     from turnstone.console.server import _coord_events_replay
 
     ws, ui, request = _make_coord_replay_mocks()

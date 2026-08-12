@@ -22,9 +22,17 @@ if TYPE_CHECKING:
     from turnstone.core.session import ChatSession
 
 
+def request_replay_project_name(request: Any) -> str:
+    """Return project metadata pre-resolved by the shared SSE route."""
+    value = getattr(getattr(request, "state", None), "_session_replay_project_name", "")
+    return value if isinstance(value, str) else ""
+
+
 def session_replay_preamble(
     session: ChatSession | None,
     ui: Any,
+    *,
+    project_name: str = "",
 ) -> Iterable[dict[str, Any]]:
     """Yield ``connected`` + optional ``status`` events for an SSE replay.
 
@@ -33,7 +41,8 @@ def session_replay_preamble(
       through to the kind-specific tail.
     - ``connected`` carries ``model`` / ``model_alias`` / ``skip_permissions``
       so the per-tab status bar populates the model cell before any
-      history arrives.
+      history arrives. The caller supplies the project display name already
+      resolved for the authenticated connection principal.
     - ``status`` only fires when ``session._last_usage`` exists (a
       session that has completed at least one turn). The payload shape
       matches :meth:`SessionUI.on_status` so live ticks and replays use
@@ -48,9 +57,9 @@ def session_replay_preamble(
         "type": "connected",
         "model": session.model,
         "model_alias": session.model_alias or "",
-        # The attached project's display name (""=none) so the composer can
-        # paint its "has a project" badge on connect, beside the model chip.
-        "project_name": getattr(session, "_project_name", "") or "",
+        # The visible attached-project display name (""=none) so the composer
+        # can paint its project badge on connect, beside the model chip.
+        "project_name": project_name,
         "skip_permissions": getattr(ui, "auto_approve", False),
     }
 

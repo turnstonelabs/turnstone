@@ -855,6 +855,13 @@ def search_history_recent(limit: int = 20, *, user_id: str | None = None) -> lis
 # -- Structured memories -------------------------------------------------------
 
 
+def _require_memory_description(description: str) -> str:
+    """Return a normalized description or raise the public validation error."""
+    if not isinstance(description, str) or not (normalized := description.strip()):
+        raise ValueError("memory description is required and must be non-empty")
+    return normalized
+
+
 def save_structured_memory(
     name: str,
     content: str,
@@ -873,16 +880,20 @@ def save_structured_memory(
     :meth:`StorageBackend.upsert_structured_memory`) -- no preceding read, no
     IntegrityError round-trip, no TOCTOU window.  ``(row, was_update)`` comes
     straight from that upsert (this passes a fresh ``memory_id``, so a differing
-    returned id means an existing row was updated in place).  A ``None``
-    ``description`` is required and must contain non-whitespace text for both
-    inserts and updates. A ``None`` ``mem_type`` keeps the stored value on an
-    update and uses the column default on insert.
+    returned id means an existing row was updated in place). ``description``
+    is required and must contain non-whitespace text for both inserts and
+    updates. A ``None`` ``mem_type`` keeps the stored value on an update and
+    uses the column default on insert.
     """
+    # Validate outside the best-effort storage boundary. Backend/driver
+    # ``ValueError`` instances remain operational failures; only this explicit
+    # caller-input check propagates.
+    normalized_description = _require_memory_description(description)
     try:
         return save_structured_memory_strict(
             name,
             content,
-            description=description,
+            description=normalized_description,
             mem_type=mem_type,
             scope=scope,
             scope_id=scope_id,
@@ -907,14 +918,12 @@ def save_structured_memory_strict(
 
     Unlike :func:`save_structured_memory`, storage failures propagate so an
     API or tool cannot report a database outage as an ordinary failed/not-found
-    result.  Prompt composition keeps using the best-effort facade.
+    result. Best-effort internal callers keep using the facade.
     """
     import uuid
 
     normalized = normalize_key(name)
-    normalized_description = (description or "").strip()
-    if not normalized_description:
-        raise ValueError("memory description is required and must be non-empty")
+    normalized_description = _require_memory_description(description)
     row, was_update = get_storage().upsert_structured_memory(
         str(uuid.uuid4()),
         normalized,

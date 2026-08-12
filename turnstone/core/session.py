@@ -18417,6 +18417,15 @@ class ChatSession:
             project_writable=project_writable,
         )
 
+    def project_name_for_principal(self, principal_id: str) -> str:
+        """Return the active attached-project name visible to ``principal_id``.
+
+        The principal is explicit so connection-level presentation never reads
+        the session's mutable acting-user binding. Project rename, archival,
+        and access revocation therefore take effect on the next lookup.
+        """
+        return self._memory_access(principal_id).project_name
+
     def _resolve_scope_id(self, scope: str, access: _MemoryAccess | None = None) -> str:
         """Map a validated scope to the actor-specific storage key."""
         resolved = access or self._memory_access()
