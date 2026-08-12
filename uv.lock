@@ -2639,7 +2639,7 @@ requires-dist = [
     { name = "lacme", specifier = ">=1.0.5" },
     { name = "mcp", specifier = ">=1.27,<2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14" },
-    { name = "openai", specifier = ">=2.45" },
+    { name = "openai", specifier = ">=2.45,<3" },
     { name = "pillow", specifier = ">=10" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.0" },
