@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
 
 class TestVersionHtml:
     def test_app_css_gets_version(self):
@@ -53,6 +57,13 @@ class TestVersionHtml:
         html = '<script src="/shared/hls-1.6.17/hls.min.js"></script>'
         result = version_html(html)
         assert result == html  # unchanged
+
+    def test_vendor_prefix_lookalike_is_still_versioned(self):
+        from turnstone.core.web_helpers import version_html
+
+        html = '<script src="/shared/hls-2-player.js"></script>'
+        result = version_html(html)
+        assert "/shared/hls-2-player.js?v=" in result
 
     def test_external_urls_not_modified(self):
         from turnstone.core.web_helpers import version_html
@@ -114,6 +125,140 @@ class TestVersionHtml:
         html = '<script src="/static/app.js?foo=bar"></script>'
         result = version_html(html)
         assert result == html  # unchanged — already has query string
+
+
+class TestRevalidatingStaticFiles:
+    def test_same_versioned_url_revalidates_after_asset_changes(self, tmp_path):
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone import __version__
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        asset = tmp_path / "app.js"
+        old_body = b"export const generation = 'old';"
+        new_body = b"export const generation = 'new';"
+        assert len(old_body) == len(new_body)
+        asset.write_bytes(old_body)
+        original_stat = asset.stat()
+        app = Starlette(
+            routes=[Mount("/static", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        with TestClient(app) as client:
+            url = f"/static/app.js?v={__version__}"
+            first = client.get(url)
+            assert first.status_code == 200
+            assert first.headers["cache-control"] == "no-cache"
+            assert "last-modified" not in first.headers
+            old_etag = first.headers["etag"]
+
+            asset.write_bytes(new_body)
+            os.utime(
+                asset,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+            changed_stat = asset.stat()
+            assert changed_stat.st_size == original_stat.st_size
+            assert changed_stat.st_mtime_ns == original_stat.st_mtime_ns
+
+            changed = client.get(url, headers={"If-None-Match": old_etag})
+            assert changed.status_code == 200
+            assert changed.content == new_body
+            assert changed.headers["etag"] != old_etag
+            assert changed.headers["cache-control"] == "no-cache"
+            assert "last-modified" not in changed.headers
+
+            stale_date_only = client.get(
+                url,
+                headers={"If-Modified-Since": "Wed, 31 Dec 9999 23:59:59 GMT"},
+            )
+            assert stale_date_only.status_code == 200
+            assert stale_date_only.content == new_body
+
+            unchanged = client.get(url, headers={"If-None-Match": changed.headers["etag"]})
+            assert unchanged.status_code == 304
+            assert unchanged.headers["cache-control"] == "no-cache"
+
+    def test_version_named_vendor_asset_is_immutable(self, tmp_path):
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        vendor_dir = tmp_path / "katex-0.18.4"
+        vendor_dir.mkdir()
+        (vendor_dir / "katex.min.css").write_text(".katex {}", encoding="utf-8")
+        app = Starlette(
+            routes=[Mount("/shared", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        with TestClient(app) as client:
+            resp = client.get("/shared/katex-0.18.4/katex.min.css")
+
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "public, max-age=31536000, immutable"
+        assert resp.headers["etag"]
+
+    def test_missing_asset_is_not_cached(self, tmp_path):
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from turnstone.core.web_helpers import RevalidatingStaticFiles
+
+        app = Starlette(
+            routes=[Mount("/shared", app=RevalidatingStaticFiles(directory=str(tmp_path)))]
+        )
+
+        with TestClient(app) as client:
+            resp = client.get("/shared/not-deployed-yet.js")
+
+        assert resp.status_code == 404
+        assert resp.headers["cache-control"] == "no-store"
+
+
+class TestStaticAssetCacheControl:
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("interactive.js", "no-cache"),
+            ("hls-2-player.js", "no-cache"),
+            ("katex-0.18.4/katex.min.css", "public, max-age=31536000, immutable"),
+            ("hljs-11.11.1/highlight.min.js", "public, max-age=31536000, immutable"),
+            ("katex-0.18.4/../private.json", "no-store"),
+            (r"katex-0.18.4\..\private.json", "no-store"),
+            ("nested//asset.js", "no-store"),
+        ],
+    )
+    def test_policy_requires_a_canonical_exact_vendor_path(self, path, expected):
+        from turnstone.core.web_helpers import static_asset_cache_control
+
+        assert static_asset_cache_control(path) == expected
+
+    def test_every_packaged_versioned_vendor_directory_uses_the_shared_policy(self):
+        import re
+        from pathlib import Path
+
+        import turnstone
+        from turnstone.core.web_helpers import static_asset_cache_control, version_html
+
+        shared_dir = Path(turnstone.__file__).resolve().parent / "shared_static"
+        versioned_dir = re.compile(r"^[a-z][a-z0-9_-]*-\d+(?:\.\d+)+$")
+        vendor_dirs = sorted(
+            path.name
+            for path in shared_dir.iterdir()
+            if path.is_dir() and versioned_dir.fullmatch(path.name)
+        )
+        assert vendor_dirs
+
+        for directory in vendor_dirs:
+            asset_path = f"{directory}/asset.js"
+            assert static_asset_cache_control(asset_path) == "public, max-age=31536000, immutable"
+            html = f'<script src="/shared/{asset_path}"></script>'
+            assert version_html(html) == html
 
 
 class TestLatin1SafeFilename:

@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
+
+from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException
+from starlette.responses import FileResponse, PlainTextResponse, Response
+from starlette.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
     from starlette.middleware import Middleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse
+    from starlette.types import Scope
 
 
 def latin1_safe_filename(name: str, *, fallback: str = "attachment") -> str:
@@ -463,6 +471,103 @@ def cors_middleware(origins: list[str]) -> Middleware:
 # Static asset cache-busting
 # ---------------------------------------------------------------------------
 
+# Keep this directory definition shared by the HTML rewriter and static response
+# policy.  These directories already carry their library version in the URL,
+# so their contents can be cached immutably; every other first-party asset must
+# revalidate because ES-module imports do not inherit the entry module's ?v=.
+_VERSIONED_VENDOR_DIR = r"(?:katex|hljs|hls|mermaid)-\d+(?:\.\d+)+"
+_VERSIONED_VENDOR_PATH_RE = re.compile(rf"^{_VERSIONED_VENDOR_DIR}/")
+
+
+def is_safe_static_asset_path(path: str) -> bool:
+    """Return whether *path* is a canonical mount-relative asset path.
+
+    Starlette decodes percent escapes before populating ``{path:path}``, and
+    HTTPX normalizes dot segments when it builds an outbound URL.  Reject the
+    ambiguous forms before a console proxy can leave its static mount.
+    """
+    return (
+        bool(path)
+        and "\\" not in path
+        and all(segment not in {"", ".", ".."} for segment in path.split("/"))
+    )
+
+
+def static_asset_cache_control(path: str) -> str:
+    """Return the cache policy for an asset path relative to its mount."""
+    if not is_safe_static_asset_path(path):
+        return "no-store"
+    if _VERSIONED_VENDOR_PATH_RE.match(path):
+        return "public, max-age=31536000, immutable"
+    return "no-cache"
+
+
+class RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles with correctness-first caching for first-party assets.
+
+    First-party files use a content-derived ETag and no Last-Modified header.
+    ``no-cache`` therefore revalidates by content on reload, even when two
+    builds share a package version, byte length, and filesystem timestamp.
+    Version-named vendor directories retain immutable caching.
+    """
+
+    @cached_property
+    def _content_etags(self) -> dict[str, tuple[tuple[int, int, int], str]]:
+        """Lazily allocate the bounded per-static-tree validator cache."""
+        return {}
+
+    def _content_etag(
+        self,
+        full_path: str | os.PathLike[str],
+        stat_result: os.stat_result,
+    ) -> str:
+        path = os.fspath(full_path)
+        signature = (stat_result.st_mtime_ns, stat_result.st_ctime_ns, stat_result.st_size)
+        cached = self._content_etags.get(path)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        with open(path, "rb") as asset:
+            digest = hashlib.file_digest(asset, "sha256").hexdigest()
+        etag = f'"sha256-{digest}"'
+        self._content_etags[path] = (signature, etag)
+        return etag
+
+    def file_response(
+        self,
+        full_path: str | os.PathLike[str],
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        asset_path = self.get_path(scope)
+        if static_asset_cache_control(asset_path) != "no-cache":
+            return super().file_response(full_path, stat_result, scope, status_code)
+
+        request_headers = Headers(scope=scope)
+        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
+        etag = self._content_etag(full_path, stat_result)
+        response.headers["ETag"] = etag
+        del response.headers["Last-Modified"]
+        if self.is_not_modified(response.headers, request_headers):
+            return Response(status_code=304, headers={"ETag": etag})
+        return response
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        try:
+            response = await super().get_response(path, scope)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            return PlainTextResponse(
+                "Not Found", status_code=404, headers={"Cache-Control": "no-store"}
+            )
+        cache_control = (
+            "no-store" if response.status_code >= 400 else static_asset_cache_control(path)
+        )
+        response.headers["Cache-Control"] = cache_control
+        return response
+
+
 # Matches src="/static/..." and href="/shared/..." (and vice-versa) but skips
 # vendored libraries whose directory names already contain a version number
 # (e.g. katex-0.16.44/, hljs-11.11.1/) and URLs that already have a query
@@ -470,7 +575,7 @@ def cors_middleware(origins: list[str]) -> Middleware:
 _ASSET_RE = re.compile(
     r'(?P<attr>(?:src|href)=")'
     r"(?P<path>/(?:static|shared)/)"
-    r"(?!(?:katex|hljs|hls|mermaid)-\d)"
+    rf"(?!{_VERSIONED_VENDOR_DIR}/)"
     r'(?P<file>[^"?]+)"'
 )
 
@@ -480,7 +585,7 @@ def version_html(html: str) -> str:
 
     Vendored libraries with version-bearing directory names are skipped.
     URLs that already contain a query string are left unchanged.
-    Called once at startup when loading HTML into memory.
+    Safe to call either at startup or while rendering a dynamic template.
     """
     from turnstone import __version__
 

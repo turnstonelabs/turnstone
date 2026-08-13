@@ -42,7 +42,6 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
-from starlette.staticfiles import StaticFiles
 
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
@@ -114,6 +113,7 @@ from turnstone.core.session_ui_base import (
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.trajectory import final_assistant_text
+from turnstone.core.web_helpers import RevalidatingStaticFiles
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
@@ -5802,8 +5802,16 @@ def create_app(
             Route("/metrics", metrics_endpoint),
             Route("/openapi.json", _openapi_handler),
             Route("/docs", _docs_handler),
-            Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
-            Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
+            Mount(
+                "/static",
+                app=RevalidatingStaticFiles(directory=str(_STATIC_DIR)),
+                name="static",
+            ),
+            Mount(
+                "/shared",
+                app=RevalidatingStaticFiles(directory=str(_SHARED_DIR)),
+                name="shared",
+            ),
         ],
         middleware=_build_middleware(cors_origins),
         lifespan=_lifespan,

@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import contextlib
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -38,7 +39,6 @@ from starlette.background import BackgroundTask
 from starlette.middleware import Middleware
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
-from starlette.staticfiles import StaticFiles
 
 from turnstone.api.console_spec import build_console_spec
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
@@ -110,8 +110,12 @@ from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.web_helpers import (
+    RevalidatingStaticFiles,
+    is_safe_static_asset_path,
     read_json_or_400,
     require_storage_or_503,
+    static_asset_cache_control,
+    version_html,
 )
 from turnstone.core.workstream import (
     Workstream,
@@ -147,10 +151,6 @@ _HTML_ETAG = ""
 
 
 def _load_static() -> None:
-    import hashlib
-
-    from turnstone.core.web_helpers import version_html
-
     global _HTML, _HTML_ETAG
     _HTML = version_html((_STATIC_DIR / "index.html").read_text(encoding="utf-8"))
     _HTML_ETAG = '"' + hashlib.md5(_HTML.encode()).hexdigest()[:16] + '"'  # noqa: S324
@@ -3032,52 +3032,66 @@ async def proxy_index(request: Request) -> Response:
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
 
-async def proxy_static(request: Request) -> Response:
-    """GET /node/{node_id}/static/{path} — proxy static files."""
+def _proxy_static_request_headers(request: Request) -> dict[str, str]:
+    """Build upstream headers for a cache-aware static asset request."""
+    headers = _proxy_auth_headers(request)
+    for name in ("if-none-match", "if-modified-since"):
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+    return headers
+
+
+def _proxy_static_response(resp: httpx.Response, path: str) -> Response:
+    """Preserve upstream validators and apply the local static cache policy."""
+    cache_control = "no-store"
+    if resp.status_code in (200, 304):
+        cache_control = resp.headers.get("cache-control") or static_asset_cache_control(path)
+    headers = {"Cache-Control": cache_control}
+    for name in ("content-type", "etag", "last-modified"):
+        value = resp.headers.get(name)
+        if value:
+            headers[name] = value
+    return Response(content=resp.content, status_code=resp.status_code, headers=headers)
+
+
+def _static_proxy_error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        {"error": message}, status_code=status_code, headers={"Cache-Control": "no-store"}
+    )
+
+
+async def _proxy_static_mount(request: Request, mount: str) -> Response:
+    """Proxy one validated static mount without URL-normalization ambiguity."""
     node_id = request.path_params["node_id"]
     path = request.path_params["path"]
+    if not is_safe_static_asset_path(path):
+        return _static_proxy_error("Invalid static asset path", 400)
     server_url = _get_server_url(request, node_id)
     if not server_url:
-        return JSONResponse({"error": "Node not found"}, status_code=404)
+        return _static_proxy_error("Node not found", 404)
 
+    encoded_path = "/".join(urllib.parse.quote(segment, safe="") for segment in path.split("/"))
     client: httpx.AsyncClient = request.app.state.proxy_client
     try:
         resp = await client.get(
-            f"{server_url}/static/{path}",
-            headers=_proxy_auth_headers(request),
+            f"{server_url}/{mount}/{encoded_path}",
+            headers=_proxy_static_request_headers(request),
         )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/octet-stream"),
-        )
+        return _proxy_static_response(resp, path)
     except httpx.HTTPError as exc:
-        log.debug("Proxy static error for %s/%s: %s", node_id, path, exc)
-        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+        log.debug("Proxy %s error for %s/%s: %s", mount, node_id, path, exc)
+        return _static_proxy_error("Node unreachable", 502)
+
+
+async def proxy_static(request: Request) -> Response:
+    """GET /node/{node_id}/static/{path} — proxy static files."""
+    return await _proxy_static_mount(request, "static")
 
 
 async def proxy_shared_static(request: Request) -> Response:
     """GET /node/{node_id}/shared/{path} — proxy shared static files."""
-    node_id = request.path_params["node_id"]
-    path = request.path_params["path"]
-    server_url = _get_server_url(request, node_id)
-    if not server_url:
-        return JSONResponse({"error": "Node not found"}, status_code=404)
-
-    client: httpx.AsyncClient = request.app.state.proxy_client
-    try:
-        resp = await client.get(
-            f"{server_url}/shared/{path}",
-            headers=_proxy_auth_headers(request),
-        )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/octet-stream"),
-        )
-    except httpx.HTTPError as exc:
-        log.debug("Proxy shared static error for %s/%s: %s", node_id, path, exc)
-        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    return await _proxy_static_mount(request, "shared")
 
 
 # Auth endpoints the console handles locally instead of forwarding to
@@ -3965,14 +3979,18 @@ async def coordinator_page(request: Request) -> Response:
     if not template_path.is_file():
         return JSONResponse({"error": "coordinator UI template missing"}, status_code=500)
     try:
-        body = template_path.read_text(encoding="utf-8")
+        body = version_html(template_path.read_text(encoding="utf-8"))
     except OSError:
         return JSONResponse({"error": "failed to read coordinator UI template"}, status_code=500)
     # Inject the ws_id as an HTML attribute.  ws_id passed the
     # ``_VALID_WS_ID_RE`` gate above (hex only) so there's nothing
     # to HTML-escape; leave the replacement simple.
     body = body.replace("{{WS_ID}}", ws_id)
-    return Response(body, media_type="text/html; charset=utf-8")
+    etag = '"' + hashlib.md5(body.encode()).hexdigest()[:16] + '"'  # noqa: S324
+    headers = {"Cache-Control": "no-cache", "ETag": etag}
+    if request.headers.get("If-None-Match") == etag:
+        return Response(status_code=304, headers=headers)
+    return HTMLResponse(body, headers=headers)
 
 
 _CHILDREN_PAGE_LIMIT = 200
@@ -16471,8 +16489,16 @@ def create_app(
             Route("/metrics", console_metrics_endpoint),
             Route("/openapi.json", _openapi_handler),
             Route("/docs", _docs_handler),
-            Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
-            Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
+            Mount(
+                "/static",
+                app=RevalidatingStaticFiles(directory=str(_STATIC_DIR)),
+                name="static",
+            ),
+            Mount(
+                "/shared",
+                app=RevalidatingStaticFiles(directory=str(_SHARED_DIR)),
+                name="shared",
+            ),
             # Coordinator one-pane UI — the route serves a single
             # index.html template with the ws_id injected via data-ws-id
             # so coordinator.js can pull it without an extra round-trip.

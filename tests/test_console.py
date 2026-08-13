@@ -1587,6 +1587,168 @@ class TestConsoleProxy:
         mock_collector.get_node_detail.return_value = None
         resp = client.get("/node/unknown/static/app.js")
         assert resp.status_code == 404
+        assert resp.headers["cache-control"] == "no-store"
+
+    @pytest.mark.parametrize("mount", ["static", "shared"])
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "%2e%2e/%2e%2e/v1/api/workstreams/private/history",
+            "%2E%2E/%2E%2E/v1/api/workstreams/private/history",
+            "%2e%2e%2f%2e%2e%2fv1%2fapi%2fworkstreams",
+            "%5c..%5c..%5cv1%5capi%5cworkstreams",
+        ],
+    )
+    def test_proxy_static_rejects_encoded_traversal_before_upstream(self, mount, suffix):
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+
+        from turnstone.console import server as csrv
+
+        handler = csrv.proxy_static if mount == "static" else csrv.proxy_shared_static
+        app = Starlette(
+            routes=[Route(f"/node/{{node_id}}/{mount}/{{path:path}}", endpoint=handler)]
+        )
+        app.state.proxy_client = MagicMock()
+
+        with TestClient(app) as client:
+            resp = client.get(f"/node/node-a/{mount}/katex-0.18.4/{suffix}")
+
+        assert resp.status_code == 400
+        assert resp.headers["cache-control"] == "no-store"
+        app.state.proxy_client.get.assert_not_called()
+
+    def test_proxy_static_percent_encodes_each_valid_path_segment(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import httpx
+
+        from turnstone.console import server as csrv
+
+        upstream = httpx.Response(
+            200,
+            content=b"asset",
+            request=httpx.Request("GET", "http://n:1/static/nested/asset"),
+        )
+        calls = []
+
+        async def _mock_get(url, *, headers):
+            calls.append((url, headers))
+            return upstream
+
+        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client.get = MagicMock(side_effect=_mock_get)
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
+            path_params={"node_id": "node-a", "path": "nested/asset name?#.js"},
+            headers={},
+        )
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+        monkeypatch.setattr(csrv, "_get_server_url", lambda request, node_id: "http://n:1")
+
+        resp = asyncio.run(csrv.proxy_static(request))
+
+        assert calls == [("http://n:1/static/nested/asset%20name%3F%23.js", {})]
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-cache"
+
+    @pytest.mark.parametrize(
+        ("handler_name", "mount", "path"),
+        [
+            ("proxy_static", "static", "app.js"),
+            ("proxy_shared_static", "shared", "interactive.js"),
+        ],
+    )
+    def test_proxy_static_forwards_conditional_request_and_validators(
+        self, monkeypatch, handler_name, mount, path
+    ):
+        from types import SimpleNamespace
+
+        import httpx
+
+        from turnstone.console import server as csrv
+
+        upstream = httpx.Response(
+            304,
+            headers={
+                "etag": '"current-build"',
+                "last-modified": "Wed, 12 Aug 2026 12:00:00 GMT",
+            },
+            request=httpx.Request("GET", f"http://n:1/{mount}/{path}"),
+        )
+        calls = []
+
+        async def _mock_get(url, *, headers):
+            calls.append((url, headers))
+            return upstream
+
+        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client.get = MagicMock(side_effect=_mock_get)
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
+            path_params={"node_id": "node-a", "path": path},
+            headers={"if-none-match": '"current-build"'},
+        )
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {"X-Auth": "test"})
+        monkeypatch.setattr(csrv, "_get_server_url", lambda request, node_id: "http://n:1")
+
+        resp = asyncio.run(getattr(csrv, handler_name)(request))
+
+        assert calls == [
+            (
+                f"http://n:1/{mount}/{path}",
+                {"X-Auth": "test", "if-none-match": '"current-build"'},
+            )
+        ]
+        assert resp.status_code == 304
+        assert resp.headers["cache-control"] == "no-cache"
+        assert resp.headers["etag"] == '"current-build"'
+        assert resp.headers["last-modified"] == "Wed, 12 Aug 2026 12:00:00 GMT"
+
+    @pytest.mark.parametrize("status_code", [404, 500])
+    def test_proxy_vendor_static_error_is_never_immutable(self, status_code):
+        import httpx
+
+        from turnstone.console.server import _proxy_static_response
+
+        upstream = httpx.Response(
+            status_code,
+            content=b"transient failure",
+            request=httpx.Request("GET", "http://n:1/shared/katex-0.18.4/missing.css"),
+        )
+
+        resp = _proxy_static_response(upstream, "katex-0.18.4/missing.css")
+
+        assert resp.status_code == status_code
+        assert resp.headers["cache-control"] == "no-store"
+
+    @pytest.mark.parametrize(
+        ("upstream_policy", "expected"),
+        [
+            ("no-store", "no-store"),
+            ("private, max-age=600", "private, max-age=600"),
+            ("public, max-age=0, must-revalidate", "public, max-age=0, must-revalidate"),
+            ("public, max-age=60", "public, max-age=60"),
+        ],
+    )
+    def test_proxy_vendor_static_preserves_stricter_upstream_policy(
+        self, upstream_policy, expected
+    ):
+        import httpx
+
+        from turnstone.console.server import _proxy_static_response
+
+        upstream = httpx.Response(
+            200,
+            content=b"asset",
+            headers={"cache-control": upstream_policy},
+            request=httpx.Request("GET", "http://n:1/shared/katex-0.18.4/katex.js"),
+        )
+
+        resp = _proxy_static_response(upstream, "katex-0.18.4/katex.js")
+
+        assert resp.headers["cache-control"] == expected
 
     def test_proxy_api_unknown_node_returns_404(self, client, mock_collector):
         mock_collector.get_node_detail.return_value = None
@@ -2447,6 +2609,7 @@ class TestProxySharedStatic:
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         resp = client.get("/node/unknown/shared/base.css")
         assert resp.status_code == 404
+        assert resp.headers["cache-control"] == "no-store"
         client.close()
 
 

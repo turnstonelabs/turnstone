@@ -26,6 +26,8 @@ def client():
 
 
 def test_valid_ws_id_injects_data_attr(client):
+    from turnstone import __version__
+
     ws_id = "a" * 32
     resp = client.get(f"/coordinator/{ws_id}")
     assert resp.status_code == 200
@@ -35,9 +37,27 @@ def test_valid_ws_id_injects_data_attr(client):
     assert f'data-ws-id="{ws_id}"' in body
     # Template placeholder is fully substituted.
     assert "{{WS_ID}}" not in body
-    # Sanity: the shared static imports are wired.
-    assert "/shared/base.css" in body
-    assert "/static/coordinator/coordinator.js" in body
+    # First-party tags are versioned; version-named vendor assets stay stable.
+    assert f"/shared/base.css?v={__version__}" in body
+    assert f"/static/coordinator/coordinator.css?v={__version__}" in body
+    assert "/shared/katex-0.18.4/katex.min.css?v=" not in body
+    # Inline module imports are outside version_html's src/href boundary.  The
+    # static route's no-cache policy makes this URL revalidate on every reload.
+    assert 'from "/static/coordinator/coordinator.js"' in body
+
+
+def test_coordinator_page_revalidates_with_etag(client):
+    ws_id = "b" * 32
+    first = client.get(f"/coordinator/{ws_id}")
+    assert first.headers["cache-control"] == "no-cache"
+    assert first.headers["etag"]
+
+    unchanged = client.get(
+        f"/coordinator/{ws_id}", headers={"If-None-Match": first.headers["etag"]}
+    )
+    assert unchanged.status_code == 304
+    assert unchanged.headers["cache-control"] == "no-cache"
+    assert unchanged.headers["etag"] == first.headers["etag"]
 
 
 def test_non_hex_ws_id_returns_400(client):

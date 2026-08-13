@@ -91,6 +91,8 @@ class TestServerVersioning:
     def test_shared_static_unversioned(self, client):
         resp = client.get("/shared/base.css")
         assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-cache"
+        assert resp.headers["etag"]
 
 
 class TestConsoleVersioning:
@@ -147,3 +149,5 @@ class TestConsoleVersioning:
         resp = client.get("/static/app.js")
         body = resp.text
         assert "/v1/api/cluster" in body
+        assert resp.headers["cache-control"] == "no-cache"
+        assert resp.headers["etag"]
