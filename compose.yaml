@@ -53,8 +53,9 @@
 # The node registers in Postgres, auto-enrolls its mTLS cert from the console's
 # ACME endpoint (when the cluster runs mTLS), and the console collector reaches
 # it back via host.docker.internal. To join from ANOTHER machine, set
-# TURNSTONE_HOST_IP to this host's LAN IP and use it in the URLs above (and the
-# node's TURNSTONE_ADVERTISE_URL = the NODE host's IP) — see docs/docker.md.
+# TURNSTONE_HOST_IP to this host's LAN IP and set TURNSTONE_ACME_EXTERNAL_URL to
+# http://<this-host-ip>:8090/acme. Use the same host IP in the node's URLs above
+# (and the NODE host's IP in TURNSTONE_ADVERTISE_URL) — see docs/docker.md.
 # =============================================================================
 
 name: turnstone
@@ -154,9 +155,11 @@ services:
     # Publishes the console's plain-HTTP listener so a bare-metal node can reach
     # the ACME endpoint, fetch the CA, and enroll its cert (the console serves
     # HTTP here even under mTLS). Bound to 127.0.0.1 by default; setting
-    # TURNSTONE_HOST_IP exposes the WHOLE console HTTP API — including the
-    # cert-issuing ACME endpoint — on that interface, so the JWT secret's
-    # strength is the only gate. Browsers use Caddy :8443, never this port.
+    # TURNSTONE_HOST_IP exposes the WHOLE console HTTP API on that interface.
+    # ACME signing routes require a dedicated short-lived service JWT, but the
+    # listener and bearer token are still plain HTTP: bind only a trusted LAN
+    # or VPN interface and restrict it to enrolling nodes. Browsers use Caddy
+    # :8443, never this port.
     ports:
       - "${TURNSTONE_HOST_IP:-127.0.0.1}:8090:8090"
     environment:
@@ -164,6 +167,9 @@ services:
       TURNSTONE_DB_BACKEND: *db-backend
       TURNSTONE_DB_URL: *db-url
       TURNSTONE_CONSOLE_URL: http://console:8090
+      # Separate from TURNSTONE_CONSOLE_URL: this is the canonical responder
+      # base embedded in ACME directory/order URLs for cross-host enrollment.
+      TURNSTONE_ACME_EXTERNAL_URL: "${TURNSTONE_ACME_EXTERNAL_URL:-}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -305,6 +311,9 @@ services:
       SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
       TURNSTONE_NODE_ID: node-1
       TURNSTONE_ADVERTISE_URL: http://node-1:8080
+      # Lets the authenticated ACME client follow the console's canonical LAN
+      # URLs without trusting destinations learned from the public directory.
+      TURNSTONE_ACME_EXTERNAL_URL: "${TURNSTONE_ACME_EXTERNAL_URL:-}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

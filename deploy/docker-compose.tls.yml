@@ -38,10 +38,18 @@ services:
         condition: service_completed_successfully
     volumes:
       - tls-certs:/certs:ro
+    # The production base keeps :8090 private. The TLS overlay publishes it on
+    # localhost for same-host enrollment; use a trusted LAN/VPN address for a
+    # remote node and firewall it to that node.
+    ports:
+      - "${TURNSTONE_CONSOLE_HTTP_BIND:-127.0.0.1}:8090:8090"
     environment:
       TURNSTONE_TLS_ENABLED: "true"
       TURNSTONE_TLS_SANS: "console"
       TURNSTONE_CONSOLE_URL: "http://console:8090"
+      # Canonical ACME responder base advertised to enrolling nodes. Set this
+      # when they reach the console through a different host/address.
+      TURNSTONE_ACME_EXTERNAL_URL: "${TURNSTONE_ACME_EXTERNAL_URL:-}"
     command:
       - turnstone-console
       - --host=0.0.0.0
@@ -58,11 +66,7 @@ services:
     environment:
       TURNSTONE_TLS_ENABLED: "true"
       TURNSTONE_TLS_SANS: "server"
-    # Disable healthcheck — server serves HTTPS with mTLS which the
-    # stdlib healthcheck script can't satisfy. The base compose
-    # healthcheck uses plain HTTP which won't work on an HTTPS listener.
-    healthcheck:
-      disable: true
+      TURNSTONE_ACME_EXTERNAL_URL: "${TURNSTONE_ACME_EXTERNAL_URL:-}"
 
   # Channel: TLS
   channel:

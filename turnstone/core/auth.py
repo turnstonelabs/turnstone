@@ -71,6 +71,7 @@ JWT_ISSUER = "turnstone"
 JWT_AUD_SERVER = "turnstone-server"
 JWT_AUD_CONSOLE = "turnstone-console"
 JWT_AUD_CHANNEL = "turnstone-channel"
+TLS_ACME_TOKEN_SOURCE = "tls-acme-enrollment"
 _MIN_SECRET_LENGTH = 32  # 256 bits minimum for HMAC-SHA256
 
 VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "approve", "service"})
@@ -685,7 +686,19 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         "/api/auth/oidc/callback",
     }
 )
-PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/", "/acme/")
+PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/")
+
+# ACME discovery/bootstrap material is public because a node does not have a
+# cluster identity yet.  Everything capable of creating or changing an order
+# is authenticated separately below: lacme's lightweight responder deliberately
+# does not validate ACME JWS signatures or nonces itself.
+ACME_PUBLIC_PATHS: frozenset[str] = frozenset(
+    {
+        "/acme/directory",
+        "/acme/new-nonce",
+        "/acme/ca.pem",
+    }
+)
 
 WRITE_PATHS: frozenset[str] = frozenset(
     {
@@ -717,6 +730,14 @@ def _strip_version_prefix(path: str) -> str:
     if path.startswith("/v1/"):
         return path[3:]
     return path
+
+
+def _is_protected_acme_path(path: str) -> bool:
+    """Return whether *path* is an authenticated ACME responder resource."""
+    normalized = _strip_version_prefix(path)
+    return (
+        normalized == "/acme" or normalized.startswith("/acme/")
+    ) and normalized not in ACME_PUBLIC_PATHS
 
 
 # ---------------------------------------------------------------------------
@@ -1011,7 +1032,7 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
 def is_public_path(path: str) -> bool:
     """Return *True* if the path should be accessible without authentication."""
     normalized = _strip_version_prefix(path)
-    if normalized in PUBLIC_PATHS:
+    if normalized in PUBLIC_PATHS or normalized in ACME_PUBLIC_PATHS:
         return True
     if any(normalized.startswith(prefix) for prefix in PUBLIC_PREFIXES):
         return True
@@ -1038,6 +1059,13 @@ def required_scope(method: str, path: str) -> str:
     """
     normalized = _strip_version_prefix(path)
     normalized = normalized.rstrip("/") if normalized != "/" else normalized
+
+    # The responder auto-approves challenges, so every non-bootstrap ACME route
+    # is a cluster-CA signing surface.  ``service`` cannot be granted through
+    # user-facing token mints; check_request additionally pins the token source
+    # to the dedicated enrollment identity.
+    if normalized == "/acme" or normalized.startswith("/acme/"):
+        return "service"
 
     # Admin endpoints require approve scope
     if normalized.startswith(ADMIN_PREFIX):
@@ -1228,6 +1256,13 @@ def check_request(
     )
     if result is None:
         return False, 401, "Unauthorized: missing or invalid token", None
+
+    is_protected_acme = _is_protected_acme_path(path)
+    is_enrollment_token = result.token_source == TLS_ACME_TOKEN_SOURCE
+    if is_protected_acme and not is_enrollment_token:
+        return False, 403, "Forbidden: token is not valid for ACME enrollment", None
+    if is_enrollment_token and not is_protected_acme:
+        return False, 403, "Forbidden: ACME enrollment token is not valid for this resource", None
 
     # Version gate — reject tokens minted by a different major.minor.
     # Tokens without a ``ver`` claim are accepted (backward compat).
@@ -1631,6 +1666,11 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
             jwt_audience=audience,
             storage=storage,
         )
+        # Enrollment JWTs are capabilities for the protected ACME responder,
+        # not general service credentials.  In particular, never let the
+        # legacy token-exchange path extend one into a fresh 24-hour session.
+        if result is not None and result.token_source == TLS_ACME_TOKEN_SOURCE:
+            result = None
 
     if result is None:
         # Record failed attempt for rate limiting

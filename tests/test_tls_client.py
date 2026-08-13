@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from turnstone.core.storage import get_storage, init_storage, reset_storage
-
-lacme = pytest.importorskip("lacme")
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +57,49 @@ def test_explicit_console_url_skips_discovery():
     assert client._console_url == "http://explicit:9090"
 
 
+@pytest.mark.anyio
+async def test_ca_fetch_preserves_explicit_https(monkeypatch):
+    """A trusted HTTPS bootstrap proxy must not be silently downgraded."""
+    from turnstone.core import tls as tls_module
+
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        content = b"ca-pem"
+
+        def raise_for_status(self):
+            pass
+
+    class FakeHTTPClient:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def get(self, url):
+            seen["url"] = url
+            return FakeResponse()
+
+    monkeypatch.setattr(tls_module.httpx2, "AsyncClient", FakeHTTPClient)
+    client = tls_module.TLSClient(
+        storage=get_storage(),
+        console_url="https://console.example:8443",
+        hostnames=["node-1"],
+    )
+
+    await client._fetch_ca_cert()
+
+    assert seen == {
+        "kwargs": {"trust_env": False},
+        "url": "https://console.example:8443/acme/ca.pem",
+    }
+    assert client.ca_pem == b"ca-pem"
+
+
 # ── SSL context construction ─────────────────────────────────────────────────
 
 
@@ -74,6 +116,280 @@ async def test_ssl_contexts_none_before_init():
     assert client.get_server_ssl_context() is None
     assert client.get_client_ssl_context() is None
     assert not client.initialized
+
+
+@pytest.mark.anyio
+async def test_request_reissues_legacy_dns_ip_as_ip_san(monkeypatch):
+    """A legacy DNS:<ip> row is not reused for a typed IP node identity."""
+    import lacme
+    from cryptography import x509
+
+    from turnstone.core import tls as tls_module
+
+    ca = lacme.CertificateAuthority()
+    ca.init()
+    legacy = ca.issue(["192.0.2.10"])
+    replacement = ca.issue([ipaddress.IPv4Address("192.0.2.10")])
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self._store = kwargs["store"]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def issue(self, identifiers):
+            captured["identifiers"] = identifiers
+            return self._store.save_cert(replacement)
+
+    monkeypatch.setattr(tls_module.lacme, "Client", FakeClient)
+    client = tls_module.TLSClient(
+        storage=get_storage(),
+        console_url="http://console:8090",
+        hostnames=["192.0.2.10"],
+    )
+    client._ca_pem = ca.root_cert_pem
+    client._store.save_cert(legacy)
+
+    await client._request_cert()
+
+    assert captured["identifiers"] == [ipaddress.IPv4Address("192.0.2.10")]
+    assert client.bundle is not None
+    assert client.bundle.cert_pem == replacement.cert_pem
+    sans = (
+        x509.load_pem_x509_certificate(client.bundle.cert_pem)
+        .extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        .value
+    )
+    assert list(sans) == [x509.IPAddress(ipaddress.IPv4Address("192.0.2.10"))]
+    assert client._store.load_cert("192.0.2.10").cert_pem == replacement.cert_pem
+
+
+# ── Renewal client lifecycle ─────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_renewal_uses_public_stop_and_close(monkeypatch):
+    """The manager and HTTPX2-backed lacme client both release their resources."""
+    from turnstone.core import tls as tls_module
+
+    state: dict[str, bool] = {}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            state["client_created"] = True
+
+        async def close(self):
+            state["client_closed"] = True
+
+    class FakeRenewalManager:
+        def __init__(self, **kwargs):
+            state["manager_created"] = True
+            state["renewal_policy"] = {
+                "interval_hours": kwargs["interval_hours"],
+                "days_before_expiry": kwargs["days_before_expiry"],
+                "max_jitter_seconds": kwargs["max_jitter_seconds"],
+            }
+
+        def start(self):
+            state["manager_started"] = True
+
+        async def stop(self):
+            state["manager_stopped"] = True
+
+    monkeypatch.setattr(tls_module.lacme, "Client", FakeClient)
+    monkeypatch.setattr(tls_module.lacme, "RenewalManager", FakeRenewalManager)
+
+    client = tls_module.TLSClient(
+        storage=get_storage(),
+        console_url="http://console:8090",
+        hostnames=["node-1"],
+    )
+    await client.start_renewal()
+    http_client = client._renewal_http_client
+    assert http_client is not None
+    await client.stop_renewal()
+
+    assert state == {
+        "client_created": True,
+        "manager_created": True,
+        "renewal_policy": {
+            "interval_hours": 12,
+            "days_before_expiry": 1,
+            "max_jitter_seconds": 600,
+        },
+        "manager_started": True,
+        "manager_stopped": True,
+        "client_closed": True,
+    }
+    assert client._renewal_manager is None
+    assert client._renewal_client is None
+    assert client._renewal_http_client is None
+    assert http_client.is_closed
+
+
+def test_renewal_policy_has_one_failure_headroom():
+    """The next retry after one failed due sweep still precedes expiry."""
+    from turnstone.core.tls import (
+        CERT_VALIDITY_HOURS,
+        RENEW_INTERVAL_HOURS,
+        RENEW_MAX_JITTER_SECONDS,
+    )
+
+    max_sleep_seconds = RENEW_INTERVAL_HOURS * 3600 + RENEW_MAX_JITTER_SECONDS
+    assert 3 * max_sleep_seconds < CERT_VALIDITY_HOURS * 3600
+
+
+@pytest.mark.anyio
+async def test_renewal_start_failure_closes_client(monkeypatch):
+    """A failed manager start must not leak its HTTPX2-backed lacme client."""
+    from turnstone.core import tls as tls_module
+
+    state: dict[str, bool] = {}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def close(self):
+            state["client_closed"] = True
+
+    class FailingRenewalManager:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("could not start")
+
+    monkeypatch.setattr(tls_module.lacme, "Client", FakeClient)
+    monkeypatch.setattr(tls_module.lacme, "RenewalManager", FailingRenewalManager)
+
+    client = tls_module.TLSClient(
+        storage=get_storage(),
+        console_url="http://console:8090",
+        hostnames=["node-1"],
+    )
+    with pytest.raises(RuntimeError, match="could not start"):
+        await client.start_renewal()
+
+    assert state == {"client_closed": True}
+    assert client._renewal_manager is None
+    assert client._renewal_client is None
+    assert client._renewal_http_client is None
+
+
+@pytest.mark.anyio
+async def test_renewal_start_failure_preserves_original_when_close_fails(monkeypatch):
+    """Cleanup errors must not replace the manager startup failure."""
+    from turnstone.core import tls as tls_module
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def close(self):
+            raise RuntimeError("close failed")
+
+    class FailingRenewalManager:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("could not start")
+
+    monkeypatch.setattr(tls_module.lacme, "Client", FakeClient)
+    monkeypatch.setattr(tls_module.lacme, "RenewalManager", FailingRenewalManager)
+    client = tls_module.TLSClient(
+        storage=get_storage(),
+        console_url="http://console:8090",
+        hostnames=["node-1"],
+    )
+
+    with pytest.raises(RuntimeError, match="could not start"):
+        await client.start_renewal()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("anyio_backend", ["asyncio"])
+async def test_renewal_stop_finishes_cleanup_before_propagating_repeated_cancellation(
+    monkeypatch, anyio_backend
+):
+    """Manager, lacme client, and HTTPX2 transport close despite cancellation."""
+    import asyncio
+
+    from turnstone.core import tls as tls_module
+
+    manager_entered = asyncio.Event()
+    release_manager = asyncio.Event()
+    client_entered = asyncio.Event()
+    release_client = asyncio.Event()
+    events: list[str] = []
+
+    class FakeHTTPClient:
+        async def aclose(self):
+            events.append("http_closed")
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def close(self):
+            events.append("client_entered")
+            client_entered.set()
+            await release_client.wait()
+            events.append("client_closed")
+
+    class FakeRenewalManager:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        async def stop(self):
+            events.append("manager_entered")
+            manager_entered.set()
+            await release_manager.wait()
+            events.append("manager_stopped")
+
+    monkeypatch.setattr(tls_module, "build_acme_http_client", lambda *_a, **_kw: FakeHTTPClient())
+    monkeypatch.setattr(tls_module.lacme, "Client", FakeClient)
+    monkeypatch.setattr(tls_module.lacme, "RenewalManager", FakeRenewalManager)
+    client = tls_module.TLSClient(
+        storage=get_storage(),
+        console_url="http://console:8090",
+        hostnames=["node-1"],
+    )
+    await client.start_renewal()
+
+    stopping = asyncio.create_task(client.stop_renewal())
+    await manager_entered.wait()
+    stopping.cancel()
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    release_manager.set()
+    await client_entered.wait()
+    stopping.cancel()
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    release_client.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    assert events == [
+        "manager_entered",
+        "manager_stopped",
+        "client_entered",
+        "client_closed",
+        "http_closed",
+    ]
+    assert client._renewal_manager is None
+    assert client._renewal_client is None
+    assert client._renewal_http_client is None
 
 
 # ── Backward compatibility ───────────────────────────────────────────────────

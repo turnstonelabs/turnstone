@@ -253,17 +253,58 @@ def _cmd_revoke_token(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _atomic_write_file(path: str | os.PathLike[str], data: bytes, *, mode: int) -> None:
+    """Atomically replace *path* without exposing partial or permissive data."""
+    import contextlib
+    import stat
+    import tempfile
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    absolute_parent = target.parent.absolute()
+    if absolute_parent.resolve(strict=True) != absolute_parent:
+        raise RuntimeError(f"Refusing output directory with symlink components: {target.parent}")
+    parent_stat = target.parent.lstat()
+    if (
+        stat.S_ISLNK(parent_stat.st_mode)
+        or not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.geteuid()
+    ):
+        raise RuntimeError(f"Refusing unsafe output directory: {target.parent}")
+    if target.is_symlink():
+        raise RuntimeError(f"Refusing to replace symlink: {target}")
+
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(target.parent, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
 def _cmd_tls_bootstrap(args: argparse.Namespace) -> None:
     """Initialize CA and issue certs offline."""
-    try:
-        from lacme import CertificateAuthority, FileStore
-    except ImportError:
-        print("lacme not installed. Run: pip install turnstone[tls]", file=sys.stderr)
-        sys.exit(1)
-
     import contextlib
     import os
     from pathlib import Path
+
+    from lacme import CertificateAuthority, FileStore
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -282,12 +323,17 @@ def _cmd_tls_bootstrap(args: argparse.Namespace) -> None:
         os.chmod(ca_cert_path, 0o644)
     print(f"CA cert: {ca_cert_path}")
 
-    # Issue certs for requested domains
-    for domain in args.issue:
-        bundle = ca.issue([domain], validity_hours=48)
-        store.save_cert(bundle)
-        cert_dir = out_dir / "certs" / domain
-        print(f"Issued: {domain} -> {cert_dir}")
+    from turnstone.core.tls import parse_certificate_identifier
+
+    # Issue certs for requested DNS names or IP literals. CertificateAuthority
+    # saves through FileStore and returns its authoritative encoded paths; IPv6
+    # and other non-portable keys must never be projected into a guessed path.
+    for raw_identifier in args.issue:
+        identifier = parse_certificate_identifier(raw_identifier)
+        bundle = ca.issue([identifier], validity_hours=48)
+        if bundle.cert_path is None:
+            raise RuntimeError("FileStore did not return the issued certificate path")
+        print(f"Issued: {bundle.domain} -> {bundle.cert_path.parent}")
 
     print(f"\nBootstrap complete. {len(args.issue)} cert(s) issued.")
     print(f"CA and certs written to: {out_dir}")
@@ -295,35 +341,58 @@ def _cmd_tls_bootstrap(args: argparse.Namespace) -> None:
 
 def _cmd_tls_issue(args: argparse.Namespace) -> None:
     """Request a cert from the console's ACME endpoint."""
-    try:
-        from lacme import SyncClient
-    except ImportError:
-        print("lacme not installed. Run: pip install turnstone[tls]", file=sys.stderr)
-        sys.exit(1)
-
     import os
     from pathlib import Path
+
+    from lacme import SyncClient
+
+    from turnstone.core.auth import (
+        JWT_AUD_CONSOLE,
+        TLS_ACME_TOKEN_SOURCE,
+        ServiceTokenManager,
+        load_jwt_secret,
+    )
+    from turnstone.core.tls import (
+        TurnstoneAutoApproveChallengeHandler,
+        build_acme_http_client,
+        normalize_certificate_identifiers,
+    )
 
     console_url = args.console_url
     if not console_url:
         console_url = _discover_console_url()
 
-    domains = [args.domain] + args.san
+    identifiers = normalize_certificate_identifiers([args.domain, *args.san])
+    identifier_strings = [str(value) for value in identifiers]
     directory_url = f"{console_url}/acme/directory"
-    print(f"Requesting cert for {domains} from {directory_url}")
+    print(f"Requesting cert for {identifier_strings} from {directory_url}")
 
-    client = SyncClient(
-        directory_url=directory_url,
-        allow_insecure=True,
+    enrollment_tokens = ServiceTokenManager(
+        user_id="admin-cli",
+        scopes=frozenset({"service"}),
+        source=TLS_ACME_TOKEN_SOURCE,
+        secret=load_jwt_secret(),
+        audience=JWT_AUD_CONSOLE,
     )
-    bundle = client.issue(domains)
+    http_client = build_acme_http_client(
+        console_url,
+        external_url=os.environ.get("TURNSTONE_ACME_EXTERNAL_URL", ""),
+        token_provider=lambda: enrollment_tokens.token,
+    )
+
+    with SyncClient(
+        directory_url=directory_url,
+        http_client=http_client,
+        challenge_handler=TurnstoneAutoApproveChallengeHandler(),
+        allow_insecure=True,
+    ) as client:
+        bundle = client.issue(identifiers)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "cert.pem").write_bytes(bundle.cert_pem)
-    (out_dir / "fullchain.pem").write_bytes(bundle.fullchain_pem)
-    (out_dir / "key.pem").write_bytes(bundle.key_pem)
-    os.chmod(out_dir / "key.pem", 0o600)
+    _atomic_write_file(out_dir / "cert.pem", bundle.cert_pem, mode=0o644)
+    _atomic_write_file(out_dir / "fullchain.pem", bundle.fullchain_pem, mode=0o644)
+    _atomic_write_file(out_dir / "key.pem", bundle.key_pem, mode=0o600)
 
     print(f"Certificate written to {out_dir}/")
     print("  cert.pem      (leaf certificate)")
@@ -333,20 +402,21 @@ def _cmd_tls_issue(args: argparse.Namespace) -> None:
 
 def _cmd_tls_ca_cert(args: argparse.Namespace) -> None:
     """Download the CA root certificate from the console."""
-    import httpx
+    import httpx2
 
     console_url = args.console_url
     if not console_url:
         console_url = _discover_console_url()
 
-    # Use plain HTTP for bootstrap (node may not have CA cert yet)
-    # WARNING: This is trust-on-first-use (TOFU) — verify the fingerprint
-    base = console_url.replace("https://", "http://")
+    # Preserve an explicitly trusted HTTPS bootstrap endpoint. Plain HTTP is
+    # still supported for direct trusted-network deployments and remains TOFU.
+    base = console_url.rstrip("/")
     url = f"{base}/acme/ca.pem"
     print(f"Fetching CA cert from {url}")
-    print("WARNING: Fetching over plain HTTP — verify the fingerprint below")
+    if url.startswith("http://"):
+        print("WARNING: Fetching over plain HTTP — verify the fingerprint below")
 
-    resp = httpx.get(url)
+    resp = httpx2.get(url, follow_redirects=False, trust_env=False)
     resp.raise_for_status()
 
     # Show fingerprint for out-of-band verification
@@ -357,13 +427,13 @@ def _cmd_tls_ca_cert(args: argparse.Namespace) -> None:
 
     from pathlib import Path
 
-    Path(args.out).write_bytes(resp.content)
+    _atomic_write_file(Path(args.out), resp.content, mode=0o644)
     print(f"CA cert written to {args.out}")
 
 
 def _cmd_tls_list(args: argparse.Namespace) -> None:
     """List certificates from the console."""
-    import httpx
+    import httpx2
 
     console_url = args.console_url
     if not console_url:
@@ -384,7 +454,7 @@ def _cmd_tls_list(args: argparse.Namespace) -> None:
             audience=JWT_AUD_CONSOLE,
         )
         headers["Authorization"] = f"Bearer {mgr.token}"
-    resp = httpx.get(url, headers=headers)
+    resp = httpx2.get(url, headers=headers)
     resp.raise_for_status()
     data = resp.json()
 
@@ -699,12 +769,17 @@ def main() -> None:
         "--issue",
         action="append",
         default=[],
-        help="Domain to issue cert for (repeatable)",
+        help="DNS name or IP address to issue a cert for (repeatable)",
     )
 
     p_issue = sub.add_parser("tls-issue", help="Request cert from console ACME")
-    p_issue.add_argument("domain", help="Primary domain for the certificate")
-    p_issue.add_argument("--san", action="append", default=[], help="Additional SAN (repeatable)")
+    p_issue.add_argument("domain", help="Primary DNS name or IP address for the certificate")
+    p_issue.add_argument(
+        "--san",
+        action="append",
+        default=[],
+        help="Additional DNS or IP SAN (repeatable)",
+    )
     p_issue.add_argument("--out", default=".", help="Output directory for PEM files")
     p_issue.add_argument(
         "--console-url", default="", help="Console URL (discovered from DB if empty)"
@@ -714,7 +789,7 @@ def main() -> None:
     p_cacert.add_argument("--out", default="ca.pem", help="Output file path")
     p_cacert.add_argument("--console-url", default="", help="Console URL")
 
-    p_tlslist = sub.add_parser("tls-list", help="List issued certificates")
+    p_tlslist = sub.add_parser("tls-list", help="List managed certificates")
     p_tlslist.add_argument("--console-url", default="", help="Console URL")
 
     # Node metadata commands

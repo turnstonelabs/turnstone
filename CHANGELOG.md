@@ -158,6 +158,25 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Changed
 
+- **lacme 1.2.0 and HTTPX2 now back the core mTLS path.** TLS/ACME is a typed
+  core dependency rather than optional-import-era code; renewal and admin
+  clients use lacme's public close/stop lifecycle. Consoles can set
+  `TURNSTONE_ACME_EXTERNAL_URL` to a routable responder base ending in `/acme`,
+  so nodes on another host receive usable directory and follow-up URLs during
+  enrollment. Signing routes now require a dedicated, purpose-confined rotating
+  service JWT, and HTTPX2 pins that credential to canonical resources on
+  configured responder origins. Internal and external console identities use
+  separate persistence namespaces; cluster identities are reused only after
+  key, SAN, validity, EKU, and active-root verification. Responder-side keyless
+  CSR results cannot overwrite managed identities, failed live reloads restore
+  the last usable bundle, certificate lifetime stays at 48 hours with a
+  12-hour renewal cadence, and cancellation drains renewal clients before
+  propagating. Operator-supplied IPv4 and IPv6 literals are passed to lacme as
+  typed IP identifiers and issued as IP SANs; unexpired legacy certificates
+  containing `DNS:<ip>` are reissued instead of being reused as an invalid IP
+  identity
+  ([#1011](https://github.com/turnstonelabs/turnstone/issues/1011)).
+
 - **OpenAI SDK v3 and its HTTPX2 default transport are now supported (#1009).**
   Chat Completions and Responses streams normalize native HTTPX2 connection
   deaths through the same retry boundary as legacy HTTPX-backed providers,

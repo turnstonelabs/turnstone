@@ -15586,7 +15586,7 @@ async def tls_ca_status(request: Request) -> JSONResponse:
 
 
 async def tls_list_certs(request: Request) -> JSONResponse:
-    """GET /v1/api/admin/tls/certs — List issued certificates."""
+    """GET /v1/api/admin/tls/certs — List managed certificates."""
     from turnstone.core.auth import require_permission
 
     err = require_permission(request, "admin.settings")
@@ -15604,6 +15604,8 @@ async def tls_list_certs(request: Request) -> JSONResponse:
                     "domains": list(c.domains),
                     "issued_at": c.issued_at.isoformat(),
                     "expires_at": c.expires_at.isoformat(),
+                    "renewable": mgr.can_renew_cert(c.domain),
+                    "deletable": mgr.can_delete_cert(c.domain),
                 }
                 for c in certs
             ],
@@ -15613,6 +15615,7 @@ async def tls_list_certs(request: Request) -> JSONResponse:
 
 async def tls_renew_cert(request: Request) -> JSONResponse:
     """POST /v1/api/admin/tls/certs/{domain}/renew — Force cert renewal."""
+    from turnstone.console.tls import CertificateNotLocallyManagedError
     from turnstone.core.auth import require_permission
 
     err = require_permission(request, "admin.settings")
@@ -15631,6 +15634,8 @@ async def tls_renew_cert(request: Request) -> JSONResponse:
                 "expires_at": bundle.expires_at.isoformat(),
             },
         )
+    except CertificateNotLocallyManagedError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
     except Exception as e:
@@ -15639,6 +15644,7 @@ async def tls_renew_cert(request: Request) -> JSONResponse:
 
 async def tls_delete_cert(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/tls/certs/{domain} — Delete a certificate."""
+    from turnstone.console.tls import CertificateNotLocallyManagedError
     from turnstone.core.auth import require_permission
 
     err = require_permission(request, "admin.settings")
@@ -15648,7 +15654,11 @@ async def tls_delete_cert(request: Request) -> JSONResponse:
     if mgr is None or not mgr.ca_initialized:
         return JSONResponse({"error": "TLS not enabled"}, status_code=404)
     domain = request.path_params["domain"]
-    if not mgr.delete_cert(domain):
+    try:
+        deleted = mgr.delete_cert(domain)
+    except CertificateNotLocallyManagedError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    if not deleted:
         return JSONResponse({"error": f"No cert for {domain}"}, status_code=404)
     return JSONResponse({"deleted": domain})
 
@@ -16540,7 +16550,9 @@ def create_app(
     app.state.console_metrics = console_metrics or ConsoleMetrics()
 
     # Mount ACME responder whenever a TLS manager is configured.
-    # ACMEResponder (lacme 1.0.2+) serves /ca.pem natively.
+    # ACMEResponder serves /ca.pem natively. AuthMiddleware leaves only
+    # directory/nonce/CA bootstrap resources public; every signing route needs
+    # the dedicated service enrollment JWT.
     if tls_manager is not None:
         from starlette.routing import Mount as RouteMount
 
@@ -16747,7 +16759,11 @@ def main() -> None:
             if _cs.get("tls.enabled"):
                 from turnstone.console.tls import TLSManager
 
-                tls_mgr = TLSManager(auth_storage, config_store=_cs)
+                tls_mgr = TLSManager(
+                    auth_storage,
+                    config_store=_cs,
+                    acme_external_url=os.environ.get("TURNSTONE_ACME_EXTERNAL_URL") or None,
+                )
                 # Init CA before create_app so ACME responder can be mounted
                 import asyncio
 
@@ -16758,9 +16774,6 @@ def main() -> None:
                 # / docs/tls.md); rewriting the scheme to https here would
                 # advertise an ACME URL nodes can't reach.
                 log.info("TLS enabled")
-        except ImportError:
-            log.warning("TLS enabled but lacme not installed — pip install turnstone[tls]")
-            tls_mgr = None
         except Exception:
             log.warning("TLS initialization failed", exc_info=True)
             tls_mgr = None

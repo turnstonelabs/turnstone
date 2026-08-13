@@ -654,10 +654,15 @@ class TestPreflightHelpers:
 
     def test_relevant_env_redacts_secrets(self) -> None:
         out = _relevant_env(
-            {"TURNSTONE_JWT_SECRET": "supersecret", "TURNSTONE_HOST_IP": "10.0.0.1"}
+            {
+                "TURNSTONE_JWT_SECRET": "supersecret",
+                "TURNSTONE_HOST_IP": "10.0.0.1",
+                "TURNSTONE_ACME_EXTERNAL_URL": "http://ca.internal:8090/acme",
+            }
         )
         assert out["TURNSTONE_JWT_SECRET"] == "set (hidden)"
         assert out["TURNSTONE_HOST_IP"] == "10.0.0.1"
+        assert out["TURNSTONE_ACME_EXTERNAL_URL"] == "http://ca.internal:8090/acme"
 
     def test_relevant_env_redacts_db_url_creds(self) -> None:
         out = _relevant_env({"TURNSTONE_DB_URL": "postgresql://u:pw@h/db"})

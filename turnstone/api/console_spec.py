@@ -1172,7 +1172,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         "/v1/api/admin/tls/certs",
         "GET",
-        "List all issued TLS certificates",
+        "List all managed TLS certificates",
         tags=["Admin"],
     ),
     EndpointSpec(

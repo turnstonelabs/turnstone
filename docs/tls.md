@@ -54,15 +54,11 @@ docker compose exec caddy \
   cat /data/caddy/pki/authorities/local/root.crt   # import into your OS/browser
 ```
 
-**Can Caddy get its cert from the console's internal CA instead?** Technically
-yes — the console exposes a real ACME directory (`/acme/directory`) with
-auto-approval, so Caddy's `tls { ca http://console:8090/acme/directory }` would
-mint a cert for any name. It's not recommended as the default: lacme's ACME
-responder is built for turnstone's own client (interop with Caddy's client is
-unverified), it couples Caddy startup to the console, and the browser must trust
-a private CA either way — so it buys nothing over `tls internal`. For a publicly
-trusted cert (no warning), point Caddy at Let's Encrypt with a real domain
-instead.
+**Can Caddy get its cert from the console's internal CA instead?** Not directly.
+The console's ACME signing routes require Turnstone's rotating enrollment JWT,
+which a standard Caddy ACME issuer does not attach. Keep `tls internal`, or use a
+public ACME CA for a publicly trusted certificate. An authenticated gateway or
+Caddy plugin would be required to use Turnstone's responder.
 
 ---
 
@@ -106,13 +102,15 @@ An mTLS listener rejects plain-HTTP probes at the socket, so
 it presents the node's own cert as the client cert and pins the cluster
 CA, using the PEM files the server writes at boot under
 `$TURNSTONE_TLS_PEM_DIR` (default `<tmpdir>/turnstone-tls`). The probe
-dials `localhost` for the TLS attempt — the internal CA issues DNS SANs
-only, so a literal-IP URL would fail verification. Cert renewal rewrites
+dials `localhost` for the TLS attempt, which every service certificate carries
+as a DNS SAN. Cert renewal rewrites
 the PEM dir alongside the live listener swap, so the probe's client cert
 never outlives the served cert. With TLS disabled the plain probe succeeds
 and the PEM directory is never consulted. On bare metal with multiple
 nodes per host, set `TURNSTONE_TLS_PEM_DIR` per node (each boot clears
 stale `lacme-pem-*` dirs under its root).
+The production TLS Compose overlay inherits this healthcheck from the base
+service; it remains enabled under mTLS.
 
 ---
 
@@ -124,6 +122,13 @@ stale `lacme-pem-*` dirs under its root).
 |---------|---------|-------------|
 | `tls.enabled` | `false` | Master switch for internal mTLS |
 | `tls.acme_directory` | `""` | External ACME CA URL for console frontend cert |
+
+### ACME topology environment
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TURNSTONE_ACME_EXTERNAL_URL` | request-derived | Canonical externally reachable responder base, including `/acme` (for example `http://192.0.2.1:8090/acme`). Set it on the console so advertised URLs are routable and on in-cluster clients so their enrollment JWT is allowed only at that configured destination. A public path prefix is valid only when a reverse proxy maps it to Turnstone's internal `/acme` mount. |
+| `TURNSTONE_CONSOLE_HTTP_BIND` | `127.0.0.1` | Production TLS-overlay bind for the console's plain-HTTP bootstrap/API port. For cross-host enrollment, use a trusted LAN/VPN interface and firewall it to enrolling nodes. |
 
 ### Bootstrap Config (config.toml)
 
@@ -144,7 +149,7 @@ sslkey = ""          # path to client key
 | CA common name | "Turnstone CA" | |
 | CA validity | 10 years | |
 | Cert validity | 48 hours | Short-lived, auto-renewed |
-| Renewal interval | 24 hours | Half of validity |
+| Renewal interval | 12 hours | Leaves retry headroom before expiry |
 | ACME auto-approve | true | Internal network, no challenge validation |
 
 ---
@@ -177,9 +182,13 @@ turnstone-admin tls-ca-cert --out ca.pem --console-url http://console:8080
 # Request a cert for a domain
 turnstone-admin tls-issue worker-1.internal --out /certs --console-url http://console:8080
 
-# List issued certs
+# List managed cluster certs
 turnstone-admin tls-list --console-url http://console:8080
 ```
+
+`tls-ca-cert` preserves the supplied scheme. An `https://` console URL is
+verified with the system trust store; an explicitly supplied `http://` URL is
+TOFU and prints a fingerprint that must be checked out of band.
 
 ### Console URL Discovery
 
@@ -193,7 +202,9 @@ table in the shared database. The console registers itself on startup.
 The **TLS** tab in the console admin panel (System group) shows:
 - CA status (common name, certificate count)
 - Certificate table (domain, SANs, issued, expires)
-- Force-renew and delete actions per certificate
+- Force-renew for the console-owned internal identity; remote nodes renew and
+  hot-reload their own keys
+- Delete for expired, remotely managed certificate rows
 
 ---
 
@@ -248,8 +259,15 @@ const client = new TurnstoneServer({
    `TURNSTONE_CONSOLE_URL` (a bare-metal node outside the compose network can't
    resolve the in-cluster `console` name, so it points this at the console's
    published ACME endpoint)
-3. Fetches CA root cert from `http://console/acme/ca.pem` (plain HTTP, TOFU)
-4. Requests a service cert via ACME (plain HTTP, JWS-signed). The cert's
+3. Fetches the CA root from the configured console scheme. Direct deployments
+   use `http://console/acme/ca.pem` (plain HTTP, TOFU); an explicitly configured
+   HTTPS proxy is preserved and verified with the system trust store.
+4. Requests a service cert via ACME with a dedicated, short-lived Turnstone
+   service JWT pinned to configured responder origins. lacme emits ACME JWS
+   messages, but its lightweight responder deliberately does not validate their
+   signatures or nonces; the service JWT is the enrollment authorization gate.
+   Direct HTTP bootstrap therefore still requires a trusted LAN/VPN (or an
+   independently trusted HTTPS proxy). The cert's
    primary domain / SAN is the node's **advertised host** (the host of
    `TURNSTONE_ADVERTISE_URL`, e.g. `node-1`) — the name peers actually dial,
    not the container hostname. This makes mTLS hostname verification succeed
@@ -264,7 +282,12 @@ const client = new TurnstoneServer({
 
 1. Read `tls.enabled` from ConfigStore
 2. Initialize CA (load from DB or generate new root key)
-3. Mount ACME responder at `/acme` (serves `/ca.pem` natively)
+3. Mount ACME responder at `/acme` (serves `/ca.pem` natively). When
+   `TURNSTONE_ACME_EXTERNAL_URL` is set, use it for every advertised directory,
+   order, authorization, and certificate URL; otherwise derive URLs from each
+   request as before. Directory, nonce, and CA bootstrap resources stay public;
+   account/order/challenge/finalization/certificate routes require the dedicated
+   enrollment service JWT.
 4. Issue console certs (internal + optional frontend)
 5. Start CA-direct auto-renewal (no network, signs directly), scoped to the
    console's own cert, plus a periodic GC that reclaims cert rows for
@@ -290,12 +313,37 @@ fronted under a second hostname). Symptom if this is wrong: the console
 dashboard shows nodes as unreachable and `openssl s_client` reports the served
 cert's SANs don't include the dialed name.
 
+The advertised host and extra SANs may be DNS names or literal IPv4/IPv6
+addresses. Turnstone converts IP literals to typed ACME identifiers so the
+certificate contains `IPAddress` SANs that normal IP hostname verification can
+use; DNS spelling is preserved. Bracket an IPv6 address when it appears in a URL
+(for example `TURNSTONE_ADVERTISE_URL=http://[2001:db8::10]:8080`), but use the
+bare address in `TURNSTONE_TLS_SANS`. Unspecified bind addresses (`0.0.0.0` and
+`::`) and scoped IPv6 addresses such as `fe80::1%eth0` are not certificate
+identities. Restart after changing the advertised identity or extra SANs.
+
 ### "No console service found"
 
 The console registers itself in the `services` table on startup. If the console
 hasn't started or the registration expired (1 hour TTL), nodes can't discover
 it. Set `TURNSTONE_CONSOLE_URL` to a reachable console address (this is also how
 a bare-metal node that can't resolve the in-cluster `console` name enrolls).
+
+### Cross-host ACME links point at the container
+
+For a node on another host, publish port 8090 on a reachable interface and set
+`TURNSTONE_ACME_EXTERNAL_URL` on the console **and in-cluster nodes** to that full
+responder base, including `/acme` (for example
+`http://192.0.2.1:8090/acme`). The console advertises it; clients use it as a
+trusted enrollment-token destination. Keep
+`TURNSTONE_CONSOLE_URL=http://console:8090` for in-cluster service discovery.
+A remote node whose `TURNSTONE_CONSOLE_URL` already names the public origin can
+derive the same `/acme` base, but setting both values explicitly avoids drift.
+
+Bind only a trusted LAN/VPN interface and firewall it to enrolling nodes. The
+JWT authenticates the client, but a direct plain-HTTP bootstrap remains TOFU and
+does not resist an active on-path attacker. If the network is untrusted, expose
+the responder through an independently trusted HTTPS proxy instead.
 
 ### Browser HTTPS to the console
 

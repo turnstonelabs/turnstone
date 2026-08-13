@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+import lacme
 import pytest
 
 from turnstone.core.storage import get_storage, init_storage, reset_storage
@@ -165,7 +166,6 @@ def test_adapter_load_ca_missing(store_adapter):
 
 
 def test_adapter_save_load_cert(store_adapter):
-    lacme = pytest.importorskip("lacme")
     now = datetime.now(UTC)
     bundle = lacme.CertBundle(
         domain="test.internal",
@@ -186,8 +186,82 @@ def test_adapter_save_load_cert(store_adapter):
     assert loaded.key_pem == b"key"
 
 
+def test_adapter_keyless_save_does_not_create_managed_identity(store_adapter):
+    """Responder-side CSR results are not usable identities without a key."""
+    now = datetime.now(UTC)
+    bundle = lacme.CertBundle(
+        domain="new.internal",
+        domains=("new.internal",),
+        cert_pem=b"new-cert",
+        fullchain_pem=b"new-chain",
+        key_pem=b"",
+        issued_at=now,
+        expires_at=now,
+    )
+
+    assert store_adapter.save_cert(bundle) is bundle
+    assert store_adapter.load_cert("new.internal") is None
+    assert get_storage().load_tls_cert("new.internal") is None
+
+
+def test_adapter_keyless_save_preserves_existing_identity(store_adapter):
+    """Interrupted reenrollment cannot replace a working cert and private key."""
+    now = datetime.now(UTC)
+    existing = lacme.CertBundle(
+        domain="node.internal",
+        domains=("node.internal",),
+        cert_pem=b"old-cert",
+        fullchain_pem=b"old-chain",
+        key_pem=b"old-key",
+        issued_at=now,
+        expires_at=now,
+    )
+    keyless = lacme.CertBundle(
+        domain="node.internal",
+        domains=("node.internal",),
+        cert_pem=b"new-cert",
+        fullchain_pem=b"new-chain",
+        key_pem=b"",
+        issued_at=now,
+        expires_at=now,
+    )
+    store_adapter.save_cert(existing)
+
+    store_adapter.save_cert(keyless)
+
+    loaded = store_adapter.load_cert("node.internal")
+    assert loaded == existing
+
+
+def test_adapter_hides_and_heals_legacy_keyless_rows(store_adapter):
+    """Old poisoned rows are ignored until a complete enrollment replaces them."""
+    now = datetime.now(UTC)
+    get_storage().save_tls_cert(
+        domain="legacy.internal",
+        cert_pem="keyless-cert",
+        fullchain_pem="keyless-chain",
+        key_pem="",
+        issued_at=now.isoformat(),
+        expires_at=now.isoformat(),
+        meta='{"domains": ["legacy.internal"]}',
+    )
+    assert store_adapter.load_cert("legacy.internal") is None
+    assert store_adapter.list_certs() == []
+
+    complete = lacme.CertBundle(
+        domain="legacy.internal",
+        domains=("legacy.internal",),
+        cert_pem=b"complete-cert",
+        fullchain_pem=b"complete-chain",
+        key_pem=b"complete-key",
+        issued_at=now,
+        expires_at=now,
+    )
+    store_adapter.save_cert(complete)
+    assert store_adapter.load_cert("legacy.internal") == complete
+
+
 def test_adapter_list_certs(store_adapter):
-    lacme = pytest.importorskip("lacme")
     now = datetime.now(UTC)
     for name in ["alpha", "beta"]:
         bundle = lacme.CertBundle(
@@ -211,7 +285,6 @@ def test_adapter_load_cert_missing(store_adapter):
 
 def test_adapter_account_key_roundtrip(store_adapter):
     """Test account key save/load with real cryptography objects."""
-    pytest.importorskip("lacme")
     from cryptography.hazmat.primitives.asymmetric import ec
 
     key = ec.generate_private_key(ec.SECP256R1())
@@ -224,3 +297,105 @@ def test_adapter_account_key_roundtrip(store_adapter):
 
 def test_adapter_account_key_missing(store_adapter):
     assert store_adapter.load_account_key() is None
+
+
+def test_adapter_namespaces_same_domain_certificates():
+    from turnstone.core.tls_store import StorageStore
+
+    now = datetime.now(UTC)
+    internal = lacme.CertBundle(
+        domain="console.example",
+        domains=("console.example",),
+        cert_pem=b"internal-cert",
+        fullchain_pem=b"internal-chain",
+        key_pem=b"internal-key",
+        issued_at=now,
+        expires_at=now,
+    )
+    frontend = lacme.CertBundle(
+        domain="console.example",
+        domains=("console.example",),
+        cert_pem=b"frontend-cert",
+        fullchain_pem=b"frontend-chain",
+        key_pem=b"frontend-key",
+        issued_at=now,
+        expires_at=now,
+    )
+    internal_store = StorageStore(get_storage())
+    frontend_store = StorageStore(
+        get_storage(),
+        namespace="console-frontend",
+        account_key_id="console-frontend:test-ca",
+    )
+
+    internal_store.save_cert(internal)
+    frontend_store.save_cert(frontend)
+
+    assert internal_store.load_cert("console.example") == internal
+    assert frontend_store.load_cert("console.example") == frontend
+    assert internal_store.list_certs() == [internal]
+    assert frontend_store.list_certs() == [frontend]
+    rows = get_storage().list_tls_certs()
+    assert {row["domain"] for row in rows} == {
+        "console.example",
+        "turnstone-scope:console-frontend:console.example",
+    }
+
+
+def test_adapter_namespaces_account_keys():
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from turnstone.core.tls_store import StorageStore
+
+    internal_key = ec.generate_private_key(ec.SECP256R1())
+    frontend_key = ec.generate_private_key(ec.SECP256R1())
+    internal_store = StorageStore(get_storage())
+    frontend_store = StorageStore(
+        get_storage(),
+        namespace="console-frontend",
+        account_key_id="console-frontend:test-ca",
+    )
+
+    internal_store.save_account_key(internal_key)
+    frontend_store.save_account_key(frontend_key)
+
+    loaded_internal = internal_store.load_account_key()
+    loaded_frontend = frontend_store.load_account_key()
+    assert loaded_internal is not None
+    assert loaded_frontend is not None
+    assert loaded_internal.private_numbers() == internal_key.private_numbers()
+    assert loaded_frontend.private_numbers() == frontend_key.private_numbers()
+
+
+def test_validation_store_preserves_existing_bundle_on_rejection(store_adapter):
+    from turnstone.core.tls_store import CertificateValidationStore
+
+    now = datetime.now(UTC)
+    existing = lacme.CertBundle(
+        domain="node.internal",
+        domains=("node.internal",),
+        cert_pem=b"old-cert",
+        fullchain_pem=b"old-chain",
+        key_pem=b"old-key",
+        issued_at=now,
+        expires_at=now,
+    )
+    rejected = lacme.CertBundle(
+        domain="node.internal",
+        domains=("node.internal",),
+        cert_pem=b"wrong-ca-cert",
+        fullchain_pem=b"wrong-ca-chain",
+        key_pem=b"new-key",
+        issued_at=now,
+        expires_at=now,
+    )
+    store_adapter.save_cert(existing)
+    validating = CertificateValidationStore(
+        store_adapter,
+        lambda _bundle: (_ for _ in ()).throw(ValueError("wrong CA")),
+    )
+
+    with pytest.raises(ValueError, match="wrong CA"):
+        validating.save_cert(rejected)
+
+    assert store_adapter.load_cert("node.internal") == existing

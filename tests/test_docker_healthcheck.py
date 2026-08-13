@@ -18,9 +18,8 @@ from pathlib import Path
 
 import pytest
 
-lacme = pytest.importorskip("lacme")
-
 SCRIPT = Path(__file__).parent.parent / "docker" / "healthcheck.py"
+TLS_COMPOSE_OVERLAY = Path(__file__).parent.parent / "deploy" / "docker-compose.tls.yml"
 
 
 def run_healthcheck(url: str, pem_root: Path | None = None) -> subprocess.CompletedProcess:
@@ -218,6 +217,14 @@ def test_default_pem_root_matches_server(monkeypatch):
 
     monkeypatch.delenv("TURNSTONE_TLS_PEM_DIR", raising=False)
     assert _load_script_module()._pem_root() == tls_pem_runtime_dir()
+
+
+def test_tls_compose_overlay_keeps_server_healthcheck_enabled():
+    """The mTLS-aware base healthcheck must survive the production overlay."""
+    import yaml
+
+    overlay = yaml.safe_load(TLS_COMPOSE_OVERLAY.read_text())
+    assert "healthcheck" not in overlay["services"]["server"]
 
 
 def test_find_pem_dir_accepts_real_pem_layout(monkeypatch, mtls_setup):

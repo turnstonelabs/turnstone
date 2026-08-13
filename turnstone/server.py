@@ -6681,6 +6681,19 @@ def main() -> None:
                 bind_host=args.host,
                 extra_sans=os.environ.get("TURNSTONE_TLS_SANS", ""),
             )
+            from turnstone.core.auth import (
+                JWT_AUD_CONSOLE,
+                TLS_ACME_TOKEN_SOURCE,
+                ServiceTokenManager,
+            )
+
+            enrollment_tokens = ServiceTokenManager(
+                user_id=_node_id,
+                scopes=frozenset({"service"}),
+                source=TLS_ACME_TOKEN_SOURCE,
+                secret=jwt_secret,
+                audience=JWT_AUD_CONSOLE,
+            )
             tls_client = TLSClient(
                 storage=get_storage(),
                 hostnames=hostnames,
@@ -6689,6 +6702,11 @@ def main() -> None:
                 # explicit override pointing at the published ACME endpoint.
                 # Empty (the in-cluster default) falls back to service discovery.
                 console_url=os.environ.get("TURNSTONE_CONSOLE_URL", ""),
+                # In-cluster clients fetch the directory from ``console`` but a
+                # cross-host responder advertises its LAN/proxy URL. Trust that
+                # second credential destination only when operators configured it.
+                acme_external_url=os.environ.get("TURNSTONE_ACME_EXTERNAL_URL", ""),
+                enrollment_token_provider=lambda: enrollment_tokens.token,
             )
             asyncio.run(tls_client.init(attempts=TLS_INIT_RETRY_ATTEMPTS))
             bundle = tls_client.bundle
@@ -6723,21 +6741,16 @@ def main() -> None:
                     """
                     from turnstone.core.tls import refresh_runtime_pems, swap_context_cert
 
-                    try:
-                        new_paths = refresh_runtime_pems(
-                            new_bundle,
-                            ca_pem=tls_client.ca_pem,
-                            previous=pem_dir_state["dir"],
-                        )
-                        pem_dir_state["dir"] = new_paths.cert.parent
-                    except Exception:
-                        log.warning("TLS runtime PEM refresh failed", exc_info=True)
-
                     cfg = getattr(app.state, "uvicorn_config", None)
                     live_ctx = getattr(cfg, "ssl", None) if cfg is not None else None
-                    if live_ctx is None:
-                        return  # listener not started yet — boot cert still valid
-                    swap_context_cert(live_ctx, new_bundle, ca_pem=tls_client.ca_pem)
+                    if live_ctx is not None:
+                        swap_context_cert(live_ctx, new_bundle, ca_pem=tls_client.ca_pem)
+                    new_paths = refresh_runtime_pems(
+                        new_bundle,
+                        ca_pem=tls_client.ca_pem,
+                        previous=pem_dir_state["dir"],
+                    )
+                    pem_dir_state["dir"] = new_paths.cert.parent
                     log.info("TLS cert reloaded into listener: %s", new_bundle.domain)
 
                 tls_client.set_cert_reload_hook(_reload_server_cert)

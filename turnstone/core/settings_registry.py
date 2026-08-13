@@ -855,7 +855,7 @@ def _build_registry() -> dict[str, SettingDef]:
             restart_required=True,
             help="When enabled, the console runs an internal Certificate Authority and "
             "ACME server. All cluster services (servers, channels) auto-provision "
-            "short-lived certificates for mutual TLS. Requires lacme: pip install turnstone[tls]",
+            "short-lived certificates for mutual TLS. ACME support is included with Turnstone.",
         ),
         SettingDef(
             "tls.acme_directory",

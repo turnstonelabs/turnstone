@@ -47,7 +47,9 @@ dependencies = [
     "PyJWT>=2.8",
     "bcrypt>=4.0",
     "cryptography>=48.0.1",  # GHSA-537c-gmf6-5ccf: PyPI wheels <48.0.1 bundle a vulnerable statically-linked OpenSSL (2026-06-09 secadv)
-    "lacme>=1.0.5",
+    # Core mTLS/ACME contract. 1.1 moves lacme onto HTTPX2; 1.2 adds typed IP
+    # identifiers and retains the external responder URL for cross-host enrollment.
+    "lacme>=1.2,<2",
     "python-frontmatter>=1.0",
     "pypdfium2>=4",  # PDF text-extract + rasterize for models without native PDF input (core/pdf.py)
     "pillow>=10",  # PNG encoding for the PDF->images rasterize fallback (vision models, core/pdf.py)
@@ -195,10 +197,6 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["frontmatter", "frontmatter.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["lacme", "lacme.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

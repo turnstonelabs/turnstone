@@ -4700,7 +4700,7 @@
     },
     "/v1/api/admin/tls/certs": {
       "get": {
-        "summary": "List all issued TLS certificates",
+        "summary": "List all managed TLS certificates",
         "operationId": "v1_api_admin_tls_certs_get",
         "tags": [
           "Admin"

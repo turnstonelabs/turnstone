@@ -7,12 +7,37 @@ CA and ACME server, issuing short-lived mTLS certificates to all services.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import hashlib
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
+import lacme
 import structlog
+from lacme import (
+    ACMEResponder,
+    CertBundle,
+    CertificateAuthority,
+    IdentifierValue,
+    RenewalManager,
+)
+from lacme.events import (
+    CertificateExpiring,
+    CertificateIssued,
+    CertificateRenewed,
+    ChallengeFailed,
+)
+
+from turnstone.core.tls import (
+    CERT_VALIDITY_HOURS,
+    RENEW_BEFORE_EXPIRY_DAYS,
+    RENEW_INTERVAL_HOURS,
+    RENEW_MAX_JITTER_SECONDS,
+)
 
 if TYPE_CHECKING:
     import ssl
+    from collections.abc import Sequence
 
     from starlette.types import ASGIApp
 
@@ -25,19 +50,66 @@ log = structlog.get_logger(__name__)
 _CA_CN = "Turnstone CA"
 _CA_NAME = "turnstone"  # Store key for save_ca/load_ca
 _CA_VALIDITY_DAYS = 3650  # 10 years
-_CERT_VALIDITY_HOURS = 48
-_RENEW_INTERVAL_HOURS = 24
-_RENEW_BEFORE_EXPIRY_DAYS = 1
 
 
-def _require_lacme() -> Any:
+class CertificateNotLocallyManagedError(RuntimeError):
+    """Raised when an admin action would take ownership from another issuer."""
+
+
+class _TurnstoneCertificateAuthority(CertificateAuthority):
+    """Pin lacme's implicit responder/renewal lifetime to Turnstone policy.
+
+    lacme's public CA methods default to 24-hour leaves, and its responder and
+    CA-mode RenewalManager intentionally call those methods without a lifetime.
+    Turnstone advertises and schedules around 48-hour cluster identities, so
+    the CA owned by this manager supplies that default at the shared chokepoint.
+    Explicit non-default lifetimes remain available to callers.
+    """
+
+    def issue(
+        self,
+        names: IdentifierValue | Sequence[IdentifierValue],
+        *,
+        client: bool = False,
+        validity_days: int = CERT_VALIDITY_HOURS // 24,
+        validity_hours: int | None = None,
+    ) -> CertBundle:
+        return super().issue(
+            names,
+            client=client,
+            validity_days=validity_days,
+            validity_hours=validity_hours,
+        )
+
+    def issue_from_csr(
+        self,
+        csr_der: bytes,
+        *,
+        validated_identifiers: Sequence[IdentifierValue] | None = None,
+        client: bool = False,
+        validity_days: int = CERT_VALIDITY_HOURS // 24,
+        validity_hours: int | None = None,
+    ) -> CertBundle:
+        return super().issue_from_csr(
+            csr_der,
+            validated_identifiers=validated_identifiers,
+            client=client,
+            validity_days=validity_days,
+            validity_hours=validity_hours,
+        )
+
+
+def _certificate_not_valid_after(bundle: CertBundle) -> datetime:
+    """Read expiry from the signed leaf rather than mutable store metadata."""
+    from cryptography import x509
+
     try:
-        import lacme
-    except ImportError:
-        raise ImportError(
-            "lacme is required for TLS support. Install with: pip install turnstone[tls]",
-        ) from None
-    return lacme
+        certificates = x509.load_pem_x509_certificates(bundle.cert_pem)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Certificate {bundle.domain!r} is malformed") from exc
+    if len(certificates) != 1:
+        raise ValueError(f"Certificate {bundle.domain!r} does not contain one leaf")
+    return certificates[0].not_valid_after_utc
 
 
 class TLSManager:
@@ -49,27 +121,28 @@ class TLSManager:
         await mgr.init_ca()
         responder = mgr.get_responder()       # Mount at /acme
         await mgr.issue_console_certs()        # Self-issue for this node
-        mgr.start_renewal()                    # Background auto-renewal
+        await mgr.start_renewal()              # Background auto-renewal
     """
 
     def __init__(
         self,
         storage: StorageBackend,
         config_store: ConfigStore | None = None,
+        acme_external_url: str | None = None,
     ) -> None:
-        lacme = _require_lacme()
-
         from turnstone.core.tls_store import StorageStore
 
+        self._storage = storage
         self._store = StorageStore(storage)
+        self._frontend_store: StorageStore | None = None
         self._config_store = config_store
+        self._acme_external_url = acme_external_url
         self._event_dispatcher = lacme.EventDispatcher()
-        self._ca: Any | None = None
-        self._responder: Any | None = None
-        self._renewal_task: Any | None = None
-        self._renewal_manager: Any | None = None
-        self._internal_bundle: Any | None = None
-        self._frontend_bundle: Any | None = None
+        self._ca: _TurnstoneCertificateAuthority | None = None
+        self._responder: ACMEResponder | None = None
+        self._renewal_manager: RenewalManager | None = None
+        self._internal_bundle: CertBundle | None = None
+        self._frontend_bundle: CertBundle | None = None
         # Cached mTLS client context, mutated in place on renewal so the
         # proxy/collector httpx clients pick up the renewed client cert
         # without being rebuilt.
@@ -93,29 +166,18 @@ class TLSManager:
 
     def _subscribe_events(self) -> None:
         """Subscribe structlog handlers to lacme lifecycle events."""
-        _require_lacme()
-        from lacme.events import (
-            CertificateExpiring,
-            CertificateIssued,
-            CertificateRenewed,
-            ChallengeFailed,
-        )
 
-        def _on_issued(event: Any) -> None:
-            if isinstance(event, CertificateIssued):
-                log.info("tls.cert.issued", domain=event.domain)
+        def _on_issued(event: CertificateIssued) -> None:
+            log.info("tls.cert.issued", domain=event.domain)
 
-        def _on_renewed(event: Any) -> None:
-            if isinstance(event, CertificateRenewed):
-                log.info("tls.cert.renewed", domain=event.domain)
+        def _on_renewed(event: CertificateRenewed) -> None:
+            log.info("tls.cert.renewed", domain=event.domain)
 
-        def _on_expiring(event: Any) -> None:
-            if isinstance(event, CertificateExpiring):
-                log.warning("tls.cert.expiring", domain=event.domain)
+        def _on_expiring(event: CertificateExpiring) -> None:
+            log.warning("tls.cert.expiring", domain=event.domain)
 
-        def _on_failed(event: Any) -> None:
-            if isinstance(event, ChallengeFailed):
-                log.error("tls.challenge.failed", domain=getattr(event, "domain", "unknown"))
+        def _on_failed(event: ChallengeFailed) -> None:
+            log.error("tls.challenge.failed", domain=event.domain)
 
         self._event_dispatcher.subscribe(_on_issued, event_type=CertificateIssued)
         self._event_dispatcher.subscribe(_on_renewed, event_type=CertificateRenewed)
@@ -131,12 +193,10 @@ class TLSManager:
         into the database store first so the console uses the same CA that
         signed the infrastructure certs.
         """
-        lacme = _require_lacme()
-
         # Import bootstrap CA from well-known volume path if not already in DB
         self._import_bootstrap_ca()
 
-        self._ca = lacme.CertificateAuthority(
+        self._ca = _TurnstoneCertificateAuthority(
             self._store,
             name=_CA_NAME,
             event_dispatcher=self._event_dispatcher,
@@ -176,23 +236,29 @@ class TLSManager:
         """Return the ACME responder ASGI app for mounting."""
         if self._ca is None:
             raise RuntimeError("CA not initialized — call init_ca() first")
-        lacme = _require_lacme()
         if self._responder is None:
+            if self._acme_external_url is not None:
+                path = urlsplit(self._acme_external_url).path.rstrip("/")
+                if not path.endswith("/acme"):
+                    raise ValueError(
+                        "TURNSTONE_ACME_EXTERNAL_URL must include the responder's /acme mount"
+                    )
             self._responder = lacme.ACMEResponder(
                 ca=self._ca,
                 auto_approve=True,
+                external_url=self._acme_external_url,
             )
-        return self._responder  # type: ignore[no-any-return]
+        return self._responder
 
     def get_root_cert_pem(self) -> bytes:
         """Return the CA root certificate in PEM format."""
         if self._ca is None:
             raise RuntimeError("CA not initialized — call init_ca() first")
-        return self._ca.root_cert_pem  # type: ignore[no-any-return]
+        return self._ca.root_cert_pem
 
     # -- Cert issuance ---------------------------------------------------------
 
-    async def issue_console_certs(self, hostnames: list[str]) -> None:
+    async def issue_console_certs(self, hostnames: Sequence[IdentifierValue]) -> None:
         """Issue certificates for the console node.
 
         Raises ValueError if hostnames is empty.
@@ -201,11 +267,12 @@ class TLSManager:
         - Internal cert: always from the internal CA (for mTLS with cluster)
         - Frontend cert: from external ACME CA if configured, else internal CA
         """
-        if not hostnames:
-            raise ValueError("issue_console_certs requires at least one hostname")
+        from turnstone.core.tls import normalize_certificate_identifiers
+
+        identifiers = normalize_certificate_identifiers(hostnames)
 
         # Internal cert — always from our own CA
-        await self._issue_internal_cert(hostnames)
+        await self._issue_internal_cert(identifiers)
 
         # Frontend cert — external CA if configured
         acme_directory = ""
@@ -213,128 +280,157 @@ class TLSManager:
             acme_directory = self._config_store.get("tls.acme_directory") or ""
 
         if acme_directory:
-            await self._issue_frontend_cert(hostnames, acme_directory)
+            await self._issue_frontend_cert(identifiers, acme_directory)
         else:
             # Self-issue from internal CA (behind reverse proxy or internal only)
+            self._frontend_store = None
             self._frontend_bundle = self._internal_bundle
-            log.info("tls.frontend.self_issued", hostnames=hostnames)
+            log.info("tls.frontend.self_issued", hostnames=[str(value) for value in identifiers])
 
-    async def _issue_internal_cert(self, hostnames: list[str]) -> None:
+    async def _issue_internal_cert(self, identifiers: Sequence[IdentifierValue]) -> None:
         """Issue an internal mTLS cert from the internal CA."""
         if self._ca is None:
             raise RuntimeError("CA not initialized")
 
-        # Check for existing cert in store (skip if expired)
-        existing = self._store.load_cert(hostnames[0])
+        from turnstone.core.tls import validate_cluster_certificate_bundle
+
+        primary = str(identifiers[0])
+        # Reuse only when the complete identity is valid for this exact active
+        # CA and typed SAN set. A legacy bundle keyed by "192.0.2.10" may hold
+        # DNS:192.0.2.10, and a pre-namespace frontend bundle may be signed by
+        # a public CA despite sharing the same string key.
+        existing = self._store.load_cert(primary)
         if existing is not None:
-            from datetime import UTC, datetime
-
-            if existing.expires_at > datetime.now(UTC):
+            try:
+                validate_cluster_certificate_bundle(
+                    existing,
+                    identifiers,
+                    self.get_root_cert_pem(),
+                )
+            except ValueError as exc:
+                log.warning(
+                    "tls.internal.invalid_existing_identity",
+                    domain=primary,
+                    error=str(exc),
+                )
+            else:
                 self._internal_bundle = existing
-                log.info("tls.internal.loaded", domain=hostnames[0])
+                log.info("tls.internal.loaded", domain=primary)
                 return
-            log.info("tls.internal.expired", domain=hostnames[0])
-            self._store.delete_cert(hostnames[0])
 
-        # Issue new cert
+        # CA issuance saves the complete bundle through StorageStore, replacing
+        # the old row only after the new key and certificate both exist.
         bundle = self._ca.issue(
-            hostnames,
-            validity_hours=_CERT_VALIDITY_HOURS,
+            identifiers,
+            validity_hours=CERT_VALIDITY_HOURS,
         )
-        self._store.save_cert(bundle)
         self._internal_bundle = bundle
-        log.info("tls.internal.issued", domain=hostnames[0])
+        log.info("tls.internal.issued", domain=primary)
 
     async def _issue_frontend_cert(
         self,
-        hostnames: list[str],
+        identifiers: Sequence[IdentifierValue],
         acme_directory: str,
     ) -> None:
         """Issue a frontend cert from an external ACME CA."""
-        lacme = _require_lacme()
         from lacme.challenges.http01 import HTTP01Handler
 
+        from turnstone.core.tls_store import StorageStore
+
         handler = HTTP01Handler()
+        profile = hashlib.sha256(acme_directory.rstrip("/").encode()).hexdigest()
+        frontend_store = StorageStore(
+            self._storage,
+            namespace="console-frontend",
+            account_key_id=f"console-frontend:{profile}",
+        )
 
         async with lacme.Client(
             directory_url=acme_directory,
-            store=self._store,
+            store=frontend_store,
             challenge_handler=handler,
             event_dispatcher=self._event_dispatcher,
         ) as client:
-            self._frontend_bundle = await client.issue(hostnames)
-            self._store.save_cert(self._frontend_bundle)
+            self._frontend_bundle = await client.issue(identifiers)
+            self._frontend_store = frontend_store
             log.info(
                 "tls.frontend.issued",
-                domain=hostnames[0],
+                domain=str(identifiers[0]),
                 ca=acme_directory,
             )
 
     # -- Auto-renewal ----------------------------------------------------------
 
     async def start_renewal(self) -> None:
-        """Start background auto-renewal for all stored certificates.
+        """Start CA-direct auto-renewal for the console's internal certificate.
 
-        Uses CA-direct mode (lacme 1.0.2+) — signs directly via the CA
-        without going through ACME. No loopback client, no network,
-        no startup ordering dependency.
+        Other nodes renew their own identities, and an externally issued
+        frontend certificate is deliberately excluded. This signs directly via
+        the CA without a loopback client or startup-ordering dependency.
         """
         if self._ca is None:
             raise RuntimeError("CA not initialized")
-        lacme = _require_lacme()
-        from turnstone.core.tls import _SingleDomainStore
+        if self._renewal_manager is not None:
+            raise RuntimeError("TLS renewal is already running")
+        from turnstone.core.tls_store import RenewalStoreView
 
-        def _on_renewed(bundle: Any) -> None:
-            # Update our cached bundles if the renewed domain matches
+        def _on_renewed(bundle: CertBundle) -> None:
+            # Only the internal scoped store reaches this callback. A
+            # same-domain frontend identity lives in a separate store and must
+            # never be replaced by the cluster CA.
             if self._internal_bundle and bundle.domain == self._internal_bundle.domain:
-                self._internal_bundle = bundle
-                # Swap the renewed material into the live mTLS client context so
-                # proxy/collector connections present the new cert. Contain
-                # failures (matching the node-side reload hook) so a reload
-                # error can't abort the callback before the frontend-bundle
-                # update below or perturb the renewal sweep.
+                previous = self._internal_bundle
                 try:
                     self._reload_client_ctx(bundle)
                 except Exception:
+                    try:
+                        self._reload_client_ctx(previous)
+                    except Exception:
+                        log.error("tls.client_ctx.rollback_failed", exc_info=True)
+                    self._store.save_cert(previous)
                     log.warning("tls.client_ctx.reload_failed", exc_info=True)
-            if self._frontend_bundle and bundle.domain == self._frontend_bundle.domain:
+                    raise
+                self._internal_bundle = bundle
+            if self._frontend_store is None and self._frontend_bundle:
                 self._frontend_bundle = bundle
 
         # Scope the sweep to the console's own cert; the store is shared, so an
         # unscoped CA-direct sweep would re-sign every node's cert. Empty domain
         # → renew nothing (never the whole store). An external-ACME frontend
-        # cert has a different domain and is intentionally excluded (re-signing
-        # an externally-issued cert with the internal CA would break it).
+        # cert is held in its own namespace and intentionally excluded even
+        # when it has the same primary domain; the cluster CA must not re-sign it.
         own_domain = self._internal_bundle.domain if self._internal_bundle is not None else ""
-        renewal_store = _SingleDomainStore(self._store, own_domain)
+        renewal_store = RenewalStoreView(self._store, own_domain)
 
-        self._renewal_manager = lacme.RenewalManager(
+        manager = lacme.RenewalManager(
             ca=self._ca,
             store=renewal_store,
-            interval_hours=_RENEW_INTERVAL_HOURS,
-            days_before_expiry=_RENEW_BEFORE_EXPIRY_DAYS,
+            interval_hours=RENEW_INTERVAL_HOURS,
+            days_before_expiry=RENEW_BEFORE_EXPIRY_DAYS,
+            max_jitter_seconds=RENEW_MAX_JITTER_SECONDS,
             on_renewed=_on_renewed,
             event_dispatcher=self._event_dispatcher,
         )
-        self._renewal_task = self._renewal_manager.start()
+        manager.start()
+        self._renewal_manager = manager
         log.info(
             "tls.renewal.started",
-            interval_hours=_RENEW_INTERVAL_HOURS,
+            interval_hours=RENEW_INTERVAL_HOURS,
         )
 
     async def stop_renewal(self) -> None:
         """Stop the background renewal task."""
-        if self._renewal_task is not None:
-            import asyncio
-            import contextlib
+        manager, self._renewal_manager = self._renewal_manager, None
+        if manager is not None:
+            from turnstone.core.tls import complete_tls_cleanup
 
-            self._renewal_task.cancel()
-            try:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._renewal_task
-            except Exception:
-                log.exception("tls.renewal.stop_error")
-            self._renewal_task = None
+            async def _cleanup() -> None:
+                try:
+                    await manager.stop()
+                except Exception:
+                    log.exception("tls.renewal.stop_error")
+
+            await complete_tls_cleanup(_cleanup())
 
     # -- SSL contexts ----------------------------------------------------------
 
@@ -346,10 +442,9 @@ class TLSManager:
         """
         if self._frontend_bundle is None:
             return None
-        _require_lacme()
         from lacme.mtls import server_ssl_context
 
-        return server_ssl_context(  # type: ignore[no-any-return,unused-ignore]
+        return server_ssl_context(
             cert_pem=self._frontend_bundle.fullchain_pem,
             key_pem=self._frontend_bundle.key_pem,
             ca_cert_pem=self.get_root_cert_pem(),
@@ -364,7 +459,6 @@ class TLSManager:
         if self._internal_bundle is None:
             return None
         if self._client_ctx is None:
-            _require_lacme()
             from lacme.mtls import client_ssl_context
 
             self._client_ctx = client_ssl_context(
@@ -374,7 +468,7 @@ class TLSManager:
             )
         return self._client_ctx
 
-    def _reload_client_ctx(self, bundle: Any) -> None:
+    def _reload_client_ctx(self, bundle: CertBundle) -> None:
         """Load a renewed bundle into the cached mTLS client context in place.
 
         httpx clients built with this context present the new client cert on
@@ -390,16 +484,25 @@ class TLSManager:
     def gc_expired_certs(self, max_age_days: int = 7) -> int:
         """Delete stored certs that expired more than ``max_age_days`` ago.
 
-        A live node keeps its cert's ``expires_at`` in the future, so only
-        decommissioned-node (or legacy container-ID) rows go stale; deleting
-        them well past expiry is safe. Returns the number of rows removed.
+        The signed leaf, rather than mutable database metadata, determines the
+        cutoff. Only decommissioned-node (or legacy container-ID) rows go stale;
+        deleting them well past expiry is safe. Returns the number removed.
         """
         from datetime import UTC, datetime, timedelta
 
         cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
         removed = 0
         for bundle in self._store.list_certs():
-            if bundle.expires_at < cutoff and self._store.delete_cert(bundle.domain):
+            try:
+                not_valid_after = _certificate_not_valid_after(bundle)
+            except ValueError as exc:
+                log.warning(
+                    "tls.certs.gc_invalid_identity",
+                    domain=bundle.domain,
+                    error=str(exc),
+                )
+                continue
+            if not_valid_after < cutoff and self._store.delete_cert(bundle.domain):
                 removed += 1
         if removed:
             log.info("tls.certs.gc", removed=removed, max_age_days=max_age_days)
@@ -407,40 +510,90 @@ class TLSManager:
 
     # -- Properties ------------------------------------------------------------
 
-    def list_certs(self) -> list[Any]:
-        """List all stored certificate bundles."""
+    def list_certs(self) -> list[CertBundle]:
+        """List all managed certificate identities."""
         return self._store.list_certs()
 
-    def renew_cert(self, domain: str) -> Any:
-        """Force-renew a certificate by domain. Returns the new bundle."""
+    def renew_cert(self, domain: str) -> CertBundle:
+        """Force-renew the console-owned internal identity."""
         if self._ca is None:
             raise RuntimeError("CA not initialized")
         existing = self._store.load_cert(domain)
         if existing is None:
             raise ValueError(f"No certificate for {domain}")
-        # Issue new cert first, then delete old (safe if issuance fails)
-        bundle = self._ca.issue(list(existing.domains))
-        self._store.delete_cert(domain)
-        self._store.save_cert(bundle)
-        # Update in-memory bundles if this is the console's own cert
-        if self._internal_bundle and bundle.domain == self._internal_bundle.domain:
-            self._internal_bundle = bundle
-        if self._frontend_bundle and bundle.domain == self._frontend_bundle.domain:
+        if self._internal_bundle is None or domain != self._internal_bundle.domain:
+            raise CertificateNotLocallyManagedError(
+                f"Certificate {domain!r} is owned by a remote node or external ACME issuer"
+            )
+        # CA issuance saves the complete replacement atomically through the
+        # store, preserving the previous usable row if issuance fails.
+        from turnstone.core.tls import certificate_bundle_identifiers
+
+        identifiers = certificate_bundle_identifiers(existing)
+        frontend_is_internal = self._frontend_store is None
+        try:
+            bundle = self._ca.issue(identifiers, validity_hours=CERT_VALIDITY_HOURS)
+            self._reload_client_ctx(bundle)
+        except BaseException:
+            # CA.issue persists before returning. Restore the prior complete
+            # identity if live-context installation fails so the DB does not
+            # claim a rotation the process could not adopt.
+            try:
+                self._reload_client_ctx(existing)
+            except Exception:
+                log.error("tls.client_ctx.rollback_failed", exc_info=True)
+            self._store.save_cert(existing)
+            raise
+        self._internal_bundle = bundle
+        if frontend_is_internal:
             self._frontend_bundle = bundle
         return bundle
 
     def delete_cert(self, domain: str) -> bool:
-        """Delete a certificate by domain."""
+        """Delete an expired, remotely managed certificate by domain."""
+        existing = self._store.load_cert(domain)
+        if existing is None:
+            return False
+        if self._internal_bundle is not None and domain == self._internal_bundle.domain:
+            raise CertificateNotLocallyManagedError(
+                "The console's active internal certificate cannot be deleted"
+            )
+        try:
+            expired = _certificate_not_valid_after(existing) <= datetime.now(UTC)
+        except ValueError as exc:
+            raise CertificateNotLocallyManagedError(
+                f"Certificate {domain!r} is malformed and cannot be safely deleted"
+            ) from exc
+        if not expired:
+            raise CertificateNotLocallyManagedError(
+                f"Active certificate {domain!r} must be rotated or removed by its owning node"
+            )
         return self._store.delete_cert(domain)
+
+    def can_renew_cert(self, domain: str) -> bool:
+        """Return whether this process owns and can hot-reload *domain*."""
+        return self._internal_bundle is not None and domain == self._internal_bundle.domain
+
+    def can_delete_cert(self, domain: str) -> bool:
+        """Return whether *domain* is an expired remote identity."""
+        if self.can_renew_cert(domain):
+            return False
+        existing = self._store.load_cert(domain)
+        if existing is None:
+            return False
+        try:
+            return _certificate_not_valid_after(existing) <= datetime.now(UTC)
+        except ValueError:
+            return False
 
     @property
     def ca_initialized(self) -> bool:
         return self._ca is not None
 
     @property
-    def internal_bundle(self) -> Any | None:
+    def internal_bundle(self) -> CertBundle | None:
         return self._internal_bundle
 
     @property
-    def frontend_bundle(self) -> Any | None:
+    def frontend_bundle(self) -> CertBundle | None:
         return self._frontend_bundle

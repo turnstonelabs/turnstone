@@ -11,6 +11,8 @@ from turnstone.core.auth import (
     AUTH_COOKIE,
     AUTH_COOKIE_CONSOLE,
     AUTH_COOKIE_SERVER,
+    JWT_AUD_CONSOLE,
+    TLS_ACME_TOKEN_SOURCE,
     WRITE_PATHS,
     _extract_bearer,
     _extract_cookie,
@@ -52,6 +54,17 @@ class TestIsPublicPath:
 
     def test_shared_js_public(self):
         assert is_public_path("/shared/utils.js") is True
+
+    @pytest.mark.parametrize("path", ["/acme/directory", "/acme/new-nonce", "/acme/ca.pem"])
+    def test_acme_bootstrap_resources_public(self, path):
+        assert is_public_path(path) is True
+
+    @pytest.mark.parametrize(
+        "path",
+        ["/acme/new-account", "/acme/new-order", "/acme/authz/order-1", "/acme/cert/1"],
+    )
+    def test_acme_signing_resources_not_public(self, path):
+        assert is_public_path(path) is False
 
     def test_api_workstreams_not_public(self):
         assert is_public_path("/api/workstreams") is False
@@ -128,6 +141,12 @@ class TestIsPublicPath:
 class TestRequiredScope:
     def test_get_api_needs_read(self):
         assert required_scope("GET", "/api/workstreams") == "read"
+
+    @pytest.mark.parametrize(
+        "path", ["/acme/new-account", "/acme/new-order", "/acme/finalize/order-1"]
+    )
+    def test_acme_signing_requires_service(self, path):
+        assert required_scope("POST", path) == "service"
 
     def test_get_events_needs_read(self):
         assert required_scope("GET", "/api/events") == "read"
@@ -478,6 +497,146 @@ class TestCheckRequest:
             "GET", "/static/style.css", None, cookie_name=AUTH_COOKIE_SERVER
         )
         assert allowed is True
+
+    def test_acme_signing_no_token_401(self):
+        allowed, status, _msg, _result = check_request(
+            "POST", "/acme/new-order", None, cookie_name=AUTH_COOKIE_CONSOLE
+        )
+        assert allowed is False
+        assert status == 401
+
+    def test_acme_rejects_generic_service_token(self):
+        token = create_jwt(
+            "node-1",
+            frozenset({"service"}),
+            "console",
+            self._SECRET,
+            audience=JWT_AUD_CONSOLE,
+        )
+        allowed, status, msg, _result = check_request(
+            "POST",
+            "/acme/new-order",
+            f"Bearer {token}",
+            jwt_secret=self._SECRET,
+            jwt_audience=JWT_AUD_CONSOLE,
+            cookie_name=AUTH_COOKIE_CONSOLE,
+        )
+        assert allowed is False
+        assert status == 403
+        assert "ACME enrollment" in msg
+
+    def test_acme_rejects_enrollment_token_without_service_scope(self):
+        token = create_jwt(
+            "node-1",
+            frozenset({"read"}),
+            TLS_ACME_TOKEN_SOURCE,
+            self._SECRET,
+            audience=JWT_AUD_CONSOLE,
+        )
+        allowed, status, _msg, _result = check_request(
+            "POST",
+            "/acme/new-order",
+            f"Bearer {token}",
+            jwt_secret=self._SECRET,
+            jwt_audience=JWT_AUD_CONSOLE,
+            cookie_name=AUTH_COOKIE_CONSOLE,
+        )
+        assert allowed is False
+        assert status == 403
+
+    def test_acme_accepts_purpose_specific_service_token(self):
+        token = create_jwt(
+            "node-1",
+            frozenset({"service"}),
+            TLS_ACME_TOKEN_SOURCE,
+            self._SECRET,
+            audience=JWT_AUD_CONSOLE,
+        )
+        allowed, status, _msg, result = check_request(
+            "POST",
+            "/acme/new-order",
+            f"Bearer {token}",
+            jwt_secret=self._SECRET,
+            jwt_audience=JWT_AUD_CONSOLE,
+            cookie_name=AUTH_COOKIE_CONSOLE,
+        )
+        assert allowed is True
+        assert status == 200
+        assert result is not None and result.token_source == TLS_ACME_TOKEN_SOURCE
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/v1/api/workstreams"),
+            ("POST", "/v1/api/workstreams/new"),
+            ("GET", "/v1/api/admin/users"),
+            ("POST", "/v1/api/admin/tls/certs/node-1/renew"),
+            ("GET", "/v1/node/node-1/api/workstreams"),
+        ],
+    )
+    def test_enrollment_token_rejected_outside_acme(self, method, path):
+        token = create_jwt(
+            "node-1",
+            frozenset({"service"}),
+            TLS_ACME_TOKEN_SOURCE,
+            self._SECRET,
+            audience=JWT_AUD_CONSOLE,
+        )
+
+        allowed, status, msg, result = check_request(
+            method,
+            path,
+            f"Bearer {token}",
+            jwt_secret=self._SECRET,
+            jwt_audience=JWT_AUD_CONSOLE,
+            cookie_name=AUTH_COOKIE_CONSOLE,
+        )
+
+        assert allowed is False
+        assert status == 403
+        assert "enrollment token" in msg
+        assert result is None
+
+    def test_versioned_acme_accepts_purpose_specific_service_token(self):
+        token = create_jwt(
+            "node-1",
+            frozenset({"service"}),
+            TLS_ACME_TOKEN_SOURCE,
+            self._SECRET,
+            audience=JWT_AUD_CONSOLE,
+        )
+
+        allowed, status, _msg, result = check_request(
+            "POST",
+            "/v1/acme/new-order",
+            f"Bearer {token}",
+            jwt_secret=self._SECRET,
+            jwt_audience=JWT_AUD_CONSOLE,
+            cookie_name=AUTH_COOKIE_CONSOLE,
+        )
+
+        assert allowed is True
+        assert status == 200
+        assert result is not None and result.token_source == TLS_ACME_TOKEN_SOURCE
+
+    def test_acme_rejects_wrong_audience(self):
+        token = create_jwt(
+            "node-1",
+            frozenset({"service"}),
+            TLS_ACME_TOKEN_SOURCE,
+            self._SECRET,
+            audience="another-service",
+        )
+        allowed, status, _msg, _result = check_request(
+            "POST",
+            "/acme/new-order",
+            f"Bearer {token}",
+            jwt_secret=self._SECRET,
+            jwt_audience=JWT_AUD_CONSOLE,
+            cookie_name=AUTH_COOKIE_CONSOLE,
+        )
+        assert allowed is False
+        assert status == 401
 
     def test_api_no_token_401(self):
         allowed, status, msg, _result = check_request(
@@ -1405,6 +1564,25 @@ class TestConsoleLogin:
             json={"token": "tok_read"},
         )
         assert resp.status_code == 401
+
+    def test_login_enrollment_token_rejected(self):
+        token = create_jwt(
+            "node-1",
+            frozenset({"service"}),
+            TLS_ACME_TOKEN_SOURCE,
+            self._jwt_secret,
+            audience=JWT_AUD_CONSOLE,
+        )
+
+        resp = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"token": token},
+        )
+
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "Invalid credentials"}
+        assert "jwt" not in resp.json()
+        assert AUTH_COOKIE_CONSOLE not in resp.headers.get("set-cookie", "")
 
     def test_login_password_ok(self):
         resp = self.test_client.post(

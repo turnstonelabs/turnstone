@@ -3887,24 +3887,31 @@ function loadTlsCerts() {
 
         const colActions = document.createElement("span");
         colActions.className = "admin-col admin-col-actions";
-        const kebab = _kebabMenuEl([
-          {
+        const actions = [];
+        if (c.renewable) {
+          actions.push({
             label: "Renew",
             attrs: {
               "data-tls-renew": c.domain,
               "aria-label": "Renew certificate for " + c.domain,
             },
-          },
-          {
+          });
+        }
+        if (c.deletable) {
+          actions.push({
             label: "Delete",
             kind: "danger",
             attrs: {
               "data-tls-delete": c.domain,
               "aria-label": "Delete certificate for " + c.domain,
             },
-          },
-        ]);
-        colActions.appendChild(kebab);
+          });
+        }
+        if (actions.length > 0) {
+          colActions.appendChild(_kebabMenuEl(actions));
+        } else {
+          colActions.textContent = "Managed by node";
+        }
 
         row.appendChild(colDomain);
         row.appendChild(colSans);

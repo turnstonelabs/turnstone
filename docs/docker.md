@@ -102,13 +102,26 @@ the cluster runs mTLS; harmless otherwise), and `TURNSTONE_SEARXNG_URL` points
 are the dev-stack defaults — match whatever you set in `.env` if you changed them.
 
 To let a server on a **different** machine join, start the stack with
-`TURNSTONE_HOST_IP=<this host's LAN IP>` — that binds PostgreSQL, the console
-ACME endpoint, and SearxNG to that interface. Then on the remote box set the
-three URLs above to that IP, and set `TURNSTONE_ADVERTISE_URL` to the **remote**
-box's own IP (the address the console dials back). **Set a strong
-`POSTGRES_PASSWORD` first** — `TURNSTONE_HOST_IP` exposes the database (and every
-user account + API-token hash in it), the console API, and the unauthenticated
-SearxNG to your network.
+both `TURNSTONE_HOST_IP=<this host's LAN IP>` and
+`TURNSTONE_ACME_EXTERNAL_URL=http://<this host's LAN IP>:8090/acme`. The first
+binds PostgreSQL, the console ACME endpoint, and SearxNG to that interface; the
+second makes every URL in the ACME directory routable from the remote node (the
+full value must include the `/acme` mount). Set the same
+`TURNSTONE_ACME_EXTERNAL_URL` on the remote node so its authenticated ACME
+client can pin that credential destination. Set `TURNSTONE_CONSOLE_URL` and
+`TURNSTONE_SEARXNG_URL` to the compose host's IP, but set
+`TURNSTONE_ADVERTISE_URL=http://192.0.2.10:8080` to the **remote** box's own
+address. A resolvable DNS name works too. IPv6 literals must be bracketed in
+URLs, for example `http://[2001:db8::10]:8080`; Turnstone enrolls literal
+addresses as IP SANs rather than numeric DNS SANs.
+
+Use a trusted LAN or VPN address and firewall `:8090` to enrolling nodes. ACME
+signing routes require a dedicated short-lived service JWT, but direct bootstrap
+is still plain HTTP/TOFU: a bearer token provides authentication, not transport
+confidentiality or protection from an active on-path attacker. **Set a strong
+`POSTGRES_PASSWORD` first** — `TURNSTONE_HOST_IP` also exposes the database (and
+every user account + API-token hash in it), the console API, and the
+unauthenticated SearxNG to your network.
 
 To run the bare-metal node as a hardened, persistent service instead of by hand,
 use the systemd units in [`deploy/systemd/`](../deploy/systemd/).
@@ -147,6 +160,11 @@ certs via the console's ACME endpoint:
 ```bash
 docker compose -f turnstone/deploy/compose.yaml -f deploy/docker-compose.tls.yml up
 ```
+
+The overlay publishes the console's plain-HTTP bootstrap/API port on
+`TURNSTONE_CONSOLE_HTTP_BIND` (default `127.0.0.1`). For a cross-host node, set
+that to a trusted LAN/VPN address, set `TURNSTONE_ACME_EXTERNAL_URL` to the same
+address plus `/acme`, and firewall the port to enrolling nodes.
 
 See [tls.md](tls.md) for details.
 
@@ -206,6 +224,8 @@ Caddy or proxied by the console:
 | `POSTGRES_PORT` | `5432` | Host port for PostgreSQL (for bare-metal joins) |
 | `SEARXNG_API_PORT` | `8081` | Host port for the SearxNG API a bare-metal node's `web_search` dials (dev stack) |
 | `TURNSTONE_HOST_IP` | `127.0.0.1` | Interface PostgreSQL, the console ACME endpoint, and SearxNG bind on (dev stack). Set to this host's LAN IP so a bare-metal node on **another machine** can reach them — set a strong `POSTGRES_PASSWORD` first (it also exposes the DB and the unauthenticated SearxNG to your network). |
+| `TURNSTONE_CONSOLE_HTTP_BIND` | `127.0.0.1` | Production TLS-overlay interface for the console's plain-HTTP bootstrap/API listener. Use only a trusted LAN/VPN address and firewall it to enrolling nodes. |
+| `TURNSTONE_ACME_EXTERNAL_URL` | request-derived | Canonical externally reachable ACME responder base, including the final `/acme` mount (for example `http://192.0.2.1:8090/acme`). Set it on the console and clients for cross-host mTLS: the console advertises it, while clients pin it as an allowed enrollment-JWT destination. A reverse-proxy prefix is supported only when the proxy maps it to Turnstone's internal `/acme` mount. |
 | `POSTGRES_BIND` | `127.0.0.1` | Production stack (`turnstone/deploy/compose.yaml`) only: interface PostgreSQL binds on; set to the host's LAN IP for remote joins. |
 
 ### Channel gateway

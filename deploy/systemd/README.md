@@ -15,11 +15,14 @@ counterpart to the quick `turnstone-server …` invocation in
 ## Cluster-side prerequisite
 
 The compose stack must publish Postgres, the console's ACME endpoint, and SearxNG
-on an address the bare-metal host can reach. Start it with `TURNSTONE_HOST_IP`
-set to the compose host's LAN IP (default `127.0.0.1` keeps everything host-local):
+on an address the bare-metal host can reach. Use a trusted LAN or VPN interface,
+firewall it to the joining node, and advertise the same reachable ACME endpoint
+(default `127.0.0.1` keeps everything host-local):
 
 ```bash
-TURNSTONE_HOST_IP=<compose-host-ip> docker compose up -d
+TURNSTONE_HOST_IP=<compose-host-ip> \
+TURNSTONE_ACME_EXTERNAL_URL=http://<compose-host-ip>:8090/acme \
+  docker compose up -d
 ```
 
 ## Install (run as root on the bare-metal host)
@@ -65,8 +68,20 @@ journalctl -u turnstone-server -f          # watch it register + (if the cluster
 shared settings (the database). If the cluster runs mTLS, the node auto-enrolls a
 cert from the console's ACME endpoint and re-advertises itself over `https://`.
 
-> **mTLS + cross-host caveat:** a node on a *different* host than the console
-> currently can't complete ACME enrollment — the console advertises an
-> unroutable in-container address in its ACME directory
-> ([turnstonelabs/lacme#22](https://github.com/turnstonelabs/lacme/issues/22)).
-> Same-host bare-metal nodes, and any node in a non-mTLS cluster, are unaffected.
+For a node on a different host, `TURNSTONE_ACME_EXTERNAL_URL` is required on the
+console and should also be set in the node drop-in. It is the full, externally
+reachable responder base
+(including `/acme`) that the console embeds in the ACME protocol's follow-up
+URLs and that the node trusts as an enrollment-credential destination. The
+node's `TURNSTONE_CONSOLE_URL` should point at the same host and port, without
+the `/acme` suffix.
+
+For mTLS, `TURNSTONE_ADVERTISE_URL` may use a resolvable DNS hostname or a
+literal IP address. Turnstone enrolls literals as IP SANs. Bracket IPv6 literals
+inside URLs, for example `http://[2001:db8::10]:8080`; do not use wildcard,
+unspecified, or scoped addresses as certificate identities. Restart the node
+after changing its advertised identity so it enrolls a matching certificate.
+
+The dedicated service JWT authenticates enrollment but the direct `:8090`
+bootstrap is still plain HTTP/TOFU. Use HTTPS through an independently trusted
+proxy when the network itself is not trusted.
