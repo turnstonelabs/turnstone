@@ -15,12 +15,13 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from turnstone.core.storage._notify import Notify, NotifyStream
     from turnstone.core.trajectory import Turn
 
 from turnstone.core.log import get_logger
+from turnstone.core.project_access import fold_role_permissions
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     USER_SCOPED_AUTH_TYPES,
@@ -48,6 +49,7 @@ from turnstone.core.storage._schema import (
     mcp_pending_consent,
     mcp_servers,
     mcp_user_tokens,
+    memory_index_snapshots,
     metadata,
     model_definitions,
     oidc_identities,
@@ -68,6 +70,7 @@ from turnstone.core.storage._schema import (
     skill_resources,
     skill_versions,
     structured_memories,
+    structured_memory_summary_columns,
     system_settings,
     tls_account_keys,
     tls_ca,
@@ -79,6 +82,7 @@ from turnstone.core.storage._schema import (
     watches,
     workstream_attachments,
     workstream_config,
+    workstream_id_registry,
     workstream_overrides,
     workstreams,
 )
@@ -143,24 +147,32 @@ from turnstone.core.storage._utils import (
     KeyedAttachmentSaveWrappers as _KeyedAttachmentSaveWrappers,
 )
 from turnstone.core.storage._utils import (
-    assert_single_default_persona as _assert_single_default_persona,
-)
-from turnstone.core.storage._utils import (
-    build_attachments_by_msg as _build_attachments_by_msg,
-)
-from turnstone.core.storage._utils import (
+    acquire_memory_index_snapshot_on_connection,
+    build_memory_scope_or_clause,
     clone_workstream_transaction,
     find_orphan_conversations,
+    memory_index_health_inputs_on_connection,
     parse_checkpoint_watermark,
     prepare_attachment_commit,
     prepare_conversation_row_values,
     prepare_provider_data_for_save,
     purge_orphan_conversations,
     release_attachment_refs,
+    require_active_workstream_on_connection,
+    require_project_memory_access_on_connection,
+    require_project_memory_scopes_on_connection,
     retain_attachment_refs,
     sanitize_text,
     save_attachment_commit_transaction,
     senders_from_user_meta,
+    structured_memory_exact_scope_predicate,
+    structured_memory_filter_scope_predicate,
+)
+from turnstone.core.storage._utils import (
+    assert_single_default_persona as _assert_single_default_persona,
+)
+from turnstone.core.storage._utils import (
+    build_attachments_by_msg as _build_attachments_by_msg,
 )
 from turnstone.core.storage._utils import (
     delete_messages_after_core as _delete_messages_after_core,
@@ -1444,6 +1456,13 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         norm_project = project_id if project_id else None
         norm_persona = persona if persona else None
         with self._conn() as conn:
+            registry_result = conn.execute(
+                sa.insert(workstream_id_registry).prefix_with("OR IGNORE"),
+                {"ws_id": ws_id, "created": now},
+            )
+            if registry_result.rowcount != 1:
+                conn.commit()
+                return False
             result = conn.execute(
                 sa.insert(workstreams).prefix_with("OR IGNORE"),
                 {
@@ -1465,7 +1484,24 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 },
             )
             inserted = result.rowcount == 1
+            if not inserted:
+                # Compatibility for a legacy/direct row that bypassed the
+                # registry. Migration 072 backfills every production row.
+                conn.execute(
+                    sa.delete(workstream_id_registry).where(workstream_id_registry.c.ws_id == ws_id)
+                )
             if inserted:
+                # Defensive cleanup for pre-072 orphan data. Once registered,
+                # this id can never name a second published workstream.
+                conn.execute(
+                    sa.delete(memory_index_snapshots).where(memory_index_snapshots.c.ws_id == ws_id)
+                )
+                conn.execute(
+                    sa.delete(structured_memories).where(
+                        structured_memories.c.scope == "workstream",
+                        structured_memories.c.scope_id == ws_id,
+                    )
+                )
                 if fork_reservation_token:
                     # Persist the destination-incarnation fence atomically
                     # with the row. OR REPLACE overwrites a stale orphan key
@@ -1679,6 +1715,10 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
     def _delete_workstream_on_connection(self, conn: Any, ws_id: str) -> bool:
         """Delete one row and dependents inside the caller's transaction."""
+        state_row = conn.execute(
+            sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id)
+        ).fetchone()
+        was_unpublished = state_row is not None and str(state_row[0] or "") == "creating"
         # Refcount GC over every referenced blob (content-addressed ids are
         # global, so a deduped blob may be shared with another workstream —
         # decrement, don't blanket-delete by ws_id).  Blobs that hit 0 are
@@ -1696,6 +1736,15 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             ref_ids.extend(_parse_attachment_refs(refs))
         release_attachment_refs(conn, ref_ids)
         conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
+        conn.execute(
+            sa.delete(memory_index_snapshots).where(memory_index_snapshots.c.ws_id == ws_id)
+        )
+        conn.execute(
+            sa.delete(structured_memories).where(
+                structured_memories.c.scope == "workstream",
+                structured_memories.c.scope_id == ws_id,
+            )
+        )
         conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
         conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id))
         # Null-out parent_ws_id on children before dropping the row —
@@ -1710,6 +1759,10 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             .values(parent_ws_id=None)
         )
         result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
+        if result.rowcount > 0 and was_unpublished:
+            conn.execute(
+                sa.delete(workstream_id_registry).where(workstream_id_registry.c.ws_id == ws_id)
+            )
         return bool(result.rowcount > 0)
 
     def delete_workstream(self, ws_id: str) -> bool:
@@ -3165,6 +3218,13 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         fields = {k: v for k, v in fields.items() if k in _ROLE_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id)
+            ).fetchone()
+            if role is None:
+                conn.rollback()
+                return False
             result = conn.execute(
                 sa.update(roles).where(roles.c.role_id == role_id).values(**fields)
             )
@@ -3173,6 +3233,13 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
     def delete_role(self, role_id: str) -> bool:
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id)
+            ).fetchone()
+            if role is None:
+                conn.rollback()
+                return False
             conn.execute(sa.delete(user_roles).where(user_roles.c.role_id == role_id))
             # No FK on role_permission_overrides (migration 057 omitted
             # to match the rest of the governance schema), so clean up
@@ -3191,6 +3258,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
     def assign_role(self, user_id: str, role_id: str, assigned_by: str = "") -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id)
+            ).fetchone()
+            if role is None:
+                raise ValueError(f"role {role_id!r} does not exist")
             conn.execute(
                 sa.insert(user_roles).prefix_with("OR IGNORE"),
                 {
@@ -3204,6 +3277,13 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
     def unassign_role(self, user_id: str, role_id: str) -> bool:
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id)
+            ).fetchone()
+            if role is None:
+                conn.rollback()
+                return False
             result = conn.execute(
                 sa.delete(user_roles).where(
                     (user_roles.c.user_id == user_id) & (user_roles.c.role_id == role_id)
@@ -3253,6 +3333,15 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         # actual transition that hit the table.
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            existing_desired = {
+                str(row[0])
+                for row in conn.execute(
+                    sa.select(roles.c.role_id).where(roles.c.role_id.in_(desired_role_ids))
+                ).fetchall()
+            }
+            missing = desired_role_ids - existing_desired
+            if missing:
+                raise ValueError(f"roles do not exist: {sorted(missing)!r}")
             existing_rows = conn.execute(
                 sa.select(user_roles.c.role_id, user_roles.c.assigned_by).where(
                     user_roles.c.user_id == user_id
@@ -3276,6 +3365,15 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             # any state change that landed between the two reads.
             conn.commit()
             conn.execute(sa.text("BEGIN IMMEDIATE"))
+            existing_desired = {
+                str(row[0])
+                for row in conn.execute(
+                    sa.select(roles.c.role_id).where(roles.c.role_id.in_(desired_role_ids))
+                ).fetchall()
+            }
+            missing = desired_role_ids - existing_desired
+            if missing:
+                raise ValueError(f"roles do not exist: {sorted(missing)!r}")
             existing_rows = conn.execute(
                 sa.select(user_roles.c.role_id, user_roles.c.assigned_by).where(
                     user_roles.c.user_id == user_id
@@ -3339,9 +3437,13 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                         revokes.setdefault(rid, set()).add(perm)
             perms: set[str] = set()
             for rid, perms_str, builtin in role_rows:
-                role_perms = _split_perms(perms_str)
+                role_perms = fold_role_permissions(perms_str)
                 if builtin:
-                    role_perms = (role_perms | grants.get(rid, set())) - revokes.get(rid, set())
+                    role_perms = fold_role_permissions(
+                        role_perms,
+                        grants=grants.get(rid, set()),
+                        revokes=revokes.get(rid, set()),
+                    )
                 perms |= role_perms
             return perms
 
@@ -3381,9 +3483,13 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                         revokes.setdefault(rid, set()).add(perm)
             holders: set[str] = set()
             for user_id, role_id, perms_str, builtin in rows:
-                eff = _split_perms(perms_str)
+                eff = fold_role_permissions(perms_str)
                 if builtin:
-                    eff = (eff | grants.get(role_id, set())) - revokes.get(role_id, set())
+                    eff = fold_role_permissions(
+                        eff,
+                        grants=grants.get(role_id, set()),
+                        revokes=revokes.get(role_id, set()),
+                    )
                 if permission in eff:
                     holders.add(user_id)
             return holders
@@ -3411,6 +3517,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             raise ValueError("grants and revokes must be disjoint")
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id)
+            ).fetchone()
+            if role is None:
+                raise ValueError(f"role {role_id!r} does not exist")
             conn.execute(
                 sa.delete(role_permission_overrides).where(
                     role_permission_overrides.c.role_id == role_id
@@ -3437,15 +3549,24 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             ]
             if rows:
                 conn.execute(sa.insert(role_permission_overrides), rows)
+            conn.execute(sa.update(roles).where(roles.c.role_id == role_id).values(updated=now))
             conn.commit()
 
     def clear_role_overrides(self, role_id: str) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id)
+            ).fetchone()
+            if role is None:
+                raise ValueError(f"role {role_id!r} does not exist")
             conn.execute(
                 sa.delete(role_permission_overrides).where(
                     role_permission_overrides.c.role_id == role_id
                 )
             )
+            conn.execute(sa.update(roles).where(roles.c.role_id == role_id).values(updated=now))
             conn.commit()
 
     def effective_role_permissions(self, role_id: str) -> dict[str, list[str]]:
@@ -3470,7 +3591,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                         grants.add(perm)
                     elif action == "revoke":
                         revokes.add(perm)
-            effective = (baseline | grants) - revokes
+            effective = fold_role_permissions(baseline, grants=grants, revokes=revokes)
             return {
                 "baseline": sorted(baseline),
                 "grants": sorted(grants),
@@ -3512,7 +3633,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 baseline = _split_perms(perms_str)
                 role_grants = grants.get(rid, set()) if builtin else set()
                 role_revokes = revokes.get(rid, set()) if builtin else set()
-                effective = (baseline | role_grants) - role_revokes
+                effective = fold_role_permissions(
+                    baseline,
+                    grants=role_grants,
+                    revokes=role_revokes,
+                )
                 out[rid] = {
                     "baseline": sorted(baseline),
                     "grants": sorted(role_grants),
@@ -4524,6 +4649,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         judge_model: str,
         latency_ms: int,
         user_decision: str = "pending",
+        resolver_principal_id: str = "",
+        execution_principal_id: str = "",
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
@@ -4545,6 +4672,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     "judge_model": judge_model,
                     "latency_ms": latency_ms,
                     "user_decision": user_decision,
+                    "resolver_principal_id": resolver_principal_id,
+                    "execution_principal_id": execution_principal_id,
                     "created": now,
                 },
             )
@@ -4567,6 +4696,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         judge_model: str,
         latency_ms: int,
         user_decision: str = "pending",
+        resolver_principal_id: str = "",
+        execution_principal_id: str = "",
     ) -> None:
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -4587,6 +4718,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             judge_model=judge_model,
             latency_ms=latency_ms,
             user_decision=user_decision,
+            resolver_principal_id=resolver_principal_id,
+            execution_principal_id=execution_principal_id,
             created=now,
         )
         # On verdict_id conflict, update only the three fields that
@@ -4630,6 +4763,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 "judge_model": v.get("judge_model", ""),
                 "latency_ms": v.get("latency_ms", 0),
                 "user_decision": v.get("user_decision", "pending"),
+                "resolver_principal_id": v.get("resolver_principal_id", ""),
+                "execution_principal_id": v.get("execution_principal_id", ""),
                 "created": now,
             }
             for v in verdicts
@@ -4818,11 +4953,14 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         scope_id: str,
         content: str,
     ) -> None:
-        if description is None or not description.strip():
-            raise ValueError("memory description is required and must be non-empty")
-        description = description.strip()
+        from turnstone.core.memory_index import normalize_memory_description
+
+        description = normalize_memory_description(description)
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            if scope == "workstream":
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                require_active_workstream_on_connection(conn, ws_id=scope_id)
             conn.execute(
                 sa.insert(structured_memories),
                 {
@@ -4835,7 +4973,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     "content": content,
                     "created": now,
                     "updated": now,
-                    "last_accessed": now,
+                    "last_accessed": "",
                     "access_count": 0,
                 },
             )
@@ -4852,12 +4990,13 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         content: str,
         *,
         require_active_project: bool = False,
+        acting_principal_id: str = "",
     ) -> tuple[dict[str, str], bool]:
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        if description is None or not description.strip():
-            raise ValueError("memory description is required and must be non-empty")
-        description = description.strip()
+        from turnstone.core.memory_index import normalize_memory_description
+
+        description = normalize_memory_description(description)
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         insert_stmt = sqlite_insert(structured_memories).values(
             memory_id=memory_id,
@@ -4869,15 +5008,14 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             content=content,
             created=now,
             updated=now,
-            last_accessed=now,
+            last_accessed="",
             access_count=0,
         )
-        # On conflict, refresh content, description, and timestamps. A None type means
-        # "unset" -> keep the stored value. created/access_count stay untouched.
+        # On conflict, refresh authored content and metadata. Access fields record
+        # explicit full-body fetches only, so writes leave them untouched.
         set_: dict[str, Any] = {
             "content": insert_stmt.excluded.content,
             "updated": now,
-            "last_accessed": now,
         }
         set_["description"] = insert_stmt.excluded.description
         if mem_type is not None:
@@ -4885,15 +5023,29 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         stmt = insert_stmt.on_conflict_do_update(
             index_elements=["name", "scope", "scope_id"],
             set_=set_,
-        ).returning(structured_memories)
+        ).returning(*structured_memory_summary_columns)
         with self._conn() as conn:
-            if require_active_project:
+            if (
+                require_active_project
+                or scope == "workstream"
+                or (scope == "project" and acting_principal_id)
+            ):
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+            if scope == "workstream":
+                require_active_workstream_on_connection(conn, ws_id=scope_id)
+            if scope == "project" and acting_principal_id:
+                require_project_memory_access_on_connection(
+                    conn,
+                    project_id=scope_id,
+                    principal_id=acting_principal_id,
+                    write=True,
+                )
+            elif require_active_project:
                 if scope != "project" or not scope_id:
                     raise ValueError("active-project guard requires project scope")
                 # SQLite has no row locks.  Taking the writer lock before the
                 # existence check serializes this transaction with
                 # ``delete_project`` (which uses the same prologue).
-                conn.execute(sa.text("BEGIN IMMEDIATE"))
                 project = conn.execute(
                     sa.select(projects.c.project_id).where(
                         sa.and_(
@@ -4920,40 +5072,134 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             return dict(row._mapping) if row else None
 
     def get_structured_memory_by_name(
-        self, name: str, scope: str = "global", scope_id: str = ""
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
     ) -> dict[str, str] | None:
         with self._conn() as conn:
             row = conn.execute(
                 sa.select(structured_memories).where(
-                    sa.and_(
-                        structured_memories.c.name == name,
-                        structured_memories.c.scope == scope,
-                        structured_memories.c.scope_id == scope_id,
-                    )
+                    structured_memories.c.name == name,
+                    structured_memory_exact_scope_predicate(
+                        scope,
+                        scope_id,
+                    ),
                 )
             ).fetchone()
             return dict(row._mapping) if row else None
 
+    def get_and_touch_structured_memory(self, memory_id: str) -> dict[str, str] | None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.update(structured_memories)
+                .where(structured_memories.c.memory_id == memory_id)
+                .values(
+                    last_accessed=now,
+                    access_count=structured_memories.c.access_count + 1,
+                )
+                .returning(structured_memories)
+            ).fetchone()
+            conn.commit()
+            return dict(row._mapping) if row is not None else None
+
+    def get_and_touch_structured_memory_by_name(
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
+    ) -> dict[str, str] | None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            if scope == "project" and acting_principal_id:
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                require_project_memory_access_on_connection(
+                    conn,
+                    project_id=scope_id,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
+            row = conn.execute(
+                sa.update(structured_memories)
+                .where(
+                    structured_memories.c.name == name,
+                    structured_memory_exact_scope_predicate(
+                        scope,
+                        scope_id,
+                    ),
+                )
+                .values(
+                    last_accessed=now,
+                    access_count=structured_memories.c.access_count + 1,
+                )
+                .returning(structured_memories)
+            ).fetchone()
+            conn.commit()
+            return dict(row._mapping) if row is not None else None
+
+    def update_structured_memory_description(
+        self, memory_id: str, description: str
+    ) -> dict[str, str] | None:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        normalized = normalize_memory_description(description)
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.update(structured_memories)
+                .where(structured_memories.c.memory_id == memory_id)
+                .values(description=normalized, updated=now)
+                .returning(*structured_memory_summary_columns)
+            ).fetchone()
+            conn.commit()
+            return dict(row._mapping) if row is not None else None
+
     def delete_structured_memory(
-        self, name: str, scope: str = "global", scope_id: str = ""
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
     ) -> bool:
-        return self.delete_structured_memory_returning(name, scope, scope_id) is not None
+        return (
+            self.delete_structured_memory_returning(
+                name,
+                scope,
+                scope_id,
+            )
+            is not None
+        )
 
     def delete_structured_memory_returning(
-        self, name: str, scope: str = "global", scope_id: str = ""
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
     ) -> dict[str, str] | None:
         stmt = (
             sa.delete(structured_memories)
             .where(
-                sa.and_(
-                    structured_memories.c.name == name,
-                    structured_memories.c.scope == scope,
-                    structured_memories.c.scope_id == scope_id,
-                )
+                structured_memories.c.name == name,
+                structured_memory_exact_scope_predicate(
+                    scope,
+                    scope_id,
+                ),
             )
-            .returning(structured_memories)
+            .returning(*structured_memory_summary_columns)
         )
         with self._conn() as conn:
+            if scope == "project" and acting_principal_id:
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                require_project_memory_access_on_connection(
+                    conn,
+                    project_id=scope_id,
+                    principal_id=acting_principal_id,
+                    write=True,
+                )
             row = conn.execute(stmt).fetchone()
             conn.commit()
             return dict(row._mapping) if row is not None else None
@@ -4966,7 +5212,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             row = conn.execute(
                 sa.delete(structured_memories)
                 .where(structured_memories.c.memory_id == memory_id)
-                .returning(structured_memories)
+                .returning(*structured_memory_summary_columns)
             ).fetchone()
             conn.commit()
             return dict(row._mapping) if row is not None else None
@@ -4975,10 +5221,20 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         self,
         name: str,
         scopes: list[tuple[str, str]],
+        *,
+        acting_principal_id: str = "",
     ) -> list[tuple[str, str]]:
         if not scopes:
             return []
         with self._conn() as conn:
+            if acting_principal_id:
+                conn.execute(sa.text("BEGIN"))
+                require_project_memory_scopes_on_connection(
+                    conn,
+                    scopes=scopes,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
             scope_clauses, params = self._build_scope_or_clause(scopes)
             rows = conn.execute(
                 sa.text(
@@ -4998,16 +5254,30 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         limit: int = 100,
     ) -> list[dict[str, str]]:
         with self._conn() as conn:
-            q = sa.select(structured_memories).order_by(
+            q = sa.select(
+                structured_memories.c.memory_id,
+                structured_memories.c.name,
+                structured_memories.c.description,
+                structured_memories.c.type,
+                structured_memories.c.scope,
+                structured_memories.c.scope_id,
+                structured_memories.c.created,
+                structured_memories.c.updated,
+                structured_memories.c.last_accessed,
+                structured_memories.c.access_count,
+            ).order_by(
                 structured_memories.c.updated.desc(),
                 structured_memories.c.memory_id.asc(),
             )
             if mem_type:
                 q = q.where(structured_memories.c.type == mem_type)
             if scope:
-                q = q.where(structured_memories.c.scope == scope)
-            if scope_id and scope:
-                q = q.where(structured_memories.c.scope_id == scope_id)
+                q = q.where(
+                    structured_memory_filter_scope_predicate(
+                        scope,
+                        scope_id,
+                    )
+                )
             q = q.limit(limit)
             rows = conn.execute(q).fetchall()
             return [dict(r._mapping) for r in rows]
@@ -5023,12 +5293,18 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         """OR-of-terms LIKE search; ranking is the caller's job (BM25 downstream)."""
         if not query or not query.strip():
             return self.list_structured_memories(
-                mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
             )
         terms = _normalize_search_terms(query)
         if not terms:
             return self.list_structured_memories(
-                mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
             )
         with self._conn() as conn:
             clauses = []
@@ -5036,27 +5312,26 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             for i, t in enumerate(terms):
                 escaped = _escape_like(t)
                 clauses.append(
-                    f"(name LIKE :n{i} ESCAPE '\\' "
-                    f"OR description LIKE :d{i} ESCAPE '\\' "
-                    f"OR content LIKE :c{i} ESCAPE '\\')"
+                    f"(name LIKE :n{i} ESCAPE '\\' OR description LIKE :d{i} ESCAPE '\\')"
                 )
                 params[f"n{i}"] = f"%{escaped}%"
                 params[f"d{i}"] = f"%{escaped}%"
-                params[f"c{i}"] = f"%{escaped}%"
             term_clause = " OR ".join(clauses)
             scope_filters = ""
             if mem_type:
                 scope_filters += " AND type = :type_filter"
                 params["type_filter"] = mem_type
             if scope:
-                scope_filters += " AND scope = :scope_filter"
-                params["scope_filter"] = scope
-            if scope_id and scope:
-                scope_filters += " AND scope_id = :scope_id_filter"
-                params["scope_id_filter"] = scope_id
+                exact_scope, exact_params = build_memory_scope_or_clause(
+                    [(scope, scope_id)],
+                )
+                scope_filters += f" AND ({exact_scope})"
+                params.update(exact_params)
             rows = conn.execute(
                 sa.text(
-                    f"SELECT * FROM structured_memories WHERE ({term_clause}){scope_filters} "
+                    "SELECT memory_id, name, description, type, scope, scope_id, "
+                    "created, updated, last_accessed, access_count "
+                    f"FROM structured_memories WHERE ({term_clause}){scope_filters} "
                     f"ORDER BY updated DESC, memory_id ASC LIMIT :lim"
                 ),
                 {**params, "lim": limit},
@@ -5068,11 +5343,21 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         scopes: list[tuple[str, str]],
         mem_type: str = "",
         limit: int = 100,
+        *,
+        acting_principal_id: str = "",
     ) -> list[dict[str, str]]:
         """Single-query union across visible (scope, scope_id) pairs."""
         if not scopes:
             return []
         with self._conn() as conn:
+            if acting_principal_id:
+                conn.execute(sa.text("BEGIN"))
+                require_project_memory_scopes_on_connection(
+                    conn,
+                    scopes=scopes,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
             scope_clauses, params = self._build_scope_or_clause(scopes)
             extra = ""
             if mem_type:
@@ -5080,7 +5365,9 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 params["type_filter"] = mem_type
             rows = conn.execute(
                 sa.text(
-                    f"SELECT * FROM structured_memories WHERE ({scope_clauses}){extra} "
+                    "SELECT memory_id, name, description, type, scope, scope_id, "
+                    "created, updated, last_accessed, access_count "
+                    f"FROM structured_memories WHERE ({scope_clauses}){extra} "
                     f"ORDER BY updated DESC, memory_id ASC LIMIT :lim"
                 ),
                 {**params, "lim": limit},
@@ -5093,28 +5380,45 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         scopes: list[tuple[str, str]],
         mem_type: str = "",
         limit: int = 20,
+        *,
+        acting_principal_id: str = "",
     ) -> list[dict[str, str]]:
         """OR-of-terms search joined with a single visibility OR-group."""
         if not scopes:
             return []
         if not query or not query.strip():
-            return self.list_visible_structured_memories(scopes, mem_type=mem_type, limit=limit)
+            return self.list_visible_structured_memories(
+                scopes,
+                mem_type=mem_type,
+                limit=limit,
+                acting_principal_id=acting_principal_id,
+            )
         terms = _normalize_search_terms(query)
         if not terms:
-            return self.list_visible_structured_memories(scopes, mem_type=mem_type, limit=limit)
+            return self.list_visible_structured_memories(
+                scopes,
+                mem_type=mem_type,
+                limit=limit,
+                acting_principal_id=acting_principal_id,
+            )
         with self._conn() as conn:
+            if acting_principal_id:
+                conn.execute(sa.text("BEGIN"))
+                require_project_memory_scopes_on_connection(
+                    conn,
+                    scopes=scopes,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
             scope_clauses, params = self._build_scope_or_clause(scopes)
             term_clauses = []
             for i, t in enumerate(terms):
                 escaped = _escape_like(t)
                 term_clauses.append(
-                    f"(name LIKE :n{i} ESCAPE '\\' "
-                    f"OR description LIKE :d{i} ESCAPE '\\' "
-                    f"OR content LIKE :c{i} ESCAPE '\\')"
+                    f"(name LIKE :n{i} ESCAPE '\\' OR description LIKE :d{i} ESCAPE '\\')"
                 )
                 params[f"n{i}"] = f"%{escaped}%"
                 params[f"d{i}"] = f"%{escaped}%"
-                params[f"c{i}"] = f"%{escaped}%"
             term_clause = " OR ".join(term_clauses)
             extra = ""
             if mem_type:
@@ -5122,7 +5426,9 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 params["type_filter"] = mem_type
             rows = conn.execute(
                 sa.text(
-                    f"SELECT * FROM structured_memories "
+                    "SELECT memory_id, name, description, type, scope, scope_id, "
+                    "created, updated, last_accessed, access_count "
+                    "FROM structured_memories "
                     f"WHERE ({scope_clauses}) AND ({term_clause}){extra} "
                     f"ORDER BY updated DESC, memory_id ASC LIMIT :lim"
                 ),
@@ -5130,59 +5436,107 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
+    def list_visible_memory_index_entries(
+        self,
+        scopes: list[tuple[str, str]],
+        *,
+        acting_principal_id: str = "",
+    ) -> list[dict[str, str]]:
+        if not scopes:
+            return []
+        with self._conn() as conn:
+            if acting_principal_id:
+                conn.execute(sa.text("BEGIN"))
+                require_project_memory_scopes_on_connection(
+                    conn,
+                    scopes=scopes,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
+            scope_clauses, params = self._build_scope_or_clause(scopes)
+            rows = conn.execute(
+                sa.text(
+                    "SELECT memory_id, name, description, type, scope, scope_id "
+                    "FROM structured_memories "
+                    f"WHERE ({scope_clauses}) ORDER BY scope, name, memory_id"
+                ),
+                params,
+            ).fetchall()
+            return [dict(row._mapping) for row in rows]
+
+    def get_memory_index_health_inputs(self) -> dict[str, list[dict[str, Any]]]:
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN"))
+            result = memory_index_health_inputs_on_connection(conn)
+            conn.commit()
+            return result
+
+    def get_memory_index_snapshot(
+        self,
+        ws_id: str,
+    ) -> dict[str, Any] | None:
+        if not ws_id:
+            return None
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(memory_index_snapshots).where(
+                    memory_index_snapshots.c.ws_id == ws_id,
+                )
+            ).fetchone()
+            return dict(row._mapping) if row is not None else None
+
+    def acquire_memory_index_snapshot(
+        self,
+        ws_id: str,
+        principal_id: str,
+        *,
+        commit_guard: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
+    ) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            row = acquire_memory_index_snapshot_on_connection(
+                conn,
+                ws_id=ws_id,
+                principal_id=principal_id,
+            )
+            with commit_guard() if commit_guard is not None else contextlib.nullcontext():
+                conn.commit()
+            return row
+
     @staticmethod
     def _build_scope_or_clause(
         scopes: list[tuple[str, str]],
     ) -> tuple[str, dict[str, str]]:
         """Build a parameterized OR-group of (scope[, scope_id]) predicates."""
-        params: dict[str, str] = {}
-        clauses: list[str] = []
-        for i, (s, sid) in enumerate(scopes):
-            params[f"sc{i}"] = s
-            if sid:
-                params[f"sid{i}"] = sid
-                clauses.append(f"(scope = :sc{i} AND scope_id = :sid{i})")
-            else:
-                clauses.append(f"scope = :sc{i}")
-        return " OR ".join(clauses), params
-
-    def touch_structured_memories(self, keys: list[tuple[str, str, str]]) -> int:
-        """Batch-touch multiple memories by (name, scope, scope_id)."""
-        if not keys:
-            return 0
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        total = 0
-        with self._conn() as conn:
-            for name, scope, scope_id in keys:
-                result = conn.execute(
-                    sa.update(structured_memories)
-                    .where(
-                        sa.and_(
-                            structured_memories.c.name == name,
-                            structured_memories.c.scope == scope,
-                            structured_memories.c.scope_id == scope_id,
-                        )
-                    )
-                    .values(
-                        last_accessed=now,
-                        access_count=structured_memories.c.access_count + 1,
-                    )
-                )
-                total += result.rowcount
-            conn.commit()
-        return total
+        return build_memory_scope_or_clause(scopes)
 
     def count_structured_memories(
-        self, mem_type: str = "", scope: str = "", scope_id: str = ""
+        self,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
     ) -> int:
         with self._conn() as conn:
+            if scope == "project" and acting_principal_id:
+                conn.execute(sa.text("BEGIN"))
+                require_project_memory_access_on_connection(
+                    conn,
+                    project_id=scope_id,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
             q = sa.select(sa.func.count()).select_from(structured_memories)
             if mem_type:
                 q = q.where(structured_memories.c.type == mem_type)
             if scope:
-                q = q.where(structured_memories.c.scope == scope)
-            if scope_id and scope:
-                q = q.where(structured_memories.c.scope_id == scope_id)
+                q = q.where(
+                    structured_memory_filter_scope_predicate(
+                        scope,
+                        scope_id,
+                    )
+                )
             result = conn.execute(q).scalar()
             return int(result or 0)
 

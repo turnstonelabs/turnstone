@@ -33,6 +33,7 @@ import httpx
 import pytest
 
 from tests._session_helpers import ArmedHandle, as_stream, mock_completion_result, think_tag_stream
+from tests._session_helpers import make_registered_session as _make_registered_session
 from tests._session_helpers import make_session as _make_session
 from turnstone.core.model_turn import maybe_attach_vllm_chat_reasoning, resolve_lane
 from turnstone.core.providers._anthropic import AnthropicProvider
@@ -407,8 +408,8 @@ class TestCallSitesInvokeMaybeAttach:
     Verify the wiring at each — without this, a refactor that gives one
     funnel its own wire build would silently regress Phase 5 there."""
 
-    def test_streaming_call_site_attaches(self) -> None:
-        session = _make_session()
+    def test_streaming_call_site_attaches(self, tmp_db: str) -> None:
+        session = _make_registered_session()
         registry = _vllm_registry(replay=True)
 
         captured: dict[str, Any] = {}

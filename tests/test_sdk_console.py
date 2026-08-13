@@ -30,6 +30,61 @@ def _mock_transport(
 
 
 # ---------------------------------------------------------------------------
+# Memory index maintenance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_memory_description_update_and_index_health():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path.endswith("/index-health"):
+            return _json_response(
+                {
+                    "budget_chars": 65_536,
+                    "over_budget": False,
+                    "max_char_count": 120,
+                    "max_entry_count": 2,
+                    "over_by_chars": 0,
+                    "invalid_description_count": 0,
+                    "envelope_count": 1,
+                }
+            )
+        description = json.loads(request.content)["description"]
+        return _json_response(
+            {
+                "memory_id": "m1",
+                "name": "deployment_process",
+                "description": description,
+                "type": "general",
+                "scope": "global",
+                "scope_id": "",
+                "content": "Deploy from main",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+                "last_accessed": "",
+                "access_count": 0,
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        updated = await client.update_memory_description(
+            "m1",
+            "  Production\n deployment workflow  ",
+        )
+        health = await client.memory_index_health()
+
+    assert updated.description == "Production deployment workflow"
+    assert health.budget_chars == 65_536
+    assert captured[0].method == "PATCH"
+    assert captured[1].url.path == "/v1/api/admin/memories/index-health"
+
+
+# ---------------------------------------------------------------------------
 # Routing proxy — rewind / retry (#549)
 # ---------------------------------------------------------------------------
 

@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 from turnstone.api.console_schemas import (
     AdminMemoryInfo,
+    AdminMemorySummary,
     AssignRoleRequest,
     AuditEventInfo,
     AvailableModelInfo,
@@ -73,6 +74,7 @@ from turnstone.api.console_schemas import (
     ListVerdictsResponse,
     McpReloadResponse,
     McpServerDetail,
+    MemoryIndexHealthResponse,
     ModelAuthConstraintsResponse,
     ModelCapabilitiesResponse,
     ModelDefinitionInfo,
@@ -105,6 +107,7 @@ from turnstone.api.console_schemas import (
     SkillVersionInfo,
     ToolPolicyInfo,
     UpdateMcpServerRequest,
+    UpdateMemoryDescriptionRequest,
     UpdateModelDefinitionRequest,
     UpdateOrgRequest,
     UpdatePersonaRequest,
@@ -818,10 +821,27 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     ),
     EndpointSpec(
         "/v1/api/admin/memories/{memory_id}",
+        "PATCH",
+        "Update a memory's authored index description",
+        request_model=UpdateMemoryDescriptionRequest,
+        response_model=AdminMemorySummary,
+        error_codes=[400, 404, 500],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/memories/{memory_id}",
         "DELETE",
         "Delete a memory by ID",
         response_model=StatusResponse,
         error_codes=[404],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/memories/index-health",
+        "GET",
+        "Get derived live memory-index budget and legacy-hook health",
+        response_model=MemoryIndexHealthResponse,
+        error_codes=[500, 503],
         tags=["Admin"],
     ),
     # --- Admin: System Settings ---
@@ -1463,10 +1483,10 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Resolve a pending tool approval on the coordinator session",
         description=(
-            "Approves or denies the pending tool call(s).  Set ``always`` to "
-            "True to also add the pending tool name(s) to the session's "
-            "auto-approve set so subsequent calls of the same tool skip the "
-            "prompt."
+            "Approves or denies the pending tool call(s). An authorized peer may "
+            "make a binary decision, but only the initiating execution principal "
+            "may add feedback or set ``always``. Always grants are scoped to that "
+            "execution principal and tool."
         ),
         request_model=CoordinatorApproveRequest,
         response_model=ApproveResponse,

@@ -1,5 +1,6 @@
 import { BaseClient, type ClientOptions } from "./base.js";
 import type { ServerEvent } from "./events.js";
+import { normalizeMemoryDescription } from "./memory_description.js";
 import type {
   AttachmentContent,
   AttachmentUpload,
@@ -12,6 +13,7 @@ import type {
   CreateWorkstreamResponse,
   DashboardResponse,
   DeleteMemoryOptions,
+  GetMemoryOptions,
   HealthResponse,
   ListAttachmentsResponse,
   ListMemoriesOptions,
@@ -19,6 +21,7 @@ import type {
   ListSavedWorkstreamsResponse,
   ListWorkstreamsResponse,
   MemoryInfo,
+  MemorySummary,
   SaveMemoryRequest,
   SearchMemoriesRequest,
   SendAndWaitOptions,
@@ -393,14 +396,10 @@ export class TurnstoneServer extends BaseClient {
     return this.request("GET", "/v1/api/memories", { params });
   }
 
-  async saveMemory(opts: SaveMemoryRequest): Promise<MemoryInfo> {
-    if (typeof opts.description !== "string" || !opts.description.trim()) {
-      throw new TypeError(
-        "memory description is required and must be non-empty",
-      );
-    }
+  async saveMemory(opts: SaveMemoryRequest): Promise<MemorySummary> {
+    const description = normalizeMemoryDescription(opts.description);
     return this.request("POST", "/v1/api/memories", {
-      json: { ...opts, description: opts.description.trim() },
+      json: { ...opts, description },
     });
   }
 
@@ -410,6 +409,16 @@ export class TurnstoneServer extends BaseClient {
     return this.request("POST", "/v1/api/memories/search", { json: opts });
   }
 
+  async getMemory(
+    name: string,
+    opts?: GetMemoryOptions,
+  ): Promise<MemoryInfo> {
+    const params: Record<string, string> = {};
+    if (opts?.scope) params.scope = opts.scope;
+    if (opts?.scope_id) params.scope_id = opts.scope_id;
+    return this.request("GET", `/v1/api/memories/${encodeURIComponent(name)}`, { params });
+  }
+
   async deleteMemory(
     name: string,
     opts?: DeleteMemoryOptions,
@@ -417,7 +426,7 @@ export class TurnstoneServer extends BaseClient {
     const params: Record<string, string> = {};
     if (opts?.scope) params.scope = opts.scope;
     if (opts?.scope_id) params.scope_id = opts.scope_id;
-    return this.request("DELETE", `/v1/api/memories/${name}`, { params });
+    return this.request("DELETE", `/v1/api/memories/${encodeURIComponent(name)}`, { params });
   }
 
   // -- Auth -----------------------------------------------------------------

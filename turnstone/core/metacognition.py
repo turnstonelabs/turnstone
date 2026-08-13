@@ -95,12 +95,6 @@ NUDGE_COMPLETION = (
     "as memories (memory action='save') so future sessions can benefit."
 )
 
-NUDGE_START = (
-    "You have saved memories from prior sessions that may be relevant. "
-    "Consider using memory(action='search') with keywords from the "
-    "user's request to find applicable context, preferences, or guidance."
-)
-
 NUDGE_TOOL_ERROR = (
     "A tool just returned an error. Before retrying, check your memories — "
     "the user may have given feedback about this tool or error pattern in a "
@@ -149,7 +143,6 @@ _NUDGE_MAP: dict[str, str] = {
     "denial": NUDGE_DENIAL,
     "resume": NUDGE_RESUME,
     "completion": NUDGE_COMPLETION,
-    "start": NUDGE_START,
     "tool_error": NUDGE_TOOL_ERROR,
     "repeat": NUDGE_REPEAT,
     "compaction_pending": NUDGE_COMPACTION,
@@ -176,6 +169,8 @@ _NUDGE_MAP: dict[str, str] = {
     # (enforced by ``test_vocabulary_mirrors_nudge_map_both_directions``); nothing
     # calls ``should_nudge("participant_joined", …)`` so it never auto-fires.
     "participant_joined": "",
+    # Live metadata-only pointer generated directly by the session planner.
+    "memory_pointer": "",
 }
 
 # Nudge types whose copy directs the model at the memory tool ("save that
@@ -185,7 +180,7 @@ _NUDGE_MAP: dict[str, str] = {
 # fixed — while behavioural nudges (repeat, compaction_pending,
 # idle_children, watch_triggered) keep firing.
 MEMORY_NUDGE_TYPES: frozenset[str] = frozenset(
-    {"correction", "denial", "resume", "completion", "start", "tool_error"}
+    {"correction", "denial", "resume", "completion", "tool_error"}
 )
 
 # Nudge types whose copy names a specific tool the model is told to call,
@@ -214,6 +209,7 @@ MEMORY_NUDGE_TYPES: frozenset[str] = frozenset(
 # coordinator, which is the failure the wake exists to prevent.
 NUDGE_REQUIRED_TOOL: dict[str, str] = {
     **dict.fromkeys(MEMORY_NUDGE_TYPES, "memory"),
+    "memory_pointer": "memory",
     "idle_tasks": "tasks",
 }
 
@@ -1235,24 +1231,22 @@ def nudge_allowed(
     that was never delivered.
 
     Note the gates this applies that a bare ``_cooldown_allows`` peek
-    does NOT: unknown type, ``message_count <= 1``, the ``start``
-    first-message rule, and the memory-count requirements.  A caller
+    does NOT: unknown type, ``message_count <= 1``, and the memory-count
+    requirements. A caller
     that charges budget before consulting THIS function would charge on
     every one of those refusals.
     """
     if nudge_type not in _NUDGE_MAP:
         return False
-    # Don't nudge on the very first message (except resume/start)
-    if message_count <= 1 and nudge_type not in ("resume", "start"):
-        return False
-    # Start nudge only on first message
-    if nudge_type == "start" and message_count != 1:
+    # Resume is the sole nudge allowed on the first message: it describes
+    # rehydrated conversation state, not a live user-message heuristic.
+    if message_count <= 1 and nudge_type != "resume":
         return False
     # Tool error nudge only if there are memories to search
     if nudge_type == "tool_error" and memory_count == 0:
         return False
-    # Resume/start nudge only if there are memories to recall
-    if nudge_type in ("resume", "start") and memory_count == 0:
+    # Resume nudge only if there are memories to recall.
+    if nudge_type == "resume" and memory_count == 0:
         return False
     # Rate limit: one nudge per type per cooldown window
     last = state.get(nudge_type)

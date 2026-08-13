@@ -538,7 +538,7 @@ def test_retry_walk_skips_operator_context_cards() -> None:
 
 def test_operator_nudge_labels_use_shared_helper() -> None:
     """Operator-context nudge bubbles collapse the metacognition nudge types
-    (start / resume / correction / denial / completion / repeat) to one
+    (including legacy persisted start turns) to one
     'metacognition' category via the shared ``utils.js`` ``operatorSourceLabel``
     helper rather than leaking the raw ``_source`` (the 'operator · start'
     regression).  Both panes call the one helper so they can't drift."""
@@ -3694,6 +3694,121 @@ def test_every_system_turn_source_has_a_fallback_label() -> None:
     labelled = {ln.split(":", 1)[0].strip() for ln in block.splitlines() if ":" in ln}
     missing = set(SYSTEM_TURN_SOURCES) - labelled - {"compaction"}
     assert not missing, f"system turn sources with no operator label: {sorted(missing)}"
+
+
+def test_memory_description_editor_defers_normalization_to_server() -> None:
+    root = Path(__file__).resolve().parent.parent
+    governance = (root / "turnstone/console/static/governance.js").read_text(encoding="utf-8")
+
+    editor = governance.split("function editMemoryDescription(memoryId) {", 1)[1].split(
+        "\nfunction showMemoryDetailModal", 1
+    )[0]
+    assert "JSON.stringify({ description: value })" in editor
+    assert ".replace(" not in editor
+    assert "Array.from(" not in editor
+
+
+def test_memory_health_refresh_lifecycle() -> None:
+    import tempfile
+
+    governance = _CONSOLE_GOVERNANCE_JS.read_text(encoding="utf-8")
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    load_memories = _slice_function_body(governance, "loadAdminMemories")
+    load_health = _slice_function_body(governance, "loadMemoryIndexHealth")
+    edit_memory = _slice_function_body(governance, "editMemoryDescription")
+    delete_memory = _slice_function_body(governance, "deleteAdminMemory")
+    assert load_memories and load_health and edit_memory and delete_memory
+
+    # Activation owns the ordinary refresh; list/search/filter work never does.
+    memories_tab = re.search(r'if \(tab === "memories"\) \{(?P<body>.*?)\n\s*\}', admin, re.S)
+    assert memories_tab is not None
+    assert memories_tab.group("body").count("loadAdminMemories();") == 1
+    assert memories_tab.group("body").count("loadMemoryIndexHealth();") == 1
+    assert "loadMemoryIndexHealth" not in load_memories
+    # Each successful mutation forces exactly one new health generation.
+    assert edit_memory.count("loadMemoryIndexHealth(true);") == 1
+    assert delete_memory.count("loadMemoryIndexHealth(true);") == 1
+
+    script = f"""
+let _memoryHealthRequest = null;
+let _memoryHealthGeneration = 0;
+let _memoryHealthHasValid = false;
+const banner = {{ textContent: "", style: {{ display: "none" }} }};
+const document = {{
+  getElementById: function (id) {{
+    if (id !== "memory-index-warning") throw new Error("unexpected element " + id);
+    return banner;
+  }},
+}};
+const pending = [];
+function authFetch(url, options) {{
+  if (url !== "/v1/api/admin/memories/index-health") throw new Error(url);
+  return new Promise(function (resolve, reject) {{
+    pending.push({{ resolve: resolve, reject: reject, options: options }});
+  }});
+}}
+function response(health) {{
+  return {{ ok: true, json: function () {{ return Promise.resolve(health); }} }};
+}}
+function loadMemoryIndexHealth(force) {load_health}
+
+(async function () {{
+  const first = loadMemoryIndexHealth();
+  const coalesced = loadMemoryIndexHealth();
+  if (first !== coalesced || pending.length !== 1) throw new Error("not single flight");
+  pending[0].resolve(response({{
+    over_budget: true, over_by_chars: 7, budget_chars: 65536,
+    invalid_description_count: 0,
+  }}));
+  await first;
+  if (!banner.textContent.includes("7") || banner.style.display !== "block")
+    throw new Error("first health did not render");
+
+  const stale = loadMemoryIndexHealth();
+  const newer = loadMemoryIndexHealth(true);
+  if (pending.length !== 3) throw new Error("forced refresh did not start");
+  if (!pending[1].options.signal.aborted) throw new Error("old request was not aborted");
+  pending[2].resolve(response({{
+    over_budget: true, over_by_chars: 2, budget_chars: 65536,
+    invalid_description_count: 0,
+  }}));
+  await newer;
+  const newestBanner = banner.textContent;
+  pending[1].resolve(response({{
+    over_budget: true, over_by_chars: 999, budget_chars: 65536,
+    invalid_description_count: 9,
+  }}));
+  await stale;
+  if (banner.textContent !== newestBanner || !banner.textContent.includes("2"))
+    throw new Error("stale response won");
+
+  const failed = loadMemoryIndexHealth();
+  pending[3].reject(new Error("offline"));
+  await failed;
+  if (banner.textContent !== newestBanner) throw new Error("valid banner was erased");
+  const retry = loadMemoryIndexHealth();
+  if (pending.length !== 5) throw new Error("failed request blocked retry");
+  pending[4].resolve(response({{
+    over_budget: false, over_by_chars: 0, budget_chars: 65536,
+    invalid_description_count: 0,
+  }}));
+  await retry;
+  if (banner.style.display !== "none") throw new Error("retry did not publish");
+}})().catch(function (error) {{
+  console.error(error.stack || error);
+  process.exitCode = 1;
+}});
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as handle:
+        handle.write(script)
+        path = handle.name
+    try:
+        proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    finally:
+        os.unlink(path)
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_copy_button_survives_retry_teardown_in_both_clients() -> None:

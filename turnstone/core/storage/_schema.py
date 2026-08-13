@@ -26,6 +26,42 @@ structured_memories = sa.Table(
     sa.UniqueConstraint("name", "scope", "scope_id", name="uq_smem_name_scope"),
 )
 
+# Every metadata-only memory surface shares this projection. Keeping it next
+# to the table definition makes omitting ``content`` a storage contract rather
+# than an endpoint convention that can drift when fields are added.
+structured_memory_summary_columns = (
+    structured_memories.c.memory_id,
+    structured_memories.c.name,
+    structured_memories.c.description,
+    structured_memories.c.type,
+    structured_memories.c.scope,
+    structured_memories.c.scope_id,
+    structured_memories.c.created,
+    structured_memories.c.updated,
+    structured_memories.c.last_accessed,
+    structured_memories.c.access_count,
+)
+
+memory_index_snapshots = sa.Table(
+    "memory_index_snapshots",
+    metadata,
+    sa.Column("ws_id", sa.Text, nullable=False),
+    # One immutable binding per globally unique workstream id. principal_id
+    # and visibility_key are provenance describing the first admitted model
+    # turn; neither is part of the identity.
+    sa.Column("principal_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("project_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("project_name", sa.Text, nullable=False, server_default=""),
+    sa.Column("visibility_key", sa.Text, nullable=False),
+    sa.Column("content", sa.Text, nullable=False),
+    sa.Column("format_version", sa.Integer, nullable=False),
+    sa.Column("entry_count", sa.Integer, nullable=False),
+    sa.Column("char_count", sa.Integer, nullable=False),
+    sa.Column("invalid_description_count", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("captured_at", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("ws_id"),
+)
+
 conversations = sa.Table(
     "conversations",
     metadata,
@@ -141,6 +177,17 @@ sa.Index("idx_workstreams_alias", workstreams.c.alias)
 sa.Index("idx_workstreams_kind", workstreams.c.kind)
 sa.Index("idx_workstreams_parent", workstreams.c.parent_ws_id)
 sa.Index("idx_workstreams_project", workstreams.c.project_id)
+
+# Durable uniqueness registry. Published workstream ids remain here after a
+# hard delete, so a caller-supplied id can never address a later logical
+# workstream. Hidden ``creating`` reservations release their registry row when
+# rolled back, allowing a failed request to retry before publication.
+workstream_id_registry = sa.Table(
+    "workstream_id_registry",
+    metadata,
+    sa.Column("ws_id", sa.Text, primary_key=True),
+    sa.Column("created", sa.Text, nullable=False),
+)
 
 workstream_config = sa.Table(
     "workstream_config",
@@ -732,6 +779,8 @@ intent_verdicts = sa.Table(
     sa.Column("tier", sa.Text, nullable=False),
     sa.Column("judge_model", sa.Text, nullable=False, server_default=""),
     sa.Column("user_decision", sa.Text, nullable=False, server_default=""),
+    sa.Column("resolver_principal_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("execution_principal_id", sa.Text, nullable=False, server_default=""),
     sa.Column("latency_ms", sa.Integer, nullable=False, server_default="0"),
     sa.Column("created", sa.Text, nullable=False),
 )

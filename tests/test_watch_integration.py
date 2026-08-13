@@ -29,7 +29,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests._helpers import patch_session_storage
 from tests._session_helpers import make_result
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
@@ -93,10 +92,7 @@ def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
        the user turn.
     """
     session = _make_session()
-
-    # Bypass the storage-touching predicate — we want to assert the
-    # envelope splice, not exercise a fresh sqlite watch row.
-    patch_session_storage(monkeypatch, active=True)
+    get_storage().register_workstream(session.ws_id)
 
     # Real WatchRunner; we don't ``start()`` the daemon thread (that
     # would race with the test's deterministic order).  Direct call
@@ -127,7 +123,6 @@ def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
         patch.object(session, "_visible_memory_count", return_value=0),
-        patch("turnstone.core.session.save_message"),
     ):
         session._title_generated = True  # suppress orthogonal title side-thread
         session.send("ok")
@@ -161,8 +156,7 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
     accidental regression to the old per-fire-turn shape.
     """
     session = _make_session()
-
-    patch_session_storage(monkeypatch, active=True)
+    get_storage().register_workstream(session.ws_id)
 
     runner = WatchRunner(storage=MagicMock(), node_id="test-node")
     session.set_watch_runner(runner)
@@ -183,7 +177,6 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
         patch.object(session, "_visible_memory_count", return_value=0),
-        patch("turnstone.core.session.save_message"),
     ):
         session._title_generated = True
         session.send("user")
@@ -223,18 +216,16 @@ def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, m
     ``manager.create + session.resume`` for ``manager.open``) doesn't
     silently break the watch-restore pipeline.
     """
-    from turnstone.core import session as session_mod
-
-    patch_session_storage(monkeypatch, active=True)
-
     # Stage 1 — build the original session and persist a message so
     # ``session.resume`` finds the ws_id in storage.
     owner_id = "user-123"
+    storage = get_storage()
     original = _make_session(user_id=owner_id)
     original_ws_id = original._ws_id
+    storage.register_workstream(original_ws_id, user_id=owner_id)
     # Persist a stub user message so ``load_messages(original_ws_id)``
     # returns something non-empty (resume short-circuits on empty).
-    session_mod.save_message(original_ws_id, "user", "kickoff message")
+    storage.save_message(original_ws_id, "user", "kickoff message")
 
     # Stage 2 — runner with NO dispatch fn registered (simulates the
     # original session being evicted between watch fire and dispatch).

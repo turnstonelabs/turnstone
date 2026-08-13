@@ -556,6 +556,131 @@ class TestRouteCreate503Retry:
         router.route.assert_called_once_with(_DEST_WS_ID)
 
 
+class TestRouteCreate409Retry:
+    """Generated destination ids retry registry collisions at the router."""
+
+    def test_generated_ws_id_collision_draws_another_id(self, monkeypatch):
+        first_id = "1" * 32
+        second_id = "2" * 32
+        generated = MagicMock(side_effect=[first_id, second_id])
+        monkeypatch.setattr("turnstone.console.server.secrets.token_hex", generated)
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        posted_ids: list[str] = []
+
+        async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
+            posted_ids.append(kwargs["json"]["ws_id"])
+            status = 409 if len(posted_ids) == 1 else 200
+            payload = (
+                {"error": "Workstream already exists"}
+                if status == 409
+                else {"ws_id": second_id, "name": "retry"}
+            )
+            return httpx.Response(
+                status,
+                json=payload,
+                request=httpx.Request("POST", args[0]),
+            )
+
+        _wire_proxy(app, MagicMock(side_effect=_mock_post))
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"name": "generated"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json()["ws_id"] == second_id
+        assert posted_ids == [first_id, second_id]
+        assert generated.call_count == 2
+
+    def test_target_node_collision_retries_with_targeted_generator(self):
+        first_id = "1" * 32
+        second_id = "2" * 32
+        router = _make_mock_router()
+        router.generate_ws_id_for_node.side_effect = [first_id, second_id]
+        router.route.return_value = NodeRef("node-c", "http://c:8080")
+        app = _make_app(router=router)
+        posted_ids: list[str] = []
+
+        async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
+            posted_ids.append(kwargs["json"]["ws_id"])
+            status = 409 if len(posted_ids) == 1 else 200
+            payload = (
+                {"error": "Workstream already exists"}
+                if status == 409
+                else {"ws_id": second_id, "name": "targeted-retry"}
+            )
+            return httpx.Response(
+                status,
+                json=payload,
+                request=httpx.Request("POST", args[0]),
+            )
+
+        _wire_proxy(app, MagicMock(side_effect=_mock_post))
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"target_node": "node-c"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json()["node_id"] == "node-c"
+        assert posted_ids == [first_id, second_id]
+        assert router.generate_ws_id_for_node.call_count == 2
+        assert router.generate_ws_id_for_node.call_args_list[0].args == ("node-c",)
+        assert router.generate_ws_id_for_node.call_args_list[1].args == ("node-c",)
+
+    def test_explicit_ws_id_collision_is_not_retried(self):
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        post = _make_proxy_post(
+            status_code=409,
+            json_data={"error": "Workstream already exists"},
+        )
+        _wire_proxy(app, post)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"ws_id": _DEST_WS_ID},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 409
+        assert post.call_count == 1
+        assert post.call_args.kwargs["json"]["ws_id"] == _DEST_WS_ID
+
+    def test_generated_ws_id_collision_retry_is_bounded(self, monkeypatch):
+        generated_ids = [f"{value:x}" * 32 for value in range(1, 5)]
+        generated = MagicMock(side_effect=generated_ids)
+        monkeypatch.setattr("turnstone.console.server.secrets.token_hex", generated)
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        post = _make_proxy_post(
+            status_code=409,
+            json_data={"error": "Workstream already exists"},
+        )
+        _wire_proxy(app, post)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"name": "generated"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 409
+        assert post.call_count == 4
+        assert generated.call_count == 4
+
+
 # ---------------------------------------------------------------------------
 # Tests — cluster create (capacity-routed proxy)
 # ---------------------------------------------------------------------------

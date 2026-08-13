@@ -178,7 +178,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
     },
     "memory": {
         "relevance_k": "memory_relevance_k",
-        "fetch_limit": "memory_fetch_limit",
+        "index_budget_chars": "memory_index_budget_chars",
         "max_content": "memory_max_content",
         "nudge_cooldown": "memory_nudge_cooldown",
         "nudges": "memory_nudges",

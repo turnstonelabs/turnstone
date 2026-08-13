@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests._session_helpers import make_result, make_session
+from tests._session_helpers import make_registered_session, make_result, make_session
 from tests.test_session_manager import _make_manager
 from turnstone.core import session as session_module
 from turnstone.core.attachments import Attachment
@@ -197,15 +197,12 @@ def _send_environment(
 
 
 def _ready_session(**kwargs: Any) -> Any:
-    session = make_session(**kwargs)
-    # Keyed conversation commits intentionally refuse to resurrect a missing
-    # workstream after hard delete. Direct-session tests therefore install the
-    # parent row that production's manager/create path establishes first.
-    from turnstone.core.memory import register_workstream
+    from turnstone.core.storage import is_storage_initialized
 
-    register_workstream(session.ws_id, user_id=kwargs.get("user_id", ""))
+    session = (
+        make_registered_session(**kwargs) if is_storage_initialized() else make_session(**kwargs)
+    )
     session._title_generated = True
-    session._system_composed_with_context = True
     return session
 
 
@@ -1870,7 +1867,7 @@ def test_history_load_failure_rejects_pending_only_handoff_until_durable_prefix_
     storage = get_storage()
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    session = _ready_session(ws_id=ws.id, user_id="user-1")
+    session = _ready_session(ws_id=ws.id, user_id="user-1", kind="coordinator")
     ws.session = session
     ws.ui = session.ui
     store = _ConversationStore(ambiguous_assistant_ack=True)
@@ -2119,7 +2116,9 @@ def test_conflicted_pending_row_renders_in_place_inside_widened_window() -> None
     assert conflict_key in session._pending_conversation_commits
 
 
-def test_capture_never_runs_the_loader_under_the_handoff_lock() -> None:
+def test_capture_never_runs_the_loader_under_the_handoff_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Structural pin for the deleted in-lock storage probe.
 
     The loader is the only storage touchpoint in a capture; running it under
@@ -2127,7 +2126,13 @@ def test_capture_never_runs_the_loader_under_the_handoff_lock() -> None:
     and SSE registration behind a slow database. The overscan is sampled
     first, the load runs unlocked, and the merge is pure in-memory work.
     """
-    session = _ready_session()
+    storage = MagicMock()
+    storage.save_message.return_value = 1
+    from turnstone.core.storage import _registry
+
+    monkeypatch.setattr(_registry, "_storage", storage)
+    session = make_session()
+    session._title_generated = True
     session._append_system_turn("correction", "pending row")
     lock_free_during_load: list[bool] = []
 

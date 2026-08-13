@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
 from turnstone.core.log import get_logger
+from turnstone.core.project_access import decide_project_access, fold_role_permissions
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     AttachmentWrite,
@@ -27,11 +28,14 @@ from turnstone.core.storage._protocol import (
 )
 from turnstone.core.storage._schema import (
     conversations,
+    memory_index_snapshots,
     project_members,
     projects,
     role_permission_overrides,
     roles,
+    structured_memories,
     user_roles,
+    users,
     workstream_attachments,
     workstream_config,
     workstream_overrides,
@@ -55,6 +59,407 @@ from turnstone.core.trajectory import (
 )
 
 log = get_logger(__name__)
+
+
+def structured_memory_exact_scope_predicate(
+    scope: str,
+    scope_id: str,
+) -> Any:
+    """Build one exact structured-memory scope predicate."""
+    return sa.and_(
+        structured_memories.c.scope == scope,
+        structured_memories.c.scope_id == scope_id,
+    )
+
+
+def structured_memory_filter_scope_predicate(
+    scope: str,
+    scope_id: str,
+) -> Any:
+    """Build a list/count filter where an omitted scope id means any id."""
+    predicate = structured_memories.c.scope == scope
+    if scope_id:
+        predicate = sa.and_(predicate, structured_memories.c.scope_id == scope_id)
+    return predicate
+
+
+def build_memory_scope_or_clause(
+    scopes: list[tuple[str, str]],
+) -> tuple[str, dict[str, str]]:
+    """Build a parameterized OR-group for exact visible memory scopes."""
+    params: dict[str, str] = {}
+    clauses: list[str] = []
+    for i, (scope, scope_id) in enumerate(scopes):
+        params[f"sc{i}"] = scope
+        parts = [f"scope = :sc{i}"]
+        if scope_id:
+            params[f"sid{i}"] = scope_id
+            parts.append(f"scope_id = :sid{i}")
+        clauses.append("(" + " AND ".join(parts) + ")")
+    return " OR ".join(clauses), params
+
+
+def memory_index_health_inputs_on_connection(
+    conn: Any,
+) -> dict[str, list[dict[str, str]]]:
+    """Read live index metadata and topology from one database snapshot."""
+    entry_rows = conn.execute(
+        sa.select(
+            structured_memories.c.memory_id,
+            structured_memories.c.name,
+            structured_memories.c.description,
+            structured_memories.c.type,
+            structured_memories.c.scope,
+            structured_memories.c.scope_id,
+        ).order_by(
+            structured_memories.c.scope,
+            structured_memories.c.scope_id,
+            structured_memories.c.name,
+            structured_memories.c.memory_id,
+        )
+    ).fetchall()
+    workstream_rows = conn.execute(
+        sa.select(
+            workstreams.c.ws_id,
+            workstreams.c.kind,
+            workstreams.c.user_id,
+            workstreams.c.project_id,
+            workstreams.c.state,
+        ).where(~workstreams.c.state.in_(("creating", "deleted")))
+    ).fetchall()
+    project_rows = conn.execute(
+        sa.select(
+            projects.c.project_id,
+            projects.c.owner_id,
+            projects.c.visibility,
+            projects.c.state,
+        )
+    ).fetchall()
+    member_rows = conn.execute(
+        sa.select(project_members.c.project_id, project_members.c.user_id)
+    ).fetchall()
+    user_rows = conn.execute(sa.select(users.c.user_id)).fetchall()
+    role_rows = conn.execute(
+        sa.select(roles.c.role_id, roles.c.permissions, roles.c.builtin)
+    ).fetchall()
+    assignment_rows = conn.execute(sa.select(user_roles.c.user_id, user_roles.c.role_id)).fetchall()
+    override_rows = conn.execute(
+        sa.select(
+            role_permission_overrides.c.role_id,
+            role_permission_overrides.c.permission,
+            role_permission_overrides.c.action,
+        )
+    ).fetchall()
+    return {
+        "entries": [dict(row._mapping) for row in entry_rows],
+        "workstreams": [dict(row._mapping) for row in workstream_rows],
+        "projects": [dict(row._mapping) for row in project_rows],
+        "members": [dict(row._mapping) for row in member_rows],
+        "users": [dict(row._mapping) for row in user_rows],
+        "roles": [dict(row._mapping) for row in role_rows],
+        "user_roles": [dict(row._mapping) for row in assignment_rows],
+        "role_overrides": [dict(row._mapping) for row in override_rows],
+    }
+
+
+def require_active_workstream_on_connection(
+    conn: Any,
+    *,
+    ws_id: str,
+) -> None:
+    """Lock and validate the durable parent of a workstream-scoped write."""
+    if not ws_id:
+        raise ValueError("workstream scope_id is required")
+    workstream = conn.execute(
+        sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id).with_for_update()
+    ).fetchone()
+    if workstream is None or str(workstream[0] or "") in {"creating", "deleted"}:
+        raise ValueError("workstream is no longer active")
+
+
+class ProjectMemoryAuthorizationError(PermissionError):
+    """The acting principal cannot use the requested project-memory scope."""
+
+
+def _permissions_for_user_on_connection(
+    conn: Any,
+    user_id: str,
+    *,
+    lock_rows: bool = False,
+) -> set[str]:
+    """Resolve one user's effective RBAC permissions inside *conn*.
+
+    Memory-index capture must derive project visibility from the same database
+    snapshot as the indexed rows. Calling the public storage facade here would
+    open a second transaction and recreate the ACL/read TOCTOU this helper is
+    intended to close.
+    """
+    if not user_id:
+        return set()
+    role_query = (
+        sa.select(roles.c.role_id, roles.c.permissions, roles.c.builtin)
+        .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
+        .where(user_roles.c.user_id == user_id)
+    )
+    if lock_rows:
+        # Override replacement and deletion serialize on the stable role row.
+        # Lock that exact table, rather than leaving PostgreSQL to lock every
+        # joined table (which would invert the universal role -> child order).
+        role_query = role_query.with_for_update(read=True, of=roles)
+    role_rows = conn.execute(role_query).fetchall()
+    builtin_ids = [str(row[0]) for row in role_rows if row[2]]
+    grants: dict[str, set[str]] = {}
+    revokes: dict[str, set[str]] = {}
+    if builtin_ids:
+        override_query = sa.select(
+            role_permission_overrides.c.role_id,
+            role_permission_overrides.c.permission,
+            role_permission_overrides.c.action,
+        ).where(role_permission_overrides.c.role_id.in_(builtin_ids))
+        overrides = conn.execute(override_query).fetchall()
+        for role_id, permission, action in overrides:
+            target = grants if action == "grant" else revokes if action == "revoke" else None
+            if target is not None:
+                target.setdefault(str(role_id), set()).add(str(permission))
+    permissions: set[str] = set()
+    for role_id, raw_permissions, builtin in role_rows:
+        role_permissions = fold_role_permissions(raw_permissions)
+        if builtin:
+            role_permissions = fold_role_permissions(
+                role_permissions,
+                grants=grants.get(str(role_id), set()),
+                revokes=revokes.get(str(role_id), set()),
+            )
+        permissions.update(role_permissions)
+    return permissions
+
+
+def require_project_memory_access_on_connection(
+    conn: Any,
+    *,
+    project_id: str,
+    principal_id: str,
+    write: bool,
+) -> None:
+    """Authorize one project-memory operation in the caller's transaction.
+
+    The project, membership, and effective RBAC rows are read through the same
+    connection as the memory operation. PostgreSQL holds shared row locks until
+    commit; SQLite callers begin the appropriate transaction before entering
+    this helper. The authorization decision therefore cannot be separated from
+    the read or mutation by a second storage transaction.
+    """
+    if not project_id or not principal_id:
+        raise ProjectMemoryAuthorizationError("project memory access denied")
+
+    project = conn.execute(
+        sa.select(
+            projects.c.owner_id,
+            projects.c.visibility,
+            projects.c.state,
+        )
+        .where(projects.c.project_id == project_id)
+        .with_for_update(read=True)
+    ).fetchone()
+    if project is None or str(project[2] or "active") != "active":
+        raise ProjectMemoryAuthorizationError("project memory access denied")
+    member = conn.execute(
+        sa.select(project_members.c.project_id)
+        .where(
+            project_members.c.project_id == project_id,
+            project_members.c.user_id == principal_id,
+        )
+        .with_for_update(read=True)
+    ).fetchone()
+    permissions = _permissions_for_user_on_connection(
+        conn,
+        principal_id,
+        lock_rows=True,
+    )
+    decision = decide_project_access(
+        principal_id=principal_id,
+        owner_id=str(project[0] or ""),
+        visibility=str(project[1] or "private"),
+        state=str(project[2] or "active"),
+        is_member=member is not None,
+        permissions=permissions,
+    )
+    allowed = decision.can_write if write else decision.can_read
+    if not allowed:
+        raise ProjectMemoryAuthorizationError("project memory access denied")
+
+
+def require_project_memory_scopes_on_connection(
+    conn: Any,
+    *,
+    scopes: list[tuple[str, str]],
+    principal_id: str,
+    write: bool,
+) -> None:
+    """Authorize every distinct project scope in a visible-scope query."""
+    for project_id in sorted({scope_id for scope, scope_id in scopes if scope == "project"}):
+        require_project_memory_access_on_connection(
+            conn,
+            project_id=project_id,
+            principal_id=principal_id,
+            write=write,
+        )
+
+
+def _memory_index_project_on_connection(
+    conn: Any,
+    principal_id: str,
+    attached_project_id: str,
+    *,
+    permissions: set[str] | None = None,
+) -> tuple[str, str]:
+    """Return the active project id/name readable in this transaction."""
+    if not principal_id or not attached_project_id:
+        return "", ""
+    project = conn.execute(
+        sa.select(
+            projects.c.project_id,
+            projects.c.name,
+            projects.c.owner_id,
+            projects.c.visibility,
+            projects.c.state,
+        )
+        .where(projects.c.project_id == attached_project_id)
+        .with_for_update(read=True)
+    ).fetchone()
+    if project is None or str(project[4] or "active") != "active":
+        return "", ""
+    member = conn.execute(
+        sa.select(project_members.c.project_id)
+        .where(
+            project_members.c.project_id == attached_project_id,
+            project_members.c.user_id == principal_id,
+        )
+        .with_for_update(read=True)
+    ).fetchone()
+    decision = decide_project_access(
+        principal_id=principal_id,
+        owner_id=str(project[2] or ""),
+        visibility=str(project[3] or "private"),
+        state=str(project[4] or "active"),
+        is_member=member is not None,
+        permissions=(
+            permissions
+            if permissions is not None
+            else _permissions_for_user_on_connection(conn, principal_id, lock_rows=True)
+        ),
+    )
+    if decision.can_read:
+        return str(project[0]), str(project[1] or "")
+    return "", ""
+
+
+def acquire_memory_index_snapshot_on_connection(
+    conn: Any,
+    *,
+    ws_id: str,
+    principal_id: str,
+) -> dict[str, Any] | None:
+    """Capture or load one immutable index under one database snapshot.
+
+    The caller must begin a write transaction before invoking this helper
+    (``BEGIN IMMEDIATE`` on SQLite; a row-locking transaction on PostgreSQL).
+    Workstream identity, project ACL, visible memory metadata, rendering, and
+    the first-writer insert therefore describe one coherent state. Published
+    workstream ids are globally non-reusable, so ``ws_id`` is the complete
+    durable identity of the snapshot.
+    """
+    from turnstone.core.memory_index import (
+        MEMORY_INDEX_FORMAT_VERSION,
+        memory_visibility_key,
+        render_memory_index,
+    )
+
+    # PostgreSQL captures under REPEATABLE READ.  Make the role/override read
+    # the transaction's first snapshot operation and hold shared locks on the
+    # concrete role rows: a concurrent override replacement is then either
+    # wholly before this snapshot or waits until the capture commits.  Loading
+    # the workstream first would fix the MVCC snapshot before the stable role
+    # lock and could observe pre-revoke override children after the replacer
+    # had already committed.
+    permissions = _permissions_for_user_on_connection(
+        conn,
+        principal_id,
+        lock_rows=True,
+    )
+    workstream = conn.execute(
+        sa.select(
+            workstreams.c.ws_id,
+            workstreams.c.kind,
+            workstreams.c.project_id,
+            workstreams.c.state,
+        )
+        .where(workstreams.c.ws_id == ws_id)
+        .with_for_update()
+    ).fetchone()
+    if workstream is None or str(workstream[3] or "") in {"creating", "deleted"}:
+        return None
+
+    existing = conn.execute(
+        sa.select(memory_index_snapshots).where(
+            memory_index_snapshots.c.ws_id == ws_id,
+        )
+    ).fetchone()
+    if existing is not None:
+        return dict(existing._mapping)
+
+    kind = str(workstream[1] or "interactive")
+    project_id, project_name = _memory_index_project_on_connection(
+        conn,
+        principal_id,
+        str(workstream[2] or ""),
+        permissions=permissions,
+    )
+    if kind == "coordinator":
+        scopes = [("coordinator", principal_id)] if principal_id else []
+    else:
+        scopes = [("global", ""), ("workstream", ws_id)]
+        if principal_id:
+            scopes.append(("user", principal_id))
+    if project_id:
+        scopes.append(("project", project_id))
+
+    predicates: list[Any] = []
+    for scope, scope_id in scopes:
+        predicate = structured_memories.c.scope == scope
+        if scope_id:
+            predicate = sa.and_(predicate, structured_memories.c.scope_id == scope_id)
+        predicates.append(predicate)
+    rows: list[dict[str, Any]] = []
+    if predicates:
+        result = conn.execute(
+            sa.select(
+                structured_memories.c.memory_id,
+                structured_memories.c.name,
+                structured_memories.c.description,
+                structured_memories.c.type,
+                structured_memories.c.scope,
+                structured_memories.c.scope_id,
+            ).where(sa.or_(*predicates))
+        ).fetchall()
+        rows = [dict(row._mapping) for row in result]
+    rendered = render_memory_index(rows, project_id=project_id)
+    captured_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    values = {
+        "ws_id": ws_id,
+        "principal_id": principal_id,
+        "project_id": project_id,
+        "project_name": project_name,
+        "visibility_key": memory_visibility_key(scopes),
+        "content": rendered.content,
+        "format_version": MEMORY_INDEX_FORMAT_VERSION,
+        "entry_count": rendered.entry_count,
+        "char_count": rendered.char_count,
+        "invalid_description_count": rendered.invalid_description_count,
+        "captured_at": captured_at,
+    }
+    conn.execute(sa.insert(memory_index_snapshots), values)
+    return values
 
 
 # Client tool-call block types across providers, used to enforce the
@@ -824,6 +1229,15 @@ def purge_orphan_conversations(conn: Any, ws_ids: list[str]) -> dict[str, int]:
     swept = sorted(purged_ws)
     for i in range(0, len(swept), _PURGE_CHUNK):
         chunk = swept[i : i + _PURGE_CHUNK]
+        conn.execute(
+            sa.delete(memory_index_snapshots).where(memory_index_snapshots.c.ws_id.in_(chunk))
+        )
+        conn.execute(
+            sa.delete(structured_memories).where(
+                structured_memories.c.scope == "workstream",
+                structured_memories.c.scope_id.in_(chunk),
+            )
+        )
         conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(chunk)))
         conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id.in_(chunk)))
     return {
@@ -1402,6 +1816,8 @@ OUTPUT_GUARD_PATTERN_MUTABLE = frozenset(
 VERDICT_MUTABLE = frozenset(
     {
         "user_decision",
+        "resolver_principal_id",
+        "execution_principal_id",
         "intent_summary",
         "risk_level",
         "confidence",
@@ -2169,38 +2585,7 @@ def _fork_attachment_refs(raw: Any) -> list[str]:
 
 def _fork_user_permissions(conn: Any, user_id: str, *, lock_rows: bool) -> set[str]:
     """Resolve one principal's effective RBAC set inside the clone snapshot."""
-    if not user_id:
-        return set()
-    role_stmt = (
-        sa.select(roles.c.role_id, roles.c.permissions, roles.c.builtin)
-        .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
-        .where(user_roles.c.user_id == user_id)
-    )
-    role_rows = conn.execute(_fork_locked(role_stmt, lock_rows=lock_rows)).fetchall()
-    builtin_role_ids = [row[0] for row in role_rows if row[2]]
-    grants: dict[str, set[str]] = {}
-    revokes: dict[str, set[str]] = {}
-    if builtin_role_ids:
-        override_stmt = sa.select(
-            role_permission_overrides.c.role_id,
-            role_permission_overrides.c.permission,
-            role_permission_overrides.c.action,
-        ).where(role_permission_overrides.c.role_id.in_(builtin_role_ids))
-        override_rows = conn.execute(_fork_locked(override_stmt, lock_rows=lock_rows)).fetchall()
-        for role_id, permission, action in override_rows:
-            if action == "grant":
-                grants.setdefault(str(role_id), set()).add(str(permission))
-            elif action == "revoke":
-                revokes.setdefault(str(role_id), set()).add(str(permission))
-    permissions: set[str] = set()
-    for role_id, raw_permissions, builtin in role_rows:
-        role_permissions = split_perms(raw_permissions)
-        if builtin:
-            role_permissions = (role_permissions | grants.get(str(role_id), set())) - revokes.get(
-                str(role_id), set()
-            )
-        permissions |= role_permissions
-    return permissions
+    return _permissions_for_user_on_connection(conn, user_id, lock_rows=lock_rows)
 
 
 def _fork_turn_insert_row(
@@ -2324,6 +2709,16 @@ def clone_workstream_transaction(
     if not trusted_internal and not principal_id:
         raise ForkSourceUnavailableError("fork source is no longer available")
 
+    # PostgreSQL clones run at SERIALIZABLE isolation.  As with immutable
+    # index capture, acquire the concrete role locks in the transaction's
+    # first snapshot read so override replacement/deletion linearizes before
+    # any source facts are observed.  The loaded set is reused by both the
+    # authorization gate and the expected-session witness below.
+    fork_permissions = (
+        _fork_user_permissions(conn, principal_id, lock_rows=lock_rows)
+        if principal_id and (not trusted_internal or expected_session is not None)
+        else set()
+    )
     workstream_stmt = (
         sa.select(workstreams)
         .where(workstreams.c.ws_id.in_((source_ws_id, destination_ws_id)))
@@ -2376,7 +2771,6 @@ def clone_workstream_transaction(
     effective_project_id = source_project_id if project is not None else None
     if project is not None:
         project_map = project._mapping
-        visibility = str(project_map.get("visibility") or "private")
         owner_id = str(project_map.get("owner_id") or "")
         if owner_id != principal_id and (not trusted_internal or expected_session is not None):
             member_stmt = sa.select(project_members.c.user_id).where(
@@ -2386,8 +2780,15 @@ def clone_workstream_transaction(
             member = conn.execute(_fork_locked(member_stmt, lock_rows=lock_rows)).fetchone()
             is_project_member = member is not None
         if not trusted_internal:
-            allowed = visibility != "private" or owner_id == principal_id or is_project_member
-            if not allowed:
+            decision = decide_project_access(
+                principal_id=principal_id,
+                owner_id=owner_id,
+                visibility=str(project_map.get("visibility") or "private"),
+                state=str(project_map.get("state") or "active"),
+                is_member=is_project_member,
+                permissions=fork_permissions,
+            )
+            if not decision.can_read:
                 raise ForkSourceUnavailableError("fork source is no longer available")
 
     destination = by_ws_id.get(destination_ws_id)
@@ -2470,25 +2871,18 @@ def clone_workstream_transaction(
         current_project_writable = False
         if project is not None and effective_project_id is not None:
             project_map = project._mapping
-            owner_id = str(project_map.get("owner_id") or "")
-            if owner_id == principal_id:
-                can_read = True
-                can_write = True
-            else:
-                permissions = _fork_user_permissions(
-                    conn,
-                    principal_id,
-                    lock_rows=lock_rows,
-                )
-                visibility = str(project_map.get("visibility") or "private")
-                can_read = "project.read" in permissions and (
-                    is_project_member or visibility == "public"
-                )
-                can_write = "project.write" in permissions and is_project_member
-            if can_read and str(project_map.get("state") or "active") != "archived":
+            decision = decide_project_access(
+                principal_id=principal_id,
+                owner_id=str(project_map.get("owner_id") or ""),
+                visibility=str(project_map.get("visibility") or "private"),
+                state=str(project_map.get("state") or "active"),
+                is_member=is_project_member,
+                permissions=fork_permissions,
+            )
+            if decision.can_read:
                 current_project_id = effective_project_id
                 current_project_name = str(project_map.get("name") or "")
-                current_project_writable = can_write
+                current_project_writable = decision.can_write
         if (
             current_project_id != expected_session.project_id
             or current_project_name != expected_session.project_name

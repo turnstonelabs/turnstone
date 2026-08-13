@@ -11,6 +11,7 @@ import pytest
 
 from tests._session_helpers import (
     arm_session,
+    make_registered_session,
     make_session,
     provider_shell,
     replace_session_lane,
@@ -41,6 +42,15 @@ from turnstone.core.trajectory import (
     turn_from_dict,
 )
 from turnstone.core.workstream import WorkstreamKind, WorkstreamState
+
+
+def _bind_storage_mock() -> MagicMock:
+    """Replace the process-global backend for one storage-boundary test."""
+    from turnstone.core.storage import _registry
+
+    storage = MagicMock()
+    _registry._storage = storage
+    return storage
 
 
 class NullUI:
@@ -172,14 +182,12 @@ def _make_session(ui=None, **kwargs):
     recording NullUI.  The defaults live in
     tests/_session_helpers.make_session — duplicating them here is
     exactly the drift its docstring warns about."""
-    session = make_session(ui=ui or NullUI(), **kwargs)
-    # Keyed conversation commits refuse orphan writes by design; production's
-    # manager creates the parent workstream row before constructing a live
-    # session, so direct-session tests mirror that prerequisite.
-    from turnstone.core.memory import register_workstream
+    return make_session(ui=ui or NullUI(), **kwargs)
 
-    register_workstream(session.ws_id, user_id=kwargs.get("user_id"))
-    return session
+
+def _make_registered_session(ui=None, **kwargs):
+    """Build the durable variant for tests that reach model admission."""
+    return make_registered_session(ui=ui or NullUI(), **kwargs)
 
 
 class _BlockingAgentStream:
@@ -290,7 +298,7 @@ class TestCancelEvent:
     def test_cancel_event_cleared_on_send_start(self, tmp_db):
         """send() clears a stale cancel flag before starting."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
         session.cancel()  # Set stale flag
 
         fake_stream = iter([StreamChunk(content_delta="Hello", finish_reason="stop")])
@@ -409,7 +417,7 @@ class TestCancelDuringStreaming:
     def test_preserves_partial_content(self, tmp_db):
         """Partial content already streamed should be preserved in messages."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         def cancelling_stream():
             """Yield a few chunks then cancel."""
@@ -447,7 +455,7 @@ class TestCancelDuringToolExecution:
     def test_rollback_incomplete_tool_results(self, tmp_db):
         """When cancelled during tool execution, synthesized results replace missing tool outputs."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         # First call: return content with a tool call
         def stream_with_tool():
@@ -497,7 +505,7 @@ class TestCancelWhenIdle:
     """Cancelling when no generation is active is harmless."""
 
     def test_cancel_when_idle_is_noop(self, tmp_db):
-        session = _make_session()
+        session = _make_registered_session()
         session.cancel()
         # Next send should work normally (cancel cleared at start)
 
@@ -516,7 +524,7 @@ class TestCancelThreadSafety:
 
     def test_cancel_from_another_thread(self, tmp_db):
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         barrier = threading.Event()
 
@@ -579,7 +587,7 @@ class TestStreamFlushBeforeToolCalls:
                 super().on_stream_end()
 
         ui = TrackingUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         def stream_content_then_tool():
             # Content long enough to leave chars in the tag-scan carry
@@ -653,7 +661,7 @@ class TestStreamAbort:
         ``cancel()`` closes to unblock a stuck read — and send()'s finally
         clears it."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         seen: dict = {}
 
@@ -675,7 +683,7 @@ class TestStreamAbort:
         """When cancel() closes the stream, the resulting transport error
         is converted to GenerationCancelled."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         def stream_that_errors():
             yield StreamChunk(content_delta="Hello")
@@ -700,7 +708,7 @@ class TestStreamAbort:
         """Exceptions during streaming that aren't caused by cancel
         should propagate normally."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         def stream_that_errors():
             yield StreamChunk(content_delta="Hello")
@@ -2177,7 +2185,7 @@ class TestCancelRef:
         linger into tool execution, where cancel() would close a dead
         handle instead of nothing)."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         arm_session(session, iter([StreamChunk(content_delta="hi", finish_reason="stop")]))
         session.send("test")
@@ -2236,7 +2244,7 @@ class TestCancelRef:
         tmp_db,
     ) -> None:
         """Close aborts the foreground SDK read and latches future arrivals."""
-        session = _make_session()
+        session = _make_registered_session()
         blocking_stream = _BlockingAgentStream()
         provider = provider_shell()
 
@@ -2396,7 +2404,7 @@ class TestForceCancelOrphanNoReissue:
 
     def test_orphan_death_not_reissued_no_ui_finalize(self, tmp_db):
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         def dying_orphan_stream():
             yield StreamChunk(content_delta="old ")
@@ -2452,7 +2460,7 @@ class TestForceCancelGeneration:
     def test_new_cancel_event_per_generation_in_send(self, tmp_db):
         """send() replaces _cancel_event with a fresh Event each generation."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         original_event = session._cancel_event
 
@@ -2469,18 +2477,18 @@ class TestSendGenerationInitializationPublication:
     """The claimed generation owns every pre-stream send mutation."""
 
     @pytest.mark.parametrize("takeover", ["successor", "close"])
-    def test_owner_lost_during_memory_count_cannot_consume_nudge_cooldown(
+    def test_owner_lost_during_memory_pointer_plan_cannot_publish(
         self,
         tmp_db,
         takeover: str,
     ) -> None:
-        """Storage-backed nudge planning is inert until its owner commits."""
+        """Storage-backed pointer planning is inert until its owner commits."""
         session = _make_session()
+        _bind_storage_mock()
         session._title_generated = True
-        session._system_composed_with_context = True
         generation = session._claim_generation()
-        count_started = threading.Event()
-        release_count = threading.Event()
+        planning_started = threading.Event()
+        release_planning = threading.Event()
         errors: list[BaseException] = []
 
         session._metacog_state["reflection"] = 123.0
@@ -2488,11 +2496,11 @@ class TestSendGenerationInitializationPublication:
         prior_metacog = dict(session._metacog_state)
         prior_nudges = tuple(session._nudge_queue.pending())
 
-        def blocked_memory_count() -> int:
-            count_started.set()
-            if not release_count.wait(2):
-                raise RuntimeError("test memory count was not released")
-            return 1
+        def blocked_pointer_plan(*_args: Any, **_kwargs: Any) -> str:
+            planning_started.set()
+            if not release_planning.wait(2):
+                raise RuntimeError("test memory pointer plan was not released")
+            return "stale private pointer"
 
         def initialize() -> None:
             try:
@@ -2510,8 +2518,7 @@ class TestSendGenerationInitializationPublication:
 
         worker = threading.Thread(target=initialize)
         with (
-            patch.object(session, "_nudges_enabled", return_value=True),
-            patch.object(session, "_visible_memory_count", side_effect=blocked_memory_count),
+            patch.object(session, "_plan_memory_pointer", side_effect=blocked_pointer_plan),
             patch.object(
                 session,
                 "_plan_metacognitive_nudge",
@@ -2521,13 +2528,13 @@ class TestSendGenerationInitializationPublication:
         ):
             worker.start()
             try:
-                assert count_started.wait(2)
+                assert planning_started.wait(2)
                 if takeover == "successor":
                     assert session._claim_generation() == generation + 1
                 else:
                     session.close()
             finally:
-                release_count.set()
+                release_planning.set()
                 worker.join(2)
 
         assert not worker.is_alive()
@@ -2541,8 +2548,8 @@ class TestSendGenerationInitializationPublication:
     def test_stop_does_not_wait_for_blocked_user_turn_storage(self, tmp_db) -> None:
         """Durable opening-turn storage cannot delay provider cancellation."""
         session = _make_session()
+        storage = _bind_storage_mock()
         session._title_generated = True
-        session._system_composed_with_context = True
         generation = session._claim_generation()
         storage_started = threading.Event()
         release_storage = threading.Event()
@@ -2596,8 +2603,9 @@ class TestSendGenerationInitializationPublication:
             child_scope.cancel_ref.append(child_handle)
             _CancelRef(session, generation).append(main_handle)
             with (
-                patch(
-                    "turnstone.core.session.save_message",
+                patch.object(
+                    storage,
+                    "save_message",
                     side_effect=blocked_save_message,
                 ) as save,
                 patch.object(session, "_check_metacognitive_nudge", return_value=None),
@@ -2634,6 +2642,7 @@ class TestSendGenerationInitializationPublication:
         takeover: str,
     ) -> None:
         session = _make_session()
+        _bind_storage_mock()
         origin_generation = session._claim_generation()
 
         if takeover == "successor":
@@ -2692,104 +2701,82 @@ class TestSendGenerationInitializationPublication:
         check_metacog.assert_not_called()
         init_system.assert_not_called()
 
-    def test_stale_system_composition_cannot_publish_private_memory_plan(
+    def test_stale_admission_cannot_commit_or_publish_private_memory_index(
         self,
         tmp_db,
     ) -> None:
-        """A superseded memory search cannot leak its cache or touch plan."""
-        from turnstone.core.memory_relevance import MemoryConfig
-
-        session = _make_session(
-            memory_config=MemoryConfig(fetch_limit=1, relevance_k=1),
-        )
-        session._invalidate_memory_cache()
-        session.messages = [
-            turn_from_dict({"role": "user", "content": "old private query"}),
-        ]
+        """A superseded capture rolls back before its durable commit."""
+        session = _make_session()
+        storage = _bind_storage_mock()
+        storage.get_memory_index_snapshot.return_value = None
         old_generation = session._claim_generation()
-        old_search_started = threading.Event()
-        release_old_search = threading.Event()
-        old_results: list[bool] = []
+        session._memory_index_admission_generation = old_generation
+        old_capture_started = threading.Event()
+        release_old_capture = threading.Event()
+        committed_principals: list[str] = []
         errors: list[BaseException] = []
-        touch_calls: list[list[tuple[str, str, str]]] = []
 
-        old_row = {
-            "memory_id": "old-private-id",
-            "name": "old_private_memory",
-            "description": "old generation only",
-            "content": "old private query details",
-            "type": "general",
-            "scope": "user",
-            "scope_id": "old-private-user",
-        }
-        successor_row = {
-            "memory_id": "successor-id",
-            "name": "successor_memory",
-            "description": "successor generation only",
-            "content": "successor query details",
-            "type": "general",
-            "scope": "user",
-            "scope_id": "successor-user",
-        }
+        def capture_snapshot(
+            _ws_id: str,
+            principal_id: str,
+            *,
+            commit_guard: Any,
+        ) -> dict[str, Any]:
+            if principal_id == "old-private-user":
+                old_capture_started.set()
+                if not release_old_capture.wait(2):
+                    raise RuntimeError("test old index capture was not released")
+                content = "<memory-index>old_private_memory</memory-index>"
+            else:
+                assert principal_id == "successor-user"
+                content = "<memory-index>successor_memory</memory-index>"
+            with commit_guard():
+                committed_principals.append(principal_id)
+            return {
+                "content": content,
+                "entry_count": 1,
+                "char_count": len(content),
+                "invalid_description_count": 0,
+                "project_id": "",
+                "project_name": "",
+            }
 
-        def searched_memories(
-            query: str,
-            *_args: Any,
-            **_kwargs: Any,
-        ) -> list[dict[str, str]]:
-            if query == "old private query":
-                old_search_started.set()
-                if not release_old_search.wait(2):
-                    raise RuntimeError("test old memory search was not released")
-                return [old_row]
-            assert query == "successor query"
-            return [successor_row]
-
-        def compose_old() -> None:
+        def admit_old() -> None:
             try:
-                old_results.append(
-                    session._init_system_messages(origin_generation=old_generation),
+                session._admit_memory_index_request(
+                    session._primary_lane(),
+                    my_generation=old_generation,
+                    principal_id="old-private-user",
                 )
             except BaseException as exc:
                 errors.append(exc)
 
-        worker = threading.Thread(target=compose_old)
-        with (
-            patch(
-                "turnstone.core.session.search_visible_structured_memories",
-                side_effect=searched_memories,
-            ),
-            patch(
-                "turnstone.core.session.score_memories",
-                side_effect=lambda rows, _query, **_kwargs: list(rows),
-            ),
-            patch(
-                "turnstone.core.session.touch_structured_memories",
-                side_effect=lambda keys: touch_calls.append(list(keys)),
-            ),
+        worker = threading.Thread(target=admit_old)
+        with patch.object(
+            storage,
+            "acquire_memory_index_snapshot",
+            side_effect=capture_snapshot,
         ):
             worker.start()
             try:
-                assert old_search_started.wait(2)
+                assert old_capture_started.wait(2)
                 successor_generation = session._claim_generation()
-                session.messages = [
-                    turn_from_dict({"role": "user", "content": "successor query"}),
-                ]
-                session._invalidate_memory_cache()
-                assert session._init_system_messages(origin_generation=successor_generation) is True
+                session._memory_index_admission_generation = successor_generation
+                session._admit_memory_index_request(
+                    session._primary_lane(),
+                    my_generation=successor_generation,
+                    principal_id="successor-user",
+                )
+                successor_wire = list(session.system_messages)
             finally:
-                release_old_search.set()
+                release_old_capture.set()
                 worker.join(2)
 
         assert not worker.is_alive()
-        assert errors == []
-        assert old_results == [False]
-        cached_names = {row["name"] for rows in session._mem_search_cache.values() for row in rows}
-        assert cached_names == {"successor_memory"}
-        assert session._touched_memory_keys == {
-            ("successor_memory", "user", "successor-user"),
-        }
-        assert touch_calls == [[("successor_memory", "user", "successor-user")]]
+        assert len(errors) == 1
+        assert isinstance(errors[0], GenerationCancelled)
+        assert committed_principals == ["successor-user"]
+        assert "successor_memory" in str(successor_wire)
         rendered = "\n".join(str(message.get("content", "")) for message in session.system_messages)
         assert "successor_memory" in rendered
         assert "old_private_memory" not in rendered
@@ -2799,8 +2786,8 @@ class TestSendGenerationInitializationPublication:
         tmp_db,
     ) -> None:
         """A resume during the user save cannot retarget deferred title work."""
-        session = _make_session(ws_id="opening-ws")
-        session._system_composed_with_context = True
+        session = _make_session(ws_id="opening-ws", user_id="opening-principal")
+        _bind_storage_mock()
         generation = session._claim_generation()
         successor_turn = turn_from_dict(
             {"role": "user", "content": "successor workstream history"},
@@ -2816,13 +2803,10 @@ class TestSendGenerationInitializationPublication:
             patch.object(
                 session,
                 "_plan_shared_state",
-                return_value=("opening-ws", set(), True),
+                return_value=("opening-ws", {"opening-principal"}, True),
             ),
             patch.object(session, "_init_system_messages") as init_system,
-            patch(
-                "turnstone.core.session.load_message_turns",
-                return_value=[successor_turn],
-            ),
+            patch("turnstone.core.session.load_message_turns", return_value=[successor_turn]),
             patch("turnstone.core.session.load_workstream_config", return_value={}),
             patch("turnstone.core.session.save_message", side_effect=save_then_resume),
             patch("turnstone.core.session.threading.Thread") as title_thread,
@@ -2856,8 +2840,8 @@ class TestSendGenerationInitializationPublication:
         tmp_db,
     ) -> None:
         """A durable user row cannot launch auxiliary work past close."""
-        session = _make_session(ws_id="opening-ws")
-        session._system_composed_with_context = True
+        session = _make_session(ws_id="opening-ws", user_id="opening-principal")
+        _bind_storage_mock()
         generation = session._claim_generation()
         save_started = threading.Event()
         release_save = threading.Event()
@@ -2907,13 +2891,12 @@ class TestSendGenerationInitializationPublication:
         tmp_db,
     ) -> None:
         """A failed sender seed remains retryable, but not in this commit."""
-        session = _make_session()
+        session = _make_session(user_id="principal")
         session._title_generated = True
-        session._system_composed_with_context = True
         session._db_senders_loaded = False
         session._senders_dirty = True
         generation = session._claim_generation()
-        storage = MagicMock()
+        storage = _bind_storage_mock()
         lock_owned_during_reads: list[bool] = []
 
         def fail_sender_read(_ws_id: str) -> list[str]:
@@ -2923,7 +2906,6 @@ class TestSendGenerationInitializationPublication:
 
         storage.list_message_senders.side_effect = fail_sender_read
         with (
-            patch("turnstone.core.session.get_storage", return_value=storage),
             patch.object(session, "_visible_memory_count", return_value=0),
             patch("turnstone.core.session.save_message", return_value=1),
         ):
@@ -3133,6 +3115,7 @@ class TestMainToolCancellationDisposition:
         """
         ui = _ToolResultTrackingUI()
         session = _make_session(ui=ui)
+        _bind_storage_mock()
         generation = session._claim_generation()
         call_ids = ("call-a", "call-b")
         detail = "Cancelled before tool execution; no side effects."
@@ -3223,6 +3206,7 @@ class TestMainToolCancellationDisposition:
         """
         ui = _ToolResultTrackingUI()
         session = _make_session(ui=ui)
+        _bind_storage_mock()
         generation = session._claim_generation()
         status_label = effect_status.value if effect_status is not None else "unclassified"
         call_id = f"call-{report_order}-{status_label}"
@@ -3384,6 +3368,7 @@ class TestGenerationDurabilityFIFO:
         """A superseded recovery cannot consume the durable-error latch."""
         ui = NullUI()
         session = _make_session(ui=ui)
+        storage = _bind_storage_mock()
         session._has_persisted_error = True
         session._persisted_error_revision = 1
         old_generation = session._claim_generation()
@@ -3412,9 +3397,10 @@ class TestGenerationDurabilityFIFO:
 
         predecessor = threading.Thread(target=run_old)
         successor: threading.Thread | None = None
-        with patch(
-            "turnstone.core.memory.clear_last_error",
-            side_effect=lambda ws_id: clear_calls.append(ws_id),
+        with patch.object(
+            storage,
+            "save_workstream_config",
+            side_effect=lambda ws_id, _config: clear_calls.append(ws_id),
         ):
             predecessor.start()
             try:
@@ -3960,9 +3946,8 @@ class TestCancelledSendCleanupOwnership:
     def test_successor_waits_for_complete_cancel_cleanup_transaction(self, tmp_db):
         """A claim already waiting on the lock observes every cleanup effect."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
         session._title_generated = True
-        session._system_composed_with_context = True
         observed_lock = _ObservedRLock()
         session._generation_lock = observed_lock
         # This test replaces the generation lock to observe ownership. The
@@ -4057,9 +4042,8 @@ class TestCancelledSendCleanupOwnership:
     def test_successor_claim_before_cleanup_refuses_entire_transaction(self, tmp_db):
         """Once a successor owns the session, no old cleanup action starts."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
         session._title_generated = True
-        session._system_composed_with_context = True
         publish_entered = threading.Event()
         release_publish = threading.Event()
         send_errors: list[BaseException] = []
@@ -4153,7 +4137,7 @@ class TestForceCancelThreaded:
         """After force cancel + new send(), the orphaned thread must not
         append stale content to session.messages."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         barrier = threading.Event()
         old_done = threading.Event()
@@ -4195,7 +4179,7 @@ class TestForceCancelThreaded:
     def test_force_cancel_then_new_send_succeeds(self, tmp_db):
         """A new send() after force cancel works cleanly."""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
 
         barrier = threading.Event()
 
@@ -4289,6 +4273,7 @@ class TestSynthesizeCancelledResults:
         """
         ui = self._ui_with_tool_result_tracking()
         session = _make_session(ui=ui)
+        _bind_storage_mock()
         call_id = "reused-call"
         disposition = "Completed before cancel: read_file. Task was interrupted."
         session.messages.append(
@@ -4419,7 +4404,12 @@ class TestTimeoutDisposition:
         session._mcp_client = MagicMock()
         session._mcp_client.call_tool_sync.side_effect = TimeoutError()
         call_id, result = session._exec_mcp_tool(
-            {"call_id": "c1", "mcp_func_name": "send_email", "mcp_args": {}}
+            {
+                "call_id": "c1",
+                "mcp_func_name": "send_email",
+                "mcp_args": {},
+                "_principal_id": "",
+            }
         )
         assert call_id == "c1"
         assert "timed out" in result.lower()
@@ -4434,7 +4424,7 @@ class TestTimeoutDisposition:
         session._mcp_client = MagicMock()
         session._mcp_client.read_resource_sync.side_effect = TimeoutError()
         call_id, result = session._exec_read_resource(
-            {"call_id": "c1", "resource_uri": "file:///doc"}
+            {"call_id": "c1", "resource_uri": "file:///doc", "_principal_id": ""}
         )
         assert call_id == "c1"
         assert "timed out" in result.lower()
@@ -4745,7 +4735,7 @@ class TestNeverArmedStopLeavesNoRow:
         via record_cancelled_partial — TestCancelDuringStreaming pins
         that side.)"""
         ui = NullUI()
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
         provider = arm_session(session)  # provider shell; create scripted below
 
         def create_cancel_then_fail(**kwargs):
@@ -4873,7 +4863,7 @@ class TestSupersessionVerdictAgreement:
     finalizing on one path and not the other."""
 
     def _session_at_generation(self, gen, ui):
-        session = _make_session(ui=ui)
+        session = _make_registered_session(ui=ui)
         session._generation = gen
         session.messages.append(Turn.user("hi"))
         return session

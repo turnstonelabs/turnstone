@@ -900,20 +900,25 @@ export interface SaveMemoryRequest {
   scope_id?: string;
 }
 
-export interface MemoryInfo {
+export interface MemorySummary {
   memory_id: string;
   name: string;
   description: string;
   type: string;
   scope: string;
   scope_id: string;
-  content: string;
   created: string;
   updated: string;
+  last_accessed: string;
+  access_count: number;
+}
+
+export interface MemoryInfo extends MemorySummary {
+  content: string;
 }
 
 export interface ListMemoriesResponse {
-  memories: MemoryInfo[];
+  memories: MemorySummary[];
   total: number;
 }
 
@@ -932,29 +937,36 @@ export interface ListMemoriesOptions {
   limit?: number;
 }
 
-export interface DeleteMemoryOptions {
+export interface MemoryScopeOptions {
   scope?: string;
   scope_id?: string;
 }
 
+export type GetMemoryOptions = MemoryScopeOptions;
+export type DeleteMemoryOptions = MemoryScopeOptions;
+
 // -- Console API: Admin Memories --------------------------------------------
 
-export interface AdminMemoryInfo {
+export interface AdminMemorySummary {
   memory_id: string;
   name: string;
   description: string;
   type: string;
   scope: string;
   scope_id: string;
-  content: string;
+  scope_label: string;
   created: string;
   updated: string;
   last_accessed: string;
   access_count: number;
 }
 
+export interface AdminMemoryInfo extends AdminMemorySummary {
+  content: string;
+}
+
 export interface ListAdminMemoriesResponse {
-  memories: AdminMemoryInfo[];
+  memories: AdminMemorySummary[];
   total: number;
 }
 
@@ -971,6 +983,16 @@ export interface AdminSearchMemoriesOptions {
   scope?: string;
   scope_id?: string;
   limit?: number;
+}
+
+export interface MemoryIndexHealthResponse {
+  budget_chars: number;
+  over_budget: boolean;
+  max_char_count: number;
+  max_entry_count: number;
+  over_by_chars: number;
+  invalid_description_count: number;
+  envelope_count: number;
 }
 
 // -- Console API: MCP Servers -----------------------------------------------

@@ -510,6 +510,9 @@ def test_postgresql_register_uses_returning_when_driver_rowcount_is_unknown() ->
     token = "postgres-register-incarnation"
     backend, conn = _scripted_postgres_backend(
         _UnknownRowcountResult(row=(ws_id,)),
+        _UnknownRowcountResult(row=(ws_id,)),
+        _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
         _UnknownRowcountResult(),
     )
 
@@ -549,12 +552,16 @@ def test_postgresql_conditional_delete_uses_returning_when_rowcount_is_unknown()
     backend, conn = _scripted_postgres_backend(
         _UnknownRowcountResult(row=(ws_id,)),
         _UnknownRowcountResult(row=(token,)),
+        _UnknownRowcountResult(row=("creating",)),
         _UnknownRowcountResult(rows=[]),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
         _UnknownRowcountResult(row=(ws_id,)),
+        _UnknownRowcountResult(),
     )
 
     assert backend.delete_workstream_if_fork_reserved(ws_id, token) is True
@@ -570,12 +577,16 @@ def test_postgresql_stale_creating_reaper_locks_state_age_and_exact_incarnation(
         _UnknownRowcountResult(rows=[(ws_id,)]),
         _UnknownRowcountResult(row=(token,)),
         _UnknownRowcountResult(row=(ws_id,)),
+        _UnknownRowcountResult(row=("creating",)),
         _UnknownRowcountResult(rows=[]),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
         _UnknownRowcountResult(row=(ws_id,)),
+        _UnknownRowcountResult(),
     )
 
     assert backend.delete_stale_creating_reservations(
@@ -610,12 +621,16 @@ def test_postgresql_stale_creating_reaper_recovers_tokenless_locked_row(
         _UnknownRowcountResult(rows=[(ws_id,)]),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(row=(ws_id,)),
+        _UnknownRowcountResult(row=("creating",)),
         _UnknownRowcountResult(rows=[]),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
         _UnknownRowcountResult(row=(ws_id,)),
+        _UnknownRowcountResult(),
     )
 
     assert backend.delete_stale_creating_reservations(
@@ -678,3 +693,33 @@ def test_postgresql_retention_prune_excludes_creating_rows() -> None:
     assert "workstreams.alias is null" in orphan_select_sql
     assert "workstreams.updated" in orphan_select_sql
     assert "workstreams.updated" in stale_select_sql
+
+
+def test_published_workstream_id_is_never_reusable(backend) -> None:
+    ws_id = "published-id"
+    assert backend.register_workstream(ws_id, state="idle", user_id="u1") is True
+    assert backend.delete_workstream(ws_id) is True
+    assert backend.register_workstream(ws_id, state="idle", user_id="u1") is False
+
+
+def test_unpublished_reservation_releases_its_id(backend) -> None:
+    ws_id = "retryable-create-id"
+    assert (
+        backend.register_workstream(
+            ws_id,
+            state="creating",
+            user_id="u1",
+            fork_reservation_token="reservation-one",
+        )
+        is True
+    )
+    assert backend.delete_workstream_if_fork_reserved(ws_id, "reservation-one") is True
+    assert (
+        backend.register_workstream(
+            ws_id,
+            state="creating",
+            user_id="u1",
+            fork_reservation_token="reservation-two",
+        )
+        is True
+    )

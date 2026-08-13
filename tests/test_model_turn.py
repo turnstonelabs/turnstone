@@ -23,6 +23,7 @@ import pytest
 import turnstone.core.model_turn as model_turn_mod
 from tests._session_helpers import as_stream
 from turnstone.core.model_turn import (
+    ModelAdmissionError,
     ModelLane,
     finalize_provider_blocks,
     maybe_attach_vllm_chat_reasoning,
@@ -316,6 +317,73 @@ def test_model_turn_materializes_before_admission_and_mints_inside_hold() -> Non
             ],
         }
     ]
+
+
+def test_request_admission_composes_final_prefix_before_wire_preparation() -> None:
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    prefix = {"value": "provisional prefix"}
+    order: list[str] = []
+
+    def admit(lane: ModelLane) -> None:
+        assert lane.model == "m"
+        order.append("admit")
+        prefix["value"] = "immutable admitted prefix"
+
+    def prepare(messages: list[dict[str, Any]], _lane: ModelLane) -> list[dict[str, Any]]:
+        order.append("prepare")
+        return [{"role": "system", "content": prefix["value"]}, *messages]
+
+    result = model_turn(
+        _lane(provider),
+        [Turn.user("hello")],
+        admit_request=admit,
+        prepare_wire=prepare,
+    )
+
+    assert order == ["admit", "prepare"]
+    assert provider.calls[0]["messages"][0]["content"] == "immutable admitted prefix"
+    assert "provisional" not in str(provider.calls[0]["messages"])
+    assert result.wire_msgs is provider.calls[0]["messages"]
+
+
+def test_model_turn_admits_the_exact_dispatched_and_reported_wire() -> None:
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    admitted = [
+        {"role": "system", "content": "immutable admission context"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    def _admit(messages: list[dict[str, Any]], lane: ModelLane) -> list[dict[str, Any]]:
+        assert messages == [{"role": "user", "content": "hello"}]
+        assert lane.model == "m"
+        return admitted
+
+    result = model_turn(
+        _lane(provider),
+        [Turn.user("hello")],
+        admit_wire=_admit,
+    )
+
+    assert provider.calls[0]["messages"] is admitted
+    assert result.wire_msgs is admitted
+
+
+def test_model_turn_admission_failure_releases_lease_and_never_dispatches() -> None:
+    from turnstone.core.admission import ModelAdmission
+
+    gate = ModelAdmission("primary", 1)
+    provider = _FakeProvider([CompletionResult(content="never")])
+    lane = ModelLane(provider=provider, client=object(), model="m", admission=gate)
+
+    def _reject(_messages: list[dict[str, Any]], _lane: ModelLane) -> list[dict[str, Any]]:
+        raise RuntimeError("storage detail must remain in the cause")
+
+    with pytest.raises(ModelAdmissionError, match="RuntimeError") as raised:
+        model_turn(lane, [Turn.user("hello")], admit_wire=_reject)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert provider.calls == []
+    assert gate.snapshot().in_flight == 0
 
 
 def test_model_turn_releases_admission_before_retry_backoff(

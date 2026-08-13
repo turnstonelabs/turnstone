@@ -1,5 +1,21 @@
 """Tests for structured memory storage backend operations."""
 
+import threading
+from typing import Any
+
+import pytest
+import sqlalchemy as sa
+
+from turnstone.core.storage._postgresql import PostgreSQLBackend
+from turnstone.core.storage._utils import ProjectMemoryAuthorizationError
+
+
+@pytest.fixture(autouse=True)
+def _registered_workstream_scopes(backend):
+    """Workstream-scoped rows always have a live durable parent."""
+    backend.register_workstream("ws1", user_id="u1")
+    backend.register_workstream("ws2", user_id="u2")
+
 
 class TestCreateAndGet:
     def test_create_requires_non_empty_description(self, backend):
@@ -36,6 +52,64 @@ class TestCreateAndGet:
         assert g["content"] == "g"
         assert w["content"] == "w"
 
+    def test_exact_name_operations_never_wildcard_an_empty_scope_id(self, backend):
+        backend.create_structured_memory(
+            "m-u1", "shared", "u1 hook", "general", "user", "u1", "u1 body"
+        )
+        backend.create_structured_memory(
+            "m-u2", "shared", "u2 hook", "general", "user", "u2", "u2 body"
+        )
+
+        assert backend.get_structured_memory_by_name("shared", "user", "") is None
+        assert backend.get_and_touch_structured_memory_by_name("shared", "user", "") is None
+        assert not backend.delete_structured_memory("shared", "user", "")
+
+        assert backend.count_structured_memories(scope="user") == 2
+        assert {row["scope_id"] for row in backend.list_structured_memories(scope="user")} == {
+            "u1",
+            "u2",
+        }
+        for memory_id in ("m-u1", "m-u2"):
+            row = backend.get_structured_memory(memory_id)
+            assert row is not None
+            assert row["access_count"] == 0
+
+    def test_get_and_touch_returns_the_updated_full_row(self, backend):
+        backend.create_structured_memory(
+            "m1", "key", "hook", "reference", "user", "u1", "private body"
+        )
+
+        first = backend.get_and_touch_structured_memory_by_name("key", "user", "u1")
+        second = backend.get_and_touch_structured_memory("m1")
+
+        assert first is not None
+        assert first["memory_id"] == "m1"
+        assert first["content"] == "private body"
+        assert first["access_count"] == 1
+        assert first["last_accessed"]
+        assert second is not None
+        assert second["access_count"] == 2
+        assert second["last_accessed"]
+
+    def test_get_and_touch_miss_changes_nothing(self, backend):
+        backend.create_structured_memory("m1", "key", "hook", "general", "global", "", "body")
+
+        assert backend.get_and_touch_structured_memory_by_name("missing", "global", "") is None
+        assert backend.get_and_touch_structured_memory("missing") is None
+
+        row = backend.get_structured_memory("m1")
+        assert row is not None
+        assert row["access_count"] == 0
+        assert not row["last_accessed"]
+
+
+def test_role_override_mutations_require_existing_role(backend):
+    with pytest.raises(ValueError, match="does not exist"):
+        backend.set_role_overrides("missing-role", {"project.read"}, set())
+    with pytest.raises(ValueError, match="does not exist"):
+        backend.clear_role_overrides("missing-role")
+    assert backend.list_role_overrides("missing-role") == []
+
 
 class TestSaveUpsert:
     """``save_structured_memory`` upserts by (name, scope, scope_id).
@@ -58,6 +132,242 @@ class TestSaveUpsert:
                 "m2", "dup", "Test memory", "general", "global", "", "b"
             )
 
+
+class TestProjectActingPrincipalAuthorization:
+    """Project ACL/RBAC is enforced by the memory transaction itself."""
+
+    @staticmethod
+    def _seed(backend):
+        backend.create_project("project-auth", "Project", "owner")
+        backend.create_structured_memory(
+            "project-memory",
+            "runbook",
+            "Project runbook",
+            "reference",
+            "project",
+            "project-auth",
+            "private body",
+        )
+
+    def test_owner_can_mutate_and_fetch(self, backend):
+        self._seed(backend)
+        row, was_update = backend.upsert_structured_memory(
+            "replacement-id",
+            "runbook",
+            "Updated project runbook",
+            None,
+            "project",
+            "project-auth",
+            "updated body",
+            acting_principal_id="owner",
+        )
+        assert was_update is True
+        assert row["memory_id"] == "project-memory"
+
+        fetched = backend.get_and_touch_structured_memory_by_name(
+            "runbook",
+            "project",
+            "project-auth",
+            acting_principal_id="owner",
+        )
+        assert fetched is not None
+        assert fetched["content"] == "updated body"
+        assert (
+            backend.delete_structured_memory_returning(
+                "runbook",
+                "project",
+                "project-auth",
+                acting_principal_id="owner",
+            )
+            is not None
+        )
+
+    def test_read_only_member_cannot_write_or_delete(self, backend):
+        self._seed(backend)
+        backend.create_role("project-reader", "reader", "Reader", "project.read", False)
+        backend.assign_role("reader", "project-reader")
+        backend.add_project_member("project-auth", "reader")
+
+        assert (
+            backend.get_and_touch_structured_memory_by_name(
+                "runbook",
+                "project",
+                "project-auth",
+                acting_principal_id="reader",
+            )
+            is not None
+        )
+        with pytest.raises(ProjectMemoryAuthorizationError):
+            backend.upsert_structured_memory(
+                "replacement-id",
+                "runbook",
+                "Changed",
+                None,
+                "project",
+                "project-auth",
+                "changed",
+                acting_principal_id="reader",
+            )
+        with pytest.raises(ProjectMemoryAuthorizationError):
+            backend.delete_structured_memory_returning(
+                "runbook",
+                "project",
+                "project-auth",
+                acting_principal_id="reader",
+            )
+        assert backend.get_structured_memory("project-memory") is not None
+
+    def test_grants_revokes_and_write_policy_share_one_decision(self, backend):
+        self._seed(backend)
+        backend.create_role("builtin-project", "builtin-project", "Project", "", True)
+        backend.assign_role("member", "builtin-project")
+        backend.add_project_member("project-auth", "member")
+
+        # A revoke cannot accidentally confer a permission absent from baseline.
+        backend.set_role_overrides("builtin-project", set(), {"project.read"})
+        with pytest.raises(ProjectMemoryAuthorizationError):
+            backend.get_and_touch_structured_memory_by_name(
+                "runbook",
+                "project",
+                "project-auth",
+                acting_principal_id="member",
+            )
+
+        # An override grant is realized by the guarded read transaction.
+        backend.set_role_overrides("builtin-project", {"project.read"}, set())
+        assert (
+            backend.get_and_touch_structured_memory_by_name(
+                "runbook",
+                "project",
+                "project-auth",
+                acting_principal_id="member",
+            )
+            is not None
+        )
+        backend.clear_role_overrides("builtin-project")
+        with pytest.raises(ProjectMemoryAuthorizationError):
+            backend.get_and_touch_structured_memory_by_name(
+                "runbook",
+                "project",
+                "project-auth",
+                acting_principal_id="member",
+            )
+
+        # Read and write are independent effective capabilities. Replacement
+        # removes the unrelated grant before installing the requested revoke.
+        assert backend.update_role("builtin-project", permissions="project.read,project.write")
+        backend.set_role_overrides("builtin-project", {"admin.audit"}, set())
+        backend.set_role_overrides("builtin-project", set(), {"project.read"})
+        overrides = backend.list_role_overrides("builtin-project")
+        assert [(row["role_id"], row["permission"], row["action"]) for row in overrides] == [
+            ("builtin-project", "project.read", "revoke")
+        ]
+        backend.upsert_structured_memory(
+            "replacement-id",
+            "runbook",
+            "Write remains authorized",
+            None,
+            "project",
+            "project-auth",
+            "updated through write-only permission",
+            acting_principal_id="member",
+        )
+        backend.set_role_overrides("builtin-project", set(), {"project.write"})
+        assert (
+            backend.get_and_touch_structured_memory_by_name(
+                "runbook",
+                "project",
+                "project-auth",
+                acting_principal_id="member",
+            )
+            is not None
+        )
+        with pytest.raises(ProjectMemoryAuthorizationError):
+            backend.upsert_structured_memory(
+                "replacement-id",
+                "runbook",
+                "Denied write",
+                None,
+                "project",
+                "project-auth",
+                "must not land",
+                acting_principal_id="member",
+            )
+
+    def test_role_delete_cleans_authority_without_touching_unrelated_role(self, backend):
+        self._seed(backend)
+        backend.create_role("doomed", "doomed", "Doomed", "project.read", True)
+        backend.create_role("survivor", "survivor", "Survivor", "project.read", True)
+        backend.assign_role("member", "doomed")
+        backend.assign_role("other", "survivor")
+        backend.add_project_member("project-auth", "member")
+        backend.set_role_overrides("doomed", {"project.write"}, set())
+
+        assert backend.delete_role("doomed") is True
+        assert backend.get_role("doomed") is None
+        assert backend.list_role_overrides("doomed") == []
+        assert backend.list_user_roles("member") == []
+        assert backend.get_role("survivor") is not None
+        assert {row["role_id"] for row in backend.list_user_roles("other")} == {"survivor"}
+        with pytest.raises(ProjectMemoryAuthorizationError):
+            backend.get_and_touch_structured_memory_by_name(
+                "runbook",
+                "project",
+                "project-auth",
+                acting_principal_id="member",
+            )
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["get", "find", "list", "search", "index", "count"],
+    )
+    def test_non_member_cannot_read_project_surface(self, backend, operation):
+        self._seed(backend)
+        scopes = [("global", ""), ("project", "project-auth")]
+
+        with pytest.raises(ProjectMemoryAuthorizationError):
+            if operation == "get":
+                backend.get_and_touch_structured_memory_by_name(
+                    "runbook",
+                    "project",
+                    "project-auth",
+                    acting_principal_id="stranger",
+                )
+            elif operation == "find":
+                backend.find_structured_memory_scopes(
+                    "runbook",
+                    scopes,
+                    acting_principal_id="stranger",
+                )
+            elif operation == "list":
+                backend.list_visible_structured_memories(
+                    scopes,
+                    acting_principal_id="stranger",
+                )
+            elif operation == "search":
+                backend.search_visible_structured_memories(
+                    "runbook",
+                    scopes,
+                    acting_principal_id="stranger",
+                )
+            elif operation == "index":
+                backend.list_visible_memory_index_entries(
+                    scopes,
+                    acting_principal_id="stranger",
+                )
+            else:
+                backend.count_structured_memories(
+                    scope="project",
+                    scope_id="project-auth",
+                    acting_principal_id="stranger",
+                )
+
+        row = backend.get_structured_memory("project-memory")
+        assert row is not None
+        assert row["access_count"] == 0
+
+
+class TestSaveUpsertBehavior:
     def test_save_same_key_updates_in_place(self, backend):
         from turnstone.core.memory import save_structured_memory
 
@@ -71,7 +381,8 @@ class TestSaveUpsert:
         )
         assert row2 and was_update2 is True  # updated in place
         assert row2["memory_id"] == row1["memory_id"]  # same row, not a duplicate
-        assert row2["content"] == "v2"
+        assert "content" not in row2
+        assert backend.get_structured_memory(row2["memory_id"])["content"] == "v2"
         names = [r["name"] for r in backend.list_structured_memories(scope="global")]
         assert names.count("upsert_key") == 1
 
@@ -102,7 +413,8 @@ class TestSaveUpsert:
         )
         assert was_update is True
         assert row["memory_id"] == "m1"  # existing row id, not the supplied "m2"
-        assert row["content"] == "v2"
+        assert "content" not in row
+        assert backend.get_structured_memory("m1")["content"] == "v2"
         assert row["description"] == "newdesc"
         assert row["type"] == "note"
         names = [r["name"] for r in backend.list_structured_memories(scope="global")]
@@ -121,7 +433,8 @@ class TestSaveUpsert:
         row, _ = backend.upsert_structured_memory(
             "m2", "k", "new description", None, "global", "", "v2"
         )
-        assert row["content"] == "v2"
+        assert "content" not in row
+        assert backend.get_structured_memory("m1")["content"] == "v2"
         assert row["description"] == "new description"
         assert row["type"] == "fact"
         row2, _ = backend.upsert_structured_memory(
@@ -280,12 +593,12 @@ class TestSearch:
         assert len(results) == 1
         assert results[0]["name"] == "database_config"
 
-    def test_search_by_content(self, backend):
+    def test_search_does_not_match_private_content(self, backend):
         backend.create_structured_memory(
             "m1", "a", "Test memory", "general", "global", "", "postgresql host"
         )
         results = backend.search_structured_memories("postgresql")
-        assert len(results) == 1
+        assert results == []
 
     def test_search_empty_lists_all(self, backend):
         backend.create_structured_memory("m1", "a", "Test memory", "general", "global", "", "1")
@@ -360,7 +673,7 @@ class TestSearchOrOfTerms:
             "m3", "global_note", "Test memory", "general", "global", "", "info"
         )
 
-        results = backend.search_structured_memories("info", scope="workstream", scope_id="ws1")
+        results = backend.search_structured_memories("note", scope="workstream", scope_id="ws1")
         names = {r["name"] for r in results}
         assert "ws1_note" in names
         assert "ws2_note" not in names
@@ -435,18 +748,17 @@ class TestStableOrderingOnTimestampTies:
     """When two memories share an `updated` timestamp, secondary sort on
     memory_id keeps the order deterministic across calls.
 
-    `updated` is second-precision, and touch_structured_memories() can bump
-    a batch to identical timestamps — without a tie-breaker BM25 input
-    order shuffles run-to-run, busting the LLM-side prompt cache.
+    `updated` is second-precision, so independent writes can share a timestamp.
+    Without a tie-breaker BM25 input order shuffles run-to-run, busting the
+    LLM-side prompt cache.
     """
 
     def _seed_with_shared_timestamp(self, backend):
         # Create three memories then force their `updated` columns equal —
-        # mirrors the real-world case where a touch_structured_memories
-        # batch lands them in the same second.
+        # mirrors the real-world case where several writes land in one second.
         for mid in ("zebra_id", "apple_id", "mango_id"):
             backend.create_structured_memory(
-                mid, f"name_{mid}", "Test memory", "general", "global", "", "shared content"
+                mid, f"name_{mid}", "shared memory", "general", "global", "", "private body"
             )
         import sqlalchemy as sa
 
@@ -480,3 +792,542 @@ class TestStableOrderingOnTimestampTies:
         ]
         assert first == second
         assert first == ["apple_id", "mango_id", "zebra_id"]
+
+
+def _postgres_blocking_pids(backend: PostgreSQLBackend, pid: int) -> list[int]:
+    with backend._engine.connect() as conn:
+        return list(
+            conn.execute(
+                sa.text("SELECT pg_blocking_pids(:pid)"),
+                {"pid": pid},
+            ).scalar_one()
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "scenario",
+        "baseline",
+        "initial_grants",
+        "operation",
+        "mutation",
+        "expected_overrides",
+    ),
+    [
+        (
+            "absent-to-revoke",
+            "project.read",
+            set(),
+            "read",
+            "revoke-read",
+            [("project.read", "revoke")],
+        ),
+        (
+            "existing-grant-to-clear",
+            "",
+            {"project.read"},
+            "read",
+            "clear",
+            [],
+        ),
+        (
+            "unrelated-grant-to-revoke",
+            "project.read",
+            {"project.write"},
+            "read",
+            "revoke-read",
+            [("project.read", "revoke")],
+        ),
+        (
+            "write-guard",
+            "project.write",
+            set(),
+            "write",
+            "revoke-write",
+            [("project.write", "revoke")],
+        ),
+        (
+            "role-delete",
+            "project.read",
+            {"project.write"},
+            "read",
+            "delete",
+            [],
+        ),
+    ],
+)
+def test_postgresql_role_mutation_waits_for_guarded_project_operation(
+    backend,
+    scenario: str,
+    baseline: str,
+    initial_grants: set[str],
+    operation: str,
+    mutation: str,
+    expected_overrides: list[tuple[str, str]],
+) -> None:
+    """Concrete role rows serialize ACL decisions with override/delete writes."""
+    if not isinstance(backend, PostgreSQLBackend):
+        pytest.skip("PostgreSQL row-lock schedule")
+
+    role_id = f"role-{scenario}"
+    project_id = f"project-{scenario}"
+    backend.create_role(role_id, role_id, role_id, baseline, True)
+    backend.assign_role("member", role_id)
+    backend.create_project(project_id, project_id, "owner")
+    backend.add_project_member(project_id, "member")
+    backend.create_structured_memory(
+        f"memory-{scenario}",
+        "runbook",
+        "Runbook",
+        "general",
+        "project",
+        project_id,
+        "body",
+    )
+    if initial_grants:
+        backend.set_role_overrides(role_id, initial_grants, set())
+
+    auth_locked = threading.Event()
+    release_auth = threading.Event()
+    mutation_started = threading.Event()
+    auth_pid: list[int] = []
+    mutation_pid: list[int] = []
+    errors: list[BaseException] = []
+    outcome: dict[str, Any] = {}
+
+    def before_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == "role-mutation"
+            and "SELECT roles.role_id" in statement
+            and "FOR UPDATE" in statement
+        ):
+            cursor.execute("SET LOCAL lock_timeout = '5s'")
+            mutation_pid.append(int(cursor.connection.info.backend_pid))
+            mutation_started.set()
+
+    def after_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == "role-authorization"
+            and "FROM user_roles JOIN roles" in statement
+            and "FOR SHARE OF roles" in statement
+        ):
+            auth_pid.append(int(cursor.connection.info.backend_pid))
+            auth_locked.set()
+            if not release_auth.wait(timeout=10):
+                raise AssertionError("authorization role lock was not released")
+
+    def authorize() -> None:
+        try:
+            if operation == "read":
+                outcome["authorization"] = backend.get_and_touch_structured_memory_by_name(
+                    "runbook",
+                    "project",
+                    project_id,
+                    acting_principal_id="member",
+                )
+            else:
+                outcome["authorization"] = backend.upsert_structured_memory(
+                    "replacement-id",
+                    "runbook",
+                    "Updated runbook",
+                    None,
+                    "project",
+                    project_id,
+                    "updated body",
+                    acting_principal_id="member",
+                )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def mutate() -> None:
+        try:
+            if mutation == "clear":
+                backend.clear_role_overrides(role_id)
+                outcome["mutation"] = True
+            elif mutation == "delete":
+                outcome["mutation"] = backend.delete_role(role_id)
+            else:
+                permission = "project.write" if mutation == "revoke-write" else "project.read"
+                backend.set_role_overrides(role_id, set(), {permission})
+                outcome["mutation"] = True
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    sa.event.listen(backend._engine, "before_cursor_execute", before_cursor_execute)
+    sa.event.listen(backend._engine, "after_cursor_execute", after_cursor_execute)
+    auth_thread = threading.Thread(target=authorize, name="role-authorization")
+    mutation_thread = threading.Thread(target=mutate, name="role-mutation")
+    try:
+        auth_thread.start()
+        assert auth_locked.wait(timeout=10), "authorization never acquired the role share lock"
+        mutation_thread.start()
+        assert mutation_started.wait(timeout=10), "mutation never attempted the role update lock"
+        assert auth_pid and mutation_pid
+        for _attempt in range(1_000):
+            if auth_pid[0] in _postgres_blocking_pids(backend, mutation_pid[0]):
+                break
+        else:
+            raise AssertionError("role mutation was not blocked by authorization")
+    finally:
+        release_auth.set()
+        auth_thread.join(timeout=10)
+        mutation_thread.join(timeout=10)
+        sa.event.remove(backend._engine, "before_cursor_execute", before_cursor_execute)
+        sa.event.remove(backend._engine, "after_cursor_execute", after_cursor_execute)
+
+    assert not auth_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert errors == []
+    assert outcome["authorization"] is not None
+    assert outcome["mutation"] is True
+    overrides = backend.list_role_overrides(role_id)
+    assert [(row["permission"], row["action"]) for row in overrides] == expected_overrides
+
+    if operation == "read":
+        with pytest.raises(ProjectMemoryAuthorizationError):
+            backend.get_and_touch_structured_memory_by_name(
+                "runbook",
+                "project",
+                project_id,
+                acting_principal_id="member",
+            )
+    else:
+        with pytest.raises(ProjectMemoryAuthorizationError):
+            backend.upsert_structured_memory(
+                "final-attempt",
+                "runbook",
+                "Denied",
+                None,
+                "project",
+                project_id,
+                "must not land",
+                acting_principal_id="member",
+            )
+
+
+def test_postgresql_guarded_role_lock_does_not_block_unrelated_role(backend) -> None:
+    if not isinstance(backend, PostgreSQLBackend):
+        pytest.skip("PostgreSQL row-lock schedule")
+
+    backend.create_role("role-a", "role-a", "Role A", "project.read", True)
+    backend.create_role("role-b", "role-b", "Role B", "", True)
+    backend.assign_role("member", "role-a")
+    backend.create_project("project-a", "Project A", "owner")
+    backend.add_project_member("project-a", "member")
+    backend.create_structured_memory(
+        "memory-a", "runbook", "Runbook", "general", "project", "project-a", "body"
+    )
+    auth_locked = threading.Event()
+    release_auth = threading.Event()
+    mutation_done = threading.Event()
+    errors: list[BaseException] = []
+
+    def after_cursor_execute(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == "role-a-authorization"
+            and "FROM user_roles JOIN roles" in statement
+            and "FOR SHARE OF roles" in statement
+        ):
+            auth_locked.set()
+            if not release_auth.wait(timeout=10):
+                raise AssertionError("role-a authorization was not released")
+
+    def authorize_a() -> None:
+        try:
+            backend.get_and_touch_structured_memory_by_name(
+                "runbook",
+                "project",
+                "project-a",
+                acting_principal_id="member",
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def mutate_b() -> None:
+        try:
+            backend.set_role_overrides("role-b", {"project.read"}, set())
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+        finally:
+            mutation_done.set()
+
+    sa.event.listen(backend._engine, "after_cursor_execute", after_cursor_execute)
+    auth_thread = threading.Thread(target=authorize_a, name="role-a-authorization")
+    mutation_thread = threading.Thread(target=mutate_b, name="role-b-mutation")
+    try:
+        auth_thread.start()
+        assert auth_locked.wait(timeout=10)
+        mutation_thread.start()
+        assert mutation_done.wait(timeout=10), "unrelated role mutation was spuriously blocked"
+    finally:
+        release_auth.set()
+        auth_thread.join(timeout=10)
+        mutation_thread.join(timeout=10)
+        sa.event.remove(backend._engine, "after_cursor_execute", after_cursor_execute)
+
+    assert not auth_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert errors == []
+    assert [
+        (row["permission"], row["action"]) for row in backend.list_role_overrides("role-b")
+    ] == [("project.read", "grant")]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["override-revoke", "unassign", "oidc-remove", "delete-user"],
+)
+def test_postgresql_snapshot_retries_when_role_assignment_revoke_wins(
+    backend, mutation: str
+) -> None:
+    """A pre-lock RR snapshot cannot survive a winning authority update."""
+    if not isinstance(backend, PostgreSQLBackend):
+        pytest.skip("PostgreSQL row-lock schedule")
+
+    role_id = "role-snapshot-retry"
+    project_id = "project-snapshot-retry"
+    ws_id = "ws-snapshot-retry"
+    backend.create_role(role_id, role_id, role_id, "project.read", True)
+    if mutation == "delete-user":
+        backend.create_user("member", "member", "Member", "hash")
+    backend.assign_role("member", role_id, "oidc" if mutation == "oidc-remove" else "")
+    backend.create_project(project_id, project_id, "owner")
+    backend.add_project_member(project_id, "member")
+    assert backend.register_workstream(ws_id, user_id="owner", project_id=project_id)
+    backend.create_structured_memory(
+        "memory-snapshot-retry",
+        "runbook",
+        "Project runbook",
+        "general",
+        "project",
+        project_id,
+        "private body",
+    )
+
+    mutation_locked = threading.Event()
+    release_mutation = threading.Event()
+    capture_attempted = threading.Event()
+    mutation_pid: list[int] = []
+    capture_pid: list[int] = []
+    errors: list[BaseException] = []
+    outcome: dict[str, Any] = {}
+
+    def before_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == "snapshot-authorization"
+            and "FROM user_roles JOIN roles" in statement
+            and "FOR SHARE OF roles" in statement
+        ):
+            cursor.execute("SET LOCAL lock_timeout = '5s'")
+            if not capture_pid:
+                capture_pid.append(int(cursor.connection.info.backend_pid))
+                capture_attempted.set()
+
+    def after_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == "snapshot-revoke"
+            and "SELECT roles.role_id" in statement
+            and "FOR UPDATE" in statement
+        ):
+            mutation_pid.append(int(cursor.connection.info.backend_pid))
+            mutation_locked.set()
+            if not release_mutation.wait(timeout=10):
+                raise AssertionError("snapshot revoke was not released")
+
+    def revoke() -> None:
+        try:
+            if mutation == "override-revoke":
+                backend.set_role_overrides(role_id, set(), {"project.read"})
+            elif mutation == "unassign":
+                assert backend.unassign_role("member", role_id)
+            elif mutation == "oidc-remove":
+                assert backend.replace_oidc_roles("member", set()) == (set(), {role_id})
+            else:
+                assert backend.delete_user("member")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def capture() -> None:
+        try:
+            outcome["snapshot"] = backend.acquire_memory_index_snapshot(ws_id, "member")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    sa.event.listen(backend._engine, "before_cursor_execute", before_cursor_execute)
+    sa.event.listen(backend._engine, "after_cursor_execute", after_cursor_execute)
+    mutation_thread = threading.Thread(target=revoke, name="snapshot-revoke")
+    capture_thread = threading.Thread(target=capture, name="snapshot-authorization")
+    try:
+        mutation_thread.start()
+        assert mutation_locked.wait(timeout=10), "revoke never acquired the stable role lock"
+        capture_thread.start()
+        assert capture_attempted.wait(timeout=10), "capture never attempted the role share lock"
+        assert mutation_pid and capture_pid
+        for _attempt in range(1_000):
+            if mutation_pid[0] in _postgres_blocking_pids(backend, capture_pid[0]):
+                break
+        else:
+            raise AssertionError("snapshot capture was not blocked by the winning revoke")
+    finally:
+        release_mutation.set()
+        mutation_thread.join(timeout=10)
+        capture_thread.join(timeout=10)
+        sa.event.remove(backend._engine, "before_cursor_execute", before_cursor_execute)
+        sa.event.remove(backend._engine, "after_cursor_execute", after_cursor_execute)
+
+    assert not mutation_thread.is_alive()
+    assert not capture_thread.is_alive()
+    assert errors == []
+    snapshot = outcome["snapshot"]
+    assert snapshot is not None
+    assert snapshot["project_id"] == ""
+    assert "runbook" not in snapshot["content"]
+    if mutation == "override-revoke":
+        assert [
+            (row["permission"], row["action"]) for row in backend.list_role_overrides(role_id)
+        ] == [("project.read", "revoke")]
+    else:
+        assert backend.list_user_roles("member") == []
+
+
+def test_postgresql_first_snapshot_insert_collision_retries_complete_capture(backend) -> None:
+    """Two RR first-captures converge on the first committed snapshot."""
+    if not isinstance(backend, PostgreSQLBackend):
+        pytest.skip("PostgreSQL row-lock schedule")
+
+    ws_id = "ws-first-capture-race"
+    assert backend.register_workstream(ws_id, user_id="owner")
+    backend.create_structured_memory(
+        "memory-first-capture-race",
+        "runbook",
+        "Runbook",
+        "general",
+        "global",
+        "",
+        "body",
+    )
+
+    first_at_empty_snapshot = threading.Event()
+    release_first = threading.Event()
+    second_attempted_workstream_lock = threading.Event()
+    first_pid: list[int] = []
+    second_pid: list[int] = []
+    second_attempts = 0
+    errors: list[BaseException] = []
+    outcome: dict[str, Any] = {}
+
+    def before_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        nonlocal second_attempts
+        name = threading.current_thread().name
+        if name == "snapshot-first" and "FROM user_roles JOIN roles" in statement:
+            if not first_pid:
+                first_pid.append(int(cursor.connection.info.backend_pid))
+        elif name == "snapshot-second" and "FROM user_roles JOIN roles" in statement:
+            second_attempts += 1
+            if not second_pid:
+                second_pid.append(int(cursor.connection.info.backend_pid))
+        if (
+            name == "snapshot-second"
+            and "FROM workstreams" in statement
+            and "FOR UPDATE" in statement
+        ):
+            cursor.execute("SET LOCAL lock_timeout = '5s'")
+            second_attempted_workstream_lock.set()
+
+    def after_cursor_execute(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == "snapshot-first"
+            and "FROM memory_index_snapshots" in statement
+            and not first_at_empty_snapshot.is_set()
+        ):
+            first_at_empty_snapshot.set()
+            if not release_first.wait(timeout=10):
+                raise AssertionError("first capture was not released")
+
+    def capture(label: str, principal: str) -> None:
+        try:
+            outcome[label] = backend.acquire_memory_index_snapshot(ws_id, principal)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    sa.event.listen(backend._engine, "before_cursor_execute", before_cursor_execute)
+    sa.event.listen(backend._engine, "after_cursor_execute", after_cursor_execute)
+    first_thread = threading.Thread(
+        target=capture, args=("first", "first-principal"), name="snapshot-first"
+    )
+    second_thread = threading.Thread(
+        target=capture, args=("second", "second-principal"), name="snapshot-second"
+    )
+    try:
+        first_thread.start()
+        assert first_at_empty_snapshot.wait(timeout=10), "first capture never observed an empty row"
+        second_thread.start()
+        assert second_attempted_workstream_lock.wait(timeout=10)
+        assert first_pid and second_pid
+        for _attempt in range(1_000):
+            if first_pid[0] in _postgres_blocking_pids(backend, second_pid[0]):
+                break
+        else:
+            raise AssertionError("second capture was not blocked by the first workstream lock")
+    finally:
+        release_first.set()
+        first_thread.join(timeout=10)
+        second_thread.join(timeout=10)
+        sa.event.remove(backend._engine, "before_cursor_execute", before_cursor_execute)
+        sa.event.remove(backend._engine, "after_cursor_execute", after_cursor_execute)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    assert second_attempts >= 2
+    assert outcome["first"] == outcome["second"]
+    assert outcome["first"]["principal_id"] == "first-principal"

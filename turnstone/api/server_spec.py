@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from turnstone.api.openapi import EndpointSpec, QueryParam, build_openapi
+from turnstone.api.openapi import EndpointSpec, PathParam, QueryParam, build_openapi
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -39,6 +39,7 @@ from turnstone.api.server_schemas import (
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
     MemoryInfo,
+    MemorySummary,
     PersonaChoice,
     RewindRequest,
     SaveMemoryRequest,
@@ -514,7 +515,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Save (upsert) a structured memory",
         request_model=SaveMemoryRequest,
-        response_model=MemoryInfo,
+        response_model=MemorySummary,
         error_codes=[400, 403, 404, 500],
         tags=["Memories"],
     ),
@@ -529,9 +530,37 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
     ),
     EndpointSpec(
         "/v1/api/memories/{name}",
+        "GET",
+        "Fetch a structured memory body by exact name and scope",
+        response_model=MemoryInfo,
+        path_params=[
+            PathParam(
+                "name",
+                "Canonical lowercase ASCII snake_case memory identifier",
+                pattern=r"^[a-z0-9]+(?:_[a-z0-9]+)*$",
+                max_length=256,
+            )
+        ],
+        query_params=[
+            QueryParam("scope", "Scope (default: global)"),
+            QueryParam("scope_id", "Scope identifier"),
+        ],
+        error_codes=[400, 403, 404, 500],
+        tags=["Memories"],
+    ),
+    EndpointSpec(
+        "/v1/api/memories/{name}",
         "DELETE",
         "Delete a structured memory by name and scope",
         response_model=StatusResponse,
+        path_params=[
+            PathParam(
+                "name",
+                "Canonical lowercase ASCII snake_case memory identifier",
+                pattern=r"^[a-z0-9]+(?:_[a-z0-9]+)*$",
+                max_length=256,
+            )
+        ],
         query_params=[
             QueryParam("scope", "Scope (default: global)"),
             QueryParam("scope_id", "Scope identifier"),

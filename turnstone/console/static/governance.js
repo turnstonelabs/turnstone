@@ -3008,6 +3008,7 @@ function _renderAdminMemories(items, total) {
       '<span class="admin-col admin-col-actions">' +
       _kebabMenu([
         { label: "view", attrs: { "data-view-memory": m.memory_id } },
+        { label: "edit hook", attrs: { "data-edit-memory": m.memory_id } },
         {
           label: "delete",
           kind: "danger",
@@ -3031,6 +3032,13 @@ function _renderAdminMemories(items, total) {
     });
   }
 
+  const editBtns = el.querySelectorAll("[data-edit-memory]");
+  for (let e = 0; e < editBtns.length; e++) {
+    editBtns[e].addEventListener("click", function () {
+      editMemoryDescription(this.getAttribute("data-edit-memory"));
+    });
+  }
+
   // Bind delete buttons
   const delBtns = el.querySelectorAll("[data-delete-memory]");
   for (let d = 0; d < delBtns.length; d++) {
@@ -3040,6 +3048,96 @@ function _renderAdminMemories(items, total) {
       deleteAdminMemory(mid, mname);
     });
   }
+}
+
+let _memoryHealthRequest = null;
+let _memoryHealthGeneration = 0;
+let _memoryHealthHasValid = false;
+
+function loadMemoryIndexHealth(force) {
+  const banner = document.getElementById("memory-index-warning");
+  if (!banner) return Promise.resolve();
+  if (_memoryHealthRequest && !force) return _memoryHealthRequest.promise;
+  if (_memoryHealthRequest && force) _memoryHealthRequest.controller.abort();
+
+  const generation = ++_memoryHealthGeneration;
+  const controller = new AbortController();
+  const request = {};
+  request.controller = controller;
+  request.promise = authFetch("/v1/api/admin/memories/index-health", {
+    signal: controller.signal,
+  })
+    .then(function (r) {
+      if (!r.ok) throw new Error("health unavailable");
+      return r.json();
+    })
+    .then(function (health) {
+      if (generation !== _memoryHealthGeneration) return;
+      const parts = [];
+      if (health.over_budget) {
+        parts.push(
+          "The largest live memory index is " +
+            Number(health.over_by_chars || 0).toLocaleString() +
+            " characters over the " +
+            Number(health.budget_chars || 0).toLocaleString() +
+            "-character soft limit.",
+        );
+      }
+      if (health.invalid_description_count) {
+        parts.push(
+          Number(health.invalid_description_count).toLocaleString() +
+            " legacy entries need an authored description.",
+        );
+      }
+      banner.textContent = parts.join(" ");
+      banner.style.display = parts.length ? "block" : "none";
+      _memoryHealthHasValid = true;
+    })
+    .catch(function (error) {
+      if (generation !== _memoryHealthGeneration) return;
+      if (error && error.name === "AbortError") return;
+      if (!_memoryHealthHasValid) {
+        banner.textContent = "Memory index health is temporarily unavailable.";
+        banner.style.display = "block";
+      }
+    })
+    .finally(function () {
+      if (_memoryHealthRequest === request) _memoryHealthRequest = null;
+    });
+  _memoryHealthRequest = request;
+  return request.promise;
+}
+
+function editMemoryDescription(memoryId) {
+  const memory = _adminMemories.find(function (item) {
+    return item.memory_id === memoryId;
+  });
+  const value = prompt(
+    "Authored memory-index hook (512 characters max)",
+    memory ? memory.description || "" : "",
+  );
+  if (value === null) return;
+  authFetch("/v1/api/admin/memories/" + encodeURIComponent(memoryId), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ description: value }),
+  })
+    .then(function (r) {
+      if (!r.ok) {
+        return r.json().then(function (data) {
+          throw new Error(data.error || "Failed to update description");
+        });
+      }
+      return r.json();
+    })
+    .then(function () {
+      showToast("Memory description updated");
+      loadAdminMemories();
+      loadMemoryIndexHealth(true);
+    })
+    .catch(function (err) {
+      showToast(err.message || "Failed to update description", "error");
+    });
 }
 
 function showMemoryDetailModal(memoryId) {
@@ -3146,6 +3244,7 @@ function deleteAdminMemory(memoryId, memoryName) {
         hideMemoryDetailModal();
       }
       loadAdminMemories();
+      loadMemoryIndexHealth(true);
     })
     .catch(function (e) {
       showToast("Error: " + e.message);

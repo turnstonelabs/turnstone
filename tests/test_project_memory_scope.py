@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import MagicMock
+
+import pytest
 
 from turnstone.core import auth
 from turnstone.core.session import ChatSession
+from turnstone.core.storage._registry import get_storage
 from turnstone.core.workstream import WorkstreamKind
 
-if TYPE_CHECKING:
-    import pytest
+
+@pytest.fixture(autouse=True)
+def _isolated_storage(tmp_db: str) -> None:
+    """Keep even constructor-only session tests off the repository database."""
 
 
 def _session(**kwargs: Any) -> ChatSession:
@@ -49,6 +54,9 @@ def _project_session(
         "resolve_project_access",
         lambda *_a, **_k: auth.ProjectAccess(True, writable, "P", "active"),
     )
+    storage = get_storage()
+    if storage.get_project("p1") is None:
+        storage.create_project("p1", "P", user_id)
     return _session(user_id=user_id, ws_id="ws1", kind=kind, project_id="p1")
 
 
@@ -123,7 +131,7 @@ class TestLiveProjectAccess:
     ) -> None:
         seen: list[tuple[str, str]] = []
 
-        def _resolve(principal_id: str, project_id: str) -> object:
+        def _resolve(principal_id: str, project_id: str, **_kwargs: Any) -> object:
             seen.append((principal_id, project_id))
             return self._access(True, True)
 
@@ -140,7 +148,7 @@ class TestLiveProjectAccess:
     ) -> None:
         seen: list[tuple[str, str]] = []
 
-        def _resolve(principal_id: str, project_id: str) -> object:
+        def _resolve(principal_id: str, project_id: str, **_kwargs: Any) -> object:
             seen.append((principal_id, project_id))
             return self._access(True, True)
 
@@ -358,6 +366,53 @@ class TestActingPrincipalProjectAuthority:
         assert "acting user cannot access" in message
         assert get_structured_memory_by_name("shared_secret", "project", "p1") is not None
 
+    def test_project_delete_rechecks_acl_inside_storage_transaction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from turnstone.core.memory import get_structured_memory_by_name, save_structured_memory
+
+        storage = get_storage()
+        storage.create_project("p1", "Shared", "owner")
+        storage.create_role(
+            "project-writer",
+            "project-writer",
+            "Project writer",
+            "project.read,project.write",
+            False,
+        )
+        storage.assign_role("guest", "project-writer")
+        storage.add_project_member("p1", "guest")
+        save_structured_memory(
+            "shared_secret",
+            "keep",
+            description="Shared project secret",
+            scope="project",
+            scope_id="p1",
+        )
+        session = _session(user_id="owner", ws_id="shared", project_id="p1")
+        session.bind_acting_user("guest")
+        item = session._prepare_tool(
+            self._tool_call(
+                "delete",
+                action="delete",
+                name="shared_secret",
+                scope="project",
+            )
+        )
+        assert "error" not in item
+
+        real_delete = storage.delete_structured_memory_returning
+
+        def revoke_then_delete(*args: Any, **kwargs: Any):
+            assert storage.remove_project_member("p1", "guest") is True
+            return real_delete(*args, **kwargs)
+
+        monkeypatch.setattr(storage, "delete_structured_memory_returning", revoke_then_delete)
+        _, message = _execute_prepared_tool(session, item)
+
+        assert "no longer has access to project-scoped memory" in message
+        assert get_structured_memory_by_name("shared_secret", "project", "p1") is not None
+
     def test_archived_project_is_removed_from_live_visibility(
         self, tmp_db: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -386,26 +441,35 @@ class TestActingPrincipalProjectAuthority:
 class TestProjectDefaultSaveScope:
     """An attachment is the inherited target even when it is read-only."""
 
+    @staticmethod
+    def _get_inherited_scope(session) -> str:
+        item = session._prepare_memory(
+            "scope-probe",
+            {"action": "get", "name": "probe"},
+        )
+        assert "error" not in item
+        return str(item["scopes_to_try"][0][0])
+
     def test_writable_project_is_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         s = _project_session(monkeypatch)
-        assert s._default_memory_scope() == "project"
+        assert self._get_inherited_scope(s) == "project"
 
     def test_read_only_project_remains_inherited_target(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         s = _project_session(monkeypatch, writable=False)
-        assert s._default_memory_scope() == "project"
+        assert self._get_inherited_scope(s) == "project"
 
     def test_no_project_keeps_kind_default(self) -> None:
-        assert _session(user_id="u1")._default_memory_scope() == "global"
+        assert self._get_inherited_scope(_session(user_id="u1")) == "global"
 
     def test_coordinator_writable_project_is_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         s = _project_session(monkeypatch, kind=WorkstreamKind.COORDINATOR)
-        assert s._default_memory_scope() == "project"
+        assert self._get_inherited_scope(s) == "project"
 
     def test_coordinator_without_project_is_coordinator(self) -> None:
         s = _session(user_id="u1", kind=WorkstreamKind.COORDINATOR)
-        assert s._default_memory_scope() == "coordinator"
+        assert self._get_inherited_scope(s) == "coordinator"
 
     def test_save_without_scope_lands_in_project(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # End-to-end: an unscoped save in a writable-project session resolves to

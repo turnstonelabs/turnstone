@@ -15,6 +15,7 @@ import pytest
 from tests._session_helpers import (
     RecordingUI,
     arm_session,
+    make_registered_session,
     make_session,
     replace_session_lane,
     scripted_chat_client,
@@ -82,15 +83,6 @@ def _log_has_field(record: logging.LogRecord, key: str, value: str | int) -> boo
             f'"{key}": {json.dumps(value)}',
         )
     )
-
-
-def _register_session_parent(session: Any) -> None:
-    """Mirror production's parent-before-keyed-conversation ordering."""
-    from turnstone.core.storage import get_storage
-
-    storage = get_storage()
-    assert storage is not None
-    storage.register_workstream(session.ws_id, user_id=session._user_id)
 
 
 def test_model_turn_stamps_one_immutable_serving_identity() -> None:
@@ -175,13 +167,12 @@ def test_creation_fallback_stamps_fallback_binding_and_principal(tmp_db: str) ->
         default="primary",
         fallback=["fallback"],
     )
-    session = make_session(
+    session = make_registered_session(
         registry=registry,
         model_alias="primary",
         user_id="owner",
         ui=RecordingUI(),  # type: ignore[no-untyped-call]
     )
-    _register_session_parent(session)
     session._title_generated = True
     session._primary_lane().client.chat.completions.create = MagicMock(
         side_effect=ConnectionError("primary unavailable")
@@ -204,13 +195,12 @@ def test_midstream_rebind_stamps_only_the_successful_replacement(
     tmp_db: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    session = make_session(
+    session = make_registered_session(
         model_alias="primary",
         registry_generation=3,
         user_id="owner",
         ui=RecordingUI(),  # type: ignore[no-untyped-call]
     )
-    _register_session_parent(session)
     provider = arm_session(
         session,
         _dying_stream("discarded"),
@@ -259,13 +249,12 @@ def test_midstream_rebind_stamps_only_the_successful_replacement(
 
 def test_headless_send_stamps_effective_owner_principal(tmp_db: str) -> None:
     """Scheduled/internal sends record the credential principal they use."""
-    session = make_session(
+    session = make_registered_session(
         model_alias="headless",
         registry_generation=6,
         user_id="owner-principal",
         ui=RecordingUI(),  # type: ignore[no-untyped-call]
     )
-    _register_session_parent(session)
     arm_session(session, _good_stream("accepted"))
 
     session.send("scheduled work")
@@ -279,13 +268,12 @@ def test_headless_send_stamps_effective_owner_principal(tmp_db: str) -> None:
 
 
 def test_shared_workstream_rebind_cannot_relabel_inflight_turn(tmp_db: str) -> None:
-    session = make_session(
+    session = make_registered_session(
         model_alias="shared",
         registry_generation=4,
         user_id="owner",
         ui=RecordingUI(),  # type: ignore[no-untyped-call]
     )
-    _register_session_parent(session)
 
     def _stream() -> Iterator[StreamChunk]:
         # A second browser binds a new actor while Alice's response is in
@@ -310,13 +298,12 @@ def test_tool_rows_record_the_same_principal_as_their_assistant_turn(tmp_db: str
     read the generation's bound principal, so revocation can query tool rows
     directly instead of joining each one back to its batch head.
     """
-    session = make_session(
+    session = make_registered_session(
         model_alias="main",
         registry_generation=5,
         user_id="owner",
         ui=RecordingUI(),  # type: ignore[no-untyped-call]
     )
-    _register_session_parent(session)
     session._title_generated = True
     session._primary_lane().client.chat.completions.create = scripted_chat_client(
         {
@@ -432,13 +419,12 @@ def test_cancelled_partial_stamps_the_armed_fallback_lane_and_principal(
     tmp_db: str,
 ) -> None:
     """A partial accepted on Stop is an assistant turn, not unattributed UI."""
-    session = make_session(
+    session = make_registered_session(
         model_alias="primary",
         registry_generation=3,
         user_id="owner",
         ui=RecordingUI(),  # type: ignore[no-untyped-call]
     )
-    _register_session_parent(session)
     fallback_provider = seam_provider("unused", provider_name="fallback-provider")
     fallback_lane = ModelLane(
         provider=fallback_provider,
@@ -655,7 +641,7 @@ def test_provider_bound_wire_never_carries_the_tool_acting_principal() -> None:
 
 def test_pending_and_ambiguous_ack_keep_one_exact_provenance_tuple(tmp_db: str) -> None:
     """A lost ACK cannot relabel or duplicate the accepted assistant row."""
-    session = make_session(
+    session = make_registered_session(
         model_alias="main",
         registry_generation=5,
         user_id="owner",

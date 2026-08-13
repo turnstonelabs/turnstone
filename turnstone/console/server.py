@@ -74,6 +74,7 @@ from turnstone.core.model_registry import (
     strip_control_characters,
 )
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
+from turnstone.core.project_access import fold_role_permissions
 from turnstone.core.rendezvous import NoAvailableNodeError, NodeRef
 from turnstone.core.rerank_calibrate import canonical_caps_value
 from turnstone.core.session_replay import (
@@ -246,6 +247,7 @@ _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
 _VALID_CREATE_WS_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _MAX_ROUTE_RESUME_LEN = 256
+_GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 
 # Client timeout for the REST proxy pool (BOTH constructions: startup and
 # the mTLS re-create).  Node endpoints that answer degraded-but-in-time
@@ -2249,50 +2251,9 @@ async def route_create(request: Request) -> Response:
                 ),
             )
 
-        try:
-            resp = await client.post(
-                f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
-            )
-        except httpx.HTTPError:
-            return _record_route(
-                request,
-                "create",
-                502,
-                t0,
-                JSONResponse(
-                    {"error": f"upstream node {ref.node_id} unreachable"},
-                    status_code=502,
-                ),
-            )
-
-        # 503 retry with a new ws_id that hashes to a different node.
-        # Multipart variant skips this branch — the body is bound to the
-        # ws_id the caller chose, so re-routing would mean re-uploading.
-        if resp.status_code == 503 and not pin and not resume_ws and not fixed_ws_id:
-            failed_node = ref.node_id
-            found_alt = False
-            for _ in range(10):
-                ws_id = secrets.token_hex(16)
-                try:
-                    ref = router.route(ws_id)
-                except NoAvailableNodeError:
-                    break
-                if ref.node_id != failed_node:
-                    found_alt = True
-                    break
-            if not found_alt:
-                return _record_route(
-                    request,
-                    "create",
-                    resp.status_code,
-                    t0,
-                    Response(
-                        content=resp.content,
-                        status_code=resp.status_code,
-                        headers=dict(resp.headers),
-                    ),
-                )
-            body["ws_id"] = ws_id
+        collision_retries = 0
+        capacity_retried = False
+        while True:
             try:
                 resp = await client.post(
                     f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
@@ -2308,6 +2269,77 @@ async def route_create(request: Request) -> Response:
                         status_code=502,
                     ),
                 )
+
+            # The console chooses the destination id before routing, so the
+            # node necessarily receives it as an explicit value. Preserve the
+            # ordinary generated-id contract here: an atomic registry
+            # collision draws another id, while a caller-selected id remains
+            # authoritative and returns the node's 409 unchanged.
+            if (
+                resp.status_code == 409
+                and not resume_ws
+                and not fixed_ws_id
+                and collision_retries < _GENERATED_WS_ID_COLLISION_RETRY_CAP
+            ):
+                collision_retries += 1
+                try:
+                    if target_node:
+                        ws_id = await asyncio.to_thread(router.generate_ws_id_for_node, target_node)
+                    else:
+                        ws_id = secrets.token_hex(16)
+                    ref = router.route(ws_id)
+                except NoAvailableNodeError:
+                    return _record_route(
+                        request,
+                        "create",
+                        503,
+                        t0,
+                        JSONResponse(
+                            {"error": "No available node for routing"},
+                            status_code=503,
+                        ),
+                    )
+                body["ws_id"] = ws_id
+                continue
+
+            # Retry one capacity failure with a new generated id that hashes
+            # to a different node. Multipart, resume, caller-selected, and
+            # target-pinned creates retain their existing placement contract.
+            if (
+                resp.status_code == 503
+                and not capacity_retried
+                and not pin
+                and not resume_ws
+                and not fixed_ws_id
+            ):
+                capacity_retried = True
+                failed_node = ref.node_id
+                found_alt = False
+                for _ in range(10):
+                    ws_id = secrets.token_hex(16)
+                    try:
+                        ref = router.route(ws_id)
+                    except NoAvailableNodeError:
+                        break
+                    if ref.node_id != failed_node:
+                        found_alt = True
+                        break
+                if not found_alt:
+                    return _record_route(
+                        request,
+                        "create",
+                        resp.status_code,
+                        t0,
+                        Response(
+                            content=resp.content,
+                            status_code=resp.status_code,
+                            headers=dict(resp.headers),
+                        ),
+                    )
+                body["ws_id"] = ws_id
+                continue
+
+            break
 
     if resp.status_code == 200:
         try:
@@ -7417,11 +7449,11 @@ def _check_admin_lockout(
     role = storage.get_role(role_id)
     if role is None:
         return None  # caller already validated existence; defensive no-op
-    baseline = {p.strip() for p in (role.get("permissions") or "").split(",") if p.strip()}
+    baseline = fold_role_permissions(str(role.get("permissions") or ""))
     # Simulate the proposed PUT on the target role.  If admin.roles
     # survives there, every user assigned to the target keeps it; we're
     # done.
-    target_effective = (baseline | grants) - revokes
+    target_effective = fold_role_permissions(baseline, grants=grants, revokes=revokes)
     if "admin.roles" in target_effective:
         return None
     # admin.roles is leaving the target role.  Only need a single user
@@ -9544,10 +9576,93 @@ async def admin_get_memory(request: Request) -> JSONResponse:
         return err
 
     memory_id = request.path_params["memory_id"]
-    mem = storage.get_structured_memory(memory_id)
+    try:
+        mem = storage.get_and_touch_structured_memory(memory_id)
+    except Exception:
+        log.warning("memory.admin_get_failed memory_id=%s", memory_id, exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
     if not mem:
         return JSONResponse({"error": "Memory not found"}, status_code=404)
+    _enrich_memory_scope_labels([mem], storage)
     return JSONResponse(mem)
+
+
+async def admin_update_memory_description(request: Request) -> JSONResponse:
+    """PATCH /v1/api/admin/memories/{memory_id} — edit the authored hook."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.memory import update_structured_memory_description_strict
+    from turnstone.core.memory_index import normalize_memory_description
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    try:
+        description = normalize_memory_description(body.get("description"))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    memory_id = request.path_params["memory_id"]
+    try:
+        updated = update_structured_memory_description_strict(
+            memory_id,
+            description,
+            storage=storage,
+        )
+    except Exception:
+        log.warning("memory.admin_description_update_failed memory_id=%s", memory_id, exc_info=True)
+        return JSONResponse({"error": "Failed to update memory"}, status_code=500)
+    if updated is None:
+        return JSONResponse({"error": "Memory not found"}, status_code=404)
+    _enrich_memory_scope_labels([updated], storage)
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "memory.description_update",
+        "memory",
+        memory_id,
+        {"name": updated["name"], "scope": updated["scope"]},
+        ip,
+    )
+    return JSONResponse(updated)
+
+
+async def admin_memory_index_health(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/memories/index-health — persistent derived warning state."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.memory import memory_index_health
+    from turnstone.core.memory_index import MEMORY_INDEX_DEFAULT_BUDGET_CHARS
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+    config_store = getattr(request.app.state, "config_store", None)
+    budget = (
+        int(config_store.get("memory.index_budget_chars"))
+        if config_store is not None
+        else MEMORY_INDEX_DEFAULT_BUDGET_CHARS
+    )
+    try:
+        report = await asyncio.to_thread(
+            memory_index_health,
+            budget_chars=budget,
+            storage=storage,
+        )
+        return JSONResponse(report)
+    except Exception:
+        log.warning("memory.admin_index_health_failed", exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
 
 
 async def admin_delete_memory(request: Request) -> JSONResponse:
@@ -16187,7 +16302,13 @@ def create_app(
                     # Governance: Memories
                     Route("/api/admin/memories", admin_list_memories),
                     Route("/api/admin/memories/search", admin_search_memories),
+                    Route("/api/admin/memories/index-health", admin_memory_index_health),
                     Route("/api/admin/memories/{memory_id}", admin_get_memory),
+                    Route(
+                        "/api/admin/memories/{memory_id}",
+                        admin_update_memory_description,
+                        methods=["PATCH"],
+                    ),
                     Route(
                         "/api/admin/memories/{memory_id}",
                         admin_delete_memory,
@@ -16609,6 +16730,34 @@ def _build_console_middleware(cors_origins: list[str] | None = None) -> list[Mid
 # ---------------------------------------------------------------------------
 
 
+def _get_console_storage(args: argparse.Namespace) -> Any:
+    """Initialize console storage from config, environment, or defaults.
+
+    Precedence matches the server and admin entry points: values parsed from
+    ``config.toml`` win over ``TURNSTONE_DB_*`` environment variables, which
+    in turn win over hardcoded defaults.
+    """
+    from turnstone.core.storage import init_storage
+
+    def _pick(arg_name: str, env_name: str, default: str = "") -> Any:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            return value
+        return os.environ.get(env_name, default)
+
+    return init_storage(
+        str(_pick("db_backend", "TURNSTONE_DB_BACKEND", "sqlite")),
+        path=str(_pick("db_path", "TURNSTONE_DB_PATH")),
+        url=str(_pick("db_url", "TURNSTONE_DB_URL")),
+        pool_size=int(_pick("db_pool_size", "TURNSTONE_DB_POOL_SIZE", "2")),
+        sslmode=str(_pick("db_sslmode", "TURNSTONE_DB_SSLMODE")),
+        sslrootcert=str(_pick("db_sslrootcert", "TURNSTONE_DB_SSLROOTCERT")),
+        sslcert=str(_pick("db_sslcert", "TURNSTONE_DB_SSLCERT")),
+        sslkey=str(_pick("db_sslkey", "TURNSTONE_DB_SSLKEY")),
+        listen_url=str(_pick("db_listen_url", "TURNSTONE_DB_LISTEN_URL")),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="turnstone console — cluster dashboard service.",
@@ -16650,28 +16799,7 @@ def main() -> None:
     # Initialize storage early — the collector needs it for service discovery.
     auth_storage = None
     try:
-        from turnstone.core.storage import init_storage
-
-        db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
-        db_url = os.environ.get("TURNSTONE_DB_URL", "")
-        db_path = os.environ.get("TURNSTONE_DB_PATH", "")
-        # Optional dedicated LISTEN URL — config.toml ``[database] listen_url``
-        # (lifted onto args by ``apply_config``) wins over env, and an empty
-        # value falls through to the main DB URL inside the storage layer.
-        # Only used by the ``NotifyDispatcher``; ignored on SQLite.
-        db_listen_url = getattr(args, "db_listen_url", None) or os.environ.get(
-            "TURNSTONE_DB_LISTEN_URL", ""
-        )
-        auth_storage = init_storage(
-            db_backend,
-            path=db_path,
-            url=db_url,
-            sslmode=os.environ.get("TURNSTONE_DB_SSLMODE", ""),
-            sslrootcert=os.environ.get("TURNSTONE_DB_SSLROOTCERT", ""),
-            sslcert=os.environ.get("TURNSTONE_DB_SSLCERT", ""),
-            sslkey=os.environ.get("TURNSTONE_DB_SSLKEY", ""),
-            listen_url=db_listen_url,
-        )
+        auth_storage = _get_console_storage(args)
     except Exception:
         log.info("Console storage not available — admin API disabled, JWT-only auth")
 

@@ -156,6 +156,19 @@ class TestProjectApi:
         r = client.get("/v1/api/projects?include_archived=1")
         assert pid in {p["project_id"] for p in r.json()["projects"]}
 
+    def test_owner_can_inspect_and_reactivate_archived_project(self, client: TestClient) -> None:
+        pid = client.post("/v1/api/projects", json={"name": "A"}).json()["project_id"]
+        assert (
+            client.patch(f"/v1/api/projects/{pid}", json={"state": "archived"}).status_code == 200
+        )
+
+        assert client.get(f"/v1/api/projects/{pid}").status_code == 200
+        assert client.get(f"/v1/api/projects/{pid}/resources").status_code == 200
+        assert client.get(f"/v1/api/projects/{pid}/members").status_code == 200
+        reactivated = client.patch(f"/v1/api/projects/{pid}", json={"state": "active"})
+        assert reactivated.status_code == 200
+        assert reactivated.json()["state"] == "active"
+
     def test_visibility_change_is_owner_only(
         self, client: TestClient, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -163,7 +176,11 @@ class TestProjectApi:
         # AuthResult); grant it so this test isolates the owner-vs-member gate.
         from turnstone.core import auth
 
-        monkeypatch.setattr(auth, "user_has_permission", lambda *a, **k: True)
+        monkeypatch.setattr(
+            auth,
+            "_load_user_permissions",
+            lambda *a, **k: {"project.read", "project.write"},
+        )
         # Alice owns this one → she may flip visibility.
         pid = client.post("/v1/api/projects", json={"name": "Mine"}).json()["project_id"]
         r = client.patch(f"/v1/api/projects/{pid}", json={"visibility": "public"})

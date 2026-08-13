@@ -125,6 +125,28 @@ class TestServerSpec:
         assert "requestBody" in send
         assert "application/json" in send["requestBody"]["content"]
 
+    def test_memory_name_contract_is_published_on_body_and_path(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        expected_pattern = "^[a-z0-9]+(?:_[a-z0-9]+)*$"
+        save_name = spec["components"]["schemas"]["SaveMemoryRequest"]["properties"]["name"]
+        assert save_name["pattern"] == expected_pattern
+        assert save_name["maxLength"] == 256
+        for method in ("get", "delete"):
+            operation = spec["paths"]["/v1/api/memories/{name}"][method]
+            name = next(param for param in operation["parameters"] if param["name"] == "name")
+            assert name["schema"]["pattern"] == expected_pattern
+            assert name["schema"]["maxLength"] == 256
+
+    def test_admin_verdict_contract_exposes_approval_principals(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        verdict = spec["components"]["schemas"]["VerdictInfo"]["properties"]
+        assert verdict["resolver_principal_id"]["type"] == "string"
+        assert verdict["execution_principal_id"]["type"] == "string"
+
     def test_approval_and_cancel_preserve_extended_response_contracts(self):
         from turnstone.api.server_spec import build_server_spec
 

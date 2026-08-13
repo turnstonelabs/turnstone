@@ -56,7 +56,21 @@ class TestIntentVerdictCRUD:
         # from pre-convention legacy rows that carry the column's
         # server_default of ``""``.
         assert v["user_decision"] == "pending"
+        assert v["resolver_principal_id"] == ""
+        assert v["execution_principal_id"] == ""
         assert "created" in v
+
+    def test_create_records_resolver_and_execution_principals(self, db):
+        db.create_intent_verdict(
+            **_make_verdict_kwargs(
+                resolver_principal_id="reviewer",
+                execution_principal_id="executor",
+            )
+        )
+        verdict = db.get_intent_verdict("v_001")
+        assert verdict is not None
+        assert verdict["resolver_principal_id"] == "reviewer"
+        assert verdict["execution_principal_id"] == "executor"
 
     def test_get_nonexistent(self, db):
         assert db.get_intent_verdict("nonexistent") is None
@@ -82,6 +96,8 @@ class TestIntentVerdictCRUD:
             tier="llm",
             judge_model="gpt-5",
             latency_ms=500,
+            resolver_principal_id="reviewer",
+            execution_principal_id="executor",
         )
         assert ok is True
         v = db.get_intent_verdict("v_001")
@@ -95,6 +111,8 @@ class TestIntentVerdictCRUD:
         assert v["tier"] == "llm"
         assert v["judge_model"] == "gpt-5"
         assert v["latency_ms"] == 500
+        assert v["resolver_principal_id"] == "reviewer"
+        assert v["execution_principal_id"] == "executor"
 
     def test_update_rejects_immutable_fields(self, db):
         """Non-mutable fields like ws_id, call_id, func_name are rejected."""

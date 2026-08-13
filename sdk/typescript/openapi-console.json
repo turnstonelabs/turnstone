@@ -3056,6 +3056,75 @@
           }
         }
       },
+      "patch": {
+        "summary": "Update a memory's authored index description",
+        "operationId": "v1_api_admin_memories_{memory_id}_patch",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "memory_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMemoryDescriptionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminMemorySummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
       "delete": {
         "summary": "Delete a memory by ID",
         "operationId": "v1_api_admin_memories_{memory_id}_delete",
@@ -3085,6 +3154,47 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/memories/index-health": {
+      "get": {
+        "summary": "Get derived live memory-index budget and legacy-hook health",
+        "operationId": "v1_api_admin_memories_index-health_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryIndexHealthResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -6484,7 +6594,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Approves or denies the pending tool call(s).  Set ``always`` to True to also add the pending tool name(s) to the session's auto-approve set so subsequent calls of the same tool skip the prompt.",
+        "description": "Approves or denies the pending tool call(s). An authorized peer may make a binary decision, but only the initiating execution principal may add feedback or set ``always``. Always grants are scoped to that execution principal and tool.",
         "parameters": [
           {
             "name": "ws_id",
@@ -8770,12 +8880,12 @@
               }
             ],
             "default": null,
-            "description": "Optional human feedback string forwarded to the model.",
+            "description": "Optional feedback forwarded under the initiating execution principal; authorized peer resolvers must omit it.",
             "title": "Feedback"
           },
           "always": {
             "default": false,
-            "description": "When approved=True, also adds the pending tool name(s) to the session's auto-approve set so subsequent calls of the same tool skip the prompt.",
+            "description": "For a same-principal approval, adds the pending tool name(s) to that execution principal's auto-approve set. Authorized peers cannot set it.",
             "title": "Always",
             "type": "boolean"
           },
@@ -8829,12 +8939,12 @@
               }
             ],
             "default": null,
-            "description": "Optional denial reason",
+            "description": "Optional feedback forwarded under the initiating execution principal; authorized peer resolvers must omit it.",
             "title": "Feedback"
           },
           "always": {
             "default": false,
-            "description": "Auto-approve the tools in this batch going forward",
+            "description": "For a same-principal approval, auto-approve these tools for future calls executing as that principal. Authorized peers cannot set this.",
             "title": "Always",
             "type": "boolean"
           },
@@ -10843,6 +10953,16 @@
             "title": "User Decision",
             "type": "string"
           },
+          "resolver_principal_id": {
+            "default": "",
+            "title": "Resolver Principal Id",
+            "type": "string"
+          },
+          "execution_principal_id": {
+            "default": "",
+            "title": "Execution Principal Id",
+            "type": "string"
+          },
           "latency_ms": {
             "default": 0,
             "title": "Latency Ms",
@@ -11025,8 +11145,98 @@
             "title": "Scope Id",
             "type": "string"
           },
+          "scope_label": {
+            "default": "",
+            "title": "Scope Label",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "title": "Updated",
+            "type": "string"
+          },
+          "last_accessed": {
+            "default": "",
+            "title": "Last Accessed",
+            "type": "string"
+          },
+          "access_count": {
+            "default": 0,
+            "title": "Access Count",
+            "type": "integer"
+          },
           "content": {
             "title": "Content",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id",
+          "name",
+          "type",
+          "scope",
+          "created",
+          "updated",
+          "content"
+        ],
+        "title": "AdminMemoryInfo",
+        "type": "object"
+      },
+      "ListAdminMemoriesResponse": {
+        "properties": {
+          "memories": {
+            "items": {
+              "$ref": "#/components/schemas/AdminMemorySummary"
+            },
+            "title": "Memories",
+            "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "memories"
+        ],
+        "title": "ListAdminMemoriesResponse",
+        "type": "object"
+      },
+      "AdminMemorySummary": {
+        "properties": {
+          "memory_id": {
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "scope": {
+            "title": "Scope",
+            "type": "string"
+          },
+          "scope_id": {
+            "default": "",
+            "title": "Scope Id",
+            "type": "string"
+          },
+          "scope_label": {
+            "default": "",
+            "title": "Scope Label",
             "type": "string"
           },
           "created": {
@@ -11053,32 +11263,10 @@
           "name",
           "type",
           "scope",
-          "content",
           "created",
           "updated"
         ],
-        "title": "AdminMemoryInfo",
-        "type": "object"
-      },
-      "ListAdminMemoriesResponse": {
-        "properties": {
-          "memories": {
-            "items": {
-              "$ref": "#/components/schemas/AdminMemoryInfo"
-            },
-            "title": "Memories",
-            "type": "array"
-          },
-          "total": {
-            "default": 0,
-            "title": "Total",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "memories"
-        ],
-        "title": "ListAdminMemoriesResponse",
+        "title": "AdminMemorySummary",
         "type": "object"
       },
       "SettingInfo": {
@@ -15311,6 +15499,416 @@
           "ws_id"
         ],
         "title": "WorkstreamHistoryResponse",
+        "type": "object"
+      },
+      "AuthWhoamiResponse": {
+        "description": "GET /v1/api/auth/whoami response.",
+        "properties": {
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          },
+          "permissions": {
+            "default": "",
+            "title": "Permissions",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "title": "AuthWhoamiResponse",
+        "type": "object"
+      },
+      "RoleEffectiveResponse": {
+        "properties": {
+          "baseline": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Baseline",
+            "type": "array"
+          },
+          "grants": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Grants",
+            "type": "array"
+          },
+          "revokes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Revokes",
+            "type": "array"
+          },
+          "effective": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Effective",
+            "type": "array"
+          }
+        },
+        "required": [
+          "baseline",
+          "grants",
+          "revokes",
+          "effective"
+        ],
+        "title": "RoleEffectiveResponse",
+        "type": "object"
+      },
+      "RoleOverridesRequest": {
+        "properties": {
+          "grant": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Grant",
+            "type": "array"
+          },
+          "revoke": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Revoke",
+            "type": "array"
+          }
+        },
+        "title": "RoleOverridesRequest",
+        "type": "object"
+      },
+      "UpdateMemoryDescriptionRequest": {
+        "properties": {
+          "description": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Description",
+            "type": "string"
+          }
+        },
+        "required": [
+          "description"
+        ],
+        "title": "UpdateMemoryDescriptionRequest",
+        "type": "object"
+      },
+      "MemoryIndexHealthResponse": {
+        "properties": {
+          "budget_chars": {
+            "title": "Budget Chars",
+            "type": "integer"
+          },
+          "over_budget": {
+            "title": "Over Budget",
+            "type": "boolean"
+          },
+          "max_char_count": {
+            "title": "Max Char Count",
+            "type": "integer"
+          },
+          "max_entry_count": {
+            "title": "Max Entry Count",
+            "type": "integer"
+          },
+          "over_by_chars": {
+            "title": "Over By Chars",
+            "type": "integer"
+          },
+          "invalid_description_count": {
+            "title": "Invalid Description Count",
+            "type": "integer"
+          },
+          "envelope_count": {
+            "title": "Envelope Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "budget_chars",
+          "over_budget",
+          "max_char_count",
+          "max_entry_count",
+          "over_by_chars",
+          "invalid_description_count",
+          "envelope_count"
+        ],
+        "title": "MemoryIndexHealthResponse",
+        "type": "object"
+      },
+      "NodeMetadataResponse": {
+        "properties": {
+          "node_id": {
+            "title": "Node Id",
+            "type": "string"
+          },
+          "metadata": {
+            "items": {
+              "$ref": "#/components/schemas/NodeMetadataEntry"
+            },
+            "title": "Metadata",
+            "type": "array"
+          }
+        },
+        "required": [
+          "node_id"
+        ],
+        "title": "NodeMetadataResponse",
+        "type": "object"
+      },
+      "BulkSetNodeMetadataRequest": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/SetNodeMetadataRequest"
+            },
+            "title": "Entries",
+            "type": "array"
+          }
+        },
+        "title": "BulkSetNodeMetadataRequest",
+        "type": "object"
+      },
+      "SetNodeMetadataRequest": {
+        "description": "Single entry in a bulk metadata set.",
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "SetNodeMetadataRequest",
+        "type": "object"
+      },
+      "SetNodeMetadataValueRequest": {
+        "description": "Request body for PUT /admin/nodes/{node_id}/metadata/{key}.",
+        "properties": {
+          "value": {
+            "title": "Value"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "SetNodeMetadataValueRequest",
+        "type": "object"
+      },
+      "RewindRequest": {
+        "properties": {
+          "turns": {
+            "description": "Number of conversation turns (user message + its responses) to drop from the end. Clamped to the available turn count.",
+            "minimum": 1,
+            "title": "Turns",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "turns"
+        ],
+        "title": "RewindRequest",
+        "type": "object"
+      },
+      "ListWorkstreamsResponse": {
+        "description": "Response body for ``GET /v1/api/workstreams`` on either kind.\n\nTop-level key is ``workstreams`` regardless of the kind serving\nthe request \u2014 pre-lift coord returned ``{\"coordinators\": [...]}``;\nconvergence lifted both kinds onto the same shape. Coord SDK /\nfrontend consumers branching on ``data.coordinators`` swap to\n``data.workstreams``.",
+        "properties": {
+          "workstreams": {
+            "items": {
+              "$ref": "#/components/schemas/WorkstreamInfo"
+            },
+            "title": "Workstreams",
+            "type": "array"
+          }
+        },
+        "required": [
+          "workstreams"
+        ],
+        "title": "ListWorkstreamsResponse",
+        "type": "object"
+      },
+      "WorkstreamInfo": {
+        "description": "Active-list row shape, shared across both kinds.\n\nRenamed ``id`` \u2192 ``ws_id`` and added ``user_id`` in the Stage 2\n``list``/``saved`` verb lift so the active-list response shape\nmatches the rest of the v1 surface (every other shared verb's\npayload uses ``ws_id``). ``user_id`` was previously coord-only;\ninteractive now populates it too. SDK consumers reading\n``row.id`` should swap to ``row.ws_id``.",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive"
+          },
+          "parent_ws_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Ws Id"
+          },
+          "user_id": {
+            "default": "",
+            "title": "User Id",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "persistence_state": {
+            "default": "healthy",
+            "description": "Sanitized durable-history status for the loaded workstream: healthy, pending its first save, retrying automatically, or blocked by a permanent commit conflict. Older servers and unloaded rows default to healthy.",
+            "enum": [
+              "healthy",
+              "pending",
+              "retrying",
+              "conflict"
+            ],
+            "title": "Persistence State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ws_id",
+          "name",
+          "state"
+        ],
+        "title": "WorkstreamInfo",
+        "type": "object"
+      },
+      "UploadAttachmentResponse": {
+        "description": "Returned after a successful upload.",
+        "properties": {
+          "attachment_id": {
+            "description": "Opaque id for this attachment",
+            "title": "Attachment Id",
+            "type": "string"
+          },
+          "filename": {
+            "description": "Original upload filename",
+            "title": "Filename",
+            "type": "string"
+          },
+          "mime_type": {
+            "description": "Canonicalized MIME type",
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "Payload size in bytes",
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "'image', 'text', 'pdf', or 'audio'",
+            "examples": [
+              "image",
+              "text",
+              "pdf",
+              "audio"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachment_id",
+          "filename",
+          "mime_type",
+          "size_bytes",
+          "kind"
+        ],
+        "title": "UploadAttachmentResponse",
+        "type": "object"
+      },
+      "ListAttachmentsResponse": {
+        "properties": {
+          "attachments": {
+            "description": "Pending (unconsumed) attachments for caller+workstream",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentInfo"
+            },
+            "title": "Attachments",
+            "type": "array"
+          }
+        },
+        "required": [
+          "attachments"
+        ],
+        "title": "ListAttachmentsResponse",
+        "type": "object"
+      },
+      "AttachmentInfo": {
+        "properties": {
+          "attachment_id": {
+            "description": "Opaque id for this attachment",
+            "title": "Attachment Id",
+            "type": "string"
+          },
+          "filename": {
+            "description": "Original upload filename",
+            "title": "Filename",
+            "type": "string"
+          },
+          "mime_type": {
+            "description": "Canonicalized MIME type",
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "Payload size in bytes",
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "'image', 'text', 'pdf', or 'audio'",
+            "examples": [
+              "image",
+              "text",
+              "pdf",
+              "audio"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachment_id",
+          "filename",
+          "mime_type",
+          "size_bytes",
+          "kind"
+        ],
+        "title": "AttachmentInfo",
         "type": "object"
       }
     }

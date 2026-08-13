@@ -499,10 +499,9 @@ class SessionManager:
         project_id: str | None = None,
         persona: str = "",
         defer_emit_created: bool = False,
-        _fork_reservation: bool = False,
         **extra_session_kwargs: Any,
     ) -> Workstream:
-        """Create one workstream with an exact durable incarnation fence."""
+        """Create one workstream with an exact private rollback fence."""
         return self._create_serialized(
             user_id=user_id,
             name=name,
@@ -516,7 +515,6 @@ class SessionManager:
             project_id=project_id,
             persona=persona,
             defer_emit_created=defer_emit_created,
-            _fork_reservation=_fork_reservation,
             **extra_session_kwargs,
         )
 
@@ -535,24 +533,20 @@ class SessionManager:
         project_id: str | None = None,
         persona: str = "",
         defer_emit_created: bool = False,
-        _fork_reservation: bool = False,
         **extra_session_kwargs: Any,
     ) -> Workstream:
         """Construct a new workstream, persist, and register.
 
         Slot reservation + placeholder install happen under the lock
         (single-phase). Session construction runs outside the lock; on
-        failure the in-memory slot is freed so capacity isn't leaked.
-        The storage row survives construction failure — the next
-        ``open(ws_id)`` retries session construction rather than
-        forcing the user to create a brand-new workstream.
+        failure both the in-memory slot and its unpublished durable
+        reservation are released so capacity and IDs are not leaked.
 
         Raises ``RuntimeError`` when the manager is at capacity with
         no idle workstream to evict — callers (HTTP handlers) translate
         this to 429.
 
         ``defer_emit_created``: when ``True``, the workstream is reserved and
-        fully constructed but hidden from ordinary lookup/list/open surfaces;
         the ``emit_created`` call is skipped. The caller takes ownership of
         advertising it — typically by calling :meth:`commit_create` after
         running additional
@@ -573,86 +567,97 @@ class SessionManager:
         runs both terminations within a single request lifecycle.
         """
         requested_ws_id = ws_id
-        ws_id = ws_id or uuid.uuid4().hex
-        effective_name = name or f"ws-{ws_id[:4]}"
-        # Every deferred create needs a durable incarnation fence: rollback,
-        # close and a storage clone must never delete or mutate a same-id row
-        # that another process registered after this reservation was retired.
-        # Every manager-created row gets a durable incarnation token. Deferred
-        # HTTP creates also remain in state=creating until commit publishes
-        # them, so cross-node open/delete cannot observe a half-built session.
-        fork_reservation_token = uuid.uuid4().hex
-        create_lane = self._acquire_open_lock(ws_id)
-        create_lane.acquire()
-        create_lane_released = False
+        while True:
+            # Caller-chosen ids are contractual and collide loudly. Generated
+            # ids are opaque implementation detail, so a registry collision
+            # simply draws another UUID. The storage insert remains the
+            # authoritative race-free check; a preflight alone cannot close a
+            # cross-node collision window.
+            ws_id = requested_ws_id or uuid.uuid4().hex
+            effective_name = name or f"ws-{ws_id[:4]}"
+            # Every deferred create needs a durable construction fence:
+            # rollback, close and a storage clone must never delete or mutate
+            # a row owned by a different in-flight creator. Deferred HTTP
+            # creates remain in state=creating until commit publishes them.
+            fork_reservation_token = uuid.uuid4().hex
+            create_lane = self._acquire_open_lock(ws_id)
+            create_lane.acquire()
+            create_lane_released = False
 
-        def _release_create_lane() -> None:
-            nonlocal create_lane_released
-            if create_lane_released:
-                return
-            create_lane_released = True
-            create_lane.release()
-            self._release_open_lock(ws_id)
+            def _release_create_lane(
+                lane: Any = create_lane,
+                lane_ws_id: str = ws_id,
+            ) -> None:
+                nonlocal create_lane_released
+                if create_lane_released:
+                    return
+                create_lane_released = True
+                lane.release()
+                self._release_open_lock(lane_ws_id)
 
-        # Avoid allocating a UI or evicting an idle workstream for the common
-        # caller-chosen collision case. The insert result below is still the
-        # authoritative race-free reservation.
-        try:
-            if requested_ws_id and self._storage.get_workstream(ws_id) is not None:
-                raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} already exists")
-
-            ws, _evicted = self._reserve_and_install(
-                ws_id,
-                user_id=user_id,
-                name=effective_name,
-                parent_ws_id=parent_ws_id,
-                project_id=project_id,
-                persona=persona,
-                pending=True,
-                reservation_token=fork_reservation_token,
-            )
-        except BaseException:
-            _release_create_lane()
-            raise
-
-        # Persist before session construction. Fail-closed: if the row
-        # can't be written, the in-memory session would be invisible to
-        # any lazy-rehydrate path and show up as "missing" after
-        # restart — surface the storage failure now.
-        try:
-            inserted = self._storage.register_workstream(
-                ws_id,
-                node_id=self._node_id,
-                user_id=user_id,
-                name=ws.name,
-                state="creating",
-                kind=self.kind,
-                parent_ws_id=parent_ws_id,
-                project_id=project_id,
-                persona=persona,
-                skill_id=skill_id,
-                skill_version=skill_version,
-                fork_reservation_token=fork_reservation_token,
-            )
-            if inserted is False:
-                raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} already exists")
-        except BaseException:
-            with self._lock:
-                self._remove_locked(ws_id)
-                if self._pending_creates.get(ws_id) is ws:
-                    self._pending_creates.pop(ws_id, None)
+            # Avoid allocating a UI or evicting an idle workstream for the
+            # common caller-chosen collision case. The insert result below is
+            # still the authoritative race-free reservation.
             try:
-                self._adapter.cleanup_ui(ws)
-            except Exception:
-                log.warning(
-                    "session_mgr.create.register_failure_cleanup_failed ws=%s",
-                    ws_id[:8],
-                    exc_info=True,
-                )
-            _release_create_lane()
-            raise
+                if requested_ws_id and self._storage.get_workstream(ws_id) is not None:
+                    raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} already exists")
 
-        _release_create_lane()
+                ws, _evicted = self._reserve_and_install(
+                    ws_id,
+                    user_id=user_id,
+                    name=effective_name,
+                    parent_ws_id=parent_ws_id,
+                    project_id=project_id,
+                    persona=persona,
+                    pending=True,
+                    reservation_token=fork_reservation_token,
+                )
+            except BaseException as exc:
+                _release_create_lane()
+                if not requested_ws_id and isinstance(exc, WorkstreamAlreadyExistsError):
+                    continue
+                raise
+
+            # Persist before session construction. Fail-closed: if the row
+            # can't be written, the in-memory session would be invisible to
+            # any lazy-rehydrate path and show up as "missing" after restart.
+            try:
+                inserted = self._storage.register_workstream(
+                    ws_id,
+                    node_id=self._node_id,
+                    user_id=user_id,
+                    name=ws.name,
+                    state="creating",
+                    kind=self.kind,
+                    parent_ws_id=parent_ws_id,
+                    project_id=project_id,
+                    persona=persona,
+                    skill_id=skill_id,
+                    skill_version=skill_version,
+                    fork_reservation_token=fork_reservation_token,
+                )
+                if inserted is False:
+                    raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} already exists")
+            except BaseException as exc:
+                with self._lock:
+                    self._remove_locked(ws_id)
+                    if self._pending_creates.get(ws_id) is ws:
+                        self._pending_creates.pop(ws_id, None)
+                try:
+                    self._adapter.cleanup_ui(ws)
+                except Exception:
+                    log.warning(
+                        "session_mgr.create.register_failure_cleanup_failed ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
+                _release_create_lane()
+                if not requested_ws_id and isinstance(exc, WorkstreamAlreadyExistsError):
+                    continue
+                raise
+
+            _release_create_lane()
+            break
 
         built_session: Any | None = None
         try:
@@ -685,10 +690,8 @@ class SessionManager:
         except Exception:
             # Release the slot so capacity isn't leaked, and call
             # cleanup_ui on the placeholder so any listener/lock state
-            # the UI factory allocated is released. Storage row stays:
-            # the next open() on this ws_id retries construction. A pending
-            # fork is the exception: its HTTP rollback bracket was never
-            # entered, so remove exactly that durable reservation here.
+            # the UI factory allocated is released. The durable row is still
+            # unpublished, so remove exactly that reservation too.
             with ws._lifecycle_lock:
                 with self._lock:
                     owned = (

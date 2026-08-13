@@ -255,7 +255,8 @@ class TestRoles:
 
         from turnstone.console.server import _VALID_PERMISSIONS
 
-        src = Path("turnstone/console/static/governance.js").read_text()
+        root = Path(__file__).resolve().parents[1]
+        src = (root / "turnstone/console/static/governance.js").read_text()
         # _PERMISSION_SECTIONS is a `const X = [...]` containing nested
         # `permissions: ["a", "b", ...]` arrays.  Pull every quoted
         # string out of every permissions: [...] block; we don't need

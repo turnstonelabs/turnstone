@@ -209,6 +209,20 @@ class _SmartApprovalConfig:
     wait_seconds: float
 
 
+class CrossPrincipalApprovalError(ValueError):
+    """A peer attempted a resolver action reserved for the executor."""
+
+
+def _execution_principal_for_items(items: list[dict[str, Any]]) -> str:
+    """Return the one immutable execution principal carried by a tool batch."""
+    principals = {
+        principal for item in items if (principal := str(item.get("_principal_id") or "").strip())
+    }
+    if len(principals) > 1:
+        raise ValueError("approval batch contains multiple execution principals")
+    return next(iter(principals), "")
+
+
 class ApprovalCycle:
     """One in-flight human-approval round on a workstream.
 
@@ -237,11 +251,13 @@ class ApprovalCycle:
         "cycle_id",
         "decision",
         "event",
+        "execution_principal_id",
         "items",
         "judge_event",
         "pending_verdicts",
         "publication_done",
         "resolved",
+        "resolver_principal_id",
         "result",
     )
 
@@ -255,6 +271,8 @@ class ApprovalCycle:
         self.items = items
         self.card = card
         self.call_ids: set[str] = {it.get("call_id", "") for it in items if it.get("call_id")}
+        self.execution_principal_id = _execution_principal_for_items(items)
+        self.resolver_principal_id = ""
         # The judge generation that evaluated this batch — identity-
         # compared against the delivering daemon's cancel event so a
         # stale generation (a prior turn's run-to-completion daemon
@@ -423,8 +441,8 @@ class AutoApproveReason:
       can see when a child is silently auto-approving because of a
       previously-installed skill they may have forgotten about.
     - :attr:`ALWAYS` — operator clicked "Approve + Always" on a
-      tool earlier in this session, adding its name to
-      ``auto_approve_tools``.
+      tool earlier in this session, adding its name to that execution
+      principal's runtime grant set.
     - :attr:`POLICY` — admin-defined ``tool_policies`` row with
       ``action='allow'`` matched the tool name (or pattern).
     - :attr:`BLANKET` — workstream-level ``auto_approve=True`` flag
@@ -577,6 +595,10 @@ class SessionUIBase:
         self._pending_approval: dict[str, Any] | None = None
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
+        # Runtime "Approve + Always" grants are scoped to the immutable
+        # execution principal, not the shared session. Configured/template
+        # grants remain in ``auto_approve_tools`` as workstream policy.
+        self._always_approve_tools_by_principal: dict[str, set[str]] = {}
         # Smart Approvals (``judge.smart_approvals``): when enabled, a
         # tool call whose LLM intent verdict recommends ``approve`` with
         # confidence ≥ ``smart_approval_threshold`` is auto-approved
@@ -592,22 +614,14 @@ class SessionUIBase:
         # by the judge timeout; the wait returns early the moment every
         # pending call has a verdict.
         self.smart_approval_wait_seconds = 0.0
-        # Per-tool source for ``auto_approve_tools`` membership.  Two
-        # writers populate the set with semantically different intent:
-        #
-        # - **Skill template** at create time (the ``allowed_tools``
-        #   JSON list landing on ``auto_approve_tools`` from
-        #   ``server.py``'s skill block) — operator may not have
-        #   explicitly opted in tool-by-tool.
-        # - **User "Approve + Always"** click at runtime — explicit
-        #   per-tool consent from the live operator.
-        #
-        # Without per-tool source tracking the dashboard can't tell
-        # the operator WHICH path silently approved a tool call.
-        # Maps ``approval_label_or_func_name → source_string``;
-        # callers populate at the same point they update the set
-        # itself.  Default empty when neither writer ran (e.g. CLI
-        # ``/always`` doesn't set this — pre-existing).
+        # Per-tool source for configured ``auto_approve_tools`` membership.
+        # A skill template's ``allowed_tools`` JSON list lands here through
+        # ``server.py``; the operator may not have opted in tool-by-tool.
+        # Runtime user "Approve + Always" grants live separately in
+        # ``_always_approve_tools_by_principal`` and are always tagged with
+        # ``AutoApproveReason.ALWAYS``. This map is populated at the same point
+        # as the configured set; missing entries retain the legacy generic
+        # ``auto_approve_tools`` reason.
         self._auto_approve_tools_source: dict[str, str] = {}
         # Ring buffer of recent auto-approve events for /dashboard
         # visibility — a child workstream whose tool calls bypass the
@@ -759,6 +773,7 @@ class SessionUIBase:
         self._recent_decisions: collections.OrderedDict[str, tuple[str, threading.Event | None]] = (
             collections.OrderedDict()
         )
+        self._recent_decision_principals: dict[str, tuple[str, str]] = {}
         # Verdict cache for SSE reconnect replay (tab switching
         # shouldn't lose the judge's final call on a just-run tool).
         self._llm_verdicts: dict[str, dict[str, Any]] = {}
@@ -1584,6 +1599,7 @@ class SessionUIBase:
                     self._llm_verdicts.pop(cid, None)
                     self._verdict_origins.pop(cid, None)
                 self._recent_decisions.pop(cid, None)
+                self._recent_decision_principals.pop(cid, None)
 
     # ------------------------------------------------------------------
     # Approval-cycle registry
@@ -1703,6 +1719,44 @@ class SessionUIBase:
             bool(getattr(witness, "aborted", False)) for witness in cycle.cancel_witnesses
         )
 
+    @staticmethod
+    def _approval_grant_names(cycle: ApprovalCycle) -> set[str]:
+        """Return the human-gated tool labels eligible for an Always grant."""
+        names = {
+            item.get("approval_label", "") or item.get("func_name", "")
+            for item in cycle.items
+            if item.get("needs_approval") and item.get("func_name") and not item.get("error")
+        }
+        names.discard("")
+        names.discard("__budget_override__")
+        return names
+
+    @staticmethod
+    def _validate_approval_resolver(
+        cycle: ApprovalCycle,
+        *,
+        resolver_principal_id: str | None,
+        feedback: str | None,
+        always: bool,
+    ) -> str:
+        """Validate peer-resolution limits and return durable resolver identity.
+
+        ``None`` identifies internal timeout/cancel/legacy callers which do not
+        represent an authenticated human resolver. HTTP callers always pass a
+        concrete principal, including the anonymous empty-string principal.
+        """
+        if resolver_principal_id is None:
+            return ""
+        resolver = resolver_principal_id.strip()
+        if resolver != cycle.execution_principal_id and (
+            bool(str(feedback or "").strip()) or always
+        ):
+            raise CrossPrincipalApprovalError(
+                "A peer may approve or reject this action, but only the initiating "
+                "principal may add feedback or choose Approve + Always"
+            )
+        return resolver
+
     def _claim_approval_cycle_locked(
         self,
         cycle: ApprovalCycle,
@@ -1720,9 +1774,14 @@ class SessionUIBase:
         self._refresh_pending_approval_view()
         for cid in cycle.call_ids:
             self._recent_decisions[cid] = (decision, cycle.judge_event)
+            self._recent_decision_principals[cid] = (
+                cycle.resolver_principal_id,
+                cycle.execution_principal_id,
+            )
             self._recent_decisions.move_to_end(cid)
         while len(self._recent_decisions) > _RECENT_DECISION_CAP:
-            self._recent_decisions.popitem(last=False)
+            evicted_call_id, _decision = self._recent_decisions.popitem(last=False)
+            self._recent_decision_principals.pop(evicted_call_id, None)
         return pending
 
     def _publish_approval_resolution(
@@ -1765,6 +1824,7 @@ class SessionUIBase:
         timeout: bool = False,
         call_id: str | None = None,
         cycle_id: str | None = None,
+        resolver_principal_id: str | None = None,
     ) -> str | None:
         """Unblock ONE pending approval cycle with the caller's decision.
 
@@ -1783,11 +1843,10 @@ class SessionUIBase:
         that fired during this cycle's round — the audit trail reflects
         what the user actually chose for THESE calls.
 
-        ``always`` reports whether the resolving caller asked for
-        "Approve + Always" (the tool name has been added to
-        ``auto_approve_tools`` upstream by the HTTP handler — this
-        method only echoes the intent on the SSE event so peer tabs
-        can label their resolved-status pill correctly).
+        ``resolver_principal_id`` is supplied by authenticated HTTP callers.
+        A different authorized peer may make the binary approve/reject choice,
+        but cannot inject feedback or create an ``always`` grant. Same-principal
+        Always grants are owned here and scoped by execution principal + tool.
 
         ``timeout`` flips the persisted ``user_decision`` from
         ``"denied"`` to ``"timeout"`` so the audit trail can
@@ -1811,6 +1870,7 @@ class SessionUIBase:
         if not self._begin_approval_admission(lambda: self._approval_cycle_owner_aborted(cycle)):
             return None
         pending: list[dict[str, Any]] | None = None
+        effective_always = False
         try:
             # A resolver can discover the cycle immediately after
             # registration. Wait outside every state lock until the gate has
@@ -1820,6 +1880,19 @@ class SessionUIBase:
                 selected = self._select_cycle_locked(cycle_id=cycle.cycle_id)
                 if selected is not cycle:
                     return None
+                cycle.resolver_principal_id = self._validate_approval_resolver(
+                    cycle,
+                    resolver_principal_id=resolver_principal_id,
+                    feedback=feedback,
+                    always=always,
+                )
+                effective_always = bool(always and approved)
+                if effective_always:
+                    grant_names = self._approval_grant_names(cycle)
+                    if grant_names:
+                        self._always_approve_tools_by_principal.setdefault(
+                            cycle.execution_principal_id, set()
+                        ).update(grant_names)
                 pending = self._claim_approval_cycle_locked(
                     cycle,
                     approved=approved,
@@ -1831,7 +1904,7 @@ class SessionUIBase:
                     cycle,
                     approved=approved,
                     feedback=feedback,
-                    always=always,
+                    always=effective_always,
                 )
             except Exception:
                 # The decision is authoritative and the gate was awakened in
@@ -1846,7 +1919,12 @@ class SessionUIBase:
         finally:
             self._end_approval_admission()
         if pending:
-            self._persist_verdict_decisions(pending, decision_str)
+            self._persist_verdict_decisions(
+                pending,
+                decision_str,
+                resolver_principal_id=cycle.resolver_principal_id,
+                execution_principal_id=cycle.execution_principal_id,
+            )
         return cycle.cycle_id
 
     def resolve_all_approvals(
@@ -1897,6 +1975,7 @@ class SessionUIBase:
                     and (not cycle.cancel_witnesses or self._approval_cycle_owner_aborted(cycle))
                 ]
                 for cycle in targets:
+                    cycle.resolver_principal_id = ""
                     pending = self._claim_approval_cycle_locked(
                         cycle,
                         approved=approved,
@@ -1931,13 +2010,21 @@ class SessionUIBase:
         decision_str = "timeout" if timeout else ("approved" if approved else "denied")
         for _cycle, pending in claimed:
             if pending:
-                self._persist_verdict_decisions(pending, decision_str)
+                self._persist_verdict_decisions(
+                    pending,
+                    decision_str,
+                    resolver_principal_id=_cycle.resolver_principal_id,
+                    execution_principal_id=_cycle.execution_principal_id,
+                )
         return len(claimed)
 
     def _persist_verdict_decisions(
         self,
         pending: list[dict[str, Any]],
         decision_str: str,
+        *,
+        resolver_principal_id: str | None = None,
+        execution_principal_id: str | None = None,
     ) -> None:
         """Persist a verdict decision safely in either arrival order.
 
@@ -1957,10 +2044,28 @@ class SessionUIBase:
             for v in pending:
                 vid = v.get("verdict_id", "")
                 if vid:
+                    resolver = (
+                        str(v.get("resolver_principal_id") or "")
+                        if resolver_principal_id is None
+                        else resolver_principal_id
+                    )
+                    executor = (
+                        str(v.get("execution_principal_id") or "")
+                        if execution_principal_id is None
+                        else execution_principal_id
+                    )
                     decided = dict(v)
                     decided["user_decision"] = decision_str
+                    decided["resolver_principal_id"] = resolver
+                    decided["execution_principal_id"] = executor
                     self._persist_intent_verdict(decided)
-                    storage.update_intent_verdict(vid, user_decision=decision_str)
+                    update_fields = {"user_decision": decision_str}
+                    if resolver or executor:
+                        update_fields.update(
+                            resolver_principal_id=resolver,
+                            execution_principal_id=executor,
+                        )
+                    storage.update_intent_verdict(vid, **update_fields)
         except Exception:
             log.debug("Failed to update verdict user_decision", exc_info=True)
 
@@ -1975,8 +2080,8 @@ class SessionUIBase:
            the previous round can't leak onto this one.
         2. Evaluate admin-defined tool policies (deny short-circuits;
            allow tags items as auto-approved with ``AutoApproveReason.POLICY``).
-        3. Per-tool auto-approve via ``self.auto_approve_tools`` (skill
-           ``allowed_tools`` and operator "Approve + Always").
+        3. Per-tool auto-approve via configured ``self.auto_approve_tools``
+           plus execution-principal-scoped "Approve + Always" grants.
         4. Budget-override carve-out + blanket ``self.auto_approve``.
            Synthetic ``__budget_override__`` items always prompt.
         5. Activity tagging + ``_broadcast_activity`` so the dashboard
@@ -2000,6 +2105,8 @@ class SessionUIBase:
         :class:`ApprovalCycle`.  Shared state is touched only under
         ``_ws_lock`` and scoped to this batch's call_ids.
         """
+
+        execution_principal_id = _execution_principal_for_items(items)
 
         def _cancelled() -> bool:
             return any(
@@ -2187,31 +2294,35 @@ class SessionUIBase:
             return False, "Cancelled by user"
         # -- End tool policy evaluation -------------------------------------------
 
-        # Per-tool auto-approve check (from workstream template or interactive "Always").
+        # Per-tool auto-approve check. Template/config grants are shared
+        # workstream policy; interactive "Always" grants apply only to calls
+        # executing as the same immutable principal that received the grant.
         # Suppressed when a budget-override item is present so the carve-out
         # at the next gate stays effective even if ``__budget_override__`` ever
         # lands in ``auto_approve_tools`` (defensive — listings filter it out
         # today, but the worker can be configured by a skill template).
-        if pending and self.auto_approve_tools and not has_budget_override:
+        with self._ws_lock:
+            principal_grants = set(
+                self._always_approve_tools_by_principal.get(execution_principal_id, set())
+            )
+        auto_approve_names = set(self.auto_approve_tools) | principal_grants
+        if pending and auto_approve_names and not has_budget_override:
             pending_names = {
                 it.get("approval_label", "") or it.get("func_name", "")
                 for it in pending
                 if it.get("func_name")
             }
-            if pending_names and pending_names.issubset(self.auto_approve_tools):
+            if pending_names and pending_names.issubset(auto_approve_names):
                 if _cancelled():
                     return False, "Cancelled by user"
-                # Tag each formerly-pending item with the per-tool source
-                # recorded when ``auto_approve_tools`` was populated:
-                # ``skill`` (skill template's ``allowed_tools``) /
-                # ``always`` (user "Approve + Always" click) / fallback
-                # ``auto_approve_tools`` for legacy or unknown writers.
-                # Visibility for the skill-vs-explicit conflation
-                # flagged on the coord tree dashboard.
+                # Merge configured-source labels with the current execution
+                # principal's explicit Always grants for dashboard attribution.
+                source_map = dict(self._auto_approve_tools_source)
+                source_map.update({name: AutoApproveReason.ALWAYS for name in principal_grants})
                 self._tag_auto_approved(
                     pending,
                     AutoApproveReason.AUTO_APPROVE_TOOLS,
-                    source_map=self._auto_approve_tools_source,
+                    source_map=source_map,
                 )
                 pending = []
 
@@ -2298,6 +2409,8 @@ class SessionUIBase:
             if not hv:
                 continue
             heuristic_row = dict(hv)
+            heuristic_row["execution_principal_id"] = execution_principal_id
+            heuristic_row.setdefault("resolver_principal_id", "")
             if item.get("auto_approved"):
                 heuristic_row["user_decision"] = item.get("auto_approve_reason", "") or "pending"
             else:
@@ -2528,6 +2641,11 @@ class SessionUIBase:
                 hv = it.get("_heuristic_verdict") or {}
                 if hv.get("recommendation") == "deny" or hv.get("risk_level") == "critical":
                     return pending  # explicit deterministic danger flag → human
+                v.setdefault(
+                    "execution_principal_id",
+                    str(it.get("_principal_id") or "").strip(),
+                )
+                v.setdefault("resolver_principal_id", "")
                 qualified[cid] = v
 
         # Whole batch qualified.  Commit its shared state through the caller's
@@ -2737,6 +2855,8 @@ class SessionUIBase:
         call_id = verdict.get("call_id", "")
         auto_reason = ""
         decision = ""
+        decision_resolver_principal_id = ""
+        decision_execution_principal_id = ""
         initial_owner: ApprovalCycle | None = None
 
         def _unresolved_owner_locked() -> tuple[ApprovalCycle | None, bool]:
@@ -2770,6 +2890,10 @@ class SessionUIBase:
                     stale.setdefault("user_decision", "superseded")
                     persist_actions.append(functools.partial(self._persist_intent_verdict, stale))
                     return persist_actions
+                if initial_owner is not None and initial_owner.execution_principal_id:
+                    verdict.setdefault(
+                        "execution_principal_id", initial_owner.execution_principal_id
+                    )
                 if (
                     len(self._llm_verdicts) >= self._LLM_VERDICT_CACHE_MAX
                     and call_id not in self._llm_verdicts
@@ -2873,12 +2997,18 @@ class SessionUIBase:
                             decision = "superseded"
                         else:
                             decision = prior_decision
+                            (
+                                decision_resolver_principal_id,
+                                decision_execution_principal_id,
+                            ) = self._recent_decision_principals.get(call_id, ("", ""))
         if decision:
             persist_actions.append(
                 functools.partial(
                     self._persist_verdict_decisions,
                     [dict(verdict)],
                     decision,
+                    resolver_principal_id=decision_resolver_principal_id,
+                    execution_principal_id=decision_execution_principal_id,
                 )
             )
         return persist_actions
@@ -2977,6 +3107,8 @@ class SessionUIBase:
                     "judge_model": v.get("judge_model", ""),
                     "latency_ms": v.get("latency_ms", 0),
                     "user_decision": v.get("user_decision", "pending"),
+                    "resolver_principal_id": v.get("resolver_principal_id", ""),
+                    "execution_principal_id": v.get("execution_principal_id", ""),
                 }
                 for v in verdicts
             ]
@@ -3044,6 +3176,8 @@ class SessionUIBase:
                 judge_model=verdict.get("judge_model", ""),
                 latency_ms=verdict.get("latency_ms", 0),
                 user_decision=verdict.get("user_decision", "pending"),
+                resolver_principal_id=verdict.get("resolver_principal_id", ""),
+                execution_principal_id=verdict.get("execution_principal_id", ""),
             )
         except Exception:
             log.debug("Failed to persist intent verdict", exc_info=True)
@@ -3270,7 +3404,10 @@ class SessionUIBase:
             if not hv:
                 continue
             hv["user_decision"] = it.get("auto_approve_reason", "") or "pending"
-            verdicts.append(dict(hv))
+            row = dict(hv)
+            row["execution_principal_id"] = str(it.get("_principal_id") or "").strip()
+            row.setdefault("resolver_principal_id", "")
+            verdicts.append(row)
         if not verdicts:
             return
 
@@ -3306,6 +3443,7 @@ class SessionUIBase:
         """
         if not items:
             return
+        execution_principal_id = _execution_principal_for_items(items)
         ts = time.time()
         appended = [
             {
@@ -3376,7 +3514,7 @@ class SessionUIBase:
                     return
                 record_audit(
                     storage,
-                    self._user_id,
+                    execution_principal_id or self._user_id,
                     "tool.auto_approved",
                     "workstream",
                     self.ws_id,

@@ -32,6 +32,25 @@ def _collect_schemas(models: list[type[BaseModel]]) -> dict[str, Any]:
     return schemas
 
 
+def _component_refs(value: Any) -> set[str]:
+    """Collect local schema names referenced anywhere in an OpenAPI value."""
+    if isinstance(value, dict):
+        refs = {
+            ref.removeprefix("#/components/schemas/")
+            for ref in [value.get("$ref")]
+            if isinstance(ref, str) and ref.startswith("#/components/schemas/")
+        }
+        for nested in value.values():
+            refs.update(_component_refs(nested))
+        return refs
+    if isinstance(value, list):
+        list_refs: set[str] = set()
+        for nested in value:
+            list_refs.update(_component_refs(nested))
+        return list_refs
+    return set()
+
+
 @dataclass
 class QueryParam:
     """Describes a query parameter for an endpoint."""
@@ -42,6 +61,17 @@ class QueryParam:
     schema_type: str = "string"
     default: Any = None
     enum: list[str] | None = None
+
+
+@dataclass
+class PathParam:
+    """Describes validation metadata for one detected path parameter."""
+
+    name: str
+    description: str = ""
+    schema_type: str = "string"
+    pattern: str | None = None
+    max_length: int | None = None
 
 
 @dataclass
@@ -59,6 +89,7 @@ class EndpointSpec:
     error_codes: list[int] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     query_params: list[QueryParam] = field(default_factory=list)
+    path_params: list[PathParam] = field(default_factory=list)
 
 
 def build_openapi(
@@ -67,7 +98,7 @@ def build_openapi(
     endpoints: list[EndpointSpec],
     models: list[type[BaseModel]],
 ) -> dict[str, Any]:
-    """Build an OpenAPI 3.1.0 spec dict."""
+    """Build an OpenAPI 3.1.0 spec with a closed component graph."""
     from turnstone.api.schemas import ErrorResponse
 
     paths: dict[str, Any] = {}
@@ -81,15 +112,27 @@ def build_openapi(
             op["description"] = ep.description
         # Auto-detect path parameters from {param} segments
         params: list[dict[str, Any]] = []
+        path_metadata = {param.name: param for param in ep.path_params}
         for match in re.finditer(r"\{(\w+)\}", ep.path):
-            params.append(
-                {
-                    "name": match.group(1),
-                    "in": "path",
-                    "required": True,
-                    "schema": {"type": "string"},
-                }
-            )
+            name = match.group(1)
+            metadata = path_metadata.get(name)
+            schema: dict[str, Any] = {
+                "type": metadata.schema_type if metadata is not None else "string"
+            }
+            parameter: dict[str, Any] = {
+                "name": name,
+                "in": "path",
+                "required": True,
+                "schema": schema,
+            }
+            if metadata is not None:
+                if metadata.description:
+                    parameter["description"] = metadata.description
+                if metadata.pattern is not None:
+                    schema["pattern"] = metadata.pattern
+                if metadata.max_length is not None:
+                    schema["maxLength"] = metadata.max_length
+            params.append(parameter)
         if ep.query_params:
             for qp in ep.query_params:
                 p: dict[str, Any] = {
@@ -128,9 +171,41 @@ def build_openapi(
         op["responses"] = responses
         paths.setdefault(ep.path, {})[method] = op
 
-    return {
+    # Endpoint models are part of the graph by construction.  Requiring every
+    # caller to repeat them in ``models`` produced valid-looking operations
+    # with dangling component references whenever that second registry drifted.
+    # Key by schema name as well as class identity: two distinct Pydantic
+    # classes with the same public component name would otherwise overwrite
+    # each other silently in ``_collect_schemas``.
+    unique_models: list[type[BaseModel]] = []
+    models_by_name: dict[str, type[BaseModel]] = {}
+    endpoint_models: list[type[BaseModel]] = []
+    for endpoint in endpoints:
+        if endpoint.request_model is not None:
+            endpoint_models.append(endpoint.request_model)
+        if endpoint.response_model is not None:
+            endpoint_models.append(endpoint.response_model)
+    candidate_models: list[type[BaseModel]] = [*models, *endpoint_models]
+    candidate_models.append(ErrorResponse)
+    for model in candidate_models:
+        prior = models_by_name.get(model.__name__)
+        if prior is not None and prior is not model:
+            raise ValueError(
+                "OpenAPI component name collision: "
+                f"{model.__name__!r} is provided by distinct model classes"
+            )
+        if prior is None:
+            models_by_name[model.__name__] = model
+            unique_models.append(model)
+
+    component_schemas = _collect_schemas(unique_models)
+    spec: dict[str, Any] = {
         "openapi": "3.1.0",
         "info": {"title": title, "version": __version__, "description": description},
         "paths": paths,
-        "components": {"schemas": _collect_schemas(models)},
+        "components": {"schemas": component_schemas},
     }
+    missing = _component_refs(spec) - set(component_schemas)
+    if missing:
+        raise ValueError(f"OpenAPI schema graph has unresolved refs: {sorted(missing)}")
+    return spec

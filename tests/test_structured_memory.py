@@ -8,6 +8,7 @@ from turnstone.core.memory import (
     get_structured_memory_by_name,
     list_structured_memories,
     normalize_key,
+    normalize_memory_name,
     save_structured_memory,
     save_structured_memory_strict,
     search_structured_memories,
@@ -17,6 +18,16 @@ from turnstone.core.memory import (
 def _save(name, content, **kwargs):
     kwargs.setdefault("description", "test memory description")
     return save_structured_memory(name, content, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _registered_workstream_scopes(tmp_db):
+    """Workstream-scoped memories always have live durable parents."""
+    from turnstone.core.storage import get_storage
+
+    storage = get_storage()
+    storage.register_workstream("ws1")
+    storage.register_workstream("ws2")
 
 
 class TestSaveStructuredMemory:
@@ -65,7 +76,9 @@ class TestSaveStructuredMemory:
         assert was_update1 is False
         assert was_update2 is True
         assert row2 and row1 and row2["memory_id"] == row1["memory_id"]  # same row
-        assert row2["content"] == "second"
+        assert "content" not in row2
+        stored = get_structured_memory_by_name("test_key", "global", "")
+        assert stored is not None and stored["content"] == "second"
 
     def test_save_normalizes_key(self, tmp_db):
         _save("My-Key", "value")
@@ -137,9 +150,21 @@ class TestSearchStructuredMemories:
 
     def test_search_scope_filtering_preserved(self, tmp_db):
         """Search with scope filter only returns memories in that scope."""
-        _save("ws1_fact", "alpha info", scope="workstream", scope_id="ws1")
-        _save("ws2_fact", "alpha info", scope="workstream", scope_id="ws2")
-        _save("global_fact", "alpha info", scope="global")
+        _save(
+            "ws1_fact",
+            "body one",
+            description="alpha info",
+            scope="workstream",
+            scope_id="ws1",
+        )
+        _save(
+            "ws2_fact",
+            "body two",
+            description="alpha info",
+            scope="workstream",
+            scope_id="ws2",
+        )
+        _save("global_fact", "body three", description="alpha info", scope="global")
 
         results = search_structured_memories("alpha", scope="workstream", scope_id="ws1")
         names = {r["name"] for r in results}
@@ -185,6 +210,41 @@ class TestNormalizeKey:
     def test_basic(self):
         assert normalize_key("My-Key Name") == "my_key_name"
 
+    @pytest.mark.parametrize(
+        ("raw", "canonical"),
+        [
+            ("  Café Notes  ", "cafe_notes"),
+            ("Straße", "strasse"),
+            ("Ærø Guide", "aero_guide"),
+            ("release — checklist", "release_checklist"),
+            ("Cafe\N{COMBINING ACUTE ACCENT}", "cafe"),
+        ],
+    )
+    def test_canonical_latin_names(self, raw, canonical):
+        assert normalize_memory_name(raw) == canonical
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "_leading",
+            "trailing_",
+            "repeated__underscore",
+            "path/name",
+            "query?name",
+            "fragment#name",
+            "control\nname",
+            "中文名称",
+            "日本語",
+        ],
+    )
+    def test_invalid_names_are_rejected(self, raw):
+        with pytest.raises(ValueError, match="memory name"):
+            normalize_memory_name(raw)
+
+    def test_unsupported_script_error_is_retryable_guidance(self):
+        with pytest.raises(ValueError, match="ASCII semantic key"):
+            normalize_memory_name("部署手順")
+
 
 class TestScopeIsolation:
     """Verify that list/search without scope only returns visible memories.
@@ -196,11 +256,35 @@ class TestScopeIsolation:
 
     def _seed(self):
         """Create memories across multiple scopes."""
-        _save("global_note", "visible to all", scope="global")
-        _save("ws1_note", "belongs to ws1", scope="workstream", scope_id="ws1")
-        _save("ws2_note", "belongs to ws2", scope="workstream", scope_id="ws2")
-        _save("u1_note", "belongs to user1", scope="user", scope_id="u1")
-        _save("u2_note", "belongs to user2", scope="user", scope_id="u2")
+        _save("global_note", "global body", description="visible to all", scope="global")
+        _save(
+            "ws1_note",
+            "workstream one body",
+            description="belongs to ws1",
+            scope="workstream",
+            scope_id="ws1",
+        )
+        _save(
+            "ws2_note",
+            "workstream two body",
+            description="belongs to ws2",
+            scope="workstream",
+            scope_id="ws2",
+        )
+        _save(
+            "u1_note",
+            "user one body",
+            description="belongs to user1",
+            scope="user",
+            scope_id="u1",
+        )
+        _save(
+            "u2_note",
+            "user two body",
+            description="belongs to user2",
+            scope="user",
+            scope_id="u2",
+        )
 
     @staticmethod
     def _list_visible(ws_id: str, user_id: str, mem_type: str = "", limit: int = 50):

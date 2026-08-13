@@ -115,15 +115,12 @@ class TestEmptyToolset:
         # tools.md's IC block opener — self-suppressed on an empty envelope.
         assert "read_file" not in prompt
         assert _wire_names(session) == []
-        # Even with memories IN SCOPE, the "memories in scope" advisory must
-        # not compose — the empty toolset hides the memory tool, and the
-        # preamble must never point the model at a tool the wire omits.  The
-        # prior `"You have" not in prompt or ...` disjunction was vacuous
-        # (no memory was ever in scope, so the branch was unreachable).
-        fake = [{"memory_id": "m1", "name": "n", "scope": "user", "scope_id": "u", "content": "c"}]
-        with patch.object(session, "_select_memory_candidates", return_value=(fake, "recency")):
-            session._init_system_messages()
-        assert "memories in scope" not in session.system_messages[0]["content"]
+        # Even with a bound principal, the hidden memory tool must prevent
+        # index acquisition and keep the index off the wire.
+        with patch("turnstone.core.session.acquire_memory_index_snapshot") as acquire:
+            session._init_system_messages(principal_id="u")
+        acquire.assert_not_called()
+        assert "<memory-index" not in session.system_messages[0]["content"]
 
     def test_base_override_replaces_only_base(self, tmp_db, mock_openai_client) -> None:
         session = _session(
@@ -269,7 +266,7 @@ class TestToolSearchEscape:
 
 
 # ---------------------------------------------------------------------------
-# Guard 4 — memory-off: no recall injection, memory tool hidden, memory
+# Guard 4 — memory-off: no index or live pointers, memory tool hidden, memory
 # nudges suppressed; compaction mechanics stay untouched.
 # ---------------------------------------------------------------------------
 
@@ -277,13 +274,14 @@ class TestToolSearchEscape:
 class TestMemoryOff:
     def test_memory_levers(self, tmp_db, mock_openai_client) -> None:
         session = _session(mock_openai_client, persona_snapshot=_snap(memory=False))
-        with patch.object(session, "_select_memory_candidates") as select:
-            session._init_system_messages()
-        select.assert_not_called()
+        with patch("turnstone.core.session.acquire_memory_index_snapshot") as acquire:
+            session._init_system_messages(principal_id="u")
+        acquire.assert_not_called()
+        assert "<memory-index" not in session.system_messages[0]["content"]
         assert "memory" not in _wire_names(session)
         # Memory-directed nudges are suppressed; behavioural nudges stay.
         session._memory_config.nudges = True
-        assert not session._nudges_enabled("start")
+        assert not session._nudges_enabled("correction")
         assert not session._nudges_enabled("tool_error")
         assert session._nudges_enabled("repeat")
         assert session._nudges_enabled("compaction_pending")
@@ -298,7 +296,7 @@ class TestMemoryOff:
             persona_snapshot=_snap(tools=frozenset({"read_file"}), memory=True),
         )
         session._memory_config.nudges = True
-        assert not session._nudges_enabled("start")
+        assert not session._nudges_enabled("correction")
         assert session._nudges_enabled("repeat")
 
     def test_recall_pointer_gates_on_visibility(self, tmp_db, mock_openai_client) -> None:
@@ -360,7 +358,6 @@ class TestMemoryOff:
             patch.object(session, "_estimated_prompt_tokens", side_effect=est),
             patch.object(session, "_utility_completion", return_value=summary) as uc,
             patch.object(session, "_append_user_turn", wraps=session._append_user_turn) as resume,
-            patch("turnstone.core.session.save_message"),
         ):
             session.send("go")
         return uc, resume
@@ -381,6 +378,7 @@ class TestMemoryOff:
             tool_timeout=10,
             persona_snapshot=_snap(memory=False),
         )
+        get_storage().register_workstream(session.ws_id)
         assert session._persona_tool_visible("recall")
         uc, resume = self._drive_advised_compaction(session)
         assert uc.call_count >= 1  # a real summary was produced (the spill)
@@ -405,6 +403,7 @@ class TestMemoryOff:
             tool_timeout=10,
             persona_snapshot=_snap(tools=frozenset()),
         )
+        get_storage().register_workstream(session.ws_id)
         assert not session._persona_tool_visible("recall")
         uc, resume = self._drive_advised_compaction(session)
         assert uc.call_count >= 1
@@ -437,6 +436,7 @@ class TestMcpOff:
         assert "mcp_widget" not in names
         task_names = {t["function"]["name"] for t in session._task_tools if "function" in t}
         assert "mcp_widget" not in task_names
+        assert "memory" not in task_names
         mcp.add_listener.assert_not_called()
         mcp.add_resource_listener.assert_not_called()
         mcp.add_prompt_listener.assert_not_called()
@@ -444,6 +444,8 @@ class TestMcpOff:
         session._on_mcp_tools_changed()
         names_after = {t["function"]["name"] for t in session._tools if "function" in t}
         assert "mcp_widget" not in names_after
+        task_names_after = {t["function"]["name"] for t in session._task_tools if "function" in t}
+        assert "memory" not in task_names_after
 
     def test_memory_off_does_not_touch_task_tools(self, tmp_db, mock_openai_client) -> None:
         # The deliberate asymmetry with guard 5: memory-off shapes the
@@ -1838,6 +1840,9 @@ class TestNudgeToolVisibility:
     def test_idle_tasks_allowed_when_tasks_visible(self, tmp_db, mock_openai_client) -> None:
         session = _session(
             mock_openai_client,
+            kind=WorkstreamKind.COORDINATOR,
+            user_id="u1",
+            coord_client=MagicMock(),
             persona_snapshot=_snap(tools=frozenset({"tasks"}), memory=True),
         )
         session._memory_config.nudges = True

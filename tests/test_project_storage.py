@@ -130,17 +130,21 @@ class TestUserCanAccessProject:
         backend.create_project("p1", "A", "u1")
         backend.add_project_member("p1", "u2")
         # Member but no project.read capability → denied.
-        monkeypatch.setattr(auth, "user_has_permission", lambda *a, **k: False)
+        monkeypatch.setattr(auth, "_load_user_permissions", lambda *a, **k: set())
         assert not auth.user_can_access_project("u2", "p1", write=False, storage=backend)
         # Member with project.read → allowed.
-        monkeypatch.setattr(auth, "user_has_permission", lambda *a, **k: True)
+        monkeypatch.setattr(auth, "_load_user_permissions", lambda *a, **k: {"project.read"})
         assert auth.user_can_access_project("u2", "p1", write=False, storage=backend)
 
     def test_public_read_needs_capability_not_membership(
         self, backend: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         backend.create_project("p1", "A", "u1", visibility="public")
-        monkeypatch.setattr(auth, "user_has_permission", lambda *a, **k: True)
+        monkeypatch.setattr(
+            auth,
+            "_load_user_permissions",
+            lambda *a, **k: {"project.read", "project.write"},
+        )
         # Non-member with project.read can READ a public project...
         assert auth.user_can_access_project("stranger", "p1", write=False, storage=backend)
         # ...but cannot WRITE without membership.
@@ -148,7 +152,7 @@ class TestUserCanAccessProject:
 
     def test_private_non_member_denied(self, backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         backend.create_project("p1", "A", "u1")  # private
-        monkeypatch.setattr(auth, "user_has_permission", lambda *a, **k: True)
+        monkeypatch.setattr(auth, "_load_user_permissions", lambda *a, **k: {"project.read"})
         assert not auth.user_can_access_project("stranger", "p1", write=False, storage=backend)
 
     def test_write_requires_membership_even_with_capability(
@@ -156,23 +160,34 @@ class TestUserCanAccessProject:
     ) -> None:
         backend.create_project("p1", "A", "u1")
         backend.add_project_member("p1", "u2")
-        monkeypatch.setattr(auth, "user_has_permission", lambda *a, **k: True)
+        monkeypatch.setattr(auth, "_load_user_permissions", lambda *a, **k: {"project.write"})
         assert auth.user_can_access_project("u2", "p1", write=True, storage=backend)
         # Non-member with the write capability is still denied.
         assert not auth.user_can_access_project("u9", "p1", write=True, storage=backend)
 
     def test_resolve_returns_name_state_and_both_bits(self, backend: Any) -> None:
-        # The single-fetch resolver behind the wrapper surfaces name + state (so
-        # the session constructor needn't re-fetch them) and both access bits.
+        # The single-fetch resolver behind the wrapper surfaces name + state
+        # even when archival closes both access bits.
         backend.create_project("p1", "Research", "u1")
         backend.update_project("p1", state="archived")
         acc = auth.resolve_project_access("u1", "p1", storage=backend)  # owner
-        assert acc.can_read and acc.can_write
+        assert not acc.can_read and not acc.can_write
         assert acc.name == "Research"
         assert acc.state == "archived"
         deny = auth.resolve_project_access("u1", "nope", storage=backend)
         assert not deny.can_read and not deny.can_write
         assert deny.name == "" and deny.state == ""
+
+    def test_archived_project_is_manageable_but_not_runtime_eligible(self, backend: Any) -> None:
+        backend.create_project("p1", "Research", "u1", state="archived")
+
+        runtime = auth.resolve_project_access("u1", "p1", storage=backend)
+        management = auth.resolve_project_management_access("u1", "p1", storage=backend)
+
+        assert (runtime.can_read, runtime.can_write) == (False, False)
+        assert (management.can_read, management.can_write) == (True, True)
+        assert management.name == "Research"
+        assert management.state == "archived"
 
 
 class TestWorkstreamProjectId:

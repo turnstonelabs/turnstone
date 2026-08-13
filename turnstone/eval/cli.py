@@ -14,7 +14,6 @@ Usage:
 import argparse
 import json
 import os
-import re
 import textwrap
 from datetime import datetime
 from typing import Any
@@ -339,12 +338,6 @@ def main() -> None:
         )
         if initial_prompt is None:
             raise SystemExit("No developer prompt found. Provide one with --prompt <file>")
-        # Strip memory reminder — it's a runtime artifact, not part of the prompt
-        initial_prompt = re.sub(
-            r"\n*REMINDER: You currently have \d+ memories stored\..*$",
-            "",
-            initial_prompt,
-        ).strip()
 
     # Load test cases
     with open(args.test_file) as f:

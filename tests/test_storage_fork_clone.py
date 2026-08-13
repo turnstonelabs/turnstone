@@ -66,9 +66,21 @@ def _raw_workstream_config(backend, ws_id: str) -> dict[str, str]:
     return {str(key): str(value) for key, value in rows}
 
 
+def _grant_project_read(backend, user_id: str) -> None:
+    backend.create_role(
+        "fork-project-reader",
+        "fork-project-reader",
+        "Fork Project Reader",
+        "project.read",
+        False,
+    )
+    backend.assign_role(user_id, "fork-project-reader")
+
+
 def test_clone_accepts_empty_source_and_replaces_config_and_project(storage_backend) -> None:
     backend = storage_backend
     backend.create_project("shared", "Shared", "owner", visibility="public")
+    _grant_project_read(backend, "alice")
     _register(backend, "source", "owner", project_id="shared")
     _register(backend, "destination", "alice", project_id="shared", state="creating")
     backend.save_workstream_config(
@@ -103,6 +115,7 @@ def test_clone_rechecks_current_project_authorization(
     backend.create_project("project", "Project", "owner", visibility=visibility)
     if authorization_change == "membership_revoked":
         backend.add_project_member("project", "alice")
+    _grant_project_read(backend, "alice")
     _register(backend, "source", "owner", project_id="project")
     _register(backend, "destination", "alice", project_id="project", state="creating")
     backend.save_message("source", "user", "private history")
@@ -213,7 +226,7 @@ def test_clone_rejects_hidden_creating_source(storage_backend) -> None:
     assert backend.load_message_turns("destination") == []
 
 
-def test_clone_refuses_same_id_source_replacement_after_preflight(storage_backend) -> None:
+def test_clone_refuses_consumed_source_id_after_preflight(storage_backend) -> None:
     backend = storage_backend
     _register(backend, "source", "alice")
     backend.save_message("source", "user", "authorized predecessor")
@@ -222,14 +235,16 @@ def test_clone_refuses_same_id_source_replacement_after_preflight(storage_backen
     predecessor_token = source_snapshot["fork_reservation_token"]
 
     assert backend.delete_workstream("source") is True
-    _register(
-        backend,
-        "source",
-        "alice",
-        state="idle",
-        fork_reservation_token="replacement-incarnation",
+    assert (
+        backend.register_workstream(
+            "source",
+            user_id="alice",
+            state="idle",
+            kind="interactive",
+            fork_reservation_token="replacement-incarnation",
+        )
+        is False
     )
-    backend.save_message("source", "user", "replacement history")
     _register(
         backend,
         "destination",
@@ -254,8 +269,8 @@ def test_clone_refuses_same_id_source_replacement_after_preflight(storage_backen
         )
 
     assert backend.load_message_turns("destination") == []
-    assert [turn.text for turn in backend.load_message_turns("source")] == ["replacement history"]
-    assert backend.get_workstream_reservation_token("source") == "replacement-incarnation"
+    assert backend.load_message_turns("source") == []
+    assert backend.get_workstream_reservation_token("source") == ""
 
 
 def test_clone_refuses_nonempty_destination_without_mutation(storage_backend) -> None:

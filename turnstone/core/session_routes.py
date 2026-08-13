@@ -44,7 +44,7 @@ from starlette.routing import Route
 from turnstone.core.log import get_logger
 from turnstone.core.session_manager import WorkstreamAlreadyExistsError
 from turnstone.core.session_replay import session_replay_preamble
-from turnstone.core.session_ui_base import AutoApproveReason
+from turnstone.core.session_ui_base import CrossPrincipalApprovalError
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
     PENDING_SENDS_MAX,
@@ -808,7 +808,7 @@ def make_approve_handler(
     reachable by coord sessions spawning interactive children.
     """
     from turnstone.core.auth import require_any_permission
-    from turnstone.core.web_helpers import read_json_or_400
+    from turnstone.core.web_helpers import auth_user_id, read_json_or_400
 
     async def approve(request: Request) -> Response:
         import asyncio
@@ -836,6 +836,7 @@ def make_approve_handler(
         approved = bool(body.get("approved", False))
         feedback = body.get("feedback")
         always = bool(body.get("always", False))
+        resolver_principal_id = auth_user_id(request)
         if cfg.tenant_check is not None:
             err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
@@ -849,7 +850,6 @@ def make_approve_handler(
                 {"error": "session UI does not support approval"},
                 status_code=409,
             )
-        auto_approve_tools = getattr(ui, "auto_approve_tools", None)
         # Cycle routing — with parallel task agents a workstream can
         # have SEVERAL approval cycles live at once, each its own
         # prompt.  A decision addresses exactly one:
@@ -894,14 +894,12 @@ def make_approve_handler(
             # For selector-less bodies the lookup and the resolve would
             # otherwise EACH independently pick "the oldest" — a cycle
             # resolving in the gap (gate timeout, peer tab, smart
-            # approval) silently retargets the resolve at the next
-            # cycle while the always-names below were collected from
-            # the previous one, whitelisting a batch the operator never
-            # looked at.
+            # approval) could silently retarget the resolve at the next
+            # cycle the operator never looked at.
             pinned_cycle_id = (target_card or {}).get("cycle_id") or None
         else:
             # Legacy/stub UI (tests, external SessionUI impls): fall back
-            # to the single-slot view for the always-names read below.
+            # to the single-slot view for selector validation.
             target_card = getattr(ui, "_pending_approval", None)
             if body_call_id:
                 if target_card is None:
@@ -920,16 +918,9 @@ def make_approve_handler(
                         {"error": "stale call_id", "current_call_id": primary},
                         status_code=409,
                     )
-        # Resolve FIRST, then whitelist: the "Approve + Always" names
-        # must describe the cycle that actually resolved.  On the cycle
-        # path the resolve is pinned to the lookup's cycle_id, so the
-        # only race left is that cycle resolving in the gap — then
-        # ``resolved_cycle`` comes back ``None`` and the whitelist below
-        # is skipped (approving a card someone else already resolved
-        # must not grow the auto-approve set).  ``always`` still rides
-        # the ``approval_resolved`` SSE event so peer tabs that didn't
-        # click can render the right status pill ("✓ approved · always"
-        # vs plain "✓ approved") without a side-channel broadcast.
+        # Resolve against the pinned cycle. The UI owns principal validation,
+        # per-principal Always grants, durable attribution, and the resolved
+        # SSE event as one cycle transition.
         try:
             if find_cycle is not None:
                 if pinned_cycle_id is not None:
@@ -938,6 +929,7 @@ def make_approve_handler(
                         feedback,
                         always=always,
                         cycle_id=pinned_cycle_id,
+                        resolver_principal_id=resolver_principal_id,
                     )
                 elif body_call_id or body_cycle_id:
                     # Lookup matched a card that carries no cycle_id
@@ -949,6 +941,7 @@ def make_approve_handler(
                         always=always,
                         call_id=body_call_id or None,
                         cycle_id=body_cycle_id or None,
+                        resolver_principal_id=resolver_principal_id,
                     )
                 else:
                     # No selector AND nothing pending at lookup time:
@@ -963,45 +956,14 @@ def make_approve_handler(
                     always=always,
                     call_id=body_call_id or None,
                     cycle_id=body_cycle_id or None,
+                    resolver_principal_id=resolver_principal_id,
                 )
+        except CrossPrincipalApprovalError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
         except TypeError:
             # Pre-cycle SessionUI impls (external/custom) without the
             # selector kwargs.
             resolved_cycle = ui.resolve_approval(approved, feedback, always=always)
-        if (
-            always
-            and approved
-            and target_card
-            and auto_approve_tools is not None
-            # Cycle-registry UIs: whitelist only when OUR resolve landed
-            # on the pinned cycle (non-None return).  Stub/legacy UIs
-            # (no registry) keep the unconditional legacy behavior —
-            # their resolve's return value carries no cycle contract to
-            # gate on.
-            and (find_cycle is None or resolved_cycle is not None)
-        ):
-            tool_names: set[str] = {
-                it.get("approval_label", "") or it.get("func_name", "")
-                for it in target_card.get("items", [])
-                if it.get("needs_approval") and it.get("func_name") and not it.get("error")
-            }
-            tool_names.discard("")
-            # Budget-override is an interactive-only pseudo-tool that
-            # must never be added to the auto-approve set — discarding
-            # unconditionally is safe (no-op for coord).
-            tool_names.discard("__budget_override__")
-            if tool_names:
-                auto_approve_tools.update(tool_names)
-                # Tag the source so /dashboard pills can distinguish
-                # an explicit "Approve + Always" click from the
-                # skill-template path (which the user may have set
-                # up months ago).  Defensive ``getattr`` because the
-                # source map landed alongside this fix; pre-fix
-                # workstreams would lack it during a hot-deploy.
-                source_map = getattr(ui, "_auto_approve_tools_source", None)
-                if source_map is not None:
-                    for t in tool_names:
-                        source_map[t] = AutoApproveReason.ALWAYS
         return JSONResponse({"status": "ok", "cycle_id": resolved_cycle})
 
     return approve
@@ -3460,15 +3422,6 @@ def make_create_handler(
                 # **extra_session_kwargs into the session factory.
                 kwargs["persona"] = persona_snapshot.name
                 kwargs["persona_snapshot"] = persona_snapshot
-            if (
-                cfg.create_pre_commit is not None
-                and isinstance(resume_ws_id_raw, str)
-                and resume_ws_id_raw
-            ):
-                # The token itself never crosses the HTTP boundary. Ask the
-                # manager to create a private storage-visible incarnation
-                # fence only for the transactional fork path that consumes it.
-                kwargs["_fork_reservation"] = True
             # Deferred emit — committed below post-attachment-
             # validation. See handler docstring's Ordering invariants.
             create_task = asyncio.ensure_future(

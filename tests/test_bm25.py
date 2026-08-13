@@ -125,7 +125,7 @@ class TestBM25Reranking:
         # an endpoint failure, not a floor verdict -> BM25 fallback, NOT empty.
         # This is the parse-failure-vs-floor distinction at the seam: the
         # _bm25_reranker closure raises on an unparseable/empty response so
-        # memory composition can't be silently suppressed by a broken endpoint.
+        # memory-pointer relevance filtering can't be silently suppressed by a broken endpoint.
         def boom(q, d):
             raise RuntimeError("rerank endpoint down")
 

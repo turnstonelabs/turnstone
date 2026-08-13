@@ -126,8 +126,8 @@
 # full /rerank endpoint, then pick it under Models -> Roles -> Reranker. The
 # settings below are global knobs — there is no rerank_url-style endpoint setting.
 # rerank_web_search = true     # rerank web_search results (when an endpoint is set)
-# rerank_bm25 = true           # rerank BM25 retrieval: tool search, skill search, memory
-# rerank_bm25_threshold = 0.0  # 0-1 relevance floor for proactive memory; 0 = off (reorder
+# rerank_bm25 = true           # rerank tool/skill search and live memory-pointer metadata
+# rerank_bm25_threshold = 0.0  # 0-1 relevance floor for memory pointers; 0 = off (reorder
                                # only). Per-model: set via `turnstone-admin rerank-calibrate`.
 # rerank_instruction = ""      # for instruction-aware rerankers (Qwen3) when the endpoint
                                # does NOT apply the model's chat template, e.g. "Given a web
@@ -148,8 +148,8 @@
 # --- Memory (turnstone, node) ---
 
 [memory]
-# relevance_k = 5              # Top-K memories for context injection
-# fetch_limit = 50             # Max memories to fetch for ranking
+# relevance_k = 5              # Live metadata pointers after each user turn
+# index_budget_chars = 65536   # Complete-index soft budget (never truncates)
 # max_content = 32768          # Max memory content size in chars
 # nudge_cooldown = 300         # Min seconds between metacognitive nudges
 # nudges = true                # Enable memory nudges

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # TC002 suppressed deliberately: pydantic resolves the stringified annotation
 # at class-build time, so SkipJsonSchema must exist at runtime — under
@@ -616,6 +616,8 @@ class VerdictInfo(BaseModel):
     tier: str
     judge_model: str = ""
     user_decision: str = ""
+    resolver_principal_id: str = ""
+    execution_principal_id: str = ""
     latency_ms: int = 0
     created: str
 
@@ -689,23 +691,48 @@ class CreateChannelUserRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AdminMemoryInfo(BaseModel):
+class AdminMemorySummary(BaseModel):
     memory_id: str
     name: str
     description: str = ""
     type: str
     scope: str
     scope_id: str = ""
-    content: str
+    scope_label: str = ""
     created: str
     updated: str
     last_accessed: str = ""
     access_count: int = 0
 
 
+class AdminMemoryInfo(AdminMemorySummary):
+    content: str
+
+
 class ListAdminMemoriesResponse(BaseModel):
-    memories: list[AdminMemoryInfo]
+    memories: list[AdminMemorySummary]
     total: int = 0
+
+
+class UpdateMemoryDescriptionRequest(BaseModel):
+    description: str = Field(min_length=1, max_length=512)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def _normalize_description(cls, value: object) -> str:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        return normalize_memory_description(value)
+
+
+class MemoryIndexHealthResponse(BaseModel):
+    budget_chars: int
+    over_budget: bool
+    max_char_count: int
+    max_entry_count: int
+    over_by_chars: int
+    invalid_description_count: int
+    envelope_count: int
 
 
 # ---------------------------------------------------------------------------
@@ -1578,13 +1605,16 @@ class CoordinatorApproveRequest(BaseModel):
     approved: bool = Field(description="True approves the pending tool call(s); False denies.")
     feedback: str | None = Field(
         default=None,
-        description="Optional human feedback string forwarded to the model.",
+        description=(
+            "Optional feedback forwarded under the initiating execution principal; "
+            "authorized peer resolvers must omit it."
+        ),
     )
     always: bool = Field(
         default=False,
         description=(
-            "When approved=True, also adds the pending tool name(s) to the session's "
-            "auto-approve set so subsequent calls of the same tool skip the prompt."
+            "For a same-principal approval, adds the pending tool name(s) to that "
+            "execution principal's auto-approve set. Authorized peers cannot set it."
         ),
     )
     cycle_id: str | None = Field(

@@ -26,6 +26,9 @@ member.  Covered here:
 
 from __future__ import annotations
 
+import json
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from tests._session_helpers import make_session
@@ -169,37 +172,55 @@ class TestRecallScopePlumbing:
 
         return fake_search_history
 
+    @staticmethod
+    def _prepare(session):
+        return session._prepare_tool(
+            {
+                "id": "c1",
+                "function": {
+                    "name": "recall",
+                    "arguments": json.dumps({"query": "x"}),
+                },
+            }
+        )
+
     def test_prepare_pins_owner_without_acting_user(self):
         session = make_session(user_id="owner")
-        item = session._prepare_recall("c1", {"query": "x"})
-        assert item["scope_user_id"] == "owner"
+        item = self._prepare(session)
+        assert item["_principal_id"] == "owner"
 
     def test_prepare_pins_acting_user_over_owner(self):
         session = make_session(user_id="owner")
         session.bind_acting_user("driver")
-        item = session._prepare_recall("c1", {"query": "x"})
-        assert item["scope_user_id"] == "driver"
+        item = self._prepare(session)
+        assert item["_principal_id"] == "driver"
 
     def test_prepare_pins_none_for_single_user_lanes(self):
         session = make_session()  # user_id defaults to "" — CLI lane
-        item = session._prepare_recall("c1", {"query": "x"})
-        assert item["scope_user_id"] is None
+        item = self._prepare(session)
+        assert item["_principal_id"] == ""
 
-    def test_exec_searches_as_pinned_user(self, monkeypatch):
+    def test_exec_searches_as_pinned_user(self):
         calls: list[str | None] = []
-        monkeypatch.setattr("turnstone.core.session.search_history", self._recorder(calls))
         session = make_session(user_id="owner")
-        item = session._prepare_recall("c1", {"query": "x"})
-        session._exec_recall(item)
+        storage = MagicMock()
+        storage.search_history.side_effect = self._recorder(calls)
+        item = self._prepare(session)
+        with patch("turnstone.core.session.get_storage", return_value=storage):
+            session._exec_recall(item)
         assert calls == ["owner"]
 
-    def test_exec_refuses_unpinned_item(self, monkeypatch):
+    def test_exec_refuses_unpinned_item(self):
         """Fail loudly rather than fall back to a tenant-wide search."""
         calls: list[str | None] = []
-        monkeypatch.setattr("turnstone.core.session.search_history", self._recorder(calls))
         session = make_session(user_id="owner")
-        item = session._prepare_recall("c1", {"query": "x"})
-        del item["scope_user_id"]
-        with pytest.raises(KeyError):
+        storage = MagicMock()
+        storage.search_history.side_effect = self._recorder(calls)
+        item = self._prepare(session)
+        del item["_principal_id"]
+        with (
+            patch("turnstone.core.session.get_storage", return_value=storage),
+            pytest.raises(KeyError),
+        ):
             session._exec_recall(item)
         assert calls == []

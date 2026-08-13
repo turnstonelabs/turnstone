@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.api.console_schemas import (
     AdminMemoryInfo,
+    AdminMemorySummary,
     ClusterNodesResponse,
     ClusterOverviewResponse,
     ClusterSnapshotResponse,
@@ -36,6 +37,7 @@ from turnstone.api.console_schemas import (
     ListToolPoliciesResponse,
     ListUserRolesResponse,
     McpServerDetail,
+    MemoryIndexHealthResponse,
     NodeDetailResponse,
     OrgInfo,
     ParseSkillResponse,
@@ -962,6 +964,27 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=AdminMemoryInfo,
         )
 
+    async def update_memory_description(
+        self,
+        memory_id: str,
+        description: str,
+    ) -> AdminMemorySummary:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        return await self._request(
+            "PATCH",
+            f"/v1/api/admin/memories/{memory_id}",
+            json_body={"description": normalize_memory_description(description)},
+            response_model=AdminMemorySummary,
+        )
+
+    async def memory_index_health(self) -> MemoryIndexHealthResponse:
+        return await self._request(
+            "GET",
+            "/v1/api/admin/memories/index-health",
+            response_model=MemoryIndexHealthResponse,
+        )
+
     async def delete_memory(self, memory_id: str) -> StatusResponse:
         return await self._request(
             "DELETE",
@@ -1712,6 +1735,16 @@ class TurnstoneConsole:
 
     def get_memory(self, memory_id: str) -> AdminMemoryInfo:
         return self._runner.run(self._async.get_memory(memory_id))
+
+    def update_memory_description(
+        self,
+        memory_id: str,
+        description: str,
+    ) -> AdminMemorySummary:
+        return self._runner.run(self._async.update_memory_description(memory_id, description))
+
+    def memory_index_health(self) -> MemoryIndexHealthResponse:
+        return self._runner.run(self._async.memory_index_health())
 
     def delete_memory(self, memory_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_memory(memory_id))

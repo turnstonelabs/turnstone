@@ -1144,7 +1144,42 @@ def test_approve_resolves_ui_event(storage):
     assert resp.json()["cycle_id"] == cycle.cycle_id
     assert cycle.event.is_set()
     assert cycle.result == (True, None)
-    assert "spawn_workstream" in ws.ui.auto_approve_tools
+    assert ws.ui._always_approve_tools_by_principal["user-1"] == {"spawn_workstream"}
+
+
+def test_peer_approval_is_binary_only_and_keeps_execution_principal(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    peer_headers = {"X-Test-User": "user-2", "X-Test-Perms": "admin.coordinator"}
+
+    feedback_cycle = _seed_pending(ws, "c-feedback")
+    response = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": False, "feedback": "change this", "call_id": "c-feedback"},
+        headers=peer_headers,
+    )
+    assert response.status_code == 409
+    assert not feedback_cycle.resolved
+
+    always_cycle = _seed_pending(ws, "c-always")
+    response = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "always": True, "call_id": "c-always"},
+        headers=peer_headers,
+    )
+    assert response.status_code == 409
+    assert not always_cycle.resolved
+
+    response = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "call_id": "c-feedback"},
+        headers=peer_headers,
+    )
+    assert response.status_code == 200
+    assert feedback_cycle.resolver_principal_id == "user-2"
+    assert feedback_cycle.execution_principal_id == "user-1"
+    assert feedback_cycle.result == (True, None)
 
 
 def _seed_pending(ws, *call_ids: str, func_name: str = "spawn_workstream"):
@@ -1160,6 +1195,7 @@ def _seed_pending(ws, *call_ids: str, func_name: str = "spawn_workstream"):
             "func_name": func_name,
             "approval_label": func_name,
             "needs_approval": True,
+            "_principal_id": ws.user_id,
         }
         for cid in call_ids
     ]
@@ -1286,8 +1322,9 @@ def test_selectorless_always_whitelists_only_the_resolved_oldest_cycle(storage):
     assert resp.json()["cycle_id"] == oldest.cycle_id
     assert oldest.event.is_set()
     assert not newer.event.is_set()
-    assert "spawn_workstream" in ws.ui.auto_approve_tools
-    assert "send_message" not in ws.ui.auto_approve_tools
+    grants = ws.ui._always_approve_tools_by_principal["user-1"]
+    assert "spawn_workstream" in grants
+    assert "send_message" not in grants
 
 
 def test_approve_always_skips_whitelist_when_pinned_cycle_lost_the_race(storage):
@@ -1319,7 +1356,7 @@ def test_approve_always_skips_whitelist_when_pinned_cycle_lost_the_race(storage)
     )
     assert resp.status_code == 200
     assert resp.json()["cycle_id"] is None
-    assert "spawn_workstream" not in ws.ui.auto_approve_tools
+    assert "spawn_workstream" not in ws.ui._always_approve_tools_by_principal.get("user-1", set())
 
 
 # ---------------------------------------------------------------------------

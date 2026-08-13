@@ -23,7 +23,6 @@ from turnstone.core.metacognition import (
     NUDGE_REPEAT,
     NUDGE_REQUIRED_TOOL,
     NUDGE_RESUME,
-    NUDGE_START,
     NUDGE_TOOL_ERROR,
     RepeatDetector,
     detect_completion,
@@ -254,18 +253,6 @@ class TestShouldNudge:
         state: dict[str, float] = {}
         assert should_nudge("resume", state, message_count=1, memory_count=3) is True
 
-    def test_start_fires_on_first_message_with_memories(self):
-        state: dict[str, float] = {}
-        assert should_nudge("start", state, message_count=1, memory_count=3) is True
-
-    def test_start_requires_memories(self):
-        state: dict[str, float] = {}
-        assert should_nudge("start", state, message_count=1, memory_count=0) is False
-
-    def test_start_only_on_first_message(self):
-        state: dict[str, float] = {}
-        assert should_nudge("start", state, message_count=2, memory_count=3) is False
-
     def test_invalid_type(self):
         state: dict[str, float] = {}
         assert should_nudge("invalid", state, message_count=3, memory_count=0) is False
@@ -283,9 +270,6 @@ class TestFormatNudge:
 
     def test_completion(self):
         assert format_nudge("completion") == NUDGE_COMPLETION
-
-    def test_start(self):
-        assert format_nudge("start") == NUDGE_START
 
     def test_tool_error(self):
         assert format_nudge("tool_error") == NUDGE_TOOL_ERROR

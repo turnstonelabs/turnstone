@@ -119,6 +119,7 @@ def _register_cycle(
     judge_event: object | None = None,
     cancel_witness: object | None = None,
     cycle_id: str | None = None,
+    execution_principal_id: str = "",
 ) -> Any:
     """Register a live ApprovalCycle the way ``approve_tools`` does.
 
@@ -129,7 +130,13 @@ def _register_cycle(
     from turnstone.core.session_ui_base import ApprovalCycle
 
     items = [
-        {"call_id": cid, "func_name": "bash", "approval_label": "bash", "needs_approval": True}
+        {
+            "call_id": cid,
+            "func_name": "bash",
+            "approval_label": "bash",
+            "needs_approval": True,
+            "_principal_id": execution_principal_id,
+        }
         for cid in call_ids
     ]
     if cancel_witness is not None:
@@ -178,6 +185,88 @@ def test_resolve_approval_broadcasts_approval_resolved() -> None:
     # Cycle identity rides the event so clients dismiss the RIGHT card.
     assert event["cycle_id"] == cycle.cycle_id
     assert event["call_ids"] == ["c1"]
+
+
+def test_peer_can_make_binary_decision_but_cannot_add_feedback_or_always() -> None:
+    from turnstone.core.session_ui_base import CrossPrincipalApprovalError
+
+    storage = MagicMock()
+    ui = _make_ui()
+    feedback_cycle = _register_cycle(ui, ["feedback"], execution_principal_id="alice")
+    feedback_cycle.pending_verdicts = [{"verdict_id": "v-peer", "call_id": "feedback"}]
+    with pytest.raises(CrossPrincipalApprovalError, match="only the initiating principal"):
+        ui.resolve_approval(
+            False,
+            "please change this",
+            cycle_id=feedback_cycle.cycle_id,
+            resolver_principal_id="bob",
+        )
+    assert not feedback_cycle.resolved
+
+    always_cycle = _register_cycle(ui, ["always"], execution_principal_id="alice")
+    with pytest.raises(CrossPrincipalApprovalError, match="only the initiating principal"):
+        ui.resolve_approval(
+            True,
+            always=True,
+            cycle_id=always_cycle.cycle_id,
+            resolver_principal_id="bob",
+        )
+    assert not always_cycle.resolved
+
+    reject_cycle = _register_cycle(ui, ["reject"], execution_principal_id="alice")
+    assert (
+        ui.resolve_approval(
+            False,
+            cycle_id=reject_cycle.cycle_id,
+            resolver_principal_id="bob",
+        )
+        == reject_cycle.cycle_id
+    )
+    assert reject_cycle.result == (False, None)
+
+    with _patch_get_storage(storage):
+        assert (
+            ui.resolve_approval(
+                True,
+                cycle_id=feedback_cycle.cycle_id,
+                resolver_principal_id="bob",
+            )
+            == feedback_cycle.cycle_id
+        )
+    assert feedback_cycle.resolver_principal_id == "bob"
+    assert feedback_cycle.execution_principal_id == "alice"
+    storage.update_intent_verdict.assert_called_once_with(
+        "v-peer",
+        user_decision="approved",
+        resolver_principal_id="bob",
+        execution_principal_id="alice",
+    )
+
+
+def test_same_principal_feedback_and_always_are_preserved_and_attributed() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"], execution_principal_id="alice")
+    cycle.pending_verdicts = [{"verdict_id": "v1", "call_id": "c1"}]
+
+    with _patch_get_storage(storage):
+        resolved = ui.resolve_approval(
+            True,
+            "ship it",
+            always=True,
+            cycle_id=cycle.cycle_id,
+            resolver_principal_id="alice",
+        )
+
+    assert resolved == cycle.cycle_id
+    assert cycle.result == (True, "ship it")
+    assert ui._always_approve_tools_by_principal["alice"] == {"bash"}
+    storage.update_intent_verdict.assert_called_once_with(
+        "v1",
+        user_decision="approved",
+        resolver_principal_id="alice",
+        execution_principal_id="alice",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -570,12 +659,17 @@ def test_resolve_approval_timeout_kwarg_writes_timeout_value() -> None:
     string used to carry this distinction but the column alone could not."""
     storage = MagicMock()
     ui = _make_ui()
-    _register_cycle(ui, ["c1"])
+    _register_cycle(ui, ["c1"], execution_principal_id="alice")
     with _patch_get_storage(storage):
         ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
     with _patch_get_storage(storage):
         ui.resolve_approval(False, "expired", timeout=True)
-    storage.update_intent_verdict.assert_any_call("v1", user_decision="timeout")
+    storage.update_intent_verdict.assert_any_call(
+        "v1",
+        user_decision="timeout",
+        resolver_principal_id="",
+        execution_principal_id="alice",
+    )
     assert ui._recent_decisions.get("c1") == ("timeout", None)
 
 
@@ -2647,6 +2741,36 @@ def test_concurrent_gates_resolve_independently() -> None:
         assert not tb.is_alive()
         assert box_b["approved"] is False
         assert box_b["feedback"] == "not this one"
+
+
+def test_always_grant_is_isolated_by_execution_principal() -> None:
+    ui = _make_ui()
+    seed = _register_cycle(ui, ["seed"], execution_principal_id="alice")
+    assert (
+        ui.resolve_approval(
+            True,
+            always=True,
+            cycle_id=seed.cycle_id,
+            resolver_principal_id="alice",
+        )
+        == seed.cycle_id
+    )
+
+    alice_item = _pending_item("alice-next")
+    alice_item["_principal_id"] = "alice"
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        assert ui.approve_tools([alice_item]) == (True, None)
+    assert alice_item["auto_approve_reason"] == "always"
+
+    bob_item = _pending_item("bob-next")
+    bob_item["_principal_id"] = "bob"
+    with _gate_harness(ui) as spawn:
+        bob_thread, bob_result = spawn(bob_item)
+        _wait_for_cycles(ui, 2)  # seed remains registered + Bob's live gate
+        assert bob_thread.is_alive()
+        assert ui.resolve_approval(False, call_id="bob-next") is not None
+        bob_thread.join(timeout=5.0)
+        assert bob_result["approved"] is False
 
 
 def test_sibling_gate_entry_cannot_eat_a_resolution() -> None:

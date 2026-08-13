@@ -1310,12 +1310,6 @@ def run_optimization(
         )
         if initial_prompt is None:
             raise SystemExit("No developer prompt found. Provide one with --prompt <file>")
-        # Strip memory reminder — it's a runtime artifact, not part of the prompt
-        initial_prompt = re.sub(
-            r"\n*REMINDER: You currently have \d+ memories stored\..*$",
-            "",
-            initial_prompt,
-        ).strip()
 
     # --- Evolution tree ---
     nodes: dict[int, EvolutionNode] = {

@@ -36,7 +36,7 @@ from typing import Any
 
 from tests._session_helpers import (
     RecordingUI,
-    make_session,
+    make_registered_session,
     replace_session_lane,
     scripted_provider,
 )
@@ -170,7 +170,7 @@ def run_scenario(name: str) -> dict[str, Any]:
     behavior — ``write_fixture`` refuses one.
     """
     ui = RecordingUI()
-    session = make_session(ui=ui)
+    session = make_registered_session(ui=ui)
     # Zero the ladder backoff: a scenario that reaches the mid-stream
     # re-issue ladder (no_finish_clean_exhaust) must not sleep real
     # exponential delays in a unit run.  The retry-notice transform in

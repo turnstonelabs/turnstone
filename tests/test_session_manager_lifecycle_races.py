@@ -11,7 +11,7 @@ import pytest
 from tests.test_session_manager import FakeAdapter, FakeSession, FakeStorage, _make_manager
 from turnstone.core import session_worker
 from turnstone.core.session import ChatSession
-from turnstone.core.session_manager import SessionManager
+from turnstone.core.session_manager import SessionManager, WorkstreamAlreadyExistsError
 from turnstone.core.state_writer import StateWriter
 from turnstone.core.workstream import WorkstreamState
 
@@ -929,10 +929,10 @@ def test_delete_drains_and_tombstones_predecessor_state_before_same_id_successor
     assert storage.rows[ws_id].state == "idle"
 
 
-def test_delete_drains_admitted_conversation_write_before_same_id_successor(
+def test_delete_drains_admitted_conversation_write_and_consumes_published_id(
     storage_backend: Any,
 ) -> None:
-    """An accepted save cannot land after delete and leak into successor B."""
+    """An accepted save drains before delete and the published ID stays consumed."""
     backend = storage_backend
     adapter = FakeAdapter()
     mgr = SessionManager(
@@ -995,8 +995,8 @@ def test_delete_drains_admitted_conversation_write_before_same_id_successor(
     assert delete_results == [True]
     assert delete_called.is_set()
 
-    successor = mgr.create(ws_id=ws_id, user_id="u2", name="successor")
-    assert successor is not predecessor
+    with pytest.raises(WorkstreamAlreadyExistsError):
+        mgr.create(ws_id=ws_id, user_id="u2", name="successor")
     assert backend.load_message_turns(ws_id) == []
     assert (
         session.commit_durable(
@@ -1078,7 +1078,7 @@ def test_same_id_successor_created_waits_for_predecessor_closed_publication(
     ]
 
 
-def test_retirement_probe_never_blocks_on_held_session_locks() -> None:
+def test_retirement_probe_never_blocks_on_held_session_locks(tmp_db: str) -> None:
     """Round-4 review pin (AB/BA deadlock): the idle-close and eviction scans
     probe persistence while holding ``ws._lock``, and force-cancel's finalizer
     holds the generation lock and then takes ``ws._lock`` — so the retirement

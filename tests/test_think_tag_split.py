@@ -29,7 +29,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests._reasoning_dialect import CASES as DIALECT_CASES
-from tests._session_helpers import make_session, replace_session_lane, scripted_provider
+from tests._session_helpers import (
+    make_registered_session,
+    make_session,
+    replace_session_lane,
+    scripted_provider,
+)
 from turnstone.core.model_turn import ModelLane
 from turnstone.core.providers import StreamChunk, ToolCallDelta
 from turnstone.core.session import _CancelRef, _StreamTurnConsumer
@@ -323,7 +328,7 @@ def test_one_shot_equivalent_to_streaming_over_random_chunkings(case):
         assert "".join(t for t, is_r in spans if is_r) == one_reasoning
 
 
-def test_tool_calls_flush_pending_raw_at_current_state():
+def test_tool_calls_flush_pending_raw_at_current_state(tmp_db: str):
     # Once tool calls begin, buffered text cannot be a partial tag: it
     # flushes RAW (no tag scan) at the current in_think state.  Assembly
     # is the drain's job while the consumer only flushes the splitter, so
@@ -337,7 +342,7 @@ def test_tool_calls_flush_pending_raw_at_current_state():
             finish_reason="tool_calls",
         ),
     ]
-    session = make_session()
+    session = make_registered_session()
     ui = _TokenRecorderUI()
     session.ui = ui
     replace_session_lane(session, provider=scripted_provider(chunks))

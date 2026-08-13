@@ -340,13 +340,14 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools.rerank_bm25",
             "bool",
             True,
-            "Rerank BM25-backed retrieval (tool/skill search, memory) when configured",
+            "Rerank BM25-backed tool/skill search and live memory pointers when configured",
             "tools",
             help="When a rerank endpoint is configured, rerank BM25-backed retrieval "
-            "(tool search, skill search, memory composition). Disable on low-power hosts "
-            "to keep web_search reranking without paying the per-turn memory-composition "
-            "rerank. Reranking sends the candidate text (tool/skill names + descriptions, "
-            "and memory name/description/content) to the configured rerank endpoint; "
+            "(tool search, skill search, and live memory-pointer selection). Disable on "
+            "low-power hosts to keep web_search reranking without paying the per-user-turn "
+            "pointer rerank. Reranking sends the current query and candidate metadata "
+            "(tool/skill names + descriptions, and memory names + descriptions) to the "
+            "configured rerank endpoint; memory bodies are never sent. "
             "self-hosted (vLLM/llama.cpp/TEI) keeps it on your infrastructure, a hosted "
             "provider (Cohere/Jina/Voyage) sends it off-box.",
         ),
@@ -354,10 +355,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools.rerank_bm25_threshold",
             "float",
             0.0,
-            "Fallback relevance floor (0-1) for proactive memory surfacing; 0 disables",
+            "Fallback relevance floor (0-1) for live memory pointers; 0 disables",
             "tools",
-            help="0-1 relevance-probability FALLBACK floor for PROACTIVE memory surfacing, used "
-            "only when the active reranker model has no per-model calibration (calibrate a "
+            help="0-1 relevance-probability FALLBACK floor for live memory-pointer selection, "
+            "used only when the active reranker model has no per-model calibration (calibrate a "
             "reranker via the Models tab to set its own floor, which takes precedence); 0 "
             "disables it. Reranker scores are normalised to 0-1 first (logit rerankers like "
             "bge/TEI are sigmoid-mapped), so the scale is uniform across endpoints.",
@@ -790,24 +791,23 @@ def _build_registry() -> dict[str, SettingDef]:
             "memory.relevance_k",
             "int",
             5,
-            "Top-K memories for relevance injection",
+            "Max relevant pointers per user turn",
             "memory",
             min_value=1,
             max_value=50,
-            help="How many saved memories to automatically include in each conversation. "
-            "Memories are ranked by text relevance and the top K are injected into the "
-            "model's context so it can recall past information.",
+            help="How many live, metadata-only memory pointers may be appended after a user "
+            "turn. The complete immutable index remains in the initial system prefix.",
         ),
         SettingDef(
-            "memory.fetch_limit",
+            "memory.index_budget_chars",
             "int",
-            50,
-            "Max memories fetched from storage",
+            65536,
+            "Soft memory-index budget in characters",
             "memory",
-            min_value=1,
-            max_value=500,
-            help="How many memories to load from the database for ranking. The top relevance_k "
-            "are selected from this pool. Higher values find better matches but cost more.",
+            min_value=1024,
+            max_value=1048576,
+            help="Persistent operator warnings appear when a live complete index exceeds this "
+            "size. The index is never silently truncated or filtered.",
         ),
         SettingDef(
             "memory.max_content",

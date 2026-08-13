@@ -109,7 +109,104 @@ describe("TurnstoneServer", () => {
         description: "   ",
       }),
     ).rejects.toThrow("description is required");
+    await expect(
+      client.saveMemory({
+        name: "deployment_process",
+        content: "Deploy from main",
+        description: "\u0085".repeat(4),
+      }),
+    ).rejects.toThrow("description is required");
+    await expect(
+      client.saveMemory({
+        name: "deployment_process",
+        content: "Deploy from main",
+        description: "x".repeat(513),
+      }),
+    ).rejects.toThrow("512");
+    const unicodeFetch = mockFetch({});
+    const unicodeClient = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: unicodeFetch,
+    });
+    await unicodeClient.saveMemory({
+      name: "unicode_hook",
+      content: "body",
+      description: "🙂".repeat(512),
+    });
     expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(unicodeFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("getMemory fetches one exact body with scope", async () => {
+    const fetchFn = mockFetch({
+      memory_id: "m1",
+      name: "deployment_process",
+      description: "Production deployment workflow",
+      type: "general",
+      scope: "workstream",
+      scope_id: "ws1",
+      content: "Deploy from main",
+      created: "2026-08-11T00:00:00",
+      updated: "2026-08-11T00:00:00",
+      last_accessed: "",
+      access_count: 0,
+    });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    const memory = await client.getMemory("deployment_process", {
+      scope: "workstream",
+      scope_id: "ws1",
+    });
+
+    expect(memory.content).toBe("Deploy from main");
+    const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toContain("/v1/api/memories/deployment_process");
+    expect(url).toContain("scope=workstream");
+    expect(url).toContain("scope_id=ws1");
+    expect(init.method).toBe("GET");
+  });
+
+  it("percent-encodes memory names as one path segment", async () => {
+    const responseBody = {
+      memory_id: "m1",
+      name: "reserved_name",
+      description: "Reserved-name probe",
+      type: "general",
+      scope: "global",
+      scope_id: "",
+      content: "body",
+      created: "2026-08-11T00:00:00",
+      updated: "2026-08-11T00:00:00",
+      last_accessed: "",
+      access_count: 0,
+      status: "ok",
+    };
+    const fetchFn = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify(responseBody), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    ) as typeof globalThis.fetch;
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    await client.getMemory("café/name?#");
+    await client.deleteMemory("café/name?#");
+
+    const urls = (fetchFn as ReturnType<typeof vi.fn>).mock.calls.map(
+      ([url]) => url,
+    );
+    expect(urls).toEqual([
+      "http://test/v1/api/memories/caf%C3%A9%2Fname%3F%23",
+      "http://test/v1/api/memories/caf%C3%A9%2Fname%3F%23",
+    ]);
   });
 
   it("send posts correct payload", async () => {

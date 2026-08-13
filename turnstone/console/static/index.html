@@ -968,7 +968,7 @@
                   >
                     <option value="">All types</option>
                     <option value="user">user</option>
-                    <option value="project">project</option>
+                    <option value="general">general</option>
                     <option value="feedback">feedback</option>
                     <option value="reference">reference</option>
                   </select>
@@ -993,6 +993,13 @@
                   />
                 </div>
               </div>
+              <div
+                id="memory-index-warning"
+                class="sh-alert"
+                role="alert"
+                aria-live="polite"
+                style="display: none"
+              ></div>
               <div class="admin-colheaders" aria-hidden="true">
                 <span class="admin-col admin-col-mname">NAME</span>
                 <span class="admin-col admin-col-mtype">TYPE</span>
@@ -2955,8 +2962,8 @@
                   <input id="pr-memory" type="checkbox" checked />
                   <span class="toggle-track" aria-hidden="true"></span>
                   <span class="toggle-label"
-                    >Memory enabled (recall injection, nudges, memory
-                    tool)</span
+                    >Memory enabled (metadata index and pointers, nudges,
+                    memory tool)</span
                   >
                 </label>
               </div>

@@ -627,17 +627,16 @@ class TestDeleteWorkstream:
         assert r.status_code == 200
         assert r.json()["deleted"] == "ws-flaky"
 
-    def test_delete_does_not_erase_same_id_replacement_after_authorization(
+    def test_delete_rejects_same_id_replacement_after_authorization(
         self,
         delete_client,
         storage,
         monkeypatch,
     ):
-        """The authorized row's private token, not just its ID, fences delete."""
+        """A published ID remains consumed even while an exact delete races."""
         client, _ = delete_client
         ws_id = "ws-delete-aba"
         original_token = "original-incarnation"
-        replacement_token = "replacement-incarnation"
         storage.register_workstream(
             ws_id,
             "node-1",
@@ -671,15 +670,14 @@ class TestDeleteWorkstream:
         request_thread.start()
         assert delete_admitted.wait(timeout=5), "request never reached exact delete"
         try:
-            # The request authorized the original snapshot. Replace it with a
-            # different owner + incarnation before the conditional delete.
+            # The request authorized the original snapshot. A concurrent hard
+            # delete cannot make that published ID available to a new owner.
             storage.delete_workstream(ws_id)
-            assert storage.register_workstream(
+            assert not storage.register_workstream(
                 ws_id,
                 "node-2",
                 name="replacement",
                 user_id="other-user",
-                fork_reservation_token=replacement_token,
             )
         finally:
             release_delete.set()
@@ -688,26 +686,21 @@ class TestDeleteWorkstream:
         assert not request_thread.is_alive()
         assert len(responses) == 1
         assert responses[0].status_code == 404
-        replacement = storage.get_workstream(ws_id)
-        assert replacement is not None
-        assert replacement["name"] == "replacement"
-        assert replacement["user_id"] == "other-user"
-        assert storage.get_workstream_reservation_token(ws_id) == replacement_token
+        assert storage.get_workstream(ws_id) is None
 
     @pytest.mark.parametrize("loaded", [False, True])
-    def test_delete_claims_legacy_incarnation_before_replacement_race(
+    def test_delete_claims_legacy_fence_before_nonreuse_race(
         self,
         delete_client,
         storage,
         monkeypatch,
         loaded: bool,
     ):
-        """Tokenless legacy rows gain a fence before ACL and exact delete."""
+        """Tokenless legacy rows gain a fence and retain their consumed ID."""
         from tests.test_session_manager import _make_manager
 
         client, app = delete_client
         ws_id = f"ws-delete-legacy-{'loaded' if loaded else 'saved'}"
-        replacement_token = "replacement-incarnation"
         storage.register_workstream(
             ws_id,
             "node-1",
@@ -729,7 +722,6 @@ class TestDeleteWorkstream:
         def _blocked_exact_delete(candidate_id: str, token: str) -> bool:
             assert candidate_id == ws_id
             assert token
-            assert token != replacement_token
             captured_tokens.append(token)
             delete_admitted.set()
             assert release_delete.wait(timeout=10), "test did not install replacement"
@@ -749,15 +741,14 @@ class TestDeleteWorkstream:
         assert delete_admitted.wait(timeout=5), "request never reached exact delete"
         try:
             # The endpoint has atomically installed a private token and
-            # authorized that snapshot. Replacing the row now must only make
-            # its conditional delete lose.
+            # authorized that snapshot. Deletion consumes the published ID,
+            # so a second logical workstream cannot take its place.
             assert storage.delete_workstream(ws_id) is True
-            assert storage.register_workstream(
+            assert not storage.register_workstream(
                 ws_id,
                 "node-2",
                 name="replacement",
                 user_id="other-user",
-                fork_reservation_token=replacement_token,
             )
         finally:
             release_delete.set()
@@ -767,12 +758,7 @@ class TestDeleteWorkstream:
         assert len(captured_tokens) == 1
         assert len(responses) == 1
         assert responses[0].status_code == 404
-        replacement = storage.get_workstream(ws_id)
-        assert replacement is not None
-        assert replacement["name"] == "replacement"
-        assert replacement["user_id"] == "other-user"
-        assert "fork_reservation_token" not in replacement
-        assert storage.get_workstream_reservation_token(ws_id) == replacement_token
+        assert storage.get_workstream(ws_id) is None
         if mgr is not None:
             # A failed exact delete proves the loaded object is a predecessor;
             # retire it silently instead of serving it over the replacement.

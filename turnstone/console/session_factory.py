@@ -93,7 +93,7 @@ def build_console_session_factory(
     def _build_memory_config() -> MemoryConfig:
         return MemoryConfig(
             relevance_k=config_store.get("memory.relevance_k"),
-            fetch_limit=config_store.get("memory.fetch_limit"),
+            index_budget_chars=config_store.get("memory.index_budget_chars"),
             max_content=config_store.get("memory.max_content"),
             nudge_cooldown=config_store.get("memory.nudge_cooldown"),
             nudges=config_store.get("memory.nudges"),

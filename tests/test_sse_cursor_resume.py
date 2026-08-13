@@ -231,7 +231,7 @@ def test_append_system_turn_stamps_row_with_its_sse_event_id(
         parent_ws_id=session._parent_ws_id,
     )
     ui._enqueue({"type": "content"})  # advance past the prior turn
-    session._append_system_turn("start", "ground yourself")
+    session._append_system_turn("correction", "ground yourself")
     row = storage.load_messages(session.ws_id, repair=False)[-1]
     assert row["_event_id"] == ui._event_buffer[-1][0]
     assert ui._event_buffer[-1][1]["type"] == "system_turn"
@@ -255,7 +255,7 @@ def test_system_turn_bool_hook_return_falls_back_to_counter(
         parent_ws_id=session._parent_ws_id,
     )
     session.ui.on_system_turn = lambda *_a, **_k: True
-    session._append_system_turn("start", "ground yourself")
+    session._append_system_turn("correction", "ground yourself")
     row = storage.load_messages(session.ws_id, repair=False)[-1]
     assert not isinstance(row["_event_id"], bool)
     assert row["_event_id"] == session._ui_event_id()

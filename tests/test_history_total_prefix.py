@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests._session_helpers import make_result, make_session
+from tests._session_helpers import make_registered_session, make_result
 from tests.test_history_commit_handoff import _send_environment, _start_send
 from tests.test_session_manager import _make_manager
 from turnstone.core import session as session_module
@@ -136,9 +136,8 @@ class _PrefixStore:
 
 
 def _ready_session(**kwargs: Any) -> Any:
-    session = make_session(**kwargs)
+    session = make_registered_session(**kwargs)
     session._title_generated = True
-    session._system_composed_with_context = True
     return session
 
 
@@ -226,8 +225,8 @@ def test_tool_system_user_fold_is_one_visible_causal_prefix(tmp_db: Any) -> None
     assert all(row.get("_commit_key") for row in rows_during[-3:])
 
 
-def test_initial_user_and_nudge_are_visible_in_append_order(tmp_db: Any) -> None:
-    """The initialization batch cannot expose USER without its accepted nudge."""
+def test_initial_user_and_correction_are_visible_in_append_order(tmp_db: Any) -> None:
+    """The initialization batch cannot expose USER without its accepted correction."""
 
     session = _ready_session()
     store = _PrefixStore()
@@ -236,8 +235,8 @@ def test_initial_user_and_nudge_are_visible_in_append_order(tmp_db: Any) -> None
 
     def _emit_init_nudge(*, deferred_persistence: list[Callable[[], None]] | None = None) -> None:
         session._append_system_turn(
-            "start",
-            "initial metacognitive nudge",
+            "correction",
+            "initial metacognitive correction",
             deferred_persistence=deferred_persistence,
         )
 
@@ -274,7 +273,7 @@ def test_initial_user_and_nudge_are_visible_in_append_order(tmp_db: Any) -> None
     assert send_errors == []
     assert _roles_and_content(rows_during)[-2:] == [
         ("user", "opening user"),
-        ("system", "initial metacognitive nudge"),
+        ("system", "initial metacognitive correction"),
     ]
     assert all(row.get("_commit_key") for row in rows_during[-2:])
 
@@ -797,7 +796,7 @@ def test_soft_close_retries_the_latched_pending_prefix(
         assert session._publication_shutdown is False
 
 
-def test_soft_close_terminal_latch_refuses_a_fresh_worker_claim() -> None:
+def test_soft_close_terminal_latch_refuses_a_fresh_worker_claim(tmp_db: Any) -> None:
     """No POST-equivalent dispatch may be acknowledged inside close's latch gap."""
 
     ws_id = "ws-soft-close-dispatch-gap"

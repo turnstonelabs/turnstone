@@ -32,7 +32,7 @@ from tests._parity_832 import (
 )
 from tests._session_helpers import (
     RecordingUI,
-    make_session,
+    make_registered_session,
     replace_session_lane,
     scripted_provider,
 )
@@ -102,7 +102,7 @@ def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
-def test_parity(name: str) -> None:
+def test_parity(name: str, tmp_db: str) -> None:
     record = run_scenario(name)
     if UPDATE:
         write_fixture(name, record)
@@ -132,7 +132,7 @@ class TestDisplayCommitMirror:
 
     def _mirror(self, chunks: list[StreamChunk]) -> tuple[str, str]:
         ui = RecordingUI()
-        session = make_session(ui=ui)
+        session = make_registered_session(ui=ui)
         session._RETRY_BASE_DELAY = 0
         replace_session_lane(session, provider=scripted_provider(chunks))
         session.messages.append(Turn.user("hi"))
@@ -254,7 +254,7 @@ class TestDisplayCommitMirror:
             ),
         ],
     )
-    def test_mirror(self, name: str, chunks: list[StreamChunk]) -> None:
+    def test_mirror(self, name: str, chunks: list[StreamChunk], tmp_db: str) -> None:
         stamped = [*chunks]
         # Ride usage on the finish chunk so the strict gate passes.
         for i, c in enumerate(stamped):

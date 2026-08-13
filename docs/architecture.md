@@ -451,13 +451,15 @@ class Workstream:
     _state_tail_lock: threading.Lock  # durable state/observer ordering
 ```
 
-The durable incarnation token and lifecycle fields are internal and never appear in
-public workstream/config projections. They distinguish successive objects that
-reuse one logical ID. Manager-created rows receive the token at registration;
-legacy rows acquire one atomically when rehydration, delete, or fork preflight
-takes its authoritative snapshot. This prevents an old manager state
-transition, buffered lifecycle-state write, stale delete authorization, or
-fork operation from targeting a replacement incarnation.
+The durable reservation token and lifecycle fields are internal and never
+appear in public workstream/config projections. A published workstream ID is
+globally non-reusable: hard deletion retains a small registry tombstone, while
+a hidden `creating` reservation releases its ID if construction rolls back.
+The token still identifies the exact retryable reservation and is installed
+atomically for legacy rows during rehydration, delete, or fork preflight. It
+prevents an old provisional create, buffered lifecycle-state write, stale
+delete authorization, or fork operation from targeting a replacement hidden
+reservation before either object is published.
 
 ### SessionManager
 
@@ -523,8 +525,8 @@ after the committed snapshot is adopted in memory does the normal
 `creating -> idle -> ws_created` publication run.
 
 Rehydration binds the private token before constructing the session, then
-rechecks it after configuration and history are loaded; a delete/re-register
-crossing retires the hybrid candidate and retries from a fresh snapshot.
+rechecks it after configuration and history are loaded; a concurrent lifecycle
+change retires the hybrid candidate and retries from a fresh snapshot.
 Loaded hard-delete similarly compares the endpoint's authorized token with
 both the local and current durable incarnations before making any terminal
 mutation. It closes generation publication, drains every already-admitted
@@ -535,9 +537,9 @@ a false `ws_closed` event.
 
 That drain covers manager-owned session durability admitted through the ticket
 lane. Direct legacy storage helpers that mutate only by `ws_id` are not made
-token-conditional by this refactor and must not be used as a same-ID reuse
-fence; the incarnation token guarantees exact create/fork/delete target
-selection, not a new transaction contract for every maintenance API.
+token-conditional by this refactor. The reservation token guarantees exact
+create/fork/delete target selection during provisional lifecycle races; the
+durable ID registry separately prevents reuse after publication.
 
 #### Crash-Abandoned Create Recovery
 
@@ -629,9 +631,10 @@ non-idle background workstreams above the input prompt.
   run outside it.
 - `Workstream._lock`: guards one workstream's worker pair and short state
   mutations.
-- The per-ID lifecycle lane orders create/open/close/hard-delete across object
-  incarnations; `Workstream._lifecycle_lock` orders one object's birth against
-  its terminal paths.
+- The per-ID lifecycle lane orders create/open/close/hard-delete, including a
+  rolled-back hidden reservation followed by its retry;
+  `Workstream._lifecycle_lock` orders one object's birth against its terminal
+  paths.
 - `Workstream._state_tail_lock` orders accepted state persistence and observer
   events. `_state_revision` rejects superseded tails, while
   `_state_incarnation` and `StateWriter` prevent close/reopen ABA writes.
@@ -1447,7 +1450,7 @@ and are the single source of truth for both backends and Alembic migrations.
 
 | Method | Purpose |
 |--------|---------|
-| `register_workstream(..., fork_reservation_token=...)` | Atomically insert `creating` row plus private incarnation token; report collision |
+| `register_workstream(..., fork_reservation_token=...)` | Atomically reserve a globally unique ID and insert its row plus private reservation token; report current or tombstoned collisions |
 | `ensure_workstream_incarnation_snapshot(ws_id)` | Lock and return one exact row plus its private token, installing a token atomically for legacy rows |
 | `finalize_deferred_create(...)` | Apply alias/config/node writes only if row and token still match |
 | `publish_deferred_create(ws_id, token)` | Compare-and-swap the exact reservation from `creating` to `idle` |

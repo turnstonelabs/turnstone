@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
     from contextlib import AbstractContextManager
 
     from turnstone.core.storage._notify import NotifyStream
@@ -103,8 +103,9 @@ class ForkCloneExpectation:
     constructor.  The source can change between that preflight and the clone.
     Carrying this immutable witness into the transaction makes such drift a
     retryable source refusal instead of committing history under a stale live
-    security envelope. Source and destination incarnation tokens additionally
-    fence delete/re-register reuse of either caller-known id.
+    security envelope. Source and destination reservation tokens additionally
+    fence pre-publication rollback/retry races. Published workstream ids are
+    globally non-reusable.
     """
 
     persona_config: tuple[tuple[str, str], ...]
@@ -843,6 +844,7 @@ class StorageBackend(Protocol):
         content: str,
         *,
         require_active_project: bool = False,
+        acting_principal_id: str = "",
     ) -> tuple[dict[str, str], bool]:
         """Insert a structured memory, or update it in place on a
         ``(name, scope, scope_id)`` conflict.
@@ -853,17 +855,20 @@ class StorageBackend(Protocol):
         or update. A ``mem_type`` of ``None`` means "unset": the column default
         is used on insert and the stored value is kept on conflict.
 
-        Returns ``(row, was_update)`` (like Django's ``update_or_create``): the
-        full saved row, and ``True`` when an existing row was updated rather
+        Returns ``(row, was_update)`` (like Django's ``update_or_create``): a
+        body-free summary row, and ``True`` when an existing row was updated rather
         than inserted.  Callers MUST supply a fresh unique ``memory_id`` — it is
         compared against the returned row's id to tell INSERT from UPDATE, so a
         reused id would report ``was_update=False`` on a real update.
 
-        When ``require_active_project`` is true, ``scope`` must be
-        ``"project"`` and the backend must verify that the referenced project
-        still exists and is active in the same transaction as the upsert.  The
-        project row is locked where the backend supports row locks so a
-        concurrent project delete cannot leave an orphaned memory behind.
+        When ``acting_principal_id`` is supplied for project scope, the backend
+        must resolve active project write access in the same transaction as the
+        upsert. ``require_active_project`` retains the trusted internal path's
+        active-project guard when there is no acting principal.
+
+        Workstream-scoped writes similarly lock and verify their durable parent
+        in the same transaction, so a deleted workstream cannot gain orphaned
+        memory rows.
         """
         ...
 
@@ -872,19 +877,51 @@ class StorageBackend(Protocol):
         ...
 
     def get_structured_memory_by_name(
-        self, name: str, scope: str = "global", scope_id: str = ""
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
     ) -> dict[str, str] | None:
         """Lookup structured memory by (name, scope, scope_id). Returns dict or None."""
         ...
 
+    def get_and_touch_structured_memory(self, memory_id: str) -> dict[str, str] | None:
+        """Atomically return one full body while recording its access."""
+        ...
+
+    def get_and_touch_structured_memory_by_name(
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
+    ) -> dict[str, str] | None:
+        """Atomically return one scoped full body while recording its access."""
+        ...
+
+    def update_structured_memory_description(
+        self, memory_id: str, description: str
+    ) -> dict[str, str] | None:
+        """Atomically update an authored memory description and return the row."""
+        ...
+
     def delete_structured_memory(
-        self, name: str, scope: str = "global", scope_id: str = ""
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
     ) -> bool:
         """Delete a structured memory by (name, scope, scope_id). Returns True if existed."""
         ...
 
     def delete_structured_memory_returning(
-        self, name: str, scope: str = "global", scope_id: str = ""
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
     ) -> dict[str, str] | None:
         """Atomically delete and return a memory selected by its scoped name."""
         ...
@@ -901,6 +938,8 @@ class StorageBackend(Protocol):
         self,
         name: str,
         scopes: list[tuple[str, str]],
+        *,
+        acting_principal_id: str = "",
     ) -> list[tuple[str, str]]:
         """Return visible scope pairs containing ``name`` in one small query."""
         ...
@@ -931,6 +970,8 @@ class StorageBackend(Protocol):
         scopes: list[tuple[str, str]],
         mem_type: str = "",
         limit: int = 100,
+        *,
+        acting_principal_id: str = "",
     ) -> list[dict[str, str]]:
         """List memories matching ANY of the (scope, scope_id) pairs in *scopes*.
 
@@ -946,6 +987,8 @@ class StorageBackend(Protocol):
         scopes: list[tuple[str, str]],
         mem_type: str = "",
         limit: int = 20,
+        *,
+        acting_principal_id: str = "",
     ) -> list[dict[str, str]]:
         """OR-of-terms search across memories visible under *scopes*.
 
@@ -954,17 +997,58 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def touch_structured_memories(self, keys: list[tuple[str, str, str]]) -> int:
-        """Batch-touch multiple memories.
+    def list_visible_memory_index_entries(
+        self,
+        scopes: list[tuple[str, str]],
+        *,
+        acting_principal_id: str = "",
+    ) -> list[dict[str, str]]:
+        """Return complete visible index metadata without memory bodies."""
+        ...
 
-        Each key is ``(name, scope, scope_id)``.  Callers should deduplicate
-        before calling; each key increments ``access_count`` once per call.
-        Returns count of rows found and updated.
+    def get_memory_index_health_inputs(self) -> dict[str, list[dict[str, Any]]]:
+        """Return live topology plus all index metadata in one read snapshot.
+
+        Keys include index entries, workstreams, projects, memberships, users,
+        roles, user-role assignments, and role overrides.
+        The health calculator combines pre-rendered per-scope metrics from
+        these rows; it never scans every memory once per visibility envelope.
+        """
+        ...
+
+    def get_memory_index_snapshot(
+        self,
+        ws_id: str,
+    ) -> dict[str, Any] | None:
+        """Load the immutable index bound to one globally unique workstream."""
+        ...
+
+    def acquire_memory_index_snapshot(
+        self,
+        ws_id: str,
+        principal_id: str,
+        *,
+        commit_guard: Callable[[], AbstractContextManager[None]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically bind the first principal's complete index.
+
+        Workstream validation, live project ACL resolution, the
+        metadata read and first-writer insertion are one coherent database
+        transaction. A missing, provisional, or deleted workstream returns
+        ``None``. When supplied, ``commit_guard`` is entered only around the
+        final commit, after all blocking reads/rendering. Raising from the
+        guard rolls the candidate back; session callers use this to keep a
+        cancelled generation from durably binding the first index.
         """
         ...
 
     def count_structured_memories(
-        self, mem_type: str = "", scope: str = "", scope_id: str = ""
+        self,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
     ) -> int:
         """Count structured memories with optional type and scope filters."""
         ...
@@ -990,9 +1074,12 @@ class StorageBackend(Protocol):
     ) -> bool:
         """Create a workstreams row and report whether it was inserted.
 
-        Existing ids remain an idempotent no-op for compatibility, but return
-        ``False`` so create flows can distinguish their own durable reservation
-        from a caller-chosen id that already belongs to another workstream.
+        An id is reserved transactionally with its workstream row. Once the row
+        is published, that id remains reserved after hard deletion and can
+        never identify another logical workstream. Existing or previously
+        published ids return ``False``. A hidden ``creating`` reservation that
+        is rolled back before publication releases the id so the same create
+        request can retry safely.
 
         ``kind`` accepts a ``WorkstreamKind`` member or its raw string value
         (``"interactive"`` / ``"coordinator"``); the storage edge validates
@@ -1003,10 +1090,12 @@ class StorageBackend(Protocol):
         ``workstream_config``) — all normalized from the empty string to
         ``None`` at the storage edge.
 
-        ``fork_reservation_token`` is private create-path plumbing.  When
+        ``fork_reservation_token`` is private create-path plumbing. When
         non-empty, the backend stores it with the new row in the same
-        transaction under :data:`FORK_RESERVATION_CONFIG_KEY`; an ignored
-        duplicate insert must not alter the incumbent row's token.
+        transaction under :data:`FORK_RESERVATION_CONFIG_KEY`; a rejected
+        duplicate must not alter the incumbent row's token. The token fences
+        exact operations on retryable pre-publication reservations; it is not
+        part of memory-index identity.
         """
         ...
 
@@ -2271,6 +2360,8 @@ class StorageBackend(Protocol):
         judge_model: str,
         latency_ms: int,
         user_decision: str = "pending",
+        resolver_principal_id: str = "",
+        execution_principal_id: str = "",
     ) -> None:
         """Record an intent validation verdict.
 
@@ -2308,6 +2399,8 @@ class StorageBackend(Protocol):
         judge_model: str,
         latency_ms: int,
         user_decision: str = "pending",
+        resolver_principal_id: str = "",
+        execution_principal_id: str = "",
     ) -> None:
         """INSERT a verdict row, or UPDATE the judge-output fields on conflict.
 

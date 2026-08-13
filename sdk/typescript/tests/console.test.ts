@@ -11,6 +11,61 @@ function mockFetch(response: object): typeof globalThis.fetch {
 }
 
 describe("TurnstoneConsole", () => {
+  it("updates memory hooks and reads index health", async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            memory_id: "m1",
+            name: "deployment_process",
+            description: "Production deployment workflow",
+            type: "general",
+            scope: "global",
+            scope_id: "",
+            content: "Deploy from main",
+            created: "2026-08-11T00:00:00",
+            updated: "2026-08-11T00:00:00",
+            last_accessed: "",
+            access_count: 0,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            budget_chars: 65536,
+            over_budget: false,
+            max_char_count: 120,
+            max_entry_count: 2,
+            over_by_chars: 0,
+            invalid_description_count: 0,
+            envelope_count: 1,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    const client = new TurnstoneConsole({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    await client.updateMemoryDescription(
+      "m1",
+      "  Production\n deployment workflow  ",
+    );
+    const health = await client.memoryIndexHealth();
+
+    const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe("http://test/v1/api/admin/memories/m1");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body)).toEqual({
+      description: "Production deployment workflow",
+    });
+    expect(health.budget_chars).toBe(65536);
+  });
+
   it("overview returns parsed response", async () => {
     const fetchFn = mockFetch({
       nodes: 2,

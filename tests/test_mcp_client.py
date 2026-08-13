@@ -822,6 +822,7 @@ class TestSessionIntegration:
             "call_id": "call_789",
             "mcp_func_name": "mcp__test__search",
             "mcp_args": {"query": "hello"},
+            "_principal_id": "",
         }
         call_id, output = session._exec_mcp_tool(item)
         assert call_id == "call_789"
@@ -845,6 +846,7 @@ class TestSessionIntegration:
             "call_id": "call_err",
             "mcp_func_name": "mcp__test__search",
             "mcp_args": {"query": "hello"},
+            "_principal_id": "",
         }
         call_id, output = session._exec_mcp_tool(item)
         assert call_id == "call_err"
@@ -1442,6 +1444,32 @@ class TestSessionRefresh:
         defaults.update(kwargs)
         return ChatSession(**defaults)
 
+    @staticmethod
+    def _actor_catalog(actor: str, count: int = 25) -> list[dict[str, Any]]:
+        token = {"actor-a": "alphacatalogtoken", "actor-b": "bravocatalogtoken"}[actor]
+        tools = [_fake_openai_tool(f"mcp__{actor}__tool{i}") for i in range(count)]
+        for tool in tools:
+            tool["function"]["description"] = f"{token} tool"
+        return tools
+
+    @staticmethod
+    def _mcp_names(tools: list[dict[str, Any]]) -> set[str]:
+        return {
+            str(tool.get("function", {}).get("name", ""))
+            for tool in tools
+            if str(tool.get("function", {}).get("name", "")).startswith("mcp__")
+        }
+
+    def _assert_actor_projection(self, session, actor: str, *, coordinator: bool) -> None:
+        expected = {f"mcp__{actor}__tool{i}" for i in range(25)}
+        assert self._mcp_names(session._tools) == expected
+        assert self._mcp_names(session._task_tools) == (set() if coordinator else expected)
+        assert session._tool_search is not None
+        token = "alphacatalogtoken" if actor == "actor-a" else "bravocatalogtoken"
+        results = session._tool_search.search(token)
+        assert results
+        assert self._mcp_names(results) <= expected
+
     def test_listener_registered_on_init(self, tmp_db):
         mock_mcp = MagicMock()
         mock_mcp.get_tools.return_value = []
@@ -1482,6 +1510,445 @@ class TestSessionRefresh:
         ]
         session._on_mcp_tools_changed()
         assert len(session._tools) == initial_count + 1
+        task_names = {tool["function"]["name"] for tool in session._task_tools}
+        assert {"mcp__test__a", "mcp__test__b"} <= task_names
+        assert "memory" not in task_names
+
+    @pytest.mark.parametrize("kind", ["interactive", "coordinator"])
+    def test_actor_handoff_discards_stalled_prior_catalog(self, tmp_db, kind):
+        started = threading.Event()
+        release = threading.Event()
+        catalogs = {
+            "actor-a": self._actor_catalog("actor-a"),
+            "actor-b": self._actor_catalog("actor-b"),
+        }
+
+        def get_tools(*, user_id=None):
+            actor = user_id or "actor-a"
+            if threading.current_thread().name == "stale-actor-a":
+                started.set()
+                assert release.wait(timeout=5)
+            return catalogs[actor]
+
+        manager = MagicMock()
+        manager.get_tools.side_effect = get_tools
+        with patch("turnstone.core.session.try_prime_user_pools"):
+            session = self._make_session(
+                mcp_client=manager,
+                user_id="actor-a",
+                kind=kind,
+                tool_search="on",
+            )
+            stale = threading.Thread(
+                target=session._on_mcp_tools_changed,
+                name="stale-actor-a",
+            )
+            stale.start()
+            assert started.wait(timeout=5)
+            session.bind_acting_user("actor-b")
+            self._assert_actor_projection(
+                session,
+                "actor-b",
+                coordinator=kind == "coordinator",
+            )
+            release.set()
+            stale.join(timeout=5)
+
+        assert not stale.is_alive()
+        self._assert_actor_projection(
+            session,
+            "actor-b",
+            coordinator=kind == "coordinator",
+        )
+
+    def test_actor_handoff_aba_discards_first_actor_epoch(self, tmp_db):
+        started = threading.Event()
+        release = threading.Event()
+        catalogs = {
+            "actor-a": self._actor_catalog("actor-a"),
+            "actor-b": self._actor_catalog("actor-b"),
+        }
+        first_a_catalog = self._actor_catalog("actor-a")
+        for tool in first_a_catalog:
+            tool["function"]["name"] = tool["function"]["name"].replace(
+                "mcp__actor-a__", "mcp__stale-a__"
+            )
+
+        def get_tools(*, user_id=None):
+            if threading.current_thread().name == "stale-actor-a":
+                started.set()
+                assert release.wait(timeout=5)
+                return first_a_catalog
+            return catalogs[user_id or "actor-a"]
+
+        manager = MagicMock()
+        manager.get_tools.side_effect = get_tools
+        with patch("turnstone.core.session.try_prime_user_pools"):
+            session = self._make_session(
+                mcp_client=manager,
+                user_id="actor-a",
+                tool_search="on",
+            )
+            stale = threading.Thread(
+                target=session._on_mcp_tools_changed,
+                name="stale-actor-a",
+            )
+            stale.start()
+            assert started.wait(timeout=5)
+            session.bind_acting_user("actor-b")
+            session.bind_acting_user("actor-a")
+            release.set()
+            stale.join(timeout=5)
+
+        assert not stale.is_alive()
+        self._assert_actor_projection(session, "actor-a", coordinator=False)
+        assert not self._mcp_names(session._tools) & {f"mcp__stale-a__tool{i}" for i in range(25)}
+
+    def test_same_actor_epoch_refresh_publishes(self, tmp_db):
+        manager = MagicMock()
+        manager.get_tools.return_value = self._actor_catalog("actor-a")
+        session = self._make_session(
+            mcp_client=manager,
+            user_id="actor-a",
+            tool_search="on",
+        )
+        manager.get_tools.return_value = self._actor_catalog("actor-b")
+
+        session._on_mcp_tools_changed()
+
+        self._assert_actor_projection(session, "actor-b", coordinator=False)
+
+    def test_same_actor_callbacks_publish_in_start_order(self, tmp_db):
+        """A slower older callback cannot overwrite a newer same-actor read."""
+        older_started = threading.Event()
+        release_older = threading.Event()
+        initial_catalog = self._actor_catalog("actor-a")
+        older_catalog = self._actor_catalog("actor-a")
+        for tool in older_catalog:
+            tool["function"]["name"] = tool["function"]["name"].replace(
+                "mcp__actor-a__", "mcp__stale__"
+            )
+        latest_catalog = self._actor_catalog("actor-b")
+
+        def get_tools(*, user_id=None):
+            assert user_id == "actor-a"
+            if threading.current_thread().name == "older-same-actor-refresh":
+                older_started.set()
+                assert release_older.wait(timeout=5)
+                return older_catalog
+            if older_started.is_set():
+                return latest_catalog
+            return initial_catalog
+
+        manager = MagicMock()
+        manager.get_tools.side_effect = get_tools
+        session = self._make_session(
+            mcp_client=manager,
+            user_id="actor-a",
+            tool_search="on",
+        )
+        older = threading.Thread(
+            target=session._on_mcp_tools_changed,
+            name="older-same-actor-refresh",
+        )
+        older.start()
+        assert older_started.wait(timeout=5)
+
+        assert session._on_mcp_tools_changed() is True
+        self._assert_actor_projection(session, "actor-b", coordinator=False)
+
+        release_older.set()
+        older.join(timeout=5)
+        assert not older.is_alive()
+        self._assert_actor_projection(session, "actor-b", coordinator=False)
+        assert not self._mcp_names(session._tools) & {f"mcp__stale__tool{i}" for i in range(25)}
+
+    def test_stalled_refresh_cannot_republish_after_surface_drop(self, tmp_db):
+        started = threading.Event()
+        release = threading.Event()
+        catalog = self._actor_catalog("actor-a")
+
+        def get_tools(*, user_id=None):
+            if threading.current_thread().name == "stale-drop":
+                started.set()
+                assert release.wait(timeout=5)
+            return catalog
+
+        manager = MagicMock()
+        manager.get_tools.side_effect = get_tools
+        session = self._make_session(
+            mcp_client=manager,
+            user_id="actor-a",
+            tool_search="on",
+        )
+        stale = threading.Thread(target=session._on_mcp_tools_changed, name="stale-drop")
+        stale.start()
+        assert started.wait(timeout=5)
+        session._drop_mcp_surface()
+        session._rebuild_tool_search()
+        release.set()
+        stale.join(timeout=5)
+
+        assert not stale.is_alive()
+        assert self._mcp_names(session._tools) == set()
+        assert self._mcp_names(session._task_tools) == set()
+        assert session._tool_search is not None
+        assert session._tool_search.search("alphacatalogtoken") == []
+
+    def test_stalled_refresh_cannot_republish_after_surface_replacement(self, tmp_db):
+        started = threading.Event()
+        release = threading.Event()
+        old_manager = MagicMock()
+
+        def old_get_tools(*, user_id=None):
+            if threading.current_thread().name == "stale-replacement":
+                started.set()
+                assert release.wait(timeout=5)
+            return self._actor_catalog("actor-a")
+
+        old_manager.get_tools.side_effect = old_get_tools
+        session = self._make_session(
+            mcp_client=old_manager,
+            user_id="actor-a",
+            tool_search="on",
+        )
+        stale = threading.Thread(
+            target=session._on_mcp_tools_changed,
+            name="stale-replacement",
+        )
+        stale.start()
+        assert started.wait(timeout=5)
+
+        new_manager = MagicMock()
+        new_manager.get_tools.return_value = self._actor_catalog("actor-b")
+        with session._acting_user_bind_lock:
+            session._mcp_client = new_manager
+            session._mcp_projection_epoch += 1
+        session._on_mcp_tools_changed()
+        release.set()
+        stale.join(timeout=5)
+
+        assert not stale.is_alive()
+        self._assert_actor_projection(session, "actor-b", coordinator=False)
+
+    def test_stalled_refresh_cannot_publish_after_close(self, tmp_db):
+        started = threading.Event()
+        release = threading.Event()
+        live_catalog = self._actor_catalog("actor-a")
+        stale_catalog = self._actor_catalog("actor-b")
+
+        def get_tools(*, user_id=None):
+            if threading.current_thread().name == "stale-close":
+                started.set()
+                assert release.wait(timeout=5)
+                return stale_catalog
+            return live_catalog
+
+        manager = MagicMock()
+        manager.get_tools.side_effect = get_tools
+        session = self._make_session(
+            mcp_client=manager,
+            user_id="actor-a",
+            tool_search="on",
+        )
+        stale = threading.Thread(target=session._on_mcp_tools_changed, name="stale-close")
+        stale.start()
+        assert started.wait(timeout=5)
+        session.close()
+        release.set()
+        stale.join(timeout=5)
+
+        assert not stale.is_alive()
+        self._assert_actor_projection(session, "actor-a", coordinator=False)
+
+    @pytest.mark.parametrize(
+        ("callback_name", "catalog_method", "stale_row"),
+        [
+            (
+                "_on_mcp_resources_changed",
+                "get_resources",
+                {"uri": "stale://resource", "description": "stale resource"},
+            ),
+            (
+                "_on_mcp_prompts_changed",
+                "get_prompts",
+                {"name": "stale_prompt", "description": "stale prompt", "arguments": []},
+            ),
+        ],
+    )
+    def test_stalled_catalog_prefix_refresh_cannot_publish_after_close(
+        self,
+        tmp_db,
+        callback_name,
+        catalog_method,
+        stale_row,
+    ):
+        """Resource/prompt recomposition shares the terminal publish latch."""
+        started = threading.Event()
+        release = threading.Event()
+        manager = MagicMock()
+        manager.get_tools.return_value = []
+        manager.get_resources.return_value = []
+        manager.get_prompts.return_value = []
+        session = self._make_session(mcp_client=manager, user_id="actor-a")
+        before = list(session.system_messages)
+
+        def stalled_catalog(*, user_id=None):
+            assert user_id == "actor-a"
+            started.set()
+            assert release.wait(timeout=5)
+            return [stale_row]
+
+        getattr(manager, catalog_method).side_effect = stalled_catalog
+        stale = threading.Thread(
+            target=getattr(session, callback_name),
+            name=f"stale-{catalog_method}",
+        )
+        stale.start()
+        assert started.wait(timeout=5)
+        session.close()
+        release.set()
+        stale.join(timeout=5)
+
+        assert not stale.is_alive()
+        assert session.system_messages == before
+        assert "stale" not in str(session.system_messages)
+
+    def test_failed_soft_close_reconciles_suppressed_tool_notification(self, tmp_db):
+        """A catalog edge suppressed by soft close is refreshed after rollback."""
+        from turnstone.core.session import ConversationPersistenceError
+
+        manager = MagicMock()
+        manager.get_tools.return_value = self._actor_catalog("actor-a")
+        session = self._make_session(
+            mcp_client=manager,
+            user_id="actor-a",
+            tool_search="on",
+        )
+        manager.get_tools.return_value = self._actor_catalog("actor-b")
+
+        def fail_reconciliation(**_kwargs):
+            assert session._publication_shutdown is True
+            assert session._on_mcp_tools_changed() is False
+            assert session._mcp_projection_dirty is True
+            raise ConversationPersistenceError("durability still unavailable")
+
+        with patch.object(
+            session,
+            "_reconcile_pending_conversation_commits",
+            side_effect=fail_reconciliation,
+        ):
+            assert session.prepare_soft_close() is False
+
+        assert session._publication_shutdown is False
+        assert session._mcp_projection_dirty is False
+        self._assert_actor_projection(session, "actor-b", coordinator=False)
+
+    def test_failed_soft_close_refresh_failure_retries_at_next_admission(self, tmp_db):
+        """A failed rollback refresh remains dirty until the admission fence retries."""
+        from turnstone.core.session import ConversationPersistenceError
+
+        initial_catalog = self._actor_catalog("actor-a")
+        recovered_catalog = self._actor_catalog("actor-b")
+        reads = 0
+
+        def get_tools(*, user_id=None):
+            nonlocal reads
+            assert user_id == "actor-a"
+            reads += 1
+            if reads == 1:
+                return initial_catalog
+            if reads == 2:
+                raise RuntimeError("catalog temporarily unavailable")
+            return recovered_catalog
+
+        manager = MagicMock()
+        manager.get_tools.side_effect = get_tools
+        session = self._make_session(
+            mcp_client=manager,
+            user_id="actor-a",
+            tool_search="on",
+        )
+
+        def fail_reconciliation(**_kwargs):
+            assert session._on_mcp_tools_changed() is False
+            raise ConversationPersistenceError("durability still unavailable")
+
+        with patch.object(
+            session,
+            "_reconcile_pending_conversation_commits",
+            side_effect=fail_reconciliation,
+        ):
+            assert session.prepare_soft_close() is False
+
+        assert reads == 2
+        assert session._mcp_projection_dirty is True
+        self._assert_actor_projection(session, "actor-a", coordinator=False)
+
+        # This is the first operation in the provider-attempt admission path;
+        # it must converge before active tools are derived for the wire.
+        session._ensure_mcp_projection_current()
+
+        assert reads == 3
+        assert session._mcp_projection_dirty is False
+        self._assert_actor_projection(session, "actor-b", coordinator=False)
+
+    @pytest.mark.parametrize(
+        ("callback_name", "catalog_method", "fresh_row", "marker"),
+        [
+            (
+                "_on_mcp_resources_changed",
+                "get_resources",
+                {"uri": "fresh://resource", "description": "fresh resource"},
+                "fresh://resource",
+            ),
+            (
+                "_on_mcp_prompts_changed",
+                "get_prompts",
+                {"name": "fresh_prompt", "description": "fresh prompt", "arguments": []},
+                "fresh_prompt",
+            ),
+        ],
+    )
+    def test_failed_soft_close_keeps_catalog_prefix_dirty_for_admission(
+        self,
+        tmp_db,
+        callback_name,
+        catalog_method,
+        fresh_row,
+        marker,
+    ):
+        """Resource/prompt notifications suppressed by rollback remain observable."""
+        from turnstone.core.session import ConversationPersistenceError
+
+        manager = MagicMock()
+        manager.get_tools.return_value = []
+        manager.get_resources.return_value = []
+        manager.get_prompts.return_value = []
+        session = self._make_session(mcp_client=manager, user_id="actor-a")
+        before = list(session.system_messages)
+        getattr(manager, catalog_method).return_value = [fresh_row]
+
+        def fail_reconciliation(**_kwargs):
+            assert session._publication_shutdown is True
+            getattr(session, callback_name)()
+            assert session._system_prefix_dirty is True
+            raise ConversationPersistenceError("durability still unavailable")
+
+        with patch.object(
+            session,
+            "_reconcile_pending_conversation_commits",
+            side_effect=fail_reconciliation,
+        ):
+            assert session.prepare_soft_close() is False
+
+        assert session.system_messages == before
+        assert session._system_prefix_dirty is True
+
+        session._ensure_system_prefix_fresh(principal_id="actor-a")
+
+        assert session._system_prefix_dirty is False
+        assert marker in str(session.system_messages)
 
     def test_tool_search_preserved_across_refresh(self, tmp_db):
         # Create enough MCP tools to trigger tool search
@@ -1503,6 +1970,47 @@ class TestSessionRefresh:
         session._on_mcp_tools_changed()
         assert session._tool_search is not None
         assert "mcp__srv__tool0" in session._tool_search.get_expanded_names()
+
+    def test_live_tool_search_expansion_survives_stalled_refresh(self, tmp_db):
+        """The real expansion commit and refresh publication share one witness."""
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+        target = "mcp__srv__tool24"
+        catalog = [_fake_openai_tool(f"mcp__srv__tool{i}") for i in range(25)]
+        for tool in catalog:
+            if tool["function"]["name"] == target:
+                tool["function"]["description"] = "liveexpansionuniquetoken"
+
+        def get_tools(*, user_id=None):
+            if threading.current_thread().name == "stalled-expansion-refresh":
+                refresh_started.set()
+                assert release_refresh.wait(timeout=5)
+            return catalog
+
+        manager = MagicMock()
+        manager.get_tools.side_effect = get_tools
+        session = self._make_session(
+            mcp_client=manager,
+            tool_search="on",
+        )
+        refresh = threading.Thread(
+            target=session._on_mcp_tools_changed,
+            name="stalled-expansion-refresh",
+        )
+        refresh.start()
+        assert refresh_started.wait(timeout=5)
+
+        call_id, output = session._exec_tool_search(
+            {"call_id": "call-expand", "query": "liveexpansionuniquetoken"}
+        )
+        assert call_id == "call-expand"
+        assert target in output
+        assert target in session._tool_search.get_expanded_names()
+
+        release_refresh.set()
+        refresh.join(timeout=5)
+        assert not refresh.is_alive()
+        assert target in session._tool_search.get_expanded_names()
 
     def test_tool_search_prunes_removed_from_expanded(self, tmp_db):
         mcp_tools = [_fake_openai_tool(f"mcp__srv__tool{i}") for i in range(25)]

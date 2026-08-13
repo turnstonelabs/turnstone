@@ -240,7 +240,10 @@ function switchAdminTab(tab) {
     _populateAuditUserFilter();
     loadGovAudit();
   }
-  if (tab === "memories") loadAdminMemories();
+  if (tab === "memories") {
+    loadAdminMemories();
+    loadMemoryIndexHealth();
+  }
   if (tab === "models") loadAdminModels();
   if (tab === "node-metadata") loadAdminNodeMetadata();
   if (tab === "settings") loadSettings();
@@ -6742,7 +6745,7 @@ const MODEL_ROLES = [
   {
     label: "Reranker",
     description:
-      "Reranks web_search results. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty disables reranking. Enabling a reranker sends web_search results AND BM25 retrieval candidates (tool/skill descriptions and memory content) to this endpoint; self-hosted endpoints keep it on your infrastructure.",
+      "Reranks web_search results. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty disables reranking. Enabling a reranker sends web_search results and BM25 candidate metadata (tool/skill descriptions plus memory names/descriptions, never memory bodies) to this endpoint; self-hosted endpoints keep it on your infrastructure.",
     aliasKey: "tools.reranker_alias",
     fallbackKind: "disabled",
     disabledLabel: "(disabled — reranking off)",

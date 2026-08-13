@@ -26,6 +26,7 @@ from turnstone.core.providers import ModelCapabilities, StreamChunk, ToolCallDel
 from turnstone.core.session import ChatSession
 from turnstone.core.session_ui_base import SessionUIBase
 from turnstone.core.trajectory import ProviderNative, ToolCall, Turn
+from turnstone.core.workstream import WorkstreamKind
 
 
 class NullUI(SessionUIBase):
@@ -78,7 +79,15 @@ def replace_session_lane(
 
 def make_session(**kwargs: Any) -> ChatSession:
     """Build a ChatSession with minimal defaults; tests override
-    individual fields via kwargs."""
+    individual fields via kwargs.
+
+    This is the ordinary factory. It never publishes a durable workstream;
+    tests that exercise first-provider-request admission opt in through
+    :func:`make_registered_session` after initializing a test storage backend.
+    Storage selection remains ChatSession's normal process-global contract,
+    including its file-backed SQLite fallback when the host has not initialized
+    another backend.
+    """
     defaults: dict[str, Any] = {
         "client": MagicMock(),
         "model": "test-model",
@@ -104,6 +113,75 @@ def make_session(**kwargs: Any) -> ChatSession:
         if "context_window" not in kwargs and binding.config is not None:
             defaults["context_window"] = binding.config.context_window
     return ChatSession(**defaults)
+
+
+def make_registered_session(**kwargs: Any) -> ChatSession:
+    """Build a session backed by an explicitly initialized storage backend.
+
+    The helper never invokes ``get_storage`` until the singleton has already
+    been initialized, preventing an unrelated test from creating
+    ``.turnstone.db`` in its ambient cwd.  A repeated id is accepted only when
+    the durable identity metadata is exactly the identity this session asks
+    for; collisions are surfaced instead of quietly borrowing another row.
+    """
+    import uuid
+
+    from turnstone.core.storage import get_storage, is_storage_initialized
+
+    if not is_storage_initialized():
+        raise RuntimeError("make_registered_session requires initialized test storage")
+    storage = get_storage()
+    ws_id = str(kwargs.get("ws_id") or uuid.uuid4().hex)
+    user_id = str(kwargs.get("user_id") or "") or None
+    raw_kind = kwargs.get("kind", WorkstreamKind.INTERACTIVE)
+    kind = raw_kind if isinstance(raw_kind, WorkstreamKind) else WorkstreamKind(str(raw_kind))
+    if kind == WorkstreamKind.COORDINATOR and user_id is None:
+        raise ValueError(
+            "coordinator sessions require an authenticated user_id; "
+            f"refusing to construct an anonymous coordinator (ws_id={ws_id!r})"
+        )
+    project_id = str(kwargs.get("project_id") or "").strip() or None
+    persona_snapshot = kwargs.get("persona_snapshot")
+    persona = (
+        str(getattr(persona_snapshot, "name", "") or "").strip() or None
+        if persona_snapshot is not None
+        else None
+    )
+    expected = {
+        "user_id": user_id,
+        "kind": kind.value,
+        "project_id": project_id,
+        "persona": persona,
+    }
+    existing = storage.get_workstream(ws_id)
+    if existing is None:
+        inserted = storage.register_workstream(
+            ws_id,
+            user_id=expected["user_id"],
+            kind=kind,
+            project_id=expected["project_id"],
+            persona=expected["persona"],
+        )
+        existing = storage.get_workstream(ws_id)
+        if inserted is False and existing is None:
+            raise RuntimeError(f"workstream {ws_id!r} registration lost its durable row")
+    actual = (
+        {
+            "user_id": existing.get("user_id") or None,
+            "kind": str(existing.get("kind") or ""),
+            "project_id": existing.get("project_id") or None,
+            "persona": existing.get("persona") or None,
+        }
+        if existing is not None
+        else None
+    )
+    if actual != expected:
+        raise RuntimeError(
+            f"workstream {ws_id!r} is already registered with different metadata: "
+            f"expected {expected!r}, found {actual!r}"
+        )
+    kwargs["ws_id"] = ws_id
+    return make_session(**kwargs)
 
 
 def mock_completion_result(

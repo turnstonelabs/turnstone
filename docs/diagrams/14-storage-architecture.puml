@@ -73,6 +73,11 @@ class "workstreams" as Workstreams <<schema>> {
     project_id, persona, alias, title
 }
 
+class "workstream_id_registry" as WorkstreamIds <<schema>> {
+    ws_id PK
+    published ids survive hard delete
+}
+
 class "conversations" as Conversations <<schema>> {
     canonical persisted Turn rows
     provider_data + tool_calls mirror
@@ -122,6 +127,7 @@ SQLite --> Utils
 PG --> Utils
 
 Storage --> Workstreams
+Storage --> WorkstreamIds
 Storage --> Conversations
 Storage --> WorkstreamConfig
 Storage --> Attachments
@@ -145,8 +151,10 @@ note right of Manager
   5. Only then emit ws_created.
 
   Any normal prepublication failure immediately calls exact token-checked
-  deletion. The token survives publication as the row's incarnation fence:
-  rollback or later hard delete can never ABA-delete a replacement row.
+  deletion. Rollback releases the ID before publication; after publication a
+  durable registry tombstone makes the ID globally non-reusable. The token
+  still prevents stale provisional operations from deleting a retried hidden
+  reservation.
   A legacy row acquires the same private token atomically when rehydrate,
   delete, or fork preflight takes its authoritative snapshot. Loaded hard
   delete drains admitted session durability before its token-checked delete.

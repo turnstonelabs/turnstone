@@ -145,6 +145,15 @@ class WirePreparationError(RuntimeError):
     """
 
 
+class ModelAdmissionError(RuntimeError):
+    """The caller's local admitted-request hook failed before dispatch.
+
+    Unlike ``prepare_wire``, this hook may durably bind request context after
+    the serving lane admits the call. Its failure is still a local lifecycle
+    fault, never evidence that the selected model backend is unhealthy.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Lane resolution — the ONE place capability / extra-params / flag lookup
 # happens.  ``ChatSession`` delegates its wrappers here; the judges build
@@ -1110,6 +1119,8 @@ def model_turn(
     acting_principal_id: str = "",
     deferred_names: frozenset[str] | None = None,
     prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None = None,
+    admit_request: Callable[[ModelLane], None] | None = None,
+    admit_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
@@ -1199,6 +1210,20 @@ def model_turn(
     session discovers tools), so it is a parameter and not a
     ``ModelLane`` field.
 
+    *admit_wire* is the caller's local request-admission hook. It runs while
+    holding the serving lane's admission lease, after dynamic backend
+    authentication succeeds and immediately before dispatch. This is the
+    narrow place for a durable first-request CAS whose result changes the
+    exact wire (the immutable memory-index binding); it must not perform a
+    provider call. A failure is wrapped as :class:`ModelAdmissionError` and
+    no request bytes are sent.
+
+    *admit_request* is the context-first variant used when admission changes
+    the cached prefix itself. It runs at the same post-credential boundary,
+    but before ``prepare_wire`` so the final prefix is composed exactly once
+    and no provisional wire needs string surgery. Attachment materialization
+    still happens before the lease, over the prefix-free trajectory.
+
     *on_chunk* is the streaming surface (#832): each normalized
     :class:`StreamChunk` reaches the caller as it arrives — via a tee
     UPSTREAM of the drain, so the callback sees exactly the sequence the
@@ -1264,7 +1289,7 @@ def model_turn(
         sanitize_tool_call_arguments(dicts_from_turns(list(turns))),
         wire_id_map if wire_id_map is not None else {},
     )
-    if prepare_wire is not None:
+    if prepare_wire is not None and admit_request is None:
         try:
             # The serving lane rides along so caller lowering can be
             # capability-correct per attempt — a fallback's fold posture
@@ -1280,7 +1305,14 @@ def model_turn(
             # persisted error row.  The message rides ``__cause__``, which
             # tracebacks and debug logs still have.
             raise WirePreparationError(type(prep_err).__name__) from prep_err
-    wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
+    if admit_request is None:
+        wire = maybe_attach_vllm_chat_reasoning(
+            wire,
+            lane.provider,
+            lane.registry,
+            lane.alias,
+            cfg=cfg,
+        )
     # The effort assignment scheme's lower rungs: explicit relay → lane
     # (operator) → in-code model definition → None.  None/unset knobs are
     # OMITTED from the wire so the inference engine's default rules
@@ -1297,6 +1329,7 @@ def model_turn(
     # sampling.  Complete it before taking the outer alias's admission slot so
     # a cap of one cannot deadlock on a nested call that needs the same alias.
     served_wire = materialize_attachments(wire, resolve_attachments)
+    dispatched_wire = served_wire
     # A partially-surfaced stream is never silently re-issued — the
     # streaming caller owns re-issue.
     drain_retries = 0 if on_chunk is not None else _DRAIN_RETRIES
@@ -1316,6 +1349,32 @@ def model_turn(
                 cancel_ref=cancel_ref,
             )
             _raise_if_aborted(cancel_ref, lane)
+            if admit_request is not None:
+                try:
+                    admit_request(lane)
+                except Exception as admission_err:
+                    raise ModelAdmissionError(type(admission_err).__name__) from admission_err
+                dispatched_wire = served_wire
+                if prepare_wire is not None:
+                    try:
+                        dispatched_wire = prepare_wire(dispatched_wire, lane)
+                    except Exception as prep_err:
+                        raise WirePreparationError(type(prep_err).__name__) from prep_err
+                dispatched_wire = maybe_attach_vllm_chat_reasoning(
+                    dispatched_wire,
+                    lane.provider,
+                    lane.registry,
+                    lane.alias,
+                    cfg=cfg,
+                )
+            else:
+                dispatched_wire = served_wire
+                if admit_wire is not None:
+                    try:
+                        dispatched_wire = admit_wire(served_wire, lane)
+                    except Exception as admission_err:
+                        raise ModelAdmissionError(type(admission_err).__name__) from admission_err
+            _raise_if_aborted(cancel_ref, lane)
             mark_dispatch = getattr(cancel_ref, "mark_dispatch", None)
             if callable(mark_dispatch):
                 with contextlib.suppress(Exception):
@@ -1326,7 +1385,7 @@ def model_turn(
             chunks = lane.provider.create_streaming(
                 client=call_client,
                 model=lane.model,
-                messages=served_wire,
+                messages=dispatched_wire,
                 tools=tools,
                 max_tokens=max_tokens,
                 temperature=temperature if temperature is not None else lane.temperature,
@@ -1451,7 +1510,7 @@ def model_turn(
         usage=result.usage,
         tool_calls=raw_calls,
         provenance=provenance,
-        wire_msgs=served_wire,
+        wire_msgs=dispatched_wire,
         producer=lane.provider.provider_name,
         serving_model=lane.model,
         tool_def_chars=(

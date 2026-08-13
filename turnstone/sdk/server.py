@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import secrets
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 from turnstone.api.schemas import (
     AuthLoginResponse,
@@ -36,6 +37,7 @@ from turnstone.api.server_schemas import (
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
     MemoryInfo,
+    MemorySummary,
     SendResponse,
     UploadAttachmentResponse,
     WorkstreamHistoryResponse,
@@ -529,10 +531,10 @@ class AsyncTurnstoneServer(_BaseClient):
         mem_type: str = "general",
         scope: str = "global",
         scope_id: str = "",
-    ) -> MemoryInfo:
-        description = (description or "").strip()
-        if not description:
-            raise ValueError("memory description is required and must be non-empty")
+    ) -> MemorySummary:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        description = normalize_memory_description(description)
         body: dict[str, Any] = {
             "name": name,
             "content": content,
@@ -543,7 +545,7 @@ class AsyncTurnstoneServer(_BaseClient):
         if scope_id:
             body["scope_id"] = scope_id
         return await self._request(
-            "POST", "/v1/api/memories", json_body=body, response_model=MemoryInfo
+            "POST", "/v1/api/memories", json_body=body, response_model=MemorySummary
         )
 
     async def search_memories(
@@ -569,6 +571,23 @@ class AsyncTurnstoneServer(_BaseClient):
             response_model=ListMemoriesResponse,
         )
 
+    async def get_memory(
+        self,
+        name: str,
+        *,
+        scope: str = "global",
+        scope_id: str = "",
+    ) -> MemoryInfo:
+        params: dict[str, Any] = {"scope": scope}
+        if scope_id:
+            params["scope_id"] = scope_id
+        return await self._request(
+            "GET",
+            f"/v1/api/memories/{quote(name, safe='')}",
+            params=params,
+            response_model=MemoryInfo,
+        )
+
     async def delete_memory(
         self,
         name: str,
@@ -581,7 +600,7 @@ class AsyncTurnstoneServer(_BaseClient):
             params["scope_id"] = scope_id
         return await self._request(
             "DELETE",
-            f"/v1/api/memories/{name}",
+            f"/v1/api/memories/{quote(name, safe='')}",
             params=params,
             response_model=StatusResponse,
         )
@@ -874,7 +893,7 @@ class TurnstoneServer:
         mem_type: str = "general",
         scope: str = "global",
         scope_id: str = "",
-    ) -> MemoryInfo:
+    ) -> MemorySummary:
         return self._runner.run(
             self._async.save_memory(
                 name,
@@ -900,6 +919,9 @@ class TurnstoneServer:
                 query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
             )
         )
+
+    def get_memory(self, name: str, *, scope: str = "global", scope_id: str = "") -> MemoryInfo:
+        return self._runner.run(self._async.get_memory(name, scope=scope, scope_id=scope_id))
 
     def delete_memory(
         self, name: str, *, scope: str = "global", scope_id: str = ""

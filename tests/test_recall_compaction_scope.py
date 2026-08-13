@@ -25,6 +25,7 @@ browsing history has no "context" to duplicate.
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock, patch
 
 from tests._session_helpers import make_session
 from turnstone.core.metacognition import NUDGE_COMPACTION_RESUME
@@ -135,43 +136,51 @@ class TestLiveContextExclusion:
 
 
 class TestRecallExecScope:
-    def _run_recall(self, session, rows, monkeypatch, checkpoint=7):
+    def _run_recall(self, session, rows, checkpoint=7):
         calls: dict = {}
 
         def fake_search_history(query, limit=20, offset=0, **kwargs):
             calls.update(kwargs)
             return rows
 
-        monkeypatch.setattr("turnstone.core.session.search_history", fake_search_history)
-        monkeypatch.setattr(
-            "turnstone.core.session.get_compaction_checkpoint", lambda ws: checkpoint
+        storage = MagicMock()
+        storage.search_history.side_effect = fake_search_history
+        storage.get_compaction_checkpoint.return_value = checkpoint
+        item = session._prepare_tool(
+            {
+                "id": "c1",
+                "function": {
+                    "name": "recall",
+                    "arguments": json.dumps({"query": "x"}),
+                },
+            }
         )
-        item = session._prepare_recall("c1", {"query": "x"})
-        _, output = session._exec_recall(item)
+        with patch("turnstone.core.session.get_storage", return_value=storage):
+            _, output = session._exec_recall(item)
         return calls, output
 
-    def test_passes_own_ws_and_fresh_boundary(self, monkeypatch):
+    def test_passes_own_ws_and_fresh_boundary(self):
         session = make_session(user_id="owner")
         session._ws_id = "ws-self"
-        calls, _ = self._run_recall(session, [], monkeypatch, checkpoint=42)
+        calls, _ = self._run_recall(session, [], checkpoint=42)
         assert calls["exclude_ws_id"] == "ws-self"
         assert calls["exclude_after"] == 42
 
-    def test_no_exclusion_without_registered_ws(self, monkeypatch):
+    def test_no_exclusion_without_registered_ws(self):
         session = make_session(user_id="owner")
         session._ws_id = ""
-        calls, _ = self._run_recall(session, [], monkeypatch)
+        calls, _ = self._run_recall(session, [])
         assert calls["exclude_ws_id"] is None
         assert calls["exclude_after"] is None
 
-    def test_own_conversation_hits_are_labeled(self, monkeypatch):
+    def test_own_conversation_hits_are_labeled(self):
         session = make_session(user_id="owner")
         session._ws_id = "ws-self"
         rows = [
             ("2026-07-02T10:00:00", "ws-self", "user", "old detail", None),
             ("2026-07-02T11:00:00", "ws-other", "user", "other detail", None),
         ]
-        _, output = self._run_recall(session, rows, monkeypatch)
+        _, output = self._run_recall(session, rows)
         own_line = next(line for line in output.splitlines() if "old detail" in line)
         other_line = next(line for line in output.splitlines() if "other detail" in line)
         assert "(earlier in this conversation, compacted)" in own_line

@@ -81,6 +81,7 @@ const OPERATOR_SOURCE_LABELS = {
   compaction_pending: "context budget",
   background_shell_exit: "background shell",
   participant_joined: "participant",
+  memory_pointer: "memory pointer",
 };
 export function operatorSourceLabel(source) {
   return OPERATOR_SOURCE_LABELS[source] || source || "operator";

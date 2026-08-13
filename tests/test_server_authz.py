@@ -328,7 +328,8 @@ class _FakeSession:
     def close(self) -> None:
         pass
 
-    def handle_command(self, cmd: str) -> bool:
+    def handle_command(self, cmd: str, *, principal_id: str | None = None) -> bool:
+        del principal_id
         self.commands.append(cmd)
         if self.command_gate is not None:
             self.command_gate.wait(timeout=10)
@@ -3043,12 +3044,12 @@ class TestCreateForkRollback:
             if event.get("type") in {"ws_created", "ws_rename"}
         }
 
-    def test_source_replacement_after_preflight_cannot_inherit_fork(
+    def test_published_source_id_cannot_be_reused_after_preflight(
         self,
         app_client,
         monkeypatch,
     ) -> None:
-        from turnstone.core.storage import ForkCloneExpectation, get_storage
+        from turnstone.core.storage import get_storage
 
         client, mgr = app_client
         storage = get_storage()
@@ -3056,7 +3057,7 @@ class TestCreateForkRollback:
         source_id = "8" * 32
         destination_id = "9" * 32
         self._register_source(storage, source_id, with_history=True)
-        replacement_token = "replacement-source-incarnation"
+        original_fork = _FakeSession.fork_from_storage
 
         def _replace_at_pre_commit(
             session: _FakeSession,
@@ -3070,30 +3071,20 @@ class TestCreateForkRollback:
             assert source_reservation_token
             assert storage.get_workstream_reservation_token(source_id) == (source_reservation_token)
             assert storage.delete_workstream(source_id) is True
-            assert storage.register_workstream(
+            assert not storage.register_workstream(
                 source_id,
                 user_id="user-1",
                 name="replacement-source",
                 state="idle",
                 kind="interactive",
-                fork_reservation_token=replacement_token,
             )
-            storage.save_message(source_id, "user", "replacement must not fork")
-            destination_token = str(getattr(session, "_fork_reservation_token", ""))
-            assert destination_token
-            return storage.clone_workstream(
-                source_id,
-                session.ws_id,
+            assert storage.get_workstream(source_id) is None
+            return original_fork(
+                session,
+                fork_source_id,
                 principal_id=principal_id,
+                source_reservation_token=source_reservation_token,
                 trusted_internal=trusted_internal,
-                expected_session=ForkCloneExpectation(
-                    persona_config=(),
-                    project_id="",
-                    project_name="",
-                    project_writable=False,
-                    destination_reservation_token=destination_token,
-                    source_reservation_token=source_reservation_token,
-                ),
             )
 
         monkeypatch.setattr(_FakeSession, "fork_from_storage", _replace_at_pre_commit)
@@ -3111,14 +3102,7 @@ class TestCreateForkRollback:
         assert response.json() == {"error": "Fork source is no longer available"}
         assert mgr.get(destination_id) is None
         assert storage.get_workstream(destination_id) is None
-        replacement = storage.get_workstream(source_id)
-        assert replacement is not None
-        assert replacement["name"] == "replacement-source"
-        assert "fork_reservation_token" not in replacement
-        assert storage.get_workstream_reservation_token(source_id) == replacement_token
-        assert [turn.text for turn in storage.load_message_turns(source_id)] == [
-            "replacement must not fork"
-        ]
+        assert storage.get_workstream(source_id) is None
 
     def test_destination_storage_failure_rolls_back_destination(
         self, app_client, monkeypatch

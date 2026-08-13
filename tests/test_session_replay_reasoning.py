@@ -40,6 +40,7 @@ from tests._session_helpers import (
     mock_completion_result,
     scripted_provider,
 )
+from tests._session_helpers import make_registered_session as _make_registered_session
 from tests._session_helpers import make_session as _make_session
 from turnstone.core.model_turn import resolve_lane, resolve_replay_reasoning_to_model
 from turnstone.core.providers._protocol import ModelCapabilities
@@ -207,8 +208,8 @@ class TestStreamingCallSitePassesFlag:
     the flag rides the lane the walk actually served the turn on.
     """
 
-    def test_replay_true_propagates_to_provider(self) -> None:
-        session = _make_session()
+    def test_replay_true_propagates_to_provider(self, tmp_db: str) -> None:
+        session = _make_registered_session()
         registry = _registry_with_flag(replay=True)
         kwargs = _drive_stream(
             session,
@@ -218,8 +219,8 @@ class TestStreamingCallSitePassesFlag:
         )
         assert kwargs["replay_reasoning_to_model"] is True
 
-    def test_replay_false_propagates_to_provider(self) -> None:
-        session = _make_session()
+    def test_replay_false_propagates_to_provider(self, tmp_db: str) -> None:
+        session = _make_registered_session()
         registry = _registry_with_flag(replay=False)
         # Capability advertises replay support: the False comes from the
         # operator flag alone, not from the AND-gate's other half.
@@ -231,11 +232,11 @@ class TestStreamingCallSitePassesFlag:
         )
         assert kwargs["replay_reasoning_to_model"] is False
 
-    def test_fallback_alias_uses_its_own_flag(self) -> None:
+    def test_fallback_alias_uses_its_own_flag(self, tmp_db: str) -> None:
         # When the primary fails and we fall back to an alias with a
         # different flag, the flag MUST track the resolved alias —
         # not the session's primary alias.
-        session = _make_session()
+        session = _make_registered_session()
 
         def per_alias(alias: str) -> Any:
             return SimpleNamespace(
@@ -327,7 +328,7 @@ class TestSessionToWireBoundaryIntegration:
         """
         from turnstone.core.providers._anthropic import AnthropicProvider
 
-        session = _make_session()
+        session = _make_registered_session()
         registry = _registry_with_flag(replay=replay_flag, caps_overrides=caps_overrides)
         client, captured = self._stub_anthropic_client()
         _bind_session_lane(
@@ -342,7 +343,7 @@ class TestSessionToWireBoundaryIntegration:
         session._stream_response(0)
         return captured
 
-    def test_replay_false_strips_thinking_at_wire(self) -> None:
+    def test_replay_false_strips_thinking_at_wire(self, tmp_db: str) -> None:
         msgs: list[dict[str, Any]] = [
             {"role": "user", "content": "hello"},
             {
@@ -373,7 +374,7 @@ class TestSessionToWireBoundaryIntegration:
         flat = repr(captured)
         assert "secret reasoning" not in flat, "Reasoning text leaked into the SDK boundary payload"
 
-    def test_replay_true_preserves_thinking_at_wire(self) -> None:
+    def test_replay_true_preserves_thinking_at_wire(self, tmp_db: str) -> None:
         msgs: list[dict[str, Any]] = [
             {"role": "user", "content": "hello"},
             {
@@ -395,7 +396,10 @@ class TestSessionToWireBoundaryIntegration:
             f"Replay-true did not preserve thinking at wire: blocks={block_types}"
         )
 
-    def test_capability_false_strips_thinking_even_when_operator_flag_true(self) -> None:
+    def test_capability_false_strips_thinking_even_when_operator_flag_true(
+        self,
+        tmp_db: str,
+    ) -> None:
         # Mirror of the OpenAI Responses ``test_capability_false_omits_
         # include_even_when_flag_true`` test below: operator flips
         # replay=True but the model's capability advertises
@@ -505,8 +509,8 @@ class TestSessionToOpenAIResponsesBoundaryIntegration:
         session._stream_response(0)
         return captured
 
-    def test_replay_true_adds_include_to_responses_request(self) -> None:
-        session = _make_session()
+    def test_replay_true_adds_include_to_responses_request(self, tmp_db: str) -> None:
+        session = _make_registered_session()
         registry = self._registry_with_reasoning_capability(replay=True, supports_replay=True)
         captured = self._drive(
             session,
@@ -516,8 +520,8 @@ class TestSessionToOpenAIResponsesBoundaryIntegration:
         )
         assert captured.get("include") == ["reasoning.encrypted_content"]
 
-    def test_replay_false_omits_include(self) -> None:
-        session = _make_session()
+    def test_replay_false_omits_include(self, tmp_db: str) -> None:
+        session = _make_registered_session()
         registry = self._registry_with_reasoning_capability(replay=False, supports_replay=True)
         captured = self._drive(
             session,
@@ -527,11 +531,11 @@ class TestSessionToOpenAIResponsesBoundaryIntegration:
         )
         assert "include" not in captured
 
-    def test_capability_false_omits_include_even_when_flag_true(self) -> None:
+    def test_capability_false_omits_include_even_when_flag_true(self, tmp_db: str) -> None:
         # Operator flips replay=True but the model has
         # supports_reasoning_replay=False (e.g. gpt-4o via Responses).
         # Capability gate prevents the include= from being sent.
-        session = _make_session()
+        session = _make_registered_session()
         registry = self._registry_with_reasoning_capability(replay=True, supports_replay=False)
         captured = self._drive(
             session,
@@ -541,8 +545,8 @@ class TestSessionToOpenAIResponsesBoundaryIntegration:
         )
         assert "include" not in captured
 
-    def test_replay_true_emits_reasoning_input_item(self) -> None:
-        session = _make_session()
+    def test_replay_true_emits_reasoning_input_item(self, tmp_db: str) -> None:
+        session = _make_registered_session()
         registry = self._registry_with_reasoning_capability(replay=True, supports_replay=True)
         # Multi-turn conversation with stored reasoning on assistant turn.
         msgs: list[dict[str, Any]] = [

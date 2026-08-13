@@ -1988,7 +1988,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/MemoryInfo"
+                  "$ref": "#/components/schemas/MemorySummary"
                 }
               }
             }
@@ -2108,6 +2108,96 @@
       }
     },
     "/v1/api/memories/{name}": {
+      "get": {
+        "summary": "Fetch a structured memory body by exact name and scope",
+        "operationId": "v1_api_memories_{name}_get",
+        "tags": [
+          "Memories"
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$",
+              "maxLength": 256
+            },
+            "description": "Canonical lowercase ASCII snake_case memory identifier"
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Scope (default: global)"
+          },
+          {
+            "name": "scope_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Scope identifier"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
       "delete": {
         "summary": "Delete a structured memory by name and scope",
         "operationId": "v1_api_memories_{name}_delete",
@@ -2120,8 +2210,11 @@
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string"
-            }
+              "type": "string",
+              "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$",
+              "maxLength": 256
+            },
+            "description": "Canonical lowercase ASCII snake_case memory identifier"
           },
           {
             "name": "scope",
@@ -2673,12 +2766,12 @@
               }
             ],
             "default": null,
-            "description": "Optional denial reason",
+            "description": "Optional feedback forwarded under the initiating execution principal; authorized peer resolvers must omit it.",
             "title": "Feedback"
           },
           "always": {
             "default": false,
-            "description": "Auto-approve the tools in this batch going forward",
+            "description": "For a same-principal approval, auto-approve these tools for future calls executing as that principal. Authorized peers cannot set this.",
             "title": "Always",
             "type": "boolean"
           },
@@ -3993,9 +4086,10 @@
       "SaveMemoryRequest": {
         "properties": {
           "name": {
-            "description": "Memory identifier (normalized to snake_case)",
+            "description": "Memory identifier. Latin input is normalized to a lowercase ASCII snake_case semantic key; unsupported scripts and punctuation are rejected.",
             "maxLength": 256,
             "minLength": 1,
+            "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$",
             "title": "Name",
             "type": "string"
           },
@@ -4007,7 +4101,8 @@
             "type": "string"
           },
           "description": {
-            "description": "Required non-empty description used for relevance matching",
+            "description": "Required authored one-line memory-index hook",
+            "maxLength": 512,
             "minLength": 1,
             "title": "Description",
             "type": "string"
@@ -4096,16 +4191,26 @@
             "title": "Scope Id",
             "type": "string"
           },
-          "content": {
-            "title": "Content",
-            "type": "string"
-          },
           "created": {
             "title": "Created",
             "type": "string"
           },
           "updated": {
             "title": "Updated",
+            "type": "string"
+          },
+          "last_accessed": {
+            "default": "",
+            "title": "Last Accessed",
+            "type": "string"
+          },
+          "access_count": {
+            "default": 0,
+            "title": "Access Count",
+            "type": "integer"
+          },
+          "content": {
+            "title": "Content",
             "type": "string"
           }
         },
@@ -4114,9 +4219,9 @@
           "name",
           "type",
           "scope",
-          "content",
           "created",
-          "updated"
+          "updated",
+          "content"
         ],
         "title": "MemoryInfo",
         "type": "object"
@@ -4125,7 +4230,7 @@
         "properties": {
           "memories": {
             "items": {
-              "$ref": "#/components/schemas/MemoryInfo"
+              "$ref": "#/components/schemas/MemorySummary"
             },
             "title": "Memories",
             "type": "array"
@@ -4140,6 +4245,75 @@
           "memories"
         ],
         "title": "ListMemoriesResponse",
+        "type": "object"
+      },
+      "MemorySummary": {
+        "properties": {
+          "memory_id": {
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "user",
+              "general",
+              "feedback",
+              "reference"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "global",
+              "workstream",
+              "user"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "scope_id": {
+            "default": "",
+            "title": "Scope Id",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "title": "Updated",
+            "type": "string"
+          },
+          "last_accessed": {
+            "default": "",
+            "title": "Last Accessed",
+            "type": "string"
+          },
+          "access_count": {
+            "default": 0,
+            "title": "Access Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "memory_id",
+          "name",
+          "type",
+          "scope",
+          "created",
+          "updated"
+        ],
+        "title": "MemorySummary",
         "type": "object"
       },
       "SearchMemoriesRequest": {
@@ -4402,6 +4576,25 @@
           }
         },
         "title": "ListAvailableModelsResponse",
+        "type": "object"
+      },
+      "AuthWhoamiResponse": {
+        "description": "GET /v1/api/auth/whoami response.",
+        "properties": {
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          },
+          "permissions": {
+            "default": "",
+            "title": "Permissions",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "title": "AuthWhoamiResponse",
         "type": "object"
       }
     }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Pydantic evaluates this annotation while building the schema, so the symbol
 # must remain available at runtime rather than behind TYPE_CHECKING.
@@ -142,9 +142,19 @@ class TextToSpeechRequest(BaseModel):
 
 class ApproveRequest(BaseModel):
     approved: bool = Field(description="True to approve, false to deny")
-    feedback: str | None = Field(default=None, description="Optional denial reason")
+    feedback: str | None = Field(
+        default=None,
+        description=(
+            "Optional feedback forwarded under the initiating execution principal; "
+            "authorized peer resolvers must omit it."
+        ),
+    )
     always: bool = Field(
-        default=False, description="Auto-approve the tools in this batch going forward"
+        default=False,
+        description=(
+            "For a same-principal approval, auto-approve these tools for future "
+            "calls executing as that principal. Authorized peers cannot set this."
+        ),
     )
     cycle_id: str | None = Field(
         default=None,
@@ -754,14 +764,19 @@ MemoryScope = Literal["global", "workstream", "user"]
 
 class SaveMemoryRequest(BaseModel):
     name: str = Field(
-        description="Memory identifier (normalized to snake_case)",
+        description=(
+            "Memory identifier. Latin input is normalized to a lowercase ASCII "
+            "snake_case semantic key; unsupported scripts and punctuation are rejected."
+        ),
         min_length=1,
         max_length=256,
+        pattern=r"^[a-z0-9]+(?:_[a-z0-9]+)*$",
     )
     content: str = Field(description="Memory content", min_length=1, max_length=65536)
     description: str = Field(
-        description="Required non-empty description used for relevance matching",
+        description="Required authored one-line memory-index hook",
         min_length=1,
+        max_length=512,
     )
     type: MemoryType | None = Field(
         default=None,
@@ -773,10 +788,22 @@ class SaveMemoryRequest(BaseModel):
         description="Scope identifier (ws_id for workstream, user_id for user scope)",
     )
 
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: object) -> str:
+        from turnstone.core.memory import normalize_memory_name
+
+        return normalize_memory_name(value)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def _normalize_description(cls, value: object) -> str:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        return normalize_memory_description(value)
+
     @model_validator(mode="after")
     def _validate_scope_scope_id(self) -> SaveMemoryRequest:
-        if not self.description.strip():
-            raise ValueError("description is required and must be non-empty")
         scope_id = self.scope_id.strip()
         if self.scope == "global" and scope_id:
             raise ValueError("scope_id is not allowed with global scope")
@@ -785,20 +812,25 @@ class SaveMemoryRequest(BaseModel):
         return self
 
 
-class MemoryInfo(BaseModel):
+class MemorySummary(BaseModel):
     memory_id: str
     name: str
     description: str = ""
     type: MemoryType
     scope: MemoryScope
     scope_id: str = ""
-    content: str
     created: str
     updated: str
+    last_accessed: str = ""
+    access_count: int = 0
+
+
+class MemoryInfo(MemorySummary):
+    content: str
 
 
 class ListMemoriesResponse(BaseModel):
-    memories: list[MemoryInfo]
+    memories: list[MemorySummary]
     total: int = 0
 
 

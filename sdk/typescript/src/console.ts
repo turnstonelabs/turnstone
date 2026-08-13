@@ -1,8 +1,10 @@
 import { BaseClient, type ClientOptions } from "./base.js";
 import type { ClusterEvent } from "./events.js";
+import { normalizeMemoryDescription } from "./memory_description.js";
 import type {
   AdminListMemoriesOptions,
   AdminMemoryInfo,
+  AdminMemorySummary,
   AdminSearchMemoriesOptions,
   AttachmentContent,
   AttachmentUpload,
@@ -34,6 +36,7 @@ import type {
   ListSettingsResponse,
   ListSkillResourcesResponse,
   ListSkillsResponse,
+  MemoryIndexHealthResponse,
   McpServerDetail,
   RegistryInstallRequest,
   RegistrySearchResponse,
@@ -492,6 +495,20 @@ export class TurnstoneConsole extends BaseClient {
 
   async getMemory(memoryId: string): Promise<AdminMemoryInfo> {
     return this.request("GET", `/v1/api/admin/memories/${memoryId}`);
+  }
+
+  async updateMemoryDescription(
+    memoryId: string,
+    description: string,
+  ): Promise<AdminMemorySummary> {
+    const normalized = normalizeMemoryDescription(description);
+    return this.request("PATCH", `/v1/api/admin/memories/${memoryId}`, {
+      json: { description: normalized },
+    });
+  }
+
+  async memoryIndexHealth(): Promise<MemoryIndexHealthResponse> {
+    return this.request("GET", "/v1/api/admin/memories/index-health");
   }
 
   async deleteMemory(memoryId: string): Promise<StatusResponse> {
