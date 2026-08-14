@@ -255,11 +255,13 @@ class TestMemoryIndexStorage:
         assert backend.delete_workstream("ws-index") is True
         assert backend.get_memory_index_snapshot("ws-index") is None
 
-    def test_snapshot_commit_guard_rejection_rolls_back_candidate(self, backend) -> None:
+    def test_snapshot_commit_context_rejection_rolls_back_candidate(self, backend) -> None:
         backend.register_workstream("ws-guard", user_id="u1")
 
         @contextlib.contextmanager
-        def reject_commit():
+        def reject_commit(candidate):
+            assert candidate is not None
+            assert candidate["ws_id"] == "ws-guard"
             raise RuntimeError("generation superseded")
             yield
 
@@ -267,10 +269,25 @@ class TestMemoryIndexStorage:
             backend.acquire_memory_index_snapshot(
                 "ws-guard",
                 "u1",
-                commit_guard=reject_commit,
+                commit_context=reject_commit,
             )
 
         assert backend.get_memory_index_snapshot("ws-guard") is None
+
+    def test_snapshot_commit_context_is_not_entered_without_candidate(self, backend) -> None:
+        @contextlib.contextmanager
+        def unexpected_context(_candidate):
+            raise AssertionError("missing workstreams have no commit candidate")
+            yield
+
+        assert (
+            backend.acquire_memory_index_snapshot(
+                "missing-workstream",
+                "u1",
+                commit_context=unexpected_context,
+            )
+            is None
+        )
 
     def test_writes_do_not_count_as_fetches_and_lists_omit_content(self, backend) -> None:
         backend.create_structured_memory(
@@ -347,6 +364,8 @@ class TestMemoryIndexStorage:
         self,
         backend,
     ) -> None:
+        backend.create_user("owner", "owner", "Owner", "hash")
+        backend.create_user("member", "member", "Member", "hash")
         backend.create_project("health-project", "Health Project", "owner")
         backend.create_role(
             "health-reader",
@@ -457,6 +476,8 @@ class TestMemoryIndexStorage:
         expected: bool,
     ) -> None:
         """Health uses the exact capture policy for every RBAC topology."""
+        for user_id in {"owner", principal}:
+            backend.create_user(user_id, user_id, user_id.title(), "hash")
         project_id = f"matrix-{scenario}-{kind}"
         if state != "missing":
             backend.create_project(project_id, "Matrix Project", "owner", visibility=visibility)
@@ -719,3 +740,74 @@ def test_health_metric_index_matches_brute_force_envelopes() -> None:
         expected = brute_force(inputs)
         actual = memory_index_health(budget_chars=65_536, storage=FakeStorage(inputs))
         assert {key: actual[key] for key in expected} == expected, inputs
+
+
+def test_health_project_authorization_scales_with_distinct_live_projects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Public-project health reuses reader metrics instead of P x J matrices."""
+    from turnstone.core.memory import _PrincipalMetricSet
+
+    principal_count = 64
+    project_count = 64
+    principals = [f"u{index}" for index in range(principal_count)]
+    inputs = {
+        "entries": [],
+        "workstreams": [
+            {
+                "ws_id": f"p{index}-interactive",
+                "kind": "interactive",
+                "user_id": principals[index % principal_count],
+                "project_id": f"p{index}",
+            }
+            for index in range(project_count)
+        ]
+        + [
+            {
+                "ws_id": f"p{index}-coordinator",
+                "kind": "coordinator",
+                "user_id": principals[index % principal_count],
+                "project_id": f"p{index}",
+            }
+            for index in range(project_count)
+        ],
+        "projects": [
+            {
+                "project_id": f"p{index}",
+                "owner_id": principals[index % principal_count],
+                "visibility": "public",
+                "state": "active",
+            }
+            for index in range(project_count)
+        ],
+        "members": [],
+        "users": [{"user_id": user_id} for user_id in principals],
+        "roles": [
+            {
+                "role_id": "reader",
+                "permissions": "project.read",
+                "builtin": False,
+            }
+        ],
+        "user_roles": [{"user_id": user_id, "role_id": "reader"} for user_id in principals],
+        "role_overrides": [],
+    }
+
+    class FakeStorage:
+        def get_memory_index_health_inputs(self):
+            return inputs
+
+    metric_bucket_counts: list[int] = []
+    real_init = _PrincipalMetricSet.__init__
+
+    def counting_init(self, buckets):
+        metric_bucket_counts.append(len(buckets))
+        real_init(self, buckets)
+
+    monkeypatch.setattr(_PrincipalMetricSet, "__init__", counting_init)
+
+    memory_index_health(budget_chars=65_536, storage=FakeStorage())
+
+    # Two unfiltered scope metrics plus two project.read-filtered metrics.
+    # Neither distinct projects nor workstreams multiply principal scans.
+    assert metric_bucket_counts == [principal_count] * 4

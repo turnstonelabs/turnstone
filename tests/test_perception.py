@@ -100,8 +100,8 @@ def test_describe_lowers_prompt_then_by_reference_parts() -> None:
     assert prov.last_messages is not None
     content = prov.last_messages[0]["content"]
     assert content[0]["type"] == "text"  # prompt leads
-    # model_turn materializes before admission, then hands the provider the
-    # prebuilt inline part with no resolver left to invoke under the gate.
+    # model_turn materializes before the model-capacity lease, then hands the
+    # provider the prebuilt inline part with no resolver left under the gate.
     assert content[1] == _parts()[0]
     assert prov.last_resolve is None
 

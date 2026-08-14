@@ -372,6 +372,7 @@ class TestActingPrincipalProjectAuthority:
         from turnstone.core.memory import get_structured_memory_by_name, save_structured_memory
 
         storage = get_storage()
+        storage.create_user("guest", "guest", "Guest", "hash")
         storage.create_project("p1", "Shared", "owner")
         storage.create_role(
             "project-writer",
@@ -486,6 +487,44 @@ class TestProjectDefaultSaveScope:
         )
         assert out.get("scope") == "project"
         assert out.get("scope_id") == "p1"
+
+    def test_stored_attachment_fails_closed_until_authorized_reactivation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project = {"can_read": False, "state": "missing"}
+
+        def resolve(*_args: object, **_kwargs: object) -> auth.ProjectAccess:
+            return auth.ProjectAccess(
+                project["can_read"],
+                project["can_read"],
+                "Shared",
+                project["state"],
+            )
+
+        monkeypatch.setattr(auth, "resolve_project_access", resolve)
+        session = _session(user_id="owner", ws_id="shared", project_id="p1")
+
+        for state, can_read in (("missing", False), ("archived", True), ("active", False)):
+            project.update(state=state, can_read=can_read)
+            item = session._prepare_memory("get", {"action": "get", "name": "probe"})
+            assert "active attached project" in item["error"]
+            assert "scopes_to_try" not in item
+
+        project.update(state="active", can_read=True)
+        get_item = session._prepare_memory("get", {"action": "get", "name": "probe"})
+        save_item = session._prepare_memory(
+            "save",
+            {
+                "action": "save",
+                "name": "probe",
+                "content": "body",
+                "description": "Probe memory",
+            },
+        )
+        assert get_item["scopes_to_try"] == [("project", "p1")]
+        assert save_item["scope"] == "project"
+        assert save_item["scope_id"] == "p1"
 
 
 class TestProjectDefaultGetDeleteScope:

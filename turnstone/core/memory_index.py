@@ -2,7 +2,7 @@
 
 The index is model-visible durable state. It is rendered once from a complete
 metadata snapshot, persisted byte-for-byte, and reused for the lifetime of its
-globally unique workstream. Memory bodies never enter this module: they remain
+durable workstream row. Memory bodies never enter this module: they remain
 available only through an explicit memory ``get``.
 """
 

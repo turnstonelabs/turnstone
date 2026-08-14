@@ -5,8 +5,11 @@ from __future__ import annotations
 import time
 
 import pytest
+import sqlalchemy as sa
 
 from turnstone.core.storage import StorageConflictError
+from turnstone.core.storage._schema import users
+from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Atomic OIDC user provisioning
@@ -555,6 +558,14 @@ class TestReplaceOIDCRoles:
         assert added == set()
         assert removed == set()
 
+    def test_missing_user_is_rejected_without_orphan_assignment(self, db):
+        self._seed_role(db, "role-a")
+
+        with pytest.raises(ValueError, match="user 'missing-user' does not exist"):
+            db.replace_oidc_roles("missing-user", {"role-a"})
+
+        assert db.list_user_roles("missing-user") == []
+
     def test_desired_role_blocked_by_admin_ui_assignment(self, db):
         """Desired role already held via admin-ui: untouched, no PK conflict."""
         db.create_user("u1", "alice", "Alice", "h")
@@ -658,3 +669,38 @@ class TestReplaceOIDCRoles:
         after = db.list_user_roles("u1")
         assert len(after) == 1
         assert after[0]["assignment_created"] == original_created
+
+    def test_replace_oidc_roles_revalidates_user_after_write_lock(self, db):
+        if not isinstance(db, SQLiteBackend):
+            pytest.skip("SQLite optimistic-read schedule")
+
+        db.create_user("u1", "alice", "Alice", "h")
+        self._seed_role(db, "role-a")
+        deleted = False
+
+        def delete_before_write_lock(
+            _conn,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            nonlocal deleted
+            if deleted or statement.strip().upper() != "BEGIN IMMEDIATE":
+                return
+            deleted = True
+            with db._engine.connect() as delete_conn:
+                delete_conn.execute(sa.delete(users).where(users.c.user_id == "u1"))
+                delete_conn.commit()
+
+        sa.event.listen(db._engine, "before_cursor_execute", delete_before_write_lock)
+        try:
+            with pytest.raises(ValueError, match="user 'u1' does not exist"):
+                db.replace_oidc_roles("u1", {"role-a"})
+        finally:
+            sa.event.remove(db._engine, "before_cursor_execute", delete_before_write_lock)
+
+        assert deleted
+        assert db.get_user("u1") is None
+        assert db.list_user_roles("u1") == []

@@ -235,6 +235,18 @@ class TestServerSaveMemory:
         )
         assert r.status_code == 201
         data = r.json()
+        assert set(data) == {
+            "memory_id",
+            "name",
+            "description",
+            "type",
+            "scope",
+            "scope_id",
+            "created",
+            "updated",
+            "last_accessed",
+            "access_count",
+        }
         assert data["name"] == "my_key"
         assert "content" not in data
         assert data["type"] == "general"
@@ -254,6 +266,56 @@ class TestServerSaveMemory:
         fetched = server_client.get("/v1/api/memories/key")
         assert fetched.status_code == 200
         assert fetched.json()["content"] == "v2"
+
+    @pytest.mark.anyio
+    async def test_python_sdk_omission_preserves_type_through_server(
+        self,
+        server_client: TestClient,
+    ) -> None:
+        import httpx
+
+        from turnstone.sdk.server import AsyncTurnstoneServer
+
+        def forward(request: httpx.Request) -> httpx.Response:
+            response = server_client.request(
+                request.method,
+                request.url.raw_path.decode(),
+                content=request.content,
+                headers={"content-type": request.headers.get("content-type", "")},
+            )
+            return httpx.Response(
+                response.status_code,
+                content=response.content,
+                headers={"content-type": response.headers.get("content-type", "")},
+            )
+
+        transport = httpx.MockTransport(forward)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            sdk = AsyncTurnstoneServer(httpx_client=http)
+            created = await sdk.save_memory(
+                "typed_note",
+                "v1",
+                description="Typed note",
+                mem_type="feedback",
+            )
+            preserved = await sdk.save_memory(
+                "typed_note",
+                "v2",
+                description="Updated typed note",
+            )
+            fetched = await sdk.get_memory("typed_note")
+            reclassified = await sdk.save_memory(
+                "typed_note",
+                "v3",
+                description="Reclassified typed note",
+                mem_type="general",
+            )
+
+        assert created.type == "feedback"
+        assert preserved.type == "feedback"
+        assert fetched.type == "feedback"
+        assert fetched.content == "v2"
+        assert reclassified.type == "general"
 
     def test_with_type_and_scope(self, server_client, storage):
         _seed_workstream(storage)
@@ -640,6 +702,7 @@ class TestAdminListMemories:
         r = admin_client.get("/v1/api/admin/memories")
         assert r.json()["total"] == 2
         assert all("content" not in row for row in r.json()["memories"])
+        assert all("scope_label" in row for row in r.json()["memories"])
 
     def test_filter(self, admin_client, storage):
         _seed_memory(storage, "a", "1", mem_type="user")
@@ -693,6 +756,8 @@ class TestAdminGetMemory:
         assert r.status_code == 200
         assert r.json()["name"] == "k"
         assert r.json()["content"] == "content"
+        assert r.json()["scope_label"] == ""
+        assert r.json()["access_count"] == 1
         assert storage.get_structured_memory(mid)["access_count"] == 1
 
     def test_not_found(self, admin_client):
@@ -709,6 +774,8 @@ class TestAdminMemoryIndexMaintenance:
         )
         assert response.status_code == 200
         assert response.json()["description"] == "useful hook"
+        assert response.json()["scope_label"] == ""
+        assert "content" not in response.json()
         assert storage.get_structured_memory(mid)["description"] == "useful hook"
         events = storage.list_audit_events(action="memory.description_update")
         assert len(events) == 1

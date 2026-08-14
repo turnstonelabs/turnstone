@@ -557,7 +557,7 @@ class TestRouteCreate503Retry:
 
 
 class TestRouteCreate409Retry:
-    """Generated destination ids retry registry collisions at the router."""
+    """Generated destination ids retry live collisions at the router."""
 
     def test_generated_ws_id_collision_draws_another_id(self, monkeypatch):
         first_id = "1" * 32

@@ -126,18 +126,31 @@ class TestServerSpec:
         assert "application/json" in send["requestBody"]["content"]
 
     def test_memory_name_contract_is_published_on_body_and_path(self):
+        from jsonschema import validate
+
+        from turnstone.api.server_schemas import MEMORY_NAME_INPUT_DESCRIPTION
         from turnstone.api.server_spec import build_server_spec
 
         spec = build_server_spec()
-        expected_pattern = "^[a-z0-9]+(?:_[a-z0-9]+)*$"
         save_name = spec["components"]["schemas"]["SaveMemoryRequest"]["properties"]["name"]
-        assert save_name["pattern"] == expected_pattern
-        assert save_name["maxLength"] == 256
+        assert save_name["description"] == MEMORY_NAME_INPUT_DESCRIPTION
+        assert "pattern" not in save_name
+        assert "maxLength" not in save_name
+        raw_aliases = ["Café Notes", "Release — Checklist", "Ærø_Guide"]
+        for alias in raw_aliases:
+            validate(alias, save_name)
         for method in ("get", "delete"):
             operation = spec["paths"]["/v1/api/memories/{name}"][method]
             name = next(param for param in operation["parameters"] if param["name"] == "name")
-            assert name["schema"]["pattern"] == expected_pattern
-            assert name["schema"]["maxLength"] == 256
+            assert name["description"] == MEMORY_NAME_INPUT_DESCRIPTION
+            assert "pattern" not in name["schema"]
+            assert "maxLength" not in name["schema"]
+            for alias in raw_aliases:
+                validate(alias, name["schema"])
+        for response_model in ("MemorySummary", "MemoryInfo"):
+            response_name = spec["components"]["schemas"][response_model]["properties"]["name"]
+            assert "pattern" not in response_name
+            assert "maxLength" not in response_name
 
     def test_admin_verdict_contract_exposes_approval_principals(self):
         from turnstone.api.console_spec import build_console_spec
@@ -162,6 +175,7 @@ class TestServerSpec:
         assert cancel["requestBody"]["required"] is False
         assert "cycle_id" in spec["components"]["schemas"]["ApproveResponse"]["properties"]
         assert "dropped" in spec["components"]["schemas"]["CancelResponse"]["properties"]
+        assert "400" in approve["responses"]
 
     def test_create_status_is_optional_but_never_advertised_as_null(self):
         from turnstone.api.server_spec import build_server_spec
@@ -332,6 +346,31 @@ class TestConsoleSpec:
 
         live = spec["paths"]["/v1/api/route/workstreams/{ws_id}/live"]["get"]
         assert set(live["responses"]) == {"200", "400", "502", "503"}
+
+    def test_admin_memory_get_and_patch_publish_storage_failures(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        operations = build_console_spec()["paths"]["/v1/api/admin/memories/{memory_id}"]
+        assert set(operations["get"]["responses"]) == {"200", "404", "500", "503"}
+        assert set(operations["patch"]["responses"]) == {
+            "200",
+            "400",
+            "404",
+            "500",
+            "503",
+        }
+
+    def test_admin_memory_schemas_extend_public_metadata(self):
+        from turnstone.api.console_spec import build_console_spec
+        from turnstone.api.server_spec import build_server_spec
+
+        public = set(build_server_spec()["components"]["schemas"]["MemorySummary"]["properties"])
+        admin_schemas = build_console_spec()["components"]["schemas"]
+        admin_summary = set(admin_schemas["AdminMemorySummary"]["properties"])
+        admin_info = set(admin_schemas["AdminMemoryInfo"]["properties"])
+
+        assert admin_summary == public | {"scope_label"}
+        assert admin_info == admin_summary | {"content"}
 
     def test_coordinator_create_has_request_body_and_200(self):
         """Coordinator create returns 200 and accepts a body.

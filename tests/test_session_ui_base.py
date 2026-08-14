@@ -2828,6 +2828,34 @@ def test_resolve_all_approvals_wakes_every_gate() -> None:
         assert "Cancelled by user" in (box_a["feedback"] or "")
 
 
+def test_resolve_all_approvals_stamps_authenticated_resolver() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    first = _register_cycle(ui, ["a-1"], execution_principal_id="alice")
+    second = _register_cycle(ui, ["b-1"], execution_principal_id="bob")
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v-a", "call_id": "a-1"})
+
+    with _patch_get_storage(storage):
+        assert (
+            ui.resolve_all_approvals(
+                False,
+                "Cancelled by user",
+                resolver_principal_id="operator",
+            )
+            == 2
+        )
+
+    assert first.resolver_principal_id == "operator"
+    assert second.resolver_principal_id == "operator"
+    storage.update_intent_verdict.assert_any_call(
+        "v-a",
+        user_decision="denied",
+        resolver_principal_id="operator",
+        execution_principal_id="alice",
+    )
+
+
 def test_resolve_all_continues_after_first_resolution_transport_failure(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

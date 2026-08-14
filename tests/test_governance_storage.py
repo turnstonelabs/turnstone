@@ -102,6 +102,14 @@ class TestRoleCRUD:
         assert roles[0]["role_id"] == "r1"
         assert roles[0]["assigned_by"] == "admin"
 
+    def test_assign_role_rejects_missing_user(self, db):
+        db.create_role("r1", "editor", "Editor", "read,write", builtin=False, org_id="")
+
+        with pytest.raises(ValueError, match="user 'missing' does not exist"):
+            db.assign_role("missing", "r1", assigned_by="admin")
+
+        assert db.list_user_roles("missing") == []
+
     def test_assign_role_idempotent(self, db):
         db.create_role("r1", "editor", "Editor", "read,write", builtin=False, org_id="")
         db.create_user("u1", "alice", "Alice", "$2b$hash")

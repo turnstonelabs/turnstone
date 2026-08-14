@@ -3288,10 +3288,13 @@ class TestLiveConfigUpdate:
 
         # Default: relevance_k=5
         assert session._mem_cfg.relevance_k == 5
+        assert session._mem_cfg.model_index_over_budget_notice is False
 
         # Admin changes the setting
         cs.set("memory.relevance_k", 10, changed_by="test")
         assert session._mem_cfg.relevance_k == 10
+        cs.set("memory.model_index_over_budget_notice", True, changed_by="test")
+        assert session._mem_cfg.model_index_over_budget_notice is True
 
     def test_judge_config_reads_from_config_store(self, tmp_db):
         """_judge_cfg returns live behavioral flags from ConfigStore."""
@@ -6916,11 +6919,10 @@ class TestCoordinatorMemoryScope:
         )
         assert "error" in item
 
-        # The implicit read lane must fail closed too: the storage
-        # helpers treat a falsy scope_id as "no scope_id filter", so
-        # ("coordinator", "") would otherwise read EVERY user's
-        # coordinator rows.  Seed another user's row and prove the
-        # unauthenticated double sees nothing, not everything.
+        # The implicit read lane must fail closed too: an anonymous
+        # coordinator namespace is invalid. Seed another user's row and
+        # prove the constructor-bypassing double synthesizes no visible
+        # coordinator scope.
         from turnstone.core.memory import save_structured_memory
 
         save_structured_memory(
@@ -7345,8 +7347,9 @@ class TestPerKindToolVariants:
         # 'project' scope, alongside its isolated 'coordinator' namespace.
         assert scope["enum"] == ["coordinator", "project"]
         scope_desc = scope["description"]
-        assert "Save/get/delete without scope target project when attached" in scope_desc
-        assert "otherwise coordinator" in scope_desc
+        assert "stored project attachment pins unscoped save/get/delete to project" in scope_desc
+        assert "fails closed without fallback" in scope_desc
+        assert "no project attachment defaults to coordinator" in scope_desc
         assert "valid explicit scope selects exactly that scope" in scope_desc
 
     def test_coord_memory_tool_description_mentions_orchestration(self):
@@ -7368,8 +7371,9 @@ class TestPerKindToolVariants:
         # v1.7: 'project' is offered (usable when the workstream is attached).
         assert scope["enum"] == ["global", "workstream", "user", "project"]
         scope_desc = scope["description"]
-        assert "Save/get/delete without scope target project when attached" in scope_desc
-        assert "otherwise global" in scope_desc
+        assert "stored project attachment pins unscoped save/get/delete to project" in scope_desc
+        assert "fails closed without fallback" in scope_desc
+        assert "no project attachment defaults to global" in scope_desc
         assert "valid explicit scope selects exactly that scope" in scope_desc
 
     def test_ic_memory_tool_description_omits_coord_scope(self):
@@ -7496,6 +7500,390 @@ class TestMemoryIndexSnapshotLifecycle:
         assert "<memory-index" in str(wire)
         assert session._system_prefix_dirty is False
 
+    def test_snapshot_commit_failure_does_not_publish_candidate_prefix(self, tmp_db):
+        from turnstone.core.memory_index import render_memory_index
+
+        session = _make_registered_session(ws_id="commit-failure-index", user_id="owner")
+        session._known_senders = {"original-sender"}
+        session._shared_workstream = False
+        session._db_senders_loaded = False
+        session._senders_dirty = True
+        original_prefix = list(session.system_messages)
+        original_system_tokens = session._system_tokens
+        original_shared_state = (
+            set(session._known_senders),
+            session._shared_workstream,
+            session._db_senders_loaded,
+            session._senders_dirty,
+        )
+        rendered = render_memory_index([])
+        candidate = {
+            "ws_id": session.ws_id,
+            "principal_id": "owner",
+            "project_id": "",
+            "project_name": "",
+            "content": rendered.content,
+            "entry_count": rendered.entry_count,
+            "char_count": rendered.char_count,
+            "invalid_description_count": rendered.invalid_description_count,
+        }
+
+        def fail_commit(
+            ws_id: str,
+            principal_id: str,
+            *,
+            commit_context: Any,
+        ) -> dict[str, Any]:
+            assert ws_id == session.ws_id
+            assert principal_id == "owner"
+            with commit_context(candidate):
+                raise RuntimeError("snapshot commit failed")
+            raise AssertionError("snapshot commit unexpectedly returned")
+
+        with (
+            patch(
+                "turnstone.core.session.acquire_memory_index_snapshot",
+                side_effect=fail_commit,
+            ),
+            pytest.raises(RuntimeError, match="snapshot commit failed"),
+        ):
+            self._admit(session, "owner")
+
+        assert session._memory_index_snapshot is None
+        assert session.system_messages == original_prefix
+        assert session._system_tokens == original_system_tokens
+        assert self._index_text(session) == ""
+        assert (
+            session._known_senders,
+            session._shared_workstream,
+            session._db_senders_loaded,
+            session._senders_dirty,
+        ) == original_shared_state
+
+    def test_small_context_refuses_without_dispatch_or_snapshot_then_retries(self, tmp_db):
+        from turnstone.core.attachments import Attachment
+        from turnstone.core.memory import delete_structured_memory_returning_strict
+        from turnstone.core.memory_relevance import MemoryConfig
+        from turnstone.core.model_turn import ModelAdmissionError
+        from turnstone.core.personas import PersonaSnapshot
+        from turnstone.core.storage import get_storage
+
+        for index in range(20):
+            self._save(
+                f"oversized_{index}",
+                "private body",
+                description="D" * 500,
+            )
+        ui = NullUI()
+        ui.on_error = MagicMock()
+        session = _make_registered_session(
+            ws_id="small-context-index",
+            user_id="owner",
+            ui=ui,
+            context_window=4096,
+            max_tokens=512,
+            memory_config=MemoryConfig(nudges=False),
+            persona_snapshot=PersonaSnapshot(
+                "memory-only",
+                "You are helpful.",
+                frozenset({"memory"}),
+                False,
+                True,
+            ),
+        )
+        session._title_generated = True
+        provider = seam_provider("ok")
+        replace_session_lane(session, provider=provider)
+        resolve_attachments = MagicMock(
+            side_effect=AssertionError("refusal must precede attachment materialization")
+        )
+        provisional, provisional_capacity, _ = session._memory_index_prefix_estimate(
+            session.system_messages,
+            session._primary_lane(),
+        )
+        assert provisional <= provisional_capacity
+
+        with (
+            patch.object(session, "_resolve_attachments", resolve_attachments),
+            pytest.raises(ModelAdmissionError) as raised,
+        ):
+            session.send(
+                "Use the available context.",
+                attachments=[
+                    Attachment(
+                        attachment_id="oversized-document",
+                        filename="context.txt",
+                        mime_type="text/plain",
+                        kind="text",
+                        content=b"attachment context",
+                    )
+                ],
+                acting_user_id="owner",
+            )
+
+        detail = str(raised.value.__cause__)
+        assert "complete final prefix is estimated at" in detail
+        assert "4,096-token context" in detail
+        assert "memory index " in detail and " characters" in detail
+        assert "larger-context model" in detail
+        assert "delete/consolidate memories" in detail
+        assert "did not commit a new memory-index snapshot" in detail
+        assert provider.create_streaming.call_count == 0
+        resolve_attachments.assert_not_called()
+        assert get_storage().get_memory_index_snapshot(session.ws_id) is None
+        ui.on_error.assert_called_once_with(detail)
+        admitted_user = next(turn for turn in session.messages if turn.role is Role.USER)
+        assert admitted_user.text.startswith("Use the available context.")
+        assert admitted_user.meta.extra["sender"] == "owner"
+
+        for index in range(18):
+            assert delete_structured_memory_returning_strict(f"oversized_{index}") is not None
+        session.send("Retry after remediation.", acting_user_id="owner")
+
+        snapshot = get_storage().get_memory_index_snapshot(session.ws_id)
+        assert snapshot is not None
+        assert snapshot["entry_count"] == 2
+        assert provider.create_streaming.call_count == 1
+
+    def test_prefix_only_gate_does_not_project_tool_definitions(self, tmp_db):
+        session = _make_registered_session(ws_id="prefix-only-index", user_id="owner")
+
+        with patch.object(
+            session,
+            "_get_active_tools",
+            side_effect=AssertionError("tool projection is outside the prefix-only gate"),
+        ):
+            prefix_tokens, input_capacity, context_window = session._memory_index_prefix_estimate(
+                session.system_messages,
+                session._primary_lane(),
+            )
+
+        assert prefix_tokens > 0
+        assert input_capacity == (
+            session.context_window
+            - min(session.max_tokens, session.context_window // 4)
+            - int(session.context_window * 0.05)
+        )
+        assert context_window == session.context_window
+
+    def test_large_context_admits_complete_index_and_dispatches(self, tmp_db):
+        from turnstone.core.memory_relevance import MemoryConfig
+        from turnstone.core.personas import PersonaSnapshot
+        from turnstone.core.storage import get_storage
+
+        for index in range(20):
+            self._save(
+                f"large_{index}",
+                "private body",
+                description="D" * 500,
+            )
+        session = _make_registered_session(
+            ws_id="large-context-index",
+            user_id="owner",
+            context_window=32_768,
+            max_tokens=1024,
+            memory_config=MemoryConfig(nudges=False),
+            persona_snapshot=PersonaSnapshot(
+                "memory-only",
+                "You are helpful.",
+                frozenset({"memory"}),
+                False,
+                True,
+            ),
+        )
+        session._title_generated = True
+        provider = seam_provider("ok")
+        replace_session_lane(session, provider=provider)
+
+        session.send("Use the available context.", acting_user_id="owner")
+
+        snapshot = get_storage().get_memory_index_snapshot(session.ws_id)
+        assert snapshot is not None
+        assert snapshot["entry_count"] == 20
+        assert snapshot["content"] == self._index_text(session)
+        assert provider.create_streaming.call_count == 1
+
+    def test_first_capture_transaction_does_not_reenter_prefix_storage_planning(self, tmp_db):
+        from turnstone.core.storage import get_storage
+
+        self._save("runbook", "private body", description="Incident procedure")
+        session = _make_registered_session(ws_id="pool-safe-index", user_id="owner")
+        storage = get_storage()
+        real_acquire = storage.acquire_memory_index_snapshot
+        real_build = session._build_system_prefix_plan
+        real_sizing = session._memory_index_sizing
+        capture_active = False
+
+        def acquire(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+            nonlocal capture_active
+            capture_active = True
+            try:
+                return real_acquire(*args, **kwargs)
+            finally:
+                capture_active = False
+
+        def build(*args: Any, **kwargs: Any) -> Any:
+            assert not capture_active
+            return real_build(*args, **kwargs)
+
+        def sizing(*args: Any, **kwargs: Any) -> Any:
+            assert not capture_active
+            return real_sizing(*args, **kwargs)
+
+        with (
+            patch.object(storage, "acquire_memory_index_snapshot", side_effect=acquire),
+            patch.object(session, "_build_system_prefix_plan", side_effect=build),
+            patch.object(session, "_memory_index_sizing", side_effect=sizing),
+        ):
+            self._admit(session, "owner")
+
+        assert get_storage().get_memory_index_snapshot(session.ws_id) is not None
+
+    def test_raced_existing_snapshot_refusal_reports_truthful_remediation(self, tmp_db):
+        from turnstone.core.personas import PersonaSnapshot
+        from turnstone.core.storage import get_storage
+
+        for index in range(20):
+            self._save(
+                f"raced_{index}",
+                "private body",
+                description="D" * 500,
+            )
+        persona = PersonaSnapshot(
+            "memory-only",
+            "You are helpful.",
+            frozenset({"memory"}),
+            False,
+            True,
+        )
+        winner = _make_registered_session(
+            ws_id="raced-index",
+            user_id="first-owner",
+            context_window=32_768,
+            persona_snapshot=persona,
+        )
+        self._admit(winner, "first-owner")
+        storage = get_storage()
+        durable = storage.get_memory_index_snapshot(winner.ws_id)
+        assert durable is not None
+
+        loser = _make_registered_session(
+            ws_id="raced-index",
+            user_id="first-owner",
+            context_window=4096,
+            max_tokens=512,
+            persona_snapshot=persona,
+        )
+        # Model a first-capture pre-load miss followed by the adapter finding
+        # the winner's row inside its transaction.
+        loser._memory_index_snapshot = None
+        generation = loser._claim_generation(principal_id="second-owner")
+        loser._memory_index_admission_generation = generation
+        real_build = loser._build_system_prefix_plan
+        with (
+            patch.object(storage, "get_memory_index_snapshot", return_value=None),
+            patch.object(loser, "_build_system_prefix_plan", wraps=real_build) as build,
+            pytest.raises(RuntimeError) as raised,
+        ):
+            loser._admit_memory_index_request(
+                loser._primary_lane(),
+                my_generation=generation,
+                principal_id="second-owner",
+            )
+
+        detail = str(raised.value)
+        assert "if this workstream still has no immutable snapshot" in detail
+        assert "did not commit a new memory-index snapshot" in detail
+        assert durable["principal_id"] == "first-owner"
+        assert storage.get_memory_index_snapshot(winner.ws_id) == durable
+        assert build.call_count == 1
+
+    def test_first_capture_uses_fallback_lane_context_window(self, tmp_db):
+        import dataclasses
+
+        from turnstone.core.model_registry import ModelConfig
+        from turnstone.core.storage import get_storage
+
+        session = _make_registered_session(
+            ws_id="fallback-context-index",
+            user_id="owner",
+            context_window=32_768,
+        )
+        registry = MagicMock()
+        registry.get_config.return_value = SimpleNamespace(context_window=32_768)
+        session._registry = registry
+        frozen_config = ModelConfig(
+            alias="small-fallback",
+            base_url="https://frozen.invalid/v1",
+            api_key="test",
+            model="small-fallback-model",
+            context_window=2048,
+        )
+        fallback = dataclasses.replace(
+            session._primary_lane(),
+            alias="small-fallback",
+            model="small-fallback-model",
+            registry=registry,
+            backend_auth_config=frozen_config,
+        )
+        generation = session._claim_generation(principal_id="owner")
+        session._memory_index_admission_generation = generation
+
+        with pytest.raises(RuntimeError, match="2,048-token context"):
+            session._admit_memory_index_request(
+                fallback,
+                my_generation=generation,
+                principal_id="owner",
+            )
+
+        registry.get_config.assert_not_called()
+        assert get_storage().get_memory_index_snapshot(session.ws_id) is None
+
+    def test_admitted_prefix_invalidates_resumed_provider_anchor(self, tmp_db):
+        from turnstone.core.trajectory import TurnProvenance
+
+        self._save("runbook", "private body", description="Incident procedure")
+        session = _make_registered_session(ws_id="anchored-index", user_id="owner")
+        lane = session._primary_lane()
+        session.messages.append(Turn.user("resumed history"))
+        session._msg_tokens.append(1)
+        session._activate_token_calibration(lane)
+        session._last_usage = {
+            "prompt_tokens": 900,
+            "completion_tokens": 10,
+            "total_tokens": 910,
+        }
+        session._update_token_table(
+            msgs=[{"role": "user", "content": "x" * 3600}],
+            tool_def_chars=0,
+            provenance=TurnProvenance(
+                model_alias=lane.alias,
+                backend_model_id=lane.model,
+                registry_generation=lane.registry_generation,
+            ),
+        )
+        key = session._active_token_calibration_key
+        assert key is not None
+        assert session._token_calibrations[key].prompt_tokens == 900
+        assert session._last_usage_calibration_key == key
+
+        self._admit(session, "owner")
+
+        calibration = session._token_calibrations[key]
+        assert calibration.prompt_tokens is None
+        assert calibration.message_prefix_ids == ()
+        assert session._last_usage is None
+        assert session._last_usage_calibration_key is None
+        assert session._calibrated_msg_count == 0
+        system_chars = sum(session._msg_char_count(message) for message in session.system_messages)
+        assert session._system_tokens == max(
+            1,
+            int(system_chars / session._chars_per_token),
+        )
+        assert session._estimated_prompt_tokens() == (
+            session._system_tokens + sum(session._msg_tokens) + session._tool_def_tokens()
+        )
+
     def test_capture_is_complete_metadata_only_and_immutable(self, tmp_db):
         from turnstone.core.memory import delete_structured_memory_returning_strict
 
@@ -7519,16 +7907,22 @@ class TestMemoryIndexSnapshotLifecycle:
         assert "garden_notes" in captured
 
     def test_same_tuple_reuses_persisted_bytes_across_session_instances(self, tmp_db):
+        from turnstone.core.storage import get_storage
+
         self._save("runbook", "body", description="Incident procedure")
         first = _make_registered_session(ws_id="shared-index", user_id="owner")
         self._admit(first, "owner")
         captured = self._index_text(first)
+        durable = get_storage().get_memory_index_snapshot(first.ws_id)
+        assert durable is not None
 
         self._save("newer", "body", description="Created after capture")
         reopened = _make_registered_session(ws_id="shared-index", user_id="owner")
+        self._admit(reopened, "owner")
 
         assert self._index_text(reopened) == captured
         assert "newer" not in captured
+        assert get_storage().get_memory_index_snapshot(reopened.ws_id) == durable
 
     def test_first_principal_binds_one_shared_immutable_snapshot(self, tmp_db):
         self._save("global_note", "body")
@@ -7756,6 +8150,115 @@ class TestMemoryAccessTouch:
         _execute_prepared_tool(session, save_item)
         assert self._access_count("kafka_runbook") == 0
         assert self._access_count("another") == 0
+
+    @pytest.mark.parametrize(
+        ("enabled", "expect_notice"),
+        [(False, False), (True, True)],
+    )
+    def test_model_save_over_budget_notice_is_opt_in(
+        self,
+        tmp_db,
+        enabled: bool,
+        expect_notice: bool,
+    ) -> None:
+        from turnstone.core.memory_relevance import MemoryConfig
+
+        session = _make_registered_session(
+            ws_id=f"notice-{enabled}",
+            user_id="owner",
+            memory_config=MemoryConfig(
+                index_budget_chars=1,
+                model_index_over_budget_notice=enabled,
+            ),
+        )
+        item = session._prepare_memory(
+            "save",
+            {
+                "action": "save",
+                "name": "runbook",
+                "content": "private body",
+                "description": "Incident recovery procedure",
+                "scope": "global",
+            },
+        )
+
+        _call_id, message = _execute_prepared_tool(session, item)
+
+        assert ("configured soft budget" in message) is expect_notice
+        if expect_notice:
+            assert "/ 1 characters" in message
+            assert "delete" not in message.lower()
+            assert "compact" not in message.lower()
+
+    def test_model_save_backpressure_calls_prospective_facade(
+        self,
+        tmp_db,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[tuple[list[tuple[str, str]], str]] = []
+
+        def prospective(
+            scopes: list[tuple[str, str]],
+            *,
+            acting_principal_id: str = "",
+        ) -> dict[str, int]:
+            calls.append((scopes, acting_principal_id))
+            return {
+                "entry_count": 1,
+                "char_count": 100,
+                "invalid_description_count": 1,
+            }
+
+        monkeypatch.setattr("turnstone.core.session.prospective_memory_index", prospective)
+        session = self._session()
+        item = session._prepare_memory(
+            "save",
+            {
+                "action": "save",
+                "name": "runbook",
+                "content": "private body",
+                "description": "Incident recovery procedure",
+                "scope": "global",
+            },
+        )
+
+        _call_id, message = _execute_prepared_tool(session, item)
+
+        assert calls == [
+            (
+                [("global", ""), ("workstream", "ws-1"), ("user", "user-1")],
+                "user-1",
+            )
+        ]
+        assert "1 legacy entries need authored descriptions" in message
+
+    def test_model_save_backpressure_facade_failure_keeps_notice_wording(
+        self,
+        tmp_db,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def fail(*_args: object, **_kwargs: object) -> dict[str, int]:
+            raise RuntimeError("health unavailable")
+
+        monkeypatch.setattr("turnstone.core.session.prospective_memory_index", fail)
+        session = self._session()
+        item = session._prepare_memory(
+            "save",
+            {
+                "action": "save",
+                "name": "runbook",
+                "content": "private body",
+                "description": "Incident recovery procedure",
+                "scope": "global",
+            },
+        )
+
+        _call_id, message = _execute_prepared_tool(session, item)
+
+        assert message.endswith(
+            "\nNotice: complete live index health could not be calculated; "
+            "check admin memory index health before adding more entries."
+        )
 
     def test_get_is_the_only_tool_read_that_touches(self, tmp_db):
         session = self._session()

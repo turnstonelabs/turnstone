@@ -70,7 +70,6 @@ def build_console_session_factory(
     constructing a malformed session.
     """
     from turnstone.core.judge import JudgeConfig
-    from turnstone.core.memory_relevance import MemoryConfig
 
     def _build_judge_config() -> JudgeConfig:
         return JudgeConfig(
@@ -88,15 +87,6 @@ def build_console_session_factory(
             output_guard_model=config_store.get("judge.output_guard_model"),
             output_guard_llm_timeout=config_store.get("judge.output_guard_llm_timeout"),
             redact_secrets=config_store.get("judge.redact_secrets"),
-        )
-
-    def _build_memory_config() -> MemoryConfig:
-        return MemoryConfig(
-            relevance_k=config_store.get("memory.relevance_k"),
-            index_budget_chars=config_store.get("memory.index_budget_chars"),
-            max_content=config_store.get("memory.max_content"),
-            nudge_cooldown=config_store.get("memory.nudge_cooldown"),
-            nudges=config_store.get("memory.nudges"),
         )
 
     def factory(
@@ -163,7 +153,6 @@ def build_console_session_factory(
             except Exception:
                 log.debug("coord_factory.username_resolve_failed uid=%s", uid, exc_info=True)
 
-        live_memory_config = _build_memory_config()
         live_judge_config = _build_judge_config()
         # Coordinator MCP surface (#725): resolved per construction so the
         # session sees the CURRENT manager — the console ensure-helper can
@@ -247,7 +236,6 @@ def build_console_session_factory(
             skill=skill or None,
             judge_config=live_judge_config,
             user_id=uid,
-            memory_config=live_memory_config,
             config_store=config_store,
             client_type=ClientType(client_type)
             if client_type in {ct.value for ct in ClientType}

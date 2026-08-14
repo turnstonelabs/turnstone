@@ -833,9 +833,23 @@ def make_approve_handler(
         if isinstance(body, JSONResponse):
             return body
         ws_id = request.path_params.get("ws_id", "")
-        approved = bool(body.get("approved", False))
+        approved = body.get("approved")
+        if not isinstance(approved, bool):
+            return JSONResponse({"error": "approved must be a boolean"}, status_code=400)
         feedback = body.get("feedback")
-        always = bool(body.get("always", False))
+        if feedback is not None and not isinstance(feedback, str):
+            return JSONResponse({"error": "feedback must be a string or null"}, status_code=400)
+        always = body.get("always", False)
+        if not isinstance(always, bool):
+            return JSONResponse({"error": "always must be a boolean"}, status_code=400)
+        body_call_id_raw = body.get("call_id")
+        if body_call_id_raw is not None and not isinstance(body_call_id_raw, str):
+            return JSONResponse({"error": "call_id must be a string or null"}, status_code=400)
+        body_cycle_id_raw = body.get("cycle_id")
+        if body_cycle_id_raw is not None and not isinstance(body_cycle_id_raw, str):
+            return JSONResponse({"error": "cycle_id must be a string or null"}, status_code=400)
+        body_call_id = (body_call_id_raw or "").strip()
+        body_cycle_id = (body_cycle_id_raw or "").strip()
         resolver_principal_id = auth_user_id(request)
         if cfg.tenant_check is not None:
             err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
@@ -845,9 +859,11 @@ def make_approve_handler(
         if ws is None:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
         ui = ws.ui
-        if ui is None or not hasattr(ui, "resolve_approval"):
+        resolve_approval = getattr(ui, "resolve_approval", None)
+        find_cycle = getattr(ui, "find_approval_cycle", None)
+        if not callable(resolve_approval) or not callable(find_cycle):
             return JSONResponse(
-                {"error": "session UI does not support approval"},
+                {"error": "session UI does not support principal-aware approval"},
                 status_code=409,
             )
         # Cycle routing — with parallel task agents a workstream can
@@ -861,96 +877,53 @@ def make_approve_handler(
         #     unrelated batch;
         #   - neither (CLI wrappers, old tabs) → the OLDEST live cycle,
         #     matching the order the prompts were issued.
-        body_call_id_raw = body.get("call_id", "")
-        body_call_id = body_call_id_raw.strip() if isinstance(body_call_id_raw, str) else ""
-        body_cycle_id_raw = body.get("cycle_id", "")
-        body_cycle_id = body_cycle_id_raw.strip() if isinstance(body_cycle_id_raw, str) else ""
-        find_cycle = getattr(ui, "find_approval_cycle", None)
         target_card: dict[str, Any] | None = None
         pinned_cycle_id: str | None = None
-        if find_cycle is not None:
-            target_card = find_cycle(cycle_id=body_cycle_id or None, call_id=body_call_id or None)
-            if target_card is None and (body_cycle_id or body_call_id):
-                # Selector given but nothing matched: the round was
-                # resolved/replaced after this client rendered it.
-                # Report the CURRENT oldest cycle (first entry of
-                # ``serialize_pending_approval_details``) so the client
-                # can re-render against what the server thinks is live.
-                current = find_cycle()
-                current_items = (current or {}).get("items") or []
-                primary = next(
-                    (item.get("call_id", "") for item in current_items if item.get("call_id")),
-                    None,
-                )
-                return JSONResponse(
-                    {
-                        "error": ("stale call_id" if body_call_id else "stale cycle_id"),
-                        "current_call_id": primary,
-                        "current_cycle_id": (current or {}).get("cycle_id"),
-                    },
-                    status_code=409,
-                )
-            # Pin the resolution to the exact cycle the lookup returned.
-            # For selector-less bodies the lookup and the resolve would
-            # otherwise EACH independently pick "the oldest" — a cycle
-            # resolving in the gap (gate timeout, peer tab, smart
-            # approval) could silently retarget the resolve at the next
-            # cycle the operator never looked at.
-            pinned_cycle_id = (target_card or {}).get("cycle_id") or None
-        else:
-            # Legacy/stub UI (tests, external SessionUI impls): fall back
-            # to the single-slot view for selector validation.
-            target_card = getattr(ui, "_pending_approval", None)
-            if body_call_id:
-                if target_card is None:
-                    return JSONResponse(
-                        {"error": "no pending approval", "current_call_id": None},
-                        status_code=409,
-                    )
-                legacy_ids = {
-                    item.get("call_id", "")
-                    for item in target_card.get("items") or []
-                    if item.get("call_id")
-                }
-                if body_call_id not in legacy_ids:
-                    primary = next(iter(sorted(legacy_ids)), None)
-                    return JSONResponse(
-                        {"error": "stale call_id", "current_call_id": primary},
-                        status_code=409,
-                    )
+        target_card = find_cycle(cycle_id=body_cycle_id or None, call_id=body_call_id or None)
+        if target_card is None and (body_cycle_id or body_call_id):
+            # Selector given but nothing matched: the round was
+            # resolved/replaced after this client rendered it.
+            # Report the CURRENT oldest cycle (first entry of
+            # ``serialize_pending_approval_details``) so the client
+            # can re-render against what the server thinks is live.
+            current = find_cycle()
+            current_items = (current or {}).get("items") or []
+            primary = next(
+                (item.get("call_id", "") for item in current_items if item.get("call_id")),
+                None,
+            )
+            return JSONResponse(
+                {
+                    "error": ("stale call_id" if body_call_id else "stale cycle_id"),
+                    "current_call_id": primary,
+                    "current_cycle_id": (current or {}).get("cycle_id"),
+                },
+                status_code=409,
+            )
+        # Pin the resolution to the exact cycle the lookup returned.
+        # For selector-less bodies the lookup and the resolve would
+        # otherwise EACH independently pick "the oldest" — a cycle
+        # resolving in the gap (gate timeout, peer tab, smart
+        # approval) could silently retarget the resolve at the next
+        # cycle the operator never looked at.
+        pinned_cycle_id = (target_card or {}).get("cycle_id") or None
         # Resolve against the pinned cycle. The UI owns principal validation,
         # per-principal Always grants, durable attribution, and the resolved
         # SSE event as one cycle transition.
         try:
-            if find_cycle is not None:
-                if pinned_cycle_id is not None:
-                    resolved_cycle = ui.resolve_approval(
-                        approved,
-                        feedback,
-                        always=always,
-                        cycle_id=pinned_cycle_id,
-                        resolver_principal_id=resolver_principal_id,
-                    )
-                elif body_call_id or body_cycle_id:
-                    # Lookup matched a card that carries no cycle_id
-                    # (custom registrations outside ``approve_tools``):
-                    # honor the client's own selector.
-                    resolved_cycle = ui.resolve_approval(
-                        approved,
-                        feedback,
-                        always=always,
-                        call_id=body_call_id or None,
-                        cycle_id=body_cycle_id or None,
-                        resolver_principal_id=resolver_principal_id,
-                    )
-                else:
-                    # No selector AND nothing pending at lookup time:
-                    # resolve nothing rather than racing a cycle that
-                    # registered in the gap — the client can't have
-                    # been looking at it.
-                    resolved_cycle = None
-            else:
-                resolved_cycle = ui.resolve_approval(
+            if pinned_cycle_id is not None:
+                resolved_cycle = resolve_approval(
+                    approved,
+                    feedback,
+                    always=always,
+                    cycle_id=pinned_cycle_id,
+                    resolver_principal_id=resolver_principal_id,
+                )
+            elif body_call_id or body_cycle_id:
+                # Lookup matched a card that carries no cycle_id
+                # (custom registrations outside ``approve_tools``):
+                # honor the client's own selector.
+                resolved_cycle = resolve_approval(
                     approved,
                     feedback,
                     always=always,
@@ -958,12 +931,14 @@ def make_approve_handler(
                     cycle_id=body_cycle_id or None,
                     resolver_principal_id=resolver_principal_id,
                 )
+            else:
+                # No selector AND nothing pending at lookup time:
+                # resolve nothing rather than racing a cycle that
+                # registered in the gap — the client can't have
+                # been looking at it.
+                resolved_cycle = None
         except CrossPrincipalApprovalError as exc:
             return JSONResponse({"error": str(exc)}, status_code=409)
-        except TypeError:
-            # Pre-cycle SessionUI impls (external/custom) without the
-            # selector kwargs.
-            resolved_cycle = ui.resolve_approval(approved, feedback, always=always)
         return JSONResponse({"status": "ok", "cycle_id": resolved_cycle})
 
     return approve
@@ -1260,7 +1235,7 @@ def make_cancel_handler(
     thread so the UI recovers immediately.
 
     Both kinds share the cancel sequence (``session.cancel`` →
-    ``ui.resolve_approval(False)``).
+    ``ui.resolve_all_approvals(False)``).
     Per-kind divergence captured via the cfg + ``audit_emit``:
 
     - ``cancel_forensics`` (cfg) — when set, the lifted body calls
@@ -1301,16 +1276,14 @@ def make_cancel_handler(
       cancel addresses the workstream, so EVERY live cycle (parallel
       task agents can park several gates at once) wakes with its own
       denied result.  The sweep is a no-op when nothing is pending
-      (no stale ``approval_resolved`` broadcast on idle cancels);
-      legacy/stub UIs without it fall back to the old single-slot
-      ``resolve_approval`` gated on ``_pending_approval``.
+      (no stale ``approval_resolved`` broadcast on idle cancels).
     """
 
     async def cancel(request: Request) -> Response:
         import asyncio
 
         from turnstone.core import session_worker
-        from turnstone.core.web_helpers import read_json_or_400
+        from turnstone.core.web_helpers import auth_user_id, read_json_or_400
 
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
@@ -1386,23 +1359,22 @@ def make_cancel_handler(
         # idle cancels stay silent — the same property the old
         # pending-slot gate provided; the recovery semantics for a
         # stuck approval-pending state are preserved because a stuck
-        # cycle IS a live cycle.  Legacy/stub UIs without the sweep
-        # keep the old single-slot fallback.
+        # cycle IS a live cycle. Every production UI implements the
+        # attributed sweep; an incompatible custom UI is logged without
+        # weakening the workstream cancel itself.
         try:
             session.cancel()
         except Exception:
             log.debug("ws.cancel.session_failed ws=%s", ws_id[:8], exc_info=True)
         try:
-            if hasattr(ui, "resolve_all_approvals"):
-                ui.resolve_all_approvals(False, "Cancelled by user")
-            elif (
-                hasattr(ui, "resolve_approval")
-                and getattr(ui, "_pending_approval", None) is not None
-            ):
-                ui.resolve_approval(False, "Cancelled by user")
+            cast("SessionUIBase", ui).resolve_all_approvals(
+                False,
+                "Cancelled by user",
+                resolver_principal_id=auth_user_id(request),
+            )
         except Exception:
             log.debug(
-                "ws.cancel.resolve_approval_failed ws=%s",
+                "ws.cancel.resolve_all_approvals_failed ws=%s",
                 ws_id[:8],
                 exc_info=True,
             )

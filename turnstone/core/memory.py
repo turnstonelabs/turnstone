@@ -111,7 +111,7 @@ def normalize_memory_name(name: object) -> str:
                 continue
         if category.startswith("L"):
             raise ValueError(
-                "memory name contains unsupported non-Latin characters; "
+                "memory name contains unsupported characters; "
                 "choose an ASCII semantic key and keep native-language wording "
                 "in the description or content"
             )
@@ -1262,7 +1262,7 @@ def acquire_memory_index_snapshot(
     ws_id: str,
     principal_id: str,
     *,
-    commit_guard: Callable[[], AbstractContextManager[None]] | None = None,
+    commit_context: Callable[[dict[str, Any]], AbstractContextManager[None]] | None = None,
 ) -> dict[str, Any]:
     """Atomically bind or load one workstream's immutable memory index.
 
@@ -1270,12 +1270,18 @@ def acquire_memory_index_snapshot(
     admission rather than publish an empty block falsely described as complete.
     The backend resolves the live visibility envelope inside the same database
     transaction as its metadata read and first-writer insert.
+
+    When supplied, ``commit_context`` runs only for a concrete candidate. Its
+    pre-yield phase may reject, rolling back any newly inserted candidate; the
+    backend commit is the context body at yield; its post-yield phase therefore
+    runs after the commit and must be deterministic publication, not
+    rollback-dependent work.
     """
     storage = get_storage()
     snapshot = storage.acquire_memory_index_snapshot(
         ws_id,
         principal_id,
-        commit_guard=commit_guard,
+        commit_context=commit_context,
     )
     if snapshot is None:
         raise RuntimeError("memory index workstream is no longer active")
@@ -1399,15 +1405,16 @@ class _PrincipalMetricSet:
 def memory_index_health(*, budget_chars: int, storage: Any | None = None) -> dict[str, Any]:
     """Return derived health over possible envelopes in the live topology.
 
-    Memory rows are rendered to per-scope metrics once. Workstreams then add
-    those buckets, so the calculation is linear in memories plus topology and
-    does not depend on whether an old snapshot still happens to exist.
+    Memory rows are rendered to per-scope metrics once. Public projects reuse
+    one project-reader metric set; private projects intersect only their stored
+    memberships. The calculation never materializes a project-by-principal
+    matrix and does not depend on whether an old snapshot still exists.
     """
     from turnstone.core.memory_index import (
         memory_index_base_char_count,
         memory_index_entry_metrics,
     )
-    from turnstone.core.project_access import decide_project_access, fold_role_permissions
+    from turnstone.core.project_access import fold_role_permissions
 
     backend = storage or get_storage()
     inputs = backend.get_memory_index_health_inputs()
@@ -1479,30 +1486,25 @@ def memory_index_health(*, budget_chars: int, storage: Any | None = None) -> dic
             )
 
     def _principal_metrics(scope: str, ids: set[str] | None = None) -> _PrincipalMetricSet:
-        selected = ordered_principals if ids is None else sorted(ids & principal_ids)
+        selected = ordered_principals if ids is None else sorted(ids)
         return _PrincipalMetricSet(
             [buckets.get((scope, user_id), _IndexBucket()) for user_id in selected]
         )
 
     all_users = _principal_metrics("user")
     all_coordinators = _principal_metrics("coordinator")
-    project_user_metrics: dict[tuple[str, str], _PrincipalMetricSet] = {}
-
-    def _project_principals(project_id: str) -> set[str]:
-        project = projects[project_id]
-        members = project_members.get(project_id, set())
-        return {
-            principal_id
-            for principal_id in principal_ids
-            if decide_project_access(
-                principal_id=principal_id,
-                owner_id=str(project.get("owner_id") or ""),
-                visibility=str(project.get("visibility") or "private"),
-                state=str(project.get("state") or "active"),
-                is_member=principal_id in members,
-                permissions=permissions_by_principal.get(principal_id, set()),
-            ).can_read
-        }
+    project_readers = {
+        principal_id
+        for principal_id in principal_ids
+        if "project.read" in permissions_by_principal.get(principal_id, set())
+    }
+    reader_metrics = {
+        "user": _principal_metrics("user", project_readers),
+        "coordinator": _principal_metrics("coordinator", project_readers),
+    }
+    member_metrics: dict[tuple[str, str], _PrincipalMetricSet] = {}
+    principal_metrics: dict[tuple[str, str], _PrincipalMetricSet] = {}
+    eligible_members_by_project: dict[str, set[str]] = {}
 
     max_chars = memory_index_base_char_count(0)
     max_entries = 0
@@ -1519,6 +1521,45 @@ def memory_index_health(*, budget_chars: int, storage: Any | None = None) -> dic
         )
         max_entries = max(max_entries, base.entry_count + metrics.max_entries)
 
+    def _consider_project(base: _IndexBucket, scope: str, project_id: str) -> None:
+        """Consider the exact active-project reader envelopes without P x J sets."""
+        project = projects[project_id]
+        if str(project.get("state") or "active") != "active":
+            return
+        project_base = base + buckets.get(("project", project_id), _IndexBucket())
+        owner_id = str(project.get("owner_id") or "")
+        visibility = str(project.get("visibility") or "private")
+
+        # This is the set form of decide_project_access().can_read. The
+        # randomized brute-force test below compares this optimized path to
+        # that canonical single-principal policy across ACL/RBAC matrices.
+        if visibility == "public":
+            if project_readers:
+                _consider(project_base, reader_metrics[scope], project_id)
+            owner_is_included = owner_id in project_readers
+        else:
+            if project_id not in eligible_members_by_project:
+                eligible_members_by_project[project_id] = (
+                    project_members.get(project_id, set()) & project_readers
+                )
+            eligible_members = eligible_members_by_project[project_id]
+            if eligible_members:
+                key = (scope, project_id)
+                metrics = member_metrics.get(key)
+                if metrics is None:
+                    metrics = _principal_metrics(scope, eligible_members)
+                    member_metrics[key] = metrics
+                _consider(project_base, metrics, project_id)
+            owner_is_included = owner_id in eligible_members
+
+        if owner_id and not owner_is_included:
+            key = (scope, owner_id)
+            metrics = principal_metrics.get(key)
+            if metrics is None:
+                metrics = _principal_metrics(scope, {owner_id})
+                principal_metrics[key] = metrics
+            _consider(project_base, metrics, project_id)
+
     for workstream in inputs["workstreams"]:
         ws_id = str(workstream.get("ws_id") or "")
         kind = str(workstream.get("kind") or WorkstreamKind.INTERACTIVE.value)
@@ -1528,18 +1569,7 @@ def memory_index_health(*, budget_chars: int, storage: Any | None = None) -> dic
             _consider(_IndexBucket(), all_coordinators)
             envelope_count += len(principal_ids)
             if live_project:
-                allowed = _project_principals(live_project)
-                if allowed:
-                    key = ("coordinator", live_project)
-                    metrics = project_user_metrics.setdefault(
-                        key,
-                        _principal_metrics("coordinator", allowed),
-                    )
-                    _consider(
-                        buckets.get(("project", live_project), _IndexBucket()),
-                        metrics,
-                        live_project,
-                    )
+                _consider_project(_IndexBucket(), "coordinator", live_project)
             continue
 
         base = global_bucket + buckets.get(("workstream", ws_id), _IndexBucket())
@@ -1547,18 +1577,7 @@ def memory_index_health(*, budget_chars: int, storage: Any | None = None) -> dic
         # One anonymous envelope plus one exact user scope per known principal.
         envelope_count += len(principal_ids) + 1
         if live_project:
-            allowed = _project_principals(live_project)
-            if allowed:
-                key = ("user", live_project)
-                metrics = project_user_metrics.setdefault(
-                    key,
-                    _principal_metrics("user", allowed),
-                )
-                _consider(
-                    base + buckets.get(("project", live_project), _IndexBucket()),
-                    metrics,
-                    live_project,
-                )
+            _consider_project(base, "user", live_project)
 
     return {
         "budget_chars": budget_chars,

@@ -91,10 +91,8 @@ def build_memory_scope_or_clause(
     clauses: list[str] = []
     for i, (scope, scope_id) in enumerate(scopes):
         params[f"sc{i}"] = scope
-        parts = [f"scope = :sc{i}"]
-        if scope_id:
-            params[f"sid{i}"] = scope_id
-            parts.append(f"scope_id = :sid{i}")
+        params[f"sid{i}"] = scope_id
+        parts = [f"scope = :sc{i}", f"scope_id = :sid{i}"]
         clauses.append("(" + " AND ".join(parts) + ")")
     return " OR ".join(clauses), params
 
@@ -200,6 +198,7 @@ def _permissions_for_user_on_connection(
         sa.select(roles.c.role_id, roles.c.permissions, roles.c.builtin)
         .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
         .where(user_roles.c.user_id == user_id)
+        .order_by(roles.c.role_id)
     )
     if lock_rows:
         # Override replacement and deletion serialize on the stable role row.
@@ -365,9 +364,9 @@ def acquire_memory_index_snapshot_on_connection(
     The caller must begin a write transaction before invoking this helper
     (``BEGIN IMMEDIATE`` on SQLite; a row-locking transaction on PostgreSQL).
     Workstream identity, project ACL, visible memory metadata, rendering, and
-    the first-writer insert therefore describe one coherent state. Published
-    workstream ids are globally non-reusable, so ``ws_id`` is the complete
-    durable identity of the snapshot.
+    the first-writer insert therefore describe one coherent state. The
+    snapshot belongs to the current durable row; transactional hard-delete and
+    registration cleanup prevent a later same-ID row from inheriting it.
     """
     from turnstone.core.memory_index import (
         MEMORY_INDEX_FORMAT_VERSION,
@@ -424,12 +423,9 @@ def acquire_memory_index_snapshot_on_connection(
     if project_id:
         scopes.append(("project", project_id))
 
-    predicates: list[Any] = []
-    for scope, scope_id in scopes:
-        predicate = structured_memories.c.scope == scope
-        if scope_id:
-            predicate = sa.and_(predicate, structured_memories.c.scope_id == scope_id)
-        predicates.append(predicate)
+    predicates = [
+        structured_memory_exact_scope_predicate(scope, scope_id) for scope, scope_id in scopes
+    ]
     rows: list[dict[str, Any]] = []
     if predicates:
         result = conn.execute(

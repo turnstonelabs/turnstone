@@ -714,6 +714,32 @@ class TestRoleAssignments:
         roles = list_resp.json()["roles"]
         assert len(roles) >= 1
 
+    def test_assign_role_user_deleted_after_precheck_returns_404(
+        self,
+        client,
+        storage,
+        monkeypatch,
+    ):
+        create_resp = client.post("/v1/api/admin/roles", json=_role_payload())
+        role_id = create_resp.json()["role_id"]
+        assign_role = storage.assign_role
+
+        def delete_then_assign(user_id, target_role_id, assigned_by=""):
+            assert storage.delete_user(user_id)
+            return assign_role(user_id, target_role_id, assigned_by)
+
+        monkeypatch.setattr(storage, "assign_role", delete_then_assign)
+
+        resp = client.post(
+            "/v1/api/admin/users/user-1/roles",
+            json={"role_id": role_id},
+        )
+
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "User not found"}
+        assert storage.list_user_roles("user-1") == []
+        assert storage.list_audit_events(action="role.assign") == []
+
     def test_assign_role_missing_role_id(self, client):
         resp = client.post(
             "/v1/api/admin/users/user-1/roles",

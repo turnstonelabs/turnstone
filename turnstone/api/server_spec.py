@@ -19,6 +19,7 @@ from turnstone.api.schemas import (
     StatusResponse,
 )
 from turnstone.api.server_schemas import (
+    MEMORY_NAME_INPUT_DESCRIPTION,
     ApproveRequest,
     ApproveResponse,
     AvailableModelInfo,
@@ -141,7 +142,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Approve or deny a tool call",
         request_model=ApproveRequest,
         response_model=ApproveResponse,
-        error_codes=[404, 409],
+        error_codes=[400, 404, 409],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -536,9 +537,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         path_params=[
             PathParam(
                 "name",
-                "Canonical lowercase ASCII snake_case memory identifier",
-                pattern=r"^[a-z0-9]+(?:_[a-z0-9]+)*$",
-                max_length=256,
+                MEMORY_NAME_INPUT_DESCRIPTION,
             )
         ],
         query_params=[
@@ -556,9 +555,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         path_params=[
             PathParam(
                 "name",
-                "Canonical lowercase ASCII snake_case memory identifier",
-                pattern=r"^[a-z0-9]+(?:_[a-z0-9]+)*$",
-                max_length=256,
+                MEMORY_NAME_INPUT_DESCRIPTION,
             )
         ],
         query_params=[

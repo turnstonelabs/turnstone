@@ -82,7 +82,6 @@ from turnstone.core.storage._schema import (
     watches,
     workstream_attachments,
     workstream_config,
-    workstream_id_registry,
     workstream_overrides,
     workstreams,
 )
@@ -1450,27 +1449,12 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             workstreams.c.ws_id
         )
         with self._conn() as conn:
-            registry_stmt = pg_insert(workstream_id_registry).values(
-                ws_id=ws_id,
-                created=now,
-            )
-            registry_row = conn.execute(
-                registry_stmt.on_conflict_do_nothing(index_elements=["ws_id"]).returning(
-                    workstream_id_registry.c.ws_id
-                )
-            ).fetchone()
-            if registry_row is None:
-                conn.commit()
-                return False
             inserted_row = conn.execute(insert_stmt).fetchone()
             inserted = inserted_row is not None
-            if not inserted:
-                # Compatibility for a legacy/direct row that bypassed the
-                # registry. Migration 072 backfills every production row.
-                conn.execute(
-                    sa.delete(workstream_id_registry).where(workstream_id_registry.c.ws_id == ws_id)
-                )
             if inserted:
+                # Defensive cleanup for orphan data left by historical delete
+                # paths. A newly inserted row must not inherit memory state
+                # from an earlier workstream that used the same id.
                 conn.execute(
                     sa.delete(memory_index_snapshots).where(memory_index_snapshots.c.ws_id == ws_id)
                 )
@@ -1665,10 +1649,6 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
 
     def _delete_workstream_on_connection(self, conn: Any, ws_id: str) -> bool:
         """Delete one row and dependents inside the caller's transaction."""
-        state_row = conn.execute(
-            sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id)
-        ).fetchone()
-        was_unpublished = state_row is not None and str(state_row[0] or "") == "creating"
         # Refcount GC over every referenced blob (content-addressed ids are
         # global, so a deduped blob may be shared with another workstream —
         # decrement, don't blanket-delete by ws_id).  Blobs that hit 0 are
@@ -1708,10 +1688,6 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             .where(workstreams.c.ws_id == ws_id)
             .returning(workstreams.c.ws_id)
         ).fetchone()
-        if deleted is not None and was_unpublished:
-            conn.execute(
-                sa.delete(workstream_id_registry).where(workstream_id_registry.c.ws_id == ws_id)
-            )
         return deleted is not None
 
     def delete_workstream(self, ws_id: str) -> bool:
@@ -2201,9 +2177,14 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
     def delete_user(self, user_id: str) -> bool:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            # User deletion is rare and can remove assignments spanning any
-            # role. Lock stable role parents in canonical order before their
-            # assignment children, matching every other authority mutation.
+            # Authority mutations that touch both principal and role parents
+            # lock the principal first, then role ids in canonical order.
+            user = conn.execute(
+                sa.select(users.c.user_id).where(users.c.user_id == user_id).with_for_update()
+            ).fetchone()
+            if user is None:
+                conn.rollback()
+                return False
             conn.execute(
                 sa.select(roles.c.role_id).order_by(roles.c.role_id).with_for_update()
             ).fetchall()
@@ -3227,6 +3208,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
     def assign_role(self, user_id: str, role_id: str, assigned_by: str = "") -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            user = conn.execute(
+                sa.select(users.c.user_id).where(users.c.user_id == user_id).with_for_update()
+            ).fetchone()
+            if user is None:
+                raise ValueError(f"user {user_id!r} does not exist")
             role = conn.execute(
                 sa.select(roles.c.role_id).where(roles.c.role_id == role_id).with_for_update()
             ).fetchone()
@@ -3296,13 +3282,12 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            # Serialize this user's OIDC reconciliations on the stable user
-            # row.  Do not lock assignment children first: every role mutation
-            # follows role -> assignment/override, so child-first here would
-            # deadlock against role deletion.
-            conn.execute(
+            # Match delete_user's principal -> sorted-role lock order.
+            user = conn.execute(
                 sa.select(users.c.user_id).where(users.c.user_id == user_id).with_for_update()
             ).fetchone()
+            if user is None:
+                raise ValueError(f"user {user_id!r} does not exist")
             initial_rows = conn.execute(
                 sa.select(user_roles.c.role_id, user_roles.c.assigned_by).where(
                     user_roles.c.user_id == user_id
@@ -5267,11 +5252,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 scope_filters += " AND type = :type_filter"
                 params["type_filter"] = mem_type
             if scope:
-                exact_scope, exact_params = build_memory_scope_or_clause(
-                    [(scope, scope_id)],
-                )
-                scope_filters += f" AND ({exact_scope})"
-                params.update(exact_params)
+                scope_filters += " AND scope = :scope_filter"
+                params["scope_filter"] = scope
+                if scope_id:
+                    scope_filters += " AND scope_id = :scope_id_filter"
+                    params["scope_id_filter"] = scope_id
             rows = conn.execute(
                 sa.text(
                     "SELECT memory_id, name, description, type, scope, scope_id, "
@@ -5439,7 +5424,8 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         ws_id: str,
         principal_id: str,
         *,
-        commit_guard: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
+        commit_context: Callable[[dict[str, Any]], contextlib.AbstractContextManager[None]]
+        | None = None,
     ) -> dict[str, Any] | None:
         for attempt in range(3):
             with self._conn() as base_conn:
@@ -5455,7 +5441,12 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                         ws_id=ws_id,
                         principal_id=principal_id,
                     )
-                    with commit_guard() if commit_guard is not None else contextlib.nullcontext():
+                    context = (
+                        commit_context(row)
+                        if commit_context is not None and row is not None
+                        else contextlib.nullcontext()
+                    )
+                    with context:
                         conn.commit()
                     return row
                 except sa.exc.DBAPIError as exc:
@@ -5484,7 +5475,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
     def _build_scope_or_clause(
         scopes: list[tuple[str, str]],
     ) -> tuple[str, dict[str, str]]:
-        """Build a parameterized OR-group of (scope[, scope_id]) predicates."""
+        """Build a parameterized OR-group of exact (scope, scope_id) pairs."""
         return build_memory_scope_or_clause(scopes)
 
     def count_structured_memories(

@@ -164,6 +164,7 @@ def _src_storage(
     project_owner: str = "other",
     source_owner: str = "other",
     members: tuple[str, ...] = (),
+    permissions: tuple[str, ...] = ("project.read",),
     resolve_none: bool = False,
     get_project_missing: bool = False,
 ) -> MagicMock:
@@ -191,6 +192,7 @@ def _src_storage(
             "state": "active",
         }
     storage.is_project_member.side_effect = lambda pid, uid: uid in members
+    storage.get_user_permissions.return_value = set(permissions)
     return storage
 
 
@@ -483,7 +485,8 @@ class TestConsoleRequireProjectSurfacing:
 
     def test_attach_denied_403_masked(self) -> None:
         node = _node_resp(
-            403, {"error": "cannot attach a workstream to a private project you don't belong to"}
+            403,
+            {"error": "project is not available for workstream attachment"},
         )
         with _console_client(node) as client:
             resp = _create(client)

@@ -2720,7 +2720,7 @@ class TestSendGenerationInitializationPublication:
             _ws_id: str,
             principal_id: str,
             *,
-            commit_guard: Any,
+            commit_context: Any,
         ) -> dict[str, Any]:
             if principal_id == "old-private-user":
                 old_capture_started.set()
@@ -2730,16 +2730,18 @@ class TestSendGenerationInitializationPublication:
             else:
                 assert principal_id == "successor-user"
                 content = "<memory-index>successor_memory</memory-index>"
-            with commit_guard():
-                committed_principals.append(principal_id)
-            return {
+            candidate = {
                 "content": content,
+                "principal_id": principal_id,
                 "entry_count": 1,
                 "char_count": len(content),
                 "invalid_description_count": 0,
                 "project_id": "",
                 "project_name": "",
             }
+            with commit_context(candidate):
+                committed_principals.append(principal_id)
+            return candidate
 
         def admit_old() -> None:
             try:

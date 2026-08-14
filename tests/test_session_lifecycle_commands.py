@@ -78,7 +78,7 @@ def test_cli_delete_command_keeps_local_repl_behavior(tmp_db: str) -> None:
     ui.on_info.assert_called_once_with("Deleted workstream target")
 
 
-def test_cli_new_retries_a_consumed_generated_id(
+def test_cli_new_retries_a_live_generated_id(
     tmp_db: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -88,7 +88,6 @@ def test_cli_new_retries_a_consumed_generated_id(
     consumed = "a" * 32
     replacement = "b" * 32
     assert storage.register_workstream(consumed) is True
-    assert storage.delete_workstream(consumed) is True
     generated = iter((MagicMock(hex=consumed), MagicMock(hex=replacement)))
     monkeypatch.setattr("turnstone.core.session.uuid.uuid4", lambda: next(generated))
     session = make_registered_session(client_type=ClientType.CLI, ws_id="current-ws")
@@ -96,7 +95,7 @@ def test_cli_new_retries_a_consumed_generated_id(
     assert session.handle_command("/new") is False
 
     assert session.ws_id == replacement
-    assert storage.get_workstream(consumed) is None
+    assert storage.get_workstream(consumed) is not None
     assert storage.get_workstream(replacement) is not None
 
 

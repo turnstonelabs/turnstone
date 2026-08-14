@@ -12,6 +12,7 @@ the lifted ``approve`` and ``close`` handlers from
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
@@ -163,6 +164,7 @@ def _make_client(
     coord_mgr=None,
     alias="my-model",
     registry=None,
+    raise_server_exceptions: bool = True,
 ) -> TestClient:
     """Build a TestClient exposing just the coordinator routes."""
     coord_attachments = make_attachment_handlers(_coord_endpoint_config)
@@ -295,7 +297,7 @@ def _make_client(
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
     app.state.auth_storage = storage
     app.state.jwt_secret = "x" * 64
-    return TestClient(app)
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +573,29 @@ def test_create_returns_ws_id_and_records_audit(storage):
     events = storage.list_audit_events(user_id="user-1", limit=10)
     actions = [e["action"] for e in events]
     assert "coordinator.create" in actions
+
+
+def test_create_unreadable_project_refuses_without_partial_create(storage):
+    storage.create_project(
+        "public-without-read",
+        "Public Without Read",
+        "project-owner",
+        visibility="public",
+    )
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "must-not-exist", "project_id": "public-without-read"},
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 403
+    assert resp.json() == {"error": "project is not available for workstream attachment"}
+    assert mgr.list_all() == []
+    assert storage.list_workstreams() == []
+    assert storage.list_audit_events(action="coordinator.create") == []
 
 
 def _capture_factory_pair():
@@ -1304,6 +1329,114 @@ def test_approve_call_id_matches_any_item_in_multi_envelope(storage):
     assert cycle.event.is_set()
 
 
+def test_approve_invokes_modern_handler_once_with_pinned_identity(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cycle = _seed_pending(ws, "c-modern")
+    real_find = ws.ui.find_approval_cycle
+    real_resolve = ws.ui.resolve_approval
+    ws.ui.find_approval_cycle = MagicMock(wraps=real_find)
+    ws.ui.resolve_approval = MagicMock(wraps=real_resolve)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "feedback": "ship it", "call_id": "c-modern"},
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 200
+    ws.ui.find_approval_cycle.assert_called_once_with(cycle_id=None, call_id="c-modern")
+    ws.ui.resolve_approval.assert_called_once_with(
+        True,
+        "ship it",
+        always=False,
+        cycle_id=cycle.cycle_id,
+        resolver_principal_id="user-1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "field"),
+    [
+        ({}, "approved"),
+        ({"approved": "false"}, "approved"),
+        ({"approved": True, "always": "false"}, "always"),
+        ({"approved": True, "feedback": ["no"]}, "feedback"),
+        ({"approved": True, "call_id": 123}, "call_id"),
+        ({"approved": True, "cycle_id": ["cycle"]}, "cycle_id"),
+    ],
+)
+def test_approve_rejects_malformed_fields_without_resolving(storage, body, field):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cycle = _seed_pending(ws, "c-malformed")
+    ws.ui.find_approval_cycle = MagicMock(wraps=ws.ui.find_approval_cycle)
+    ws.ui.resolve_approval = MagicMock(wraps=ws.ui.resolve_approval)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json=body,
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 400
+    assert field in resp.json()["error"]
+    ws.ui.find_approval_cycle.assert_not_called()
+    ws.ui.resolve_approval.assert_not_called()
+    assert not cycle.event.is_set()
+
+
+def test_approve_rejects_ui_without_cycle_routing(storage):
+    class _LegacyApprovalUI:
+        def resolve_approval(self, *_args, **_kwargs):
+            raise AssertionError("legacy resolver must not be called")
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    ws.ui = _LegacyApprovalUI()
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True},
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json() == {"error": "session UI does not support principal-aware approval"}
+
+
+def test_approve_callback_type_error_is_not_retried(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    cycle = _seed_pending(ws, "c-bug")
+    ws.ui.resolve_approval = MagicMock(side_effect=TypeError("callback implementation bug"))
+    client = _make_client(
+        storage,
+        coord_mgr=mgr,
+        registry=_fake_registry(),
+        raise_server_exceptions=False,
+    )
+
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": False, "call_id": "c-bug"},
+        headers=_COORD_HEADERS,
+    )
+
+    assert resp.status_code == 500
+    ws.ui.resolve_approval.assert_called_once_with(
+        False,
+        None,
+        always=False,
+        cycle_id=cycle.cycle_id,
+        resolver_principal_id="user-1",
+    )
+    assert not cycle.event.is_set()
+
+
 def test_selectorless_always_whitelists_only_the_resolved_oldest_cycle(storage):
     """sweep-3 regression: with several live cycles, a selector-less
     "Approve + Always" must whitelist the tools of the cycle it
@@ -1816,6 +1949,22 @@ def test_cancel_resolves_pending_approval(storage):
     assert first.event.is_set()
     assert second.event.is_set()
     assert first.result == (False, "Cancelled by user")
+    assert first.resolver_principal_id == "user-1"
+    assert second.resolver_principal_id == "user-1"
+
+
+def test_cancel_does_not_fallback_to_single_cycle_approval_api(storage):
+    """An incompatible UI cannot bypass the attributed all-cycle sweep."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    single_cycle_resolver = MagicMock()
+    ws.ui = SimpleNamespace(resolve_approval=single_cycle_resolver)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
+
+    assert resp.status_code == 200
+    single_cycle_resolver.assert_not_called()
 
 
 def test_cancel_response_always_includes_dropped_key(storage):

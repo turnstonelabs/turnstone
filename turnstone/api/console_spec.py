@@ -816,7 +816,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "GET",
         "Get a single memory by ID",
         response_model=AdminMemoryInfo,
-        error_codes=[404],
+        error_codes=[404, 500, 503],
         tags=["Admin"],
     ),
     EndpointSpec(
@@ -825,7 +825,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Update a memory's authored index description",
         request_model=UpdateMemoryDescriptionRequest,
         response_model=AdminMemorySummary,
-        error_codes=[400, 404, 500],
+        error_codes=[400, 404, 500, 503],
         tags=["Admin"],
     ),
     EndpointSpec(

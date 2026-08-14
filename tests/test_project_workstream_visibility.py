@@ -29,6 +29,8 @@ def _fake_storage(
     visibility: str = "private",
     owner: str = "alice",
     members: tuple[str, ...] = (),
+    permissions: tuple[str, ...] = (),
+    state: str = "active",
     missing: bool = False,
 ) -> MagicMock:
     storage = MagicMock()
@@ -40,9 +42,10 @@ def _fake_storage(
             "name": "P1",
             "owner_id": owner,
             "visibility": visibility,
-            "state": "active",
+            "state": state,
         }
     storage.is_project_member.side_effect = lambda pid, uid: uid in members
+    storage.get_user_permissions.return_value = set(permissions)
     return storage
 
 
@@ -146,33 +149,137 @@ class TestEnsureProjectAttachable:
 
     def test_unknown_project_is_400(self) -> None:
         denied = ensure_project_attachable("bob", "p1", storage=_fake_storage(missing=True))
-        assert denied is not None and denied[0] == 400
+        assert denied == (400, "unknown project_id")
 
-    def test_public_project_allowed(self) -> None:
-        assert (
-            ensure_project_attachable("bob", "p1", storage=_fake_storage(visibility="public"))
-            is None
+    @pytest.mark.parametrize(
+        ("scenario", "user_id", "storage", "allowed"),
+        [
+            ("owner-no-role", "alice", _fake_storage(), True),
+            (
+                "private-member-read",
+                "bob",
+                _fake_storage(members=("bob",), permissions=("project.read",)),
+                True,
+            ),
+            (
+                "private-member-no-read",
+                "bob",
+                _fake_storage(members=("bob",)),
+                False,
+            ),
+            (
+                "private-member-read-revoked",
+                "bob",
+                _fake_storage(members=("bob",), permissions=()),
+                False,
+            ),
+            (
+                "private-member-write-only",
+                "bob",
+                _fake_storage(members=("bob",), permissions=("project.write",)),
+                False,
+            ),
+            (
+                "public-nonmember-read",
+                "bob",
+                _fake_storage(visibility="public", permissions=("project.read",)),
+                True,
+            ),
+            (
+                "public-nonmember-no-read",
+                "bob",
+                _fake_storage(visibility="public"),
+                False,
+            ),
+            (
+                "public-nonmember-write-only",
+                "bob",
+                _fake_storage(visibility="public", permissions=("project.write",)),
+                False,
+            ),
+            (
+                "private-nonmember-read",
+                "bob",
+                _fake_storage(permissions=("project.read",)),
+                False,
+            ),
+            (
+                "archived-owner",
+                "alice",
+                _fake_storage(state="archived"),
+                False,
+            ),
+            (
+                "archived-public-reader",
+                "bob",
+                _fake_storage(
+                    visibility="public",
+                    state="archived",
+                    permissions=("project.read",),
+                ),
+                False,
+            ),
+            (
+                "empty-principal-public",
+                "",
+                _fake_storage(visibility="public", permissions=("project.read",)),
+                False,
+            ),
+        ],
+    )
+    def test_active_project_read_matrix(
+        self,
+        scenario: str,
+        user_id: str,
+        storage: MagicMock,
+        allowed: bool,
+    ) -> None:
+        del scenario
+        result = ensure_project_attachable(user_id, "p1", storage=storage)
+        assert (result is None) is allowed
+        if not allowed:
+            assert result == (403, "project is not available for workstream attachment")
+
+    @pytest.mark.parametrize(
+        "failed_operation",
+        ["get_project", "is_project_member", "get_user_permissions"],
+    )
+    def test_storage_error_fails_closed(self, failed_operation: str) -> None:
+        storage = _fake_storage(
+            visibility="public",
+            permissions=("project.read",),
+        )
+        getattr(storage, failed_operation).side_effect = RuntimeError("db down")
+
+        assert ensure_project_attachable("bob", "p1", storage=storage) == (
+            403,
+            "project is not available for workstream attachment",
         )
 
-    def test_private_member_and_owner_allowed(self) -> None:
-        assert (
-            ensure_project_attachable("bob", "p1", storage=_fake_storage(members=("bob",))) is None
+    def test_existing_project_is_fetched_once(self) -> None:
+        storage = _fake_storage(members=("bob",), permissions=("project.read",))
+
+        assert ensure_project_attachable("bob", "p1", storage=storage) is None
+        storage.get_project.assert_called_once_with("p1")
+        storage.is_project_member.assert_called_once_with("p1", "bob")
+        storage.get_user_permissions.assert_called_once_with("bob")
+
+    def test_effective_project_read_revocation_denies_attach(self, tmp_db: str) -> None:
+        from turnstone.core.storage import get_storage
+
+        storage = get_storage()
+        storage.create_user("bob", "bob", "Bob", "hash")
+        storage.create_project("p1", "P1", "alice")
+        storage.add_project_member("p1", "bob")
+        storage.create_role("reader", "reader", "Reader", "project.read", True)
+        storage.assign_role("bob", "reader")
+
+        assert ensure_project_attachable("bob", "p1", storage=storage) is None
+        storage.set_role_overrides("reader", set(), {"project.read"})
+        assert ensure_project_attachable("bob", "p1", storage=storage) == (
+            403,
+            "project is not available for workstream attachment",
         )
-        assert ensure_project_attachable("alice", "p1", storage=_fake_storage()) is None
-
-    def test_private_non_member_is_403(self) -> None:
-        denied = ensure_project_attachable("bob", "p1", storage=_fake_storage())
-        assert denied is not None and denied[0] == 403
-
-    def test_anonymous_private_is_403(self) -> None:
-        denied = ensure_project_attachable("", "p1", storage=_fake_storage())
-        assert denied is not None and denied[0] == 403
-
-    def test_storage_error_fails_closed(self) -> None:
-        storage = MagicMock()
-        storage.get_project.side_effect = RuntimeError("db down")
-        denied = ensure_project_attachable("bob", "p1", storage=storage)
-        assert denied is not None and denied[0] == 403
 
 
 class TestResolveWorkstreamOwnerProjectGate:
@@ -431,7 +538,8 @@ class TestClusterTenancyFilter:
 
 class TestCreateValidatorProjectGate:
     """The interactive create validator's attach gate: explicit ids are
-    strict, inherited ids tolerate a deleted project (real ephemeral DB)."""
+    strict, inherited ids need active read access, and tolerate a deleted
+    project (real ephemeral DB)."""
 
     async def test_inherited_dangling_project_is_stripped(self, tmp_db: str) -> None:
         from turnstone.core.memory import register_workstream
@@ -450,6 +558,20 @@ class TestCreateValidatorProjectGate:
         err = await _interactive_create_validate_request(MagicMock(), body, "alice", [])
         assert err is not None and err.status_code == 400
 
+    @pytest.mark.parametrize("project_id", [None, "   ", 123])
+    async def test_empty_or_non_string_project_remains_projectless(
+        self,
+        tmp_db: str,
+        project_id: Any,
+    ) -> None:
+        from turnstone.server import _interactive_create_validate_request
+
+        body: dict[str, Any] = {"kind": "interactive", "project_id": project_id}
+        err = await _interactive_create_validate_request(MagicMock(), body, "alice", [])
+
+        assert err is None
+        assert body["project_id"] == ""
+
     async def test_inherited_private_revoked_membership_403s(self, tmp_db: str) -> None:
         from turnstone.core.memory import register_workstream
         from turnstone.core.storage import get_storage
@@ -467,8 +589,11 @@ class TestCreateValidatorProjectGate:
         from turnstone.server import _interactive_create_validate_request
 
         storage = get_storage()
+        storage.create_user("alice", "alice", "Alice", "hash")
         storage.create_project("p-ok", "P", "zed")
         storage.add_project_member("p-ok", "alice")
+        storage.create_role("project-reader", "project-reader", "Reader", "project.read", False)
+        storage.assign_role("alice", "project-reader")
         register_workstream("coord-3", user_id="alice", kind="coordinator", project_id="p-ok")
         body: dict = {"kind": "interactive", "parent_ws_id": "coord-3"}
         err = await _interactive_create_validate_request(MagicMock(), body, "alice", [])

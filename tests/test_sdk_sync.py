@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 
 from turnstone.sdk._sync import _SyncRunner
@@ -90,6 +92,52 @@ def test_sync_server_list_workstreams():
         assert len(resp.workstreams) == 1
         # Row key renamed id → ws_id in the Stage 2 list-verb lift.
         assert resp.workstreams[0].ws_id == "ws1"
+    finally:
+        server.close()
+
+
+def test_sync_server_save_memory_preserves_omission_and_explicit_type():
+    bodies: list[dict[str, object]] = []
+    current_type = "feedback"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal current_type
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "type" in body:
+            current_type = str(body["type"])
+        return _json_response(
+            {
+                "memory_id": f"m{len(bodies)}",
+                "name": body["name"],
+                "description": body["description"],
+                "type": current_type,
+                "scope": body["scope"],
+                "scope_id": "",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    hc = httpx.AsyncClient(transport=transport, base_url="http://test")
+    async_client = AsyncTurnstoneServer(httpx_client=hc)
+    server = TurnstoneServer.__new__(TurnstoneServer)
+    server._runner = _SyncRunner()
+    server._async = async_client
+
+    try:
+        defaulted = server.save_memory("key", "v2", description="Updated body")
+        explicit = server.save_memory(
+            "key",
+            "v3",
+            description="Reclassified body",
+            mem_type="general",
+        )
+        assert defaulted.type == "feedback"
+        assert explicit.type == "general"
+        assert "type" not in bodies[0]
+        assert bodies[1]["type"] == "general"
     finally:
         server.close()
 

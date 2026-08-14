@@ -1975,8 +1975,9 @@ permission.
 | `scope_id` | string | no       | `""`    | Filter by scope ID           |
 | `limit`    | int    | no       | `100`   | Max results (capped at 200)  |
 
-**Response:** `200` -- the same body-free summary schema as
-`GET /v1/api/memories`.
+**Response:** `200` -- `AdminMemorySummary`, the public body-free metadata plus
+`scope_label`, a human-readable label for `scope_id` (empty when there is no
+scope ID, with the raw ID as fallback).
 
 ---
 
@@ -1994,8 +1995,8 @@ Search memories by query. Requires `admin.memories` permission.
 | `scope_id` | string | no       | `""`    | Filter by scope ID            |
 | `limit`    | int    | no       | `20`    | Max results (capped at 50)    |
 
-**Response:** `200` -- the same body-free summary schema as
-`GET /v1/api/memories`.
+**Response:** `200` -- the same `AdminMemorySummary` schema as
+`GET /v1/api/admin/memories`.
 
 **Error:** `400` with `{"error": "q is required"}` if `q` is empty.
 
@@ -2022,17 +2023,25 @@ Get a single memory body by ID and record an access. Requires
   "type": "general",
   "scope": "global",
   "scope_id": "",
+  "scope_label": "",
   "content": "The project uses...",
   "created": "2026-03-10T10:00:00",
-  "updated": "2026-03-12T14:30:00"
+  "updated": "2026-03-12T14:30:00",
+  "last_accessed": "2026-03-12T14:31:00",
+  "access_count": 1
 }
 ```
+
+The response is `AdminMemoryInfo` (`AdminMemorySummary` plus `content`), and
+the counters include the completed GET touch.
 
 **Error (not found):** `404`
 
 ```json
 {"error": "Memory not found"}
 ```
+
+Storage-operation failures return `500`; unavailable storage returns `503`.
 
 ---
 
@@ -2046,8 +2055,26 @@ snapshots remain unchanged.
 {"description": "Updated retrieval hook"}
 ```
 
-Returns the updated body-free metadata summary, `400` for an invalid
-description, or `404` when the memory does not exist.
+Returns the updated body-free `AdminMemorySummary`:
+
+```json
+{
+  "memory_id": "a1b2c3d4-e5f6-...",
+  "name": "project_architecture",
+  "description": "Updated retrieval hook",
+  "type": "general",
+  "scope": "global",
+  "scope_id": "",
+  "scope_label": "",
+  "created": "2026-03-10T10:00:00",
+  "updated": "2026-03-14T09:00:00",
+  "last_accessed": "",
+  "access_count": 0
+}
+```
+
+Invalid descriptions return `400`, missing memories return `404`, storage
+operation failures return `500`, and unavailable storage returns `503`.
 
 ---
 
@@ -2069,6 +2096,8 @@ complete live index, overage, and legacy descriptions that need editing.
   "envelope_count": 3
 }
 ```
+
+Calculation failures return `500`; unavailable storage returns `503`.
 
 ---
 

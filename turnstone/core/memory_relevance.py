@@ -17,6 +17,7 @@ class MemoryConfig:
 
     relevance_k: int = 5
     index_budget_chars: int = 65_536
+    model_index_over_budget_notice: bool = False
     max_content: int = 32768
     nudge_cooldown: int = 300
     nudges: bool = True

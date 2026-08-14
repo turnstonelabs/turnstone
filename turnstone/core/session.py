@@ -93,6 +93,7 @@ from turnstone.core.memory import (
     load_workstream_config,
     normalize_memory_name,
     persist_last_error,
+    prospective_memory_index,
     resolve_workstream,
     sanitize_error_text,
     save_message,
@@ -107,7 +108,6 @@ from turnstone.core.memory import (
 )
 from turnstone.core.memory_index import (
     normalize_memory_description,
-    render_memory_index,
     render_memory_pointer,
 )
 from turnstone.core.memory_relevance import (
@@ -390,6 +390,13 @@ class _TokenCalibration:
     chars_per_token: float
     prompt_tokens: int | None = None
     message_prefix_ids: tuple[int, ...] = ()
+
+
+def _usable_input_capacity(context_window: int, max_tokens: int) -> int:
+    """Return prompt capacity after the response reserve and safety margin."""
+    response_reserve = min(max_tokens, context_window // 4)
+    safety_margin = int(context_window * 0.05)
+    return max(0, context_window - response_reserve - safety_margin)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1616,6 +1623,49 @@ class _PromptComponent:
 
     content: str
     required_capabilities: frozenset[str] = frozenset()
+
+
+@dataclasses.dataclass(frozen=True)
+class _SystemPrefixPlan:
+    """A fully rendered prefix awaiting one generation-owned publication."""
+
+    composition_epoch: int
+    memory_signature: tuple[str, str, str, str, bool]
+    shared_state: tuple[str, set[str], bool]
+    agent_prompt_components: tuple[_PromptComponent, ...]
+    system_messages: list[dict[str, Any]]
+
+
+@dataclasses.dataclass(frozen=True)
+class _MemoryIndexSizing:
+    """Frozen inputs for prefix-only admission arithmetic."""
+
+    capabilities: ModelCapabilities
+    chars_per_token: float
+    input_capacity: int
+    context_window: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _MemoryIndexAdmissionPlan:
+    """Storage-free facts needed to validate and install one candidate."""
+
+    prefix: _SystemPrefixPlan
+    lane: ModelLane
+    candidate_witness: tuple[str, str]
+    sizing: _MemoryIndexSizing
+
+
+class _MemoryIndexContextError(RuntimeError):
+    """The complete memory-bearing request cannot fit the serving model."""
+
+
+class _MemoryIndexPlanStaleError(RuntimeError):
+    """The transaction candidate no longer matches its storage-free plan."""
+
+    def __init__(self, snapshot: dict[str, Any]) -> None:
+        super().__init__("memory-index admission plan changed during capture")
+        self.snapshot = snapshot
 
 
 # ``list_nodes`` reserves four top-level kwargs for control parameters
@@ -3258,6 +3308,7 @@ class ChatSession:
         return MemoryConfig(
             relevance_k=cs.get("memory.relevance_k"),
             index_budget_chars=cs.get("memory.index_budget_chars"),
+            model_index_over_budget_notice=cs.get("memory.model_index_over_budget_notice"),
             max_content=cs.get("memory.max_content"),
             nudge_cooldown=cs.get("memory.nudge_cooldown"),
             nudges=cs.get("memory.nudges"),
@@ -5091,7 +5142,7 @@ class ChatSession:
             self.tool_truncation = int(self.context_window * ratio * 0.5)
 
     def _invalidate_token_calibration_anchors(self) -> None:
-        """Forget prompt-prefix counts after replacing/removing history.
+        """Forget prompt-prefix counts after changing history or its prefix.
 
         Tokenizer ratios remain useful per model binding; only the provider
         counts tied to the old Turn identities become invalid.
@@ -5146,9 +5197,7 @@ class ChatSession:
         auto-compaction triggers so truncation and compaction agree.
         """
         used = self._estimated_prompt_tokens()
-        response_reserve = min(self.max_tokens, self.context_window // 4)
-        safety_margin = int(self.context_window * 0.05)
-        return max(0, self.context_window - used - response_reserve - safety_margin)
+        return max(0, _usable_input_capacity(self.context_window, self.max_tokens) - used)
 
     def _maybe_compact_midturn(self, my_generation: int = 0) -> None:
         """Cooperative mid-turn compaction policy.
@@ -6130,8 +6179,12 @@ class ChatSession:
             if addition
         ]
 
-    def _system_messages_for_lane(self, caps: ModelCapabilities) -> list[dict[str, Any]]:
-        """Return the cached prefix plus additions required by *caps*.
+    def _system_messages_with_lane_additions(
+        self,
+        system_messages: list[dict[str, Any]],
+        caps: ModelCapabilities,
+    ) -> list[dict[str, Any]]:
+        """Return *system_messages* plus additions required by *caps*.
 
         The primary prefix stays cache-stable. A fallback can need stricter
         client-side posture than that prefix declares: nonce-fenced operator
@@ -6146,18 +6199,22 @@ class ChatSession:
             for addition in self._capability_prompt_additions(caps)
             if addition not in primary_additions
         ]
-        if not missing or not self.system_messages:
-            return self.system_messages
-        messages = list(self.system_messages)
+        if not missing or not system_messages:
+            return system_messages
+        messages = list(system_messages)
         head = messages[0]
         content = head.get("content")
         if not isinstance(content, str):
-            return self.system_messages
+            return system_messages
         messages[0] = {
             **head,
             "content": content + "\n\n" + "\n\n".join(missing),
         }
         return messages
+
+    def _system_messages_for_lane(self, caps: ModelCapabilities) -> list[dict[str, Any]]:
+        """Return the cached prefix plus additions required by *caps*."""
+        return self._system_messages_with_lane_additions(self.system_messages, caps)
 
     @staticmethod
     def _render_prompt_components(
@@ -6189,16 +6246,264 @@ class ChatSession:
             self._memory_index_snapshot = snapshot
         return snapshot
 
+    def _context_window_for_lane(self, lane: ModelLane) -> int:
+        """Return the context window frozen into one serving lane."""
+        if same_model_lane_binding(lane, self._primary_lane()):
+            return self.context_window
+        if lane.alias and lane.backend_auth_config is not None:
+            return max(1, int(lane.backend_auth_config.context_window))
+        return max(1, int(require_lane_capabilities(lane).context_window))
+
+    def _memory_index_sizing(
+        self,
+        lane: ModelLane,
+    ) -> _MemoryIndexSizing:
+        """Freeze every non-prefix input to prefix-only sizing."""
+        calibration = self._token_calibrations.get(self._token_calibration_key(lane))
+        ratio = calibration.chars_per_token if calibration is not None else 4.0
+        caps = require_lane_capabilities(lane)
+        context_window = self._context_window_for_lane(lane)
+        return _MemoryIndexSizing(
+            capabilities=caps,
+            chars_per_token=ratio,
+            input_capacity=_usable_input_capacity(context_window, self.max_tokens),
+            context_window=context_window,
+        )
+
+    def _memory_index_prefix_estimate(
+        self,
+        system_messages: list[dict[str, Any]],
+        lane: ModelLane,
+        *,
+        sizing: _MemoryIndexSizing | None = None,
+    ) -> tuple[int, int, int]:
+        """Estimate prefix use and usable capacity without projecting tools/history."""
+        frozen = sizing or self._memory_index_sizing(lane)
+        prefix = self._system_messages_with_lane_additions(
+            system_messages,
+            frozen.capabilities,
+        )
+        if not prefix:
+            raise RuntimeError("memory-index admission requires a leading system prefix")
+        prefix_tokens = sum(
+            max(1, int(self._msg_char_count(message) / frozen.chars_per_token))
+            for message in prefix
+        )
+        return prefix_tokens, frozen.input_capacity, frozen.context_window
+
+    def _validate_memory_index_prefix(
+        self,
+        system_messages: list[dict[str, Any]],
+        snapshot: dict[str, Any],
+        lane: ModelLane,
+        *,
+        snapshot_committed: bool,
+        sizing: _MemoryIndexSizing | None = None,
+    ) -> None:
+        """Refuse a complete memory-bearing request that cannot fit."""
+        prefix_tokens, input_capacity, context_window = self._memory_index_prefix_estimate(
+            system_messages,
+            lane,
+            sizing=sizing,
+        )
+        if prefix_tokens <= input_capacity:
+            return
+        raise self._memory_index_context_error(
+            snapshot,
+            lane,
+            prefix_tokens=prefix_tokens,
+            input_capacity=input_capacity,
+            context_window=context_window,
+            snapshot_committed=snapshot_committed,
+        )
+
+    @staticmethod
+    def _memory_index_context_error(
+        snapshot: dict[str, Any],
+        lane: ModelLane,
+        *,
+        prefix_tokens: int,
+        input_capacity: int,
+        context_window: int,
+        snapshot_committed: bool,
+    ) -> _MemoryIndexContextError:
+        """Build the actionable, safe refusal for an oversized index."""
+        alias = lane.alias or lane.model or "selected model"
+        index_chars = int(snapshot.get("char_count") or len(str(snapshot.get("content") or "")))
+        if snapshot_committed:
+            remediation = (
+                "Choose a larger-context model; this workstream's immutable "
+                "memory-index snapshot is already bound."
+            )
+            snapshot_note = ""
+        else:
+            remediation = (
+                "Choose a larger-context model, or, if this workstream still has no "
+                "immutable snapshot, delete/consolidate memories and retry with a "
+                "smaller candidate."
+            )
+            # Another node may have won the first-capture race after this
+            # session's pre-load miss. This statement remains true for both an
+            # uncommitted local candidate and an already-durable winner.
+            snapshot_note = " This request did not commit a new memory-index snapshot."
+        return _MemoryIndexContextError(
+            f"Memory index cannot fit model={alias}: the complete final prefix is estimated at "
+            f"{prefix_tokens:,} prompt tokens, above its {input_capacity:,}-token usable "
+            f"input capacity ({context_window:,}-token context; memory index "
+            f"{index_chars:,} characters). {remediation}{snapshot_note}"
+        )
+
+    def _plan_first_memory_index_admission(
+        self,
+        *,
+        lane: ModelLane,
+        principal_id: str,
+        project_witness: dict[str, Any] | None,
+    ) -> _MemoryIndexAdmissionPlan:
+        """Plan every storage-backed prefix fact before capture starts."""
+        with self._system_prefix_lock:
+            self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+            composition_epoch = self._system_prefix_epoch
+        prefix = self._build_system_prefix_plan(
+            principal_id=principal_id,
+            composition_epoch=composition_epoch,
+            bound_memory_index=None,
+            project_witness=project_witness,
+        )
+        return _MemoryIndexAdmissionPlan(
+            prefix=prefix,
+            lane=lane,
+            candidate_witness=(
+                str(
+                    project_witness.get("project_id") or ""
+                    if project_witness is not None
+                    else prefix.memory_signature[2]
+                ),
+                str(
+                    project_witness.get("project_name") or ""
+                    if project_witness is not None
+                    else prefix.memory_signature[3]
+                ),
+            ),
+            sizing=self._memory_index_sizing(lane),
+        )
+
+    def _attach_memory_index_to_plan(
+        self,
+        plan: _SystemPrefixPlan,
+        snapshot: dict[str, Any],
+    ) -> _SystemPrefixPlan:
+        """Attach exact candidate bytes without performing any storage reads."""
+        components = (
+            *plan.agent_prompt_components,
+            _PromptComponent(
+                str(snapshot["content"]),
+                required_capabilities=frozenset({"memory"}),
+            ),
+        )
+        rendered = self._render_prompt_components(components, frozenset({"memory"}))
+        return dataclasses.replace(
+            plan,
+            agent_prompt_components=components,
+            system_messages=[*rendered, *plan.system_messages[1:]],
+        )
+
     @contextlib.contextmanager
-    def _memory_index_commit_guard(self, my_generation: int) -> Iterator[None]:
-        """Keep the candidate snapshot commit on one side of cancellation."""
-        with self._generation_lock:
+    def _memory_index_commit_context(
+        self,
+        my_generation: int,
+        admission: _MemoryIndexAdmissionPlan,
+        snapshot: dict[str, Any],
+    ) -> Iterator[None]:
+        """Validate before yield, then publish after the backend commits at yield."""
+        candidate_witness = (
+            str(snapshot.get("project_id") or ""),
+            str(snapshot.get("project_name") or ""),
+        )
+        if candidate_witness != admission.candidate_witness:
+            raise _MemoryIndexPlanStaleError(snapshot)
+        plan = self._attach_memory_index_to_plan(admission.prefix, snapshot)
+        self._validate_memory_index_prefix(
+            plan.system_messages,
+            snapshot,
+            admission.lane,
+            snapshot_committed=False,
+            sizing=admission.sizing,
+        )
+        with self._generation_lock, self._system_prefix_lock:
             self._check_generation_admission(my_generation)
+            if plan.composition_epoch != self._system_prefix_epoch:
+                raise _MemoryIndexPlanStaleError(snapshot)
+            # Everything that can reasonably fail is prepared before yield.
+            # The backend executes its commit as the context body; the
+            # post-yield path below remains assignment-only while both
+            # publication locks exclude a superseding generation.
+            shared_state = self._resolved_shared_state_plan(*plan.shared_state)
+            prefix_changed = self.system_messages != plan.system_messages
+            token_calibrations = self._token_calibrations
+            if prefix_changed:
+                token_calibrations = {
+                    key: dataclasses.replace(value, prompt_tokens=None, message_prefix_ids=())
+                    for key, value in self._token_calibrations.items()
+                }
+            sys_chars = sum(self._msg_char_count(message) for message in plan.system_messages)
+            system_tokens = max(1, int(sys_chars / self._chars_per_token))
             yield
+            (
+                self._known_senders,
+                self._shared_workstream,
+                self._db_senders_loaded,
+                self._senders_dirty,
+            ) = shared_state
+            self._memory_index_snapshot = snapshot
+            self._system_prefix_signature = plan.memory_signature
+            self._agent_prompt_components = plan.agent_prompt_components
+            self.system_messages = plan.system_messages
+            self._system_prefix_dirty = False
+            if prefix_changed:
+                self._last_usage = None
+                self._token_calibrations = token_calibrations
+                self._last_usage_calibration_key = None
+                self._calibrated_msg_count = 0
+            self._system_tokens = system_tokens
+
+    def _bind_existing_memory_index(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        lane: ModelLane,
+        my_generation: int,
+        principal_id: str,
+    ) -> None:
+        """Validate and publish an already-durable immutable snapshot."""
+        for _attempt in range(3):
+            self._check_generation_admission(my_generation)
+            with self._system_prefix_lock:
+                self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+                composition_epoch = self._system_prefix_epoch
+            plan = self._build_system_prefix_plan(
+                principal_id=principal_id,
+                composition_epoch=composition_epoch,
+                bound_memory_index=snapshot,
+            )
+            self._validate_memory_index_prefix(
+                plan.system_messages,
+                snapshot,
+                lane,
+                snapshot_committed=True,
+            )
+            with self._generation_lock, self._system_prefix_lock:
+                self._check_generation_admission(my_generation)
+                if plan.composition_epoch != self._system_prefix_epoch:
+                    continue
+                self._memory_index_snapshot = snapshot
+                self._install_system_prefix_plan_locked(plan)
+                return
+        raise RuntimeError("memory context could not be refreshed safely")
 
     def _admit_memory_index_request(
         self,
-        _lane: ModelLane,
+        lane: ModelLane,
         *,
         my_generation: int,
         principal_id: str,
@@ -6226,40 +6531,51 @@ class ChatSession:
                 principal_id=principal_id,
                 origin_generation=my_generation,
             )
-            return
-        newly_loaded = snapshot is None
-        if snapshot is None:
-            snapshot = acquire_memory_index_snapshot(
-                self._ws_id,
-                principal_id,
-                commit_guard=functools.partial(self._memory_index_commit_guard, my_generation),
+            self._validate_memory_index_prefix(
+                self.system_messages,
+                snapshot,
+                lane,
+                snapshot_committed=True,
             )
+            return
+        if snapshot is None:
+            project_witness: dict[str, Any] | None = None
+            for _attempt in range(3):
+                admission = self._plan_first_memory_index_admission(
+                    lane=lane,
+                    principal_id=principal_id,
+                    project_witness=project_witness,
+                )
+                try:
+                    snapshot = acquire_memory_index_snapshot(
+                        self._ws_id,
+                        principal_id,
+                        commit_context=functools.partial(
+                            self._memory_index_commit_context,
+                            my_generation,
+                            admission,
+                        ),
+                    )
+                    break
+                except _MemoryIndexPlanStaleError as stale:
+                    project_witness = stale.snapshot
+            else:
+                raise RuntimeError("memory context could not be refreshed safely")
             if snapshot is None:
                 raise RuntimeError("memory index workstream is no longer active")
-        if snapshot is None:
-            raise RuntimeError("memory index snapshot is unavailable")
-
-        def _publish_snapshot() -> None:
-            self._memory_index_snapshot = snapshot
-
-        if not self._publish_for_generation(
-            my_generation,
-            _publish_snapshot,
-            allow_cancelled=False,
-        ):
-            raise GenerationCancelled()
-        if not self._init_system_messages(
-            origin_generation=my_generation,
-            principal_id=principal_id,
-        ):
-            raise GenerationCancelled()
-        if newly_loaded:
             log.info(
                 "memory.index",
                 entries=int(snapshot["entry_count"]),
                 chars=int(snapshot["char_count"]),
                 invalid_descriptions=int(snapshot["invalid_description_count"]),
             )
+            return
+        self._bind_existing_memory_index(
+            snapshot,
+            lane=lane,
+            my_generation=my_generation,
+            principal_id=principal_id,
+        )
 
     def _init_system_messages(
         self,
@@ -6277,32 +6593,29 @@ class ChatSession:
             composition_epoch=composition_epoch,
         )
 
-    def _compose_system_messages(
+    def _build_system_prefix_plan(
         self,
         *,
-        origin_generation: int = 0,
-        principal_id: str | None = None,
-        composition_epoch: int | None = None,
-    ) -> bool:
-        """Build the system/developer prefix messages.
+        principal_id: str | None,
+        composition_epoch: int,
+        bound_memory_index: dict[str, Any] | None,
+        project_witness: dict[str, Any] | None = None,
+    ) -> _SystemPrefixPlan:
+        """Render a complete prefix without publishing it.
 
         Developer message contains the composed system message (persona
         base override included), plus user-supplied instructions and the
         immutable memory index when one is bound.
 
-        Uses copy-on-write: builds new lists locally, then assigns
-        atomically so concurrent readers (e.g. background thread
-        callbacks) never see a partially-built system message.
+        Keeping planning separate from publication lets first-snapshot
+        admission validate the candidate prefix while its database insert is
+        still uncommitted, without exposing provisional state to another
+        generation.
         """
-        if composition_epoch is None:
-            with self._system_prefix_lock:
-                self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
-                composition_epoch = self._system_prefix_epoch
-
         new_system_messages: list[dict[str, Any]] = []
         memory_access = self._memory_access(principal_id)
+        context_snapshot = bound_memory_index or project_witness
         composition_principal_id = memory_access.principal_id or None
-        bound_memory_index = self._load_bound_memory_index()
         shared_state_plan = self._plan_shared_state()
         owner = (self._mcp_user_id or "").strip()
         planned_senders = set(self._known_senders) | shared_state_plan[1]
@@ -6340,15 +6653,15 @@ class ChatSession:
             timezone=now.tzname() or "UTC",
             username=self._username or self._user_id or "unknown",
             project=(
-                str(bound_memory_index.get("project_name") or "")
-                if bound_memory_index is not None
+                str(context_snapshot.get("project_name") or "")
+                if context_snapshot is not None
                 else memory_access.project_name
             ),
             shared=planned_shared,
             ws_id=self._ws_id,
             project_id=(
-                str(bound_memory_index.get("project_id") or "")
-                if bound_memory_index is not None
+                str(context_snapshot.get("project_id") or "")
+                if context_snapshot is not None
                 else memory_access.project_id
             ),
         )
@@ -6555,6 +6868,39 @@ class ChatSession:
         if skill_context:
             new_system_messages.append({"role": "user", "content": skill_context})
 
+        return _SystemPrefixPlan(
+            composition_epoch=composition_epoch,
+            memory_signature=memory_access.signature,
+            shared_state=shared_state_plan,
+            agent_prompt_components=new_agent_prompt_components,
+            system_messages=new_system_messages,
+        )
+
+    def _install_system_prefix_plan_locked(self, plan: _SystemPrefixPlan) -> None:
+        """Install *plan* while generation and prefix publication locks are held."""
+        prefix_changed = self.system_messages != plan.system_messages
+        self._apply_shared_state_plan(*plan.shared_state)
+        self._system_prefix_signature = plan.memory_signature
+        self._agent_prompt_components = plan.agent_prompt_components
+        self.system_messages = plan.system_messages
+        self._system_prefix_dirty = False
+        if prefix_changed:
+            # ``_last_usage`` carries the same provider prompt count as the
+            # keyed calibration.  Leaving it populated would activate the
+            # legacy fallback after clearing its key and reuse an anchor that
+            # predates this prefix.
+            self._last_usage = None
+            self._invalidate_token_calibration_anchors()
+        sys_chars = sum(self._msg_char_count(message) for message in self.system_messages)
+        self._system_tokens = max(1, int(sys_chars / self._chars_per_token))
+
+    def _publish_system_prefix_plan(
+        self,
+        plan: _SystemPrefixPlan,
+        *,
+        origin_generation: int,
+    ) -> bool:
+        """Atomically publish a rendered prefix if its witnesses remain current."""
         installed = False
 
         def _install() -> None:
@@ -6569,14 +6915,9 @@ class ChatSession:
                 if self._publication_shutdown:
                     self._system_prefix_dirty = True
                     return
-                if composition_epoch != getattr(self, "_system_prefix_epoch", 0):
+                if plan.composition_epoch != getattr(self, "_system_prefix_epoch", 0):
                     return
-                self._apply_shared_state_plan(*shared_state_plan)
-                self._system_prefix_signature = memory_access.signature
-                # Atomic swaps — readers see either old or new, never partial.
-                self._agent_prompt_components = new_agent_prompt_components
-                self.system_messages = new_system_messages
-                self._system_prefix_dirty = False
+                self._install_system_prefix_plan_locked(plan)
                 installed = True
 
         if origin_generation:
@@ -6590,6 +6931,28 @@ class ChatSession:
             published = True
         published = published and installed
         return published
+
+    def _compose_system_messages(
+        self,
+        *,
+        origin_generation: int = 0,
+        principal_id: str | None = None,
+        composition_epoch: int | None = None,
+    ) -> bool:
+        """Build and atomically publish the newest system-prefix attempt."""
+        if composition_epoch is None:
+            with self._system_prefix_lock:
+                self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+                composition_epoch = self._system_prefix_epoch
+        plan = self._build_system_prefix_plan(
+            principal_id=principal_id,
+            composition_epoch=composition_epoch,
+            bound_memory_index=self._load_bound_memory_index(),
+        )
+        return self._publish_system_prefix_plan(
+            plan,
+            origin_generation=origin_generation,
+        )
 
     def _ensure_system_prefix_fresh(
         self,
@@ -7132,6 +7495,33 @@ class ChatSession:
             log.debug("persisted-sender load failed for ws=%s", ws_id, exc_info=True)
             return ws_id, set(), False
 
+    def _resolved_shared_state_plan(
+        self,
+        ws_id: str,
+        persisted_senders: set[str],
+        read_complete: bool,
+    ) -> tuple[set[str], bool, bool, bool]:
+        """Return the sender state produced by one pre-read snapshot."""
+        known_senders = set(self._known_senders)
+        shared_workstream = self._shared_workstream
+        db_senders_loaded = self._db_senders_loaded
+        senders_dirty = self._senders_dirty
+        if self._ws_id == ws_id:
+            owner = (self._mcp_user_id or "").strip()
+            live_senders = {
+                s
+                for turn in self.messages
+                if turn.role is Role.USER and (s := (turn.meta.extra.get("sender") or "").strip())
+            }
+            known_senders |= persisted_senders | live_senders
+            if not shared_workstream:
+                shared_workstream = any(s != owner for s in known_senders)
+            if read_complete:
+                db_senders_loaded = True
+            if db_senders_loaded:
+                senders_dirty = False
+        return known_senders, shared_workstream, db_senders_loaded, senders_dirty
+
     def _apply_shared_state_plan(
         self,
         ws_id: str,
@@ -7139,21 +7529,12 @@ class ChatSession:
         read_complete: bool,
     ) -> None:
         """Apply one pre-read sender snapshot at an owner-fenced seam."""
-        if self._ws_id != ws_id:
-            return
-        owner = (self._mcp_user_id or "").strip()
-        live_senders = {
-            s
-            for turn in self.messages
-            if turn.role is Role.USER and (s := (turn.meta.extra.get("sender") or "").strip())
-        }
-        self._known_senders |= persisted_senders | live_senders
-        if not self._shared_workstream:
-            self._shared_workstream = any(s != owner for s in self._known_senders)
-        if read_complete:
-            self._db_senders_loaded = True
-        if self._db_senders_loaded:
-            self._senders_dirty = False
+        (
+            self._known_senders,
+            self._shared_workstream,
+            self._db_senders_loaded,
+            self._senders_dirty,
+        ) = self._resolved_shared_state_plan(ws_id, persisted_senders, read_complete)
 
     def _recompute_shared_state(self) -> None:
         """Refresh shared-workstream state from history — monotonically.
@@ -7720,6 +8101,11 @@ class ChatSession:
         raw_tail = f" raw={raw_msg!r}" if raw_msg else ""
 
         name = type(exc).__name__
+
+        if isinstance(exc, ModelAdmissionError) and isinstance(
+            exc.__cause__, _MemoryIndexContextError
+        ):
+            return str(exc.__cause__)
 
         # A wire-preparation failure is the session's own data at fault, not
         # the backend's.  Checked FIRST: the overflow text-match below must
@@ -18960,11 +19346,9 @@ class ChatSession:
         resolved = access or self._memory_access()
         if self._kind == WorkstreamKind.COORDINATOR:
             scope_id = self._coordinator_scope_id(resolved)
-            # Fail-closed on an empty scope_id (unreachable through real hosts —
-            # __init__ refuses anonymous coordinators): the storage helpers treat
-            # a falsy scope_id as "no scope_id filter" (that's how ``global``
-            # works), so a ("coordinator", "") pair would read EVERY user's
-            # coordinator rows instead of none.
+            # Fail closed on an empty scope id (unreachable through real hosts,
+            # because __init__ refuses anonymous coordinators): no anonymous
+            # coordinator namespace exists.
             coord_scopes: list[tuple[str, str]] = []
             if scope_id:
                 coord_scopes.append(("coordinator", scope_id))
@@ -19061,35 +19445,24 @@ class ChatSession:
     def _memory_index_backpressure(self, access: _MemoryAccess) -> str:
         """Return a post-save soft-cap notice for the writer's live envelope."""
         try:
-            storage = get_storage()
-            scopes = self._visible_scopes(access)
-            project_ids = sorted({scope_id for scope, scope_id in scopes if scope == "project"})
-            if len(project_ids) > 1:
-                raise ValueError("a memory index envelope may contain at most one project")
-            rendered = render_memory_index(
-                storage.list_visible_memory_index_entries(
-                    scopes,
-                    acting_principal_id=access.principal_id,
-                ),
-                project_id=project_ids[0] if project_ids else "",
+            report = prospective_memory_index(
+                self._visible_scopes(access),
+                acting_principal_id=access.principal_id,
             )
-            report = {
-                "char_count": rendered.char_count,
-                "invalid_description_count": rendered.invalid_description_count,
-            }
         except Exception:
             log.warning("memory.index_backpressure_failed", exc_info=True)
             return (
                 "\nNotice: complete live index health could not be calculated; "
                 "check admin memory index health before adding more entries."
             )
-        budget = self._mem_cfg.index_budget_chars
+        memory_config = self._mem_cfg
+        budget = memory_config.index_budget_chars
         char_count = report["char_count"]
         notices: list[str] = []
-        if char_count > budget:
+        if memory_config.model_index_over_budget_notice and char_count > budget:
             notices.append(
-                f"complete live index is {char_count - budget:,} characters over "
-                f"the {budget:,}-character soft limit"
+                f"complete live index is above its configured soft budget "
+                f"({char_count:,} / {budget:,} characters)"
             )
         invalid = report["invalid_description_count"]
         if invalid:

@@ -145,15 +145,6 @@
 # timeout = 120.0              # Per-turn LLM judge timeout in seconds
 # parallel_evaluations = 1     # Concurrent LLM evaluations per tool-call batch (1-16)
 
-# --- Memory (turnstone, node) ---
-
-[memory]
-# relevance_k = 5              # Live metadata pointers after each user turn
-# index_budget_chars = 65536   # Complete-index soft budget (never truncates)
-# max_content = 32768          # Max memory content size in chars
-# nudge_cooldown = 300         # Min seconds between metacognitive nudges
-# nudges = true                # Enable memory nudges
-
 # --- MCP (turnstone, node) ---
 
 [mcp]

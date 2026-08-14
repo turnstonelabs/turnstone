@@ -138,6 +138,8 @@ class TestProjectActingPrincipalAuthorization:
 
     @staticmethod
     def _seed(backend):
+        for user_id in ("owner", "reader", "member", "other"):
+            backend.create_user(user_id, user_id, user_id.title(), "hash")
         backend.create_project("project-auth", "Project", "owner")
         backend.create_structured_memory(
             "project-memory",
@@ -743,6 +745,52 @@ class TestVisibleStructuredMemories:
         assert backend.list_visible_structured_memories([]) == []
         assert backend.search_visible_structured_memories("x", []) == []
 
+    def test_visible_helpers_never_wildcard_an_empty_scope_id(self, backend):
+        backend.create_structured_memory(
+            "m-u1", "shared", "u1 hook", "general", "user", "u1", "u1 body"
+        )
+        backend.create_structured_memory(
+            "m-u2", "shared", "u2 hook", "general", "user", "u2", "u2 body"
+        )
+
+        assert backend.list_visible_structured_memories([("user", "")]) == []
+        assert backend.search_visible_structured_memories("shared", [("user", "")]) == []
+
+    def test_snapshot_capture_uses_the_same_exact_scope_pairs(self, backend):
+        backend.create_structured_memory(
+            "m-global", "canonical", "visible hook", "general", "global", "", "body"
+        )
+        backend.create_structured_memory(
+            "m-malformed",
+            "foreign_global",
+            "must stay hidden",
+            "general",
+            "global",
+            "tenant-b",
+            "body",
+        )
+
+        visible = backend.list_visible_memory_index_entries([("global", "")])
+        snapshot = backend.acquire_memory_index_snapshot("ws1", "u1")
+
+        assert [row["memory_id"] for row in visible] == ["m-global"]
+        assert snapshot is not None
+        assert snapshot["entry_count"] == 1
+        assert "canonical" in snapshot["content"]
+        assert "foreign_global" not in snapshot["content"]
+
+    def test_admin_search_retains_optional_scope_id_filter(self, backend):
+        backend.create_structured_memory(
+            "m-u1", "shared", "u1 hook", "general", "user", "u1", "u1 body"
+        )
+        backend.create_structured_memory(
+            "m-u2", "shared", "u2 hook", "general", "user", "u2", "u2 body"
+        )
+
+        rows = backend.search_structured_memories("shared", scope="user", scope_id="")
+
+        assert {row["memory_id"] for row in rows} == {"m-u1", "m-u2"}
+
 
 class TestStableOrderingOnTimestampTies:
     """When two memories share an `updated` timestamp, secondary sort on
@@ -802,6 +850,336 @@ def _postgres_blocking_pids(backend: PostgreSQLBackend, pid: int) -> list[int]:
                 {"pid": pid},
             ).scalar_one()
         )
+
+
+def test_postgresql_delete_user_and_oidc_reconcile_share_lock_order(backend) -> None:
+    """User deletion wins cleanly; OIDC reconciliation observes the deletion."""
+    if not isinstance(backend, PostgreSQLBackend):
+        pytest.skip("PostgreSQL row-lock schedule")
+
+    backend.create_user("member", "member", "Member", "hash")
+    backend.create_role("role-a", "role-a", "Role A", "project.read", False)
+    backend.assign_role("member", "role-a", "oidc")
+
+    delete_locked = threading.Event()
+    release_delete = threading.Event()
+    reconcile_attempted = threading.Event()
+    delete_pid: list[int] = []
+    reconcile_pid: list[int] = []
+    outcomes: dict[str, Any] = {}
+    errors: list[BaseException] = []
+
+    def before_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == "oidc-reconcile"
+            and "FROM users" in statement
+            and "FOR UPDATE" in statement
+        ):
+            cursor.execute("SET LOCAL lock_timeout = '5s'")
+            reconcile_pid.append(int(cursor.connection.info.backend_pid))
+            reconcile_attempted.set()
+
+    def after_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == "delete-user"
+            and "FROM users" in statement
+            and "FOR UPDATE" in statement
+        ):
+            delete_pid.append(int(cursor.connection.info.backend_pid))
+            delete_locked.set()
+            if not release_delete.wait(timeout=10):
+                raise AssertionError("user deletion was not released")
+
+    def delete() -> None:
+        try:
+            outcomes["deleted"] = backend.delete_user("member")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def reconcile() -> None:
+        try:
+            backend.replace_oidc_roles("member", {"role-a"})
+        except ValueError as exc:
+            outcomes["reconcile_error"] = str(exc)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    sa.event.listen(backend._engine, "before_cursor_execute", before_cursor_execute)
+    sa.event.listen(backend._engine, "after_cursor_execute", after_cursor_execute)
+    delete_thread = threading.Thread(target=delete, name="delete-user")
+    reconcile_thread = threading.Thread(target=reconcile, name="oidc-reconcile")
+    try:
+        delete_thread.start()
+        assert delete_locked.wait(timeout=10), "delete never acquired the user lock"
+        reconcile_thread.start()
+        assert reconcile_attempted.wait(timeout=10), "reconcile never attempted the user lock"
+        assert delete_pid and reconcile_pid
+        for _attempt in range(1_000):
+            if delete_pid[0] in _postgres_blocking_pids(backend, reconcile_pid[0]):
+                break
+        else:
+            raise AssertionError("OIDC reconcile was not blocked by user deletion")
+    finally:
+        release_delete.set()
+        delete_thread.join(timeout=10)
+        reconcile_thread.join(timeout=10)
+        sa.event.remove(backend._engine, "before_cursor_execute", before_cursor_execute)
+        sa.event.remove(backend._engine, "after_cursor_execute", after_cursor_execute)
+
+    assert not delete_thread.is_alive()
+    assert not reconcile_thread.is_alive()
+    assert errors == []
+    assert outcomes == {
+        "deleted": True,
+        "reconcile_error": "user 'member' does not exist",
+    }
+    assert backend.list_user_roles("member") == []
+
+
+@pytest.mark.parametrize("winner", ["assign", "delete"])
+def test_postgresql_assign_role_and_delete_user_share_lock_order(backend, winner) -> None:
+    """Whichever user-anchored mutation wins leaves no orphan assignment."""
+    if not isinstance(backend, PostgreSQLBackend):
+        pytest.skip("PostgreSQL row-lock schedule")
+
+    backend.create_user("member", "member", "Member", "hash")
+    backend.create_role("role-a", "role-a", "Role A", "project.read", False)
+
+    winner_locked = threading.Event()
+    release_winner = threading.Event()
+    loser_attempted = threading.Event()
+    winner_pid: list[int] = []
+    loser_pid: list[int] = []
+    outcomes: dict[str, Any] = {}
+    errors: list[BaseException] = []
+    winner_thread_name = f"{winner}-winner"
+    loser_thread_name = "delete-loser" if winner == "assign" else "assign-loser"
+
+    def before_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == loser_thread_name
+            and "FROM users" in statement
+            and "FOR UPDATE" in statement
+        ):
+            cursor.execute("SET LOCAL lock_timeout = '5s'")
+            loser_pid.append(int(cursor.connection.info.backend_pid))
+            loser_attempted.set()
+
+    def after_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if (
+            threading.current_thread().name == winner_thread_name
+            and "FROM users" in statement
+            and "FOR UPDATE" in statement
+        ):
+            winner_pid.append(int(cursor.connection.info.backend_pid))
+            winner_locked.set()
+            if not release_winner.wait(timeout=10):
+                raise AssertionError("winning authority mutation was not released")
+
+    def assign() -> None:
+        try:
+            backend.assign_role("member", "role-a", "admin-ui")
+            outcomes["assigned"] = True
+        except ValueError as exc:
+            outcomes["assign_error"] = str(exc)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def delete() -> None:
+        try:
+            outcomes["deleted"] = backend.delete_user("member")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    assign_thread = threading.Thread(
+        target=assign,
+        name="assign-winner" if winner == "assign" else "assign-loser",
+    )
+    delete_thread = threading.Thread(
+        target=delete,
+        name="delete-winner" if winner == "delete" else "delete-loser",
+    )
+    first_thread = assign_thread if winner == "assign" else delete_thread
+    second_thread = delete_thread if winner == "assign" else assign_thread
+    sa.event.listen(backend._engine, "before_cursor_execute", before_cursor_execute)
+    sa.event.listen(backend._engine, "after_cursor_execute", after_cursor_execute)
+    try:
+        first_thread.start()
+        assert winner_locked.wait(timeout=10), "winner never acquired the user lock"
+        second_thread.start()
+        assert loser_attempted.wait(timeout=10), "loser never attempted the user lock"
+        assert winner_pid and loser_pid
+        for _attempt in range(1_000):
+            if winner_pid[0] in _postgres_blocking_pids(backend, loser_pid[0]):
+                break
+        else:
+            raise AssertionError("loser was not blocked by the winning user lock")
+    finally:
+        release_winner.set()
+        first_thread.join(timeout=10)
+        second_thread.join(timeout=10)
+        sa.event.remove(backend._engine, "before_cursor_execute", before_cursor_execute)
+        sa.event.remove(backend._engine, "after_cursor_execute", after_cursor_execute)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    if winner == "assign":
+        assert outcomes == {"assigned": True, "deleted": True}
+    else:
+        assert outcomes == {
+            "deleted": True,
+            "assign_error": "user 'member' does not exist",
+        }
+    assert backend.get_user("member") is None
+    assert backend.list_user_roles("member") == []
+
+
+def test_postgresql_permission_reader_locks_roles_in_canonical_order(backend) -> None:
+    """A reader queues on later roles only after locking earlier role ids."""
+    if not isinstance(backend, PostgreSQLBackend):
+        pytest.skip("PostgreSQL row-lock schedule")
+
+    backend.create_user("member", "member", "Member", "hash")
+    # Insert in reverse lexical order so an unordered scan does not
+    # accidentally inherit the canonical order from insertion order.
+    backend.create_role("role-z", "role-z", "Role Z", "", False)
+    backend.create_role("role-a", "role-a", "Role A", "project.read", False)
+    backend.assign_role("member", "role-z", "oidc")
+    backend.assign_role("member", "role-a", "oidc")
+    backend.create_project("project-lock-order", "Project", "owner")
+    backend.add_project_member("project-lock-order", "member")
+    backend.create_structured_memory(
+        "memory-lock-order",
+        "runbook",
+        "Runbook",
+        "general",
+        "project",
+        "project-lock-order",
+        "body",
+    )
+
+    blocker_conn = backend._engine.connect()
+    blocker_tx = blocker_conn.begin()
+    blocker_pid = int(blocker_conn.execute(sa.text("SELECT pg_backend_pid()")).scalar_one())
+    blocker_conn.execute(
+        sa.text("SELECT role_id FROM roles WHERE role_id = :role_id FOR UPDATE"),
+        {"role_id": "role-z"},
+    ).fetchone()
+
+    reader_attempted = threading.Event()
+    writer_attempted = threading.Event()
+    reader_pid: list[int] = []
+    writer_pid: list[int] = []
+    outcomes: dict[str, Any] = {}
+    errors: list[BaseException] = []
+
+    def before_cursor_execute(
+        _conn: Any,
+        cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        thread_name = threading.current_thread().name
+        if (
+            thread_name == "permission-reader"
+            and "FROM user_roles JOIN roles" in statement
+            and "FOR SHARE OF roles" in statement
+        ):
+            cursor.execute("SET LOCAL lock_timeout = '5s'")
+            reader_pid.append(int(cursor.connection.info.backend_pid))
+            reader_attempted.set()
+        elif (
+            thread_name == "oidc-writer"
+            and "SELECT roles.role_id" in statement
+            and "ORDER BY roles.role_id" in statement
+            and "FOR UPDATE" in statement
+        ):
+            cursor.execute("SET LOCAL lock_timeout = '5s'")
+            writer_pid.append(int(cursor.connection.info.backend_pid))
+            writer_attempted.set()
+
+    def read() -> None:
+        try:
+            outcomes["memory"] = backend.get_and_touch_structured_memory_by_name(
+                "runbook",
+                "project",
+                "project-lock-order",
+                acting_principal_id="member",
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def reconcile() -> None:
+        try:
+            outcomes["reconcile"] = backend.replace_oidc_roles("member", {"role-a", "role-z"})
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    sa.event.listen(backend._engine, "before_cursor_execute", before_cursor_execute)
+    reader_thread = threading.Thread(target=read, name="permission-reader")
+    writer_thread = threading.Thread(target=reconcile, name="oidc-writer")
+    try:
+        reader_thread.start()
+        assert reader_attempted.wait(timeout=10), "reader never attempted its role locks"
+        assert reader_pid
+        for _attempt in range(1_000):
+            if blocker_pid in _postgres_blocking_pids(backend, reader_pid[0]):
+                break
+        else:
+            raise AssertionError("reader was not blocked on the later role")
+
+        writer_thread.start()
+        assert writer_attempted.wait(timeout=10), "OIDC writer never attempted its role locks"
+        assert writer_pid
+        for _attempt in range(1_000):
+            if reader_pid[0] in _postgres_blocking_pids(backend, writer_pid[0]):
+                break
+        else:
+            raise AssertionError("writer was not blocked by the reader's earlier role lock")
+    finally:
+        if blocker_tx.is_active:
+            blocker_tx.commit()
+        blocker_conn.close()
+        reader_thread.join(timeout=10)
+        writer_thread.join(timeout=10)
+        sa.event.remove(backend._engine, "before_cursor_execute", before_cursor_execute)
+
+    assert not reader_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert errors == []
+    assert outcomes["memory"] is not None
+    assert outcomes["reconcile"] == (set(), set())
 
 
 @pytest.mark.parametrize(
@@ -871,6 +1249,7 @@ def test_postgresql_role_mutation_waits_for_guarded_project_operation(
 
     role_id = f"role-{scenario}"
     project_id = f"project-{scenario}"
+    backend.create_user("member", "member", "Member", "hash")
     backend.create_role(role_id, role_id, role_id, baseline, True)
     backend.assign_role("member", role_id)
     backend.create_project(project_id, project_id, "owner")
@@ -1023,6 +1402,7 @@ def test_postgresql_guarded_role_lock_does_not_block_unrelated_role(backend) -> 
     if not isinstance(backend, PostgreSQLBackend):
         pytest.skip("PostgreSQL row-lock schedule")
 
+    backend.create_user("member", "member", "Member", "hash")
     backend.create_role("role-a", "role-a", "Role A", "project.read", True)
     backend.create_role("role-b", "role-b", "Role B", "", True)
     backend.assign_role("member", "role-a")
@@ -1108,9 +1488,8 @@ def test_postgresql_snapshot_retries_when_role_assignment_revoke_wins(
     role_id = "role-snapshot-retry"
     project_id = "project-snapshot-retry"
     ws_id = "ws-snapshot-retry"
+    backend.create_user("member", "member", "Member", "hash")
     backend.create_role(role_id, role_id, role_id, "project.read", True)
-    if mutation == "delete-user":
-        backend.create_user("member", "member", "Member", "hash")
     backend.assign_role("member", role_id, "oidc" if mutation == "oidc-remove" else "")
     backend.create_project(project_id, project_id, "owner")
     backend.add_project_member(project_id, "member")

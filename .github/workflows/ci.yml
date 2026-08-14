@@ -35,11 +35,11 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # Cap a hung run at 30 min instead of riding GitHub's 6-hour default
+    # Cap a hung run at 45 min instead of riding GitHub's 6-hour default
     # (a flaky-hang run otherwise streams -v output for hours).  Was 20;
-    # the suite's growth (~9.7k tests, coverage-instrumented, 3-version
-    # matrix) started brushing the old cap on healthy runs.
-    timeout-minutes: 30
+    # the suite's growth (~12.3k tests, coverage-instrumented, 3-version
+    # matrix) started brushing the 30-minute cap on healthy runs.
+    timeout-minutes: 45
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
@@ -68,7 +68,7 @@ jobs:
 
   test-postgres:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:18

@@ -810,6 +810,17 @@ def _build_registry() -> dict[str, SettingDef]:
             "size. The index is never silently truncated or filtered.",
         ),
         SettingDef(
+            "memory.model_index_over_budget_notice",
+            "bool",
+            False,
+            "Show memory-index over-budget notices to models",
+            "memory",
+            help="When enabled, a successful model memory-tool save reports that the "
+            "complete live index is above its soft character budget. REST and SDK save "
+            "responses are unchanged. Console admin health remains available regardless "
+            "of this setting.",
+        ),
+        SettingDef(
             "memory.max_content",
             "int",
             32768,
@@ -836,14 +847,13 @@ def _build_registry() -> dict[str, SettingDef]:
             "memory.nudges",
             "bool",
             True,
-            "Enable metacognitive nudges",
+            "Enable live memory pointers and metacognitive nudges",
             "memory",
-            help="When enabled, the system periodically reminds the AI to save important "
-            "information from conversations into long-term memory. This helps the AI "
-            "remember context across separate conversations. Also gates the coordinator's "
-            "open-task reminder. Does not affect coordinator liveness wakes (the 'children "
-            "still running' nudge), which fire regardless so an idle coordinator is never "
-            "silently stranded.",
+            help="When disabled, suppress live memory pointers and memory-directed nudges, "
+            "including save reminders, plus the coordinator's open-task reminder. The "
+            "immutable initial memory index and memory tool remain available. Coordinator "
+            "liveness wakes (the 'children still running' nudge) still fire so an idle "
+            "coordinator is never silently stranded.",
         ),
         # -- tls ----------------------------------------------------------------
         SettingDef(

@@ -2272,7 +2272,7 @@ async def route_create(request: Request) -> Response:
 
             # The console chooses the destination id before routing, so the
             # node necessarily receives it as an explicit value. Preserve the
-            # ordinary generated-id contract here: an atomic registry
+            # ordinary generated-id contract here: an atomic registration
             # collision draws another id, while a caller-selected id remains
             # authoritative and returns the node's 409 unchanged.
             if (
@@ -3798,10 +3798,9 @@ async def _coord_create_validate_request(
     """
     if not uid:
         return JSONResponse({"error": "authentication required"}, status_code=401)
-    # Project attach gate — same rule as the interactive validator: a
-    # private project accepts new workstreams only from its owner or
-    # members, and a nonexistent project_id 400s rather than minting a
-    # dangling link.
+    # Project attach gate — same canonical active-runtime read rule as the
+    # interactive validator. A nonexistent project_id 400s rather than
+    # minting a dangling link.
     project_raw = body.get("project_id")
     attach_pid = (project_raw.strip() if isinstance(project_raw, str) else "") or ""
     if attach_pid:
@@ -6618,8 +6617,8 @@ def _validate_schedule_project(
     """Gate attaching a schedule's dispatched workstream to *project_id*.
 
     Checked against *user_id* — the schedule's ``created_by``, the identity the
-    scheduler dispatches under — so the same owner/member rule the node enforces
-    at dispatch is applied up front.  Returns ``None`` when allowed, else the
+    scheduler dispatches under — so the same active-project read rule the node
+    enforces at dispatch is applied up front. Returns ``None`` when allowed, else the
     ``(status, message)`` to surface.  Empty project_id = no attach, allowed.
     """
     if not project_id:
@@ -7616,7 +7615,17 @@ async def admin_assign_role(request: Request) -> JSONResponse:
             status_code=403,
         )
 
-    storage.assign_role(user_id, role_id, assigned_by=audit_uid)
+    try:
+        storage.assign_role(user_id, role_id, assigned_by=audit_uid)
+    except ValueError:
+        # The storage transaction revalidates both parents after the checks
+        # above. A concurrent user/role deletion must fail closed without an
+        # orphan assignment or a misleading success response.
+        if storage.get_user(user_id) is None:
+            return JSONResponse({"error": "User not found"}, status_code=404)
+        if storage.get_role(role_id) is None:
+            return JSONResponse({"error": "Role not found"}, status_code=404)
+        raise
     record_audit(
         storage,
         audit_uid,

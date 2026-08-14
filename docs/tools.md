@@ -433,7 +433,12 @@ Delegate a general-purpose task to an autonomous sub-agent.
 |-----------|--------|----------|-------------|
 | `prompt`  | string | yes      | Complete task description for the sub-agent. |
 
-- **What it does**: Spawns a sub-agent that inherits the `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, and web tools). The sub-agent runs autonomously to completion. Use for work that requires file modifications or command execution.
+- **What it does**: Spawns a sub-agent that inherits the production
+  `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, and web tools). The
+  sub-agent runs autonomously to completion. A selected persona can narrow
+  that final lane but cannot add memory: task agents are memory-disabled in
+  1.8 regardless of the child persona's memory flag. Use for work that requires
+  file modifications or command execution.
 - **Auto-approve**: No -- requires user confirmation.
 - **Agent availability**: Top-level only.
 
@@ -459,15 +464,24 @@ Structured persistent memory across sessions with typed, scoped entries.
 - **What it does**: Manages structured persistent memories in the database.
   Memories persist across sessions, have a type classification, and live in a
   role-specific visible scope. Unscoped `save`/`get`/`delete` resolve to one
-  target: the attached active project, otherwise `global` for an interactive
-  session or `coordinator` for a coordinator. Read-only project access permits
-  `get` but makes `save`/`delete` fail without falling back. A valid explicit
-  scope selects exactly that scope. Unscoped `search`/`list` cover all visible
-  scopes; use the displayed scope when following a result with `get` or
-  `delete`. The initial system prefix contains an immutable, complete,
-  body-free metadata index for the acting principal and explicit project ID.
-  Later user turns may add live body-free `(scope, name)` pointers. `get` is
-  the sole full-body read and the sole action that updates access counters.
+  target. Any stored project attachment pins that target to `project`; a
+  missing or archived project, or revoked access, fails closed without falling
+  back. Authorized read-only access permits `get` but makes `save`/`delete`
+  fail. Authorized reactivation restores eligibility. Only a workstream with
+  no stored project attachment defaults to `global` (interactive) or
+  `coordinator`. A valid explicit scope selects exactly that scope. Unscoped
+  `search`/`list` cover all visible scopes; use the displayed scope when
+  following a result with `get` or `delete`. The initial system prefix contains
+  an immutable, complete, body-free metadata index for the acting principal.
+  It records an explicit project ID only when the attached project is active
+  and readable at first admission. Later user turns may add live body-free
+  `(scope, name)` pointers. Setting `memory.nudges=false` suppresses those live
+  pointers and memory-directed nudges, but not the immutable index or the
+  memory tool. `get` is the sole full-body read and the sole action that updates
+  access counters.
+  The model-facing over-budget notice is opt-in, defaults off, and can appear
+  only on a successful memory-tool save; REST/SDK saves are unchanged and
+  console health remains unconditional.
 - **Auto-approve**: Yes.
 - **Agent availability**: Not available to task agents.
 

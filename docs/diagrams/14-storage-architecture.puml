@@ -15,6 +15,8 @@ interface "StorageBackend" as Storage <<protocol>> {
     + load_message_turns(ws_id, checkpointed=True) → list[Turn]
     + save_message(ws_id, role, content, metadata...)
     + clone_workstream(source, destination, principal, expected_session) → ForkCloneSnapshot
+    + get_memory_index_snapshot(ws_id) → row | None
+    + acquire_memory_index_snapshot(ws_id, principal, commit_context) → row | None
     --
     + register_workstream(..., state, reservation_token) → bool
     + ensure_workstream_incarnation_snapshot(ws_id) → row + token
@@ -73,11 +75,6 @@ class "workstreams" as Workstreams <<schema>> {
     project_id, persona, alias, title
 }
 
-class "workstream_id_registry" as WorkstreamIds <<schema>> {
-    ws_id PK
-    published ids survive hard delete
-}
-
 class "conversations" as Conversations <<schema>> {
     canonical persisted Turn rows
     provider_data + tool_calls mirror
@@ -94,6 +91,14 @@ class "workstream_config" as WorkstreamConfig <<schema>> {
     stamped persona/session config
     private durable incarnation fence:
     __fork_destination_reservation
+}
+
+class "memory_index_snapshots" as MemoryIndexSnapshots <<schema>> {
+    ws_id PK: one binding per durable row
+    principal + project witnesses
+    visibility key + rendered content
+    format / entry / character counts
+    captured_at
 }
 
 class "workstream_attachments" as Attachments <<schema>> {
@@ -127,14 +132,15 @@ SQLite --> Utils
 PG --> Utils
 
 Storage --> Workstreams
-Storage --> WorkstreamIds
 Storage --> Conversations
 Storage --> WorkstreamConfig
+Storage --> MemoryIndexSnapshots
 Storage --> Attachments
 Storage --> Projects
 
 Manager --> Storage : lifecycle reservation + state
 Session --> Storage : turn durability + resume
+Session --> MemoryIndexSnapshots : first-admission prefix binding
 Session --> Expectation : construction witness
 Storage --> Snapshot : atomic clone result
 Expectation --> Utils : checked inside transaction
@@ -151,9 +157,9 @@ note right of Manager
   5. Only then emit ws_created.
 
   Any normal prepublication failure immediately calls exact token-checked
-  deletion. Rollback releases the ID before publication; after publication a
-  durable registry tombstone makes the ID globally non-reusable. The token
-  still prevents stale provisional operations from deleting a retried hidden
+  deletion. The workstreams primary key reserves the ID while its row exists;
+  rollback and hard deletion release it after removing owned state. The token
+  prevents stale provisional operations from deleting a same-ID replacement
   reservation.
   A legacy row acquires the same private token atomically when rehydrate,
   delete, or fork preflight takes its authoritative snapshot. Loaded hard
@@ -194,6 +200,12 @@ note bottom of Conversations
   Full transcript rows are never deleted by compaction. Normal resume
   loads the latest valid [summary] + rows after its watermark; audit and
   export can request the full marker-free history.
+end note
+
+note bottom of MemoryIndexSnapshots
+  Capture resolves project access and visible metadata in one transaction.
+  The caller validates the complete final system prefix before first commit.
+  Hard workstream deletion removes the snapshot in the same transaction.
 end note
 
 @enduml

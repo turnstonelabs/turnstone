@@ -760,17 +760,19 @@ class HealthResponse(BaseModel):
 
 MemoryType = Literal["user", "general", "feedback", "reference"]
 MemoryScope = Literal["global", "workstream", "user"]
+MEMORY_NAME_INPUT_DESCRIPTION = (
+    "Memory identifier. Raw aliases may contain supported Latin letters that fold to "
+    "ASCII, ASCII digits, Unicode space separators, Unicode hyphens, and single "
+    "underscores. The server normalizes them to a lowercase ASCII snake_case key of "
+    "at most 256 characters. Other characters and leading, trailing, or repeated "
+    "underscores are rejected."
+)
 
 
 class SaveMemoryRequest(BaseModel):
     name: str = Field(
-        description=(
-            "Memory identifier. Latin input is normalized to a lowercase ASCII "
-            "snake_case semantic key; unsupported scripts and punctuation are rejected."
-        ),
+        description=MEMORY_NAME_INPUT_DESCRIPTION,
         min_length=1,
-        max_length=256,
-        pattern=r"^[a-z0-9]+(?:_[a-z0-9]+)*$",
     )
     content: str = Field(description="Memory content", min_length=1, max_length=65536)
     description: str = Field(

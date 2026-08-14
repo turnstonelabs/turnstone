@@ -2668,17 +2668,19 @@ async def _interactive_create_validate_request(
         body["_resume_incarnation_token"] = str(_src_row.get("fork_reservation_token") or "")
         body["project_id"] = source_project
         resume_inherited_pid = bool(source_project)
-    # Project attach gate (explicit or parent-inherited): a private
-    # project accepts new workstreams only from its owner/members, and a
-    # nonexistent EXPLICIT project_id is a caller error rather than a
-    # silent dangling link. Re-checking the inherited value is deliberate
+    # Project attach gate (explicit or parent-inherited): a project requires
+    # canonical active-runtime read access, and a nonexistent EXPLICIT
+    # project_id is a caller error rather than a silent dangling link.
+    # Re-checking the inherited value is deliberate
     # — a coordinator owner whose membership was revoked fails the child
     # spawn loudly here instead of minting rows they can no longer see.
     # The one asymmetry: an INHERITED project that no longer exists is
     # not the spawner's error — project deletion leaves the parent's
     # link dangling by design and must not disable spawn_workstream, so
     # the child simply isn't attached.
-    attach_pid = str(body.get("project_id") or "")
+    project_raw = body.get("project_id")
+    attach_pid = project_raw.strip() if isinstance(project_raw, str) else ""
+    body["project_id"] = attach_pid
     if attach_pid:
         from turnstone.core.auth import ensure_project_attachable
 
@@ -6197,10 +6199,9 @@ def main() -> None:
         trusted_proxies=config_store.get("ratelimit.trusted_proxies"),
     )
 
-    # Config builders — shared between startup logging and session factory.
-    # Re-read from ConfigStore each call so hot-reload works.
+    # Judge config is shared between startup logging and session construction.
+    # Re-read from ConfigStore for each new session so hot-reload works.
     from turnstone.core.judge import JudgeConfig
-    from turnstone.core.memory_relevance import MemoryConfig
 
     def _build_judge_config() -> JudgeConfig:
         return JudgeConfig(
@@ -6218,15 +6219,6 @@ def main() -> None:
             output_guard_model=config_store.get("judge.output_guard_model"),
             output_guard_llm_timeout=config_store.get("judge.output_guard_llm_timeout"),
             redact_secrets=config_store.get("judge.redact_secrets"),
-        )
-
-    def _build_memory_config() -> MemoryConfig:
-        return MemoryConfig(
-            relevance_k=config_store.get("memory.relevance_k"),
-            index_budget_chars=config_store.get("memory.index_budget_chars"),
-            max_content=config_store.get("memory.max_content"),
-            nudge_cooldown=config_store.get("memory.nudge_cooldown"),
-            nudges=config_store.get("memory.nudges"),
         )
 
     judge_config = _build_judge_config()
@@ -6309,7 +6301,6 @@ def main() -> None:
                 log.debug("Failed to resolve username for uid %s", uid, exc_info=True)
 
         # Re-resolve from ConfigStore so new workstreams pick up hot-reloaded settings.
-        live_memory_config = _build_memory_config()
         live_judge_config = _build_judge_config()
         if live_judge_config and judge_model:
             import dataclasses
@@ -6373,7 +6364,6 @@ def main() -> None:
             skill=skill or args.skill or None,
             judge_config=live_judge_config,
             user_id=uid,
-            memory_config=live_memory_config,
             config_store=config_store,
             client_type=ClientType(client_type)
             if client_type in {ct.value for ct in ClientType}

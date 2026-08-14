@@ -1,4 +1,6 @@
 @startuml
+' This long sequence must be rendered with PLANTUML_LIMIT_SIZE=8192;
+' PlantUML's 4096px default clips the admin and configuration phases.
 !theme plain
 title Turnstone — Structured Memory Architecture
 
@@ -39,7 +41,17 @@ alt action = save
     Storage --> Facade : (saved row, was_update)
     Facade --> Session : saved row
     Session -> Session : audit acting principal
-    Session -> Facade : render complete live index\nfor soft-budget notice
+    Session -> Facade : prospective_memory_index()
+    Facade -> Storage : one visibility-union query
+    Storage --> Facade : complete live metadata
+    Session -> Session : append informational health prose\nto successful model-tool result
+    note right
+      Legacy-description health is reported here.
+      Over-budget prose requires
+      model_index_over_budget_notice = true
+      (default false). REST/SDK saves are unchanged;
+      console admin health remains unconditional.
+    end note
 end
 
 alt action = get
@@ -68,25 +80,49 @@ Session -> Session : resolve acting principal\nand live project ACL
 note right
   **Scope resolution:**
   Interactive: global + workstream
-  + acting user + readable project
+  + acting user + active, readable project
   Coordinator: acting user's coordinator
-  + readable project
+  + active, readable project
+  Missing, archived, or access-revoked attachments
+  produce empty project witnesses and no project rows.
 end note
 
 Session -> Facade : acquire_memory_index_snapshot(\nws, acting principal)
 Facade -> Storage : load durable snapshot
 alt snapshot absent
-Facade -> Storage : list every visible metadata row
-Storage --> Facade : scope + type + name + description\n(no body)
-Facade -> Facade : render complete <memory-index>\nwith explicit project_id
-Facade -> Storage : INSERT ... ON CONFLICT DO NOTHING\nRETURNING concurrent winner
+    Facade -> Storage : list every visible metadata row
+    Storage --> Facade : scope + type + name + description\n(no body)
+    Facade -> Facade : render complete <memory-index>\nwith authorized project witness
+    Facade --> Session : candidate before transaction commit
+    Session -> Session : estimate complete final system prefix\nagainst lane usable input capacity
+    break candidate prefix exceeds capacity
+        Session --> Facade : reject candidate
+        Facade --> Storage : ROLLBACK\n(no new snapshot)
+        note right
+          Refusal occurs before provider dispatch and
+          attachment/perception work. Consolidate/delete
+          memories and retry, or choose a larger model.
+        end note
+    end
+    Facade -> Storage : INSERT ... ON CONFLICT DO NOTHING\nRETURNING concurrent winner
+    Storage --> Session : immutable snapshot bytes
+else snapshot already bound
+    Storage --> Session : immutable snapshot bytes
+    Session -> Session : validate bound final system prefix
+    break bound prefix exceeds capacity
+        Session -> Session : refuse before provider dispatch
+        note right
+          A bound oversized prefix requires a larger-context
+          model for this workstream; memory edits do not rewrite it.
+        end note
+    end
 end
-Storage --> Session : immutable snapshot bytes
 Session -> Session : publish in initial system prefix
 note right
   Saving, editing, and deleting memories never rewrite
   an existing snapshot. The first model admission binds
-  one snapshot to the globally unique workstream ID.
+  one snapshot to the current durable workstream row.
+  Hard deletion removes it before the ID can be reused.
 end note
 
 Session -> Session : after each genuine user turn
@@ -99,16 +135,6 @@ note right
   Pointer and index entries are untrusted metadata.
   The model calls memory(action='get') to verify live
   access and retrieve a body. Only get records access.
-end note
-
-Session -> Facade : prospective_memory_index()
-Facade -> Storage : one visibility-union query
-Storage --> Facade : complete live metadata
-note right
-  65,536-character soft budget:
-  never truncates the index. Save responses and
-  persistent admin health report overages and
-  legacy rows needing authored descriptions.
 end note
 
 == Phase 3: Server API Path ==
@@ -175,12 +201,14 @@ Admin --> SDK : {"status": "ok"}
 == Configuration ==
 
 note over Session, Relevance
-  **MemoryConfig** (from [memory] in config.toml):
+  **Server/console live ConfigStore (standalone CLI uses defaults):**
   relevance_k = 5       -- live metadata pointers per user turn
   index_budget_chars = 65536 -- complete-index soft budget
+  model_index_over_budget_notice = false -- model-tool save only
   max_content = 32768    -- max content length per memory
   nudge_cooldown = 300   -- seconds between metacognitive nudges
-  nudges = true          -- enable/disable memory nudges
+  nudges = true          -- live pointers + memory-directed nudges;
+                         -- immutable index and tool unaffected
 end note
 
 @enduml

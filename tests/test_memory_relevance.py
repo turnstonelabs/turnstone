@@ -144,4 +144,5 @@ class TestPointerPlanning:
 def test_memory_config_defaults_to_complete_index_soft_budget() -> None:
     config = MemoryConfig()
     assert config.index_budget_chars == 65_536
+    assert config.model_index_over_budget_notice is False
     assert config.relevance_k == 5

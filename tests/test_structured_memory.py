@@ -233,6 +233,7 @@ class TestNormalizeKey:
             "query?name",
             "fragment#name",
             "control\nname",
+            "ƿynn",
             "中文名称",
             "日本語",
         ],
@@ -241,9 +242,10 @@ class TestNormalizeKey:
         with pytest.raises(ValueError, match="memory name"):
             normalize_memory_name(raw)
 
-    def test_unsupported_script_error_is_retryable_guidance(self):
+    @pytest.mark.parametrize("raw", ["ƿynn", "部署手順"])
+    def test_unsupported_character_error_is_retryable_guidance(self, raw):
         with pytest.raises(ValueError, match="ASCII semantic key"):
-            normalize_memory_name("部署手順")
+            normalize_memory_name(raw)
 
 
 class TestScopeIsolation:

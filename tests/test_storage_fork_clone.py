@@ -67,6 +67,7 @@ def _raw_workstream_config(backend, ws_id: str) -> dict[str, str]:
 
 
 def _grant_project_read(backend, user_id: str) -> None:
+    backend.create_user(user_id, user_id, user_id.title(), "hash")
     backend.create_role(
         "fork-project-reader",
         "fork-project-reader",
@@ -226,7 +227,7 @@ def test_clone_rejects_hidden_creating_source(storage_backend) -> None:
     assert backend.load_message_turns("destination") == []
 
 
-def test_clone_refuses_consumed_source_id_after_preflight(storage_backend) -> None:
+def test_clone_refuses_replaced_source_incarnation_after_preflight(storage_backend) -> None:
     backend = storage_backend
     _register(backend, "source", "alice")
     backend.save_message("source", "user", "authorized predecessor")
@@ -243,7 +244,7 @@ def test_clone_refuses_consumed_source_id_after_preflight(storage_backend) -> No
             kind="interactive",
             fork_reservation_token="replacement-incarnation",
         )
-        is False
+        is True
     )
     _register(
         backend,
@@ -270,7 +271,7 @@ def test_clone_refuses_consumed_source_id_after_preflight(storage_backend) -> No
 
     assert backend.load_message_turns("destination") == []
     assert backend.load_message_turns("source") == []
-    assert backend.get_workstream_reservation_token("source") == ""
+    assert backend.get_workstream_reservation_token("source") == "replacement-incarnation"
 
 
 def test_clone_refuses_nonempty_destination_without_mutation(storage_backend) -> None:

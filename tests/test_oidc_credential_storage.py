@@ -96,8 +96,9 @@ class TestDelete:
         assert not backend.delete_oidc_user_credential("nobody", ISS)
 
     def test_delete_user_cascades_credential(self, backend) -> None:
+        backend.create_user("u-doomed", "doomed", "Doomed", "hash")
         backend.upsert_oidc_user_credential("u-doomed", ISS, refresh_token_ct=b"ct-1")
-        backend.delete_user("u-doomed")
+        assert backend.delete_user("u-doomed")
         assert backend.get_oidc_user_credential("u-doomed", ISS) is None
 
 

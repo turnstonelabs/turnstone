@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sqlalchemy as sa
+
+from turnstone.core.storage._schema import user_roles
+
 
 class TestUserCRUD:
     def test_create_and_get(self, db):
@@ -46,6 +50,23 @@ class TestUserCRUD:
 
     def test_delete_nonexistent(self, db):
         assert not db.delete_user("missing")
+
+    def test_delete_nonexistent_preserves_historical_dependent_rows(self, db):
+        db.create_role("r1", "editor", "Editor", "read", builtin=False, org_id="")
+        with db._conn() as conn:
+            conn.execute(
+                sa.insert(user_roles),
+                {
+                    "user_id": "missing",
+                    "role_id": "r1",
+                    "assigned_by": "historical",
+                    "created": "2024-01-01T00:00:00",
+                },
+            )
+            conn.commit()
+
+        assert not db.delete_user("missing")
+        assert [row["role_id"] for row in db.list_user_roles("missing")] == ["r1"]
 
     def test_delete_cascades_tokens(self, db):
         db.create_user("u1", "admin", "Admin", "$2b$hash")

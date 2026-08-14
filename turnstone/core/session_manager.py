@@ -569,7 +569,7 @@ class SessionManager:
         requested_ws_id = ws_id
         while True:
             # Caller-chosen ids are contractual and collide loudly. Generated
-            # ids are opaque implementation detail, so a registry collision
+            # ids are opaque implementation detail, so a live-ID collision
             # simply draws another UUID. The storage insert remains the
             # authoritative race-free check; a preflight alone cannot close a
             # cross-node collision window.

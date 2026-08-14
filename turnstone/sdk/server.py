@@ -528,7 +528,7 @@ class AsyncTurnstoneServer(_BaseClient):
         content: str,
         *,
         description: str,
-        mem_type: str = "general",
+        mem_type: str | None = None,
         scope: str = "global",
         scope_id: str = "",
     ) -> MemorySummary:
@@ -539,9 +539,10 @@ class AsyncTurnstoneServer(_BaseClient):
             "name": name,
             "content": content,
             "description": description,
-            "type": mem_type,
             "scope": scope,
         }
+        if mem_type is not None:
+            body["type"] = mem_type
         if scope_id:
             body["scope_id"] = scope_id
         return await self._request(
@@ -890,7 +891,7 @@ class TurnstoneServer:
         content: str,
         *,
         description: str,
-        mem_type: str = "general",
+        mem_type: str | None = None,
         scope: str = "global",
         scope_id: str = "",
     ) -> MemorySummary:

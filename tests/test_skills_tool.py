@@ -1359,6 +1359,17 @@ class TestSkillCatalogDisclosure:
         session._applied_skill_content = None
         session.context_window = 128000
         session.messages = []
+        # ``__new__`` bypasses ChatSession's token-accounting defaults. Prefix
+        # publication invalidates any provider anchor when its bytes change,
+        # so mirror the real constructor state at that seam.
+        session._chars_per_token = 4.0
+        session._last_usage = None
+        session._token_calibrations = {}
+        session._active_token_calibration_key = None
+        session._last_usage_calibration_key = None
+        session._msg_tokens = []
+        session._system_tokens = 0
+        session._calibrated_msg_count = 0
         session._config = {}
         session.instructions = ""
         session.system_messages = []

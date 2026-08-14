@@ -54,6 +54,21 @@ class TestValidateKey:
         assert defn.section == "judge"
         assert "judge.smart_approvals" in SETTINGS
 
+    def test_memory_index_over_budget_notice_is_opt_in(self):
+        defn = validate_key("memory.model_index_over_budget_notice")
+        assert defn.type == "bool"
+        assert defn.default is False
+        assert defn.section == "memory"
+        assert "successful model memory-tool save" in defn.help
+        assert "REST and SDK save responses are unchanged" in defn.help
+        assert "Console admin health remains available" in defn.help
+
+    def test_memory_nudges_help_preserves_index_and_tool(self):
+        defn = validate_key("memory.nudges")
+        assert defn.default is True
+        assert "live memory pointers" in defn.help
+        assert "immutable initial memory index and memory tool remain available" in defn.help
+
     def test_confidence_threshold_is_smart_approval_bar(self):
         """Default bumped to the Smart Approvals auto-approve bar (0.95),
         still clamped to [0, 1]."""

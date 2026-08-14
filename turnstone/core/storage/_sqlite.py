@@ -82,7 +82,6 @@ from turnstone.core.storage._schema import (
     watches,
     workstream_attachments,
     workstream_config,
-    workstream_id_registry,
     workstream_overrides,
     workstreams,
 )
@@ -1456,13 +1455,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         norm_project = project_id if project_id else None
         norm_persona = persona if persona else None
         with self._conn() as conn:
-            registry_result = conn.execute(
-                sa.insert(workstream_id_registry).prefix_with("OR IGNORE"),
-                {"ws_id": ws_id, "created": now},
-            )
-            if registry_result.rowcount != 1:
-                conn.commit()
-                return False
             result = conn.execute(
                 sa.insert(workstreams).prefix_with("OR IGNORE"),
                 {
@@ -1484,15 +1476,10 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 },
             )
             inserted = result.rowcount == 1
-            if not inserted:
-                # Compatibility for a legacy/direct row that bypassed the
-                # registry. Migration 072 backfills every production row.
-                conn.execute(
-                    sa.delete(workstream_id_registry).where(workstream_id_registry.c.ws_id == ws_id)
-                )
             if inserted:
-                # Defensive cleanup for pre-072 orphan data. Once registered,
-                # this id can never name a second published workstream.
+                # Defensive cleanup for orphan data left by historical delete
+                # paths. A newly inserted row must not inherit memory state
+                # from an earlier workstream that used the same id.
                 conn.execute(
                     sa.delete(memory_index_snapshots).where(memory_index_snapshots.c.ws_id == ws_id)
                 )
@@ -1715,10 +1702,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
     def _delete_workstream_on_connection(self, conn: Any, ws_id: str) -> bool:
         """Delete one row and dependents inside the caller's transaction."""
-        state_row = conn.execute(
-            sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id)
-        ).fetchone()
-        was_unpublished = state_row is not None and str(state_row[0] or "") == "creating"
         # Refcount GC over every referenced blob (content-addressed ids are
         # global, so a deduped blob may be shared with another workstream —
         # decrement, don't blanket-delete by ws_id).  Blobs that hit 0 are
@@ -1759,10 +1742,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             .values(parent_ws_id=None)
         )
         result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
-        if result.rowcount > 0 and was_unpublished:
-            conn.execute(
-                sa.delete(workstream_id_registry).where(workstream_id_registry.c.ws_id == ws_id)
-            )
         return bool(result.rowcount > 0)
 
     def delete_workstream(self, ws_id: str) -> bool:
@@ -2244,8 +2223,14 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             return {r[0] for r in rows}
 
     def delete_user(self, user_id: str) -> bool:
-
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            user = conn.execute(
+                sa.select(users.c.user_id).where(users.c.user_id == user_id)
+            ).fetchone()
+            if user is None:
+                conn.rollback()
+                return False
             conn.execute(sa.delete(user_roles).where(user_roles.c.user_id == user_id))
             conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
             conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
@@ -3259,6 +3244,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             conn.execute(sa.text("BEGIN IMMEDIATE"))
+            user = conn.execute(
+                sa.select(users.c.user_id).where(users.c.user_id == user_id)
+            ).fetchone()
+            if user is None:
+                raise ValueError(f"user {user_id!r} does not exist")
             role = conn.execute(
                 sa.select(roles.c.role_id).where(roles.c.role_id == role_id)
             ).fetchone()
@@ -3333,6 +3323,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         # actual transition that hit the table.
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            user = conn.execute(
+                sa.select(users.c.user_id).where(users.c.user_id == user_id)
+            ).fetchone()
+            if user is None:
+                raise ValueError(f"user {user_id!r} does not exist")
             existing_desired = {
                 str(row[0])
                 for row in conn.execute(
@@ -3365,6 +3360,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             # any state change that landed between the two reads.
             conn.commit()
             conn.execute(sa.text("BEGIN IMMEDIATE"))
+            user = conn.execute(
+                sa.select(users.c.user_id).where(users.c.user_id == user_id)
+            ).fetchone()
+            if user is None:
+                raise ValueError(f"user {user_id!r} does not exist")
             existing_desired = {
                 str(row[0])
                 for row in conn.execute(
@@ -5322,11 +5322,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 scope_filters += " AND type = :type_filter"
                 params["type_filter"] = mem_type
             if scope:
-                exact_scope, exact_params = build_memory_scope_or_clause(
-                    [(scope, scope_id)],
-                )
-                scope_filters += f" AND ({exact_scope})"
-                params.update(exact_params)
+                scope_filters += " AND scope = :scope_filter"
+                params["scope_filter"] = scope
+                if scope_id:
+                    scope_filters += " AND scope_id = :scope_id_filter"
+                    params["scope_id_filter"] = scope_id
             rows = conn.execute(
                 sa.text(
                     "SELECT memory_id, name, description, type, scope, scope_id, "
@@ -5490,7 +5490,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         ws_id: str,
         principal_id: str,
         *,
-        commit_guard: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
+        commit_context: Callable[[dict[str, Any]], contextlib.AbstractContextManager[None]]
+        | None = None,
     ) -> dict[str, Any] | None:
         with self._conn() as conn:
             conn.execute(sa.text("BEGIN IMMEDIATE"))
@@ -5499,7 +5500,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 ws_id=ws_id,
                 principal_id=principal_id,
             )
-            with commit_guard() if commit_guard is not None else contextlib.nullcontext():
+            context = (
+                commit_context(row)
+                if commit_context is not None and row is not None
+                else contextlib.nullcontext()
+            )
+            with context:
                 conn.commit()
             return row
 
@@ -5507,7 +5513,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
     def _build_scope_or_clause(
         scopes: list[tuple[str, str]],
     ) -> tuple[str, dict[str, str]]:
-        """Build a parameterized OR-group of (scope[, scope_id]) predicates."""
+        """Build a parameterized OR-group of exact (scope, scope_id) pairs."""
         return build_memory_scope_or_clause(scopes)
 
     def count_structured_memories(

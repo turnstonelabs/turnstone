@@ -14,7 +14,7 @@ A persona is exactly four levers — no more:
 | **Base prompt** | Replaces the BASE module of the composed system message. *Only* BASE: ENV, CONTEXT, TOOLS, and POLICIES keep composing, so mandatory [prompt policies](governance.md) ride on top of every persona. Built-in personas source their prose from a repo file; operator personas store it inline — see [Where persona prompts live](#where-persona-prompts-live). |
 | **Tool visibility** | Which tools the session advertises. Tri-state: *unrestricted* (tracks tool growth and MCP catalogs), *no tools* (the TOOLS prompt block self-suppresses and zero definitions go on the wire), or an *exact set* of names. Including `tool_search` in a set makes it **soft** — tools the model discovers through search join the visible set; omitting it makes the set **hard** (the search pathway is disabled entirely). On commercial providers a soft set costs one prompt-cache re-prime per `tool_search` expansion, since each expansion rewrites the wire tool set and recomposes the prompt. |
 | **MCP** | Whether the workstream talks to MCP at all. **Session-wide**: off means no MCP tools for the persona's own hands *or* for in-process task agents, no resource/prompt catalogs, and no listener registrations. This lever expresses infrastructure intent, not behavior shaping. |
-| **Memory** | Whether the persona's **own hands** get memory: the immutable metadata index, live metadata pointers, memory-directed metacognitive nudges, and the `memory` tool. A task-agent persona applies the same lever to that child; parent and child envelopes can only narrow authority. Compaction spill/markers are session mechanics and are never memory-gated. An exact tool set that hides `memory` also suppresses the index, pointers, and memory nudges, while the compaction-resume pointer follows `recall`'s visibility. |
+| **Memory** | Whether the persona's **own hands** get memory: the immutable metadata index, live metadata pointers, memory-directed metacognitive nudges, and the `memory` tool. Production task agents are memory-disabled in 1.8 regardless of a child persona's memory flag; a persona may narrow the final task-agent capability envelope but cannot add memory to that lane ([follow-up #1017](https://github.com/turnstonelabs/turnstone/issues/1017)). Compaction spill/markers are session mechanics and are never memory-gated. An exact tool set that hides `memory` also suppresses the index, pointers, and memory nudges, while the compaction-resume pointer follows `recall`'s visibility. |
 
 Visibility is behavior shaping, **not** a security boundary: any tool call
 that does reach the wire still clears the same approval, judge, and policy
@@ -124,6 +124,8 @@ seeded):
   sub-agent's identity and capability envelope (resolved against
   interactive-kind personas, frozen into the task at prep). Omitted keeps
   the default autonomous task-agent identity — never the parent's persona.
+  The selected persona can only narrow the production task-agent lane; in
+  1.8 that lane remains memory-disabled even when the persona enables memory.
 
 ## How agents discover personas
 

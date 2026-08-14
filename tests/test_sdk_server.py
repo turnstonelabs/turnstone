@@ -397,7 +397,41 @@ async def test_save_memory_requires_and_sends_description():
         )
 
     assert captured["description"] == "Production deployment workflow"
+    assert "type" not in captured
     assert memory.description == "Production deployment workflow"
+
+
+@pytest.mark.anyio
+async def test_save_memory_explicit_general_type_is_sent():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return _json_response(
+            {
+                "memory_id": "m1",
+                "name": "deployment_process",
+                "description": "Production deployment workflow",
+                "type": captured["type"],
+                "scope": "global",
+                "scope_id": "",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        memory = await client.save_memory(
+            "deployment_process",
+            "Deploy from main",
+            description="Production deployment workflow",
+            mem_type="general",
+        )
+
+    assert captured["type"] == "general"
+    assert memory.type == "general"
 
 
 @pytest.mark.anyio

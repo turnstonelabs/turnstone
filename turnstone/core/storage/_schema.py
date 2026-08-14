@@ -1,6 +1,7 @@
-"""SQLAlchemy Core schema — single source of truth for all table definitions.
+"""SQLAlchemy Core definitions for current metadata and create-all schemas.
 
-Used by both storage backends and Alembic migrations.
+Alembic revision history is maintained separately. Parity tests keep these two
+manual definitions aligned; neither is generated from the other.
 """
 
 from __future__ import annotations
@@ -46,9 +47,9 @@ memory_index_snapshots = sa.Table(
     "memory_index_snapshots",
     metadata,
     sa.Column("ws_id", sa.Text, nullable=False),
-    # One immutable binding per globally unique workstream id. principal_id
-    # and visibility_key are provenance describing the first admitted model
-    # turn; neither is part of the identity.
+    # One immutable binding per durable workstream row. principal_id and
+    # visibility_key are provenance describing the first admitted model turn;
+    # neither is part of the identity.
     sa.Column("principal_id", sa.Text, nullable=False, server_default=""),
     sa.Column("project_id", sa.Text, nullable=False, server_default=""),
     sa.Column("project_name", sa.Text, nullable=False, server_default=""),
@@ -177,17 +178,6 @@ sa.Index("idx_workstreams_alias", workstreams.c.alias)
 sa.Index("idx_workstreams_kind", workstreams.c.kind)
 sa.Index("idx_workstreams_parent", workstreams.c.parent_ws_id)
 sa.Index("idx_workstreams_project", workstreams.c.project_id)
-
-# Durable uniqueness registry. Published workstream ids remain here after a
-# hard delete, so a caller-supplied id can never address a later logical
-# workstream. Hidden ``creating`` reservations release their registry row when
-# rolled back, allowing a failed request to retry before publication.
-workstream_id_registry = sa.Table(
-    "workstream_id_registry",
-    metadata,
-    sa.Column("ws_id", sa.Text, primary_key=True),
-    sa.Column("created", sa.Text, nullable=False),
-)
 
 workstream_config = sa.Table(
     "workstream_config",

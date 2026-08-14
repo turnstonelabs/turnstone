@@ -1933,6 +1933,7 @@ class SessionUIBase:
         feedback: str | None = None,
         *,
         timeout: bool = False,
+        resolver_principal_id: str | None = None,
     ) -> int:
         """Resolve EVERY live cycle with one decision; returns the count.
 
@@ -1949,6 +1950,10 @@ class SessionUIBase:
         deliberately excluded. Live dismissals publish before the barrier is
         retired, while durable verdict updates run afterward so storage latency
         never delays successor admission.
+
+        Authenticated request paths pass ``resolver_principal_id`` so durable
+        verdicts retain the human actor. Internal recovery and teardown paths
+        omit it and remain explicitly unattributed.
         """
         # A Smart Approval gate can still be waiting for its asynchronous
         # verdict before an ApprovalCycle exists.  Wake that pre-cycle wait as
@@ -1975,7 +1980,7 @@ class SessionUIBase:
                     and (not cycle.cancel_witnesses or self._approval_cycle_owner_aborted(cycle))
                 ]
                 for cycle in targets:
-                    cycle.resolver_principal_id = ""
+                    cycle.resolver_principal_id = resolver_principal_id or ""
                     pending = self._claim_approval_cycle_locked(
                         cycle,
                         approved=approved,

@@ -401,6 +401,16 @@
               }
             }
           },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Error 404",
             "content": {
@@ -2120,11 +2130,9 @@
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string",
-              "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$",
-              "maxLength": 256
+              "type": "string"
             },
-            "description": "Canonical lowercase ASCII snake_case memory identifier"
+            "description": "Memory identifier. Raw aliases may contain supported Latin letters that fold to ASCII, ASCII digits, Unicode space separators, Unicode hyphens, and single underscores. The server normalizes them to a lowercase ASCII snake_case key of at most 256 characters. Other characters and leading, trailing, or repeated underscores are rejected."
           },
           {
             "name": "scope",
@@ -2210,11 +2218,9 @@
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string",
-              "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$",
-              "maxLength": 256
+              "type": "string"
             },
-            "description": "Canonical lowercase ASCII snake_case memory identifier"
+            "description": "Memory identifier. Raw aliases may contain supported Latin letters that fold to ASCII, ASCII digits, Unicode space separators, Unicode hyphens, and single underscores. The server normalizes them to a lowercase ASCII snake_case key of at most 256 characters. Other characters and leading, trailing, or repeated underscores are rejected."
           },
           {
             "name": "scope",
@@ -4086,10 +4092,8 @@
       "SaveMemoryRequest": {
         "properties": {
           "name": {
-            "description": "Memory identifier. Latin input is normalized to a lowercase ASCII snake_case semantic key; unsupported scripts and punctuation are rejected.",
-            "maxLength": 256,
+            "description": "Memory identifier. Raw aliases may contain supported Latin letters that fold to ASCII, ASCII digits, Unicode space separators, Unicode hyphens, and single underscores. The server normalizes them to a lowercase ASCII snake_case key of at most 256 characters. Other characters and leading, trailing, or repeated underscores are rejected.",
             "minLength": 1,
-            "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$",
             "title": "Name",
             "type": "string"
           },

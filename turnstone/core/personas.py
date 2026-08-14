@@ -17,7 +17,10 @@ The five keys (all-or-none — a partial stamp is corruption, not a fallback):
 - ``persona_mcp``      — ``"1"``/``"0"``: whether the workstream talks to MCP
   at all (session-wide, including task-agent merges)
 - ``persona_memory``   — ``"1"``/``"0"``: whether the persona's own hands get
-  memory (immutable index, live pointers, nudges, and the memory tool); task agents keep theirs
+  memory (immutable index, live pointers, nudges, and the memory tool).
+  Production task agents are memory-disabled in 1.8 regardless of a child
+  persona's flag; their persona can only narrow the final production lane
+  (follow-up: #1017).
 
 Workstreams with none of the keys predate personas (or were created against a
 pre-seed database) and keep legacy behaviour — byte-identical to the
