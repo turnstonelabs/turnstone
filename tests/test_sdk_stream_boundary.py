@@ -1,6 +1,6 @@
-"""Offline pins of the SDK boundary behaviors the #937 retry design rests on.
+"""Offline pins of SDK boundary behaviors used by stream error handling.
 
-Four facts, each probed against the REAL SDKs over mock/loopback
+Five facts, each probed against the REAL SDKs over mock/loopback
 transports (no network, no live backend):
 
 1. OpenAI v3's ``max_retries`` covers request time only — a mid-BODY death
@@ -14,24 +14,35 @@ transports (no network, no live backend):
    wire release surfaces as an ``httpx2.TransportError`` on the blocked
    ``next()``. The production ``transport_guarded`` seam must normalize it
    before the retry gate.
+5. OpenAI v3 raises real HTTP errors before returning a stream, while an HTTP
+   200 ``application/json`` response becomes an empty iterator unless the
+   adapter rejects it before arming the stream.
 
-If an SDK/httpx upgrade changes any of these, the ``transport_guarded``
-conversion (and the retry gate consuming it) must be re-verified — these
-tests are the tripwire.  Wire framing bytes (CRLF, the SSE double-LF) are
-built via ``chr`` rather than escape literals so the payloads are
-byte-exact regardless of source-encoding handling.
+If an SDK/httpx upgrade changes any of these, the provider boundary and
+``transport_guarded`` conversion (including the retry gate consuming it) must
+be re-verified — these tests are the tripwire. Wire framing bytes (CRLF, the
+SSE double-LF) are built via ``chr`` rather than escape literals so the
+payloads are byte-exact regardless of source-encoding handling.
 """
 
 import contextlib
+import json
 import socket
 import threading
 import time
+from types import SimpleNamespace
 
 import anthropic
 import httpx
 import httpx2
 import openai
 import pytest
+
+from turnstone.core.providers._openai_common import (
+    UpstreamRateLimitError,
+    UpstreamResponseError,
+    UpstreamTransientError,
+)
 
 LF = chr(10)
 CRLF = chr(13) + chr(10)
@@ -91,6 +102,42 @@ class _Httpx2DyingStream(httpx2.SyncByteStream):
         raise httpx2.ReadError("[SSL] record layer failure (_ssl.c:2590)")
 
 
+class _BlockingJsonStream(httpx2.SyncByteStream):
+    """JSON body that blocks until cross-thread close releases it."""
+
+    def __init__(self) -> None:
+        self.read_started = threading.Event()
+        self.closed = threading.Event()
+
+    def __iter__(self):
+        self.read_started.set()
+        if not self.closed.wait(5):
+            raise AssertionError("JSON response body was not cancelled")
+        raise httpx2.ReadError("JSON response closed by cancellation")
+        yield b""  # pragma: no cover - make this a generator
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+class _OversizedJsonStream(httpx2.SyncByteStream):
+    """Unbounded-looking body that records how far the guard consumes."""
+
+    def __init__(self) -> None:
+        self.read_count = 0
+        self.closed = False
+
+    def __iter__(self):
+        yield b'{"error":{"message":"'
+        for _ in range(100):
+            self.read_count += 1
+            yield b"x" * 1024
+        raise AssertionError("bounded JSON reader consumed the response to EOF")
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _dying_transport(payload: str, requests: list) -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -115,6 +162,263 @@ def _httpx2_dying_transport(payload: str, requests: list) -> httpx2.MockTranspor
         )
 
     return httpx2.MockTransport(handler)
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+@pytest.mark.parametrize(
+    ("status_code", "message", "error_type"),
+    [
+        (
+            200,
+            "request (9870 tokens) exceeds the available context size (4096 tokens)",
+            UpstreamResponseError,
+        ),
+        (400, "request exceeds the available context size", openai.BadRequestError),
+        (413, "payload too large", openai.APIStatusError),
+        (429, "rate limit reached", openai.RateLimitError),
+    ],
+)
+def test_openai_v3_json_error_precedes_stream_arming(
+    surface: str,
+    status_code: int,
+    message: str,
+    error_type: type[Exception],
+):
+    """JSON failures retain their status and body before stream iteration.
+
+    The SDK owns real HTTP failures. Turnstone handles the compatibility case
+    where the endpoint returns the same payload under HTTP 200. Neither may
+    reach the finish-reason gate and become ``IncompleteStreamError``.
+    """
+    from turnstone.core.providers import create_provider
+
+    requests: list = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(
+            status_code,
+            headers={"content-type": "application/json"},
+            json={"error": {"message": message, "type": "upstream_error"}},
+            request=request,
+        )
+
+    client = openai.OpenAI(
+        api_key="probe",
+        base_url="http://probe.invalid/v1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        max_retries=0,
+    )
+    cancel_ref: list = []
+    provider = create_provider("openai-compatible", api_surface=surface)
+    try:
+        with pytest.raises(error_type) as excinfo:
+            provider.create_streaming(
+                client=client,
+                model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                cancel_ref=cancel_ref,
+            )
+    finally:
+        client.close()
+
+    assert getattr(excinfo.value, "status_code", None) == status_code
+    assert message in str(excinfo.value)
+    assert cancel_ref == []
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+@pytest.mark.parametrize(
+    ("code", "error_type", "expected_error"),
+    [
+        ("rate_limit_exceeded", "rate_limit_error", UpstreamRateLimitError),
+        ("server_error", "server_error", UpstreamTransientError),
+    ],
+)
+def test_http_200_json_transient_error_keeps_retry_classification(
+    surface: str,
+    code: str,
+    error_type: str,
+    expected_error: type[UpstreamResponseError],
+):
+    from turnstone.core.providers import create_provider
+
+    message = "maximum number of tokens allowed per minute is temporarily unavailable"
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={"error": {"message": message, "type": error_type, "code": code}},
+            request=request,
+        )
+
+    client = openai.OpenAI(
+        api_key="probe",
+        base_url="http://probe.invalid/v1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        max_retries=0,
+    )
+    cancel_ref: list = []
+    provider = create_provider("openai-compatible", api_surface=surface)
+    try:
+        with pytest.raises(expected_error) as excinfo:
+            provider.create_streaming(
+                client=client,
+                model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                cancel_ref=cancel_ref,
+            )
+    finally:
+        client.close()
+
+    assert excinfo.value.code == code
+    assert excinfo.value.error_type == error_type
+    assert type(excinfo.value).__name__ in provider.retryable_error_names
+    assert cancel_ref == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"message": {"role": "assistant", "content": "generated text must stay private"}},
+        {
+            "error": None,
+            "choices": [{"message": {"content": "generated text must stay private"}}],
+        },
+    ],
+)
+def test_non_stream_ambiguous_json_omits_generated_content_from_error(payload: dict):
+    from turnstone.core.providers._openai_common import reject_non_stream_response
+
+    private_output = "generated text must not enter diagnostics"
+    payload_text = json.dumps(payload).replace("generated text must stay private", private_output)
+    response = httpx2.Response(
+        200,
+        headers={"content-type": "application/json"},
+        content=payload_text.encode(),
+    )
+    stream = SimpleNamespace(response=response, close=response.close)
+
+    with pytest.raises(UpstreamResponseError) as excinfo:
+        reject_non_stream_response(stream)
+
+    assert excinfo.value.body == "<JSON response did not contain a valid error object>"
+    assert private_output not in str(excinfo.value)
+
+
+def test_non_stream_unparseable_json_fails_closed():
+    from turnstone.core.providers._openai_common import reject_non_stream_response
+
+    private_output = "generated text must not enter diagnostics"
+    response = httpx2.Response(
+        200,
+        headers={"content-type": "application/json"},
+        content=f"not-json {private_output}".encode(),
+    )
+    stream = SimpleNamespace(response=response, close=response.close)
+
+    with pytest.raises(UpstreamResponseError) as excinfo:
+        reject_non_stream_response(stream)
+
+    assert excinfo.value.body == "<JSON response did not contain a valid error object>"
+    assert private_output not in str(excinfo.value)
+
+
+def test_non_stream_error_excludes_sibling_completion_content():
+    from turnstone.core.providers._openai_common import reject_non_stream_response
+
+    private_output = "generated text must not enter diagnostics"
+    response = httpx2.Response(
+        200,
+        headers={"content-type": "application/json"},
+        json={
+            "error": {"message": "backend rejected the request", "type": "invalid_request"},
+            "choices": [{"message": {"content": private_output}}],
+        },
+    )
+    stream = SimpleNamespace(response=response, close=response.close)
+
+    with pytest.raises(UpstreamResponseError) as excinfo:
+        reject_non_stream_response(stream)
+
+    assert "backend rejected the request" in excinfo.value.body
+    assert private_output not in str(excinfo.value)
+
+
+def test_non_stream_json_body_read_is_bounded():
+    from turnstone.core.providers._openai_common import reject_non_stream_response
+
+    raw_stream = _OversizedJsonStream()
+    response = httpx2.Response(
+        200,
+        headers={"content-type": "application/json"},
+        stream=raw_stream,
+    )
+    stream = SimpleNamespace(response=response, close=response.close)
+
+    with pytest.raises(UpstreamResponseError) as excinfo:
+        reject_non_stream_response(stream)
+
+    assert excinfo.value.body == "<JSON response did not contain a valid error object>"
+    assert raw_stream.read_count < 100
+    assert raw_stream.closed
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+def test_non_stream_json_body_read_is_cancellable_without_arming(surface: str):
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.providers import create_provider
+    from turnstone.core.providers._protocol import IncompleteStreamError
+
+    raw_stream = _BlockingJsonStream()
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=raw_stream,
+            request=request,
+        )
+
+    client = openai.OpenAI(
+        api_key="probe",
+        base_url="http://probe.invalid/v1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        max_retries=0,
+    )
+    cancel_ref = StreamAbortRef()
+    errors: list[BaseException] = []
+    provider = create_provider("openai-compatible", api_surface=surface)
+
+    def run() -> None:
+        try:
+            provider.create_streaming(
+                client=client,
+                model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                cancel_ref=cancel_ref,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert raw_stream.read_started.wait(2)
+        assert cancel_ref == []
+        cancel_ref.abort()
+        worker.join(2)
+    finally:
+        cancel_ref.abort()
+        worker.join(2)
+        client.close()
+
+    assert not worker.is_alive()
+    assert raw_stream.closed.is_set()
+    assert len(errors) == 1
+    assert isinstance(errors[0], IncompleteStreamError)
 
 
 def test_openai_v3_chat_midbody_death_is_unwrapped_httpx2_error_and_no_rerequest():

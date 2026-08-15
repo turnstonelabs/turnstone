@@ -927,6 +927,12 @@ class LLMProvider(Protocol):
         per adapter.  The caller can then close the stream from another
         thread to abort a blocked HTTP read immediately.
 
+        A provider that must read and reject a response body BEFORE that
+        accepted-stream instant may temporarily call the cancel ref's duck-typed
+        ``register_cancel_handle`` / ``unregister_cancel_handle`` pair.  This
+        exposes the closeable response to Stop/deadline without appending it and
+        falsely arming a creation failure.
+
         This is the ONLY transport — single-shot callers drain it through
         :func:`drain_stream` instead of a separate non-streaming entry
         (retired on #831), so per-adapter request shaping cannot drift

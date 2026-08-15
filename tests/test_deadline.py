@@ -203,6 +203,32 @@ class TestStreamAbortRef:
         ref.append(stream)
         stream.close.assert_called_once()
 
+    def test_cancel_only_handle_closes_without_arming_list(self) -> None:
+        from unittest.mock import MagicMock
+
+        from turnstone.core.deadline import StreamAbortRef
+
+        ref = StreamAbortRef()
+        handle = MagicMock()
+        ref.register_cancel_handle(handle)
+
+        assert ref == []
+        ref.abort()
+        handle.close.assert_called_once_with()
+
+    def test_unregistered_cancel_only_handle_is_not_closed_by_later_abort(self) -> None:
+        from unittest.mock import MagicMock
+
+        from turnstone.core.deadline import StreamAbortRef
+
+        ref = StreamAbortRef()
+        handle = MagicMock()
+        ref.register_cancel_handle(handle)
+        ref.unregister_cancel_handle(handle)
+
+        ref.abort()
+        handle.close.assert_not_called()
+
     def test_cancel_event_is_visible_before_explicit_abort(self) -> None:
         """A worker observes cancellation before the polling parent aborts it."""
         from unittest.mock import MagicMock

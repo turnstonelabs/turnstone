@@ -290,20 +290,8 @@ class TestReasoningFieldReachesWireBytes:
             captured.append({"url": str(request.url), "body": body})
             return httpx.Response(
                 200,
-                json={
-                    "id": "chatcmpl-vllm-spike",
-                    "object": "chat.completion",
-                    "created": 0,
-                    "model": "qwen3-test",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "ok"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-                },
+                headers={"content-type": "text/event-stream"},
+                content=b"data: [DONE]\n\n",
             )
 
         client = OpenAI(

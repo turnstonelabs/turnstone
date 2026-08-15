@@ -116,6 +116,23 @@ class RateLimitError(Exception):
     pass
 
 
+class APIError(Exception):
+    pass
+
+
+class BackendStatusError(Exception):
+    def __init__(self, message: str, *, status_code: int, reason_phrase: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response = SimpleNamespace(reason_phrase=reason_phrase)
+
+
+class BadStatusAccessorError(Exception):
+    @property
+    def status_code(self) -> int:
+        raise RuntimeError("boom")
+
+
 class ReadError(Exception):  # noqa: N818
     pass
 
@@ -216,6 +233,99 @@ def test_rate_limit_with_overflow_phrasing_is_not_mislabeled_overflow():
     assert msg is not None
     assert "Backend rate-limited" in msg
     assert "Context window exceeded" not in msg
+
+
+@pytest.mark.parametrize(
+    ("error_name", "code", "error_type", "expected_message"),
+    [
+        (
+            "UpstreamRateLimitError",
+            "rate_limit_exceeded",
+            "rate_limit_error",
+            "Backend rate-limited",
+        ),
+        (
+            "UpstreamTransientError",
+            "server_error",
+            "server_error",
+            "Backend returned a transient application error",
+        ),
+    ],
+)
+def test_http_200_json_transient_errors_outrank_overflow_wording(
+    error_name: str, code: str, error_type: str, expected_message: str
+):
+    from turnstone.core.providers import _openai_common
+
+    error_class = getattr(_openai_common, error_name)
+    exc = error_class(
+        status_code=200,
+        content_type="application/json",
+        body="maximum number of tokens allowed per minute is temporarily unavailable",
+        code=code,
+        error_type=error_type,
+    )
+
+    msg = _format(_stub(), exc)
+
+    assert msg is not None
+    assert expected_message in msg
+    assert "Context window exceeded" not in msg
+
+
+def test_http_status_error_names_backend_status_model_and_raw_payload():
+    msg = _format(
+        _stub(model="gemma", model_alias="local-gemma"),
+        BackendStatusError(
+            '{"error":{"message":"payload too large"}}',
+            status_code=413,
+            reason_phrase="Payload Too Large",
+        ),
+    )
+    assert msg is not None
+    assert "Backend request failed (HTTP 413 Payload Too Large)" in msg
+    assert "openai-compatible" in msg
+    assert "http://192.168.0.5:8000/v1" in msg
+    assert "model=local-gemma (id=gemma)" in msg
+    assert 'raw=\'{"error":{"message":"payload too large"}}\'' in msg
+
+
+def test_in_band_api_error_is_enriched_but_overflow_keeps_specific_message():
+    generic = _format(_stub(), APIError("backend overloaded"))
+    assert generic is not None
+    assert "Backend returned an error instead of a usable stream (APIError)" in generic
+    assert "backend overloaded" in generic
+
+    overflow = _format(
+        _stub(),
+        APIError("request (9870 tokens) exceeds the available context size (4096 tokens)"),
+    )
+    assert overflow is not None
+    assert "Context window exceeded" in overflow
+    assert "Backend returned an error instead" not in overflow
+
+
+def test_http_200_json_error_is_rendered_as_context_overflow():
+    from turnstone.core.providers._openai_common import UpstreamResponseError
+
+    raw_body = (
+        '{"error":{"message":"request (9870 tokens) exceeds the available '
+        'context size (4096 tokens)"}}'
+    )
+    msg = _format(
+        _stub(model="Gemma-4-31B-it-GGUF", model_alias="gemma-4-amd-halo-one"),
+        UpstreamResponseError(
+            status_code=200,
+            content_type="application/json",
+            body=raw_body,
+        ),
+    )
+    assert msg is not None
+    assert "Context window exceeded" in msg
+    assert "model=gemma-4-amd-halo-one (id=Gemma-4-31B-it-GGUF)" in msg
+    assert "9870 tokens" in msg
+    assert "4096 tokens" in msg
+    assert "Backend stream died mid-response" not in msg
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +462,10 @@ def test_unknown_exception_returns_none():
 
 def test_unknown_exception_value_error_returns_none():
     assert _format(_stub(), ValueError("not a backend error")) is None
+
+
+def test_unknown_exception_with_bad_status_accessor_returns_none():
+    assert _format(_stub(), BadStatusAccessorError("original")) is None
 
 
 def test_trailing_slash_and_query_string_stripped():

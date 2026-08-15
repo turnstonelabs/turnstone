@@ -2171,6 +2171,39 @@ class TestCancelRef:
 
         _CancelRef(session).append(mock_stream)  # Should not raise
 
+    def test_cancel_only_handle_is_closeable_without_arming_attempt(self, tmp_db):
+        session = _make_session()
+        fired: list[int] = []
+        ref = _CancelRef(session, on_first_append=lambda: fired.append(1))
+        handle = MagicMock()
+
+        ref.register_cancel_handle(handle)
+
+        assert session._cancel_stream is handle
+        assert ref == []
+        assert not ref.armed
+        assert fired == []
+        session.cancel()
+        handle.close.assert_called_once_with()
+
+        ref.unregister_cancel_handle(handle)
+        assert session._cancel_stream is None
+
+    def test_superseded_cancel_only_handle_cannot_replace_successor(self, tmp_db):
+        session = _make_session()
+        session._generation = 5
+        successor = MagicMock()
+        session._cancel_stream = successor
+        zombie = MagicMock()
+
+        ref = _CancelRef(session, 4)
+        ref.register_cancel_handle(zombie)
+
+        assert session._cancel_stream is successor
+        assert not ref.armed
+        zombie.close.assert_called_once_with()
+        successor.close.assert_not_called()
+
     def test_no_shared_cancel_ref_attribute(self, tmp_db):
         """The long-lived shared ref is GONE (#832): every model-call site
         builds a fresh per-attempt, generation-scoped _CancelRef, so a

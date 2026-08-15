@@ -518,6 +518,11 @@ class _CancelRef(list[Any]):
     classifier, and the per-turn usage-slot resets all key on it.  A
     superseded arrival does not fire it — an orphan must not record
     health or reset the successor's usage slots.
+
+    ``register_cancel_handle`` is the deliberately unarmed sibling used while
+    an adapter validates a non-stream HTTP body.  It publishes the closeable
+    handle for Stop/close, but does not append, set ``armed``, or fire the hook;
+    a rejected response must remain a creation failure.
     """
 
     __slots__ = ("_session", "_my_generation", "_on_first_append", "_armed")
@@ -570,6 +575,28 @@ class _CancelRef(list[Any]):
         if refused:
             with contextlib.suppress(Exception):
                 stream.close()
+
+    def register_cancel_handle(self, handle: Any) -> None:
+        """Publish *handle* for cancellation without arming this attempt."""
+        session = self._session
+        with session._generation_lock:
+            refused = (
+                session._publication_shutdown
+                or self._superseded()
+                or session._cancel_event.is_set()
+            )
+            if not refused:
+                session._cancel_stream = handle
+        if refused:
+            with contextlib.suppress(Exception):
+                handle.close()
+
+    def unregister_cancel_handle(self, handle: Any) -> None:
+        """Clear a still-current cancellation-only handle by identity."""
+        session = self._session
+        with session._generation_lock:
+            if session._cancel_stream is handle:
+                session._cancel_stream = None
 
     @property
     def aborted(self) -> bool:
@@ -1992,7 +2019,19 @@ _BACKEND_NOT_FOUND_EXC_NAMES: frozenset[str] = frozenset({"NotFoundError"})
 _BACKEND_AUTH_EXC_NAMES: frozenset[str] = frozenset(
     {"AuthenticationError", "PermissionDeniedError"}
 )
-_BACKEND_RATE_LIMIT_EXC_NAMES: frozenset[str] = frozenset({"RateLimitError"})
+_BACKEND_RATE_LIMIT_EXC_NAMES: frozenset[str] = frozenset(
+    {"RateLimitError", "UpstreamRateLimitError"}
+)
+_BACKEND_TRANSIENT_EXC_NAMES: frozenset[str] = frozenset({"UpstreamTransientError"})
+# Backend-reported stream errors stay OUT of ``_BACKEND_KNOWN_EXC_NAMES``:
+# their messages can carry a real context-window rejection, which
+# ``_is_ctx_overflow`` must see before the formatter categorizes them.  The
+# OpenAI SDK raises ``APIError`` for an in-band SSE error object;
+# ``UpstreamResponseError`` is Turnstone's equivalent for a compatibility
+# proxy that returns the same error as an HTTP-200 JSON body.  Its classified
+# rate-limit and transient subclasses stay IN the known set above so their
+# token-quota wording cannot be mistaken for context overflow.
+_BACKEND_REPORTED_EXC_NAMES: frozenset[str] = frozenset({"APIError", "UpstreamResponseError"})
 # Mid-response stream deaths: the normalized shape every guarded iterator
 # raises (``IncompleteStreamError`` from ``drain_stream`` /
 # ``transport_guarded``) plus the raw HTTPX/HTTPX2 names for any future
@@ -2012,6 +2051,7 @@ _BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
     | _BACKEND_NOT_FOUND_EXC_NAMES
     | _BACKEND_AUTH_EXC_NAMES
     | _BACKEND_RATE_LIMIT_EXC_NAMES
+    | _BACKEND_TRANSIENT_EXC_NAMES
     | _BACKEND_STREAM_EXC_NAMES
 )
 
@@ -2056,6 +2096,7 @@ def _is_ctx_overflow(exc: BaseException) -> bool:
         for s in (
             "context length",
             "maximum context",
+            "available context size",
             "context window",
             "context limit",
             "prompt is too long",
@@ -8187,7 +8228,21 @@ class ChatSession:
                 f"{available}{raw_tail}"
             )
 
-        if name not in _BACKEND_KNOWN_EXC_NAMES:
+        try:
+            status_code = getattr(exc, "status_code", None)
+        except Exception:
+            log.debug("session.fatal.status_code_failed", exc_info=True)
+            status_code = None
+        is_http_status_error = (
+            isinstance(status_code, int)
+            and not isinstance(status_code, bool)
+            and 400 <= status_code <= 599
+        )
+        if (
+            name not in _BACKEND_KNOWN_EXC_NAMES
+            and name not in _BACKEND_REPORTED_EXC_NAMES
+            and not is_http_status_error
+        ):
             return None
 
         # Pull backend identity — every branch swallows so a bad
@@ -8239,6 +8294,31 @@ class ChatSession:
                 f"Backend rate-limited ({name}): {provider_label} "
                 f"at {base_url} (model={model_label})."
                 f"{raw_tail}"
+            )
+        if name in _BACKEND_TRANSIENT_EXC_NAMES:
+            return (
+                f"Backend returned a transient application error ({name}): "
+                f"{provider_label} at {base_url} (model={model_label}); retries "
+                f"did not recover it.{raw_tail}"
+            )
+        if name in _BACKEND_REPORTED_EXC_NAMES:
+            return (
+                f"Backend returned an error instead of a usable stream ({name}): "
+                f"{provider_label} at {base_url} (model={model_label})."
+                f"{raw_tail}"
+            )
+        if is_http_status_error:
+            status_label = f"HTTP {status_code}"
+            try:
+                reason = getattr(getattr(exc, "response", None), "reason_phrase", "")
+                if isinstance(reason, str) and reason.strip():
+                    status_label += f" {reason.strip()}"
+            except Exception:
+                log.debug("session.fatal.status_reason_failed", exc_info=True)
+            return (
+                f"Backend request failed ({status_label}): {provider_label} "
+                f"at {base_url} (model={model_label}). The upstream server returned "
+                f"an application error before generation started.{raw_tail}"
             )
         if name in _BACKEND_STREAM_EXC_NAMES:
             # First sentence kept short so Discord's message[:500] cut keeps

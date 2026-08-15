@@ -20,6 +20,7 @@ from turnstone.core.providers._openai_common import (
     apply_tool_search,
     extract_usage,
     format_citations,
+    reject_non_stream_response,
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
@@ -347,6 +348,7 @@ class OpenAIChatCompletionsProvider:
         )
         refuse_aborted_request(cancel_ref)
         stream = client.chat.completions.create(**kwargs)
+        reject_non_stream_response(stream, cancel_ref=cancel_ref)
         if cancel_ref is not None:
             cancel_ref.append(stream)
         return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)

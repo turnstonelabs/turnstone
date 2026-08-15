@@ -7,6 +7,7 @@ formatting, and message sanitisation live here so both
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import replace
 from typing import Any
@@ -16,6 +17,7 @@ import structlog
 from turnstone.core.attachments import safe_attachment_label
 from turnstone.core.lowering import CANCELLED_TOOL_RESULT
 from turnstone.core.providers._protocol import (
+    IncompleteStreamError,
     ModelCapabilities,
     UsageInfo,
     _lookup_capabilities,
@@ -24,6 +26,214 @@ from turnstone.core.providers._protocol import (
 )
 
 log = structlog.get_logger(__name__)
+
+_UPSTREAM_ERROR_BODY_MAX_BYTES = 4096
+_INVALID_UPSTREAM_ERROR_BODY = "<JSON response did not contain a valid error object>"
+_UPSTREAM_RATE_LIMIT_CODES = frozenset(
+    {"rate_limit_exceeded", "rate_limit_error", "too_many_requests"}
+)
+_UPSTREAM_TRANSIENT_CODES = frozenset(
+    {"server_error", "internal_server_error", "overloaded_error", "service_unavailable"}
+)
+
+
+class UpstreamResponseError(RuntimeError):
+    """An OpenAI-compatible endpoint returned JSON instead of an SSE stream."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        content_type: str,
+        body: str,
+        code: str = "",
+        error_type: str = "",
+        upstream_status_code: int | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.content_type = content_type
+        self.body = body
+        self.code = code
+        self.error_type = error_type
+        self.upstream_status_code = upstream_status_code
+        super().__init__(
+            f"backend returned HTTP {status_code} {content_type} instead of an event stream: {body}"
+        )
+
+
+class UpstreamRateLimitError(UpstreamResponseError):
+    """A JSON-under-200 response reported a retryable rate limit."""
+
+
+class UpstreamTransientError(UpstreamResponseError):
+    """A JSON-under-200 response reported a retryable server failure."""
+
+
+def _read_response_prefix(response: Any) -> tuple[bytes, bool]:
+    """Read at most one byte beyond the diagnostic cap."""
+    captured = bytearray()
+    for chunk in response.iter_bytes(chunk_size=_UPSTREAM_ERROR_BODY_MAX_BYTES + 1):
+        remaining = _UPSTREAM_ERROR_BODY_MAX_BYTES + 1 - len(captured)
+        if remaining <= 0:
+            break
+        captured.extend(chunk[:remaining])
+        if len(captured) > _UPSTREAM_ERROR_BODY_MAX_BYTES:
+            return bytes(captured[:_UPSTREAM_ERROR_BODY_MAX_BYTES]), True
+    return bytes(captured), False
+
+
+def _non_blank_string(value: Any) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+def _embedded_status_code(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+        return value
+    return None
+
+
+def _extract_upstream_error(
+    raw_body: bytes, *, truncated: bool
+) -> tuple[str, str, str, int | None]:
+    """Return a safe error-only body plus classification fields.
+
+    Successful, ambiguous, truncated, and unparsable JSON fails closed: only a
+    non-empty ``error`` string or an error object with a standard identifying
+    field may enter diagnostics.  Sibling completion output is never copied.
+    """
+    if truncated:
+        return _INVALID_UPSTREAM_ERROR_BODY, "", "", None
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, TypeError, ValueError):
+        return _INVALID_UPSTREAM_ERROR_BODY, "", "", None
+    if not isinstance(payload, dict):
+        return _INVALID_UPSTREAM_ERROR_BODY, "", "", None
+
+    error = payload.get("error")
+    top_code = _non_blank_string(payload.get("code"))
+    top_type = _non_blank_string(payload.get("type"))
+    top_status = _embedded_status_code(payload.get("status_code"))
+    if isinstance(error, str):
+        message = error.strip()
+        if not message:
+            return _INVALID_UPSTREAM_ERROR_BODY, "", "", None
+        safe_payload: dict[str, Any] = {"error": message}
+        if top_code:
+            safe_payload["code"] = top_code
+        if top_type and top_type != "error":
+            safe_payload["type"] = top_type
+        if top_status is not None:
+            safe_payload["status_code"] = top_status
+        return (
+            json.dumps(safe_payload, ensure_ascii=False, separators=(",", ":")),
+            top_code,
+            top_type,
+            top_status,
+        )
+    if not isinstance(error, dict):
+        return _INVALID_UPSTREAM_ERROR_BODY, "", "", None
+
+    message = _non_blank_string(error.get("message"))
+    nested_code = _non_blank_string(error.get("code"))
+    nested_type = _non_blank_string(error.get("type"))
+    nested_status = _embedded_status_code(error.get("status_code"))
+    if not (message or nested_code or nested_type or nested_status is not None):
+        return _INVALID_UPSTREAM_ERROR_BODY, "", "", None
+    code = nested_code or top_code
+    error_type = nested_type or top_type
+    upstream_status = nested_status or top_status
+
+    safe_error: dict[str, Any] = {}
+    if message:
+        safe_error["message"] = message
+    if error_type:
+        safe_error["type"] = error_type
+    if code:
+        safe_error["code"] = code
+    param = error.get("param")
+    if isinstance(param, str):
+        safe_error["param"] = param
+    if upstream_status is not None:
+        safe_error["status_code"] = upstream_status
+    return (
+        json.dumps({"error": safe_error}, ensure_ascii=False, separators=(",", ":")),
+        code,
+        error_type,
+        upstream_status,
+    )
+
+
+def _upstream_error_class(
+    code: str, error_type: str, upstream_status: int | None
+) -> type[UpstreamResponseError]:
+    identifiers = {value.casefold() for value in (code, error_type) if value}
+    if upstream_status == 429 or identifiers & _UPSTREAM_RATE_LIMIT_CODES:
+        return UpstreamRateLimitError
+    if (
+        upstream_status is not None and 500 <= upstream_status <= 599
+    ) or identifiers & _UPSTREAM_TRANSIENT_CODES:
+        return UpstreamTransientError
+    return UpstreamResponseError
+
+
+def reject_non_stream_response(stream: Any, *, cancel_ref: Any = None) -> None:
+    """Surface a JSON response before Turnstone arms an SDK stream.
+
+    The SDK raises real HTTP 4xx/5xx responses before returning ``stream``.  A
+    compatibility endpoint can instead acknowledge the request with HTTP 200
+    while returning ``application/json``; without this guard the SDK exposes an
+    empty iterator and Turnstone later reports a misleading stream failure.
+    """
+    response = getattr(stream, "response", None)
+    headers = getattr(response, "headers", None)
+    if response is None or headers is None:
+        return
+    raw_content_type = headers.get("content-type", "")
+    if not isinstance(raw_content_type, str):
+        return
+    content_type = raw_content_type.partition(";")[0].strip().lower()
+    if content_type != "application/json" and not content_type.endswith("+json"):
+        return
+
+    register = getattr(cancel_ref, "register_cancel_handle", None)
+    unregister = getattr(cancel_ref, "unregister_cancel_handle", None)
+    cancellation_registered = False
+    try:
+        if callable(register) and callable(unregister):
+            register(stream)
+            cancellation_registered = True
+        raw_body, truncated = _read_response_prefix(response)
+    except Exception as exc:
+        raise IncompleteStreamError(
+            "backend returned JSON instead of an event stream, but reading the "
+            f"response body failed ({type(exc).__name__})"
+        ) from exc
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            log.debug("openai.stream.invalid_response_close_failed", exc_info=True)
+        if cancellation_registered and callable(unregister):
+            try:
+                unregister(stream)
+            except Exception:
+                log.debug("openai.stream.cancel_handle_unregister_failed", exc_info=True)
+
+    body, code, error_type, upstream_status = _extract_upstream_error(raw_body, truncated=truncated)
+    status_code = getattr(response, "status_code", 0)
+    if not isinstance(status_code, int) or isinstance(status_code, bool):
+        status_code = 0
+    error_class = _upstream_error_class(code, error_type, upstream_status)
+    raise error_class(
+        status_code=status_code,
+        content_type=content_type,
+        body=body,
+        code=code,
+        error_type=error_type,
+        upstream_status_code=upstream_status,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Model capability table
@@ -701,6 +911,8 @@ RETRYABLE_ERROR_NAMES: frozenset[str] = frozenset(
         "APIError",
         "APIConnectionError",
         "RateLimitError",
+        "UpstreamRateLimitError",
+        "UpstreamTransientError",
         "Timeout",
         "APITimeoutError",
         # Transport-level: the drained stream ended with no finish signal

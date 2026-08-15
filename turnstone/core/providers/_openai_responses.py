@@ -27,6 +27,7 @@ from turnstone.core.providers._openai_common import (
     format_citations,
     format_document_wrapper,
     lookup_openai_capabilities,
+    reject_non_stream_response,
     resolve_server_side_tools,
     sanitize_messages,
 )
@@ -590,6 +591,7 @@ class OpenAIResponsesProvider:
 
         refuse_aborted_request(cancel_ref)
         stream = client.responses.create(**kwargs)
+        reject_non_stream_response(stream, cancel_ref=cancel_ref)
         if cancel_ref is not None:
             cancel_ref.append(stream)
         return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)

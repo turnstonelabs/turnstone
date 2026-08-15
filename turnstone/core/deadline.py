@@ -60,6 +60,7 @@ class StreamAbortRef(list[Any]):
     __slots__ = (
         "_aborted",
         "_cancel_event",
+        "_cancel_handles",
         "_timing_lock",
         "_admission_wait_started",
         "_admission_wait_credit",
@@ -71,6 +72,7 @@ class StreamAbortRef(list[Any]):
         super().__init__()
         self._aborted = False
         self._cancel_event = cancel_event
+        self._cancel_handles: list[Any] = []
         self._timing_lock = threading.Lock()
         self._admission_wait_started: float | None = None
         self._admission_wait_credit = 0.0
@@ -83,10 +85,30 @@ class StreamAbortRef(list[Any]):
             with contextlib.suppress(Exception):
                 stream.close()
 
+    def register_cancel_handle(self, handle: Any) -> None:
+        """Expose *handle* to abort without marking a stream as accepted.
+
+        Providers use this while validating an HTTP response body that arrived
+        before a usable event stream.  Keeping it out of the list preserves the
+        caller's creation-vs-mid-stream classifier; the same late-arrival race
+        as :meth:`append` still closes an already-aborted handle immediately.
+        """
+        self._cancel_handles.append(handle)
+        if self.aborted:
+            with contextlib.suppress(Exception):
+                handle.close()
+
+    def unregister_cancel_handle(self, handle: Any) -> None:
+        """Remove one identity-matched cancellation-only handle."""
+        for index, registered in enumerate(self._cancel_handles):
+            if registered is handle:
+                self._cancel_handles.pop(index)
+                break
+
     def abort(self) -> None:
         """Close any captured stream; late arrivals close on append."""
         self._aborted = True
-        for stream in list(self):
+        for stream in [*list(self), *list(self._cancel_handles)]:
             with contextlib.suppress(Exception):
                 stream.close()
 
