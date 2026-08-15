@@ -70,6 +70,36 @@ def _bootstrap_app(**overrides: Any) -> Any:
     return SimpleNamespace(state=SimpleNamespace(**state_kwargs))
 
 
+def test_partial_coord_teardown_shuts_registry_after_adapter() -> None:
+    from turnstone.console import server as server_module
+
+    calls: list[str] = []
+    adapter = MagicMock()
+    adapter.shutdown.side_effect = lambda: calls.append("adapter")
+    registry = MagicMock()
+    registry.shutdown.side_effect = lambda: calls.append("registry")
+    app = _bootstrap_app(coord_adapter=adapter, coord_registry=registry)
+
+    server_module._teardown_partial_coord_subsystem(app)
+
+    assert calls == ["adapter", "registry"]
+    assert app.state.coord_registry is None
+
+
+def test_console_lifespan_shuts_coord_registry_after_adapter() -> None:
+    """Pin the normal teardown ordering without booting the full console."""
+    import inspect
+
+    from turnstone.console import server as server_module
+
+    source = inspect.getsource(server_module._lifespan)
+    adapter = source.find('getattr(app.state, "coord_adapter", None)')
+    registry = source.find('getattr(app.state, "coord_registry", None)', adapter)
+    state_writer = source.find('getattr(app.state, "coord_state_writer", None)', registry)
+    assert adapter != -1 and registry != -1 and state_writer != -1
+    assert adapter < registry < state_writer
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

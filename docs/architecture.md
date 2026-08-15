@@ -846,23 +846,23 @@ boundary.
 
 ```
 ChatSession
-    |
     +-- ResolvedModelBinding
     |       +-- ModelLane (provider, client, model, capabilities, params)
     |       +-- immutable ModelConfig snapshot
     |       +-- registry generation
+    |       |
+    |       v
+    |   model_turn(ModelLane, list[Turn])
+    |       +-- lowering.py: Turn IR -> repaired provider-neutral wire dicts
+    |       +-- LLMProvider.create_streaming() (single model transport call site)
+    |               +--- OpenAIProvider --- OpenAI/vLLM/llama.cpp
+    |               +--- AnthropicProvider --- Anthropic Messages API
+    |               +--- GoogleProvider --- Gemini via /v1beta/openai/
     |
-    v
-model_turn(ModelLane, list[Turn])
-    |
-    +-- lowering.py: Turn IR -> repaired provider-neutral wire dicts
-    |
-    v
-LLMProvider.create_streaming()  (the single transport call site)
-    |
-    +--- OpenAIProvider  --- OpenAI, vLLM, llama.cpp, any /v1/chat/completions API
-    +--- AnthropicProvider --- Anthropic Messages API (native streaming, thinking)
-    +--- GoogleProvider  --- Google Gemini via /v1beta/openai/ (extends OpenAIProvider)
+    +-- RerankLane (runtime, alias admission, registry/config witnesses)
+            |
+            v
+        rerank(RerankLane, query, documents) --> Cohere/Jina-compatible endpoint
 ```
 
 **Protocol methods:**
@@ -882,6 +882,7 @@ LLMProvider.create_streaming()  (the single transport call site)
 | `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason`, `provider_blocks` |
 | `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage`, `provider_blocks` |
 | `ModelLane` | Frozen per-loop provider/client/model binding, capabilities, sampling knobs, registry reference, and backend-auth seam |
+| `RerankLane` | Frozen per-batch binding to a registry-owned rerank runtime, stable alias admission gate, and registry/config version witnesses |
 | `ResolvedModelBinding` | A `ModelLane`, its immutable `ModelConfig`, and the registry generation read in the same snapshot |
 | `ModelTurnResult` | Canonical assistant `Turn`, tool-call dispatch mirror, serving-lane provenance, usage, and exact lowered wire facts |
 | `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision`, `supports_reasoning_replay`, `supports_verbosity`, `verbosity`, `supports_pro_mode`, `reasoning_mode` |
@@ -894,6 +895,17 @@ one coherent backend binding or is cancelled; it never observes a mixture of
 old endpoint/client state and new capabilities/configuration. Per-call operator
 toggles that are intentionally live, such as reasoning replay, are re-read by
 `model_turn()` through the lane's registry reference.
+
+`RerankLane` is a deliberately narrow sibling rather than a subtype of
+`ModelLane`: endpoint reranking does not construct an LLM provider or SDK
+client. `ModelRegistry` owns the active rerank runtime, whose HTTP pool,
+per-endpoint circuit breaker, and active-call retirement state are shared by
+all sessions. Each retrieval batch resolves the Reranker alias and instruction
+from one ConfigStore snapshot and binds the matching registry generation.
+Relevant configuration changes retire the old runtime, reject new work on its
+stale lanes, and close its transport after active calls drain; cap-only reloads
+resize the stable alias admission gate without discarding the pool. Calibration
+remains an isolated one-shot client and always closes it after the probe.
 
 **OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
 already in OpenAI format), including multi-part content blocks (text + images)
@@ -1001,17 +1013,20 @@ remain warm, but the session still receives a new coherent config/lane.
 simultaneous generations for that alias in one process. Every registry-backed
 role carries the same gate on its `ModelLane`, so main turns, judges, task
 agents, perception, compaction, and background generation coordinate through
-one FIFO. Two aliases never share a gate implicitly, even when their URLs are
-identical. For calls with context-first request admission, `model_turn()` admits
-the request before materializing attachment fallbacks; an oversized refusal
-therefore invokes neither attachment resolution nor nested perception/audio.
-Ordinary calls preserve their lowering cadence. Both paths finish attachment
-materialization before acquiring model capacity, then hold one lease across
-eager stream creation and the complete drain, releasing before retry backoff.
-Capacity wait is credited out of deadline accounting, preventing queued judges
-from spending their request budget before dispatch. The gate survives cap-only
-reloads in place; the field is excluded from semantic `ModelConfig` equality so
-a capacity edit does not reset judges or output-guard state.
+one FIFO. Endpoint reranking carries the same gate on its `RerankLane`, so a
+reranker alias cannot exceed that cap or bypass capacity shared with another
+role. Two aliases never share a gate implicitly, even when their URLs are
+identical. For calls with context-first request admission, `model_turn()`
+admits the request before materializing attachment fallbacks; an oversized
+refusal therefore invokes neither attachment resolution nor nested
+perception/audio. Ordinary calls preserve their lowering cadence. Both paths
+finish attachment materialization before acquiring model capacity, then hold
+one lease across eager stream creation and the complete drain, releasing before
+retry backoff. Capacity wait is credited out of deadline accounting, preventing
+queued judges from spending their request budget before dispatch. The gate
+survives cap-only reloads in place; the field is excluded from semantic
+`ModelConfig` equality so a capacity edit does not reset judges or output-guard
+state.
 
 Primary loops, recursive compaction, judges, title generation, audio, and task
 agents all consume `ModelLane` rather than inspecting provider/client handles.

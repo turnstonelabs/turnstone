@@ -360,6 +360,16 @@ Search the web using a text query.
 
 The `rerank_web_search` toggle defaults on once a reranker is selected. If the endpoint is unreachable or errors, web_search falls back silently to the backend's native result order — reranking never makes a search fail.
 
+The selected alias's `max_concurrency` limit applies to reranking. Turnstone
+keeps one process-owned HTTP connection pool for the active endpoint, shares it
+across sessions, and rotates it when relevant model or Reranker-role settings
+change. Three consecutive endpoint failures open a 30-second circuit so later
+retrievals preserve native order immediately instead of repeatedly waiting for
+the network timeout; one probe is allowed after cooldown. Queued work observes
+generation cancellation. A synchronous HTTP request already dispatched cannot
+be interrupted safely, but its per-call timeout still bounds eventual drain
+and fallback latency.
+
 When `rerank_bm25` is enabled, Turnstone also sends the current query and BM25 candidate metadata to the rerank endpoint. Live memory-pointer candidates contain only the memory name and authored description—never the body. Tool and skill candidates contain their names and descriptive metadata. A self-hosted endpoint (vLLM/TEI/llama.cpp) keeps this on your infrastructure; a hosted provider (Cohere/Jina/Voyage) sends it off-box.
 
 **Serving a Qwen3-Reranker with vLLM.** The model is instruction-aware, so vLLM **must** apply its chat template — pass `--chat-template` explicitly. Without it the bare query produces near-random scores and reranking actively *hurts* retrieval (verified: an irrelevant passage outscored the correct one):

@@ -19,17 +19,11 @@ from turnstone.core.rerank import (
 from turnstone.core.session import ChatSession
 
 
-def _mock_httpx_post(handler):
-    """Patch target for ``rerank.httpx.post`` that routes the call through a real
-    ``httpx.MockTransport``. The request flows through genuine httpx JSON/header
-    encoding and response parsing — a true boundary, not a bare MagicMock.
-    """
+def _install_mock_httpx_client(monkeypatch, handler):
+    """Install the lifecycle-owned client over a real MockTransport boundary."""
     client = httpx.Client(transport=httpx.MockTransport(handler))
-
-    def _post(url, **kwargs):
-        return client.post(url, **kwargs)
-
-    return _post
+    monkeypatch.setattr("turnstone.core.rerank.httpx.Client", lambda: client)
+    return client
 
 
 # A Cohere/Jina/vLLM-shaped response: results wrapper + relevance_score, returned
@@ -112,7 +106,7 @@ class TestCohereJinaRerankClient:
             captured["auth"] = request.headers.get("authorization")
             return httpx.Response(200, json=RESULTS_WRAPPED)
 
-        monkeypatch.setattr("turnstone.core.rerank.httpx.post", _mock_httpx_post(handler))
+        _install_mock_httpx_client(monkeypatch, handler)
         client = CohereJinaRerankClient(
             "http://vllm:8000/rerank", model="bge", api_key="secret", timeout=10
         )
@@ -137,7 +131,7 @@ class TestCohereJinaRerankClient:
             captured["auth"] = request.headers.get("authorization")
             return httpx.Response(200, json={"results": []})
 
-        monkeypatch.setattr("turnstone.core.rerank.httpx.post", _mock_httpx_post(handler))
+        _install_mock_httpx_client(monkeypatch, handler)
         CohereJinaRerankClient("http://h/rerank").rerank("q", ["a"])
 
         assert captured["body"] == {"query": "q", "documents": ["a"]}
@@ -150,7 +144,7 @@ class TestCohereJinaRerankClient:
             called["n"] += 1
             return httpx.Response(200, json={"results": []})
 
-        monkeypatch.setattr("turnstone.core.rerank.httpx.post", _mock_httpx_post(handler))
+        _install_mock_httpx_client(monkeypatch, handler)
         assert CohereJinaRerankClient("http://h/rerank").rerank("q", []) == []
         assert called["n"] == 0  # short-circuits before any HTTP call
 
@@ -158,7 +152,7 @@ class TestCohereJinaRerankClient:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=BARE_LIST)
 
-        monkeypatch.setattr("turnstone.core.rerank.httpx.post", _mock_httpx_post(handler))
+        _install_mock_httpx_client(monkeypatch, handler)
         hits = CohereJinaRerankClient("http://tei/rerank").rerank("q", ["a", "b"])
         assert [h.index for h in hits] == [1, 0]
 
@@ -166,7 +160,7 @@ class TestCohereJinaRerankClient:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(401, text="unauthorized")
 
-        monkeypatch.setattr("turnstone.core.rerank.httpx.post", _mock_httpx_post(handler))
+        _install_mock_httpx_client(monkeypatch, handler)
         with pytest.raises(httpx.HTTPStatusError):
             CohereJinaRerankClient("http://h/rerank").rerank("q", ["a"])
 
@@ -208,6 +202,7 @@ class _FakeConfigStore:
     def __init__(self, values: dict, stored: set[str] | None = None) -> None:
         self._values = dict(values)
         self._stored = frozenset(stored if stored is not None else values.keys())
+        self.version = 1
 
     def stored_keys(self) -> frozenset[str]:
         return self._stored
@@ -215,11 +210,14 @@ class _FakeConfigStore:
     def get(self, key: str):
         return self._values.get(key)
 
+    def effective_snapshot(self):
+        return self.version, dict(self._values)
+
 
 class TestSessionRerankWiring:
     def test_disabled_when_no_config_store(self):
         stub = SimpleNamespace(_config_store=None, _registry=None, tool_timeout=30)
-        assert ChatSession._resolve_rerank_client(stub) is None
+        assert ChatSession._resolve_rerank_lane(stub) is None
 
     def test_disabled_when_no_reranker_alias(self):
         # No Reranker role selected -> reranking off. There is no global endpoint
@@ -230,7 +228,7 @@ class TestSessionRerankWiring:
             tool_timeout=30,
             _registry=SimpleNamespace(get_config=lambda a: None),
         )
-        assert ChatSession._resolve_rerank_client(stub) is None
+        assert ChatSession._resolve_rerank_lane(stub) is None
 
     def test_enabled_for_defaults_true_without_store(self):
         stub = SimpleNamespace(_config_store=None)
@@ -254,16 +252,18 @@ class TestSessionRerankWiring:
             capabilities={"supports_rerank": True},
         )
         cs = _FakeConfigStore({"tools.reranker_alias": "rr"})
-        stub = SimpleNamespace(
-            _config_store=cs,
-            tool_timeout=30,
-            _registry=SimpleNamespace(get_config=lambda a: cfg),
-        )
-        client = ChatSession._resolve_rerank_client(stub)
+        from turnstone.core.model_registry import ModelRegistry
+
+        registry = ModelRegistry({"rr": cfg}, "rr")
+        stub = SimpleNamespace(_config_store=cs, tool_timeout=30, _registry=registry)
+        lane = ChatSession._resolve_rerank_lane(stub)
+        assert lane is not None
+        client = lane.runtime.client
         assert isinstance(client, CohereJinaRerankClient)
         assert client._url == "http://rr:8000/rerank"
         assert client._model == "bge"
         assert client._api_key == "k"
+        registry.shutdown()
 
     def test_ignores_alias_without_rerank_capability(self):
         # A non-reranker model (no supports_rerank) must NOT be used as a reranker,
@@ -274,29 +274,63 @@ class TestSessionRerankWiring:
             alias="chat", base_url="http://chat/v1", api_key="k", model="gpt", capabilities={}
         )
         cs = _FakeConfigStore({"tools.reranker_alias": "chat"})
-        stub = SimpleNamespace(
-            _config_store=cs,
-            tool_timeout=30,
-            _registry=SimpleNamespace(get_config=lambda a: cfg),
+        from turnstone.core.model_registry import ModelRegistry
+
+        registry = ModelRegistry({"chat": cfg}, "chat")
+        stub = SimpleNamespace(_config_store=cs, tool_timeout=30, _registry=registry)
+        assert ChatSession._resolve_rerank_lane(stub) is None
+        registry.shutdown()
+
+    def test_unrelated_settings_version_reuses_runtime(self):
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        cfg = ModelConfig(
+            "rr",
+            "http://rr/rerank",
+            "k",
+            "bge",
+            capabilities={"supports_rerank": True},
         )
-        assert ChatSession._resolve_rerank_client(stub) is None
+        cs = _FakeConfigStore({"tools.reranker_alias": "rr", "tools.rerank_instruction": "rank"})
+        registry = ModelRegistry({"rr": cfg}, "rr")
+        stub = SimpleNamespace(_config_store=cs, _registry=registry)
+
+        first = ChatSession._resolve_rerank_lane(stub)
+        cs._values["unrelated.setting"] = True
+        cs.version += 1
+        second = ChatSession._resolve_rerank_lane(stub)
+
+        assert first is not None and second is not None
+        assert first.runtime is second.runtime
+        assert first.config_version != second.config_version
+        registry.shutdown()
+
+    def test_clearing_role_retires_previous_runtime_on_next_resolution(self):
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        cfg = ModelConfig(
+            "rr",
+            "http://rr/rerank",
+            "k",
+            "bge",
+            capabilities={"supports_rerank": True},
+        )
+        cs = _FakeConfigStore({"tools.reranker_alias": "rr"})
+        registry = ModelRegistry({"rr": cfg}, "rr")
+        stub = SimpleNamespace(_config_store=cs, _registry=registry)
+        lane = ChatSession._resolve_rerank_lane(stub)
+        assert lane is not None
+
+        cs._values["tools.reranker_alias"] = ""
+        cs.version += 1
+        assert ChatSession._resolve_rerank_lane(stub) is None
+        assert lane.runtime.snapshot().closed
+        registry.shutdown()
 
 
 # ---------------------------------------------------------------------------
 # ChatSession BM25 reranker — the closure feeding tool/skill/memory retrieval
 # ---------------------------------------------------------------------------
-
-
-class _FakeRerankClient:
-    """In-process RerankClient stub returning fixed hits (no HTTP)."""
-
-    def __init__(self, hits: list[RerankHit]) -> None:
-        self._hits = hits
-
-    def rerank(
-        self, query: str, documents: list[str], *, top_n: int | None = None
-    ) -> list[RerankHit]:
-        return self._hits
 
 
 class TestRerankInstruction:
@@ -318,13 +352,13 @@ class TestRerankInstruction:
 
     def test_no_instruction_sends_bare_query(self, monkeypatch):
         sent, handler = self._capture()
-        monkeypatch.setattr("turnstone.core.rerank.httpx.post", _mock_httpx_post(handler))
+        _install_mock_httpx_client(monkeypatch, handler)
         CohereJinaRerankClient("http://x/rerank").rerank("capital of France", ["d0"])
         assert sent["body"]["query"] == "capital of France"
 
     def test_instruction_wraps_query(self, monkeypatch):
         sent, handler = self._capture()
-        monkeypatch.setattr("turnstone.core.rerank.httpx.post", _mock_httpx_post(handler))
+        _install_mock_httpx_client(monkeypatch, handler)
         CohereJinaRerankClient("http://x/rerank", instruction="Find relevant passages").rerank(
             "capital of France", ["d0"]
         )
@@ -374,31 +408,35 @@ class TestNormalizeScores:
 class TestSessionBM25Reranker:
     """``_bm25_reranker`` / ``_bm25_rerank_threshold`` — the BM25 seam adapters.
 
-    Drives the real closure through a fake ``RerankClient`` (the in-process
-    callable seam), never by patching internal state. The HTTP boundary lives in
-    ``TestCohereJinaRerankClient`` above.
+    Drives the real closure through fixed hits at the session dispatch seam.
+    The HTTP boundary lives in ``TestCohereJinaRerankClient`` above.
     """
 
-    def test_none_when_disabled_for_bm25(self):
-        # Per-tool toggle off -> no reranker even with an endpoint configured.
+    def test_disabled_bm25_is_identity_order(self):
+        # Long-lived closures stay installed across settings changes; disabled
+        # state is an identity rerank and must not resolve a runtime.
         stub = SimpleNamespace(
             _rerank_enabled_for=lambda tool: False,
-            _resolve_rerank_client=lambda: _FakeRerankClient([]),
+            _rerank_hits=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("disabled reranker dispatched")
+            ),
         )
-        assert ChatSession._bm25_reranker(stub) is None
+        rank = ChatSession._bm25_reranker(stub)
+        assert rank("q", ["d0", "d1"]) == [0, 1]
 
-    def test_none_when_no_client(self):
-        # Enabled, but no endpoint resolves -> None.
+    def test_no_lane_is_identity_order(self):
+        # Enabled, but no endpoint resolves: preserve BM25 pool order.
         stub = SimpleNamespace(
             _rerank_enabled_for=lambda tool: True,
-            _resolve_rerank_client=lambda: None,
+            _rerank_hits=lambda *args, **kwargs: None,
         )
-        assert ChatSession._bm25_reranker(stub) is None
+        rank = ChatSession._bm25_reranker(stub)
+        assert rank("q", ["d0", "d1"]) == [0, 1]
 
     def _enabled_stub(self, hits: list[RerankHit]) -> SimpleNamespace:
         return SimpleNamespace(
             _rerank_enabled_for=lambda tool: True,
-            _resolve_rerank_client=lambda: _FakeRerankClient(hits),
+            _rerank_hits=lambda query, docs, origin_generation=0: hits,
         )
 
     def test_no_threshold_returns_all_hit_indices(self):
@@ -460,6 +498,44 @@ class TestSessionBM25Reranker:
         rank = ChatSession._bm25_reranker(self._enabled_stub(hits), 0.5)
         assert rank is not None
         assert rank("q", ["d0", "d1"]) == [0]
+
+    def test_generation_cancellation_bypasses_bm25_exception_fallback(self):
+        import threading
+        from types import MethodType
+
+        from turnstone.core.admission import ModelAdmission
+        from turnstone.core.bm25 import BM25Index
+        from turnstone.core.rerank import RerankLane, RerankRuntime
+        from turnstone.core.session import GenerationCancelled
+
+        class _NeverBackend:
+            def rerank(self, *args, **kwargs):
+                raise AssertionError("superseded generation dispatched")
+
+        lane = RerankLane(
+            RerankRuntime(_NeverBackend(), alias="rr", model="m"),
+            "rr",
+            "m",
+            ModelAdmission("rr"),
+            0,
+        )
+        stub = SimpleNamespace(
+            _generation=2,
+            _generation_lock=threading.Lock(),
+            _cancel_event=threading.Event(),
+            _publication_shutdown=False,
+            _rerank_enabled_for=lambda tool: True,
+            _resolve_rerank_lane=lambda: lane,
+            tool_timeout=10,
+        )
+        stub._check_cancelled = MethodType(ChatSession._check_cancelled, stub)
+        stub._rerank_hits = MethodType(ChatSession._rerank_hits, stub)
+        rank = ChatSession._bm25_reranker(stub, origin_generation=1)
+
+        with pytest.raises(GenerationCancelled):
+            BM25Index(["alpha"], reranker=rank).search("alpha")
+        assert lane.runtime.snapshot().circuit.consecutive_failures == 0
+        lane.runtime.retire()
 
     def test_threshold_reads_setting(self):
         cs = _FakeConfigStore({"tools.rerank_bm25_threshold": 0.42})

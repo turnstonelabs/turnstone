@@ -1020,6 +1020,227 @@ class TestResolveEnvVars:
 
 
 # ---------------------------------------------------------------------------
+# Registry-owned rerank lanes
+# ---------------------------------------------------------------------------
+
+
+class TestRerankLaneRegistry:
+    @staticmethod
+    def _cfg(
+        alias: str = "rr",
+        *,
+        url: str = "http://rerank.example/rerank",
+        model: str = "bge",
+        key: str = "secret",
+        max_concurrency: int = 2,
+    ) -> ModelConfig:
+        return ModelConfig(
+            alias,
+            url,
+            key,
+            model,
+            capabilities={"supports_rerank": True},
+            max_concurrency=max_concurrency,
+        )
+
+    def test_resolve_reuses_runtime_and_stable_admission_without_llm_client(self) -> None:
+        cfg = self._cfg()
+        reg = ModelRegistry({"rr": cfg}, "rr")
+
+        first = reg.resolve_rerank_lane("rr", instruction="rank", config_version=4)
+        second = reg.resolve_rerank_lane("rr", instruction="rank", config_version=5)
+
+        assert first.runtime is second.runtime
+        assert first.admission is second.admission is reg.get_admission("rr")
+        assert first.config_version == 4
+        assert second.config_version == 5
+        assert first.admission.limit == 2
+        assert reg._clients == {}
+        assert reg._providers == {}
+        reg.shutdown()
+
+    def test_instruction_change_rotates_and_closes_old_runtime(self) -> None:
+        reg = ModelRegistry({"rr": self._cfg()}, "rr")
+        old = reg.resolve_rerank_lane("rr", instruction="old")
+
+        new = reg.resolve_rerank_lane("rr", instruction="new")
+
+        assert new.runtime is not old.runtime
+        assert old.runtime.snapshot().retired
+        assert old.runtime.snapshot().closed
+        assert not new.runtime.snapshot().retired
+        reg.shutdown()
+
+    def test_cap_only_reload_preserves_runtime_and_resizes_gate(self) -> None:
+        reg = ModelRegistry({"rr": self._cfg(max_concurrency=1)}, "rr")
+        old = reg.resolve_rerank_lane("rr", instruction="rank")
+
+        reg.reload(
+            {"rr": self._cfg(max_concurrency=4)},
+            "rr",
+            app_state=_KEYED_STATE,
+        )
+        new = reg.resolve_rerank_lane("rr", instruction="rank")
+
+        assert new.runtime is old.runtime
+        assert new.admission is old.admission
+        assert new.admission.limit == 4
+        assert new.registry_generation == 1
+        assert not old.runtime.snapshot().retired
+        reg.shutdown()
+
+    @pytest.mark.parametrize(
+        "replacement",
+        [
+            {"url": "http://other.example/rerank"},
+            {"model": "other"},
+            {"key": "different"},
+        ],
+    )
+    def test_relevant_reload_eagerly_retires_runtime(self, replacement: dict[str, str]) -> None:
+        reg = ModelRegistry({"rr": self._cfg()}, "rr")
+        old = reg.resolve_rerank_lane("rr")
+
+        reg.reload(
+            {"rr": self._cfg(**replacement)},
+            "rr",
+            app_state=_KEYED_STATE,
+        )
+
+        assert old.runtime.snapshot().retired
+        assert old.runtime.snapshot().closed
+        assert reg._rerank_runtimes == {}
+        new = reg.resolve_rerank_lane("rr")
+        assert new.runtime is not old.runtime
+        reg.shutdown()
+
+    def test_relevant_reload_lets_active_call_drain_before_close(self) -> None:
+        from turnstone.core.rerank import RerankHit, rerank
+
+        class _BlockingClient:
+            def __init__(self) -> None:
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.close_calls = 0
+
+            def rerank(self, query: str, documents: list[str], **kwargs: Any) -> list[RerankHit]:
+                del query, kwargs
+                self.entered.set()
+                assert self.release.wait(5)
+                return [RerankHit(i, 1.0) for i in range(len(documents))]
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        client = _BlockingClient()
+        reg = ModelRegistry({"rr": self._cfg()}, "rr")
+        with patch("turnstone.core.rerank.resolve_rerank_client", return_value=client):
+            old = reg.resolve_rerank_lane("rr")
+
+        outcome: list[list[RerankHit]] = []
+        worker = threading.Thread(
+            target=lambda: outcome.append(rerank(old, "q", ["d"], timeout=2.0)),
+            daemon=True,
+        )
+        worker.start()
+        assert client.entered.wait(2)
+
+        reg.reload(
+            {"rr": self._cfg(url="http://other.example/rerank")},
+            "rr",
+            app_state=_KEYED_STATE,
+        )
+        assert old.runtime.snapshot().retired
+        assert not old.runtime.snapshot().closed
+        assert client.close_calls == 0
+
+        client.release.set()
+        worker.join(2)
+        assert not worker.is_alive()
+        assert outcome and outcome[0][0].index == 0
+        assert old.runtime.snapshot().closed
+        assert client.close_calls == 1
+        reg.shutdown()
+
+    def test_resolving_new_role_alias_retires_previous_alias(self) -> None:
+        a = self._cfg("a", url="http://a.example/rerank")
+        b = self._cfg("b", url="http://b.example/rerank")
+        reg = ModelRegistry({"a": a, "b": b}, "a")
+        old = reg.resolve_rerank_lane("a")
+
+        current = reg.resolve_rerank_lane("b")
+
+        assert old.runtime.snapshot().closed
+        assert set(reg._rerank_runtimes) == {"b"}
+        assert current.admission is reg.get_admission("b")
+        reg.shutdown()
+
+    def test_deactivate_and_shutdown_are_idempotent(self) -> None:
+        reg = ModelRegistry({"rr": self._cfg()}, "rr")
+        lane = reg.resolve_rerank_lane("rr")
+
+        reg.deactivate_rerank_runtime()
+        reg.deactivate_rerank_runtime()
+        reg.shutdown()
+        reg.shutdown()
+
+        assert lane.runtime.snapshot().retired
+        assert lane.runtime.snapshot().closed
+        assert reg._rerank_runtimes == {}
+
+    @pytest.mark.parametrize("operation", ["reload", "shutdown"])
+    def test_rerank_transport_closes_when_llm_client_close_raises(
+        self,
+        operation: str,
+    ) -> None:
+        class _RerankClient:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class _FailingLLMClient:
+            def close(self) -> None:
+                raise RuntimeError("llm close failed")
+
+        rr_cfg = self._cfg()
+        llm_cfg = ModelConfig("llm", "http://old.example/v1", "key", "model")
+        reg = ModelRegistry({"llm": llm_cfg, "rr": rr_cfg}, "llm")
+        rerank_client = _RerankClient()
+        with patch(
+            "turnstone.core.rerank.resolve_rerank_client",
+            return_value=rerank_client,
+        ):
+            lane = reg.resolve_rerank_lane("rr")
+        reg._clients["llm"] = _FailingLLMClient()
+
+        with pytest.raises(RuntimeError, match="llm close failed"):
+            if operation == "reload":
+                reg.reload(
+                    {
+                        "llm": dataclasses.replace(
+                            llm_cfg,
+                            base_url="http://new.example/v1",
+                        ),
+                        "rr": dataclasses.replace(
+                            rr_cfg,
+                            base_url="http://new-rerank.example/rerank",
+                        ),
+                    },
+                    "llm",
+                    app_state=_KEYED_STATE,
+                )
+            else:
+                reg.shutdown()
+
+        assert rerank_client.close_calls == 1
+        assert lane.runtime.snapshot().retired
+        assert lane.runtime.snapshot().closed
+        assert reg._rerank_runtimes == {}
+
+
+# ---------------------------------------------------------------------------
 # ModelRegistry.reload
 # ---------------------------------------------------------------------------
 

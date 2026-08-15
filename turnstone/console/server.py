@@ -5383,6 +5383,10 @@ def _bootstrap_coord_subsystem(
         except Exception:
             log.warning("console.coord_bootstrap_rollback_adapter_failed", exc_info=True)
         try:
+            coord_registry.shutdown()
+        except Exception:
+            log.warning("console.coord_bootstrap_rollback_registry_failed", exc_info=True)
+        try:
             shutdown_idle_nudge_watchers(app)
         except Exception:
             log.warning("console.coord_bootstrap_rollback_idle_nudge_failed", exc_info=True)
@@ -5470,6 +5474,7 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
     """
     from turnstone.core.model_registry import load_model_registry
 
+    coord_registry: Any | None = None
     try:
         try:
             coord_registry = load_model_registry(storage=storage)
@@ -5489,6 +5494,11 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
         _bootstrap_coord_subsystem(app, storage, config_store, coord_registry)
     except Exception:
         log.warning("console.coordinator_init_failed", exc_info=True)
+        if coord_registry is not None:
+            try:
+                coord_registry.shutdown()
+            except Exception:
+                log.warning("console.coord_startup_registry_shutdown_failed", exc_info=True)
         # ``_bootstrap_coord_subsystem`` rolls back its own partial
         # side-effects from locals before re-raising, so this helper
         # is normally redundant — kept as defence-in-depth in case
@@ -5555,6 +5565,13 @@ def _teardown_partial_coord_subsystem(app: Any) -> None:
             adapter.shutdown()
         except Exception:
             log.warning("console.coord_partial_adapter_shutdown_failed", exc_info=True)
+
+    registry = getattr(state, "coord_registry", None)
+    if registry is not None:
+        try:
+            registry.shutdown()
+        except Exception:
+            log.warning("console.coord_partial_registry_shutdown_failed", exc_info=True)
 
     # Idle nudge watchers are tracked in a list on app.state; the
     # console only ever installs one (the coord watcher), so a blanket
@@ -5875,6 +5892,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             coord_adapter_shutdown.shutdown()
         except Exception:
             log.debug("console.coord_adapter_shutdown_failed", exc_info=True)
+    coord_registry_shutdown = getattr(app.state, "coord_registry", None)
+    if coord_registry_shutdown is not None:
+        try:
+            # Coordinator sessions stop through the adapter first; the registry
+            # can then retire pooled model and rerank transports without a new
+            # session resolving behind the teardown.
+            await asyncio.to_thread(coord_registry_shutdown.shutdown)
+        except Exception:
+            log.debug("console.coord_registry_shutdown_failed", exc_info=True)
     coord_state_writer_shutdown = getattr(app.state, "coord_state_writer", None)
     if coord_state_writer_shutdown is not None:
         try:
@@ -12852,6 +12878,10 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
             _bootstrap_coord_subsystem(app, storage, config_store, coord_registry)
         except Exception as exc:
             log.warning("console.coord_bootstrap_failed", exc_info=True)
+            try:
+                coord_registry.shutdown()
+            except Exception:
+                log.warning("console.coord_bootstrap_registry_shutdown_failed", exc_info=True)
             # Tear down any partially-stamped handles so a later retry
             # via the same CRUD path doesn't spawn duplicate daemons.
             _teardown_partial_coord_subsystem(app)

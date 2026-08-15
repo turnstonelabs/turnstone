@@ -3978,6 +3978,133 @@ class TestCancelledSendCleanupOwnership:
         session.cancel()
         raise GenerationCancelled()
 
+    def test_cancel_cleanup_skips_remote_rerank_and_finishes(self, tmp_db) -> None:
+        """A set cancel event cannot re-enter reranking from its own repair path."""
+        from turnstone.core.admission import ModelAdmission
+        from turnstone.core.memory import save_structured_memory_strict
+        from turnstone.core.rerank import RerankLane, RerankRuntime
+
+        class _NeverBackend:
+            calls = 0
+
+            def rerank(self, *args: Any, **kwargs: Any):
+                self.calls += 1
+                raise AssertionError("cancel cleanup dispatched reranking")
+
+        ui = NullUI()
+        session = _make_registered_session(ui=ui, user_id="owner")
+        session._title_generated = True
+        save_structured_memory_strict(
+            "kafka_runbook",
+            "private body",
+            description="queued for next seam",
+            scope="global",
+        )
+        backend = _NeverBackend()
+        lane = RerankLane(
+            RerankRuntime(backend, alias="rr", model="m"),
+            "rr",
+            "m",
+            ModelAdmission("rr"),
+            0,
+        )
+
+        try:
+            with (
+                patch.object(session, "_resolve_rerank_lane", return_value=lane) as resolve,
+                patch.object(
+                    session,
+                    "_stream_response",
+                    side_effect=lambda _generation: self._cancel_with_pending_cleanup(session),
+                ),
+            ):
+                session.send("unrelated opening request")
+        finally:
+            lane.runtime.retire()
+
+        resolve.assert_not_called()
+        assert backend.calls == 0
+        assert any(turn.role is Role.TOOL for turn in session.messages)
+        assert session.messages[-2].role is Role.USER
+        assert session.messages[-2].text == "queued for next seam"
+        assert session.messages[-1].role is Role.SYSTEM
+        assert session.messages[-1].source == "memory_pointer"
+        assert "kafka_runbook" in session.messages[-1].text
+        assert ui.states[-1] == "idle"
+
+    def test_queued_turn_rerank_is_fenced_by_generation_owner(self, tmp_db) -> None:
+        """A force successor prevents the abandoned queue planner from dispatching."""
+        from turnstone.core.admission import ModelAdmission
+        from turnstone.core.memory import save_structured_memory_strict
+        from turnstone.core.rerank import RerankHit, RerankLane, RerankRuntime
+
+        class _CountingBackend:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def rerank(self, _query: str, documents: list[str], **_kwargs: Any):
+                self.calls += 1
+                return [RerankHit(index=i, score=1.0) for i in range(len(documents))]
+
+        session = _make_registered_session(user_id="owner")
+        save_structured_memory_strict(
+            "kafka_runbook",
+            "private body",
+            description="restart kafka brokers",
+            scope="global",
+        )
+        backend = _CountingBackend()
+        lane = RerankLane(
+            RerankRuntime(backend, alias="rr", model="m"),
+            "rr",
+            "m",
+            ModelAdmission("rr"),
+            0,
+        )
+        resolve_started = threading.Event()
+        release_resolve = threading.Event()
+        send_errors: list[BaseException] = []
+
+        def resolve_lane() -> RerankLane:
+            resolve_started.set()
+            if not release_resolve.wait(2):
+                raise RuntimeError("rerank lane resolution was not released")
+            return lane
+
+        def stream():
+            yield StreamChunk(content_delta="done")
+            with session._queued_lock:
+                session._queued_messages["queued-old"] = (
+                    "restart kafka brokers",
+                    "normal",
+                )
+            yield StreamChunk(finish_reason="stop")
+
+        arm_session(session, stream())
+
+        def run_send() -> None:
+            try:
+                session.send("zzzxxyy")
+            except BaseException as exc:
+                send_errors.append(exc)
+
+        sender = threading.Thread(target=run_send)
+        try:
+            with patch.object(session, "_resolve_rerank_lane", side_effect=resolve_lane):
+                sender.start()
+                assert resolve_started.wait(2)
+                assert session._claim_generation() == 2
+                release_resolve.set()
+                sender.join(2)
+        finally:
+            release_resolve.set()
+            sender.join(2)
+            lane.runtime.retire()
+
+        assert not sender.is_alive()
+        assert send_errors == []
+        assert backend.calls == 0
+
     def test_successor_waits_for_complete_cancel_cleanup_transaction(self, tmp_db):
         """A claim already waiting on the lock observes every cleanup effect."""
         ui = NullUI()

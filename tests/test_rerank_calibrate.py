@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import pytest
+
 from turnstone.core.rerank import RerankHit
-from turnstone.core.rerank_calibrate import _GAP_FRACTION, _PROBE_SET, _build_result, calibrate
+from turnstone.core.rerank_calibrate import (
+    _GAP_FRACTION,
+    _PROBE_SET,
+    _build_result,
+    calibrate,
+    calibrate_model,
+)
 
 
 class _ScriptedClient:
@@ -93,6 +101,42 @@ class TestCalibrate:
         assert not res.separated
         assert res.suggested_threshold is None
         assert res.raw_scale == "unknown (no scores)"
+
+
+class TestCalibrateModelLifecycle:
+    class _ClosableClient(_ScriptedClient):
+        def __init__(self, *, fail: bool = False) -> None:
+            super().__init__(0.9, 0.1)
+            self.fail = fail
+            self.close_calls = 0
+
+        def rerank(
+            self, query: str, documents: list[str], *, top_n: int | None = None
+        ) -> list[RerankHit]:
+            if self.fail:
+                raise RuntimeError("probe failed")
+            return super().rerank(query, documents, top_n=top_n)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def test_one_shot_client_closes_after_success(self, monkeypatch) -> None:
+        client = self._ClosableClient()
+        monkeypatch.setattr("turnstone.core.rerank.resolve_rerank_client", lambda *a, **k: client)
+
+        result = calibrate_model("http://rr/rerank", "m", "k")
+
+        assert result.separated
+        assert client.close_calls == 1
+
+    def test_one_shot_client_closes_after_failure(self, monkeypatch) -> None:
+        client = self._ClosableClient(fail=True)
+        monkeypatch.setattr("turnstone.core.rerank.resolve_rerank_client", lambda *a, **k: client)
+
+        with pytest.raises(RuntimeError, match="probe failed"):
+            calibrate_model("http://rr/rerank", "m", "k")
+
+        assert client.close_calls == 1
 
 
 class TestCalibrationCapsConfinement:

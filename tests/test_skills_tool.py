@@ -106,7 +106,7 @@ def _make_session(*, kind: str = "interactive", user_id: str = "test-user") -> A
     # Truncation budget — required by _truncate_output on every exec.
     session.tool_truncation = 100_000
     # skills(action='find') ranks via BM25Index(..., reranker=self._bm25_reranker()),
-    # which reaches _resolve_rerank_client -> self.tool_timeout. No _config_store/
+    # which reaches _resolve_rerank_lane -> self.tool_timeout. No _config_store/
     # _registry here -> no endpoint -> reranker is None -> pure-BM25 path.
     session.tool_timeout = 30
 

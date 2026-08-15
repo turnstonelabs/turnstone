@@ -278,7 +278,7 @@ if TYPE_CHECKING:
     )
     from turnstone.core.output_guard import OutputAssessment
     from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
-    from turnstone.core.rerank import RerankClient, Reranker
+    from turnstone.core.rerank import Reranker, RerankHit, RerankLane
     from turnstone.core.storage import ForkCloneSnapshot
     from turnstone.core.web_search import WebSearchClient
 
@@ -3505,28 +3505,80 @@ class ChatSession:
             timeout=self.tool_timeout,
         )
 
-    def _resolve_rerank_client(self) -> RerankClient | None:
-        """Return a rerank client, or None when reranking is unconfigured.
+    def _resolve_rerank_lane(self) -> RerankLane | None:
+        """Return a fresh rerank lane, or None when reranking is unconfigured.
 
         The reranker is a **model definition** (capability ``supports_rerank``)
         selected via the Reranker role (``tools.reranker_alias``); its base_url
         is the full /rerank endpoint. There is no bundled rerank endpoint and no
-        global URL fallback, so reranking stays disabled until such a model is
-        selected.
+        global URL fallback. The registry owns the shared runtime; callers must
+        resolve per batch rather than retain this immutable binding.
         """
-        from turnstone.core.rerank_config import resolve_rerank_client_from
+        from turnstone.core.rerank_config import resolve_rerank_lane_from
 
-        return resolve_rerank_client_from(
+        return resolve_rerank_lane_from(
             getattr(self, "_config_store", None),
             getattr(self, "_registry", None),
-            timeout=min(self.tool_timeout, _RERANK_TIMEOUT_CAP_S),
         )
+
+    def _rerank_hits(
+        self,
+        query: str,
+        documents: list[str],
+        *,
+        origin_generation: int = 0,
+    ) -> list[RerankHit] | None:
+        """Resolve and dispatch one batch, preserving its cancellation owner.
+
+        ``None`` means no live reranker is configured; callers return identity
+        order so long-lived BM25/tool-search closures can observe a later role
+        selection without being rebuilt. Endpoint and circuit failures raise
+        through the existing retrieval fallback seams.
+        """
+        lane = self._resolve_rerank_lane()
+        if lane is None:
+            return None
+
+        from turnstone.core.deadline import DeadlineCancelledError
+        from turnstone.core.rerank import rerank
+
+        task_scope = _active_task_agent_cancel_scope.get()
+        owner_generation = (
+            origin_generation
+            or _active_tool_origin_generation.get()
+            or _active_commit_origin_generation.get()
+        )
+        if task_scope is not None:
+            cancel_ref: Any = task_scope.cancel_ref
+        elif hasattr(self, "_cancel_event"):
+            cancel_ref = _CancelRef(self, owner_generation)
+        else:  # lightweight direct seam tests/embedders
+            cancel_ref = None
+
+        try:
+            return rerank(
+                lane,
+                query,
+                documents,
+                timeout=min(float(getattr(self, "tool_timeout", 30.0)), _RERANK_TIMEOUT_CAP_S),
+                cancel_ref=cancel_ref,
+            )
+        except DeadlineCancelledError:
+            # Retrieval fallbacks catch Exception. Translate the deadline seam
+            # back into GenerationCancelled (a BaseException) before they can
+            # mistake Stop/supersession for an endpoint outage.
+            if task_scope is not None:
+                task_scope.check()
+            check_cancelled = getattr(self, "_check_cancelled", None)
+            if callable(check_cancelled):
+                check_cancelled(owner_generation)
+            raise
 
     def _rerank_enabled_for(self, tool: str) -> bool:
         """Whether reranking is enabled for ``tool`` (currently: 'web_search', 'bm25').
 
         The per-tool toggles default on; the operative gate is whether an
-        endpoint is configured (``_resolve_rerank_client`` returns None when
+        endpoint is configured (``_resolve_rerank_lane`` returns None when
         not). A bare CLI without a ConfigStore inherits the on-by-default toggle.
         """
         cs = getattr(self, "_config_store", None)
@@ -3534,25 +3586,30 @@ class ChatSession:
             return bool(cs.get(f"tools.rerank_{tool}"))
         return True
 
-    def _web_search_reranker(self) -> Reranker | None:
-        """Build a web_search reranker callable, or None when disabled.
+    def _web_search_reranker(self) -> Reranker:
+        """Build a live-resolving web_search reranker callable.
 
-        Returns a ``(query, docs) -> ranked indices`` adapter over the configured
-        rerank endpoint; None when reranking is off or no endpoint is set.
+        The closure captures no concrete lane/runtime. Config changes are read
+        at each invocation; disabled/unconfigured state is identity order.
         """
-        if not self._rerank_enabled_for("web_search"):
-            return None
-        rc = self._resolve_rerank_client()
-        if rc is None:
-            return None
 
         def _rank(query: str, docs: list[str]) -> list[int]:
-            return [hit.index for hit in rc.rerank(query, docs)]
+            if not self._rerank_enabled_for("web_search"):
+                return list(range(len(docs)))
+            hits = self._rerank_hits(query, docs)
+            if hits is None:
+                return list(range(len(docs)))
+            return [hit.index for hit in hits]
 
         return _rank
 
-    def _bm25_reranker(self, threshold: float = 0.0) -> Reranker | None:
-        """Build a BM25 reranker callable, or None when disabled.
+    def _bm25_reranker(
+        self,
+        threshold: float = 0.0,
+        *,
+        origin_generation: int = 0,
+    ) -> Reranker:
+        """Build a live-resolving BM25 reranker callable.
 
         Mirrors ``_web_search_reranker``. ``threshold`` is a relevance FLOOR
         applied in this closure (where scores still exist); the BM25Index seam
@@ -3563,24 +3620,22 @@ class ChatSession:
         threshold. Only memory-pointer relevance filtering passes a configured threshold;
         reactive surfaces pass 0.
         """
-        if not self._rerank_enabled_for("bm25"):
-            return None
-        rc = self._resolve_rerank_client()
-        if rc is None:
-            return None
-
         from turnstone.core.rerank import RerankError, normalize_scores
 
         def _rank(query: str, docs: list[str]) -> list[int]:
-            hits = rc.rerank(query, docs)
+            if not self._rerank_enabled_for("bm25"):
+                return list(range(len(docs)))
+            hits = self._rerank_hits(
+                query,
+                docs,
+                origin_generation=origin_generation,
+            )
+            if hits is None:
+                return list(range(len(docs)))
             if docs and not hits:
-                # A conforming reranker scores every document; an empty result
-                # for non-empty input means the endpoint response was
-                # unparseable (rc.rerank -> _parse_hits returns [] without
-                # raising). That is an endpoint FAILURE -- a discrete branch
-                # from the relevance floor below -- so raise and let BM25Index
-                # fall back to BM25 order in BOTH modes, instead of the
-                # filter-mode floor honoring it as "nothing relevant".
+                # The managed dispatcher enforces this too. Keep the adapter
+                # fail-closed for alternate protocol implementations and
+                # lightweight test embedders that provide the seam directly.
                 raise RerankError("rerank endpoint returned no scores for non-empty input")
             # Normalise to a 0-1 relevance space (sigmoid for logit endpoints) so
             # ``threshold`` means the same on every reranker. Sigmoid is monotonic
@@ -11204,7 +11259,13 @@ class ChatSession:
         # below rejects every old mutation.  The participant lookup is cached so
         # the in-lock apply path performs no storage access.
         planned_user_turn = (
-            self._plan_genuine_user_turn(user_input, turn_principal_id) if not from_wake else None
+            self._plan_genuine_user_turn(
+                user_input,
+                turn_principal_id,
+                origin_generation=my_generation,
+            )
+            if not from_wake
+            else None
         )
         shared_state_plan = self._plan_shared_state()
         participant_name: str | None = None
@@ -11885,7 +11946,9 @@ class ChatSession:
                     # must not let this retired worker pop a successor's queue
                     # or repaint its state as idle.
                     flushed_out: list[bool] = []
-                    queued_flush = self._prepare_queued_flush()
+                    queued_flush = self._prepare_queued_flush(
+                        origin_generation=my_generation,
+                    )
 
                     def _drain_or_idle(
                         durable: list[Callable[[], None]],
@@ -12396,6 +12459,7 @@ class ChatSession:
                 queued_flush = self._prepare_queued_flush(
                     user_feedback or "",
                     include_queue=False,
+                    origin_generation=my_generation,
                 )
                 fold_tool_batch = functools.partial(
                     _fold_tool_batch,
@@ -12468,7 +12532,10 @@ class ChatSession:
             )
             raise
         except GenerationCancelled:
-            queued_flush = self._prepare_queued_flush()
+            queued_flush = self._prepare_queued_flush(
+                origin_generation=my_generation,
+                allow_rerank=False,
+            )
 
             def _finalize_cancelled_generation(
                 durable: list[Callable[[], None]],
@@ -12575,7 +12642,10 @@ class ChatSession:
             # Do NOT re-raise — return normally so server worker thread
             # completes cleanly.
         except KeyboardInterrupt as exc:
-            queued_flush = self._prepare_queued_flush()
+            queued_flush = self._prepare_queued_flush(
+                origin_generation=my_generation,
+                allow_rerank=False,
+            )
 
             def _finalize_interrupted_generation(
                 error: BaseException,
@@ -12601,7 +12671,10 @@ class ChatSession:
             )
             raise
         except Exception as exc:
-            queued_flush = self._prepare_queued_flush()
+            queued_flush = self._prepare_queued_flush(
+                origin_generation=my_generation,
+                allow_rerank=False,
+            )
 
             # Orphan gate: a superseded thread's stream death can escape
             # cancel conversion (the successor replaced the cancel event
@@ -17099,6 +17172,8 @@ class ChatSession:
         prefix: str = "",
         *,
         include_queue: bool = True,
+        origin_generation: int = 0,
+        allow_rerank: bool = True,
     ) -> _QueuedFlushPlan:
         """Snapshot and rank one prospective queued USER turn outside locks."""
         worker_claim = current_worker_claim(self)
@@ -17133,7 +17208,12 @@ class ChatSession:
         return _QueuedFlushPlan(
             prefix=prefix,
             items=items,
-            turn=self._plan_genuine_user_turn(content, principal),
+            turn=self._plan_genuine_user_turn(
+                content,
+                principal,
+                origin_generation=origin_generation,
+                allow_rerank=allow_rerank,
+            ),
         )
 
     def _apply_queued_flush(
@@ -19456,6 +19536,8 @@ class ChatSession:
         user_message: str,
         *,
         access: _MemoryAccess,
+        origin_generation: int = 0,
+        allow_rerank: bool = True,
     ) -> str:
         """Build a live metadata-only pointer for one genuine user turn."""
         if not user_message.strip() or not self._nudges_enabled("memory_pointer"):
@@ -19470,7 +19552,14 @@ class ChatSession:
                 rows,
                 user_message,
                 k=self._mem_cfg.relevance_k,
-                reranker=self._bm25_reranker(threshold),
+                reranker=(
+                    self._bm25_reranker(
+                        threshold,
+                        origin_generation=origin_generation,
+                    )
+                    if allow_rerank
+                    else None
+                ),
                 rerank_filters=threshold > 0,
             )
         except Exception:
@@ -19482,6 +19571,9 @@ class ChatSession:
         self,
         content: str,
         principal_id: str,
+        *,
+        origin_generation: int = 0,
+        allow_rerank: bool = True,
     ) -> _GenuineUserTurnPlan:
         """Plan all metadata derived from an admitted human turn."""
         principal = principal_id.strip()
@@ -19491,6 +19583,8 @@ class ChatSession:
             memory_pointer=self._plan_memory_pointer(
                 content,
                 access=self._memory_access(principal),
+                origin_generation=origin_generation,
+                allow_rerank=allow_rerank,
             ),
         )
 

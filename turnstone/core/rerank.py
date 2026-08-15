@@ -21,14 +21,21 @@ default and no fall back to a local model.
 
 from __future__ import annotations
 
+import contextlib
 import math
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
+from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.log import get_logger
+
+if TYPE_CHECKING:
+    from turnstone.core.admission import AdmissionLease, ModelAdmission
 
 log = get_logger(__name__)
 
@@ -47,6 +54,14 @@ class RerankError(RuntimeError):
     Callers raise this so retrieval falls back to BM25 order rather than
     treating the failure as "nothing relevant".
     """
+
+
+class RerankCircuitOpenError(RerankError):
+    """The endpoint circuit is open, so no rerank request was dispatched."""
+
+
+class RerankRuntimeRetiredError(RerankError):
+    """The resolved runtime retired before this batch could dispatch."""
 
 
 def _sigmoid(x: float) -> float:
@@ -89,10 +104,383 @@ class RerankClient(Protocol):
     """Minimal interface for a rerank backend."""
 
     def rerank(
-        self, query: str, documents: list[str], *, top_n: int | None = None
+        self,
+        query: str,
+        documents: list[str],
+        *,
+        top_n: int | None = None,
+        timeout: float | None = None,
     ) -> list[RerankHit]:
         """Score ``documents`` against ``query``; return hits sorted best-first."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class RerankCircuitSnapshot:
+    """Non-sensitive instantaneous breaker state for diagnostics and tests."""
+
+    state: str
+    consecutive_failures: int
+
+
+@dataclass(frozen=True, slots=True)
+class RerankRuntimeSnapshot:
+    """Non-sensitive instantaneous lifecycle state for diagnostics and tests."""
+
+    alias: str
+    model: str
+    active_calls: int
+    retired: bool
+    closed: bool
+    circuit: RerankCircuitSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class _CircuitPermit:
+    epoch: int
+    probe: bool
+
+
+class _RerankCircuit:
+    """Small thread-safe consecutive-failure circuit for one rerank runtime."""
+
+    def __init__(
+        self,
+        alias: str,
+        model: str,
+        *,
+        failure_threshold: int,
+        cooldown_seconds: float,
+        clock: Callable[[], float],
+    ) -> None:
+        self._alias = alias
+        self._model = model
+        self._failure_threshold = failure_threshold
+        self._cooldown_seconds = cooldown_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._state = "closed"
+        self._consecutive_failures = 0
+        self._opened_at: float | None = None
+        # Invalidates completions from calls admitted before a transition.
+        self._epoch = 0
+
+    def acquire(self) -> _CircuitPermit:
+        with self._lock:
+            if self._state == "closed":
+                return _CircuitPermit(self._epoch, False)
+            if self._state == "half_open":
+                raise RerankCircuitOpenError(
+                    f"rerank circuit is half-open for alias {self._alias!r}"
+                )
+            opened_at = self._opened_at
+            if opened_at is None or self._clock() - opened_at < self._cooldown_seconds:
+                raise RerankCircuitOpenError(f"rerank circuit is open for alias {self._alias!r}")
+            self._state = "half_open"
+            log.info(
+                "rerank.circuit_half_open alias=%s model=%s",
+                self._alias,
+                self._model,
+            )
+            return _CircuitPermit(self._epoch, True)
+
+    def validate(self, permit: _CircuitPermit) -> None:
+        """Refuse a permit invalidated while its caller waited for admission."""
+        with self._lock:
+            expected_state = "half_open" if permit.probe else "closed"
+            if permit.epoch != self._epoch or self._state != expected_state:
+                raise RerankCircuitOpenError(
+                    f"rerank circuit changed while waiting for alias {self._alias!r}"
+                )
+
+    def succeed(self, permit: _CircuitPermit) -> None:
+        recovered = False
+        with self._lock:
+            if permit.epoch != self._epoch:
+                return
+            if permit.probe:
+                if self._state != "half_open":
+                    return
+                self._state = "closed"
+                self._opened_at = None
+                self._consecutive_failures = 0
+                self._epoch += 1
+                recovered = True
+            elif self._state == "closed":
+                self._consecutive_failures = 0
+        if recovered:
+            log.info(
+                "rerank.circuit_recovered alias=%s model=%s",
+                self._alias,
+                self._model,
+            )
+
+    def fail(self, permit: _CircuitPermit) -> None:
+        opened = False
+        failures = 0
+        with self._lock:
+            if permit.epoch != self._epoch:
+                return
+            if permit.probe:
+                if self._state != "half_open":
+                    return
+                self._state = "open"
+                self._opened_at = self._clock()
+                self._consecutive_failures = self._failure_threshold
+                self._epoch += 1
+                failures = self._consecutive_failures
+                opened = True
+            elif self._state == "closed":
+                self._consecutive_failures += 1
+                failures = self._consecutive_failures
+                if failures >= self._failure_threshold:
+                    self._state = "open"
+                    self._opened_at = self._clock()
+                    self._epoch += 1
+                    opened = True
+        if opened:
+            log.warning(
+                "rerank.circuit_open alias=%s model=%s failures=%d",
+                self._alias,
+                self._model,
+                failures,
+            )
+
+    def abandon(self, permit: _CircuitPermit) -> None:
+        """Release a half-open reservation without judging endpoint health."""
+        with self._lock:
+            if permit.epoch == self._epoch and permit.probe and self._state == "half_open":
+                # Preserve the original opened_at. Its cooldown has already
+                # elapsed, so the next caller may become the replacement probe.
+                self._state = "open"
+
+    def snapshot(self) -> RerankCircuitSnapshot:
+        with self._lock:
+            return RerankCircuitSnapshot(self._state, self._consecutive_failures)
+
+
+class _RerankRuntimeLease:
+    """One idempotently releasable active-call hold on a runtime."""
+
+    __slots__ = ("_released", "_runtime")
+
+    def __init__(self, runtime: RerankRuntime) -> None:
+        self._runtime = runtime
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._runtime._release_call()
+
+
+class RerankRuntime:
+    """Lifecycle-owned backend, circuit, and active-call retirement state."""
+
+    def __init__(
+        self,
+        client: RerankClient,
+        *,
+        alias: str,
+        model: str,
+        failure_threshold: int = 3,
+        cooldown_seconds: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if failure_threshold < 1:
+            raise ValueError("rerank circuit failure threshold must be positive")
+        if cooldown_seconds < 0:
+            raise ValueError("rerank circuit cooldown must be non-negative")
+        self._client = client
+        self.alias = alias
+        self.model = model
+        self._state_lock = threading.Lock()
+        self._active_calls = 0
+        self._retired = False
+        self._closed = False
+        self._circuit = _RerankCircuit(
+            alias,
+            model,
+            failure_threshold=failure_threshold,
+            cooldown_seconds=cooldown_seconds,
+            clock=clock,
+        )
+
+    @property
+    def client(self) -> RerankClient:
+        return self._client
+
+    def acquire_call(self) -> _RerankRuntimeLease:
+        with self._state_lock:
+            if self._retired or self._closed:
+                raise RerankRuntimeRetiredError(f"rerank runtime retired for alias {self.alias!r}")
+            self._active_calls += 1
+        return _RerankRuntimeLease(self)
+
+    def _release_call(self) -> None:
+        close_now = False
+        with self._state_lock:
+            if self._active_calls <= 0:
+                raise RuntimeError("rerank runtime lease released without an active call")
+            self._active_calls -= 1
+            if self._retired and self._active_calls == 0 and not self._closed:
+                self._closed = True
+                close_now = True
+        if close_now:
+            self._close_client()
+
+    def begin_retirement(self) -> Callable[[], None] | None:
+        """Prevent new calls and return an idle close action for the caller.
+
+        The split lets ``ModelRegistry`` mark the runtime while holding its
+        short-lived registry lock, then execute a potentially blocking client
+        close after releasing that lock. Active calls close from their final
+        lease release instead.
+        """
+        with self._state_lock:
+            self._retired = True
+            if self._active_calls or self._closed:
+                return None
+            self._closed = True
+        return self._close_client
+
+    def retire(self) -> None:
+        close = self.begin_retirement()
+        if close is not None:
+            close()
+
+    def _close_client(self) -> None:
+        close = getattr(self._client, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:
+            log.warning(
+                "rerank.runtime_close_failed alias=%s model=%s",
+                self.alias,
+                self.model,
+                exc_info=True,
+            )
+
+    def circuit_acquire(self) -> _CircuitPermit:
+        return self._circuit.acquire()
+
+    def circuit_succeed(self, permit: _CircuitPermit) -> None:
+        self._circuit.succeed(permit)
+
+    def circuit_validate(self, permit: _CircuitPermit) -> None:
+        self._circuit.validate(permit)
+
+    def circuit_fail(self, permit: _CircuitPermit) -> None:
+        self._circuit.fail(permit)
+
+    def circuit_abandon(self, permit: _CircuitPermit) -> None:
+        self._circuit.abandon(permit)
+
+    def snapshot(self) -> RerankRuntimeSnapshot:
+        with self._state_lock:
+            active_calls = self._active_calls
+            retired = self._retired
+            closed = self._closed
+        return RerankRuntimeSnapshot(
+            alias=self.alias,
+            model=self.model,
+            active_calls=active_calls,
+            retired=retired,
+            closed=closed,
+            circuit=self._circuit.snapshot(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RerankLane:
+    """One immutable, per-batch binding to a shared rerank runtime."""
+
+    runtime: RerankRuntime
+    alias: str
+    model: str
+    admission: ModelAdmission
+    registry_generation: int
+    config_version: int = 0
+
+
+def _raise_if_aborted(cancel_ref: Any) -> None:
+    if bool(getattr(cancel_ref, "aborted", False)):
+        raise DeadlineCancelledError("rerank cancelled")
+
+
+def rerank(
+    lane: RerankLane,
+    query: str,
+    documents: list[str],
+    *,
+    top_n: int | None = None,
+    timeout: float,
+    cancel_ref: Any = None,
+) -> list[RerankHit]:
+    """Dispatch one rerank batch through circuit, admission, and runtime leases."""
+    if not documents:
+        return []
+    _raise_if_aborted(cancel_ref)
+    permit = lane.runtime.circuit_acquire()
+    admission: AdmissionLease | None = None
+    runtime_lease: _RerankRuntimeLease | None = None
+    dispatched = False
+    try:
+        admission = lane.admission.acquire(cancel_ref=cancel_ref)
+        # The circuit can open while this call is queued behind either rerank
+        # or model work on the shared alias gate. Do not let an old closed-state
+        # permit leak one more full-timeout request after that transition.
+        lane.runtime.circuit_validate(permit)
+        runtime_lease = lane.runtime.acquire_call()
+        _raise_if_aborted(cancel_ref)
+        mark_dispatch = getattr(cancel_ref, "mark_dispatch", None)
+        if callable(mark_dispatch):
+            with contextlib.suppress(Exception):
+                mark_dispatch()
+        dispatched = True
+        hits = lane.runtime.client.rerank(
+            query,
+            documents,
+            top_n=top_n,
+            timeout=timeout,
+        )
+        _raise_if_aborted(cancel_ref)
+        if not hits:
+            raise RerankError("rerank endpoint returned no scores for non-empty input")
+    except (DeadlineCancelledError, RerankCircuitOpenError, RerankRuntimeRetiredError):
+        lane.runtime.circuit_abandon(permit)
+        raise
+    except Exception:
+        try:
+            # Stop/supersession owns the outcome even when the dispatched
+            # transport fails while cancellation is landing. Do not charge a
+            # cancelled request to endpoint health or let retrieval fallback
+            # absorb it as an ordinary rerank outage.
+            _raise_if_aborted(cancel_ref)
+        except DeadlineCancelledError:
+            lane.runtime.circuit_abandon(permit)
+            raise
+        if dispatched:
+            lane.runtime.circuit_fail(permit)
+        else:
+            # Admission and lifecycle failures say nothing about endpoint
+            # health; only a call that reached the backend can trip its circuit.
+            lane.runtime.circuit_abandon(permit)
+        raise
+    except BaseException:
+        lane.runtime.circuit_abandon(permit)
+        raise
+    else:
+        lane.runtime.circuit_succeed(permit)
+        return hits
+    finally:
+        if runtime_lease is not None:
+            runtime_lease.release()
+        if admission is not None:
+            admission.release()
 
 
 class CohereJinaRerankClient:
@@ -117,9 +505,17 @@ class CohereJinaRerankClient:
         self._api_key = api_key
         self._timeout = timeout
         self._instruction = instruction
+        self._client = httpx.Client()
+        self._close_lock = threading.Lock()
+        self._closed = False
 
     def rerank(
-        self, query: str, documents: list[str], *, top_n: int | None = None
+        self,
+        query: str,
+        documents: list[str],
+        *,
+        top_n: int | None = None,
+        timeout: float | None = None,
     ) -> list[RerankHit]:
         if not documents:
             return []
@@ -135,9 +531,22 @@ class CohereJinaRerankClient:
         if top_n is not None:
             payload["top_n"] = top_n
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        resp = httpx.post(self._url, json=payload, headers=headers, timeout=self._timeout)
+        resp = self._client.post(
+            self._url,
+            json=payload,
+            headers=headers,
+            timeout=self._timeout if timeout is None else timeout,
+        )
         resp.raise_for_status()
         return _parse_hits(resp.json(), len(documents))
+
+    def close(self) -> None:
+        """Close the owned HTTP connection pool exactly once."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._client.close()
 
 
 def _parse_hits(data: Any, n_docs: int) -> list[RerankHit]:

@@ -68,8 +68,9 @@ point to the same URL; Turnstone does not infer shared capacity from endpoint
 text. Queue time is excluded from judge/output-guard deadline accounting, and
 each retry releases its slot before backoff and reacquires for the next wire
 attempt. The cap is local to each process, not cluster-wide; account for the
-number of nodes targeting the same inference server. Direct STT/TTS protocol
-calls and Cohere/Jina reranking do not currently consume this generation cap.
+number of nodes targeting the same inference server. Cohere/Jina reranking
+selected through the Reranker role consumes the same gate as every other use of
+that alias. Direct STT/TTS protocol calls do not consume this generation cap.
 
 ### Judge batch parallelism
 
@@ -478,6 +479,12 @@ started with; an admin edit never tears one request across two definitions.
 The alias's admission gate is retained and resized in place, so a concurrency
 edit preserves in-flight accounting and does not reset cached judges or the
 output-guard rate limiter.
+
+The Reranker role is resolved from one coherent ConfigStore snapshot for each
+retrieval batch, so existing sessions observe alias or instruction changes
+without reconstruction. A relevant model-definition edit retires the old
+reranker transport and lets active requests drain on their immutable lanes;
+cap-only and unrelated edits keep the pooled transport warm.
 
 Sampling and other saved workstream configuration remain workstream state. A
 model-definition edit does not silently rewrite a live workstream's chosen
