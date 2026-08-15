@@ -9,7 +9,9 @@ Nothing else enforces that they agree, so a column added to a migration but not
 to `_schema.py` (or the reverse) would silently give `create_all`-based tests a
 different schema than production — and most tests use `create_all`, so a
 migration bug could pass CI unnoticed.  This test is that enforcement: it fails
-the moment the two paths drift on a table, column, or named constraint.
+the moment the two paths drift on a table, column, named constraint, or selected
+named index definition. Index coverage is opt-in because partial and
+dialect-specific indexes require table-specific normalization.
 
 (It does NOT check seed DATA: `create_all` builds structure only, so migration
 seeds — e.g. the built-in personas — exist only on migrated DBs.  Tests that
@@ -25,6 +27,23 @@ from alembic import command
 from alembic.config import Config
 
 _MIGRATIONS = str(Path(__file__).resolve().parent.parent / "turnstone/core/storage/migrations")
+_STRUCTURED_MEMORY_INDEXES = {
+    "idx_smem_scope": ("scope", "scope_id"),
+    "idx_smem_type": ("type",),
+}
+
+
+def _structured_memory_indexes(inspector: sa.Inspector) -> dict[str, tuple[str, ...]]:
+    indexes: dict[str, tuple[str, ...]] = {}
+    for index in inspector.get_indexes("structured_memories"):
+        name = index.get("name")
+        if name is None or not name.startswith("idx_smem_"):
+            continue
+        columns = index.get("column_names") or []
+        if any(column is None for column in columns):
+            raise AssertionError(f"expression-based structured-memory index: {index}")
+        indexes[name] = tuple(column for column in columns if column is not None)
+    return indexes
 
 
 def _inspect_migrated(db_path: Path) -> sa.Inspector:
@@ -75,6 +94,34 @@ def test_create_all_matches_migrations(tmp_path: Path) -> None:
 
     assert not col_drift, f"column drift: {col_drift}"
     assert not check_drift, f"check-constraint drift: {check_drift}"
+    assert _structured_memory_indexes(mig) == _STRUCTURED_MEMORY_INDEXES
+    assert _structured_memory_indexes(meta) == _STRUCTURED_MEMORY_INDEXES
+
+
+def test_postgresql_structured_memory_indexes_match_both_paths(
+    fresh_pg_url: sa.URL,
+) -> None:
+    from turnstone.core.storage._schema import metadata
+
+    cfg = Config()
+    cfg.set_main_option("script_location", _MIGRATIONS)
+    cfg.set_main_option("sqlalchemy.url", fresh_pg_url.render_as_string(hide_password=False))
+    command.upgrade(cfg, "head")
+
+    engine = sa.create_engine(fresh_pg_url)
+    try:
+        migrated_indexes = _structured_memory_indexes(sa.inspect(engine))
+
+        # The database is fixture-owned and disposable. Rebuild it through the
+        # second schema path so PostgreSQL reflection covers both definitions.
+        metadata.drop_all(engine)
+        metadata.create_all(engine)
+        create_all_indexes = _structured_memory_indexes(sa.inspect(engine))
+    finally:
+        engine.dispose()
+
+    assert migrated_indexes == _STRUCTURED_MEMORY_INDEXES
+    assert create_all_indexes == _STRUCTURED_MEMORY_INDEXES
 
 
 def test_personas_prompt_source_check_present_on_both_paths(tmp_path: Path) -> None:

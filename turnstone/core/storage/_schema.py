@@ -27,6 +27,9 @@ structured_memories = sa.Table(
     sa.UniqueConstraint("name", "scope", "scope_id", name="uq_smem_name_scope"),
 )
 
+sa.Index("idx_smem_type", structured_memories.c.type)
+sa.Index("idx_smem_scope", structured_memories.c.scope, structured_memories.c.scope_id)
+
 # Every metadata-only memory surface shares this projection. Keeping it next
 # to the table definition makes omitting ``content`` a storage contract rather
 # than an endpoint convention that can drift when fields are added.

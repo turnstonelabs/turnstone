@@ -362,6 +362,49 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+def _pg_base_url() -> str:
+    return os.environ.get(
+        "TURNSTONE_TEST_PG_URL",
+        "postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test",
+    )
+
+
+@pytest.fixture
+def fresh_pg_url(request: pytest.FixtureRequest) -> Iterator[Any]:
+    """Create a throwaway PostgreSQL database for migration-path tests.
+
+    Skips unless the suite is running against PostgreSQL. Tests that exercise
+    migrations from scratch cannot use the shared ``turnstone_test`` schema.
+    """
+    if request.config.getoption("--storage-backend") != "postgresql":
+        pytest.skip("PostgreSQL-only migration path")
+
+    import uuid
+
+    import sqlalchemy as sa
+
+    base = sa.make_url(_pg_base_url())
+    db_name = f"ts_migtest_{uuid.uuid4().hex[:12]}"
+    # CREATE/DROP DATABASE cannot run in a transaction.
+    admin = sa.create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as conn:
+            conn.execute(sa.text(f'CREATE DATABASE "{db_name}"'))
+        yield base.set(database=db_name)
+    finally:
+        with admin.connect() as conn:
+            # Terminate any lingering backends before dropping the database.
+            conn.execute(
+                sa.text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = :d AND pid <> pg_backend_pid()"
+                ),
+                {"d": db_name},
+            )
+            conn.execute(sa.text(f'DROP DATABASE IF EXISTS "{db_name}"'))
+        admin.dispose()
+
+
 @pytest.fixture
 def tmp_db(tmp_path):
     """Provide a temporary SQLite storage backend (singleton registry)."""
