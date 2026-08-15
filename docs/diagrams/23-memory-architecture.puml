@@ -1,6 +1,4 @@
 @startuml
-' This long sequence must be rendered with PLANTUML_LIMIT_SIZE=8192;
-' PlantUML's 4096px default clips the admin and configuration phases.
 !theme plain
 title Turnstone — Structured Memory Architecture
 
@@ -34,108 +32,77 @@ Session -> Session : resolve live project access\nselect exact/inherited scope
 Session -> Session : _exec_memory(item)
 
 alt action = save
-    Session -> Session : require one-line description\n(1..512 chars)
+    Session -> Session : require non-empty description
     Session -> Facade : save_structured_memory_strict(\n..., require_active_project)
     Facade -> Facade : normalize_key(name)
     Facade -> Storage : guarded atomic upsert\nON CONFLICT ... RETURNING
     Storage --> Facade : (saved row, was_update)
     Facade --> Session : saved row
-    Session -> Session : audit acting principal
-    Session -> Facade : prospective_memory_index()
-    Facade -> Storage : one visibility-union query
-    Storage --> Facade : complete live metadata
-    Session -> Session : append informational health prose\nto successful model-tool result
-    note right
-      Legacy-description health is reported here.
-      Over-budget prose requires
-      model_index_over_budget_notice = true
-      (default false). REST/SDK saves are unchanged;
-      console admin health remains unconditional.
-    end note
+    Session -> Session : invalidate prefix/cache\naudit acting principal
 end
 
 alt action = get
-    Session -> Facade : get_and_touch_structured_memory_by_name_strict()
-    Facade -> Storage : UPDATE exact scoped name\naccess_count += 1 RETURNING full row
-    Storage --> Session : touched full row / not found
+    Session -> Facade : get_structured_memory_by_name_strict()
+    Facade -> Storage : exact scoped-name lookup
+    Storage --> Session : full row / not found
 end
 
-alt action = search or list
+alt action = search
     Session -> Storage : search exact scope or\nactor-visible scope union
-    Storage --> Session : body-free metadata rows
+    Storage --> Session : matched rows
 end
 
 alt action = delete
     Session -> Facade : delete_structured_memory_returning_strict()
     Facade -> Storage : DELETE ... RETURNING
     Storage --> Session : deleted row / not found
-    Session -> Session : audit acting principal\nimmutable prefix unchanged
+    Session -> Session : invalidate + audit\nmark prefix dirty
 end
 
-== Phase 2: Immutable Index + Live Metadata Pointers ==
+== Phase 2: BM25 Relevance Injection ==
 
-Session -> Session : first admitted model turn\nafter principal binding
+Session -> Session : _init_system_messages()\nevery conversation turn
 
 Session -> Session : resolve acting principal\nand live project ACL
+Session -> Session : _list_visible_memories(\nlimit=fetch_limit)
 note right
   **Scope resolution:**
   Interactive: global + workstream
-  + acting user + active, readable project
+  + acting user + readable project
   Coordinator: acting user's coordinator
-  + active, readable project
-  Missing, archived, or access-revoked attachments
-  produce empty project witnesses and no project rows.
+  + readable project
 end note
 
-Session -> Facade : acquire_memory_index_snapshot(\nws, acting principal)
-Facade -> Storage : load durable snapshot
-alt snapshot absent
-    Facade -> Storage : list every visible metadata row
-    Storage --> Facade : scope + type + name + description\n(no body)
-    Facade -> Facade : render complete <memory-index>\nwith authorized project witness
-    Facade --> Session : candidate before transaction commit
-    Session -> Session : estimate complete final system prefix\nagainst lane usable input capacity
-    break candidate prefix exceeds capacity
-        Session --> Facade : reject candidate
-        Facade --> Storage : ROLLBACK\n(no new snapshot)
-        note right
-          Refusal occurs before provider dispatch and
-          attachment/perception work. Consolidate/delete
-          memories and retry, or choose a larger model.
-        end note
-    end
-    Facade -> Storage : INSERT ... ON CONFLICT DO NOTHING\nRETURNING concurrent winner
-    Storage --> Session : immutable snapshot bytes
-else snapshot already bound
-    Storage --> Session : immutable snapshot bytes
-    Session -> Session : validate bound final system prefix
-    break bound prefix exceeds capacity
-        Session -> Session : refuse before provider dispatch
-        note right
-          A bound oversized prefix requires a larger-context
-          model for this workstream; memory edits do not rewrite it.
-        end note
-    end
-end
-Session -> Session : publish in initial system prefix
-note right
-  Saving, editing, and deleting memories never rewrite
-  an existing snapshot. The first model admission binds
-  one snapshot to the current durable workstream row.
-  Hard deletion removes it before the ID can be reused.
-end note
+Session -> Facade : list_visible_structured_memories()
+Facade -> Storage : one visibility-union query
+Storage --> Session : up to fetch_limit rows
 
-Session -> Session : after each genuine user turn
-Session -> Storage : list every live visible metadata row
-Storage --> Session : body-free metadata rows
-Session -> Relevance : score_memories(\nmetadata, user turn, k=relevance_k)
-Relevance --> Session : exact relevant scope + name pairs
-Session -> Session : persist memory_pointer system turn
+Session -> Relevance : extract_recent_context(\nmessages, max_messages=3)
+Relevance --> Session : user text context
+
+Session -> Relevance : score_memories(\nmemories, context,\nk=relevance_k)
 note right
-  Pointer and index entries are untrusted metadata.
-  The model calls memory(action='get') to verify live
-  access and retrieve a body. Only get records access.
+  **BM25 scoring:**
+  Index over name + description
+  + content[:200] for each memory.
+  Returns top-k by relevance.
+  Empty query returns most recent k.
 end note
+Relevance --> Session : top-k memories
+
+Session -> Relevance : build_memory_context(\nrelevant_memories)
+note right
+  Formats as XML block:
+  <memories>
+    <memory name="..." type="..."
+     scope="..." description="...">
+      content (max 500 chars)
+    </memory>
+  </memories>
+end note
+Relevance --> Session : XML string
+
+Session -> Session : inject into\nsystem message
 
 == Phase 3: Server API Path ==
 
@@ -152,18 +119,13 @@ API -> Facade : save_structured_memory_strict()
 Facade -> Storage : atomic upsert
 Storage --> API : memory row
 API -> API : record_audit(actor)
-API --> SDK : body-free summary\n201 (created) / 200 (updated)
+API --> SDK : 201 (created) / 200 (updated)
 
 SDK -> API : POST /v1/api/memories/search\n{query, type, ...}
 API -> API : bind scope to caller
 API -> Storage : search visible rows
-Storage --> API : matched metadata rows (no bodies)
+Storage --> API : matched rows
 API --> SDK : {"memories": [...], "total": N}
-
-SDK -> API : GET /v1/api/memories/{name}\n?scope=global
-API -> Facade : exact scoped-name lookup
-Facade -> Storage : fetch full row + touch access
-API --> SDK : memory body
 
 SDK -> API : DELETE /v1/api/memories/{name}\n?scope=global
 API -> Facade : delete_structured_memory_returning_strict()
@@ -180,18 +142,9 @@ Storage --> Admin : rows
 Admin --> SDK : {"memories": [...], "total": N}
 
 SDK -> Admin : GET /v1/api/admin/memories/{id}
-Admin -> Storage : UPDATE exact id\naccess_count += 1 RETURNING full row
-Storage --> Admin : touched memory row
+Admin -> Storage : get_structured_memory(id)
+Storage --> Admin : memory row
 Admin --> SDK : memory JSON
-
-SDK -> Admin : PATCH /v1/api/admin/memories/{id}\n{description}
-Admin -> Storage : update authored hook
-Admin -> Admin : record_audit(\n"memory.description_update")
-Admin --> SDK : body-free metadata summary
-
-SDK -> Admin : GET /v1/api/admin/memories/index-health
-Admin -> Facade : derive live topology envelope health\n(snapshot rows not consulted)
-Facade --> Admin : budget + legacy-hook report
 
 SDK -> Admin : DELETE /v1/api/admin/memories/{id}
 Admin -> Storage : delete_structured_memory_by_id_returning()
@@ -201,14 +154,12 @@ Admin --> SDK : {"status": "ok"}
 == Configuration ==
 
 note over Session, Relevance
-  **Server/console live ConfigStore (standalone CLI uses defaults):**
-  relevance_k = 5       -- live metadata pointers per user turn
-  index_budget_chars = 65536 -- complete-index soft budget
-  model_index_over_budget_notice = false -- model-tool save only
+  **MemoryConfig** (from [memory] in config.toml):
+  relevance_k = 5       -- top-k memories per turn
+  fetch_limit = 50       -- max memories fetched for scoring
   max_content = 32768    -- max content length per memory
   nudge_cooldown = 300   -- seconds between metacognitive nudges
-  nudges = true          -- live pointers + memory-directed nudges;
-                         -- immutable index and tool unaffected
+  nudges = true          -- enable/disable memory nudges
 end note
 
 @enduml

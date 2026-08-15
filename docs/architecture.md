@@ -451,15 +451,13 @@ class Workstream:
     _state_tail_lock: threading.Lock  # durable state/observer ordering
 ```
 
-The durable reservation token and lifecycle fields are internal and never
-appear in public workstream/config projections. `workstreams.ws_id` is the
-authoritative live-ID reservation: a concurrent or caller-selected collision is
-rejected while the row exists, and successful hard deletion releases the ID
-after removing its owned state. The token identifies the exact retryable
-reservation and is installed atomically for legacy rows during rehydration,
-delete, or fork preflight. It prevents an old provisional create, buffered
-lifecycle-state write, stale delete authorization, or fork operation from
-targeting a replacement row that reused the same ID.
+The durable incarnation token and lifecycle fields are internal and never appear in
+public workstream/config projections. They distinguish successive objects that
+reuse one logical ID. Manager-created rows receive the token at registration;
+legacy rows acquire one atomically when rehydration, delete, or fork preflight
+takes its authoritative snapshot. This prevents an old manager state
+transition, buffered lifecycle-state write, stale delete authorization, or
+fork operation from targeting a replacement incarnation.
 
 ### SessionManager
 
@@ -525,8 +523,8 @@ after the committed snapshot is adopted in memory does the normal
 `creating -> idle -> ws_created` publication run.
 
 Rehydration binds the private token before constructing the session, then
-rechecks it after configuration and history are loaded; a concurrent lifecycle
-change retires the hybrid candidate and retries from a fresh snapshot.
+rechecks it after configuration and history are loaded; a delete/re-register
+crossing retires the hybrid candidate and retries from a fresh snapshot.
 Loaded hard-delete similarly compares the endpoint's authorized token with
 both the local and current durable incarnations before making any terminal
 mutation. It closes generation publication, drains every already-admitted
@@ -537,9 +535,9 @@ a false `ws_closed` event.
 
 That drain covers manager-owned session durability admitted through the ticket
 lane. Direct legacy storage helpers that mutate only by `ws_id` are not made
-token-conditional by this refactor. The reservation token guarantees exact
-create/fork/delete target selection during provisional lifecycle races; the
-primary key separately prevents reuse while the durable row exists.
+token-conditional by this refactor and must not be used as a same-ID reuse
+fence; the incarnation token guarantees exact create/fork/delete target
+selection, not a new transaction contract for every maintenance API.
 
 #### Crash-Abandoned Create Recovery
 
@@ -631,10 +629,9 @@ non-idle background workstreams above the input prompt.
   run outside it.
 - `Workstream._lock`: guards one workstream's worker pair and short state
   mutations.
-- The per-ID lifecycle lane orders create/open/close/hard-delete, including a
-  rolled-back hidden reservation followed by its retry;
-  `Workstream._lifecycle_lock` orders one object's birth against its terminal
-  paths.
+- The per-ID lifecycle lane orders create/open/close/hard-delete across object
+  incarnations; `Workstream._lifecycle_lock` orders one object's birth against
+  its terminal paths.
 - `Workstream._state_tail_lock` orders accepted state persistence and observer
   events. `_state_revision` rejects superseded tails, while
   `_state_incarnation` and `StateWriter` prevent close/reopen ABA writes.
@@ -1002,16 +999,13 @@ simultaneous generations for that alias in one process. Every registry-backed
 role carries the same gate on its `ModelLane`, so main turns, judges, task
 agents, perception, compaction, and background generation coordinate through
 one FIFO. Two aliases never share a gate implicitly, even when their URLs are
-identical. For calls with context-first request admission, `model_turn()` admits
-the request before materializing attachment fallbacks; an oversized refusal
-therefore invokes neither attachment resolution nor nested perception/audio.
-Ordinary calls preserve their lowering cadence. Both paths finish attachment
-materialization before acquiring model capacity, then hold one lease across
-eager stream creation and the complete drain, releasing before retry backoff.
-Capacity wait is credited out of deadline accounting, preventing queued judges
-from spending their request budget before dispatch. The gate survives cap-only
-reloads in place; the field is excluded from semantic `ModelConfig` equality so
-a capacity edit does not reset judges or output-guard state.
+identical. `model_turn()` materializes attachment fallbacks before admission,
+then holds one lease across eager stream creation and the complete drain,
+releasing before retry backoff. Admission wait is credited out of deadline
+accounting, preventing queued judges from spending their request budget before
+dispatch. The gate survives cap-only reloads in place; the field is excluded
+from semantic `ModelConfig` equality so a capacity edit does not reset judges
+or output-guard state.
 
 Primary loops, recursive compaction, judges, title generation, audio, and task
 agents all consume `ModelLane` rather than inspecting provider/client handles.
@@ -1381,9 +1375,9 @@ ChatSession / SessionManager / HTTP lifecycle
   │ (FTS5 search) │    │ (tsvector/ILIKE)  │
   └─────────────┘    └──────────────────┘
         ↓                     ↓
-    storage._schema  (current metadata / create-all SQLAlchemy tables)
+    storage._schema  (SQLAlchemy Core tables — single source of truth)
         ↓
-    storage._migrate  (parallel, manually maintained Alembic history)
+    storage._migrate  (programmatic Alembic)
 ```
 
 **SQLite** is the default (zero-config, single file at `.turnstone.db`).
@@ -1442,26 +1436,18 @@ workstream_config
   -- private durable incarnation token also lives here but is filtered from
   -- every ordinary config read/snapshot
 
-memory_index_snapshots
-  ws_id                     TEXT PRIMARY KEY -- one binding per durable workstream row
-  principal_id, project_id, project_name     -- first-admission witnesses
-  visibility_key, content, format_version
-  entry_count, char_count, invalid_description_count, captured_at
-
 conversations_fts                    -- SQLite FTS5 virtual table (optional)
   content     (content=conversations, content_rowid=id)
 ```
 
-Current metadata and create-all definitions live in `storage/_schema.py`
-(SQLAlchemy Core `Table` objects). Alembic revisions are a parallel, manually
-maintained history rather than generated from that module; schema-parity tests
-keep the two definitions aligned.
+Table definitions live in `storage/_schema.py` (SQLAlchemy Core `Table` objects)
+and are the single source of truth for both backends and Alembic migrations.
 
 ### StorageBackend Protocol
 
 | Method | Purpose |
 |--------|---------|
-| `register_workstream(..., fork_reservation_token=...)` | Atomically reserve a live ID and insert its row plus private reservation token; report current-row collisions |
+| `register_workstream(..., fork_reservation_token=...)` | Atomically insert `creating` row plus private incarnation token; report collision |
 | `ensure_workstream_incarnation_snapshot(ws_id)` | Lock and return one exact row plus its private token, installing a token atomically for legacy rows |
 | `finalize_deferred_create(...)` | Apply alias/config/node writes only if row and token still match |
 | `publish_deferred_create(ws_id, token)` | Compare-and-swap the exact reservation from `creating` to `idle` |
@@ -1471,8 +1457,6 @@ keep the two definitions aligned.
 | `load_message_turns(ws_id, checkpointed=True)` | Rehydrate canonical `Turn` objects, bounded by the latest valid compaction checkpoint |
 | `load_messages(ws_id, include_compaction=...)` | Materialized display/export projection; optionally surface compaction cards |
 | `clone_workstream(source, destination, ..., expected_session=...)` | Transactionally compare source and destination incarnations, authorize, and copy canonical history/config/project/attachment ownership |
-| `get_memory_index_snapshot(ws_id)` | Load the immutable memory-index binding without creating it |
-| `acquire_memory_index_snapshot(ws_id, principal_id, commit_context=...)` | Transactionally resolve first-admission visibility, capture or load one immutable index, and let the caller validate before commit |
 | `get_compaction_watermark/floor/checkpoint(...)` | Maintain resume checkpoints without deleting audit history |
 | `update_workstream_state(...)` | Persist a lifecycle state after manager/state-writer fencing |
 | `resolve_workstream(alias_or_id)` | Resolve alias, exact ID, or ID prefix |
