@@ -4085,7 +4085,9 @@ class TestCancelledSendCleanupOwnership:
         def run_send() -> None:
             try:
                 session.send("zzzxxyy")
-            except BaseException as exc:
+            except GenerationCancelled as exc:
+                send_errors.append(exc)
+            except Exception as exc:
                 send_errors.append(exc)
 
         sender = threading.Thread(target=run_send)

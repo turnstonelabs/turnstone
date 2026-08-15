@@ -1057,6 +1057,9 @@ class TestRerankLaneRegistry:
         assert first.admission.limit == 2
         assert reg._clients == {}
         assert reg._providers == {}
+        entry = reg._rerank_runtimes["rr"]
+        assert "secret" not in repr(entry)
+        assert "secret" not in repr(entry.config)
         reg.shutdown()
 
     def test_instruction_change_rotates_and_closes_old_runtime(self) -> None:

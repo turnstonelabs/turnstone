@@ -8,7 +8,6 @@ resilience when the primary model is unreachable.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import re
 import threading
 from dataclasses import dataclass, field
@@ -466,35 +465,45 @@ def _validate_registry_args(
         raise ValueError(f"Task model '{task_model}' not found in registry")
 
 
-def _rerank_runtime_fingerprint(cfg: ModelConfig, instruction: str) -> bytes:
-    """Return a non-secret digest of configuration that changes rerank behavior."""
+@dataclass(frozen=True)
+class _RerankRuntimeConfig:
+    """Relevant immutable configuration for one cached rerank runtime."""
+
+    base_url: str
+    api_key: str = field(repr=False)
+    model: str
+    provider: str
+    auth_mode: str
+    obo_audience: str
+    obo_scopes: str
+    rerank_mode: str
+    supports_rerank: bool
+    supports_prefill_rerank: bool
+    instruction: str
+
+
+def _rerank_runtime_config(cfg: ModelConfig, instruction: str) -> _RerankRuntimeConfig:
+    """Project a model definition onto fields that change rerank behavior."""
     caps = cfg.capabilities
-    values = (
-        cfg.base_url.strip(),
-        cfg.api_key,
-        cfg.model.strip(),
-        cfg.provider,
-        cfg.auth_mode,
-        cfg.obo_audience,
-        cfg.obo_scopes,
-        str(caps.get("rerank_mode") or "endpoint"),
-        str(bool(caps.get("supports_rerank"))),
-        str(bool(caps.get("supports_prefill_rerank"))),
-        instruction.strip(),
+    return _RerankRuntimeConfig(
+        base_url=cfg.base_url.strip(),
+        api_key=cfg.api_key,
+        model=cfg.model.strip(),
+        provider=cfg.provider,
+        auth_mode=cfg.auth_mode,
+        obo_audience=cfg.obo_audience,
+        obo_scopes=cfg.obo_scopes,
+        rerank_mode=str(caps.get("rerank_mode") or "endpoint"),
+        supports_rerank=bool(caps.get("supports_rerank")),
+        supports_prefill_rerank=bool(caps.get("supports_prefill_rerank")),
+        instruction=instruction.strip(),
     )
-    digest = hashlib.sha256()
-    for value in values:
-        encoded = value.encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
-    return digest.digest()
 
 
 @dataclass(frozen=True)
 class _RerankRuntimeEntry:
     runtime: RerankRuntime
-    fingerprint: bytes = field(repr=False)
-    instruction: str = field(repr=False)
+    config: _RerankRuntimeConfig = field(repr=False)
 
 
 class ModelRegistry:
@@ -652,9 +661,9 @@ class ModelRegistry:
             if not cfg.base_url.strip() or not cfg.capabilities.get("supports_rerank"):
                 raise ValueError(f"Model alias {alias!r} is not a configured reranker")
 
-            fingerprint = _rerank_runtime_fingerprint(cfg, instruction)
+            runtime_config = _rerank_runtime_config(cfg, instruction)
             entry = self._rerank_runtimes.get(alias)
-            if entry is None or entry.fingerprint != fingerprint:
+            if entry is None or entry.config != runtime_config:
                 client = resolve_rerank_client(
                     cfg.base_url,
                     model=cfg.model,
@@ -665,8 +674,7 @@ class ModelRegistry:
                     raise ValueError(f"Model alias {alias!r} has no rerank endpoint")
                 replacement = _RerankRuntimeEntry(
                     runtime=RerankRuntime(client, alias=alias, model=cfg.model),
-                    fingerprint=fingerprint,
-                    instruction=instruction,
+                    config=runtime_config,
                 )
                 if entry is not None:
                     close = entry.runtime.begin_retirement()
@@ -903,8 +911,7 @@ class ModelRegistry:
                     rerank_cfg is None
                     or not rerank_cfg.base_url.strip()
                     or not rerank_cfg.capabilities.get("supports_rerank")
-                    or entry.fingerprint
-                    != _rerank_runtime_fingerprint(rerank_cfg, entry.instruction)
+                    or entry.config != _rerank_runtime_config(rerank_cfg, entry.config.instruction)
                 ):
                     close = entry.runtime.begin_retirement()
                     if close is not None:

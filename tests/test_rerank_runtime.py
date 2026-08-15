@@ -170,12 +170,12 @@ class TestAdmission:
         lane = _lane(backend, limit=1)
         held = lane.admission.acquire()
         cancel_ref = StreamAbortRef()
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def _waiter() -> None:
             try:
                 _call(lane, cancel_ref)
-            except BaseException as exc:  # capture the exact cancellation type
+            except Exception as exc:  # capture the exact cancellation type
                 errors.append(exc)
 
         worker = threading.Thread(target=_waiter, daemon=True)
