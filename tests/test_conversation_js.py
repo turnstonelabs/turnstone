@@ -11,7 +11,11 @@ silently in one pane.
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
+
+from tests._js_harness_helpers import node_skip
 
 _CONVERSATION_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
@@ -65,6 +69,53 @@ def test_no_inner_html() -> None:
     """House style: programmatic DOM only — no innerHTML *usage* in the shared
     module (the header comment names it; guard the access pattern)."""
     assert ".innerHTML" not in _body()
+
+
+def test_agent_card_exposes_hidden_context_badge() -> None:
+    body = _body()
+    assert "export function formatAgentContextTokens(value)" in body
+    assert "export function agentContextIsWarning(promptTokens, contextWindow)" in body
+    assert 'context.className = "conv-agent-context";' in body
+    assert "context.hidden = true;" in body
+    assert 'context.setAttribute("aria-hidden", "true");' in body
+    assert "return { wrap, body, label, context, toggle };" in body
+
+
+@node_skip
+def test_agent_context_token_formatter_is_compact_and_deterministic() -> None:
+    script = f"""
+import {{
+  formatAgentContextTokens,
+  agentContextIsWarning,
+}} from {json.dumps(_CONVERSATION_JS.as_uri())};
+const cases = [
+  [999, "999"],
+  [1000, "1k"],
+  [1280, "1.3k"],
+  [41000, "41k"],
+  [128000, "128k"],
+  [999499, "999k"],
+  [999500, "1m"],
+  [999999, "1m"],
+  [1000000, "1m"],
+  [-1, ""],
+];
+for (const [value, expected] of cases) {{
+  const actual = formatAgentContextTokens(value);
+  if (actual !== expected) throw new Error(`${{value}}: ${{actual}} !== ${{expected}}`);
+}}
+if (agentContextIsWarning(79, 100)) throw new Error("79% warned early");
+if (!agentContextIsWarning(80, 100)) throw new Error("80% did not warn");
+if (!agentContextIsWarning(81, 100)) throw new Error("81% did not warn");
+if (agentContextIsWarning(1, 0)) throw new Error("zero window warned");
+"""
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_normalize_risk_level_unknown_to_medium() -> None:

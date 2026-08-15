@@ -154,10 +154,9 @@ one `approve_request` snapshot for every unresolved approval cycle, keyed by
 the same stable `cycle_id`, plus any in-flight `wait_*` / `batch_*`
 indicator, the worker's current `state_change`, and an
 `in_progress_snapshot` carrying any partial content / reasoning the
-model has produced for the in-progress turn — so a tab refresh
-mid-approval, mid-tool-execution, or mid-stream restores both the
-correct composer mode and the partial assistant text without waiting
-for the response to complete.
+model has produced for the in-progress turn. A tab refresh mid-approval,
+mid-tool-execution, or mid-stream therefore restores the composer mode and
+partial assistant text without waiting for the response to complete.
 
 `history_resync` is stronger than a numeric replay gap. The server closes that
 stream; fetch and render `/history` again, then open a new stream with its new

@@ -1641,7 +1641,7 @@ def test_register_listener_with_in_progress_snapshot_empty() -> None:
     lq, snap = ui.register_listener_with_in_progress_snapshot()
     assert isinstance(lq, queue.Queue)
     assert lq in ui._listeners
-    assert snap == {"content": "", "reasoning": "", "seq": 0}
+    assert snap == {"content": "", "reasoning": "", "seq": 0, "agent_contexts": []}
 
 
 def test_register_listener_with_in_progress_snapshot_populated() -> None:
@@ -2553,6 +2553,115 @@ class TestAgentChildTagging:
         ui.clear_agent_children("task-A")
         ui._enqueue({"type": "tool_result", "call_id": "child-B", "name": "x", "output": "y"})
         assert lq.get_nowait()["parent_call_id"] == "task-B"
+
+
+class TestAgentContextSnapshots:
+    """Running task-agent usage is live fan-out plus a reconnect snapshot."""
+
+    def test_live_event_and_fresh_snapshot_share_one_shape(self) -> None:
+        ui = _make_ui()
+        listener = ui._register_listener()
+
+        ui.on_agent_context("task-A", 41_000, 128_000, generation=7)
+
+        event = listener.get_nowait()
+        assert event == {
+            "type": "agent_context",
+            "ws_id": "ws-1",
+            "parent_call_id": "task-A",
+            "prompt_tokens": 41_000,
+            "context_window": 128_000,
+            "_event_id": 1,
+        }
+        _, snapshot = ui.register_listener_with_in_progress_snapshot()
+        assert snapshot["agent_contexts"] == [
+            {
+                "type": "agent_context",
+                "ws_id": "ws-1",
+                "parent_call_id": "task-A",
+                "prompt_tokens": 41_000,
+                "context_window": 128_000,
+            }
+        ]
+
+    def test_parallel_agents_keep_independent_latest_readings(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("task-A", 10, 100, generation=3)
+        ui.on_agent_context("task-B", 70, 200, generation=3)
+        ui.on_agent_context("task-A", 80, 100, generation=3)
+
+        _, snapshot = ui.register_listener_with_in_progress_snapshot()
+        readings = {event["parent_call_id"]: event for event in snapshot["agent_contexts"]}
+        assert readings["task-A"]["prompt_tokens"] == 80
+        assert readings["task-B"]["prompt_tokens"] == 70
+
+    def test_clear_and_overwrite_are_generation_scoped(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("reused", 10, 100, generation=4)
+        ui.on_agent_context("reused", 20, 100, generation=5)
+
+        # The retiring predecessor can neither overwrite nor clear generation 5.
+        ui.on_agent_context("reused", 99, 100, generation=4)
+        ui.clear_agent_context("reused", generation=4)
+        assert ui._snapshot_agent_contexts()[0]["prompt_tokens"] == 20
+
+        ui.clear_agent_context("reused", generation=5)
+        assert ui._snapshot_agent_contexts() == []
+
+    def test_force_cutoff_clears_only_retired_generations(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("old-A", 10, 100, generation=4)
+        ui.on_agent_context("old-B", 20, 100, generation=4)
+        ui.on_agent_context("successor", 30, 100, generation=5)
+
+        ui.clear_agent_contexts_before_generation(5)
+
+        readings = ui._snapshot_agent_contexts()
+        assert [event["parent_call_id"] for event in readings] == ["successor"]
+
+    def test_replay_registration_captures_active_contexts(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("task-A", 10, 100, generation=1)
+
+        _, _events, status, _lost, _earliest, snapshot = ui.register_listener_with_replay(-1)
+
+        assert status == "truncated"
+        assert snapshot["agent_contexts"][0]["parent_call_id"] == "task-A"
+
+    def test_store_before_enqueue_closes_registration_loss_window(self) -> None:
+        """A subscriber in the store/enqueue gap gets snapshot and live copies.
+
+        Duplicate delivery is intentional and harmless because ``agent_context``
+        is a keyed replacement event. Missing both copies would strand a
+        refreshed badge until the task agent made another model call.
+        """
+        ui = _make_ui()
+        stored = threading.Event()
+        release = threading.Event()
+        original_enqueue = ui._enqueue
+
+        def blocked_enqueue(event: dict[str, Any]) -> int:
+            stored.set()
+            assert release.wait(timeout=2)
+            return original_enqueue(event)
+
+        with patch.object(ui, "_enqueue", side_effect=blocked_enqueue):
+            writer = threading.Thread(
+                target=ui.on_agent_context,
+                args=("task-A", 50, 100),
+                kwargs={"generation": 2},
+            )
+            writer.start()
+            try:
+                assert stored.wait(timeout=2)
+                listener, snapshot = ui.register_listener_with_in_progress_snapshot()
+                assert snapshot["agent_contexts"][0]["prompt_tokens"] == 50
+            finally:
+                release.set()
+                writer.join(timeout=2)
+
+        assert not writer.is_alive()
+        assert listener.get_nowait()["type"] == "agent_context"
 
 
 class TestAgentScopeInfoSuppression:

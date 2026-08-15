@@ -116,6 +116,7 @@ const pane = {
   _cancelTimeout: null,
   _forceTimeout: null,
   _compaction: {},
+  _agentContexts: new Map(),
   _streamHealth: { renderThrows: 0 },
   _actingUserId: null,
   pendingApproval: false,
@@ -810,6 +811,7 @@ const latestRows = new Map();
 const messagesEl = makeNode("messages");
 const pane = {
   _agentCards: null,
+  _agentContexts: new Map(),
   _renderedToolEventIds: new Set(),
   _toolResultNodes: new Map(),
   _streamElIndex: new Map(),

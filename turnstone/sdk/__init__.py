@@ -15,6 +15,7 @@ from __future__ import annotations
 from turnstone.sdk._types import AttachmentUpload, TurnResult, TurnstoneAPIError
 from turnstone.sdk.console import AsyncTurnstoneConsole, TurnstoneConsole
 from turnstone.sdk.events import (
+    AgentContextEvent,
     ApproveRequestEvent,
     BusyErrorEvent,
     ClearUiEvent,
@@ -71,6 +72,7 @@ __all__ = [
     "ThinkingStopEvent",
     "ReasoningEvent",
     "ContentEvent",
+    "AgentContextEvent",
     "StreamEndEvent",
     "ToolPendingEvent",
     "ToolInfoEvent",

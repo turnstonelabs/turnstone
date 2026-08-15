@@ -479,6 +479,31 @@ auto-reconnect re-replays).
 | `content`    | string | Joined assistant content text accumulated this turn        |
 | `reasoning`  | string | Joined reasoning / chain-of-thought text accumulated       |
 
+**`agent_context`** -- latest prompt usage for one running `task_agent`, sent
+after each of that agent's model turns when the provider reports usage. The
+parent call ID targets the existing task-agent card; clients should replace the
+prior reading for that parent rather than append a new badge. No event is sent
+when usage is unavailable. A matching `tool_result` (`call_id` equals
+`parent_call_id`) is the terminal signal: discard the reading then. Fresh and
+truncated recovery rebuild the active set from the synthetic readings they
+include, so an omitted parent is no longer active; completed readings are not
+persisted in conversation history.
+
+```json
+{
+  "type": "agent_context",
+  "parent_call_id": "call_task_abc123",
+  "prompt_tokens": 41000,
+  "context_window": 128000
+}
+```
+
+| Field             | Type   | Description                                      |
+|-------------------|--------|--------------------------------------------------|
+| `parent_call_id`  | string | Parent `task_agent` call whose card owns the badge |
+| `prompt_tokens`   | int    | Prompt tokens used by the agent's latest model turn |
+| `context_window`  | int    | Resolved context window for the agent's model lane |
+
 **`tool_info`** -- one or more tool calls that were auto-approved (no user
 action required).
 
@@ -762,9 +787,11 @@ so multiple consumers (browser, console proxy, SDK) can connect
 simultaneously and each receives every event.  On reconnect the client receives
 either the event-ring delta after its cursor or a synthetic recovery replay.
 The synthetic replay includes `connected`, cached `status`, every pending
-approval cycle, the current `state_change`, and an optional
-`in_progress_snapshot` with partial content/reasoning. Conversation history
-stays on the REST `/history` endpoint.
+approval cycle, the current `state_change`, an optional
+`in_progress_snapshot` with partial content/reasoning, and the latest
+`agent_context` reading for each running task agent. A matching `tool_result`
+ends that reading. Conversation history stays on the REST `/history` endpoint;
+completed task-agent readings are not retained.
 
 ---
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._js_harness_helpers import extract_braced as _extract_braced
 from tests._js_harness_helpers import strip_js_comments as _strip_comments
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -295,6 +296,7 @@ def test_rebuild_quiesces_live_events_and_releases_agent_tracking() -> None:
     ):
         assert line in seg, f"replayHistory must reset: {line!r}"
     assert "this._agentCards.clear();" in body
+    assert "this._agentContexts.clear();" in body
     # Review-hardened lifecycle: the card entry SURVIVES the terminal
     # tool_result (a late child event finding no Map entry would rebuild a
     # duplicate empty card beside the finished one), and transport-only
@@ -1433,6 +1435,147 @@ def test_accepted_tool_event_recorded_only_when_painted() -> None:
     gate = case.index("if (\n          this.appendToolOutput(")
     record = case.index("recordAcceptedToolEvent(this._renderedToolEventIds, evt)")
     assert gate < record
+
+
+def test_task_agent_context_badge_is_keyed_idempotent_and_terminal_safe() -> None:
+    """Live and synthetic readings share one keyed reducer.
+
+    Context may precede the parallel parent row, repeat across the
+    store-before-enqueue refresh seam, or race a completed-history replay. The
+    map/relink/result guards keep all three cases convergent.
+    """
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert 'case "agent_context":' in body
+    assert "this._updateAgentContext(evt);" in body
+
+    update = body[
+        body.index("_updateAgentContext(evt) {") : body.index(
+            "_bufferAgentOrphan(", body.index("_updateAgentContext(evt) {")
+        )
+    ]
+    assert "this._agentContexts.set(parentId, { promptTokens, contextWindow });" in update
+    assert "terminal.row === parentRow" in update
+    assert "this._ensureAgentCard(parentId, true)" in update
+
+    relink = body[
+        body.index("_relinkAgentCards(items) {") : body.index(
+            "_updateAgentLabel(", body.index("_relinkAgentCards(items) {")
+        )
+    ]
+    assert "this._agentContexts.has(it.call_id)" in relink
+
+    sync = body[
+        body.index("_syncAgentContext(parentCallId, card) {") : body.index(
+            "_updateAgentContext(evt) {"
+        )
+    ]
+    assert "agentContextIsWarning(" in sync
+    assert 'card.context.textContent = used + " / " + total;' in sync
+    assert 'classList.toggle("conv-agent-context--warning", warning)' in sync
+    assert "this._syncAgentToggleLabel(card);" in sync
+
+    accessible = body[
+        body.index("_syncAgentToggleLabel(card) {") : body.index(
+            "_syncAgentContext(parentCallId, card) {"
+        )
+    ]
+    assert 'parts.push("running")' in accessible
+    assert 'parts.push("done")' in accessible
+    assert 'parts.push("failed")' in accessible
+    assert '"Warning: " + context.title' in accessible
+    assert 'label.textContent || "0 steps"' in accessible
+
+    assert "blockedByTerminalRow: parentRow" in update
+    state_case = body[body.index('case "state_change":') : body.index('case "tool_pending":')]
+    assert "reading.blockedByTerminalRow" in state_case
+
+    result = body[
+        body.index("appendToolOutput(callId") : body.index(
+            "sendMessage() {", body.index("appendToolOutput(callId")
+        )
+    ]
+    assert "this._agentContexts.delete(callId);" in result
+    assert "this._resetAgentContextBadge(agentCard);" in result
+    assert 'agentCard.wrap.dataset.contextOnly === "true"' in result
+    assert "agentCard.wrap.hidden = true;" in result
+
+    route = body[
+        body.index("_routeAgentItems(items") : body.index(
+            "_ensureAgentCard(parentCallId", body.index("_routeAgentItems(items")
+        )
+    ]
+    assert "delete card.wrap.dataset.contextOnly;" in route
+    assert "card.wrap.hidden = false;" in route
+
+
+def test_idless_agent_context_snapshot_relinks_after_parent_runtime(tmp_path: Path) -> None:
+    """An id-less fresh/truncated snapshot may precede its parent row.
+
+    Execute the production reducer and relinker together: the reading must be
+    retained without a row, stay keyed/idempotent on a duplicate snapshot, and
+    attach as soon as the parent task-agent occurrence paints.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    update = _extract_braced(body, "  _updateAgentContext(evt) {").strip()
+    relink = _extract_braced(body, "  _relinkAgentCards(items) {").strip()
+    script = tmp_path / "agent_context_snapshot_harness.mjs"
+    script.write_text(
+        "const updateAgentContext = function "
+        + update
+        + ";\nconst relinkAgentCards = function "
+        + relink
+        + r""";
+
+let parentRow = null;
+let attached = 0;
+const pane = {
+  busy: true,
+  _agentContexts: new Map(),
+  _toolResultNodes: new Map(),
+  _toolRow() { return parentRow; },
+  _ensureAgentCard(parentId, contextOnly) {
+    if (!parentRow) return null;
+    const reading = this._agentContexts.get(parentId);
+    if (!reading || reading.promptTokens !== 27000 || reading.contextWindow !== 33000)
+      throw new Error("relink lost the snapshot reading");
+    if (!contextOnly) throw new Error("snapshot relink was not context-only");
+    attached += 1;
+    return { wrap: { dataset: { state: "running" } } };
+  },
+  _flushAgentOrphans() {},
+  _updateAgentContext: updateAgentContext,
+  _relinkAgentCards: relinkAgentCards,
+};
+const snapshot = {
+  type: "agent_context",
+  parent_call_id: "task-A",
+  prompt_tokens: 27000,
+  context_window: 33000,
+};
+if ("_event_id" in snapshot) throw new Error("fixture is not an id-less snapshot");
+pane._updateAgentContext(snapshot);
+pane._updateAgentContext(snapshot);
+if (pane._agentContexts.size !== 1 || attached !== 0)
+  throw new Error("pre-parent snapshot was dropped, duplicated, or attached early");
+parentRow = {};
+pane._relinkAgentCards([{ call_id: "task-A" }]);
+if (attached !== 1) throw new Error("snapshot did not attach when its parent painted");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, f"agent context harness failed:\n{proc.stderr}\n{proc.stdout}"
 
 
 def test_replay_system_rows_do_not_terminate_the_tool_batch_window() -> None:

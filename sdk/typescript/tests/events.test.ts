@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isContentEvent,
+  isAgentContextEvent,
   isErrorEvent,
   isStreamEndEvent,
   isToolResultEvent,
@@ -24,6 +25,20 @@ describe("event type guards", () => {
     const e: ServerEvent = { type: "reasoning", text: "step 1" };
     expect(isReasoningEvent(e)).toBe(true);
     expect(isContentEvent(e)).toBe(false);
+  });
+
+  it("isAgentContextEvent", () => {
+    const e: ServerEvent = {
+      type: "agent_context",
+      ws_id: "ws1",
+      parent_call_id: "task-A",
+      prompt_tokens: 41_000,
+      context_window: 128_000,
+    };
+    expect(isAgentContextEvent(e)).toBe(true);
+    if (!isAgentContextEvent(e)) throw new Error("agent context type guard failed");
+    expect(e.parent_call_id).toBe("task-A");
+    expect(e.context_window).toBe(128_000);
   });
 
   it("isErrorEvent", () => {

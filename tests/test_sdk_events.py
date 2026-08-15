@@ -1,6 +1,7 @@
 """Tests for turnstone.sdk.events — SSE event deserialization."""
 
 from turnstone.sdk.events import (
+    AgentContextEvent,
     ApprovalResolvedEvent,
     ApproveRequestEvent,
     BusyErrorEvent,
@@ -464,6 +465,23 @@ def test_in_progress_snapshot_event_strips_internal_seq():
     )
     assert isinstance(e, InProgressSnapshotEvent)
     assert not hasattr(e, "_seq")
+
+
+def test_agent_context_event_round_trip():
+    e = ServerEvent.from_dict(
+        {
+            "type": "agent_context",
+            "ws_id": "ws1",
+            "parent_call_id": "task-A",
+            "prompt_tokens": 41_000,
+            "context_window": 128_000,
+        }
+    )
+    assert isinstance(e, AgentContextEvent)
+    assert e.ws_id == "ws1"
+    assert e.parent_call_id == "task-A"
+    assert e.prompt_tokens == 41_000
+    assert e.context_window == 128_000
 
 
 def test_state_change_event_round_trip():

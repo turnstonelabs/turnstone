@@ -776,6 +776,28 @@
   letter-spacing: 0;
   text-transform: none;
 }
+.conv-agent-context {
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid var(--hair-2);
+  border-radius: 999px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  line-height: 1.4;
+  text-transform: none;
+  white-space: nowrap;
+}
+.conv-agent-context[hidden],
+.conv-agent[data-state="done"] .conv-agent-context,
+.conv-agent[data-state="error"] .conv-agent-context {
+  display: none;
+}
+.conv-agent-context--warning {
+  border-width: 2px;
+  color: var(--warn);
+  font-weight: 800;
+}
 /* Card-level liveness as a NON-colour cue (WCAG 1.4.1): a text suffix, not just
    a stripe — in a parallel batch the parent rail belongs to the whole group,
    not to this one task agent. */

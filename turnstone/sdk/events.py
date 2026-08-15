@@ -155,6 +155,22 @@ class InProgressSnapshotEvent(ServerEvent):
 
 
 @dataclass
+class AgentContextEvent(ServerEvent):
+    """Latest prompt usage for one running task agent.
+
+    Live updates follow each task-agent model turn. Fresh or truncated SSE
+    connections also receive one synthetic reading per active parent call. A
+    ``ToolResultEvent`` whose ``call_id`` matches ``parent_call_id`` is the
+    terminal signal; completed readings are not retained in history.
+    """
+
+    type: str = "agent_context"
+    parent_call_id: str = ""
+    prompt_tokens: int = 0
+    context_window: int = 0
+
+
+@dataclass
 class StateChangeEvent(ServerEvent):
     type: str = "state_change"
     state: str = ""
@@ -547,6 +563,7 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
         ReasoningEvent,
         ContentEvent,
         InProgressSnapshotEvent,
+        AgentContextEvent,
         StateChangeEvent,
         StreamEndEvent,
         ToolPendingEvent,

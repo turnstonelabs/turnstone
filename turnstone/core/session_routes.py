@@ -2747,6 +2747,19 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                                 }
                             )
                         }
+                    # Running task-agent context is transient UI state, not
+                    # conversation history. Fresh/truncated subscribers receive
+                    # the latest reading for each active parent through the same
+                    # idempotent reducer as live ``agent_context`` events.
+                    for agent_context in in_progress_snap.get("agent_contexts", []):
+                        yield {
+                            "data": json.dumps(
+                                {
+                                    **agent_context,
+                                    "ws_id": ws_id,
+                                }
+                            )
+                        }
                     # Surface the persisted ``last_error`` so a fresh
                     # connect to a workstream sitting in the error state
                     # shows WHY it failed (the ``error`` text bubble), not

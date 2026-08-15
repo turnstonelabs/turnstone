@@ -8,7 +8,7 @@ import threading
 import time
 from types import SimpleNamespace
 from typing import Any, ClassVar
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -3829,6 +3829,145 @@ class TestAgentOutputGuard:
             assert synth_args[2] == "task_agent_synthesis"
 
 
+class TestAgentContextReporting:
+    """A task agent reports normalized prompt usage after every model turn."""
+
+    class _ContextUI(NullUI):
+        def __init__(self) -> None:
+            self.context_calls: list[dict[str, Any]] = []
+
+        def on_agent_context(
+            self,
+            parent_call_id: str,
+            prompt_tokens: int,
+            context_window: int,
+            *,
+            generation: int = 0,
+        ) -> None:
+            self.context_calls.append(
+                {
+                    "parent_call_id": parent_call_id,
+                    "prompt_tokens": prompt_tokens,
+                    "context_window": context_window,
+                    "generation": generation,
+                }
+            )
+
+    def test_usage_uses_resolved_lane_context_window(self) -> None:
+        from turnstone.core.providers import UsageInfo
+
+        ui = self._ContextUI()
+        session = _make_session(ui=ui)
+        result = make_result(
+            "done",
+            usage=UsageInfo(prompt_tokens=41_000, completion_tokens=900, total_tokens=41_900),
+        )
+
+        with (
+            patch.object(session, "_context_window_for_lane", return_value=128_000) as window,
+            patch("turnstone.core.session.model_turn", return_value=result),
+        ):
+            output = session._run_agent(
+                [Turn.user("test")],
+                tools=[],
+                auto_tools=set(),
+                parent_call_id="task-A",
+            )
+
+        assert output == "done"
+        window.assert_called_once()
+        assert ui.context_calls == [
+            {
+                "parent_call_id": "task-A",
+                "prompt_tokens": 41_000,
+                "context_window": 128_000,
+                "generation": 0,
+            }
+        ]
+
+    def test_missing_usage_emits_no_context_event(self) -> None:
+        ui = self._ContextUI()
+        session = _make_session(ui=ui)
+
+        with patch("turnstone.core.session.model_turn", return_value=make_result("done")):
+            session._run_agent(
+                [Turn.user("test")],
+                tools=[],
+                auto_tools=set(),
+                parent_call_id="task-A",
+            )
+
+        assert ui.context_calls == []
+
+    def test_unparented_agent_does_not_compute_or_emit_badge_usage(self) -> None:
+        from turnstone.core.providers import UsageInfo
+
+        ui = self._ContextUI()
+        session = _make_session(ui=ui)
+        result = make_result(
+            "done",
+            usage=UsageInfo(prompt_tokens=10, completion_tokens=2, total_tokens=12),
+        )
+
+        with (
+            patch.object(session, "_context_window_for_lane") as window,
+            patch("turnstone.core.session.model_turn", return_value=result),
+        ):
+            session._run_agent([Turn.user("test")], tools=[], auto_tools=set())
+
+        window.assert_not_called()
+        assert ui.context_calls == []
+
+    def test_superseded_generation_cannot_publish_context(self) -> None:
+        from turnstone.core.providers import UsageInfo
+        from turnstone.core.session import GenerationCancelled
+
+        ui = self._ContextUI()
+        session = _make_session(ui=ui)
+        generation = session._claim_generation()
+        result = make_result(
+            "stale",
+            usage=UsageInfo(prompt_tokens=80, completion_tokens=2, total_tokens=82),
+        )
+
+        def supersede(*_args: Any, **_kwargs: Any) -> ModelTurnResult:
+            session._claim_generation()
+            return result
+
+        with (
+            patch.object(session, "_context_window_for_lane", return_value=100),
+            patch("turnstone.core.session.model_turn", side_effect=supersede),
+            pytest.raises(GenerationCancelled),
+        ):
+            session._run_agent(
+                [Turn.user("test")],
+                tools=[],
+                auto_tools=set(),
+                parent_call_id="task-A",
+                origin_generation=generation,
+            )
+
+        assert ui.context_calls == []
+
+    def test_force_abandon_immediately_purges_retired_context(self) -> None:
+        from turnstone.core.session_ui_base import SessionUIBase
+
+        ui = SessionUIBase(ws_id="ws-agent-context")
+        session = _make_session(ui=ui)
+        generation = session._claim_generation()
+        ui.on_agent_context("task-old", 80, 100, generation=generation)
+
+        abandoned, persistence_error = session.force_abandon_generation(
+            target_is_current=lambda: True,
+            clear_target=lambda: True,
+            publish_abandoned=lambda: None,
+        )
+
+        assert abandoned is True
+        assert persistence_error is None
+        assert ui._snapshot_agent_contexts() == []
+
+
 class TestAgentChildRegistration:
     """_run_agent registers each sub-tool under the task's parent_call_id so the
     UI can nest the step (the producer side of the SessionUIBase tagging)."""
@@ -4716,6 +4855,7 @@ class TestExecTaskReporting:
 
     def test_success_reports_result(self):
         session = self._bare_session()
+        session.ui.clear_agent_context = MagicMock()
         with (
             patch.object(session, "_run_agent", return_value="the synthesis"),
             patch.object(session, "_report_tool_result") as rpt,
@@ -4723,6 +4863,43 @@ class TestExecTaskReporting:
             cid, out = session._exec_task({"call_id": "t1", "prompt": "go"})
         assert (cid, out) == ("t1", "the synthesis")
         rpt.assert_called_once_with("t1", "task_agent", "the synthesis")
+        assert session.ui.clear_agent_context.call_args_list == [
+            call("t1", generation=0),
+            call("t1", generation=0),
+        ]
+
+    def test_terminal_clear_precedes_subscriber_snapshot_and_result(self):
+        from turnstone.core.session_ui_base import SessionUIBase
+
+        ui = SessionUIBase(ws_id="ws-agent-terminal-order")
+        session = _make_session(ui=ui)
+        session._agent_prompt_components = ()
+        session._task_tools = []
+        generation = session._claim_generation()
+        ui.on_agent_context("t1", 80, 100, generation=generation)
+        observed: dict[str, Any] = {}
+
+        def report(call_id, name, output, **kwargs):
+            listener, snapshot = ui.register_listener_with_in_progress_snapshot()
+            observed["snapshot"] = snapshot
+            observed["listener"] = listener
+            ui.on_tool_result(call_id, name, output, **kwargs)
+
+        with (
+            patch.object(session, "_run_agent", return_value="the synthesis"),
+            patch.object(session, "_report_tool_result", side_effect=report),
+        ):
+            cid, out = session._exec_task(
+                {
+                    "call_id": "t1",
+                    "prompt": "go",
+                    "_origin_generation": generation,
+                }
+            )
+
+        assert (cid, out) == ("t1", "the synthesis")
+        assert observed["snapshot"]["agent_contexts"] == []
+        assert observed["listener"].get_nowait()["type"] == "tool_result"
 
     def test_error_reports_is_error(self):
         session = self._bare_session()
@@ -4733,6 +4910,28 @@ class TestExecTaskReporting:
             cid, out = session._exec_task({"call_id": "t1", "prompt": "go"})
         assert out == "Task error: boom"
         rpt.assert_called_once_with("t1", "task_agent", "Task error: boom", is_error=True)
+
+    def test_superseded_task_still_runs_exact_context_cleanup(self):
+        from turnstone.core.session import GenerationCancelled
+
+        session = self._bare_session()
+        generation = session._claim_generation()
+        session.ui.clear_agent_context = MagicMock()
+
+        def supersede(*_args, **_kwargs):
+            session._claim_generation()
+            raise GenerationCancelled()
+
+        with patch.object(session, "_run_agent", side_effect=supersede):
+            session._exec_task(
+                {
+                    "call_id": "t1",
+                    "prompt": "go",
+                    "_origin_generation": generation,
+                }
+            )
+
+        session.ui.clear_agent_context.assert_called_once_with("t1", generation=generation)
 
 
 def _install_output_guard_judge(session: ChatSession, judge: MagicMock) -> None:

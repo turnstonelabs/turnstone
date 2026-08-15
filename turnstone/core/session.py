@@ -10180,6 +10180,7 @@ class ChatSession:
             debt = self._tool_structural_debt
             self._cancel_event.set()
             self._generation += 1
+            self._clear_agent_contexts_before_generation(self._generation)
             self._cancel_event = threading.Event()
             if debt is not None:
                 try:
@@ -24121,6 +24122,64 @@ class ChatSession:
         if fn is not None:
             fn(parent_call_id, item)
 
+    def _paint_agent_context(
+        self,
+        parent_call_id: str | None,
+        prompt_tokens: int,
+        context_window: int,
+        *,
+        generation: int,
+    ) -> None:
+        """Publish one normalized task-agent context reading when supported."""
+        if not parent_call_id:
+            return
+        fn = getattr(self.ui, "on_agent_context", None)
+        if fn is not None:
+            fn(
+                parent_call_id,
+                prompt_tokens,
+                context_window,
+                generation=generation,
+            )
+
+    def _clear_agent_context(self, parent_call_id: str | None, *, generation: int) -> None:
+        """Best-effort clear of generation-scoped task-agent reconnect state."""
+        if not parent_call_id:
+            return
+        fn = getattr(self.ui, "clear_agent_context", None)
+        if fn is not None:
+            try:
+                fn(parent_call_id, generation=generation)
+            except Exception:
+                # A custom UI hook must not suppress the task's authoritative
+                # terminal result. SessionUIBase's implementation is
+                # in-memory/infallible; this guard preserves the compatibility
+                # posture of every other optional task-agent UI hook.
+                log.debug(
+                    "session.agent_context.cleanup_failed ws=%s call_id=%s generation=%d",
+                    self._ws_id[:8],
+                    parent_call_id,
+                    generation,
+                    exc_info=True,
+                )
+
+    def _clear_agent_contexts_before_generation(self, generation: int) -> None:
+        """Best-effort purge of reconnect state owned by retired workers."""
+        fn = getattr(self.ui, "clear_agent_contexts_before_generation", None)
+        if fn is None:
+            return
+        try:
+            fn(generation)
+        except Exception:
+            # Force-abandon is the escape hatch for a wedged worker. Auxiliary
+            # UI cleanup must not defeat its structural repair + slot release.
+            log.debug(
+                "session.agent_context.force_cleanup_failed ws=%s generation=%d",
+                self._ws_id[:8],
+                generation,
+                exc_info=True,
+            )
+
     def _begin_agent_scope(self) -> None:
         """Mark a task agent as in flight so the web pane drops its ``on_info``
         progress chatter (it can't nest under the card — no call_id).  Bracketed
@@ -24441,6 +24500,7 @@ class ChatSession:
         # without consulting a later shared-workstream actor.
         cancel_scope.check()
         lane = self._lane_for_backend_auth_principal(lane, agent_principal)
+        agent_context_window = self._context_window_for_lane(lane) if parent_call_id else 0
 
         def _api_call(
             turns: list[Turn],
@@ -24493,6 +24553,21 @@ class ChatSession:
                     # window: never append or accept a stale child response
                     # after its originating run was cancelled.
                     cancel_scope.check()
+                    agent_usage = agent_result.usage
+                    if agent_usage is not None and parent_call_id:
+                        published = self._publish_for_generation(
+                            origin_generation,
+                            functools.partial(
+                                self._paint_agent_context,
+                                parent_call_id,
+                                agent_usage.prompt_tokens,
+                                agent_context_window,
+                                generation=origin_generation,
+                            ),
+                            allow_cancelled=False,
+                        )
+                        if not published:
+                            raise GenerationCancelled()
                     return agent_result
                 except Exception as e:
                     # Closing a provider stream commonly surfaces as an
@@ -24998,15 +25073,24 @@ class ChatSession:
                 origin_cancel_event=item.get("_origin_cancel_event"),
                 origin_generation=origin_generation,
             )
+
             # Self-report the task_agent's OWN result.  The parent run-loop only
             # reports error/denied/exception results centrally; success results
             # rely on each tool self-reporting (bash, search, … all do), and the
             # task_agent never did — so without this the live card has no
             # completion signal (it stays "running" and the synthesis never
             # renders live, only on reload).
+            def _publish_success() -> None:
+                # Clear-before-terminal closes the fresh-subscriber race: a
+                # listener must observe either the active snapshot followed by
+                # this result, or no snapshot plus this result — never a
+                # synthetic active reading after the terminal replay.
+                self._clear_agent_context(call_id, generation=origin_generation)
+                self._report_tool_result(call_id, "task_agent", result)
+
             if not self._publish_for_generation(
                 origin_generation,
-                lambda: self._report_tool_result(call_id, "task_agent", result),
+                _publish_success,
                 allow_cancelled=False,
             ):
                 raise GenerationCancelled()
@@ -25027,6 +25111,7 @@ class ChatSession:
             disposition = self._cancelled_agent_disposition(agent_turns, "task")
 
             def _publish_cancelled() -> None:
+                self._clear_agent_context(call_id, generation=origin_generation)
                 status = self._cancelled_agent_status(agent_turns)
                 receipt = _CancelledToolResult(
                     detail=disposition,
@@ -25078,9 +25163,14 @@ class ChatSession:
             # "failed" and the message renders (replaces the old on_info, which
             # was suppressed during the agent scope anyway).
             msg = f"Task error: {e}"
+
+            def _publish_error() -> None:
+                self._clear_agent_context(call_id, generation=origin_generation)
+                self._report_tool_result(call_id, "task_agent", msg, is_error=True)
+
             self._publish_for_generation(
                 origin_generation,
-                lambda: self._report_tool_result(call_id, "task_agent", msg, is_error=True),
+                _publish_error,
             )
             return call_id, msg
         finally:
@@ -25100,6 +25190,11 @@ class ChatSession:
             self._end_agent_scope()
             child_ids = {tc.id for tc, _result in self._iter_agent_tool_results(agent_turns)}
             self._clear_agent_children(call_id, child_ids=child_ids)
+            # This is pure exact-owner cleanup, not publication. A retiring
+            # predecessor must still drop its own reading after a force claim;
+            # the generation stored beside the entry protects a successor that
+            # reused the same public call id.
+            self._clear_agent_context(call_id, generation=origin_generation)
 
             def _stash() -> None:
                 try:

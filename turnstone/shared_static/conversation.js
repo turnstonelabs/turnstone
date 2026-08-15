@@ -924,8 +924,37 @@ export function buildPreviewChip(descriptor, onOpen) {
 // task_agent call instead of scattering at the top level.  The pane appends the
 // returned `wrap` into the task_agent .conv-row and renders step rows (ordinary
 // .conv-row leaves, matched by call_id) into `body`; `label` shows the live
-// step count.  House style: programmatic DOM, textContent only.
+// step count, `context` the visual token badge, and `toggle` owns their shared
+// accessible name.  House style: programmatic DOM, textContent only.
 let _agentCardSeq = 0;
+
+export function formatAgentContextTokens(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return "";
+  const tokens = Math.floor(numeric);
+  const compact = (divisor, suffix) => {
+    const scaled = tokens / divisor;
+    const digits = scaled < 10 && tokens % divisor !== 0 ? 1 : 0;
+    return Number(scaled.toFixed(digits)).toString() + suffix;
+  };
+  // Promote at the point integer-thousands rounding would otherwise produce
+  // the awkward cross-unit value "1000k".
+  if (tokens >= 999_500) return compact(1_000_000, "m");
+  if (tokens >= 1_000) return compact(1_000, "k");
+  return String(tokens);
+}
+
+export function agentContextIsWarning(promptTokens, contextWindow) {
+  const used = Number(promptTokens);
+  const total = Number(contextWindow);
+  return (
+    Number.isFinite(used) &&
+    used >= 0 &&
+    Number.isFinite(total) &&
+    total > 0 &&
+    used / total >= 0.8
+  );
+}
 
 export function buildAgentCardBody() {
   const wrap = document.createElement("div");
@@ -955,7 +984,11 @@ export function buildAgentCardBody() {
   const label = document.createElement("span");
   label.className = "conv-agent-label";
   label.textContent = "0 steps";
-  toggle.append(caret, label);
+  const context = document.createElement("span");
+  context.className = "conv-agent-context";
+  context.hidden = true;
+  context.setAttribute("aria-hidden", "true");
+  toggle.append(caret, label, context);
   const body = document.createElement("div");
   body.className = "conv-agent-body";
   body.id = bodyId;
@@ -965,5 +998,5 @@ export function buildAgentCardBody() {
     toggle.setAttribute("aria-expanded", collapsed ? "true" : "false");
   });
   wrap.append(toggle, body);
-  return { wrap, body, label };
+  return { wrap, body, label, context, toggle };
 }

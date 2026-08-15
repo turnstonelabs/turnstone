@@ -35,6 +35,8 @@ import {
   buildConvActions,
   buildConvStatus,
   buildAgentCardBody,
+  formatAgentContextTokens,
+  agentContextIsWarning,
   buildPreviewChip,
   batchKicker,
   indexLabel,
@@ -401,6 +403,11 @@ class Pane {
     // (output/media/MCP card/preview chip), so an accepted row can replace a
     // provisional receipt without disturbing output-guard warnings.
     this._toolResultNodes = new Map();
+    // Latest running task-agent prompt usage by parent call id. Context can
+    // arrive before its parent row during the parallel tool-pool race; the map
+    // buffers that reading until _relinkAgentCards paints the row. Repeated
+    // live/synthetic events replace one reading and update one badge.
+    this._agentContexts = new Map();
     this._resizeObs = null;
     // Set when replay_truncated arrives mid-stream (refetching then would
     // detach the live bubble); consumed on the next idle edge.  Cleared by
@@ -2210,6 +2217,7 @@ class Pane {
     // session's rewinds/compaction re-syncs — and a stale _agentOrphans
     // grace timer would escape buffered steps into the rebuilt pane.
     if (this._agentCards) this._agentCards.clear();
+    if (this._agentContexts) this._agentContexts.clear();
     if (this._agentOrphans) {
       for (const entry of this._agentOrphans.values()) {
         if (entry.timer != null) clearTimeout(entry.timer);
@@ -2422,6 +2430,15 @@ class Pane {
         }
         if (evt.state === "idle" || evt.state === "error") {
           this.setBusy(false);
+          // A context event received while its call id still resolved to a
+          // prior terminal row is retained briefly for a possible successor
+          // row with a recycled provider id. If no such row appeared before
+          // the turn settled, the reading belonged to the terminal occurrence.
+          for (const [parentId, reading] of this._agentContexts.entries()) {
+            if (reading.blockedByTerminalRow) {
+              this._agentContexts.delete(parentId);
+            }
+          }
           this._attachRetryToLastAssistant();
           // Deferred replay_truncated re-sync: the truncation arrived while
           // a segment was streaming (refetching then would have detached the
@@ -2499,6 +2516,10 @@ class Pane {
         if (!this._routeAgentItems(evt.items, "pending")) {
           this.announceToolBlock(evt.items);
         }
+        break;
+
+      case "agent_context":
+        this._updateAgentContext(evt);
         break;
 
       case "tool_info":
@@ -3955,6 +3976,7 @@ class Pane {
             (msg.tool_call_id && agentCardWraps[msg.tool_call_id]);
           if (resultAgentWrap) {
             resultAgentWrap.dataset.state = msg.is_error ? "error" : "done";
+            this._syncAgentToggleLabel(resultAgentWrap);
           }
         }
         if (msg.event_id != null) {
@@ -4410,6 +4432,14 @@ class Pane {
         approveRows.push(row);
       }
     });
+    if (card.body.querySelector(".conv-row")) {
+      // A context event can create the card before the agent emits its first
+      // sub-tool. Once a real step lands the card is ordinary transcript UI;
+      // reveal it even if a terminal result raced ahead and hid the former
+      // context-only shell.
+      delete card.wrap.dataset.contextOnly;
+      card.wrap.hidden = false;
+    }
     if (mode === "approve" && approveRows.length) {
       // Register this nested batch as its own approval cycle — the
       // backend gates each sub-agent batch independently, so buttons
@@ -4422,7 +4452,7 @@ class Pane {
     return true;
   }
 
-  _ensureAgentCard(parentCallId) {
+  _ensureAgentCard(parentCallId, contextOnly = false) {
     // _toolRow cache: a busy task agent resolves its parent row once per
     // child event — the uncached scan was O(transcript) per step.
     const parentRow = this._toolRow(parentCallId);
@@ -4430,12 +4460,16 @@ class Pane {
     if (!this._agentCards) this._agentCards = new Map();
     let card = this._agentCards.get(parentCallId);
     if (card) {
-      if (parentRow.contains(card.wrap)) return card;
+      if (parentRow.contains(card.wrap)) {
+        this._syncAgentContext(parentCallId, card);
+        return card;
+      }
       if (!card.wrap.isConnected) {
         // Same-turn row rebuild: showInlineToolBlock's replaceChildren on the
         // pending->resolved upgrade detached our card.  Re-attach the SAME card
         // so its already-rendered steps survive the upgrade.
         parentRow.appendChild(card.wrap);
+        this._syncAgentContext(parentCallId, card);
         return card;
       }
       // The cached card is still attached to a DIFFERENT (earlier) row — a
@@ -4446,9 +4480,108 @@ class Pane {
     }
     card = buildAgentCardBody();
     card.wrap.dataset.state = "running";
+    if (contextOnly) card.wrap.dataset.contextOnly = "true";
     parentRow.appendChild(card.wrap);
     this._agentCards.set(parentCallId, card);
+    this._syncAgentToggleLabel(card);
+    this._syncAgentContext(parentCallId, card);
     return card;
+  }
+
+  _syncAgentToggleLabel(card) {
+    const wrap = card.wrap || card;
+    const toggle = card.toggle || wrap.querySelector(".conv-agent-toggle");
+    const label = card.label || wrap.querySelector(".conv-agent-label");
+    const context = card.context || wrap.querySelector(".conv-agent-context");
+    if (!toggle || !label) return;
+    const parts = ["Show or hide sub-agent steps", label.textContent || "0 steps"];
+    const state = wrap.dataset.state;
+    if (state === "running") parts.push("running");
+    else if (state === "done") parts.push("done");
+    else if (state === "error") parts.push("failed");
+    if (context && !context.hidden && context.title) {
+      parts.push(
+        context.classList.contains("conv-agent-context--warning")
+          ? "Warning: " + context.title
+          : context.title,
+      );
+    }
+    toggle.setAttribute("aria-label", parts.join(". "));
+  }
+
+  _syncAgentContext(parentCallId, card) {
+    const reading = this._agentContexts.get(parentCallId);
+    if (!reading || card.wrap.dataset.state !== "running") return;
+    const used = formatAgentContextTokens(reading.promptTokens);
+    const total = formatAgentContextTokens(reading.contextWindow);
+    if (!used || !total) return;
+    const warning = agentContextIsWarning(
+      reading.promptTokens,
+      reading.contextWindow,
+    );
+    card.context.textContent = used + " / " + total;
+    card.context.hidden = false;
+    card.context.classList.toggle("conv-agent-context--warning", warning);
+    const full =
+      reading.promptTokens.toLocaleString() +
+      " of " +
+      reading.contextWindow.toLocaleString() +
+      " context tokens used";
+    card.context.title = full;
+    this._syncAgentToggleLabel(card);
+  }
+
+  _resetAgentContextBadge(card) {
+    card.context.hidden = true;
+    card.context.textContent = "";
+    card.context.classList.remove("conv-agent-context--warning");
+    card.context.removeAttribute("title");
+    this._syncAgentToggleLabel(card);
+  }
+
+  _updateAgentContext(evt) {
+    const parentId =
+      typeof evt.parent_call_id === "string" ? evt.parent_call_id : "";
+    const promptTokens = Number(evt.prompt_tokens);
+    const contextWindow = Number(evt.context_window);
+    if (
+      !parentId ||
+      !Number.isInteger(promptTokens) ||
+      promptTokens < 0 ||
+      !Number.isInteger(contextWindow) ||
+      contextWindow <= 0
+    ) {
+      return;
+    }
+
+    // A synthetic fresh-connect snapshot can race the task's terminal result.
+    // History/replay records which exact latest row already owns a result; do
+    // not resurrect a running badge on that completed card.
+    const parentRow = this._toolRow(parentId);
+    const terminal = this._toolResultNodes.get(parentId);
+    if (parentRow && terminal && terminal.row === parentRow) {
+      if (!this.busy) {
+        this._agentContexts.delete(parentId);
+        return;
+      }
+      // The provider may recycle a parent call id on a later turn. Until that
+      // successor row paints, _toolRow still resolves the prior terminal row;
+      // retain the reading without attaching it there. _relinkAgentCards will
+      // consume it when a different row occurrence arrives. An idle/error edge
+      // drops it if no successor ever appears.
+      this._agentContexts.set(parentId, {
+        promptTokens,
+        contextWindow,
+        blockedByTerminalRow: parentRow,
+      });
+      return;
+    }
+
+    this._agentContexts.set(parentId, { promptTokens, contextWindow });
+    const card = this._ensureAgentCard(parentId, true);
+    if (card && card.wrap.dataset.state !== "running") {
+      this._agentContexts.delete(parentId);
+    }
   }
 
   _bufferAgentOrphan(parentId, items, mode) {
@@ -4516,8 +4649,11 @@ class Pane {
     (items || []).forEach((it) => {
       if (!it || !it.call_id) return;
       paintedIds.push(it.call_id);
-      if (this._agentCards && this._agentCards.has(it.call_id)) {
-        this._ensureAgentCard(it.call_id);
+      if (
+        (this._agentCards && this._agentCards.has(it.call_id)) ||
+        this._agentContexts.has(it.call_id)
+      ) {
+        this._ensureAgentCard(it.call_id, this._agentContexts.has(it.call_id));
       }
     });
     if (paintedIds.length) this._flushAgentOrphans(paintedIds);
@@ -4526,6 +4662,7 @@ class Pane {
   _updateAgentLabel(card) {
     const n = card.body.querySelectorAll(".conv-row").length;
     card.label.textContent = n === 1 ? "1 step" : n + " steps";
+    this._syncAgentToggleLabel(card);
   }
 
   _replayAgentCard(row, steps) {
@@ -4564,10 +4701,20 @@ class Pane {
     // attached DOM (not a leak); the detached-retention hazard is rebuilds,
     // which _clearAgentTracking covers in replayHistory.
     if (this._agentCards && this._agentCards.has(callId)) {
-      this._agentCards.get(callId).wrap.dataset.state = isError
-        ? "error"
-        : "done";
+      const agentCard = this._agentCards.get(callId);
+      agentCard.wrap.dataset.state = isError ? "error" : "done";
+      this._resetAgentContextBadge(agentCard);
+      if (
+        agentCard.wrap.dataset.contextOnly === "true" &&
+        !agentCard.body.querySelector(".conv-row")
+      ) {
+        // A one-turn agent can report usage without ever invoking a sub-tool.
+        // Retain the hidden card in the id-ownership map so a late child event
+        // reuses it, but do not leave an empty "0 steps · done" card visible.
+        agentCard.wrap.hidden = true;
+      }
     }
+    this._agentContexts.delete(callId);
     let target = this._toolRow(callId);
     if (!target) {
       // A minted sub-agent child id ("<parent>::r{run}s{step}::<id>") whose row hasn't

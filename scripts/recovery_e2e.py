@@ -236,7 +236,13 @@ the listener is registered first), the node runs a 4-parallel-bash
 ``seq 1 500`` storm plus a task_agent whose sub-tools are chatty bashes;
 the page asserts the final DOM has the expected top-level tool rows, the
 task_agent card nests its sub-tool rows (NO child escaped to the top
-level), and the composer settles idle. Stamps ``RECOVERY-READY-STORM-<n>``.
+level), and a second one-turn task_agent leaves no empty finished card. Both
+agents report >80% prompt usage so the page can latch the real context badge,
+its warning style, and its accessible label before terminal cleanup. The runner
+reloads during a paced sub-tool and proves the new pane repaints the synthetic
+snapshot before another model call; the final agent recycles the prior call id
+and has its parent event delayed in-browser to exercise context-before-parent
+relinking. The composer must settle idle. Stamps ``RECOVERY-READY-STORM-<n>``.
 
 Scenario B (hide mid-turn -> restart -> show): the runner hides the tab
 the moment the first streamed line paints (freezing the pane's cursor at
@@ -459,6 +465,7 @@ PAGE_HTML = r"""<!doctype html>
       const wsId = q.get("ws_id");
       const scenario = q.get("scenario") || "storm";
       const expectRows = parseInt(q.get("rows") || "4", 10);
+      const agentResume = q.get("agent_resume") === "1";
       // Healed-gap sentinel, threaded from the runner (HEALED_SENTINEL)
       // so the injected turn text and this check cannot drift apart.
       const healedSentinel = q.get("healed") || "";
@@ -519,6 +526,102 @@ PAGE_HTML = r"""<!doctype html>
         document.dispatchEvent(new Event("visibilitychange"));
       };
 
+      // Latch the transient task-agent context badge while it is genuinely
+      // visible. The terminal tool_result intentionally clears it, so a final
+      // DOM-only assertion would miss whether the real SSE event ever rendered
+      // (and handleEvent catches renderer exceptions to keep the stream alive).
+      window.__agentContextProbe = {
+        seen: false,
+        warning: false,
+        contextOnly: false,
+        resumeSeen: false,
+        text: "",
+        aria: "",
+      };
+      function captureAgentContext() {
+        const badge = pane.messagesEl.querySelector(
+          '.conv-agent[data-state="running"] .conv-agent-context:not([hidden])',
+        );
+        if (!badge || !(badge.textContent || "").trim()) return;
+        const card = badge.closest(".conv-agent");
+        const toggle = card && card.querySelector(".conv-agent-toggle");
+        const warning = badge.classList.contains("conv-agent-context--warning");
+        window.__agentContextProbe.seen = true;
+        if (warning) {
+          window.__agentContextProbe.warning = true;
+          if (agentResume) window.__agentContextProbe.resumeSeen = true;
+          window.__agentContextProbe.contextOnly =
+            !!card && card.dataset.contextOnly === "true";
+          window.__agentContextProbe.text = (badge.textContent || "").trim();
+          window.__agentContextProbe.aria =
+            (toggle && toggle.getAttribute("aria-label")) || "";
+        }
+      }
+      if (scenario === "storm") {
+        const agentContextObserver = new MutationObserver(captureAgentContext);
+        agentContextObserver.observe(pane.messagesEl, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["class", "hidden", "data-state", "aria-label"],
+          characterData: true,
+        });
+
+        // Runtime reducer trap for recycled provider call ids. The runner arms
+        // this only for the final real task-agent turn. Delay its parent paint
+        // until the real agent_context event arrives, forcing the combined
+        // ordering where _toolRow still resolves the prior terminal task1 row;
+        // then replay the real parent events and require the retained reading
+        // to relink to the successor occurrence.
+        const handleAgentEvent = pane.handleEvent.bind(pane);
+        let delayedReusedParents = [];
+        window.__reuseDelayArmed = false;
+        window.__reuseContextBeforeParent = false;
+        window.__reuseRelinked = false;
+        window.__armReusedParentDelay = function () {
+          delayedReusedParents = [];
+          window.__reuseDelayArmed = true;
+        };
+        pane.handleEvent = function (evt) {
+          const delayedParent =
+            window.__reuseDelayArmed &&
+            evt &&
+            (evt.type === "tool_pending" || evt.type === "tool_info") &&
+            Array.isArray(evt.items) &&
+            evt.items.some(
+              (item) =>
+                item && item.call_id === "task1" && !item.parent_call_id,
+            );
+          if (delayedParent) {
+            delayedReusedParents.push(evt);
+            return;
+          }
+          const result = handleAgentEvent(evt);
+          if (
+            window.__reuseDelayArmed &&
+            evt &&
+            evt.type === "agent_context" &&
+            evt.parent_call_id === "task1" &&
+            delayedReusedParents.length
+          ) {
+            window.__reuseContextBeforeParent =
+              pane._agentContexts.has("task1");
+            window.__reuseDelayArmed = false;
+            const delayed = delayedReusedParents;
+            delayedReusedParents = [];
+            delayed.forEach((parentEvt) => handleAgentEvent(parentEvt));
+            const row = pane._toolRow("task1");
+            window.__reuseRelinked = !!(
+              row &&
+              row.querySelector(
+                '.conv-agent[data-state="running"] .conv-agent-context:not([hidden])',
+              )
+            );
+          }
+          return result;
+        };
+      }
+
       // Count top-level tool rows and escaped sub-agent children.
       function domCounts() {
         const topRows = pane.messagesEl.querySelectorAll(
@@ -535,7 +638,20 @@ PAGE_HTML = r"""<!doctype html>
         const nested = pane.messagesEl.querySelectorAll(
           ".conv-agent .conv-row[data-call-id]"
         ).length;
-        return { topLevel, escapedChildren, agentCard: !!agentCard, nested };
+        const visibleAgentCards = pane.messagesEl.querySelectorAll(
+          ".conv-agent:not([hidden])"
+        ).length;
+        const hiddenContextCards = pane.messagesEl.querySelectorAll(
+          '.conv-agent[data-context-only="true"][hidden]'
+        ).length;
+        return {
+          topLevel,
+          escapedChildren,
+          agentCard: !!agentCard,
+          nested,
+          visibleAgentCards,
+          hiddenContextCards,
+        };
       }
 
       let sent = false;
@@ -568,7 +684,7 @@ PAGE_HTML = r"""<!doctype html>
       pane._host.onStreamOpen = function (p) {
         origOpen(p);
         window.__streamOpen = (window.__streamOpen || 0) + 1;
-        if (scenario === "storm") sendOnce("run the storm");
+        if (scenario === "storm" && !agentResume) sendOnce("run the storm");
         else if (
           (scenario === "restart" ||
             scenario === "fail-refetch" ||
@@ -683,16 +799,45 @@ PAGE_HTML = r"""<!doctype html>
         const poll = () => {
           const c = domCounts();
           const idle = !pane.busy;
-          if (c.topLevel >= expectRows && c.agentCard && c.nested >= 2 && idle) {
+          captureAgentContext();
+          const context = window.__agentContextProbe;
+          const contextReady =
+            context.seen &&
+            context.warning &&
+            context.contextOnly &&
+            context.resumeSeen &&
+            context.text === "27k / 33k" &&
+            context.aria.startsWith("Show or hide sub-agent steps. ") &&
+            context.aria.includes("0 steps. running. Warning: ") &&
+            context.aria.endsWith(" context tokens used");
+          if (
+            c.topLevel >= expectRows &&
+            c.agentCard &&
+            c.nested >= 2 &&
+            c.visibleAgentCards === 1 &&
+            c.hiddenContextCards >= 1 &&
+            window.__reuseContextBeforeParent &&
+            window.__reuseRelinked &&
+            contextReady &&
+            idle
+          ) {
             document.title = c.escapedChildren
               ? "RECOVERY-FAILED-escaped-" + c.escapedChildren
-              : "RECOVERY-READY-STORM-" + c.topLevel + "-nested-" + c.nested;
+              : "RECOVERY-READY-STORM-" + c.topLevel + "-nested-" + c.nested +
+                "-context-warning1-resume1-reuse1-empty0";
             return;
           }
           if (Date.now() > deadline) {
             document.title =
               "RECOVERY-FAILED-STORM-top" + c.topLevel + "-agent" + (c.agentCard ? 1 : 0) +
-              "-nested" + c.nested + "-escaped" + c.escapedChildren + "-busy" + (pane.busy ? 1 : 0);
+              "-nested" + c.nested + "-escaped" + c.escapedChildren +
+              "-busy" + (pane.busy ? 1 : 0) +
+              "-visible" + c.visibleAgentCards + "-hiddenctx" + c.hiddenContextCards +
+              "-ctxseen" + (context.seen ? 1 : 0) + "-ctxwarn" + (context.warning ? 1 : 0) +
+              "-ctxowner" + (context.contextOnly ? 1 : 0) +
+              "-ctxresume" + (context.resumeSeen ? 1 : 0) +
+              "-reusepre" + (window.__reuseContextBeforeParent ? 1 : 0) +
+              "-relink" + (window.__reuseRelinked ? 1 : 0);
             return;
           }
           setTimeout(poll, 200);
@@ -1714,9 +1859,12 @@ def _poll_title(cdp: CDP, timeout: float) -> str:
 
 
 def _storm_scripts() -> tuple[Any, ...]:
-    """A parallel bash storm PLUS a task_agent whose sub-tools are chatty
-    bashes (so the browser proves both fix-3 batching AND sub-agent nesting
-    with no escaped children)."""
+    """A bash storm plus task agents with and without nested sub-tools.
+
+    Both agents report warning-level prompt usage. The browser therefore proves
+    live and refresh-restored context badges, accessibility, nested routing,
+    recycled-id relinking, and context-only terminal cleanup.
+    """
     from tests._sse_recovery_server import final_text_script, parallel_bash_script
 
     storm = parallel_bash_script({f"call_{i}": "seq 1 500" for i in range(4)})
@@ -1732,19 +1880,42 @@ def _storm_scripts() -> tuple[Any, ...]:
     )
     sub = dict(
         tool_calls=[
-            {"id": "s_a", "name": "bash", "arguments": json.dumps({"command": ": a; seq 1 200"})},
+            {
+                "id": "s_a",
+                "name": "bash",
+                "arguments": json.dumps(
+                    {"command": (": a; for i in $(seq 1 200); do echo a-$i; sleep 0.05; done")}
+                ),
+            },
             {"id": "s_b", "name": "bash", "arguments": json.dumps({"command": ": b; seq 1 200"})},
         ],
         finish_reason="tool_calls",
+        prompt_tokens=27_000,
     )
-    # Turn 1: the 4-bash storm; turn 2: a task_agent with 2 chatty sub-bashes.
+    no_step_task = dict(
+        tool_calls=[
+            {
+                # Deliberately recycle task1 across turns. The browser delays
+                # this successor's parent paint until agent_context arrives.
+                "id": "task1",
+                "name": "task_agent",
+                "arguments": json.dumps({"prompt": "answer directly"}),
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+    # Turn 1: the 4-bash storm; turn 2: a task_agent with 2 chatty sub-bashes;
+    # turn 3: a one-model-turn task_agent with no sub-tool rows.
     return (
         storm,
         final_text_script("storm done"),
         task,
         sub,
-        final_text_script("sub done"),
+        {**final_text_script("sub done"), "prompt_tokens": 27_000},
         final_text_script("all done"),
+        no_step_task,
+        {**final_text_script("direct answer"), "prompt_tokens": 27_000},
+        final_text_script("all done again"),
     )
 
 
@@ -1756,14 +1927,49 @@ def run_storm(chrome: str) -> str:
     cdp: CDP | None = None
     try:
         cdp = CDP(_page_ws_url(cdp_port))
-        # The page POSTs the STORM turn on stream-open; the runner sends the
-        # task_agent follow-up once the first turn settles so both land.
+        # The page POSTs the storm turn on stream-open. Follow it with a paced
+        # nested agent, reload while its first context reading is the only one
+        # available, then run a no-step successor that recycles the call id.
         url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=storm&rows=4"
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
-        # After the storm turn, trigger the task_agent turn via REST so the
-        # page renders the nested sub-agent card.
-        _wait_state(node, ws_id, "idle", 40)
+        node.wait_turn(ws_id, timeout=40)
         node.send(ws_id, "spawn the sub agent")
+        if not _poll_until(
+            lambda: cdp.evaluate(
+                "!!(window.__agentContextProbe && window.__agentContextProbe.warning)"
+            ),
+            15,
+            0.05,
+        ):
+            return "RECOVERY-FAILED-STORM-context-live0"
+
+        # A brand-new Pane must repaint from the server's active-context
+        # snapshot. The paced first sub-tool keeps the agent between model
+        # calls while the navigation completes; the call-count assertion below
+        # proves the observed badge cannot be the next live model reading.
+        resume_url = url + "&agent_resume=1"
+        cdp.cmd("Page.navigate", {"url": resume_url})
+        if not _poll_until(
+            lambda: cdp.evaluate(
+                "!!(window.__agentContextProbe && window.__agentContextProbe.resumeSeen)"
+            ),
+            8,
+            0.05,
+        ):
+            return "RECOVERY-FAILED-STORM-context-resume0"
+        calls_at_resume = node.model_call_count(ws_id)
+        if calls_at_resume != 4:
+            return f"RECOVERY-FAILED-STORM-context-resume-late-calls{calls_at_resume}"
+
+        node.wait_turn(ws_id, timeout=40)
+        if not _poll_until(
+            lambda: cdp.evaluate("!!window.__pane && !window.__pane.busy"),
+            5,
+            0.05,
+        ):
+            return "RECOVERY-FAILED-STORM-nested-busy1"
+        cdp.evaluate("window.__armReusedParentDelay()")
+        node.send(ws_id, "spawn the direct sub agent")
         return _poll_title(cdp, 45)
     finally:
         if cdp is not None:

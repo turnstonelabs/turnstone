@@ -100,6 +100,17 @@ export interface InProgressSnapshotEvent {
   reasoning: string;
 }
 
+/** Latest prompt usage for one running task agent. Fresh/truncated streams
+ *  replay one reading per active parent through this same event shape. A
+ *  ToolResultEvent with a matching call_id is the terminal signal. */
+export interface AgentContextEvent {
+  type: "agent_context";
+  ws_id?: string;
+  parent_call_id: string;
+  prompt_tokens: number;
+  context_window: number;
+}
+
 export interface StateChangeEvent {
   type: "state_change";
   state: "idle" | "thinking" | "running" | "attention" | "error";
@@ -288,6 +299,7 @@ export type ServerEvent =
   | ReasoningEvent
   | StreamEndEvent
   | InProgressSnapshotEvent
+  | AgentContextEvent
   | StateChangeEvent
   | ToolInfoEvent
   | ApproveRequestEvent
@@ -394,6 +406,10 @@ export function isInProgressSnapshotEvent(
   e: ServerEvent,
 ): e is InProgressSnapshotEvent {
   return e.type === "in_progress_snapshot";
+}
+
+export function isAgentContextEvent(e: ServerEvent): e is AgentContextEvent {
+  return e.type === "agent_context";
 }
 
 export function isStateChangeEvent(e: ServerEvent): e is StateChangeEvent {

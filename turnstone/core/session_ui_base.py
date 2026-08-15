@@ -484,14 +484,15 @@ class SessionUIBase:
     loop. All shared state is guarded by ``_listeners_lock`` /
     ``_ws_lock`` or ``threading.Event`` primitives.
 
-    Two ``on_*`` methods are additionally safe to call from a
+    Three ``on_*`` methods are additionally safe to call from a
     *concurrent* auxiliary thread (e.g. background title generation in
     ``ChatSession._generate_title``, or ``task_agent`` sub-agents), even
     while the worker thread is mid-stream: :meth:`on_aux_usage` (a
     storage ``usage_event`` write + thread-safe metric counters — it
     touches none of the ``_ws_lock``-guarded inflight state
     :meth:`on_status`/token writers mutate) and :meth:`on_rename` (a
-    queue / locked fan-out). Keep those two free of unguarded
+    queue / locked fan-out), plus :meth:`on_agent_context` (its own
+    snapshot lock followed by the same locked fan-out). Keep those three free of unguarded
     ``_ws_*`` writes so the auxiliary-thread guarantee holds.
     """
 
@@ -564,6 +565,16 @@ class SessionUIBase:
         # own lock so the hot fan-out path never serializes on ``_listeners_lock``.
         self._agent_children: dict[str, str] = {}
         self._agent_children_lock = threading.Lock()
+        # Latest normalized prompt usage for each RUNNING task-agent parent.
+        # This is an in-memory reconnect snapshot only: the parent result clears
+        # it, and completed readings are deliberately not durable history.  A
+        # separate lock avoids inverting ``_agent_children_lock`` against the
+        # listener fan-out path. Values retain their owner generation so a
+        # force-abandoned predecessor cannot overwrite or clear its successor
+        # when a provider reuses the public parent call id, and so force-abandon
+        # can purge every reading owned by the retired generation at once.
+        self._agent_contexts: dict[str, tuple[int, dict[str, Any]]] = {}
+        self._agent_contexts_lock = threading.Lock()
         # Recall store: a finished task agent's projected sub-trajectory (step
         # items: id/name/arguments/output/is_error), keyed by its (parent)
         # call_id, so /history can rebuild the collapsible card after a fresh
@@ -1233,6 +1244,73 @@ class SessionUIBase:
             for c in candidates:
                 del self._agent_children[c]
 
+    def on_agent_context(
+        self,
+        parent_call_id: str,
+        prompt_tokens: int,
+        context_window: int,
+        *,
+        generation: int = 0,
+    ) -> None:
+        """Publish and retain one task agent's latest context reading.
+
+        Store-before-enqueue is load-bearing for refresh races: a subscriber
+        registering between those operations sees the synthetic snapshot and
+        also may receive the live event, so clients reduce this event
+        idempotently. Reversing the order admits a window in which the event is
+        in neither the listener queue nor the snapshot.
+        """
+        if not parent_call_id or prompt_tokens < 0 or context_window <= 0:
+            return
+        event = {
+            "type": "agent_context",
+            "ws_id": self.ws_id,
+            "parent_call_id": parent_call_id,
+            "prompt_tokens": prompt_tokens,
+            "context_window": context_window,
+        }
+        with self._agent_contexts_lock:
+            current = self._agent_contexts.get(parent_call_id)
+            if current is not None and current[0] > generation:
+                return
+            self._agent_contexts[parent_call_id] = (generation, event)
+        self._enqueue(event)
+
+    def clear_agent_context(self, parent_call_id: str, *, generation: int = 0) -> None:
+        """Drop one completed task agent's reconnect snapshot.
+
+        Cleanup is exact-generation: a retiring predecessor whose public call
+        id was reused cannot remove the successor's active reading.
+        """
+        if not parent_call_id:
+            return
+        with self._agent_contexts_lock:
+            current = self._agent_contexts.get(parent_call_id)
+            if current is not None and current[0] == generation:
+                del self._agent_contexts[parent_call_id]
+
+    def clear_agent_contexts_before_generation(self, generation: int) -> None:
+        """Drop every reading owned by a force-abandoned generation.
+
+        A force successor may be claimed specifically because the retiring
+        worker is wedged and will never reach its per-agent ``finally`` block.
+        The cutoff form also preserves any reading already owned by the new
+        generation if a provider immediately reuses a public parent call id.
+        """
+        with self._agent_contexts_lock:
+            stale = [
+                parent_call_id
+                for parent_call_id, (owner_generation, _event) in self._agent_contexts.items()
+                if owner_generation < generation
+            ]
+            for parent_call_id in stale:
+                del self._agent_contexts[parent_call_id]
+
+    def _snapshot_agent_contexts(self) -> list[dict[str, Any]]:
+        """Copy active task-agent readings for fresh/truncated SSE replay."""
+        with self._agent_contexts_lock:
+            return [dict(event) for _generation, event in self._agent_contexts.values()]
+
     def on_agent_step(self, parent_call_id: str, item: dict[str, Any]) -> None:
         """Paint a sub-agent's auto-executed tool step as pending under its
         parent card so it shows live before it completes.  (Approval-gated
@@ -1337,7 +1415,8 @@ class SessionUIBase:
         events handler's ``_seq <= snap_seq`` filter drops.
 
         Returns ``(client_queue, snapshot_dict)`` where ``snapshot_dict``
-        has keys ``content`` (str), ``reasoning`` (str), ``seq`` (int).
+        has keys ``content`` (str), ``reasoning`` (str), ``seq`` (int), and
+        ``agent_contexts`` (the active task-agent context events).
         Caller checks for non-empty content / reasoning to decide
         whether to yield the event at all (empty snapshots are common
         between turns and on freshly-opened workstreams).
@@ -1355,11 +1434,13 @@ class SessionUIBase:
             with self._listeners_lock:
                 self._register_or_close_listener_locked(client_queue)
                 snap_seq = self._event_id
-        return client_queue, {
+        snapshot = {
             "content": "".join(captured_content),
             "reasoning": "".join(captured_reasoning),
             "seq": snap_seq,
+            "agent_contexts": self._snapshot_agent_contexts(),
         }
+        return client_queue, snapshot
 
     def register_listener_with_replay(
         self,
@@ -1393,7 +1474,7 @@ class SessionUIBase:
         content/reasoning that the evicted events would have carried).
         ``snapshot`` has the same shape as
         :meth:`register_listener_with_in_progress_snapshot`'s second
-        return value: ``{"content": str, "reasoning": str, "seq": int}``.
+        return value, including its active ``agent_contexts`` list.
 
         Atomicity contract: under ``_ws_lock`` (outer) + ``_listeners_lock``
         (inner) — matches writer order in :meth:`on_content_token` —
@@ -1488,6 +1569,7 @@ class SessionUIBase:
             "content": "".join(captured_content),
             "reasoning": "".join(captured_reasoning),
             "seq": snap_seq,
+            "agent_contexts": self._snapshot_agent_contexts(),
         }
         if last_event_id < 0 or last_event_id > snap_seq:
             # Event ids start at 1, with cursor 0 reserved for the initial

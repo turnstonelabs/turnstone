@@ -448,6 +448,11 @@ class RecoveryServer:
             if worker.is_alive():
                 raise AssertionError(f"turn worker for {ws_id} did not finish in {timeout}s")
 
+    def model_call_count(self, ws_id: str) -> int:
+        """Return completed-or-started scripted SDK calls for a workstream."""
+        client = self._clients.get(ws_id)
+        return len(client.calls) if client is not None else 0
+
     def get_ws(self, ws_id: str) -> Workstream | None:
         return self._manager.get(ws_id)
 

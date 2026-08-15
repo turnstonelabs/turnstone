@@ -807,6 +807,56 @@ def test_handler_truncated_emits_envelope_then_snapshot(monkeypatch: Any) -> Non
     )
 
 
+def test_handler_fresh_connect_replays_active_agent_context_without_text() -> None:
+    """Task-agent state is independently replayable from assistant text."""
+    ui = _make_ui()
+    ui.on_agent_context("task-A", 41_000, 128_000, generation=2)
+
+    _, blob = _drain_handler_yields(ui, max_yields=4)
+
+    assert blob.count('"type": "agent_context"') == 1
+    assert '"parent_call_id": "task-A"' in blob
+    assert '"prompt_tokens": 41000' in blob
+    assert "in_progress_snapshot" not in blob
+
+
+def test_handler_truncated_replays_active_agent_context(monkeypatch: Any) -> None:
+    """An evicted live context event is restored by the active snapshot."""
+    import collections
+
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
+    ui = _make_ui()
+    ui._event_buffer = collections.deque(maxlen=3)
+    ui.on_agent_context("task-A", 80, 100, generation=2)
+    for i in range(8):
+        ui.on_content_token(str(i))
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "1"},
+        max_yields=6,
+    )
+
+    assert "replay_truncated" in blob
+    assert blob.count('"type": "agent_context"') == 1
+    assert '"prompt_tokens": 80' in blob
+
+
+def test_handler_replay_ok_uses_buffered_agent_context_only() -> None:
+    """Covered reconnects must not add a synthetic duplicate reading."""
+    ui = _make_ui()
+    ui.on_agent_context("task-A", 79, 100, generation=2)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "0"},
+        max_yields=3,
+    )
+
+    assert blob.count('"type": "agent_context"') == 1
+    assert "id: 1" in blob
+
+
 def test_handler_tokenless_fresh_path_forces_old_client_history_repair() -> None:
     """A pre-handoff browser repairs in place without a reconnect loop."""
     ui = _make_ui()
