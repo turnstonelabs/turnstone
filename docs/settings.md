@@ -261,7 +261,7 @@ initialization:
 | `judge` | enabled, model, smart_approvals, confidence_threshold, max_context_ratio, timeout, parallel_evaluations, read_only_tools, output_guard, output_guard_budget_seconds, output_guard_llm, output_guard_model, output_guard_llm_timeout, redact_secrets, cancel_on_approval |
 | `interface` | close_tab_action, theme |
 | `skills` | discovery_url |
-| `memory` | relevance_k, fetch_limit, max_content, nudge_cooldown, nudges |
+| `memory` | relevance_k, index_budget_chars, model_index_over_budget_notice, max_content, nudge_cooldown, nudges |
 
 Settings are addressed by dotted key (e.g. `memory.relevance_k`). Each has a
 declared type (`int`, `float`, `str`, `bool`), optional `min_value`/`max_value`

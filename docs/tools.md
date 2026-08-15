@@ -360,7 +360,7 @@ Search the web using a text query.
 
 The `rerank_web_search` toggle defaults on once a reranker is selected. If the endpoint is unreachable or errors, web_search falls back silently to the backend's native result order — reranking never makes a search fail.
 
-When `rerank_bm25` is enabled, the candidate text for memory, tool, and skill retrieval (memory name/description/content and tool/skill names + descriptions) is also sent to the rerank endpoint — a self-hosted endpoint (vLLM/TEI/llama.cpp) keeps it on your infrastructure, a hosted provider (Cohere/Jina/Voyage) sends it off-box.
+When `rerank_bm25` is enabled, Turnstone also sends the current query and BM25 candidate metadata to the rerank endpoint. Live memory-pointer candidates contain only the memory name and authored description—never the body. Tool and skill candidates contain their names and descriptive metadata. A self-hosted endpoint (vLLM/TEI/llama.cpp) keeps this on your infrastructure; a hosted provider (Cohere/Jina/Voyage) sends it off-box.
 
 **Serving a Qwen3-Reranker with vLLM.** The model is instruction-aware, so vLLM **must** apply its chat template — pass `--chat-template` explicitly. Without it the bare query produces near-random scores and reranking actively *hurts* retrieval (verified: an irrelevant passage outscored the correct one):
 
@@ -376,7 +376,7 @@ Then add a reranker model in the **Models** tab with `base_url` `http://vllm:800
 
 For an endpoint that does *not* apply the model's template, set `rerank_instruction` instead — Turnstone then wraps each query as `<Instruct>: {instruction}` / `<Query>: {query}` (Qwen3's own default is `Given a web search query, retrieve relevant passages that answer the query`). Use the chat template **or** the instruction, not both (they double-wrap).
 
-**Picking `rerank_bm25_threshold`.** The relevance floor that gates proactive memory injection is a probability in `[0, 1]`, but the right value differs per model (a sharp 0.6B reranker may want ~0.95; a broader 4B ~0.33). Calibrate it against your endpoint:
+**Picking `rerank_bm25_threshold`.** The relevance floor that filters live memory pointers is a probability in `[0, 1]`, but the right value differs per model (a sharp 0.6B reranker may want ~0.95; a broader 4B ~0.33). Calibrate it against your endpoint:
 
 ```bash
 turnstone-admin rerank-calibrate           # probe the endpoint, recommend a floor
@@ -433,7 +433,12 @@ Delegate a general-purpose task to an autonomous sub-agent.
 |-----------|--------|----------|-------------|
 | `prompt`  | string | yes      | Complete task description for the sub-agent. |
 
-- **What it does**: Spawns a sub-agent that inherits the `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, and web tools). The sub-agent runs autonomously to completion. Use for work that requires file modifications or command execution.
+- **What it does**: Spawns a sub-agent that inherits the production
+  `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, and web tools). The
+  sub-agent runs autonomously to completion. A selected persona can narrow
+  that final lane but cannot add memory: task agents are memory-disabled in
+  1.8 regardless of the child persona's memory flag. Use for work that requires
+  file modifications or command execution.
 - **Auto-approve**: No -- requires user confirmation.
 - **Agent availability**: Top-level only.
 
@@ -450,7 +455,7 @@ Structured persistent memory across sessions with typed, scoped entries.
 | `action`      | string  | yes      | `save`, `get`, `search`, `delete`, or `list`. |
 | `name`        | string  | save/get/delete | Short snake_case identifier for the memory. |
 | `content`     | string  | save     | Memory content to store. |
-| `description` | string  | save     | Non-empty description for relevance matching; required on create and update. |
+| `description` | string  | save     | Authored one-line index hook (1-512 characters); required on every create or update. |
 | `type`        | string  | no       | Memory type: `user`, `general`, `feedback`, or `reference`. Default: `general`. |
 | `scope`       | string  | no       | Memory scope: `global`, `workstream`, `user`, `coordinator`, or `project`. See defaults below. |
 | `query`       | string  | search   | Search query for finding memories. |
@@ -459,12 +464,24 @@ Structured persistent memory across sessions with typed, scoped entries.
 - **What it does**: Manages structured persistent memories in the database.
   Memories persist across sessions, have a type classification, and live in a
   role-specific visible scope. Unscoped `save`/`get`/`delete` resolve to one
-  target: the attached active project, otherwise `global` for an interactive
-  session or `coordinator` for a coordinator. Read-only project access permits
-  `get` but makes `save`/`delete` fail without falling back. A valid explicit
-  scope selects exactly that scope. Unscoped `search`/`list` cover all visible
-  scopes; use the displayed scope when following a result with `get` or
-  `delete`.
+  target. Any stored project attachment pins that target to `project`; a
+  missing or archived project, or revoked access, fails closed without falling
+  back. Authorized read-only access permits `get` but makes `save`/`delete`
+  fail. Authorized reactivation restores eligibility. Only a workstream with
+  no stored project attachment defaults to `global` (interactive) or
+  `coordinator`. A valid explicit scope selects exactly that scope. Unscoped
+  `search`/`list` cover all visible scopes; use the displayed scope when
+  following a result with `get` or `delete`. The initial system prefix contains
+  an immutable, complete, body-free metadata index for the acting principal.
+  It records an explicit project ID only when the attached project is active
+  and readable at first admission. Later user turns may add live body-free
+  `(scope, name)` pointers. Setting `memory.nudges=false` suppresses those live
+  pointers and memory-directed nudges, but not the immutable index or the
+  memory tool. `get` is the sole full-body read and the sole action that updates
+  access counters.
+  The model-facing over-budget notice is opt-in, defaults off, and can appear
+  only on a successful memory-tool save; REST/SDK saves are unchanged and
+  console health remains unconditional.
 - **Auto-approve**: Yes.
 - **Agent availability**: Not available to task agents.
 

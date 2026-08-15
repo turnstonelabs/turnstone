@@ -1758,7 +1758,7 @@ Status code: `403`
 
 ### `GET /v1/api/memories`
 
-List structured memories with optional filters. Requires `read` scope. Without
+List body-free memory metadata with optional filters. Requires `read` scope. Without
 `scope`, returns only `global` plus the authenticated caller's `user`
 namespace. The public endpoint accepts `global`, `workstream`, and `user`;
 explicit workstream access is owner-bound.
@@ -1784,9 +1784,10 @@ explicit workstream access is owner-bound.
       "type": "general",
       "scope": "global",
       "scope_id": "",
-      "content": "The project uses a hexagonal architecture...",
       "created": "2026-03-10T10:00:00",
-      "updated": "2026-03-12T14:30:00"
+      "updated": "2026-03-12T14:30:00",
+      "last_accessed": "",
+      "access_count": 0
     }
   ],
   "total": 1
@@ -1798,8 +1799,9 @@ explicit workstream access is owner-bound.
 ### `POST /v1/api/memories`
 
 Save or upsert a structured memory. Requires `write` scope. Returns `201` on
-create, `200` on update. Every write must include a non-empty, non-whitespace
-`description`; content-only updates are rejected.
+create, `200` on update. Every write must include an authored `description`
+that normalizes to 1-512 characters on one line; content-only updates are
+rejected.
 
 **Request body:**
 
@@ -1818,7 +1820,7 @@ create, `200` on update. Every write must include a non-empty, non-whitespace
 |--------------|--------|----------|-------------|--------------------------------------|
 | `name`       | string | yes      | --          | Memory name (max 256 chars)          |
 | `content`    | string | yes      | --          | Memory content (max 65536 chars)     |
-| `description`| string | yes      | --          | Non-empty relevance summary, required on create and update |
+| `description`| string | yes      | --          | Authored one-line index hook (1-512 characters), required on every write |
 | `type`       | string | no       | unset       | user, general, feedback, or reference |
 | `scope`      | string | no       | `"global"`  | One of: global, workstream, user     |
 | `scope_id`   | string | no       | `""`        | Scope qualifier (auto-resolved for user scope) |
@@ -1833,11 +1835,15 @@ create, `200` on update. Every write must include a non-empty, non-whitespace
   "type": "general",
   "scope": "global",
   "scope_id": "",
-  "content": "Deploy via GitHub Actions...",
   "created": "2026-03-14T10:00:00",
-  "updated": "2026-03-14T10:00:00"
+  "updated": "2026-03-14T10:00:00",
+  "last_accessed": "",
+  "access_count": 0
 }
 ```
+
+The response is body-free; use the exact-name GET endpoint when content is
+needed.
 
 **Error responses:**
 
@@ -1852,7 +1858,7 @@ create, `200` on update. Every write must include a non-empty, non-whitespace
 
 ### `POST /v1/api/memories/search`
 
-Search memories by query. Uses POST for the request body but is non-mutating
+Search body-free memory metadata by query. Uses POST for the request body but is non-mutating
 (requires only `read` scope). An omitted scope searches only `global` plus the
 authenticated caller's `user` namespace.
 
@@ -1887,9 +1893,10 @@ authenticated caller's `user` namespace.
       "type": "general",
       "scope": "global",
       "scope_id": "",
-      "content": "JWT tokens with HS256...",
       "created": "2026-03-10T10:00:00",
-      "updated": "2026-03-12T14:30:00"
+      "updated": "2026-03-12T14:30:00",
+      "last_accessed": "",
+      "access_count": 0
     }
   ],
   "total": 1
@@ -1897,6 +1904,27 @@ authenticated caller's `user` namespace.
 ```
 
 **Error:** `400` with `{"error": "query is required"}` if `query` is empty.
+
+---
+
+### `GET /v1/api/memories/{name}`
+
+Fetch one live full memory body by exact name and scope. Requires `read` scope
+and records the access. List and search do not update access metadata.
+
+| Parameter  | Location | Required | Default    | Description         |
+|------------|----------|----------|------------|---------------------|
+| `name`     | path     | yes      | --         | Memory name         |
+| `scope`    | query    | no       | `"global"` | Scope of the memory |
+| `scope_id` | query    | no       | `""`       | Scope qualifier     |
+
+**Response (success):** `200` -- the full memory schema, including `content`.
+
+**Response (not found):** `404`
+
+```json
+{"error": "Memory 'auth_patterns' not found"}
+```
 
 ---
 
@@ -1935,7 +1963,7 @@ actor in the audit log.
 
 ### `GET /v1/api/admin/memories` (Console)
 
-List structured memories across all scopes. Requires `admin.memories`
+List body-free memory metadata across all scopes. Requires `admin.memories`
 permission.
 
 **Query parameters:**
@@ -1947,7 +1975,9 @@ permission.
 | `scope_id` | string | no       | `""`    | Filter by scope ID           |
 | `limit`    | int    | no       | `100`   | Max results (capped at 200)  |
 
-**Response:** `200` -- same schema as `GET /v1/api/memories`.
+**Response:** `200` -- `AdminMemorySummary`, the public body-free metadata plus
+`scope_label`, a human-readable label for `scope_id` (empty when there is no
+scope ID, with the raw ID as fallback).
 
 ---
 
@@ -1965,7 +1995,8 @@ Search memories by query. Requires `admin.memories` permission.
 | `scope_id` | string | no       | `""`    | Filter by scope ID            |
 | `limit`    | int    | no       | `20`    | Max results (capped at 50)    |
 
-**Response:** `200` -- same schema as `GET /v1/api/memories`.
+**Response:** `200` -- the same `AdminMemorySummary` schema as
+`GET /v1/api/admin/memories`.
 
 **Error:** `400` with `{"error": "q is required"}` if `q` is empty.
 
@@ -1973,7 +2004,8 @@ Search memories by query. Requires `admin.memories` permission.
 
 ### `GET /v1/api/admin/memories/{memory_id}` (Console)
 
-Get a single memory by ID. Requires `admin.memories` permission.
+Get a single memory body by ID and record an access. Requires
+`admin.memories` permission.
 
 **Path parameters:**
 
@@ -1991,17 +2023,81 @@ Get a single memory by ID. Requires `admin.memories` permission.
   "type": "general",
   "scope": "global",
   "scope_id": "",
+  "scope_label": "",
   "content": "The project uses...",
   "created": "2026-03-10T10:00:00",
-  "updated": "2026-03-12T14:30:00"
+  "updated": "2026-03-12T14:30:00",
+  "last_accessed": "2026-03-12T14:31:00",
+  "access_count": 1
 }
 ```
+
+The response is `AdminMemoryInfo` (`AdminMemorySummary` plus `content`), and
+the counters include the completed GET touch.
 
 **Error (not found):** `404`
 
 ```json
 {"error": "Memory not found"}
 ```
+
+Storage-operation failures return `500`; unavailable storage returns `503`.
+
+---
+
+### `PATCH /v1/api/admin/memories/{memory_id}` (Console)
+
+Replace the authored one-line index hook (1-512 characters) without changing
+the memory body. Records `memory.description_update`. Existing immutable
+snapshots remain unchanged.
+
+```json
+{"description": "Updated retrieval hook"}
+```
+
+Returns the updated body-free `AdminMemorySummary`:
+
+```json
+{
+  "memory_id": "a1b2c3d4-e5f6-...",
+  "name": "project_architecture",
+  "description": "Updated retrieval hook",
+  "type": "general",
+  "scope": "global",
+  "scope_id": "",
+  "scope_label": "",
+  "created": "2026-03-10T10:00:00",
+  "updated": "2026-03-14T09:00:00",
+  "last_accessed": "",
+  "access_count": 0
+}
+```
+
+Invalid descriptions return `400`, missing memories return `404`, storage
+operation failures return `500`, and unavailable storage returns `503`.
+
+---
+
+### `GET /v1/api/admin/memories/index-health` (Console)
+
+Return derived, persistent health for every visibility envelope possible in
+the live workstream/project topology. The result is independent of whether a
+snapshot row already exists and reports the configured character budget, worst
+complete live index, overage, and legacy descriptions that need editing.
+
+```json
+{
+  "budget_chars": 65536,
+  "over_budget": false,
+  "max_char_count": 18420,
+  "max_entry_count": 210,
+  "over_by_chars": 0,
+  "invalid_description_count": 0,
+  "envelope_count": 3
+}
+```
+
+Calculation failures return `500`; unavailable storage returns `503`.
 
 ---
 

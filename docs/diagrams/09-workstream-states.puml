@@ -19,7 +19,7 @@ state "ATTENTION" as attention <<attention>> : Blocked on user action.\nTool app
 state "ERROR" as error <<error>> : Exception occurred.\nRecoverable on next send().
 state "CLOSED (persisted only)" as closed <<lifecycle>> : Unloaded, explicitly reopenable row.\nNot a live WorkstreamState member.
 
-[*] --> creating : register exact incarnation\nstate="creating"
+[*] --> creating : reserve live id\nstate="creating"
 creating --> idle : finalize + publish create\nemit ws_created
 creating --> [*] : immediate exact-token rollback\n(no lifecycle birth emitted)
 creating --> [*] : stale >2h recovery\natomic hard delete; no close event
@@ -51,6 +51,12 @@ running --> closed : close\n[journal reconciled]
 attention --> closed : close\n[journal reconciled]
 closed --> [*] : hard delete
 closed --> idle : open / rehydrate
+
+note right of creating
+  The workstreams primary key reserves the ID while this row exists.
+  Rollback, stale-create reap, and hard deletion release it for reuse
+  after owned state is removed in the same transaction.
+end note
 
 note right of closed
   Before every soft-close / eviction transition,
