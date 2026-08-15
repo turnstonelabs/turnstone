@@ -8,9 +8,13 @@ export function normalizeMemoryDescription(description: unknown): string {
       "memory description is required and must be non-empty",
     );
   }
-  const normalized = description
-    .replace(DESCRIPTION_WHITESPACE, " ")
-    .replace(/^ +| +$/g, "");
+  let normalized = description.replace(DESCRIPTION_WHITESPACE, " ");
+  if (normalized.startsWith(" ")) {
+    normalized = normalized.slice(1);
+  }
+  if (normalized.endsWith(" ")) {
+    normalized = normalized.slice(0, -1);
+  }
   if (!normalized) {
     throw new TypeError(
       "memory description is required and must be non-empty",
