@@ -131,6 +131,9 @@ class _DurabilitySession(FakeSession):
         self.shutdown_entered.set()
         ChatSession.shutdown_publication_and_drain_durability(self)  # type: ignore[arg-type]
 
+    def resolve_close_approvals(self) -> None:
+        pass
+
 
 class _ReplaceAfterSnapshotStorage(FakeStorage):
     """Replace A immediately after returning its first open snapshot."""

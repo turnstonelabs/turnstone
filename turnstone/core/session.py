@@ -193,7 +193,10 @@ from turnstone.core.preview import (
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.session_worker import WorkerClaim, current_worker_claim
-from turnstone.core.settings_registry import DEFAULT_AUTO_COMPACT_PCT
+from turnstone.core.settings_registry import (
+    DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+    DEFAULT_AUTO_COMPACT_PCT,
+)
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage import (
@@ -10492,6 +10495,11 @@ class ChatSession:
                 structural_condition.notify_all()
             durability_high_water = self._durability_next_ticket
 
+        # Hard delete is terminal even when its durable outcome is ambiguous.
+        # Wake registered cycles and pre-cycle Smart Approval waits here: the
+        # retained-tombstone path deliberately skips ordinary UI cleanup.
+        self.resolve_close_approvals()
+
         terminal_error: BaseException | None = None
         if structural_debt is not None:
             try:
@@ -11491,8 +11499,9 @@ class ChatSession:
                             "needs_approval": True,
                             # Synchronization-only state. SessionUIBase projects
                             # approval items through an explicit wire allowlist,
-                            # so this witness never crosses SSE / persistence.
+                            # so these fields never cross SSE / persistence.
                             "_approval_cancel_witness": budget_cancel_witness,
+                            "_approval_wait_seconds": self._approval_wait_seconds(),
                         }
                     ]
                 )
@@ -17535,17 +17544,28 @@ class ChatSession:
     # Phase 2 — approve: display all previews, single prompt (serial)
     # Phase 3 — execute: run approved tools (parallel if multiple)
 
+    def _approval_wait_seconds(self) -> float | None:
+        """Resolve the live human-approval deadline; zero means unbounded."""
+        timeout_seconds = DEFAULT_APPROVAL_TIMEOUT_SECONDS
+        if self._config_store is not None:
+            timeout_seconds = self._config_store.get(
+                "tools.approval_timeout_seconds",
+                DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+            )
+        return float(timeout_seconds) if timeout_seconds > 0 else None
+
     def _push_smart_approval_config(self, items: list[dict[str, Any]]) -> None:
         """Stamp one coherent live Smart Approvals config on a gate batch.
 
         Called just before EVERY ``approve_tools`` — the main loop's and
         each sub-agent gate's — so a hot-reloaded ``judge.*`` change
-        takes effect on the next batch whichever path gates it.  The snapshot
+        takes effect on the next batch whichever path gates it. The snapshot
         rides the private prepared-item channel so parallel task-agent gates
-        cannot combine fields from different hot-reload generations.  Only
+        cannot combine fields from different hot-reload generations. Only
         SessionUIBase carries this gate; CLI/eval UIs keep their own approval
-        behavior.  The feature stays inert unless both the judge and Smart
-        Approvals are enabled in this exact snapshot.
+        behavior. The feature stays inert unless both the judge and Smart
+        Approvals are enabled in this exact snapshot. The same private batch
+        channel carries the independently resolved human wait deadline.
         """
         from turnstone.core.session_ui_base import SessionUIBase, _SmartApprovalConfig
 
@@ -17556,8 +17576,10 @@ class ChatSession:
                 threshold=jc.confidence_threshold if jc is not None else 0.95,
                 wait_seconds=jc.timeout if jc is not None else 0.0,
             )
+            approval_wait_seconds = self._approval_wait_seconds()
             for item in items:
                 item["_smart_approval_config"] = snapshot
+                item["_approval_wait_seconds"] = approval_wait_seconds
 
     def _execute_tools(
         self,

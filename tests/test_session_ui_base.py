@@ -2829,6 +2829,61 @@ def _wait_for_cycles(ui: SessionUIBase, count: int, deadline: float = 5.0) -> No
     raise AssertionError(f"never saw {count} live cycles")
 
 
+def test_zero_approval_timeout_waits_until_explicit_resolution() -> None:
+    """The registry's zero sentinel reaches ``Event.wait`` as ``None``."""
+    ui = _make_ui()
+    item = _pending_item("no-timeout")
+    item["_approval_wait_seconds"] = None
+
+    with _gate_harness(ui) as spawn:
+        gate, outcome = spawn(item)
+        _wait_for_cycles(ui, 1)
+        assert gate.is_alive(), "zero was passed through as an immediate timeout"
+        assert ui.resolve_approval(True, "approved later", call_id="no-timeout") is not None
+        gate.join(timeout=2.0)
+
+    assert not gate.is_alive()
+    assert outcome == {"approved": True, "feedback": "approved later"}
+
+
+def test_hard_delete_terminal_barrier_wakes_unbounded_approval() -> None:
+    """The hard-delete barrier signals gates after advancing their witness."""
+    from tests._session_helpers import make_session
+    from turnstone.core.session import _ApprovalCancelWitness
+
+    session = make_session(ws_id="hard-delete-approval")
+    ui = session.ui
+    item = _pending_item("hard-delete-call")
+    item["_approval_cancel_witness"] = _ApprovalCancelWitness(session)
+    item["_approval_wait_seconds"] = None
+
+    with _gate_harness(ui) as spawn:
+        gate, outcome = spawn(item)
+        _wait_for_cycles(ui, 1)
+        session.shutdown_publication_and_drain_durability()
+        gate.join(timeout=2.0)
+
+    assert not gate.is_alive()
+    assert outcome == {"approved": False, "feedback": "Workstream closed"}
+    assert ui._approval_cycles == {}
+
+
+def test_finite_approval_timeout_uses_captured_batch_value() -> None:
+    """A positive setting retains passive denial and its exact audit text."""
+    ui = _make_ui()
+    item = _pending_item("finite-timeout")
+    item["_approval_wait_seconds"] = 0.01
+
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        approved, feedback = ui.approve_tools([item])
+
+    assert approved is False
+    assert feedback == "Approval timed out after 0.01s"
+    assert item["denied"] is True
+    assert item["denial_msg"] == "Denied by user: Approval timed out after 0.01s"
+    assert ui._recent_decisions["finite-timeout"] == ("timeout", None)
+
+
 def test_concurrent_gates_resolve_independently() -> None:
     """THE cross-approval regression: two parallel gates, two separate
     decisions.  Approving A's cycle must not wake B, and B's later
@@ -4037,8 +4092,8 @@ def test_concurrent_smart_gate_and_human_gate() -> None:
         assert box_a["approved"] is True
 
 
-def test_chat_session_stamps_one_smart_config_snapshot_without_mutating_ui() -> None:
-    """The gate producer copies one JudgeConfig generation onto every item."""
+def test_chat_session_stamps_live_approval_config_without_mutating_ui() -> None:
+    """Each batch captures Smart settings plus the current human deadline."""
     from turnstone.core.judge import JudgeConfig
     from turnstone.core.session import ChatSession
 
@@ -4054,13 +4109,30 @@ def test_chat_session_stamps_one_smart_config_snapshot_without_mutating_ui() -> 
         confidence_threshold=0.87,
         timeout=4.5,
     )
+    session._config_store = MagicMock()
+    session._config_store.get.return_value = 0
+    session._approval_wait_seconds.side_effect = lambda: ChatSession._approval_wait_seconds(session)
     items = [_pending_item("snapshot-a"), _pending_item("snapshot-b")]
 
     ChatSession._push_smart_approval_config(session, items)
 
     snapshot = items[0]["_smart_approval_config"]
-    assert snapshot == _SmartApprovalConfig(enabled=True, threshold=0.87, wait_seconds=4.5)
+    assert snapshot == _SmartApprovalConfig(
+        enabled=True,
+        threshold=0.87,
+        wait_seconds=4.5,
+    )
     assert items[1]["_smart_approval_config"] is snapshot
+    assert items[0]["_approval_wait_seconds"] is None
+    assert items[1]["_approval_wait_seconds"] is None
+
+    # A hot reload affects the next gate but cannot mutate this batch's
+    # already-captured immutable deadline.
+    session._config_store.get.return_value = 90_000
+    next_items = [_pending_item("snapshot-next")]
+    ChatSession._push_smart_approval_config(session, next_items)
+    assert next_items[0]["_approval_wait_seconds"] == 90_000.0
+    assert items[0]["_approval_wait_seconds"] is None
     assert (
         ui.smart_approvals_enabled,
         ui.smart_approval_threshold,

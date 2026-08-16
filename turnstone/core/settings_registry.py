@@ -9,6 +9,7 @@ excluded — they are needed before storage is available.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +37,12 @@ class SettingDef:
 # with the ChatSession constructor (default + sub-0.1 coercion fallback) so the
 # "invalid → default" behavior cannot drift between the registry and the engine.
 DEFAULT_AUTO_COMPACT_PCT = 0.8
+
+# A human approval is an operator-owned wait, not an execution deadline. Zero
+# disables passive timeout denial; cancel/close still wakes every pending gate.
+# Shared with ChatSession so the registry default and the value stamped onto
+# approval batches cannot drift.
+DEFAULT_APPROVAL_TIMEOUT_SECONDS = 0
 
 
 def _build_registry() -> dict[str, SettingDef]:
@@ -193,6 +200,19 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools",
             min_value=1,
             max_value=3600,
+        ),
+        SettingDef(
+            "tools.approval_timeout_seconds",
+            "int",
+            DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+            "Human approval timeout in seconds (0 = wait indefinitely)",
+            "tools",
+            min_value=0,
+            max_value=int(threading.TIMEOUT_MAX),
+            help="How long a workstream waits for an operator to approve or deny a "
+            "pending action. The default 0 waits until someone decides or the "
+            "workstream is cancelled or closed. Set 3600 to restore the previous "
+            "one-hour timeout.",
         ),
         SettingDef(
             "tools.truncation",

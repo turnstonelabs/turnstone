@@ -2179,7 +2179,7 @@ class SessionUIBase:
         7. Check the batch's private cancellation witness around every
            pre-cycle wait/publication, register an :class:`ApprovalCycle`,
            re-check once more, emit its ``approve_request`` card, and block on
-           the CYCLE's event up to ``_APPROVAL_WAIT_TIMEOUT``.
+           the CYCLE's event up to the batch's configured human wait deadline.
 
         ``__budget_override__`` is interactive-only today (coord
         workstreams don't have token budgets), but the carve-out check
@@ -2218,10 +2218,10 @@ class SessionUIBase:
                 self._end_approval_admission()
 
         # Production ChatSession gates carry the coherent judge-config
-        # snapshot captured for THIS batch.  Parallel task-agent gates may be
+        # snapshot captured for THIS batch. Parallel task-agent gates may be
         # queued while another batch observes a hot reload; reading mutable UI
         # attributes here would let one gate combine the other's enabled flag,
-        # threshold, and timeout.  Direct/legacy UI callers do not stamp the
+        # threshold, and timeout. Direct/legacy UI callers do not stamp the
         # private field, so retain their established instance-attribute path.
         stamped_configs = [it.get("_smart_approval_config") for it in items]
         if any(isinstance(cfg, _SmartApprovalConfig) for cfg in stamped_configs):
@@ -2240,6 +2240,17 @@ class SessionUIBase:
                 self.smart_approval_threshold,
                 self.smart_approval_wait_seconds,
             )
+
+        # The independently configured human wait uses the same immutable
+        # per-item channel. Every member must carry one identical value; a
+        # partial/mixed stamp falls back to the historical one-hour deadline.
+        approval_wait_seconds: float | None = float(self._APPROVAL_WAIT_TIMEOUT)
+        if items and all("_approval_wait_seconds" in item for item in items):
+            candidate = items[0]["_approval_wait_seconds"]
+            if all(item["_approval_wait_seconds"] == candidate for item in items) and (
+                candidate is None or isinstance(candidate, (int, float))
+            ):
+                approval_wait_seconds = float(candidate) if candidate is not None else None
 
         # The batch's judge generation, stamped by ``_evaluate_intent`` —
         # one event per spawn, shared by every item in the batch.  Read
@@ -2579,17 +2590,21 @@ class SessionUIBase:
         for persist in deferred_auto_audit:
             persist()
         try:
-            if not cycle.event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
+            if not cycle.event.wait(timeout=approval_wait_seconds):
+                # ``Event.wait(None)`` only returns after the event is set.
+                # Reaching this branch therefore proves a finite deadline.
+                assert approval_wait_seconds is not None
                 # Approval timed out (e.g., user disconnected). Deny via
                 # resolve_approval so verdicts and state are updated
                 # consistently — targeted at THIS cycle so a sibling gate
                 # timing out can't deny someone else's round.  Feedback
-                # string derives from ``_APPROVAL_WAIT_TIMEOUT`` so the
-                # text follows the constant if the timeout knob moves.
+                # derives from this cycle's immutable config snapshot so a
+                # hot reload cannot make the audit text disagree with the
+                # deadline that actually fired.
                 log.warning("Approval timed out for ws_id=%s", self.ws_id)
                 self.resolve_approval(
                     False,
-                    f"Approval timed out after {self._APPROVAL_WAIT_TIMEOUT}s",
+                    f"Approval timed out after {approval_wait_seconds:g}s",
                     timeout=True,
                     cycle_id=cycle.cycle_id,
                 )
@@ -2881,11 +2896,9 @@ class SessionUIBase:
     # can't grow unbounded. FIFO eviction on insert.
     _LLM_VERDICT_CACHE_MAX = 50
 
-    # Hard cap on how long a worker thread blocks waiting for an
-    # approval decision. Subclasses' ``approve_tools`` references this
-    # rather than the literal so a future
-    # ``settings.approval_timeout_seconds`` knob can swap it in one
-    # place.
+    # Compatibility fallback for direct/legacy SessionUIBase callers whose
+    # items were not produced by ChatSession. Production batches carry the
+    # live ``tools.approval_timeout_seconds`` value per private approval item.
     _APPROVAL_WAIT_TIMEOUT = 3600
 
     def on_intent_verdict(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from turnstone.core.settings_registry import (
@@ -53,6 +55,29 @@ class TestValidateKey:
         assert defn.default is False  # opt-in: off by default
         assert defn.section == "judge"
         assert "judge.smart_approvals" in SETTINGS
+
+    def test_approval_timeout_defaults_to_waiting_indefinitely(self):
+        defn = validate_key("tools.approval_timeout_seconds")
+        assert defn.type == "int"
+        assert defn.default == 0
+        assert defn.min_value == 0
+        assert defn.max_value == int(threading.TIMEOUT_MAX)
+        assert defn.section == "tools"
+        assert "0 = wait indefinitely" in defn.description
+
+        assert validate_value("tools.approval_timeout_seconds", 0) == 0
+        assert validate_value("tools.approval_timeout_seconds", "90000") == 90_000
+        assert validate_value(
+            "tools.approval_timeout_seconds",
+            int(threading.TIMEOUT_MAX),
+        ) == int(threading.TIMEOUT_MAX)
+        with pytest.raises(ValueError, match="minimum"):
+            validate_value("tools.approval_timeout_seconds", -1)
+        with pytest.raises(ValueError, match="maximum"):
+            validate_value(
+                "tools.approval_timeout_seconds",
+                int(threading.TIMEOUT_MAX) + 1,
+            )
 
     def test_memory_index_over_budget_notice_is_opt_in(self):
         defn = validate_key("memory.model_index_over_budget_notice")

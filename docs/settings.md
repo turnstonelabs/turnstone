@@ -36,6 +36,21 @@ users to the admin Settings API.
 
 ---
 
+## Approval Wait Timeout
+
+`tools.approval_timeout_seconds` controls how long a workstream waits for a
+human approval decision. The default `0` disables passive timeout denial: the
+workstream waits until an authorized user approves or rejects the request, or
+until the workstream is cancelled or closed. Set `3600` to restore the previous
+one-hour behavior.
+
+The value is captured when each approval batch begins. A hot reload therefore
+affects the next approval without changing the deadline of a request already
+waiting. This setting does not make approvals durable across process restarts;
+pending approval cycles remain in memory.
+
+---
+
 ## Per-Model Sampling Overrides
 
 The global `model.temperature`, `model.max_tokens`, and `model.reasoning_effort`
@@ -253,7 +268,7 @@ initialization:
 |---------|----------|
 | `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
-| `tools` | timeout, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
+| `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |
 | `cluster` | node_fan_out_limit, mcp_max_servers |
 | `mcp` | config_path, registry_url |
@@ -463,8 +478,8 @@ reload.
 - New workstreams pick up updated values immediately (via `session_factory`)
 - Most workstream/session settings remain the snapshot captured at creation or
   resume. Component docs call out deliberate live-read exceptions; for
-  example, Smart Approval settings are snapshotted coherently at the start of
-  each approval batch.
+  example, Smart Approval settings and the human approval timeout are
+  snapshotted at the start of each approval batch.
 - Settings marked `restart_required=True` need a server restart to take effect
 
 ### Model-definition reloads
