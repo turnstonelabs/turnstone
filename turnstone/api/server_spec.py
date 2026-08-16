@@ -103,11 +103,12 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             "Unloads the live workstream while preserving storage. Returns 409 "
             "when any accepted live conversation row still requires persistence "
             "reconciliation; the workstream remains loaded and its history journal "
-            "is retained."
+            "is retained. Returns 503 when cancellation cleanup has not yet "
+            "finished; retrying close is safe."
         ),
         request_model=CloseWorkstreamRequest,
         response_model=StatusResponse,
-        error_codes=[400, 404, 409],
+        error_codes=[400, 404, 409, 503],
         tags=["Workstreams"],
     ),
     # --- Chat ---

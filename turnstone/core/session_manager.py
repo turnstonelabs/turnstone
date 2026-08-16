@@ -10,6 +10,7 @@ persistence, per-ws lock refcount for concurrent lazy rehydrate.
 from __future__ import annotations
 
 import contextlib
+import enum
 import functools
 import threading
 import time
@@ -39,6 +40,15 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
+class CloseOutcome(enum.Enum):
+    """Detailed soft-close result for callers that expose refusal reasons."""
+
+    CLOSED = "closed"
+    NOT_FOUND = "not_found"
+    UNRESOLVED_PERSISTENCE = "unresolved_persistence"
+    CLEANUP_PENDING = "cleanup_pending"
+
+
 def _session_has_unresolved_persistence(session: Any) -> bool:
     """Read the concrete ChatSession hook without MagicMock auto-vivification.
 
@@ -47,6 +57,12 @@ def _session_has_unresolved_persistence(session: Any) -> bool:
     Retirement scans use :func:`_session_persistence_blocks_retirement`.
     """
     check = concrete_method(session, "has_unresolved_conversation_persistence")
+    return bool(check()) if check is not None else False
+
+
+def _session_has_tool_structural_debt(session: Any) -> bool:
+    """Read the concrete structural-cleanup hook after close preparation."""
+    check = concrete_method(session, "has_tool_structural_debt")
     return bool(check()) if check is not None else False
 
 
@@ -1918,30 +1934,34 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     def close(self, ws_id: str) -> bool:
-        """Soft-close one incarnation on the stable per-id lifecycle lane."""
+        """Soft-close one incarnation, preserving the historical bool API."""
+        return self.close_with_outcome(ws_id) is CloseOutcome.CLOSED
+
+    def close_with_outcome(self, ws_id: str) -> CloseOutcome:
+        """Soft-close on the stable per-id lane and retain refusal detail."""
         with self._id_lifecycle(ws_id):
             return self._close_serialized(ws_id)
 
-    def _close_serialized(self, ws_id: str) -> bool:
+    def _close_serialized(self, ws_id: str) -> CloseOutcome:
         """Soft-close: unload from memory + mark state=closed in storage.
 
-        Returns ``True`` when a live workstream was removed,
-        ``False`` if the id wasn't tracked.
+        The detailed result lets HTTP callers distinguish an unresolved
+        durability conflict from bounded cleanup that has not finished yet.
         """
         with self._lock:
             ws = self._workstreams.get(ws_id)
             if ws is None:
-                return False
+                return CloseOutcome.NOT_FOUND
             if (
                 ws._create_publication_active
                 and ws._create_publication_thread == threading.get_ident()
             ):
-                return False
+                return CloseOutcome.NOT_FOUND
 
         with ws._lifecycle_lock:
             with self._lock:
                 if self._workstreams.get(ws_id) is not ws:
-                    return False
+                    return CloseOutcome.NOT_FOUND
             # Close admission must become terminal to dispatch before the
             # session fence begins. ``prepare_soft_close`` may wait for an
             # admitted durability batch; leaving ``_closed`` false across that
@@ -1951,18 +1971,30 @@ class SessionManager:
             # this the linearization point for close versus dispatch.
             with ws._lock:
                 if ws._closed:
-                    return False
+                    return CloseOutcome.NOT_FOUND
                 ws._closed = True
                 ws._state_revision += 1
 
             prepared = False
             try:
                 if not _session_prepare_soft_close(ws.session):
-                    # An accepted conversation row is still unresolved.
-                    # Removing the sole live handoff journal would make that
-                    # row disappear on reopen; retain the exact workstream so
-                    # storage recovery can reconcile it idempotently.
-                    return False
+                    # The first failed fence wins the response classification.
+                    # Structural debt means a cancelled turn still needs to
+                    # journal its terminal TOOL receipts. Otherwise preserve
+                    # the historical durability-conflict classification when
+                    # the accepted conversation row is still unresolved.
+                    if _session_has_tool_structural_debt(ws.session):
+                        outcome = CloseOutcome.CLEANUP_PENDING
+                    elif _session_has_unresolved_persistence(ws.session):
+                        outcome = CloseOutcome.UNRESOLVED_PERSISTENCE
+                    else:
+                        outcome = CloseOutcome.CLEANUP_PENDING
+                    log.warning(
+                        "session_mgr.close_refused ws=%s reason=%s",
+                        ws_id[:8],
+                        outcome.value,
+                    )
+                    return outcome
                 prepared = True
             finally:
                 if not prepared:
@@ -1976,7 +2008,7 @@ class SessionManager:
                         ws._state_revision += 1
             with self._lock:
                 if self._workstreams.get(ws_id) is not ws:
-                    return False
+                    return CloseOutcome.NOT_FOUND
                 self._workstreams.pop(ws_id, None)
                 was_unadvertised = self._pending_creates.get(ws_id) is ws
                 if was_unadvertised:
@@ -1999,7 +2031,7 @@ class SessionManager:
                     self._persist_closed_state(ws)
             if self._event_emitter is not None and not was_unadvertised:
                 self._event_emitter.emit_closed(ws_id, name=ws.name)
-            return True
+            return CloseOutcome.CLOSED
 
     def set_state(
         self,

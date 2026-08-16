@@ -12,11 +12,14 @@ import pytest
 from tests._session_helpers import (
     arm_session,
     make_registered_session,
+    make_result,
     make_session,
     provider_shell,
     replace_session_lane,
     scripted_chat_client,
 )
+from turnstone.cli import WorkstreamTerminalUI
+from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.core.providers import (
     IncompleteStreamError,
     StreamChunk,
@@ -294,6 +297,17 @@ class TestCancelEvent:
         session.cancel()
         session.cancel()  # Double call is harmless
         assert session._cancel_event.is_set()
+
+    def test_close_approval_sweep_preserves_legacy_single_slot_wake(self, tmp_db):
+        ui = NullUI()
+        ui._approval_event = threading.Event()
+        ui._approval_result = (True, "stale")
+        session = _make_session(ui=ui)
+
+        session.resolve_close_approvals()
+
+        assert ui._approval_event.is_set()
+        assert ui._approval_result == (False, None)
 
     def test_cancel_event_cleared_on_send_start(self, tmp_db):
         """send() clears a stale cancel flag before starting."""
@@ -907,6 +921,167 @@ class TestTaskAgentStreamAbort:
         assert isinstance(outcomes[0], GenerationCancelled)
         executor.assert_not_called()
         assert ui._approval_cycles == {}
+
+    def test_soft_close_wakes_main_tool_approval_before_structural_wait(self, tmp_db):
+        """Soft close lets the owning send journal denied TOOL receipts.
+
+        The accepted assistant row owns structural debt before the manual
+        approval gate opens. Cancellation alone advances the gate witness but
+        does not wake its wait; preparation must sweep approvals before it
+        waits for the worker to synthesize the matching TOOL receipt.
+        """
+        ui = ConsoleCoordinatorUI(ws_id="ws-soft-close-gate", user_id="u1")
+        session = _make_registered_session(
+            ui=ui,
+            ws_id="ws-soft-close-gate",
+            user_id="u1",
+        )
+        session._title_generated = True
+        tool_call = {
+            "id": "call-soft-close",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }
+        executor = MagicMock(return_value=("call-soft-close", "must not run"))
+        send_errors: list[BaseException] = []
+
+        def _prepare(tc: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "call_id": tc["id"],
+                "func_name": "read_file",
+                "header": "Read file",
+                "preview": "",
+                "needs_approval": True,
+                "execute": executor,
+            }
+
+        def _send() -> None:
+            try:
+                session.send("use the tool", acting_user_id="u1")
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                send_errors.append(exc)
+
+        with (
+            patch.object(
+                session,
+                "_stream_response",
+                return_value=make_result(tool_calls=[tool_call]),
+            ),
+            patch.object(session, "_prepare_tool", side_effect=_prepare),
+            patch.object(session, "_evaluate_intent", return_value=None),
+            patch("turnstone.core.policy.evaluate_tool_policies_batch", return_value={}),
+        ):
+            worker = threading.Thread(target=_send, daemon=True)
+            worker.start()
+            try:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    with ui._ws_lock:
+                        if ui._approval_cycles:
+                            break
+                    time.sleep(0.005)
+                with ui._ws_lock:
+                    assert len(ui._approval_cycles) == 1
+                assert session.has_tool_structural_debt() is True
+
+                assert session.prepare_soft_close() is True
+                worker.join(2)
+            finally:
+                session.cancel()
+                ui.resolve_all_approvals(False, "test teardown")
+                worker.join(2)
+
+        assert not worker.is_alive()
+        assert send_errors == []
+        executor.assert_not_called()
+        assert ui._approval_cycles == {}
+        assert session.has_tool_structural_debt() is False
+        assert [turn.role for turn in session.messages][-2:] == [Role.ASSISTANT, Role.TOOL]
+
+    def test_soft_close_cancels_background_cli_approval_without_prompt(self, tmp_db):
+        """A background CLI gate observes close without changing foreground.
+
+        WorkstreamTerminalUI parks on ``_fg_event`` until its workstream is
+        selected. Soft close must still let the worker journal its denied TOOL
+        receipt, but setting the foreground event as the wake mechanism would
+        corrupt live UI state if durability later refused the close.
+        """
+        manager = MagicMock()
+        manager.active_id = "another-workstream"
+        manager.set_state_deferred.return_value = True
+        ui = WorkstreamTerminalUI("cli-background-close", manager)
+        ui.set_foreground(False)
+        session = _make_registered_session(
+            ui=ui,
+            ws_id="cli-background-close",
+        )
+        session._title_generated = True
+        tool_call = {
+            "id": "call-cli-close",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }
+        executor = MagicMock(return_value=("call-cli-close", "must not run"))
+        send_errors: list[BaseException] = []
+
+        def _prepare(tc: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "call_id": tc["id"],
+                "func_name": "read_file",
+                "header": "Read file",
+                "preview": "",
+                "needs_approval": True,
+                "execute": executor,
+            }
+
+        def _send() -> None:
+            try:
+                session.send("use the tool")
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                send_errors.append(exc)
+
+        with (
+            patch.object(
+                session,
+                "_stream_response",
+                return_value=make_result(tool_calls=[tool_call]),
+            ),
+            patch.object(session, "_prepare_tool", side_effect=_prepare),
+            patch.object(session, "_evaluate_intent", return_value=None),
+            patch("turnstone.core.policy.evaluate_tool_policies_batch", return_value={}),
+            patch("builtins.input", return_value="y") as prompt,
+        ):
+            worker = threading.Thread(target=_send, daemon=True)
+            worker.start()
+            try:
+                deadline = time.monotonic() + 2
+                waiting = False
+                while time.monotonic() < deadline:
+                    with ui._print_lock:
+                        waiting = any(
+                            event_type == "info" and "Waiting for approval" in text
+                            for event_type, text in ui._output_buffer
+                        )
+                    if waiting and session.has_tool_structural_debt():
+                        break
+                    time.sleep(0.005)
+                assert waiting is True
+                assert session.has_tool_structural_debt() is True
+                assert ui._fg_event.is_set() is False
+
+                assert session.prepare_soft_close() is True
+                worker.join(2)
+            finally:
+                session.cancel()
+                ui._fg_event.set()
+                worker.join(2)
+
+        assert not worker.is_alive()
+        assert send_errors == []
+        prompt.assert_not_called()
+        executor.assert_not_called()
+        assert session.has_tool_structural_debt() is False
+        assert [turn.role for turn in session.messages][-2:] == [Role.ASSISTANT, Role.TOOL]
 
     def test_stop_at_task_agent_approval_folds_confirmed_no_effect(self, tmp_db):
         """Stop at consent records a denied, never-executed child as NONE.

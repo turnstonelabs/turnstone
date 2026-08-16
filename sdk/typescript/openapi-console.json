@@ -5626,6 +5626,16 @@
               }
             }
           },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "502": {
             "description": "Error 502",
             "content": {
@@ -6942,7 +6952,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Releases the worker thread + UI listeners and marks the row ``state=closed`` in storage.  The row remains queryable (audit / history) but cannot be reopened \u2014 a closed coordinator is terminal from the manager's perspective. Returns 409 while an accepted live conversation row still requires persistence reconciliation; the coordinator remains loaded and its history journal is retained.",
+        "description": "Releases the worker thread + UI listeners and marks the row ``state=closed`` in storage.  The row remains queryable (audit / history) but cannot be reopened \u2014 a closed coordinator is terminal from the manager's perspective. Returns 409 while an accepted live conversation row still requires persistence reconciliation; the coordinator remains loaded and its history journal is retained. Returns 503 when cancellation cleanup has not yet finished; retrying close is safe.",
         "parameters": [
           {
             "name": "ws_id",

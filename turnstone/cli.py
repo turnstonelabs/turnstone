@@ -158,11 +158,20 @@ class TerminalUI(SessionUI):
         sys.stdout.write("\n")
         sys.stdout.flush()
 
+    @staticmethod
+    def _approval_was_cancelled(items: list[dict[str, Any]]) -> bool:
+        """Whether a close/Stop retired the operation owning this gate."""
+        return any(
+            bool(getattr(item.get("_approval_cancel_witness"), "aborted", False)) for item in items
+        )
+
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         """Display tool previews and prompt for batch approval.
 
         Returns (approved: bool, feedback: str | None).
         """
+        if self._approval_was_cancelled(items):
+            return False, "Cancelled by user"
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         # Evaluate admin tool policies (deny/allow/ask) before prompting.
@@ -194,6 +203,12 @@ class TerminalUI(SessionUI):
                         ]
             except Exception:
                 logging.getLogger(__name__).debug("Policy evaluation unavailable", exc_info=True)
+
+        # Policy lookup is the one potentially blocking step before the prompt.
+        # Recheck ownership so a close that landed during storage I/O cannot
+        # paint or solicit approval for a retired tool batch.
+        if self._approval_was_cancelled(items):
+            return False, "Cancelled by user"
 
         with self._print_lock:
             # Print all headers, previews, and heuristic verdicts
@@ -542,7 +557,14 @@ class WorkstreamTerminalUI(TerminalUI):
             )
             if tool_names:
                 self._buffer("info", f"{YELLOW}Waiting for approval: {tool_names}{RESET}")
-            self._fg_event.wait()
+            # Foreground state is persistent, so close must not set this event
+            # merely to wake us: a later durability refusal would leave a live
+            # background workstream acting foregrounded. Poll the gate's
+            # monotonic cancellation witness instead; the bounded interval is
+            # comfortably inside soft-close's structural grace period.
+            while not self._fg_event.wait(timeout=0.05):
+                if self._approval_was_cancelled(items):
+                    return False, "Cancelled by user"
         return super().approve_tools(items)
 
     def flush_buffer(self) -> None:

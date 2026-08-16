@@ -29,7 +29,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from turnstone.core.model_registry import ModelClientConstructionError, UnknownModelAliasError
-from turnstone.core.session_manager import SessionKindAdapter, SessionManager
+from turnstone.core.session_manager import CloseOutcome, SessionKindAdapter, SessionManager
 from turnstone.core.workstream import (
     BULK_CLOSE_STATE_VALUES,
     Workstream,
@@ -1592,6 +1592,7 @@ def test_close_last_workstream_succeeds() -> None:
 
 def test_close_unknown_returns_false() -> None:
     mgr, _, _ = _make_manager()
+    assert mgr.close_with_outcome("not-there") is CloseOutcome.NOT_FOUND
     closed = mgr.close("not-there")
     assert closed is False
 

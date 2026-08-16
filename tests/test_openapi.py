@@ -88,6 +88,8 @@ class TestServerSpec:
         assert "history_resync" in events["description"]
         assert "numeric event replay is not a substitute" in events["description"]
         assert "accepted live conversation row" in close["description"]
+        assert "cancellation cleanup" in close["description"]
+        assert "503" in close["responses"]
         assert "handoff_token" in history_schema["properties"]
         assert (
             "Admission of a later row changes the token"
@@ -286,6 +288,8 @@ class TestConsoleSpec:
         assert "history_resync" in events["description"]
         assert "numeric replay is not a substitute" in events["description"]
         assert "accepted live conversation row" in close["description"]
+        assert "cancellation cleanup" in close["description"]
+        assert "503" in close["responses"]
 
     def test_routing_paths_and_extended_response_contracts(self):
         from turnstone.api.console_spec import build_console_spec
@@ -301,6 +305,7 @@ class TestConsoleSpec:
 
         coordinator_approve = paths["/v1/api/workstreams/{ws_id}/approve"]["post"]
         coordinator_cancel = paths["/v1/api/workstreams/{ws_id}/cancel"]["post"]
+        routed_close = paths["/v1/api/route/workstreams/{ws_id}/close"]["post"]
         assert coordinator_approve["responses"]["200"]["content"]["application/json"]["schema"] == {
             "$ref": "#/components/schemas/ApproveResponse"
         }
@@ -308,6 +313,7 @@ class TestConsoleSpec:
             "$ref": "#/components/schemas/CancelResponse"
         }
         assert coordinator_cancel["requestBody"]["required"] is False
+        assert "409" in routed_close["responses"]
 
     def test_route_create_and_live_contracts(self):
         from turnstone.api.console_spec import build_console_spec

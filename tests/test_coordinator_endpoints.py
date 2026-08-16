@@ -1145,6 +1145,7 @@ def test_close_returns_409_when_unresolved_persistence_refuses_unload(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     ws.session.prepare_soft_close = MagicMock(return_value=False)
+    ws.session.has_unresolved_conversation_persistence = MagicMock(return_value=True)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
     resp = client.post(f"/v1/api/workstreams/{ws.id}/close", headers=_COORD_HEADERS)
@@ -1152,6 +1153,24 @@ def test_close_returns_409_when_unresolved_persistence_refuses_unload(storage):
     assert resp.status_code == 409
     assert resp.json() == {"error": "workstream has unresolved persistence"}
     assert mgr.get(ws.id) is ws
+
+
+def test_close_returns_503_when_structural_cleanup_refuses_unload(storage, caplog):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    ws.session.prepare_soft_close = MagicMock(return_value=False)
+    ws.session.has_tool_structural_debt = MagicMock(return_value=True)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/close", headers=_COORD_HEADERS)
+
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "workstream cleanup is still in progress; try again shortly"}
+    assert mgr.get(ws.id) is ws
+    assert any(
+        "session_mgr.close_refused" in record.message and "cleanup_pending" in record.message
+        for record in caplog.records
+    )
 
 
 def test_approve_resolves_ui_event(storage):

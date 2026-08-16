@@ -167,7 +167,7 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Unloads the live workstream while preserving storage. Returns 409 when any accepted live conversation row still requires persistence reconciliation; the workstream remains loaded and its history journal is retained.",
+        "description": "Unloads the live workstream while preserving storage. Returns 409 when any accepted live conversation row still requires persistence reconciliation; the workstream remains loaded and its history journal is retained. Returns 503 when cancellation cleanup has not yet finished; retrying close is safe.",
         "parameters": [
           {
             "name": "ws_id",
@@ -221,6 +221,16 @@
           },
           "409": {
             "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {

@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 import turnstone.server as srv_mod
 from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
 from turnstone.core.metrics import MetricsCollector
+from turnstone.core.session_manager import CloseOutcome
 from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.workstream import WorkstreamState
 
@@ -67,7 +68,7 @@ def _make_app(storage: Any) -> TestClient:
     mock_ws.parent_ws_id = None
     mock_mgr = MagicMock()
     mock_mgr.get.return_value = mock_ws
-    mock_mgr.close.return_value = True
+    mock_mgr.close_with_outcome.return_value = CloseOutcome.CLOSED
     mock_mgr.list_all.return_value = [mock_ws]
     mock_mgr.max_active = 10
 

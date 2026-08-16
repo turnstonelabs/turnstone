@@ -4904,18 +4904,10 @@ class ChatSession:
         if main_stream is not None:
             with contextlib.suppress(Exception):
                 main_stream.close()
-        # Direct close paths do not all pass through the adapter cleanup that
-        # normally resolves UI gates first.  Wake every cycle that was already
-        # registered when the terminal latch landed; a gate still in its
-        # pre-registration window observes the epoch above immediately after
-        # inserting itself and self-denies.  Together those two arms make close
-        # exhaustive without coupling the UI lock to the generation lock.
-        resolve_all_approvals = getattr(self.ui, "resolve_all_approvals", None)
-        if resolve_all_approvals is not None:
-            try:
-                resolve_all_approvals(False, "Workstream closed")
-            except Exception:
-                log.debug("ui.resolve_all_approvals raised during close", exc_info=True)
+        # Direct close paths do not all pass through adapter cleanup.  Use the
+        # same workstream-wide sweep as soft-close preparation so registered
+        # cycles and pre-cycle Smart Approval waits cannot strand teardown.
+        self.resolve_close_approvals()
         # Refuse new child model calls and abort every registered child stream.
         # The shutdown latch shares the registration lock, so a racing run is
         # either included in this snapshot or born aborted.
@@ -9226,6 +9218,34 @@ class ChatSession:
                 with contextlib.suppress(OSError, ProcessLookupError):
                     proc.kill()
 
+    def resolve_close_approvals(self, feedback: str = "Workstream closed") -> None:
+        """Deny every approval wait that could otherwise strand close.
+
+        ``resolve_all_approvals`` covers both registered cycles and the
+        pre-cycle Smart Approval verdict wait. Older single-slot UIs retain
+        their event wake as a compatibility floor. The sweep is idempotent
+        because soft-close preparation, adapter cleanup, and direct ``close()``
+        can all converge on the same terminal session.
+        """
+        ui: Any = self.ui
+        resolve_all = getattr(ui, "resolve_all_approvals", None)
+        if callable(resolve_all):
+            try:
+                resolve_all(False, feedback)
+            except Exception:
+                log.debug("ui.resolve_all_approvals raised during close", exc_info=True)
+            return
+
+        approval_event = getattr(ui, "_approval_event", None)
+        if approval_event is None:
+            return
+        try:
+            if hasattr(ui, "_approval_result"):
+                ui._approval_result = (False, None)
+            approval_event.set()
+        except Exception:
+            log.debug("legacy approval wake raised during close", exc_info=True)
+
     def _check_cancelled(self, my_generation: int = 0) -> None:
         """Raise ``GenerationCancelled`` if cancellation has been requested
         or if this thread belongs to an orphaned generation (force cancel).
@@ -10157,6 +10177,13 @@ class ChatSession:
                 self._soft_close_preparing = False
                 self._tool_structural_condition.notify_all()
             raise
+
+        # Cancellation advances every gate's monotonic witness, while this
+        # sweep supplies the wake edge.  Run it before waiting for structural
+        # debt: the owning worker cannot journal denied TOOL receipts until its
+        # approval wait returns.  "requested" remains truthful if later
+        # durability reconciliation refuses the close and keeps the session.
+        self.resolve_close_approvals("Workstream close requested")
 
         deadline = time.monotonic() + _SOFT_CLOSE_STRUCTURAL_WAIT_SECONDS
         with self._tool_structural_condition:

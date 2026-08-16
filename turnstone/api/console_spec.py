@@ -1305,7 +1305,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Proxy workstream close to routed node",
         request_model=CloseWorkstreamRequest,
         response_model=StatusResponse,
-        error_codes=[400, 403, 404, 502, 503],
+        error_codes=[400, 403, 404, 409, 502, 503],
         tags=["Routing"],
     ),
     EndpointSpec(
@@ -1547,7 +1547,9 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "/ history) but cannot be reopened — a closed coordinator is "
             "terminal from the manager's perspective. Returns 409 while an "
             "accepted live conversation row still requires persistence reconciliation; "
-            "the coordinator remains loaded and its history journal is retained."
+            "the coordinator remains loaded and its history journal is retained. "
+            "Returns 503 when cancellation cleanup has not yet finished; retrying "
+            "close is safe."
         ),
         response_model=StatusResponse,
         error_codes=[403, 404, 409, 500, 503],

@@ -42,7 +42,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from turnstone.core.log import get_logger
-from turnstone.core.session_manager import WorkstreamAlreadyExistsError
+from turnstone.core.session_manager import CloseOutcome, WorkstreamAlreadyExistsError
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_ui_base import CrossPrincipalApprovalError
 from turnstone.core.workstream import (
@@ -1042,16 +1042,18 @@ def make_close_handler(
         ws_before = mgr.get(ws_id)
         if ws_before is None:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
-        if not await asyncio.to_thread(mgr.close, ws_id):
-            # A durability-poisoned session deliberately refuses soft close so
-            # its live journal cannot be discarded. Distinguish that conflict
-            # from the ordinary get-vs-close race where another caller already
-            # removed the workstream.
-            if mgr.get(ws_id) is not None:
-                return JSONResponse(
-                    {"error": "workstream has unresolved persistence"},
-                    status_code=409,
-                )
+        close_outcome = await asyncio.to_thread(mgr.close_with_outcome, ws_id)
+        if close_outcome is CloseOutcome.UNRESOLVED_PERSISTENCE:
+            return JSONResponse(
+                {"error": "workstream has unresolved persistence"},
+                status_code=409,
+            )
+        if close_outcome is CloseOutcome.CLEANUP_PENDING:
+            return JSONResponse(
+                {"error": "workstream cleanup is still in progress; try again shortly"},
+                status_code=503,
+            )
+        if close_outcome is not CloseOutcome.CLOSED:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
         storage = getattr(request.app.state, "auth_storage", None)
