@@ -570,7 +570,7 @@ class RevalidatingStaticFiles(StaticFiles):
 
 # Matches src="/static/..." and href="/shared/..." (and vice-versa) but skips
 # vendored libraries whose directory names already contain a version number
-# (e.g. katex-0.16.44/, hljs-11.11.1/) and URLs that already have a query
+# (e.g. katex-0.16.44/, hljs-11.12.0/) and URLs that already have a query
 # string (prevents double-append if called twice).
 _ASSET_RE = re.compile(
     r'(?P<attr>(?:src|href)=")'

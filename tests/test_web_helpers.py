@@ -40,7 +40,7 @@ class TestVersionHtml:
     def test_vendored_hljs_skipped(self):
         from turnstone.core.web_helpers import version_html
 
-        html = '<script src="/shared/hljs-11.11.1/highlight.min.js"></script>'
+        html = '<script src="/shared/hljs-11.12.0/highlight.min.js"></script>'
         result = version_html(html)
         assert result == html  # unchanged
 
@@ -54,7 +54,7 @@ class TestVersionHtml:
     def test_vendored_hls_skipped(self):
         from turnstone.core.web_helpers import version_html
 
-        html = '<script src="/shared/hls-1.6.17/hls.min.js"></script>'
+        html = '<script src="/shared/hls-1.7.0/hls.min.js"></script>'
         result = version_html(html)
         assert result == html  # unchanged
 
@@ -90,7 +90,7 @@ class TestVersionHtml:
             '<link rel="stylesheet" href="/shared/katex-0.18.4/katex.min.css">\n'
             '<link rel="stylesheet" href="/static/style.css">\n'
             '<script src="/shared/utils.js"></script>\n'
-            '<script src="/shared/hljs-11.11.1/highlight.min.js"></script>\n'
+            '<script src="/shared/hljs-11.12.0/highlight.min.js"></script>\n'
             '<script src="/static/app.js"></script>'
         )
         result = version_html(html)
@@ -100,7 +100,7 @@ class TestVersionHtml:
         assert f'/static/app.js?v={__version__}"' in result
         # Vendored libs unchanged
         assert '/shared/katex-0.18.4/katex.min.css"' in result
-        assert '/shared/hljs-11.11.1/highlight.min.js"' in result
+        assert '/shared/hljs-11.12.0/highlight.min.js"' in result
 
     def test_version_matches_package(self):
         from turnstone import __version__
@@ -227,7 +227,7 @@ class TestStaticAssetCacheControl:
             ("interactive.js", "no-cache"),
             ("hls-2-player.js", "no-cache"),
             ("katex-0.18.4/katex.min.css", "public, max-age=31536000, immutable"),
-            ("hljs-11.11.1/highlight.min.js", "public, max-age=31536000, immutable"),
+            ("hljs-11.12.0/highlight.min.js", "public, max-age=31536000, immutable"),
             ("katex-0.18.4/../private.json", "no-store"),
             (r"katex-0.18.4\..\private.json", "no-store"),
             ("nested//asset.js", "no-store"),
