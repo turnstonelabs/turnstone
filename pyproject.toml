@@ -31,7 +31,7 @@ dependencies = [
     # Direct because the provider boundary catches this exception family;
     # OpenAI v3's transitive dependency alone is not an import contract.
     "httpx2>=2.7,<3",
-    "mcp>=1.27,<2",  # v2 is a breaking rewrite (2.0.0a1 live 2026-06-11; stable ~2026-07-27) — streamablehttp_client removed, 2-tuple transport, snake_case types; migrate deliberately
+    "mcp>=2,<3",  # v2 is a breaking rewrite (2.0.0a1 live 2026-06-11; stable ~2026-07-27) — streamablehttp_client removed, 2-tuple transport, snake_case types; migrate deliberately
     "starlette>=1.3.1",  # CVE-2026-54282 (path->authority host spoof) + CVE-2026-54283 (url-encoded form DoS); supersedes the PYSEC-2026-161 host-header path-injection floor
     "uvicorn>=0.34",
     "sse-starlette>=2.0",
