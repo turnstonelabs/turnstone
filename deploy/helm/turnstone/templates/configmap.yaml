@@ -1,3 +1,8 @@
+{{/*
+Rendered unconditionally and by every install, which makes it the one
+reliable place to hang the values checks off.
+*/}}
+{{- include "turnstone.validateBackend" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,10 +11,12 @@ metadata:
     {{- include "turnstone.labels" . | nindent 4 }}
 data:
   TURNSTONE_DB_BACKEND: {{ .Values.database.backend | quote }}
+  {{- if ne .Values.database.backend "sqlite" }}
   TURNSTONE_DB_HOST: {{ include "turnstone.postgresql.host" . | quote }}
   TURNSTONE_DB_PORT: {{ include "turnstone.postgresql.port" . | quote }}
   TURNSTONE_DB_NAME: {{ include "turnstone.postgresql.database" . | quote }}
   TURNSTONE_DB_USER: {{ include "turnstone.postgresql.username" . | quote }}
+  {{- end }}
   TURNSTONE_SERVER_HOST: "0.0.0.0"
   TURNSTONE_SERVER_PORT: {{ .Values.server.service.port | quote }}
   TURNSTONE_CONSOLE_HOST: "0.0.0.0"

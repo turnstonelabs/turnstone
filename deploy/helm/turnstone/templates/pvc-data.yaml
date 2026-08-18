@@ -1,0 +1,35 @@
+{{/*
+The SQLite database volume. Only on the sqlite backend: on postgresql
+/data is scratch and the workloads mount an emptyDir instead.
+
+Not created when the operator supplies existingClaim — the claim is then
+theirs to manage, and its lifecycle should not follow the release.
+
+No helm.sh/resource-policy: keep. A retained claim would survive an
+uninstall and then collide with the reinstall that recreates it under
+the same name, which is a worse failure than the one it guards against.
+Operators who want the data to outlive the release should point
+existingClaim at a PVC they own.
+*/}}
+{{- if and (include "turnstone.data.persistent" .) (not .Values.database.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "turnstone.data.claimName" . }}
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data
+  {{- with .Values.database.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.database.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.database.persistence.size | quote }}
+  {{- if .Values.database.persistence.storageClass }}
+  storageClassName: {{ .Values.database.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}

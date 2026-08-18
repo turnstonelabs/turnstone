@@ -30,10 +30,18 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.server.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: server
           image: {{ include "turnstone.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.server.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           command:
             - turnstone-server
             - --host
@@ -86,3 +94,13 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "turnstone.dataVolumeMount" . | trim | nindent 12 }}
+            {{- with .Values.server.writablePaths }}
+            {{- include "turnstone.writableVolumeMounts" . | trim | nindent 12 }}
+            {{- end }}
+      volumes:
+        {{- include "turnstone.dataVolume" . | trim | nindent 8 }}
+        {{- with .Values.server.writablePaths }}
+        {{- include "turnstone.writableVolumes" . | trim | nindent 8 }}
+        {{- end }}

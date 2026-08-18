@@ -41,10 +41,18 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.console.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: console
           image: {{ include "turnstone.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.console.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           command:
             - turnstone-console
             - --host=0.0.0.0
@@ -91,3 +99,13 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.console.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "turnstone.dataVolumeMount" . | trim | nindent 12 }}
+            {{- with .Values.console.writablePaths }}
+            {{- include "turnstone.writableVolumeMounts" . | trim | nindent 12 }}
+            {{- end }}
+      volumes:
+        {{- include "turnstone.dataVolume" . | trim | nindent 8 }}
+        {{- with .Values.console.writablePaths }}
+        {{- include "turnstone.writableVolumes" . | trim | nindent 8 }}
+        {{- end }}
