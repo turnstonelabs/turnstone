@@ -7208,8 +7208,18 @@ class MCPClientManager:
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
+            # Slow-but-alive, not dead. The static session is still connected
+            # and the in-flight op keeps running server-side; ``future.cancel()``
+            # only drops our waiter, it does not tear down the transport. Tripping
+            # the per-server breaker here opens the circuit against healthy-but-slow
+            # servers (e.g. agent gateways that legitimately take minutes) and, once
+            # open, converts every subsequent call into a fast "circuit open"
+            # failure - a self-inflicted outage on a live server. Genuinely dead
+            # transports are handled by the health loop's liveness ping and
+            # ``_record_and_evict_on_dead_transport``; ``in_flight > 0`` also pins
+            # this session against eviction while the call is running.
             future.cancel()
-            self._cb_record_failure(server_name)
+            log.warning("mcp.slow_call", extra={"server": server_name, "timeout_s": timeout})
             raise TimeoutError(f"MCP tool call timed out after {timeout}s") from None
         except Exception as exc:
             self._record_and_evict_on_dead_transport(server_name, exc)
@@ -8870,8 +8880,11 @@ class MCPClientManager:
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
+            # Same policy as call_tool_sync: a client-side wait timeout against an
+            # already-connected static session means the server is slow, not dead.
+            # Do not trip the per-server breaker (see call_tool_sync comment).
             future.cancel()
-            self._cb_record_failure(server_name)
+            log.warning("mcp.slow_resource_read", extra={"server": server_name, "timeout_s": timeout})
             raise TimeoutError(f"MCP resource read timed out after {timeout}s") from None
         except Exception as exc:
             self._record_and_evict_on_dead_transport(server_name, exc)
