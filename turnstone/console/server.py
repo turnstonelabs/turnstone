@@ -6874,6 +6874,15 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
         return body
 
     updates: dict[str, Any] = {}
+    if "timeout" in body:
+        timeout = body["timeout"]
+        if timeout is not None and (
+            isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1
+        ):
+            return JSONResponse(
+                {"error": "timeout must be a positive integer or null"}, status_code=400
+            )
+        updates["timeout"] = timeout
     if "name" in body:
         updates["name"] = str(body["name"]).strip()[:256]
     if "description" in body:
@@ -10999,6 +11008,16 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
             {"error": "url is required for streamable-http transport"}, status_code=400
         )
 
+    # Optional per-server tool-call timeout override (seconds). None = use the
+    # client default (tools.timeout).
+    timeout = body.get("timeout")
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1
+    ):
+        return JSONResponse(
+            {"error": "timeout must be a positive integer or null"}, status_code=400
+        )
+
     auth_type_value, err_resp = _parse_auth_type(body)
     if err_resp is not None:
         return err_resp
@@ -11084,6 +11103,7 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         env=json.dumps(env_dict) if isinstance(env_dict, dict) else "{}",
         auto_approve=bool(body.get("auto_approve", False)),
         enabled=bool(body.get("enabled", True)),
+        timeout=timeout,
         created_by=audit_uid,
         auth_type=auth_type,
         **oauth_cols,

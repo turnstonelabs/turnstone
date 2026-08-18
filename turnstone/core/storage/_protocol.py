@@ -2621,6 +2621,7 @@ class StorageBackend(Protocol):
         registry_version: str = "",
         registry_meta: str = "{}",
         auth_type: str = "static",
+        timeout: int | None = None,
         oauth_client_id: str | None = None,
         oauth_client_secret_ct: bytes | None = None,
         oauth_scopes: str | None = None,

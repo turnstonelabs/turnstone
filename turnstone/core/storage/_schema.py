@@ -323,6 +323,7 @@ scheduled_tasks = sa.Table(
     sa.Column("project_id", sa.Text, nullable=False, server_default=""),
     sa.Column("notify_targets", sa.Text, nullable=False, server_default="[]"),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("timeout", sa.Integer, nullable=True),  # per-server tool-call timeout override (seconds); None = client default
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("last_run", sa.Text),
     sa.Column("next_run", sa.Text),
