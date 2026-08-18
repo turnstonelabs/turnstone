@@ -118,6 +118,113 @@ if (agentContextIsWarning(1, 0)) throw new Error("zero window warned");
     assert proc.returncode == 0, proc.stderr
 
 
+@node_skip
+def test_task_agent_compaction_reducer_is_nested_transient_and_id_safe() -> None:
+    """Task compaction reuses the shared lifecycle without leaking a result."""
+    script = f"""
+class Element {{
+  constructor(tag) {{
+    this.tagName = tag;
+    this.children = [];
+    this.parentNode = null;
+    this.className = "";
+    this.style = {{}};
+    this.textContent = "";
+    this.attributes = {{}};
+    this.classList = {{
+      remove: (...names) => {{
+        const drop = new Set(names);
+        this.className = this.className
+          .split(/\\s+/)
+          .filter((name) => name && !drop.has(name))
+          .join(" ");
+      }},
+      contains: (name) => this.className.split(/\\s+/).includes(name),
+    }};
+  }}
+  setAttribute(name, value) {{ this.attributes[name] = String(value); }}
+  appendChild(child) {{
+    if (child.parentNode) child.remove();
+    this.children.push(child);
+    child.parentNode = this;
+    return child;
+  }}
+  querySelector(selector) {{
+    const cls = selector.startsWith(".") ? selector.slice(1) : "";
+    for (const child of this.children) {{
+      if (cls && child.className.split(/\\s+/).includes(cls)) return child;
+      const nested = child.querySelector(selector);
+      if (nested) return nested;
+    }}
+    return null;
+  }}
+  remove() {{
+    if (!this.parentNode) return;
+    const i = this.parentNode.children.indexOf(this);
+    if (i >= 0) this.parentNode.children.splice(i, 1);
+    this.parentNode = null;
+  }}
+}}
+globalThis.document = {{ createElement: (tag) => new Element(tag) }};
+const {{ applyCompactionEvent }} = await import({json.dumps(_CONVERSATION_JS.as_uri())});
+
+const container = new Element("div");
+const nested = new Element("div");
+const holder = {{ card: null, cid: null }};
+let notices = 0;
+let scrolls = 0;
+const hooks = {{
+  container,
+  renderedIds: new Set(),
+  renderResult: false,
+  append: (node) => nested.appendChild(node),
+  onNotice: () => {{ notices += 1; }},
+  scroll: () => {{ scrolls += 1; }},
+}};
+applyCompactionEvent(holder, {{
+  phase: "start", target: "task_agent", trigger: "auto", compaction_id: 12,
+}}, hooks);
+if (!holder.card || holder.cid !== "12") throw new Error("start was not retained");
+if (nested.children.length !== 1 || container.children.length !== 0)
+  throw new Error("task progress escaped its nested placement");
+const header = holder.card.querySelector(".msg-compaction-header");
+if (!header || header.textContent !== "compacting task context… · auto")
+  throw new Error("task-specific progress copy was not rendered");
+
+applyCompactionEvent(holder, {{
+  phase: "progress", target: "task_agent", compaction_id: 12,
+  part: 2, total: 4, depth: 0,
+}}, hooks);
+const fill = holder.card.querySelector(".msg-compaction-bar-fill");
+if (fill.style.width !== "25%") throw new Error("progress did not advance");
+
+applyCompactionEvent(holder, {{
+  phase: "end", target: "task_agent", compaction_id: 11, ok: true,
+  summary: "must stay private",
+}}, hooks);
+if (!holder.card || nested.children.length !== 1)
+  throw new Error("stale end retired the live task compaction");
+if (container.children.length !== 0) throw new Error("task summary leaked to transcript");
+
+applyCompactionEvent(holder, {{
+  phase: "end", target: "task_agent", compaction_id: 12, ok: true,
+  summary: "must stay private",
+}}, hooks);
+if (holder.card || holder.cid != null || nested.children.length !== 0)
+  throw new Error("owning end did not retire progress");
+if (container.children.length !== 0 || notices !== 0)
+  throw new Error("task end rendered a durable result or notice");
+if (scrolls !== 2) throw new Error("unexpected lifecycle scroll count: " + scrolls);
+"""
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_normalize_risk_level_unknown_to_medium() -> None:
     """Unified canonical fallback (step 5e.1b): an unknown / unrecognized risk
     normalizes to "medium" (the user's decision; the coordinator's old rank used

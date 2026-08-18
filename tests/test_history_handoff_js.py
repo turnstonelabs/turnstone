@@ -117,6 +117,7 @@ const pane = {
   _forceTimeout: null,
   _compaction: {},
   _agentContexts: new Map(),
+  _agentCompactions: new Map(),
   _streamHealth: { renderThrows: 0 },
   _actingUserId: null,
   pendingApproval: false,

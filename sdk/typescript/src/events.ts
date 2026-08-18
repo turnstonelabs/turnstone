@@ -214,13 +214,19 @@ export interface CancelledEvent {
  * auto adds `where` + `pct`); `progress` carries chunked-summarization
  * `part`/`total`/`depth` (or `retry_in`/`error` for a retry wait); `end`
  * carries `ok` plus either `before_tokens`/`after_tokens`/`summary` or the
- * failure `reason`/`message`. The successful end's summary also replays from
- * `/history` as a `role: "system"`, `source: "compaction"` entry.
+ * failure `reason`/`message`. `target: "workstream"` owns the transcript and
+ * durable marker. `target: "task_agent"` carries `parent_call_id`, is
+ * transient nested progress, and omits its private `summary` on success.
+ * Events without a target are workstream events because that was the only
+ * compaction scope before targeted events existed.
  */
 export interface CompactionEvent {
   type: "compaction";
   phase: "start" | "progress" | "end";
-  /** Correlates every event of one compaction run (0 from legacy emitters). */
+  target?: "workstream" | "task_agent";
+  /** Present when target is `task_agent`; keys the nested task card. */
+  parent_call_id?: string;
+  /** Correlates every event of one compaction attempt. */
   compaction_id?: number;
   /**
    * End events only: true marks a force-abandoned compaction retiring
@@ -230,8 +236,8 @@ export interface CompactionEvent {
   superseded?: boolean;
   /**
    * Failed ends only: the emitter-computed display verdict — show
-   * `message` only when true, instead of re-deriving suppression from
-   * reason/trigger/superseded client-side.
+   * `message` only when true. Workstream errors use their paired typed error;
+   * task-agent errors use this targeted notice instead.
    */
   notice?: boolean;
   /** Present on start and on every end (ok or failed). */

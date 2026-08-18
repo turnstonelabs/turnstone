@@ -26,7 +26,7 @@ import json
 import pytest
 
 from tests._session_helpers import make_session
-from turnstone.core.session import _SummaryResult
+from turnstone.core.compaction import SummaryResult
 from turnstone.core.storage._utils import _fork_turn_insert_row
 from turnstone.core.trajectory import PROVENANCE_META_KEY, TurnProvenance, turns_from_dicts
 
@@ -250,9 +250,9 @@ def test_compaction_persists_checkpoint_and_resume_is_bounded(tmp_db, mock_opena
     sess.messages = turns_from_dicts(history)
     sess._msg_tokens = [1] * len(history)
     with patch.object(
-        sess,
-        "_summarize_blocks",
-        return_value=_SummaryResult(text="DENSE SUMMARY", producer="summary-producer"),
+        sess._compaction_engine,
+        "summarize_blocks",
+        return_value=SummaryResult(text="DENSE SUMMARY", producer="summary-producer"),
     ):
         assert sess._compact_messages(auto=False) is True
 
@@ -308,9 +308,9 @@ def test_marker_watermark_read_blip_recovers_on_retry(tmp_db, mock_openai_client
 
     with (
         patch.object(
-            sess,
-            "_summarize_blocks",
-            return_value=_SummaryResult(text="DENSE SUMMARY", producer="summary-producer"),
+            sess._compaction_engine,
+            "summarize_blocks",
+            return_value=SummaryResult(text="DENSE SUMMARY", producer="summary-producer"),
         ),
         patch.object(st, "get_compaction_watermark", side_effect=_flaky_watermark),
     ):
@@ -360,9 +360,9 @@ def test_compaction_summary_producer_survives_storage_round_trip(
     )
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
-            sess,
-            "_summarize_blocks",
-            lambda *_args, **_kwargs: _SummaryResult(
+            sess._compaction_engine,
+            "summarize_blocks",
+            lambda *_args, **_kwargs: SummaryResult(
                 text="DENSE SUMMARY",
                 producer="final-summary-producer",
                 provenance=provenance,
@@ -677,9 +677,9 @@ def test_watermark_reads_inside_the_marker_persist_not_before_the_commit(
         patch.object(sess, "_journal_conversation_row_locked", side_effect=_journal_spy),
         patch.object(st, "get_compaction_watermark", side_effect=_watermark_spy),
         patch.object(
-            sess,
-            "_summarize_blocks",
-            return_value=_SummaryResult(text="DENSE SUMMARY", producer="summary-producer"),
+            sess._compaction_engine,
+            "summarize_blocks",
+            return_value=SummaryResult(text="DENSE SUMMARY", producer="summary-producer"),
         ),
     ):
         assert sess._compact_messages(auto=False) is True

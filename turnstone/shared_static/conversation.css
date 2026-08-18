@@ -816,6 +816,21 @@
 .conv-agent-body {
   border-top: 1px solid var(--hair);
 }
+
+/* Task-agent compaction is transient controller progress, visible even while
+ * the (potentially huge) step body is collapsed. Reuse the shared progress
+ * card vocabulary but fit it to the nested card instead of a transcript row. */
+.conv-agent > .compaction-card {
+  margin: 0.35rem 0.55rem 0.5rem;
+  max-width: none;
+}
+.conv-agent-compaction-notice {
+  margin: 0.35rem 0.55rem 0.5rem;
+  color: var(--warn);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+}
 .conv-agent-body:empty {
   border-top: 0; /* no orphan hairline before the first step paints */
 }

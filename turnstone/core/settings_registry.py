@@ -176,8 +176,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "Max tokens for compaction summary",
             "session",
             min_value=0,
-            help="When conversation history is compacted (summarized to save space), this limits "
-            "how long the summary can be.",
+            help="When conversation or task-agent context is compacted (summarized to save "
+            "space), this limits how long the summary can be.",
         ),
         SettingDef(
             "session.auto_compact_pct",
@@ -187,9 +187,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "session",
             min_value=0.1,
             max_value=1.0,
-            help="Automatically summarize older messages when the conversation fills this percentage "
-            "of the context window. For example, 0.8 means compact when 80% full. This prevents "
-            "conversations from hitting the context limit and losing information.",
+            help="Automatically summarize older messages when a conversation or task-agent context "
+            "fills this percentage of its model's context window. For example, 0.8 means compact "
+            "when 80% full. This prevents model calls from hitting the context limit and losing "
+            "information.",
         ),
         # -- tools ----------------------------------------------------------
         SettingDef(

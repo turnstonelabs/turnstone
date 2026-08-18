@@ -363,21 +363,29 @@ class CompactionEvent(ServerEvent):
     wait); ``end`` carries ``ok`` plus either the result
     (``before_tokens``/``after_tokens``/``summary``) or the failure
     ``reason``/``message`` — failure ends carry ``trigger`` too.  The
-    successful end's summary is also persisted as a compaction marker
-    row and replays from ``/history`` as a ``role="system"``,
-    ``source="compaction"`` entry.  ``compaction_id`` correlates every
-    event of one compaction run (0 from internal/legacy emitters).  End
+    ``target`` is ``"workstream"`` when the lifecycle owns the transcript
+    and durable marker. ``"task_agent"`` events instead carry
+    ``parent_call_id`` and are transient progress for that nested task; their
+    successful end omits ``summary``. Events without a target are workstream
+    events because that was the only compaction scope before targeted events
+    existed. The workstream successful end's summary is also
+    persisted as a compaction marker row and replays from ``/history`` as a
+    ``role="system"``, ``source="compaction"`` entry. ``compaction_id``
+    correlates every event of one attempt (0 from internal emitters). End
     events additionally carry ``superseded``: True marks a force-abandoned
     compaction retiring after a successor generation took over — clients
     should skip failure notices for those (an OK end's result still
-    stands; the history swap happened).  Failed ends carry ``notice``:
-    the emitter-computed display verdict — show ``message`` only when it
-    is True, instead of re-deriving suppression from
-    reason/trigger/superseded client-side.
+    stands; the history swap happened). Failed ends carry ``notice``: the
+    emitter-computed display verdict. Workstream errors use their paired typed
+    error and set it false; task-agent errors have no unscoped error twin and
+    set it true for the nested card. Clients show ``message`` only when notice
+    is true instead of re-deriving policy from reason/trigger/superseded.
     """
 
     type: str = "compaction"
     phase: str = ""
+    target: str = "workstream"
+    parent_call_id: str = ""
     compaction_id: int = 0
     superseded: bool = False
     notice: bool = False

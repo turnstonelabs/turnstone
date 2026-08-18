@@ -2762,6 +2762,19 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                                 }
                             )
                         }
+                    # A task compaction is transient parent-card state, just
+                    # like its context meter. Re-emit the latest lifecycle edge
+                    # so a refresh during a long recursive summary recreates
+                    # the nested progress card without inventing history.
+                    for agent_compaction in in_progress_snap.get("agent_compactions", []):
+                        yield {
+                            "data": json.dumps(
+                                {
+                                    **agent_compaction,
+                                    "ws_id": ws_id,
+                                }
+                            )
+                        }
                     # Surface the persisted ``last_error`` so a fresh
                     # connect to a workstream sitting in the error state
                     # shows WHY it failed (the ``error`` text bubble), not

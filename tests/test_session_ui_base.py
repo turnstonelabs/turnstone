@@ -1641,7 +1641,13 @@ def test_register_listener_with_in_progress_snapshot_empty() -> None:
     lq, snap = ui.register_listener_with_in_progress_snapshot()
     assert isinstance(lq, queue.Queue)
     assert lq in ui._listeners
-    assert snap == {"content": "", "reasoning": "", "seq": 0, "agent_contexts": []}
+    assert snap == {
+        "content": "",
+        "reasoning": "",
+        "seq": 0,
+        "agent_contexts": [],
+        "agent_compactions": [],
+    }
 
 
 def test_register_listener_with_in_progress_snapshot_populated() -> None:
@@ -2602,10 +2608,10 @@ class TestAgentContextSnapshots:
 
         # The retiring predecessor can neither overwrite nor clear generation 5.
         ui.on_agent_context("reused", 99, 100, generation=4)
-        ui.clear_agent_context("reused", generation=4)
+        ui.clear_agent_transients("reused", generation=4)
         assert ui._snapshot_agent_contexts()[0]["prompt_tokens"] == 20
 
-        ui.clear_agent_context("reused", generation=5)
+        ui.clear_agent_transients("reused", generation=5)
         assert ui._snapshot_agent_contexts() == []
 
     def test_force_cutoff_clears_only_retired_generations(self) -> None:
@@ -2614,7 +2620,7 @@ class TestAgentContextSnapshots:
         ui.on_agent_context("old-B", 20, 100, generation=4)
         ui.on_agent_context("successor", 30, 100, generation=5)
 
-        ui.clear_agent_contexts_before_generation(5)
+        ui.clear_agent_transients_before_generation(5)
 
         readings = ui._snapshot_agent_contexts()
         assert [event["parent_call_id"] for event in readings] == ["successor"]
@@ -2662,6 +2668,127 @@ class TestAgentContextSnapshots:
 
         assert not writer.is_alive()
         assert listener.get_nowait()["type"] == "agent_context"
+
+
+class TestAgentCompactionSnapshots:
+    """Task compaction is nested transient state, never foreground activity."""
+
+    def test_live_progress_snapshots_and_end_clears_without_activity_latch(self) -> None:
+        ui = _make_ui()
+        listener = ui._register_listener()
+        ui._ws_current_activity = "Running tool: task_agent"
+        ui._ws_activity_state = "tool"
+
+        ui.on_compaction(
+            {
+                "phase": "start",
+                "trigger": "auto",
+                "target": "task_agent",
+                "parent_call_id": "task-A",
+                "compaction_id": 11,
+                "_generation": 7,
+            }
+        )
+        start = listener.get_nowait()
+        assert start["target"] == "task_agent"
+        assert start["parent_call_id"] == "task-A"
+        assert "_generation" not in start
+        assert ui._ws_current_activity == "Running tool: task_agent"
+        assert ui._ws_activity_state == "tool"
+        assert ui._compaction_activity_live is False
+
+        ui.on_compaction(
+            {
+                "phase": "progress",
+                "part": 2,
+                "total": 3,
+                "depth": 0,
+                "target": "task_agent",
+                "parent_call_id": "task-A",
+                "compaction_id": 11,
+                "_generation": 7,
+            }
+        )
+        listener.get_nowait()
+        _, snapshot = ui.register_listener_with_in_progress_snapshot()
+        assert snapshot["agent_compactions"] == [
+            {
+                "type": "compaction",
+                "phase": "progress",
+                "part": 2,
+                "total": 3,
+                "depth": 0,
+                "target": "task_agent",
+                "parent_call_id": "task-A",
+                "compaction_id": 11,
+                "ws_id": "ws-1",
+            }
+        ]
+
+        ui.on_compaction(
+            {
+                "phase": "end",
+                "ok": True,
+                "trigger": "auto",
+                "target": "task_agent",
+                "parent_call_id": "task-A",
+                "compaction_id": 11,
+                "_generation": 7,
+            }
+        )
+        end = listener.get_nowait()
+        assert end["superseded"] is False
+        assert ui._snapshot_agent_compactions() == []
+
+    def test_agent_scope_allows_targeted_event_but_still_drops_workstream_event(self) -> None:
+        ui = _make_ui()
+        listener = ui._register_listener()
+        ui.begin_agent_scope()
+        try:
+            ui.on_compaction(
+                {
+                    "phase": "start",
+                    "trigger": "auto",
+                    "target": "task_agent",
+                    "parent_call_id": "task-A",
+                    "compaction_id": 1,
+                    "_generation": 2,
+                }
+            )
+            ui.on_compaction(
+                {
+                    "phase": "start",
+                    "trigger": "auto",
+                    "target": "workstream",
+                    "compaction_id": 2,
+                }
+            )
+        finally:
+            ui.end_agent_scope()
+
+        assert listener.get_nowait()["target"] == "task_agent"
+        assert listener.empty()
+
+    def test_generation_cleanup_cannot_remove_successor_snapshot(self) -> None:
+        ui = _make_ui()
+        for generation, compaction_id in ((4, 1), (5, 2)):
+            ui.on_compaction(
+                {
+                    "phase": "start",
+                    "trigger": "auto",
+                    "target": "task_agent",
+                    "parent_call_id": "reused",
+                    "compaction_id": compaction_id,
+                    "_generation": generation,
+                }
+            )
+
+        ui.clear_agent_transients("reused", generation=4)
+        assert ui._snapshot_agent_compactions()[0]["compaction_id"] == 2
+        ui.clear_agent_transients_before_generation(5)
+        assert ui._snapshot_agent_compactions()[0]["compaction_id"] == 2
+        ui.clear_agent_transients("reused", generation=5)
+        assert ui._snapshot_agent_compactions() == []
 
 
 class TestAgentScopeInfoSuppression:

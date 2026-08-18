@@ -35,9 +35,11 @@ from turnstone.core.session import (
     _IMAGE_SIZE_CAP,
     _MEMORY_MIXED_BATCH_ERROR,
     ChatSession,
+    _TaskExecutionJournal,
 )
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import (
+    EffectStatus,
     Role,
     Turn,
     dicts_from_turns,
@@ -3899,7 +3901,7 @@ class TestAgentContextReporting:
 
         assert ui.context_calls == []
 
-    def test_unparented_agent_does_not_compute_or_emit_badge_usage(self) -> None:
+    def test_unparented_agent_resolves_compaction_window_but_emits_no_badge(self) -> None:
         from turnstone.core.providers import UsageInfo
 
         ui = self._ContextUI()
@@ -3910,12 +3912,12 @@ class TestAgentContextReporting:
         )
 
         with (
-            patch.object(session, "_context_window_for_lane") as window,
+            patch.object(session, "_context_window_for_lane", return_value=128_000) as window,
             patch("turnstone.core.session.model_turn", return_value=result),
         ):
             session._run_agent([Turn.user("test")], tools=[], auto_tools=set())
 
-        window.assert_not_called()
+        window.assert_called_once()
         assert ui.context_calls == []
 
     def test_superseded_generation_cannot_publish_context(self) -> None:
@@ -4062,13 +4064,13 @@ class TestAgentChildRegistration:
             ("task-1::r1s2::call_0", "task-1"),
         ]
         # Recall projection: two steps, each paired to its OWN result.
-        steps = ChatSession._project_agent_steps(agent_turns)
+        journal = _TaskExecutionJournal(agent_turns)
+        steps = journal.project_steps()
         assert [s["id"] for s in steps] == ["task-1::r1s1::call_0", "task-1::r1s2::call_0"]
         assert [s["output"] for s in steps] == ["contents-1", "contents-2"]
-        # Cancel ledger agrees: both calls answered, no in-flight gap.
-        issued, first_gap = ChatSession._cancel_ledger(agent_turns)
-        assert issued == [("read_file", True), ("read_file", True)]
-        assert first_gap is None
+        # Cancellation truth agrees: both calls answered, so the incomplete
+        # overall task is PARTIAL rather than an in-flight UNKNOWN.
+        assert journal.cancelled_status() is EffectStatus.PARTIAL
 
     @staticmethod
     def _reusing_provider(session, tool_turns: int = 1):
@@ -4581,10 +4583,8 @@ class TestRunAgentDenialMessage:
         assert text == "Blocked by tool policy ('notify')"
 
 
-class TestProjectAgentSteps:
-    """``_project_agent_steps`` projects a finished sub-agent's trajectory into
-    recall step items for the task card — one per tool call, matched to its
-    result by call_id, landmine-safe on a multimodal result."""
+class TestTaskExecutionJournalProjection:
+    """The live journal projects bounded task-card recall step items."""
 
     def test_calls_matched_to_results_in_order(self):
         from turnstone.core.trajectory import ToolCall, Turn
@@ -4601,7 +4601,7 @@ class TestProjectAgentSteps:
             ),
             Turn.tool("c2", "boom", is_error=True),
         ]
-        steps = ChatSession._project_agent_steps(turns)
+        steps = _TaskExecutionJournal(turns).project_steps()
         assert [s["id"] for s in steps] == ["c1", "c2"]
         assert steps[0] == {
             "id": "c1",
@@ -4625,7 +4625,7 @@ class TestProjectAgentSteps:
             ),
             Turn.tool("c1", [{"type": "image_url"}]),
         ]
-        steps = ChatSession._project_agent_steps(turns)
+        steps = _TaskExecutionJournal(turns).project_steps()
         assert steps[0]["output"] == "[non-text result]"
 
     def test_output_capped(self):
@@ -4637,7 +4637,7 @@ class TestProjectAgentSteps:
             Turn.assistant(tool_calls=(ToolCall(id="c1", name="bash", arguments="{}"),)),
             Turn.tool("c1", big),
         ]
-        steps = ChatSession._project_agent_steps(turns)
+        steps = _TaskExecutionJournal(turns).project_steps()
         assert len(steps[0]["output"]) < len(big)
         assert "truncated from 2500 chars" in steps[0]["output"]
 
@@ -4647,10 +4647,33 @@ class TestProjectAgentSteps:
         from turnstone.core.trajectory import ToolCall, Turn
 
         turns = [Turn.assistant(tool_calls=(ToolCall(id="c1", name="bash", arguments="{}"),))]
-        steps = ChatSession._project_agent_steps(turns)
+        steps = _TaskExecutionJournal(turns).project_steps()
         assert steps == [
             {"id": "c1", "name": "bash", "arguments": "{}", "output": "", "is_error": False}
         ]
+
+    def test_cancelled_siblings_remain_in_issue_order(self):
+        """Materializing a later never-started call must not precede the
+        earlier call that was in flight when cancellation won."""
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        turns = [
+            Turn.assistant(
+                tool_calls=(
+                    ToolCall(id="c1", name="bash", arguments='{"command":"deploy"}'),
+                    ToolCall(id="c2", name="search", arguments='{"query":"status"}'),
+                )
+            )
+        ]
+        journal = _TaskExecutionJournal(turns)
+        journal.mark_started("c1")
+        journal.materialize_unstarted(turns)
+
+        steps = journal.project_steps()
+        assert [step["id"] for step in steps] == ["c1", "c2"]
+        assert steps[0]["output"] == ""
+        assert steps[1]["output"] == "(cancelled before execution; no side effects)"
+        assert journal.cancelled_status() is EffectStatus.UNKNOWN
 
     def test_colliding_ids_paired_fifo_not_last_wins(self):
         # A local provider reuses id "call_0" across turns; FIFO pairing gives
@@ -4670,7 +4693,7 @@ class TestProjectAgentSteps:
             ),
             Turn.tool("call_0", "out-B"),
         ]
-        steps = ChatSession._project_agent_steps(turns)
+        steps = _TaskExecutionJournal(turns).project_steps()
         assert [s["output"] for s in steps] == ["out-A", "out-B"]
 
     def test_step_count_capped_with_honest_marker(self):
@@ -4683,7 +4706,7 @@ class TestProjectAgentSteps:
                 Turn.assistant(tool_calls=(ToolCall(id=f"c{i}", name="bash", arguments="{}"),))
             )
             turns.append(Turn.tool(f"c{i}", f"out{i}"))
-        steps = ChatSession._project_agent_steps(turns)
+        steps = _TaskExecutionJournal(turns).project_steps()
         # Capped + one honest LEADING marker, keeping the most RECENT steps (the
         # tail) — not the earliest — and naming how many earlier ones fell out.
         assert len(steps) == _AGENT_STEP_COUNT_CAP + 1
@@ -4695,7 +4718,7 @@ class TestProjectAgentSteps:
 
 
 class TestAgentTrajectoryStashWiring:
-    """``_stash_agent_trajectory`` projects + forwards to the UI, getattr-guarded."""
+    """The bounded recall projection is forwarded through one guarded seam."""
 
     def test_projects_and_forwards(self):
         from turnstone.core.trajectory import ToolCall, Turn
@@ -4706,7 +4729,7 @@ class TestAgentTrajectoryStashWiring:
             Turn.assistant(tool_calls=(ToolCall(id="c1", name="bash", arguments="{}"),)),
             Turn.tool("c1", "ok"),
         ]
-        session._stash_agent_trajectory("task1", turns)
+        session._stash_agent_steps("task1", _TaskExecutionJournal(turns).project_steps())
         session.ui.stash_agent_trajectory.assert_called_once()
         cid, steps = session.ui.stash_agent_trajectory.call_args[0]
         assert cid == "task1"
@@ -4717,12 +4740,12 @@ class TestAgentTrajectoryStashWiring:
     def test_noop_without_call_id(self):
         session = _make_session()
         session.ui = MagicMock()
-        session._stash_agent_trajectory(None, [])
+        session._stash_agent_steps(None, [])
         session.ui.stash_agent_trajectory.assert_not_called()
 
     def test_noop_on_ui_without_support(self):
         # NullUI has no stash_agent_trajectory → getattr None → no-op, no raise.
-        _make_session()._stash_agent_trajectory("task1", [])
+        _make_session()._stash_agent_steps("task1", [])
 
 
 class TestReadFilesIsolation:
@@ -4839,7 +4862,7 @@ class TestSubAgentErrorRecall:
         assert tool_turns, "expected a tool result turn"
         assert tool_turns[-1].is_error is True
         # And it carries through the projection to the recalled step.
-        assert ChatSession._project_agent_steps(turns)[-1]["is_error"] is True
+        assert _TaskExecutionJournal(turns).project_steps()[-1]["is_error"] is True
 
 
 class TestExecTaskReporting:
@@ -4855,7 +4878,7 @@ class TestExecTaskReporting:
 
     def test_success_reports_result(self):
         session = self._bare_session()
-        session.ui.clear_agent_context = MagicMock()
+        session.ui.clear_agent_transients = MagicMock()
         with (
             patch.object(session, "_run_agent", return_value="the synthesis"),
             patch.object(session, "_report_tool_result") as rpt,
@@ -4863,7 +4886,7 @@ class TestExecTaskReporting:
             cid, out = session._exec_task({"call_id": "t1", "prompt": "go"})
         assert (cid, out) == ("t1", "the synthesis")
         rpt.assert_called_once_with("t1", "task_agent", "the synthesis")
-        assert session.ui.clear_agent_context.call_args_list == [
+        assert session.ui.clear_agent_transients.call_args_list == [
             call("t1", generation=0),
             call("t1", generation=0),
         ]
@@ -4916,7 +4939,7 @@ class TestExecTaskReporting:
 
         session = self._bare_session()
         generation = session._claim_generation()
-        session.ui.clear_agent_context = MagicMock()
+        session.ui.clear_agent_transients = MagicMock()
 
         def supersede(*_args, **_kwargs):
             session._claim_generation()
@@ -4931,7 +4954,7 @@ class TestExecTaskReporting:
                 }
             )
 
-        session.ui.clear_agent_context.assert_called_once_with("t1", generation=generation)
+        session.ui.clear_agent_transients.assert_called_once_with("t1", generation=generation)
 
 
 def _install_output_guard_judge(session: ChatSession, judge: MagicMock) -> None:
@@ -10575,7 +10598,9 @@ class TestReminderSidechannelIsolation:
             )
         )
         session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
-        summary = session._format_messages_for_summary(dicts_from_turns(session.messages))
+        summary = session._compaction_engine.format_messages_for_summary(
+            dicts_from_turns(session.messages)
+        )
         assert "SECRET_NUDGE_TEXT" not in summary
         assert "[start system-reminder]" not in summary
         assert "user said this" in summary
@@ -10600,7 +10625,9 @@ class TestReminderSidechannelIsolation:
                 }
             )
         )
-        summary = session._format_messages_for_summary(dicts_from_turns(session.messages))
+        summary = session._compaction_engine.format_messages_for_summary(
+            dicts_from_turns(session.messages)
+        )
         assert "[image]" in summary
         assert "screenshot:" in summary
 

@@ -3954,6 +3954,10 @@ function createCoordinatorPane(root, wsId, opts) {
         break;
       }
       case "compaction":
+        // The standalone coordinator viewer does not project task-agent
+        // sub-trajectories into nested cards. Never mis-render their transient
+        // model-context work as a durable coordinator transcript compaction.
+        if ((ev.target || "workstream") === "task_agent") break;
         // Context-compaction lifecycle — the shared reducer
         // (conversation.applyCompactionEvent) is the one state machine for
         // this viewer and the interactive pane, so the two can't drift.

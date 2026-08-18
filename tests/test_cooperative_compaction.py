@@ -21,13 +21,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._session_helpers import make_result, make_session
+from turnstone.core.compaction import (
+    CompactionIrreducibleError,
+    CompactionPolicy,
+    SummaryResult,
+    SummaryRuntime,
+)
 from turnstone.core.session import (
     COMPACTION_SOURCE,
     COMPACTION_SUMMARY_LABEL,
     GenerationCancelled,
-    _CompactionIrreducibleError,
     _is_ctx_overflow,
-    _SummaryResult,
 )
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
@@ -55,6 +59,45 @@ def session(tmp_db, mock_openai_client):
         parent_ws_id=s._parent_ws_id,
     )
     return s
+
+
+def _summary_runtime(
+    session,
+    *,
+    my_generation: int = 0,
+) -> SummaryRuntime:
+    """Build the foreground adapter while engine tests target its real owner."""
+
+    return session._build_summary_runtime(
+        session._primary_lane(),
+        my_generation=my_generation,
+    )
+
+
+def _summarize_blocks(session, blocks, *, my_generation: int = 0):
+    return session._compaction_engine.summarize_blocks(
+        blocks,
+        _summary_runtime(session, my_generation=my_generation),
+    )
+
+
+def _summarize_once(session, system_prompt, body, *, my_generation: int = 0):
+    return session._compaction_engine.summarize_once(
+        system_prompt,
+        body,
+        _summary_runtime(session, my_generation=my_generation),
+    )
+
+
+def _mock_policy(*, owed=False, over_soft=False, over_hard=False):
+    """Return a policy-shaped mock for lifecycle wiring tests."""
+
+    policy = MagicMock(spec=CompactionPolicy)
+    policy.owed.side_effect = owed if callable(owed) else None
+    policy.owed.return_value = owed if not callable(owed) else False
+    policy.over_soft.return_value = over_soft
+    policy.over_hard.return_value = over_hard
+    return policy
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +232,7 @@ class TestMidturnCompactionPolicy:
             patch.object(session.ui, "on_compaction") as on_compaction,
         ):
             session._do_auto_compact("mid-turn")
-        impl.assert_called_once_with(True, 0, 0, False)
+        impl.assert_called_once_with(True, 0, 0, False, compaction_id=1)
         start = on_compaction.call_args_list[0].args[0]
         assert start["phase"] == "start"
         assert start["trigger"] == "auto"
@@ -515,20 +558,14 @@ class TestCompactBeforeTruncate:
         assert "call_1" in ids
 
     def test_compaction_owed_predicate(self, session):
+        policy = session._compaction_policy()
         # over hard ceiling (>9000) → owed regardless of the latch
-        with patch.object(session, "_estimated_prompt_tokens", return_value=9_500):
-            session._compaction_advised = False
-            assert session._compaction_owed() is True
+        assert policy.owed(9_500, advised=False) is True
         # over soft (>8000) → owed only when advised
-        with patch.object(session, "_estimated_prompt_tokens", return_value=8_500):
-            session._compaction_advised = True
-            assert session._compaction_owed() is True
-            session._compaction_advised = False
-            assert session._compaction_owed() is False
+        assert policy.owed(8_500, advised=True) is True
+        assert policy.owed(8_500, advised=False) is False
         # under soft → never owed
-        with patch.object(session, "_estimated_prompt_tokens", return_value=7_000):
-            session._compaction_advised = True
-            assert session._compaction_owed() is False
+        assert policy.owed(7_000, advised=True) is False
 
     def test_owed_compaction_runs_before_truncation_in_tool_path(self, session):
         """Wiring: in the tool path, an owed compaction fires with preserve_tail=1
@@ -554,7 +591,11 @@ class TestCompactBeforeTruncate:
             patch.object(session, "_emit_state"),
             # Owed on the tool turn (pre-truncation); _estimated_prompt_tokens stays
             # small so the end-of-turn path doesn't also compact.
-            patch.object(session, "_compaction_owed", side_effect=lambda: n["i"] == 1),
+            patch.object(
+                session,
+                "_compaction_policy",
+                return_value=_mock_policy(owed=lambda *_a, **_k: n["i"] == 1),
+            ),
             patch.object(session, "_maybe_compact_midturn"),  # isolate the pre-truncation call
             patch.object(session, "_do_auto_compact") as compact,
             patch("turnstone.core.session.save_message"),
@@ -591,8 +632,11 @@ class TestCompactBeforeTruncate:
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
             # Owed on the tool turn → the pre-truncation compaction fires.
-            # _compaction_owed takes an optional ``used`` arg, so accept *a/**k.
-            patch.object(session, "_compaction_owed", side_effect=lambda *a, **k: n["i"] == 1),
+            patch.object(
+                session,
+                "_compaction_policy",
+                return_value=_mock_policy(owed=lambda *_a, **_k: n["i"] == 1),
+            ),
             patch.object(session, "_do_auto_compact") as compact,
             patch.object(session, "_maybe_compact_midturn") as midturn,
             patch("turnstone.core.session.save_message"),
@@ -631,7 +675,11 @@ class TestCompactBeforeTruncate:
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
             # Never owed → no pre-truncation compaction this iteration.
-            patch.object(session, "_compaction_owed", side_effect=lambda *a, **k: False),
+            patch.object(
+                session,
+                "_compaction_policy",
+                return_value=_mock_policy(owed=False),
+            ),
             patch.object(session, "_do_auto_compact") as compact,
             patch.object(session, "_maybe_compact_midturn") as midturn,
             patch("turnstone.core.session.save_message"),
@@ -688,7 +736,11 @@ class TestCompactBeforeTruncate:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_emit_state"),
             patch.object(session, "_estimated_prompt_tokens", return_value=0),
-            patch.object(session, "_compaction_owed", return_value=False),
+            patch.object(
+                session,
+                "_compaction_policy",
+                return_value=_mock_policy(owed=False),
+            ),
             patch.object(session, "_remaining_token_budget", return_value=0),
             patch.object(
                 session, "_compact_messages", side_effect=compact_then_terminal
@@ -731,7 +783,7 @@ class TestPackBlocks:
 
     def test_preserves_all_blocks_and_order(self, session):
         blocks = [f"block-{i}-{'x' * 50}" for i in range(10)]
-        batches = session._pack_blocks(blocks, budget_chars=200)
+        batches = session._compaction_engine.pack_blocks(blocks, budget_chars=200)
         flat = [b for batch in batches for b in batch]
         assert flat == blocks  # every block present, order preserved
         assert all(batch for batch in batches)  # never an empty batch
@@ -739,7 +791,7 @@ class TestPackBlocks:
     def test_each_batch_within_budget(self, session):
         budget = 200
         blocks = ["a" * 80 for _ in range(12)]
-        batches = session._pack_blocks(blocks, budget_chars=budget)
+        batches = session._compaction_engine.pack_blocks(blocks, budget_chars=budget)
         for batch in batches:
             assert len("\n\n".join(batch)) <= budget
 
@@ -747,7 +799,7 @@ class TestPackBlocks:
         budget = 100
         exact = "y" * budget  # len == budget: fits a batch, not oversized
         blocks = ["short", exact, "tail"]
-        batches = session._pack_blocks(blocks, budget_chars=budget)
+        batches = session._compaction_engine.pack_blocks(blocks, budget_chars=budget)
         flat = [b for batch in batches for b in batch]
         assert flat == blocks  # order + presence
         assert exact in flat  # untouched, not truncated
@@ -758,7 +810,7 @@ class TestPackBlocks:
         budget = 100
         huge = "z" * 500  # > budget → its own truncated batch
         blocks = ["before", huge, "after"]
-        batches = session._pack_blocks(blocks, budget_chars=budget)
+        batches = session._compaction_engine.pack_blocks(blocks, budget_chars=budget)
         flat = [b for batch in batches for b in batch]
         assert flat[0] == "before" and flat[-1] == "after"  # neighbours survive
         truncated = [b for b in flat if "[truncated" in b]
@@ -776,17 +828,21 @@ class TestSummaryInputBudget:
     def test_scales_with_context_window(self, session):
         session.compact_max_tokens = 100
         session.context_window = 20_000
-        smaller = session._summary_input_budget_chars()
+        smaller = session._compaction_engine.summary_input_budget_chars(_summary_runtime(session))
         session.context_window = 40_000
-        larger = session._summary_input_budget_chars()
+        larger = session._compaction_engine.summary_input_budget_chars(_summary_runtime(session))
         assert larger > smaller
 
     def test_subtracts_output_reserve(self, session):
         session.context_window = 50_000
         session.compact_max_tokens = 100
-        small_reserve = session._summary_input_budget_chars()
+        small_reserve = session._compaction_engine.summary_input_budget_chars(
+            _summary_runtime(session)
+        )
         session.compact_max_tokens = 20_000  # larger output reserve
-        large_reserve = session._summary_input_budget_chars()
+        large_reserve = session._compaction_engine.summary_input_budget_chars(
+            _summary_runtime(session)
+        )
         assert large_reserve < small_reserve  # less room left for input
 
     def test_budget_never_exceeds_true_input_capacity(self, session):
@@ -798,14 +854,19 @@ class TestSummaryInputBudget:
         session.context_window = 1200
         session.compact_max_tokens = 1200
         session._system_tokens = 0
-        budget_chars = session._summary_input_budget_chars()
+        budget_chars = session._compaction_engine.summary_input_budget_chars(
+            _summary_runtime(session)
+        )
         prompt_tokens = int(
-            (len(session._COMPACTOR_SYSTEM_PROMPT) + len(session._COMPACT_USER_PREFIX))
+            (
+                len(session._compaction_engine.COMPACTOR_SYSTEM_PROMPT)
+                + len(session._compaction_engine.COMPACT_USER_PREFIX)
+            )
             / session._chars_per_token
         )
         # The full summary call (output reserve + budgeted input + prompt) fits.
         total = (
-            session._summary_output_tokens()
+            session._compaction_engine.summary_output_tokens(_summary_runtime(session))
             + budget_chars / session._chars_per_token
             + prompt_tokens
         )
@@ -849,7 +910,7 @@ class TestChunkedCompaction:
         session.context_window = 5_000
         session.compact_max_tokens = 4_000  # squeezes the input budget to the floor
         session._system_tokens = 0
-        budget = session._summary_input_budget_chars()
+        budget = session._compaction_engine.summary_input_budget_chars(_summary_runtime(session))
 
         session.messages = turns_from_dicts(
             [
@@ -866,7 +927,7 @@ class TestChunkedCompaction:
 
         def fake_uc(messages, **_kwargs):
             body = messages[1].text
-            prefix = session._COMPACT_USER_PREFIX
+            prefix = session._compaction_engine.COMPACT_USER_PREFIX
             if body.startswith(prefix):
                 body = body[len(prefix) :]
             recorded.append(len(body))
@@ -895,27 +956,29 @@ class TestChunkedCompaction:
         )
         session._msg_tokens = [1] * len(session.messages)
         pinned_lane = session._primary_lane()
-        seen_lanes: list[object] = []
+        seen_runtimes: list[SummaryRuntime] = []
         prompts: list[str] = []
 
-        def fake_once(system_prompt, _body, _my_generation=0, *, lane=None):
+        def fake_once(system_prompt, _body, runtime):
             # Ancillary post-fold accounting may resolve capabilities again, but
             # recursive summarization itself must not re-resolve its lane.
             assert primary_lane.call_count == 1
-            seen_lanes.append(lane)
+            seen_runtimes.append(runtime)
             prompts.append(system_prompt)
-            return _SummaryResult(text="fold", producer="summary-producer")
+            return SummaryResult(text="fold", producer="summary-producer")
 
         with (
             patch.object(session, "_primary_lane", return_value=pinned_lane) as primary_lane,
-            patch.object(session, "_summary_input_budget_chars", return_value=450),
-            patch.object(session, "_summarize_once", side_effect=fake_once),
+            patch.object(
+                session._compaction_engine, "summary_input_budget_chars", return_value=450
+            ),
+            patch.object(session._compaction_engine, "summarize_once", side_effect=fake_once),
         ):
             assert session._compact_messages(auto=False) is True
 
-        assert prompts.count(session._COMPACTOR_SYSTEM_PROMPT) >= 2
-        assert prompts[-1] == session._COMPACTOR_MERGE_SYSTEM_PROMPT
-        assert seen_lanes and all(lane is pinned_lane for lane in seen_lanes)
+        assert prompts.count(session._compaction_engine.COMPACTOR_SYSTEM_PROMPT) >= 2
+        assert prompts[-1] == session._compaction_engine.COMPACTOR_MERGE_SYSTEM_PROMPT
+        assert seen_runtimes and all(runtime is seen_runtimes[0] for runtime in seen_runtimes)
 
     def test_recursion_depth_ceiling_bails_to_false(self, session):
         """q-3: the ``depth >= _MAX_SUMMARY_DEPTH`` recursion backstop bails to
@@ -929,8 +992,10 @@ class TestChunkedCompaction:
         session.context_window = 5_000
         session.compact_max_tokens = 4_000  # squeezes the input budget
         session._system_tokens = 0
-        session._MAX_SUMMARY_DEPTH = 1  # positive, so depth 0 runs before the bail
-        budget = session._summary_input_budget_chars()
+        session._compaction_engine.MAX_SUMMARY_DEPTH = (
+            1  # positive, so depth 0 runs before the bail
+        )
+        budget = session._compaction_engine.summary_input_budget_chars(_summary_runtime(session))
 
         # ~30 messages, each block bigger than 1/6 of the budget → depth 0 packs
         # into several batches and recurses (depth 0 < MAX).
@@ -1010,9 +1075,15 @@ class TestChunkedCompaction:
         with patch.object(session, "_get_capabilities", return_value=caps):
             assert session._get_capabilities().max_output_tokens == 64000
             # Output reserve never claims more than half the window...
-            assert session._summary_output_tokens() <= session.context_window // 2
+            assert (
+                session._compaction_engine.summary_output_tokens(_summary_runtime(session))
+                <= session.context_window // 2
+            )
             # ...so the input budget is healthy, not floored to 2000.
-            assert session._summary_input_budget_chars() > 10_000
+            assert (
+                session._compaction_engine.summary_input_budget_chars(_summary_runtime(session))
+                > 10_000
+            )
 
             session._system_tokens = 0
             session.messages = turns_from_dicts(
@@ -1044,7 +1115,10 @@ class TestChunkedCompaction:
         assert recorded  # at least one summary call happened
         out_tokens = recorded[0]
         assert out_tokens <= session.context_window // 2
-        rep_input_tokens = session._summary_input_budget_chars() / session._chars_per_token
+        rep_input_tokens = (
+            session._compaction_engine.summary_input_budget_chars(_summary_runtime(session))
+            / session._chars_per_token
+        )
         assert out_tokens + rep_input_tokens < session.context_window
 
     def test_empty_summary_keeps_history(self, session):
@@ -1450,18 +1524,20 @@ class TestChunkerOverflowSplit:
         blocks = ["A" * 4000, "B" * 4000, "C" * 4000]
         bodies: list[int] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
-            assert lane is not None
+        def fake_once(_system_prompt, body, runtime):
+            assert isinstance(runtime, SummaryRuntime)
             bodies.append(len(body))
             if len(body) > 6_000:  # a multi-block body overflows the token window
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return _SummaryResult(text="S", producer="summary-producer")
+            return SummaryResult(text="S", producer="summary-producer")
 
         with (
-            patch.object(session, "_summary_input_budget_chars", return_value=100_000),
-            patch.object(session, "_summarize_once", side_effect=fake_once),
+            patch.object(
+                session._compaction_engine, "summary_input_budget_chars", return_value=100_000
+            ),
+            patch.object(session._compaction_engine, "summarize_once", side_effect=fake_once),
         ):
-            result = session._summarize_blocks(blocks)
+            result = _summarize_blocks(session, blocks)
 
         assert result.text == "S"  # produced a summary, never raised _CompactionIrreducible
         assert any(n > 6_000 for n in bodies)  # the combined batch overflowed…
@@ -1478,18 +1554,20 @@ class TestChunkerOverflowSplit:
         blocks = [f"b{i:02d} " + "z" * 500 for i in range(8)]
         calls: list[str] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
-            assert lane is not None
+        def fake_once(_system_prompt, body, runtime):
+            assert isinstance(runtime, SummaryRuntime)
             calls.append(body)
             if body.count("\n\n") >= 4:  # a body of 5+ blocks overflows the window
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return _SummaryResult(text="S", producer="summary-producer")
+            return SummaryResult(text="S", producer="summary-producer")
 
         with (
-            patch.object(session, "_summary_input_budget_chars", return_value=1_000_000),
-            patch.object(session, "_summarize_once", side_effect=fake_once),
+            patch.object(
+                session._compaction_engine, "summary_input_budget_chars", return_value=1_000_000
+            ),
+            patch.object(session._compaction_engine, "summarize_once", side_effect=fake_once),
         ):
-            result = session._summarize_blocks(blocks)
+            result = _summarize_blocks(session, blocks)
 
         assert result.text == "S"
         # Binary subdivision: [8] → two [4] halves that both fit — a handful of calls,
@@ -1502,21 +1580,23 @@ class TestChunkerOverflowSplit:
     def test_lone_oversized_block_floored_then_succeeds(self, session):
         # A single block that overflows even by itself is head/tail-truncated to
         # the floor and retried once — not bailed.
-        floor = session._MIN_SUMMARY_BUDGET_CHARS
+        floor = session._compaction_engine.MIN_SUMMARY_BUDGET_CHARS
         calls: list[int] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
-            assert lane is not None
+        def fake_once(_system_prompt, body, runtime):
+            assert isinstance(runtime, SummaryRuntime)
             calls.append(len(body))
             if len(body) > floor:
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return _SummaryResult(text="S", producer="summary-producer")
+            return SummaryResult(text="S", producer="summary-producer")
 
         with (
-            patch.object(session, "_summary_input_budget_chars", return_value=50_000),
-            patch.object(session, "_summarize_once", side_effect=fake_once),
+            patch.object(
+                session._compaction_engine, "summary_input_budget_chars", return_value=50_000
+            ),
+            patch.object(session._compaction_engine, "summarize_once", side_effect=fake_once),
         ):
-            result = session._summarize_blocks(["Z" * 20_000])
+            result = _summarize_blocks(session, ["Z" * 20_000])
 
         assert result.text == "S"  # floored block summarized, not bailed
         assert any(n > floor for n in calls)  # the over-floor call overflowed…
@@ -1527,21 +1607,23 @@ class TestChunkerOverflowSplit:
         NOT slammed straight to the 2 000-char floor — so when a mid-size truncation
         already fits the window, far more of the message survives than a floor jump
         would keep (the single-block analogue of the multi-block binary subdivision)."""
-        floor = session._MIN_SUMMARY_BUDGET_CHARS
+        floor = session._compaction_engine.MIN_SUMMARY_BUDGET_CHARS
         calls: list[int] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
-            assert lane is not None
+        def fake_once(_system_prompt, body, runtime):
+            assert isinstance(runtime, SummaryRuntime)
             calls.append(len(body))
             if len(body) > 9_000:  # only bodies well above the floor overflow
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return _SummaryResult(text="S", producer="summary-producer")
+            return SummaryResult(text="S", producer="summary-producer")
 
         with (
-            patch.object(session, "_summary_input_budget_chars", return_value=50_000),
-            patch.object(session, "_summarize_once", side_effect=fake_once),
+            patch.object(
+                session._compaction_engine, "summary_input_budget_chars", return_value=50_000
+            ),
+            patch.object(session._compaction_engine, "summarize_once", side_effect=fake_once),
         ):
-            result = session._summarize_blocks(["Z" * 16_000])
+            result = _summarize_blocks(session, ["Z" * 16_000])
 
         assert result.text == "S"
         # First shrink budget is len//2 == 8 000 (< the 9 000 overflow line), so it
@@ -1553,22 +1635,24 @@ class TestChunkerOverflowSplit:
     def test_non_shrinking_merge_bails_at_depth_not_recursionerror(self, session):
         """If per-block summaries never compress (the merge keeps overflowing),
         recursion is bounded by the depth ceiling and bails to
-        _CompactionIrreducibleError — NOT an unbounded recurse into RecursionError.
+        CompactionIrreducibleError — NOT an unbounded recurse into RecursionError.
         Regression for the depth-check-only-on-the-multi-batch-path bug."""
 
-        def no_shrink(_system_prompt, body, _my_generation=0, *, lane=None):
-            assert lane is not None
+        def no_shrink(_system_prompt, body, runtime):
+            assert isinstance(runtime, SummaryRuntime)
             if "\n\n" in body:  # any multi-block body overflows the window
                 raise RuntimeError("maximum context length is 524288 tokens")
             # A single-block 'summary' is the block itself — no shrink.
-            return _SummaryResult(text=body, producer="summary-producer")
+            return SummaryResult(text=body, producer="summary-producer")
 
         with (
-            patch.object(session, "_summary_input_budget_chars", return_value=100_000),
-            patch.object(session, "_summarize_once", side_effect=no_shrink),
-            pytest.raises(_CompactionIrreducibleError),
+            patch.object(
+                session._compaction_engine, "summary_input_budget_chars", return_value=100_000
+            ),
+            patch.object(session._compaction_engine, "summarize_once", side_effect=no_shrink),
+            pytest.raises(CompactionIrreducibleError),
         ):
-            session._summarize_blocks(["A" * 4000, "B" * 4000, "C" * 4000])
+            _summarize_blocks(session, ["A" * 4000, "B" * 4000, "C" * 4000])
 
     def test_later_batch_overflow_keeps_completed_siblings(self, session):
         """A later batch overflowing and splitting does NOT re-summarize earlier
@@ -1578,18 +1662,20 @@ class TestChunkerOverflowSplit:
         blocks = ["A" * 2000, "B" * 2000, "C" * 2000, "D" * 2000]
         bodies: list[str] = []
 
-        def fake_once(_system_prompt, body, _my_generation=0, *, lane=None):
-            assert lane is not None
+        def fake_once(_system_prompt, body, runtime):
+            assert isinstance(runtime, SummaryRuntime)
             bodies.append(body)
             if "CC" in body and "\n\n" in body:  # the multi-block batch holding C
                 raise RuntimeError("maximum context length is 524288 tokens")
-            return _SummaryResult(text="S", producer="summary-producer")
+            return SummaryResult(text="S", producer="summary-producer")
 
         with (
-            patch.object(session, "_summary_input_budget_chars", return_value=4_500),
-            patch.object(session, "_summarize_once", side_effect=fake_once),
+            patch.object(
+                session._compaction_engine, "summary_input_budget_chars", return_value=4_500
+            ),
+            patch.object(session._compaction_engine, "summarize_once", side_effect=fake_once),
         ):
-            result = session._summarize_blocks(blocks)
+            result = _summarize_blocks(session, blocks)
 
         assert result.text == "S"
         # The first batch (A+B) was summarized exactly once, never recomputed after
@@ -1619,7 +1705,9 @@ class TestChunkerOverflowSplit:
 
         try:
             with (
-                patch.object(session, "_summary_input_budget_chars", return_value=3_500),
+                patch.object(
+                    session._compaction_engine, "summary_input_budget_chars", return_value=3_500
+                ),
                 patch.object(session, "_utility_completion", side_effect=cancel_then_summarize),
                 pytest.raises(GenerationCancelled),
             ):
@@ -1652,7 +1740,9 @@ class TestChunkerOverflowSplit:
         try:
             with (
                 # Huge budget → all blocks pack into ONE batch → exactly one call.
-                patch.object(session, "_summary_input_budget_chars", return_value=100_000),
+                patch.object(
+                    session._compaction_engine, "summary_input_budget_chars", return_value=100_000
+                ),
                 patch.object(session, "_utility_completion", side_effect=cancel_during_call),
                 pytest.raises(GenerationCancelled),
             ):
@@ -1679,7 +1769,9 @@ class TestChunkerOverflowSplit:
         before = list(session.messages)
         try:
             with (
-                patch.object(session, "_summary_input_budget_chars", return_value=100_000),
+                patch.object(
+                    session._compaction_engine, "summary_input_budget_chars", return_value=100_000
+                ),
                 patch.object(session, "_utility_completion") as uc,
                 pytest.raises(GenerationCancelled),
             ):
@@ -1737,7 +1829,9 @@ class TestChunkerOverflowSplit:
             content="SUMMARY", finish_reason="stop", producer="summary-producer"
         )
         with (
-            patch.object(session, "_summary_input_budget_chars", return_value=100_000),
+            patch.object(
+                session._compaction_engine, "summary_input_budget_chars", return_value=100_000
+            ),
             patch.object(session, "_utility_completion", return_value=summary),
             pytest.raises(GenerationCancelled),
         ):
@@ -1775,9 +1869,9 @@ class TestChunkerOverflowSplit:
 
         with (
             patch.object(
-                session,
-                "_summarize_blocks",
-                return_value=_SummaryResult(text="stale summary", producer="stale-producer"),
+                session._compaction_engine,
+                "summarize_blocks",
+                return_value=SummaryResult(text="stale summary", producer="stale-producer"),
             ),
             patch(
                 "turnstone.core.session.require_lane_capabilities", side_effect=block_before_commit
@@ -1939,6 +2033,26 @@ class _ObservedRLock:
 
 
 class TestCompactionPublicationFence:
+    def test_repeated_workstream_compactions_use_distinct_attempt_ids(self, session):
+        _seed_two_messages(session)
+        summary = SimpleNamespace(
+            content="dense summary",
+            finish_reason="stop",
+            producer="summary-producer",
+        )
+        with (
+            patch.object(session, "_utility_completion", return_value=summary),
+            patch.object(session.ui, "on_compaction") as on_compaction,
+            patch("turnstone.core.session.save_message"),
+        ):
+            assert session._compact_messages() is True
+            assert session._compact_messages() is True
+
+        events = _compaction_events(on_compaction)
+        assert [event["phase"] for event in events] == ["start", "end", "start", "end"]
+        assert [event["compaction_id"] for event in events] == [1, 1, 2, 2]
+        assert {event["target"] for event in events} == {"workstream"}
+
     @pytest.mark.parametrize("phase", ["start", "progress"])
     @pytest.mark.parametrize("terminal", ["superseded", "cancelled", "closed"])
     def test_non_end_event_is_not_emitted_after_terminal_boundary(
@@ -2063,7 +2177,9 @@ class TestCompactionLifecycleEvents:
     def test_summary_error_emits_failed_end_and_returns_false(self, session):
         _seed_two_messages(session)
         with (
-            patch.object(session, "_summarize_blocks", side_effect=RuntimeError("boom")),
+            patch.object(
+                session._compaction_engine, "summarize_blocks", side_effect=RuntimeError("boom")
+            ),
             patch.object(session.ui, "on_compaction") as oc,
         ):
             assert session._compact_messages() is False
@@ -2076,7 +2192,11 @@ class TestCompactionLifecycleEvents:
         """A presentation teardown failure cannot re-enter the END backstop."""
         _seed_two_messages(session)
         with (
-            patch.object(session, "_summarize_blocks", side_effect=RuntimeError("summary boom")),
+            patch.object(
+                session._compaction_engine,
+                "summarize_blocks",
+                side_effect=RuntimeError("summary boom"),
+            ),
             patch.object(session.ui, "on_thinking_stop", side_effect=RuntimeError("ui boom")),
             patch.object(session.ui, "on_compaction") as on_compaction,
         ):
@@ -2099,7 +2219,7 @@ class TestCompactionLifecycleEvents:
             summary_started.set()
             if not release_summary.wait(2):
                 raise RuntimeError("test release timed out")
-            return _SummaryResult(text="late summary", producer="summary-producer")
+            return SummaryResult(text="late summary", producer="summary-producer")
 
         def run_compaction() -> None:
             try:
@@ -2108,7 +2228,7 @@ class TestCompactionLifecycleEvents:
                 outcomes.append(exc)
 
         with (
-            patch.object(session, "_summarize_blocks", side_effect=summarize),
+            patch.object(session._compaction_engine, "summarize_blocks", side_effect=summarize),
             patch.object(session.ui, "on_thinking_stop") as thinking_stop,
         ):
             worker = threading.Thread(target=run_compaction)
@@ -2128,7 +2248,11 @@ class TestCompactionLifecycleEvents:
     def test_irreducible_emits_failed_end(self, session):
         _seed_two_messages(session)
         with (
-            patch.object(session, "_summarize_blocks", side_effect=_CompactionIrreducibleError()),
+            patch.object(
+                session._compaction_engine,
+                "summarize_blocks",
+                side_effect=CompactionIrreducibleError(),
+            ),
             patch.object(session.ui, "on_compaction") as oc,
         ):
             assert session._compact_messages() is False
@@ -2151,7 +2275,9 @@ class TestCompactionLifecycleEvents:
         retire the in-progress card via a cancelled end event."""
         _seed_two_messages(session)
         with (
-            patch.object(session, "_summarize_blocks", side_effect=GenerationCancelled()),
+            patch.object(
+                session._compaction_engine, "summarize_blocks", side_effect=GenerationCancelled()
+            ),
             patch.object(session.ui, "on_compaction") as oc,
             pytest.raises(GenerationCancelled),
         ):
@@ -2169,7 +2295,9 @@ class TestCompactionLifecycleEvents:
         (str(KeyboardInterrupt()) is '')."""
         _seed_two_messages(session)
         with (
-            patch.object(session, "_summarize_blocks", side_effect=KeyboardInterrupt()),
+            patch.object(
+                session._compaction_engine, "summarize_blocks", side_effect=KeyboardInterrupt()
+            ),
             patch.object(session.ui, "on_error") as on_error,
             patch.object(session.ui, "on_compaction") as oc,
             pytest.raises(KeyboardInterrupt),
@@ -2264,20 +2392,22 @@ class TestCompactionLifecycleEvents:
         saved: dict = {}
         producers: list[str] = []
 
-        def fake_once(system_prompt, _body, _my_generation=0, *, lane=None):
-            assert lane is not None
-            is_merge = system_prompt == session._COMPACTOR_MERGE_SYSTEM_PROMPT
+        def fake_once(system_prompt, _body, runtime):
+            assert isinstance(runtime, SummaryRuntime)
+            is_merge = system_prompt == session._compaction_engine.COMPACTOR_MERGE_SYSTEM_PROMPT
             producer = "final-merge-producer" if is_merge else "leaf-producer"
             producers.append(producer)
-            return _SummaryResult(text="FINAL" if is_merge else "partial", producer=producer)
+            return SummaryResult(text="FINAL" if is_merge else "partial", producer=producer)
 
         def fake_save(ws_id, role, content, **kwargs):
             saved.update({"ws_id": ws_id, "role": role, "content": content, **kwargs})
             return 1
 
         with (
-            patch.object(session, "_summary_input_budget_chars", return_value=450),
-            patch.object(session, "_summarize_once", side_effect=fake_once),
+            patch.object(
+                session._compaction_engine, "summary_input_budget_chars", return_value=450
+            ),
+            patch.object(session._compaction_engine, "summarize_once", side_effect=fake_once),
             patch.object(get_storage(), "get_compaction_watermark", return_value=17),
             patch("turnstone.core.session.save_message", side_effect=fake_save),
         ):
@@ -2337,7 +2467,9 @@ class TestCompactNow:
             raise GenerationCancelled()
 
         with (
-            patch.object(session, "_summarize_blocks", side_effect=cancel_mid_summary),
+            patch.object(
+                session._compaction_engine, "summarize_blocks", side_effect=cancel_mid_summary
+            ),
             pytest.raises(GenerationCancelled),
         ):
             session.compact_now()
@@ -2363,10 +2495,10 @@ class TestCompactNow:
             # while this compaction is inside its summarize call.
             session._generation += 1
             session._cancel_event = threading.Event()
-            return _SummaryResult(text="stale summary", producer="stale-producer")
+            return SummaryResult(text="stale summary", producer="stale-producer")
 
         with (
-            patch.object(session, "_summarize_blocks", side_effect=supersede),
+            patch.object(session._compaction_engine, "summarize_blocks", side_effect=supersede),
             pytest.raises(GenerationCancelled),
         ):
             session.compact_now()
@@ -2875,7 +3007,7 @@ class TestOrphanedCompactionRetirement:
             patch.object(session, "_utility_completion") as uc,
             pytest.raises(GenerationCancelled),
         ):
-            session._summarize_blocks(["block-a"], my_generation=4)
+            _summarize_blocks(session, ["block-a"], my_generation=4)
         uc.assert_not_called()  # retired BEFORE spending another model call
 
     def test_cancel_during_retry_backoff_aborts_immediately(self, session):
@@ -2888,7 +3020,7 @@ class TestOrphanedCompactionRetirement:
             patch.object(session, "_stop_retrying", return_value=False),
             pytest.raises(GenerationCancelled),
         ):
-            session._summarize_once("sys", "body")
+            _summarize_once(session, "sys", "body")
 
     def test_summary_call_registers_abortable_stream(self, session):
         """Each summary attempt passes a fresh _CancelRef so cancel() can
@@ -2913,8 +3045,8 @@ class TestOrphanedCompactionRetirement:
             )
 
         with patch.object(session, "_utility_completion", side_effect=fake_uc):
-            assert session._summarize_once("sys", "body").text == "dense"
-            assert session._summarize_once("sys", "body").text == "dense"
+            assert _summarize_once(session, "sys", "body").text == "dense"
+            assert _summarize_once(session, "sys", "body").text == "dense"
         assert len(seen) == 2
         assert all(isinstance(ref, _CancelRef) for ref in seen)
         assert seen[0] is not seen[1]  # scoped to its call, never reused
@@ -2980,7 +3112,7 @@ class TestOrphanedCompactionRetirement:
             )
 
         with patch.object(session, "_utility_completion", side_effect=fake_uc):
-            session._summarize_once("sys", "body", my_generation=3)
+            _summarize_once(session, "sys", "body", my_generation=3)
         assert isinstance(seen[0], _CancelRef)
         assert seen[0]._my_generation == 3
 
@@ -2996,7 +3128,7 @@ class TestOrphanedCompactionRetirement:
             )
 
         with patch.object(session, "_utility_completion", side_effect=fake_uc):
-            session._summarize_once("sys", "body", my_generation=3)
+            _summarize_once(session, "sys", "body", my_generation=3)
 
         assert seen == ["user-a"]
 
@@ -3013,7 +3145,7 @@ class TestOrphanedCompactionRetirement:
             patch.object(session, "_utility_completion", side_effect=fake_uc),
             pytest.raises(GenerationCancelled),
         ):
-            session._summarize_once("sys", "body")
+            _summarize_once(session, "sys", "body")
 
 
 # ---------------------------------------------------------------------------
@@ -3028,7 +3160,9 @@ class TestCompactionErrorChannel:
         failures fed before the lifecycle events replaced on_error here."""
         _seed_two_messages(session)
         with (
-            patch.object(session, "_summarize_blocks", side_effect=RuntimeError("boom")),
+            patch.object(
+                session._compaction_engine, "summarize_blocks", side_effect=RuntimeError("boom")
+            ),
             patch.object(session.ui, "on_error") as on_error,
             patch.object(session.ui, "on_compaction") as oc,
         ):

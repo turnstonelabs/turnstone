@@ -127,15 +127,21 @@ export function buildCompactionCard(meta, summary) {
 // part-k-of-N progress event flips it determinate via
 // updateCompactionProgress.  The end event replaces the card with
 // buildCompactionCard (or a failure notice).
-export function buildCompactionProgressCard(isAuto) {
+export function buildCompactionProgressCard(isAuto, target) {
+  const taskTarget = target === "task_agent";
   const el = document.createElement("div");
   el.className = "msg compaction-card compaction-running";
   el.setAttribute("role", "status");
   el.setAttribute("data-ts-role", "compaction");
-  el.setAttribute("aria-label", "compacting context");
+  el.setAttribute(
+    "aria-label",
+    taskTarget ? "compacting task-agent context" : "compacting context",
+  );
   const header = document.createElement("div");
   header.className = "msg-compaction-header";
-  header.textContent = "compacting context…" + (isAuto ? " · auto" : "");
+  header.textContent =
+    (taskTarget ? "compacting task context…" : "compacting context…") +
+    (isAuto ? " · auto" : "");
   el.appendChild(header);
   const bar = document.createElement("div");
   bar.className = "msg-compaction-bar indeterminate";
@@ -145,7 +151,9 @@ export function buildCompactionProgressCard(isAuto) {
   el.appendChild(bar);
   const note = document.createElement("div");
   note.className = "msg-compaction-note";
-  note.textContent = "summarizing conversation…";
+  note.textContent = taskTarget
+    ? "summarizing task-agent context…"
+    : "summarizing conversation…";
   el.appendChild(note);
   return el;
 }
@@ -205,13 +213,17 @@ export function updateCompactionProgress(el, evt) {
 //   container      — the transcript element to append into
 //   renderedIds    — the pane's rendered-event-id Set (dedups the ok-end
 //                    card against the /history-projected marker row)
-//   onNotice(msg)  — render a non-error failure notice (info styling)
+//   onNotice(msg)  — render a lifecycle failure notice
 //   scroll(force)  — the pane's scroll-to-bottom
-// reason="error" ends render NO notice here: the backend pairs them with a
-// typed `error` event, which each pane's existing error handler styles red
-// (and which feeds the node's error metrics) — emitting here too would show
-// the message twice.
+//   append(node)   — optional placement override (task cards insert the
+//                    progress node outside their collapsible step body)
+//   renderResult   — false for transient task-agent compaction; its summary
+//                    is model context, not a transcript result card
+// Workstream reason="error" ends carry notice=false because the backend pairs
+// them with a typed `error` event. Task-agent errors have no unscoped twin and
+// carry notice=true; their pane hook renders the message inside the task card.
 export function applyCompactionEvent(holder, evt, hooks) {
+  const append = hooks.append || ((node) => hooks.container.appendChild(node));
   // Lifecycle ownership: events carry the backend's compaction_id and the
   // holder remembers which compaction painted the live card, so a stale
   // event — a force-abandoned compaction retiring after a successor
@@ -226,9 +238,12 @@ export function applyCompactionEvent(holder, evt, hooks) {
     String(evt.compaction_id) === holder.cid;
   if (evt.phase === "start") {
     if (holder.card) holder.card.remove();
-    holder.card = buildCompactionProgressCard(evt.trigger === "auto");
+    holder.card = buildCompactionProgressCard(
+      evt.trigger === "auto",
+      evt.target,
+    );
     holder.cid = evt.compaction_id != null ? String(evt.compaction_id) : null;
-    hooks.container.appendChild(holder.card);
+    append(holder.card);
     hooks.scroll(true);
     return;
   }
@@ -241,9 +256,9 @@ export function applyCompactionEvent(holder, evt, hooks) {
     // cosmetic, and threading trigger through the summarize stack for it
     // is disproportionate.
     if (!holder.card) {
-      holder.card = buildCompactionProgressCard(false);
+      holder.card = buildCompactionProgressCard(false, evt.target);
       holder.cid = evt.compaction_id != null ? String(evt.compaction_id) : null;
-      hooks.container.appendChild(holder.card);
+      append(holder.card);
     }
     updateCompactionProgress(holder.card, evt);
     hooks.scroll(false);
@@ -251,7 +266,7 @@ export function applyCompactionEvent(holder, evt, hooks) {
   }
   if (evt.phase === "end") {
     if (owns) resetCompactionHolder(holder);
-    if (evt.ok) {
+    if (evt.ok && hooks.renderResult !== false) {
       // The persisted marker row is stamped with THIS event's id, so
       // whichever of /history repaint or live/replayed event renders
       // first wins.  Rendered even for a non-owning end: a completed
@@ -274,9 +289,10 @@ export function applyCompactionEvent(holder, evt, hooks) {
       // cancelled / not_enough_messages / irreducible / empty_summary —
       // informational, not an error state.  Whether the message is shown
       // is the emitter's call: the backend stamps `notice` on failed ends
-      // (suppressing error-reason / superseded / cancelled-auto ends —
-      // see ChatSession._compaction_event, the single policy site), so
-      // this arm stays mechanical.  `owns` is the one pane-local clause
+      // (workstream errors use their typed-error twin; task errors use this
+      // nested notice; superseded and cancelled-auto ends stay silent — see
+      // ChatSession._compaction_event, the single policy site), so this arm
+      // stays mechanical. `owns` is the one pane-local clause
       // the emitter cannot compute — card ownership via compaction_id vs
       // holder.cid — and it guards a reachable divergence: a /resume
       // swaps sessions and restarts generation counters, so an abandoned

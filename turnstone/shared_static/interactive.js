@@ -408,6 +408,10 @@ class Pane {
     // buffers that reading until _relinkAgentCards paints the row. Repeated
     // live/synthetic events replace one reading and update one badge.
     this._agentContexts = new Map();
+    // parent call id -> shared-reducer holder for a task agent's transient
+    // compaction progress. Parallel task agents compact independently, so one
+    // foreground holder cannot represent them.
+    this._agentCompactions = new Map();
     this._resizeObs = null;
     // Set when replay_truncated arrives mid-stream (refetching then would
     // detach the live bubble); consumed on the next idle edge.  Cleared by
@@ -759,6 +763,10 @@ class Pane {
   }
 
   handleCompactionEvent(evt) {
+    if ((evt.target || "workstream") === "task_agent") {
+      this._handleAgentCompaction(evt);
+      return;
+    }
     // Shared reducer (conversation.applyCompactionEvent) — one lifecycle
     // state machine for this pane and the coordinator viewer.  The dedup
     // set is the same one the system_turn path uses: the persisted marker
@@ -2218,6 +2226,12 @@ class Pane {
     // grace timer would escape buffered steps into the rebuilt pane.
     if (this._agentCards) this._agentCards.clear();
     if (this._agentContexts) this._agentContexts.clear();
+    if (this._agentCompactions) {
+      for (const holder of this._agentCompactions.values()) {
+        resetCompactionHolder(holder);
+      }
+      this._agentCompactions.clear();
+    }
     if (this._agentOrphans) {
       for (const entry of this._agentOrphans.values()) {
         if (entry.timer != null) clearTimeout(entry.timer);
@@ -2437,6 +2451,12 @@ class Pane {
           for (const [parentId, reading] of this._agentContexts.entries()) {
             if (reading.blockedByTerminalRow) {
               this._agentContexts.delete(parentId);
+            }
+          }
+          for (const [parentId, holder] of this._agentCompactions.entries()) {
+            if (holder.blockedByTerminalRow) {
+              resetCompactionHolder(holder);
+              this._agentCompactions.delete(parentId);
             }
           }
           this._attachRetryToLastAssistant();
@@ -4356,6 +4376,111 @@ class Pane {
   }
 
   // --- Task-agent card: nest a sub-agent's sub-tool steps under its row -----
+  _agentTransientRoute(parentId) {
+    const parentRow = this._toolRow(parentId);
+    const terminal = this._toolResultNodes.get(parentId);
+    if (!parentRow || !terminal || terminal.row !== parentRow) {
+      return { state: "current", row: parentRow };
+    }
+    // A fresh/truncated snapshot or live event can race a successor whose
+    // provider recycled the same public call id. While busy, hold the transient
+    // away from the earlier terminal occurrence; the next painted row relinks
+    // it. At idle there can be no successor, so the event is stale.
+    return this.busy
+      ? { state: "blocked", row: parentRow }
+      : { state: "drop", row: parentRow };
+  }
+
+  _handleAgentCompaction(evt) {
+    const parentId =
+      typeof evt.parent_call_id === "string" ? evt.parent_call_id : "";
+    if (!parentId) return;
+    let holder = this._agentCompactions.get(parentId);
+    const route = this._agentTransientRoute(parentId);
+    if (route.state === "drop") {
+      if (holder) resetCompactionHolder(holder);
+      this._agentCompactions.delete(parentId);
+      return;
+    }
+    if (!holder) {
+      // A terminal edge with no locally active attempt has no task-context
+      // result to render. In particular, do not manufacture an empty
+      // "0 steps · running" task card when a replay begins after start.
+      if (evt.phase === "end") return;
+      holder = { card: null, cid: null, pending: null };
+      this._agentCompactions.set(parentId, holder);
+    }
+    const pendingCid =
+      holder.pending && holder.pending.compaction_id != null
+        ? String(holder.pending.compaction_id)
+        : null;
+    const activeCid = holder.cid != null ? holder.cid : pendingCid;
+    const incomingCid =
+      evt.compaction_id != null ? String(evt.compaction_id) : null;
+    if (
+      evt.phase === "end" &&
+      activeCid != null &&
+      incomingCid != null &&
+      incomingCid !== activeCid
+    ) {
+      // The shared reducer also rejects this stale end. Return before the
+      // wrapper's terminal cleanup so it cannot delete the newer holder.
+      return;
+    }
+    holder.pending = evt;
+    if (route.state === "blocked") {
+      holder.blockedByTerminalRow = route.row;
+      if (evt.phase === "end") {
+        resetCompactionHolder(holder);
+        this._agentCompactions.delete(parentId);
+      }
+      return;
+    }
+    delete holder.blockedByTerminalRow;
+    const card = this._ensureAgentCard(parentId, true);
+    if (card) this._syncAgentCompaction(parentId, card);
+    if (evt.phase === "end") {
+      // _syncAgentCompaction consumes a visible end. If the parent row has not
+      // painted, there is no live task card to retire or historical result to
+      // render, so drop the buffered terminal edge too.
+      resetCompactionHolder(holder);
+      this._agentCompactions.delete(parentId);
+    }
+  }
+
+  _syncAgentCompaction(parentId, card) {
+    const holder = this._agentCompactions.get(parentId);
+    if (!holder || !holder.pending || holder.blockedByTerminalRow) return;
+    const evt = holder.pending;
+    holder.pending = null;
+    card.wrap.hidden = false;
+    if (evt.phase === "start") {
+      const prior = card.wrap.querySelector(".conv-agent-compaction-notice");
+      if (prior) prior.remove();
+    }
+    applyCompactionEvent(holder, evt, {
+      container: card.wrap,
+      renderedIds: this._renderedSystemEventIds,
+      renderResult: false,
+      // Keep progress visible when the step body is collapsed.
+      append: (node) => card.wrap.insertBefore(node, card.body),
+      // Keep a task-local failure inside its card. It has no unscoped typed
+      // error twin, and escaping it into the workstream transcript would
+      // misattribute a non-fatal nested controller failure to the parent turn.
+      onNotice: (message) => {
+        let notice = card.wrap.querySelector(".conv-agent-compaction-notice");
+        if (!notice) {
+          notice = document.createElement("div");
+          notice.className = "conv-agent-compaction-notice";
+          notice.setAttribute("role", "status");
+          card.wrap.insertBefore(notice, card.body);
+        }
+        notice.textContent = stripAnsi(message);
+      },
+      scroll: (force) => this.scrollToBottom(force),
+    });
+  }
+
   // Child events (tool_pending / approve_request) carry parent_call_id; route
   // them into the task_agent row's collapsible body.  tool_result /
   // tool_output_chunk / intent_verdict / output_warning need no special-casing
@@ -4462,6 +4587,7 @@ class Pane {
     if (card) {
       if (parentRow.contains(card.wrap)) {
         this._syncAgentContext(parentCallId, card);
+        this._syncAgentCompaction(parentCallId, card);
         return card;
       }
       if (!card.wrap.isConnected) {
@@ -4470,6 +4596,7 @@ class Pane {
         // so its already-rendered steps survive the upgrade.
         parentRow.appendChild(card.wrap);
         this._syncAgentContext(parentCallId, card);
+        this._syncAgentCompaction(parentCallId, card);
         return card;
       }
       // The cached card is still attached to a DIFFERENT (earlier) row — a
@@ -4485,6 +4612,7 @@ class Pane {
     this._agentCards.set(parentCallId, card);
     this._syncAgentToggleLabel(card);
     this._syncAgentContext(parentCallId, card);
+    this._syncAgentCompaction(parentCallId, card);
     return card;
   }
 
@@ -4554,25 +4682,16 @@ class Pane {
       return;
     }
 
-    // A synthetic fresh-connect snapshot can race the task's terminal result.
-    // History/replay records which exact latest row already owns a result; do
-    // not resurrect a running badge on that completed card.
-    const parentRow = this._toolRow(parentId);
-    const terminal = this._toolResultNodes.get(parentId);
-    if (parentRow && terminal && terminal.row === parentRow) {
-      if (!this.busy) {
-        this._agentContexts.delete(parentId);
-        return;
-      }
-      // The provider may recycle a parent call id on a later turn. Until that
-      // successor row paints, _toolRow still resolves the prior terminal row;
-      // retain the reading without attaching it there. _relinkAgentCards will
-      // consume it when a different row occurrence arrives. An idle/error edge
-      // drops it if no successor ever appears.
+    const route = this._agentTransientRoute(parentId);
+    if (route.state === "drop") {
+      this._agentContexts.delete(parentId);
+      return;
+    }
+    if (route.state === "blocked") {
       this._agentContexts.set(parentId, {
         promptTokens,
         contextWindow,
-        blockedByTerminalRow: parentRow,
+        blockedByTerminalRow: route.row,
       });
       return;
     }
@@ -4649,11 +4768,31 @@ class Pane {
     (items || []).forEach((it) => {
       if (!it || !it.call_id) return;
       paintedIds.push(it.call_id);
+      const row = this._toolRow(it.call_id);
+      const reading = this._agentContexts.get(it.call_id);
+      const compaction = this._agentCompactions.get(it.call_id);
+      if (
+        (reading && reading.blockedByTerminalRow === row) ||
+        (compaction && compaction.blockedByTerminalRow === row)
+      ) {
+        return;
+      }
+      if (reading && reading.blockedByTerminalRow) {
+        delete reading.blockedByTerminalRow;
+      }
+      if (compaction && compaction.blockedByTerminalRow) {
+        delete compaction.blockedByTerminalRow;
+      }
       if (
         (this._agentCards && this._agentCards.has(it.call_id)) ||
-        this._agentContexts.has(it.call_id)
+        this._agentContexts.has(it.call_id) ||
+        this._agentCompactions.has(it.call_id)
       ) {
-        this._ensureAgentCard(it.call_id, this._agentContexts.has(it.call_id));
+        this._ensureAgentCard(
+          it.call_id,
+          this._agentContexts.has(it.call_id) ||
+            this._agentCompactions.has(it.call_id),
+        );
       }
     });
     if (paintedIds.length) this._flushAgentOrphans(paintedIds);
@@ -4715,6 +4854,10 @@ class Pane {
       }
     }
     this._agentContexts.delete(callId);
+    if (this._agentCompactions && this._agentCompactions.has(callId)) {
+      resetCompactionHolder(this._agentCompactions.get(callId));
+      this._agentCompactions.delete(callId);
+    }
     let target = this._toolRow(callId);
     if (!target) {
       // A minted sub-agent child id ("<parent>::r{run}s{step}::<id>") whose row hasn't

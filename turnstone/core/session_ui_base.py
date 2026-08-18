@@ -574,6 +574,11 @@ class SessionUIBase:
         # when a provider reuses the public parent call id, and so force-abandon
         # can purge every reading owned by the retired generation at once.
         self._agent_contexts: dict[str, tuple[int, dict[str, Any]]] = {}
+        # Latest in-flight compaction lifecycle event for each running task
+        # agent. Stored beside context usage because both are transient,
+        # parent-keyed reconnect state and share the same generation cleanup.
+        # Value: (owner generation, compaction id, event payload).
+        self._agent_compactions: dict[str, tuple[int, int, dict[str, Any]]] = {}
         self._agent_contexts_lock = threading.Lock()
         # Recall store: a finished task agent's projected sub-trajectory (step
         # items: id/name/arguments/output/is_error), keyed by its (parent)
@@ -1276,8 +1281,8 @@ class SessionUIBase:
             self._agent_contexts[parent_call_id] = (generation, event)
         self._enqueue(event)
 
-    def clear_agent_context(self, parent_call_id: str, *, generation: int = 0) -> None:
-        """Drop one completed task agent's reconnect snapshot.
+    def clear_agent_transients(self, parent_call_id: str, *, generation: int = 0) -> None:
+        """Drop one completed task agent's transient reconnect state.
 
         Cleanup is exact-generation: a retiring predecessor whose public call
         id was reused cannot remove the successor's active reading.
@@ -1288,9 +1293,12 @@ class SessionUIBase:
             current = self._agent_contexts.get(parent_call_id)
             if current is not None and current[0] == generation:
                 del self._agent_contexts[parent_call_id]
+            compaction = self._agent_compactions.get(parent_call_id)
+            if compaction is not None and compaction[0] == generation:
+                del self._agent_compactions[parent_call_id]
 
-    def clear_agent_contexts_before_generation(self, generation: int) -> None:
-        """Drop every reading owned by a force-abandoned generation.
+    def clear_agent_transients_before_generation(self, generation: int) -> None:
+        """Drop every agent transient owned by a force-abandoned generation.
 
         A force successor may be claimed specifically because the retiring
         worker is wedged and will never reach its per-agent ``finally`` block.
@@ -1305,11 +1313,40 @@ class SessionUIBase:
             ]
             for parent_call_id in stale:
                 del self._agent_contexts[parent_call_id]
+            stale_compactions = [
+                parent_call_id
+                for parent_call_id, (owner_generation, _cid, _event) in (
+                    self._agent_compactions.items()
+                )
+                if owner_generation < generation
+            ]
+            for parent_call_id in stale_compactions:
+                del self._agent_compactions[parent_call_id]
+
+    def _snapshot_agent_transients(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Atomically copy task-agent context and compaction reconnect state."""
+
+        with self._agent_contexts_lock:
+            contexts = [dict(event) for _generation, event in self._agent_contexts.values()]
+            compactions = [
+                dict(event)
+                for _generation, _compaction_id, event in self._agent_compactions.values()
+            ]
+        return contexts, compactions
 
     def _snapshot_agent_contexts(self) -> list[dict[str, Any]]:
-        """Copy active task-agent readings for fresh/truncated SSE replay."""
-        with self._agent_contexts_lock:
-            return [dict(event) for _generation, event in self._agent_contexts.values()]
+        """Copy active task-agent readings for focused callers/tests."""
+
+        contexts, _compactions = self._snapshot_agent_transients()
+        return contexts
+
+    def _snapshot_agent_compactions(self) -> list[dict[str, Any]]:
+        """Copy active task-agent compactions for fresh/truncated replay."""
+
+        _contexts, compactions = self._snapshot_agent_transients()
+        return compactions
 
     def on_agent_step(self, parent_call_id: str, item: dict[str, Any]) -> None:
         """Paint a sub-agent's auto-executed tool step as pending under its
@@ -1416,7 +1453,8 @@ class SessionUIBase:
 
         Returns ``(client_queue, snapshot_dict)`` where ``snapshot_dict``
         has keys ``content`` (str), ``reasoning`` (str), ``seq`` (int), and
-        ``agent_contexts`` (the active task-agent context events).
+        ``agent_contexts`` (active task-agent context events) and
+        ``agent_compactions`` (their active targeted compaction events).
         Caller checks for non-empty content / reasoning to decide
         whether to yield the event at all (empty snapshots are common
         between turns and on freshly-opened workstreams).
@@ -1434,11 +1472,13 @@ class SessionUIBase:
             with self._listeners_lock:
                 self._register_or_close_listener_locked(client_queue)
                 snap_seq = self._event_id
+        agent_contexts, agent_compactions = self._snapshot_agent_transients()
         snapshot = {
             "content": "".join(captured_content),
             "reasoning": "".join(captured_reasoning),
             "seq": snap_seq,
-            "agent_contexts": self._snapshot_agent_contexts(),
+            "agent_contexts": agent_contexts,
+            "agent_compactions": agent_compactions,
         }
         return client_queue, snapshot
 
@@ -1565,11 +1605,13 @@ class SessionUIBase:
                 buffered = list(self._event_buffer)
                 self._register_or_close_listener_locked(client_queue)
                 snap_seq = self._event_id
+        agent_contexts, agent_compactions = self._snapshot_agent_transients()
         snapshot: dict[str, Any] = {
             "content": "".join(captured_content),
             "reasoning": "".join(captured_reasoning),
             "seq": snap_seq,
-            "agent_contexts": self._snapshot_agent_contexts(),
+            "agent_contexts": agent_contexts,
+            "agent_compactions": agent_compactions,
         }
         if last_event_id < 0 or last_event_id > snap_seq:
             # Event ids start at 1, with cursor 0 reserved for the initial
@@ -4380,10 +4422,13 @@ class SessionUIBase:
         keeps a ``/history`` repaint and an SSE replay from double-rendering
         the result card.
 
-        Inside a task agent the events are dropped (same rule as
-        :meth:`on_info`): a sub-agent's compaction is progress chatter that
-        carries no ``call_id``, so it cannot nest under the task card and
-        must not paint a top-level compaction card on the pane.
+        ``target="workstream"`` owns the transcript card, activity latch, and
+        durable marker described above. ``target="task_agent"`` instead
+        carries ``parent_call_id`` and is retained as transient reconnect state
+        for that task card; it never touches the foreground activity pill or
+        becomes conversation history. A missing target is interpreted as
+        ``workstream`` so an event from an older node keeps its established
+        meaning.
 
         ``superseded`` (stamped by ``ChatSession._compaction_event``) marks
         events from a force-abandoned compaction whose generation a
@@ -4399,10 +4444,18 @@ class SessionUIBase:
         writes resume) without restoring — its saved pair predates the
         successor turn and would overwrite the live pill.
         """
+        payload = dict(payload)
+        generation = int(payload.pop("_generation", 0) or 0)
+        target = str(payload.get("target") or "workstream")
+        superseded = bool(payload.pop("superseded", False))
+        if target == "task_agent":
+            return self._on_task_agent_compaction(
+                payload,
+                generation=generation,
+                superseded=superseded,
+            )
         if _agent_scope_var.get() > 0:
             return None
-        payload = dict(payload)
-        superseded = bool(payload.pop("superseded", False))
         cid = int(payload.get("compaction_id") or 0)
         phase = payload.get("phase")
         if phase == "end":
@@ -4452,6 +4505,52 @@ class SessionUIBase:
         if superseded and phase != "end":
             return None
         return self._enqueue({"type": "compaction", **payload})
+
+    def _on_task_agent_compaction(
+        self,
+        payload: dict[str, Any],
+        *,
+        generation: int,
+        superseded: bool,
+    ) -> int | None:
+        """Reduce one parent-keyed task compaction and retain its live edge."""
+
+        parent_call_id = str(payload.get("parent_call_id") or "")
+        phase = str(payload.get("phase") or "")
+        raw_cid = payload.get("compaction_id")
+        if (
+            not parent_call_id
+            or phase not in {"start", "progress", "end"}
+            or not isinstance(raw_cid, int)
+            or isinstance(raw_cid, bool)
+        ):
+            return None
+        compaction_id = raw_cid
+        if superseded and phase != "end":
+            return None
+        if phase == "end":
+            payload["superseded"] = superseded
+
+        event = {"type": "compaction", **payload}
+        snapshot_event = {**event, "ws_id": self.ws_id}
+        with self._agent_contexts_lock:
+            current = self._agent_compactions.get(parent_call_id)
+            if phase in {"start", "progress"}:
+                if current is not None and (
+                    current[0] > generation
+                    or (current[0] == generation and current[1] > compaction_id)
+                ):
+                    return None
+                # Store before enqueue: a subscriber registering on the next
+                # instruction sees either this snapshot or this live event.
+                self._agent_compactions[parent_call_id] = (
+                    generation,
+                    compaction_id,
+                    snapshot_event,
+                )
+            elif current is not None and current[:2] == (generation, compaction_id):
+                del self._agent_compactions[parent_call_id]
+        return self._enqueue(event)
 
     def _release_compaction_latch_locked(self, *, restore: bool) -> bool:
         """Unlatch the compaction pill window; optionally restore the pair.

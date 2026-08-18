@@ -11,6 +11,7 @@ from turnstone.sdk.events import (
     ClusterWsClosedEvent,
     ClusterWsCreatedEvent,
     ClusterWsRenameEvent,
+    CompactionEvent,
     ConnectedEvent,
     ContentEvent,
     ErrorEvent,
@@ -482,6 +483,32 @@ def test_agent_context_event_round_trip():
     assert e.parent_call_id == "task-A"
     assert e.prompt_tokens == 41_000
     assert e.context_window == 128_000
+
+
+def test_task_agent_compaction_event_round_trip():
+    e = ServerEvent.from_dict(
+        {
+            "type": "compaction",
+            "phase": "progress",
+            "target": "task_agent",
+            "parent_call_id": "task-A",
+            "compaction_id": 17,
+            "part": 2,
+            "total": 4,
+        }
+    )
+    assert isinstance(e, CompactionEvent)
+    assert e.target == "task_agent"
+    assert e.parent_call_id == "task-A"
+    assert e.compaction_id == 17
+    assert e.part == 2
+
+
+def test_compaction_event_without_target_means_workstream():
+    e = ServerEvent.from_dict({"type": "compaction", "phase": "start", "compaction_id": 3})
+    assert isinstance(e, CompactionEvent)
+    assert e.target == "workstream"
+    assert e.parent_call_id == ""
 
 
 def test_state_change_event_round_trip():

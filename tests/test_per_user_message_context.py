@@ -21,8 +21,9 @@ from unittest.mock import MagicMock, patch
 
 from tests._session_helpers import make_session
 from turnstone.core import fence
+from turnstone.core.compaction import SummaryResult
 from turnstone.core.providers._anthropic import AnthropicProvider
-from turnstone.core.session import _prefix_sender_label, _SummaryResult
+from turnstone.core.session import _prefix_sender_label
 from turnstone.core.storage._utils import reconstruct_turns
 from turnstone.core.trajectory import Role, turn_from_dict, turn_to_dict
 
@@ -598,9 +599,9 @@ def test_resume_recovers_compacted_out_sender_end_to_end(tmp_db, mock_openai_cli
     sess.messages = turns_from_dicts(history)
     sess._msg_tokens = [1] * len(history)
     with _patch.object(
-        sess,
-        "_summarize_blocks",
-        return_value=_SummaryResult(text="owner and alice spoke", producer="summary-producer"),
+        sess._compaction_engine,
+        "summarize_blocks",
+        return_value=SummaryResult(text="owner and alice spoke", producer="summary-producer"),
     ):
         assert sess._compact_messages(auto=False) is True  # summarizes BOTH away
 

@@ -138,6 +138,17 @@ NUDGE_COMPACTION_RESUME_NO_RECALL = (
     "final answer."
 )
 
+# Task-agent trajectories are ephemeral: unlike foreground compaction there is
+# no durable transcript or recall surface to promise.  The agent keeps its
+# immutable delegation prefix plus the compacted summary and must re-read any
+# file whose exact contents it needs before editing.
+NUDGE_TASK_COMPACTION_RESUME = (
+    "Your task-agent context was just compacted to free space. Continue from "
+    "the summary above without waiting for further instructions. Re-read files "
+    "before editing when you need exact current contents. If the delegated task "
+    "is complete, provide your final response now."
+)
+
 _NUDGE_MAP: dict[str, str] = {
     "correction": NUDGE_CORRECTION,
     "denial": NUDGE_DENIAL,

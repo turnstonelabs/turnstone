@@ -73,6 +73,21 @@ def _stub_summary(text: str = "DENSE"):
     )
 
 
+def _summary_runtime(session):
+    return session._build_summary_runtime(session._primary_lane())
+
+
+def _carry_budget_chars(session, carries: int = 1) -> int:
+    return session._compaction_engine.carry_budget_chars(
+        _summary_runtime(session),
+        carries,
+    )
+
+
+def _summary_output_tokens(session) -> int:
+    return session._compaction_engine.summary_output_tokens(_summary_runtime(session))
+
+
 # ---------------------------------------------------------------------------
 # Provenance tags on the synthetic summary turns
 # ---------------------------------------------------------------------------
@@ -186,12 +201,12 @@ class TestCarryBudget:
         # overhead=0, reserve=100 (compact_max_tokens), margin=500,
         # spare=9_400; min(10_000 // 4, 9_400) = 2_500 tokens * 4.0 chars/token.
         _isolate_overhead(session)
-        assert session._carry_budget_chars() == 10_000
+        assert _carry_budget_chars(session) == 10_000
 
     def test_floors_on_tiny_window(self, tmp_db, mock_openai_client):
         tiny = make_session(client=mock_openai_client, context_window=1_000, tool_timeout=10)
         _isolate_overhead(tiny)
-        assert tiny._carry_budget_chars() == tiny._MIN_CARRY_BUDGET_CHARS
+        assert _carry_budget_chars(tiny) == tiny._compaction_engine.MIN_CARRY_BUDGET_CHARS
 
     @pytest.mark.parametrize("carries", [1, 2])
     def test_overhead_reserve_and_carries_fit_window_at_shipped_defaults(
@@ -206,9 +221,9 @@ class TestCarryBudget:
         away."""
         s = make_session(client=mock_openai_client, tool_timeout=10)
         _isolate_overhead(s, system_tokens=4_000)  # a chunky composed prompt
-        reserve = s._summary_output_tokens()
-        per_carry_tokens = s._carry_budget_chars(carries) / s._chars_per_token
-        margin = int(s.context_window * s._SUMMARY_SAFETY_MARGIN)
+        reserve = _summary_output_tokens(s)
+        per_carry_tokens = _carry_budget_chars(s, carries) / s._chars_per_token
+        margin = int(s.context_window * s._compaction_engine.SUMMARY_SAFETY_MARGIN)
         assert 4_000 + reserve + carries * per_carry_tokens + margin <= s.context_window
 
     def test_budget_shrinks_with_prompt_overhead(self, tmp_db, mock_openai_client):
@@ -216,9 +231,9 @@ class TestCarryBudget:
         a bigger system prompt leaves less to carry."""
         s = make_session(client=mock_openai_client, tool_timeout=10)
         _isolate_overhead(s, system_tokens=0)
-        roomy = s._carry_budget_chars(2)
+        roomy = _carry_budget_chars(s, 2)
         _isolate_overhead(s, system_tokens=8_000)
-        assert s._carry_budget_chars(2) < roomy
+        assert _carry_budget_chars(s, 2) < roomy
 
     def test_double_carry_splits_the_spare(self, tmp_db, mock_openai_client):
         """At shipped defaults the spare (window − overhead − reserve −
@@ -226,11 +241,11 @@ class TestCarryBudget:
         the solo quarter-window allowance."""
         s = make_session(client=mock_openai_client, tool_timeout=10)
         _isolate_overhead(s, system_tokens=2_000)
-        reserve = s._summary_output_tokens()
-        margin = int(s.context_window * s._SUMMARY_SAFETY_MARGIN)
+        reserve = _summary_output_tokens(s)
+        margin = int(s.context_window * s._compaction_engine.SUMMARY_SAFETY_MARGIN)
         spare = s.context_window - reserve - margin - 2_000
-        assert s._carry_budget_chars(2) == int((spare // 2) * s._chars_per_token)
-        assert s._carry_budget_chars(2) < s._carry_budget_chars(1)
+        assert _carry_budget_chars(s, 2) == int((spare // 2) * s._chars_per_token)
+        assert _carry_budget_chars(s, 2) < _carry_budget_chars(s, 1)
 
 
 class TestContinuationHintCarry:
@@ -372,7 +387,7 @@ class TestWindDownSpill:
         budget instead of stacking two solo quarter-window allowances on top
         of the half-window summary reserve."""
         s = _register_session_workstream(make_session(client=mock_openai_client, tool_timeout=10))
-        per_carry = s._carry_budget_chars(2)
+        per_carry = _carry_budget_chars(s, 2)
         ask = "ASK-HEAD " + "a" * (per_carry * 2) + " ASK-TAIL"
         spill = "PLAN-HEAD " + "b" * (per_carry * 2) + " PLAN-TAIL"
         s.messages = turns_from_dicts(
@@ -639,14 +654,22 @@ class TestCoordinatorHandles:
         miscount comes from forgetting the term or from rendering before it.
         """
         s = _coord_session(mock_openai_client)
-        with patch.object(s, "_carry_budget_chars", wraps=s._carry_budget_chars) as budget:
+        with patch.object(
+            s._compaction_engine,
+            "carry_budget_chars",
+            wraps=s._compaction_engine.carry_budget_chars,
+        ) as budget:
             _compact(s, carry_spill=True)
-        assert budget.call_args[0][0] == 3  # handles + spill + ask
+        assert budget.call_args.args[1] == 3  # handles + spill + ask
 
         bare = _coord_session(mock_openai_client, coord_client=_coord_client([], []))
-        with patch.object(bare, "_carry_budget_chars", wraps=bare._carry_budget_chars) as budget:
+        with patch.object(
+            bare._compaction_engine,
+            "carry_budget_chars",
+            wraps=bare._compaction_engine.carry_budget_chars,
+        ) as budget:
             _compact(bare, carry_spill=True)
-        assert budget.call_args[0][0] == 2  # no handles, no third share
+        assert budget.call_args.args[1] == 2  # no handles, no third share
 
     def test_block_fits_the_budget_and_cuts_only_at_row_boundaries(
         self, tmp_db, mock_openai_client
@@ -656,7 +679,7 @@ class TestCoordinatorHandles:
         cannot resolve, dressed as one that can."""
         many = [{"id": f"tsk_{i:04d}", "title": "x" * 180, "status": "pending"} for i in range(60)]
         s = _coord_session(mock_openai_client, coord_client=_coord_client(many, CHILDREN))
-        budget = s._carry_budget_chars(1)
+        budget = _carry_budget_chars(s, 1)
         block = s._render_handles_block(*s._coordinator_handle_rows(), budget)
 
         assert len(block) <= budget

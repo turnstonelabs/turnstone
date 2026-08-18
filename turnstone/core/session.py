@@ -60,6 +60,14 @@ from turnstone.core.background_shells import (
     drain_pipe_lines,
     spawn_group_leader,
 )
+from turnstone.core.compaction import (
+    CompactionEngine,
+    CompactionIrreducibleError,
+    CompactionPolicy,
+    PromptTokenEstimator,
+    SummaryRuntime,
+    calibrated_chars_per_token,
+)
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.deadline import StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
@@ -118,6 +126,7 @@ from turnstone.core.metacognition import (
     NUDGE_COMPACTION_RESUME,
     NUDGE_COMPACTION_RESUME_NO_RECALL,
     NUDGE_REQUIRED_TOOL,
+    NUDGE_TASK_COMPACTION_RESUME,
     TASK_NOTE_MAX,
     TASK_TITLE_MAX,
     RepeatDetector,
@@ -237,7 +246,6 @@ from turnstone.core.trajectory import (
     ProviderNative,
     Role,
     TextBlock,
-    ToolCall,
     Turn,
     TurnProvenance,
     dicts_from_turns,
@@ -355,27 +363,6 @@ class _MalformedToolBatchError(RuntimeError):
 _CONVERSATION_PERSISTENCE_RETRY_BASE_SECONDS = 1.0
 _CONVERSATION_PERSISTENCE_RETRY_CAP_SECONDS = 60.0
 _SOFT_CLOSE_STRUCTURAL_WAIT_SECONDS = 1.0
-
-
-class _CompactionIrreducibleError(Exception):
-    """Raised by ``ChatSession._summarize_blocks`` when chunked summarisation
-    cannot shrink the input — a recursion level fails to reduce the block count,
-    or the depth ceiling is hit.
-
-    ``ChatSession._compact_messages`` turns it into the existing ``return False``
-    bail rather than fabricate a summary.  (Chunked compaction never drops or
-    fabricates whole turns; its one lossy path is ``_truncate_block`` head/tail-
-    truncating a single oversized block as summary *input*.)
-    """
-
-
-@dataclasses.dataclass(frozen=True)
-class _SummaryResult:
-    """Compacted text plus the identity of its final model turn."""
-
-    text: str
-    producer: str | None
-    provenance: TurnProvenance = dataclasses.field(default_factory=TurnProvenance)
 
 
 _ModelCalibrationKey = tuple[str, str, int]
@@ -619,8 +606,8 @@ class _CancelRef(list[Any]):
         provided both are asked about the same generation — which every
         model-call lane guarantees by construction, building a fresh ref
         per attempt that carries the ``my_generation`` its surrounding
-        checks use.  The pairing is load-bearing twice: compaction's
-        ``_summarize_once`` handler and the main-loop wrapper's except
+        checks use.  The pairing is load-bearing twice: the shared compaction
+        engine's summary-call handler and the main-loop wrapper's except
         arms both call ``_check_cancelled`` before reading the error,
         which is what turns ``model_turn``'s pre-dispatch raise into a
         cancellation rather than a red failure row.  Widening this
@@ -1178,6 +1165,289 @@ _AGENT_STEP_OUTPUT_CAP: int = 2000
 # not per-entry bytes), so a 100+-tool agent can't blow the memory budget; the
 # overflow is replaced by one honest "(+N not retained)" marker step.
 _AGENT_STEP_COUNT_CAP: int = 100
+# Provider-generated ids/names are bounded only by one response. Keep current
+# pending calls exact for execution/cancellation pairing, but bound the durable
+# recall/aggregate projection so a model cannot turn distinct bogus tool names
+# or huge call ids into run-lifetime memory growth.
+_AGENT_STEP_ID_CAP: int = 256
+_AGENT_STEP_NAME_CAP: int = 128
+_AGENT_EFFECT_NAME_COUNT_CAP: int = 64
+_AGENT_OTHER_TOOL_NAMES = "<other tool names>"
+
+
+def _clip_agent_text(text: str, cap: int) -> str:
+    """Head-clip task-agent text with one honest truncation marker."""
+
+    if len(text) <= cap:
+        return text
+    return text[:cap] + f"\n\n... (truncated from {len(text)} chars)"
+
+
+def _bound_agent_identity(text: str, cap: int) -> str:
+    """Bound an opaque task id/name while keeping truncations distinguishable."""
+
+    if len(text) <= cap:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    marker = f"…[{digest}]"
+    return text[: max(0, cap - len(marker))] + marker
+
+
+@dataclasses.dataclass(slots=True)
+class _PendingAgentCall:
+    """One issued task-agent tool call whose result is not yet journaled."""
+
+    call_id: str
+    name: str
+    recall_step: dict[str, Any]
+    started: bool = False
+
+
+class _TaskExecutionJournal:
+    """Bounded execution truth for one autonomous task-agent run.
+
+    Model turns remain in ``context_turns`` only as long as they are useful to
+    the provider. Cancellation needs exact state only for the currently issued
+    batch plus aggregate effect dispositions for completed calls; recall needs
+    only the most recent clipped steps. These purpose-built projections avoid
+    retaining every raw assistant/native block and multi-megabyte tool payload
+    after compaction.
+    """
+
+    def __init__(self, turns: list[Turn]) -> None:
+        self._effect_counts: dict[EffectStatus | None, collections.Counter[str]] = {}
+        self._effect_names: set[str] = set()
+        self._recent_steps: collections.deque[dict[str, Any]] = collections.deque(
+            maxlen=_AGENT_STEP_COUNT_CAP
+        )
+        self._dropped_steps = 0
+        self._pending: list[_PendingAgentCall] = []
+        self._pending_by_id: dict[str, collections.deque[_PendingAgentCall]] = {}
+        self._latest_assistant_text = ""
+        self._active_child_ids: set[str] = set()
+        for turn in turns:
+            if turn.role is Role.ASSISTANT:
+                self.record_assistant(turn)
+            elif turn.role is Role.TOOL and turn.tool_call_id:
+                raw = ""
+                if turn.content:
+                    raw = (
+                        turn.content[0].text
+                        if isinstance(turn.content[0], TextBlock)
+                        else "[non-text result]"
+                    )
+                self.record_result(
+                    turn.tool_call_id,
+                    raw,
+                    is_error=turn.is_error,
+                    effect_status=turn.effect_status,
+                )
+
+    @property
+    def latest_assistant_text(self) -> str:
+        return self._latest_assistant_text
+
+    @property
+    def active_child_ids(self) -> set[str]:
+        return set(self._active_child_ids)
+
+    @property
+    def retained_step_count(self) -> int:
+        """Test/diagnostic view of bounded recall-step retention."""
+
+        return len(self._recent_steps)
+
+    @property
+    def retained_step_chars(self) -> int:
+        """Test/diagnostic payload size after recall clipping."""
+
+        return sum(len(str(value)) for step in self._recent_steps for value in step.values())
+
+    @property
+    def retained_effect_name_count(self) -> int:
+        """Test/diagnostic cardinality of completed-call aggregate keys."""
+
+        return len(self._effect_names)
+
+    def record_assistant(self, turn: Turn) -> None:
+        text = last_assistant_text([turn])
+        if text:
+            self._latest_assistant_text = text
+        for tool_call in turn.tool_calls:
+            name = (tool_call.name or "tool").strip()
+            recall_step = {
+                "id": _bound_agent_identity(tool_call.id, _AGENT_STEP_ID_CAP),
+                "name": _bound_agent_identity(name, _AGENT_STEP_NAME_CAP),
+                "arguments": _clip_agent_text(tool_call.arguments, _AGENT_STEP_OUTPUT_CAP),
+                "output": "",
+                "is_error": False,
+            }
+            pending = _PendingAgentCall(
+                call_id=tool_call.id,
+                name=name,
+                recall_step=recall_step,
+            )
+            self._pending.append(pending)
+            self._pending_by_id.setdefault(tool_call.id, collections.deque()).append(pending)
+            if len(self._recent_steps) == _AGENT_STEP_COUNT_CAP:
+                self._dropped_steps += 1
+            self._recent_steps.append(recall_step)
+
+    def mark_started(self, call_id: str) -> None:
+        queue_for_id = self._pending_by_id.get(call_id)
+        if queue_for_id:
+            queue_for_id[0].started = True
+
+    def register_child(self, call_id: str) -> None:
+        if call_id:
+            self._active_child_ids.add(call_id)
+
+    def release_child(self, call_id: str) -> None:
+        self._active_child_ids.discard(call_id)
+
+    def record_result(
+        self,
+        call_id: str,
+        output: Any,
+        *,
+        is_error: bool,
+        effect_status: EffectStatus | None,
+    ) -> dict[str, Any] | None:
+        queue_for_id = self._pending_by_id.get(call_id)
+        if not queue_for_id:
+            return None
+        pending = queue_for_id.popleft()
+        if not queue_for_id:
+            del self._pending_by_id[call_id]
+        self._pending.remove(pending)
+
+        aggregate_name = _bound_agent_identity(pending.name, _AGENT_STEP_NAME_CAP)
+        if aggregate_name not in self._effect_names:
+            if len(self._effect_names) >= _AGENT_EFFECT_NAME_COUNT_CAP:
+                aggregate_name = _AGENT_OTHER_TOOL_NAMES
+            self._effect_names.add(aggregate_name)
+        counts = self._effect_counts.setdefault(effect_status, collections.Counter())
+        counts[aggregate_name] += 1
+        self.update_step(pending.recall_step, output, is_error=is_error)
+        return pending.recall_step
+
+    @staticmethod
+    def update_step(step: dict[str, Any] | None, output: Any, *, is_error: bool) -> None:
+        if step is None:
+            return
+        raw_output = output if isinstance(output, str) else "[non-text result]"
+        step["output"] = _clip_agent_text(raw_output, _AGENT_STEP_OUTPUT_CAP)
+        step["is_error"] = is_error
+
+    def materialize_unstarted(self, agent_turns: list[Turn]) -> None:
+        """Close issued calls that never crossed the executor boundary as NONE."""
+
+        for pending in list(self._pending):
+            if pending.started:
+                continue
+            message = "(cancelled before execution; no side effects)"
+            agent_turns.append(
+                Turn.tool(
+                    pending.call_id,
+                    message,
+                    is_error=True,
+                    effect_status=EffectStatus.NONE,
+                )
+            )
+            self.record_result(
+                pending.call_id,
+                message,
+                is_error=True,
+                effect_status=EffectStatus.NONE,
+            )
+
+    def project_steps(self) -> list[dict[str, Any]]:
+        retained = [dict(step) for step in self._recent_steps]
+        if self._dropped_steps:
+            retained.insert(
+                0,
+                {
+                    "id": "",
+                    "name": "…",
+                    "arguments": "{}",
+                    "output": f"(+{self._dropped_steps} earlier steps not retained)",
+                    "is_error": False,
+                },
+            )
+        return retained
+
+    def _count(self, status: EffectStatus | None) -> collections.Counter[str]:
+        return self._effect_counts.get(status, collections.Counter())
+
+    @staticmethod
+    def _summarize_counts(counts: collections.Counter[str]) -> str:
+        return ", ".join(f"{name}×{count}" if count > 1 else name for name, count in counts.items())
+
+    def cancelled_status(self) -> EffectStatus:
+        issued = sum(sum(counts.values()) for counts in self._effect_counts.values()) + len(
+            self._pending
+        )
+        if not issued:
+            return EffectStatus.NONE
+        if any(pending.started for pending in self._pending) or self._count(EffectStatus.UNKNOWN):
+            return EffectStatus.UNKNOWN
+        effectful = (
+            self._count(None)
+            + self._count(EffectStatus.COMMITTED)
+            + self._count(EffectStatus.PARTIAL)
+        )
+        return EffectStatus.PARTIAL if effectful else EffectStatus.NONE
+
+    def cancelled_disposition(self, label: str) -> str:
+        issued = sum(sum(counts.values()) for counts in self._effect_counts.values()) + len(
+            self._pending
+        )
+        if not issued:
+            return f"({label} cancelled by user before any action — no side effects)"
+
+        parts = [f"({label} cancelled by user before completion)"]
+        groups = (
+            (
+                self._count(None) + self._count(EffectStatus.COMMITTED),
+                "Completed before cancel: ",
+            ),
+            (self._count(EffectStatus.PARTIAL), "Partially completed before cancel: "),
+            (self._count(EffectStatus.NONE), "Confirmed no effect before cancel: "),
+            (
+                self._count(EffectStatus.ROLLED_BACK),
+                "Completed and rolled back before cancel: ",
+            ),
+        )
+        for counts, prefix in groups:
+            if counts:
+                parts.append(prefix + self._summarize_counts(counts) + ".")
+        unresolved = self._count(EffectStatus.UNKNOWN)
+        if unresolved:
+            parts.append(
+                "Results received with UNKNOWN effects before cancel: "
+                + self._summarize_counts(unresolved)
+                + ". Those actions may have completed, partially executed, or caused "
+                "side effects; reconcile before re-running."
+            )
+
+        in_flight = next((pending for pending in self._pending if pending.started), None)
+        if in_flight is None:
+            return "\n".join(parts)
+        parts.append(
+            f"In flight at cancel: {in_flight.name} — outcome UNKNOWN. It may have "
+            "completed, partially executed, or caused side effects before the "
+            "agent was stopped; its result was never observed. Do not assume "
+            "it did or did not happen — reconcile before re-running."
+        )
+        not_run = [pending.name for pending in self._pending if pending is not in_flight]
+        if not_run:
+            parts.append(
+                "Not started (cancelled first): "
+                + self._summarize_counts(collections.Counter(not_run))
+                + "."
+            )
+        return "\n".join(parts)
+
 
 # Per-task-agent file-read tracking.  ``_read_files`` (the blind-overwrite guard's
 # memory of "files this agent has read") is a single set on the session, but the
@@ -1246,7 +1516,7 @@ _REPEAT_EXEMPT_TOOLS: frozenset[str] = frozenset({"bash_output"})
 # coordinator can never ``wait_for_workstream`` a child whose ws_id it never
 # saw), while admitting a floored result costs at most
 # ``_TRUNCATION_FLOOR_CHARS`` against a safety margin the pre-send
-# ``_over_hard`` guard enforces anyway.  Only builtin names belong here: MCP
+# hard-compaction guard enforces anyway.  Only builtin names belong here: MCP
 # tools are namespaced ``mcp__{server}__{tool}`` and can never collide.
 # Background-bash spawn acks carry a shell_id handle too, but share the
 # "bash" name with foreground bash (whose huge outputs MUST stay
@@ -2177,19 +2447,26 @@ class SessionUI(Protocol):
         compaction marker row can be stamped with the matching resume
         cursor; ``None`` for UIs without an event stream.
 
-        The default body IS the pre-1.8 compat rendering — the classic
-        ``on_info`` lines via the shared renderer.  It must not be a bare
-        ``...`` stub: a Protocol member's body is inherited as a REAL
-        method by explicit subclasses, so a pre-1.8 ``class MyUI(SessionUI)``
-        that never implemented this hook would satisfy the getattr probe
-        in ``_compaction_event`` with a silent no-op and defeat the very
-        fallback built for it — every lifecycle event swallowed, history
-        swapping with zero announcement.  Event-stream UIs override and
-        return the assigned id; a subclass implementing neither hook
-        no-ops through ``on_info``'s own stub (the never-crash floor).
+        ``target`` is ``"workstream"`` or ``"task_agent"``; an omitted value
+        means workstream because all events emitted before targets existed had
+        that scope. Task events carry ``parent_call_id`` and never expose their
+        private summary. Failed ends carry the server-computed ``notice``
+        display verdict.
+
+        The default body retains the original workstream ``on_info`` rendering.
+        It must not be a bare ``...`` stub: Protocol methods are inherited as
+        concrete methods by explicit subclasses, so an existing
+        ``class MyUI(SessionUI)`` without this hook would otherwise satisfy the
+        getattr probe with a silent no-op and hide every foreground compaction.
+        Targeted task events cannot be placed without a parent-aware hook and
+        are therefore ignored here. Event-stream UIs override this method and
+        return the assigned id; a subclass implementing neither hook no-ops
+        through ``on_info``'s own stub (the never-crash floor).
         """
         from turnstone.core.compaction_render import render_compaction_event_as_info
 
+        if str(payload.get("target") or "workstream") != "workstream":
+            return None
         render_compaction_event_as_info(payload, self.on_info)
         return None
 
@@ -2675,6 +2952,7 @@ class ChatSession:
         self.auto_compact_pct = (
             auto_compact_pct if auto_compact_pct >= 0.1 else DEFAULT_AUTO_COMPACT_PCT
         )
+        self._compaction_engine = CompactionEngine()
         # Cooperative-compaction latch: set once the model has been advised to
         # reach a stopping point under context pressure; if it keeps working
         # past the advisory the send loop forces a compaction.
@@ -3046,6 +3324,10 @@ class ChatSession:
         self._approval_cancel_epoch = 0
         self._generation: int = 0  # monotonic counter; orphaned threads skip cleanup
         self._generation_principals: dict[int, str] = {}
+        # Compaction attempts are concurrent with one another (parallel task
+        # agents) and may repeat inside one send generation. Give each attempt
+        # its own correlation id; generation remains only the publication owner.
+        self._compaction_seq = 0
         # Task agents and model-backed foreground tools run concurrently on the
         # tool pool and must never publish their provider handles into
         # ``_cancel_stream``.  Each live child operation owns an independent
@@ -5311,9 +5593,10 @@ class ChatSession:
         """
         self._check_cancelled(my_generation)
         est = self._estimated_prompt_tokens()
-        if self._compaction_owed(est):
+        policy = self._compaction_policy()
+        if policy.owed(est, advised=self._compaction_advised):
             self._do_auto_compact("mid-turn", my_generation=my_generation)
-        elif self._over_soft(est):
+        elif policy.over_soft(est):
 
             def _publish_advisory(durable: list[Callable[[], None]]) -> None:
                 self._append_system_turn(
@@ -5330,39 +5613,13 @@ class ChatSession:
             ):
                 raise GenerationCancelled()
 
-    def _compaction_owed(self, used: int | None = None) -> bool:
-        """True when fullness mandates compaction now: over the hard ceiling, or
-        over the soft threshold after the model worked past a wrap-up advisory.
+    def _compaction_policy(self, context_window: int | None = None) -> CompactionPolicy:
+        """Bind the shared threshold policy to one trajectory's window."""
 
-        Shared by the compact-before-truncate check in the send loop and
-        :meth:`_maybe_compact_midturn`.  Pass a precomputed ``used`` to avoid a
-        redundant :meth:`_estimated_prompt_tokens` sum.  The hard ceiling sits a
-        band above the soft threshold (capped at 95%); if ``auto_compact_pct`` is
-        set above that, the band collapses and any over-soft state is "owed".
-        """
-        if used is None:
-            used = self._estimated_prompt_tokens()
-        return self._over_hard(used) or (self._over_soft(used) and self._compaction_advised)
-
-    def _over_soft(self, used: int) -> bool:
-        """True when ``used`` tokens exceed the soft auto-compaction threshold.
-
-        Single source for the ``context_window * auto_compact_pct`` predicate
-        shared by the mid-turn policy, :meth:`_compaction_owed`, and the
-        end-of-turn check, so they can't drift.
-        """
-        return used > self.context_window * self.auto_compact_pct
-
-    def _over_hard(self, used: int) -> bool:
-        """True when ``used`` tokens exceed the hard ceiling — a band above the
-        soft threshold (capped at 95%).
-
-        The "compact now, no turn to spare" line.  Single source shared by
-        :meth:`_compaction_owed` and the proactive pre-send guard; the latter uses
-        it ALONE (not ``_compaction_owed``, whose advised-soft arm belongs to the
-        cooperative mid/end-of-turn wind-down, not to a pre-send emergency).
-        """
-        return used > self.context_window * min(0.95, self.auto_compact_pct + 0.10)
+        return CompactionPolicy(
+            context_window=context_window or self.context_window,
+            auto_compact_pct=self.auto_compact_pct,
+        )
 
     def _do_auto_compact(
         self,
@@ -5423,7 +5680,7 @@ class ChatSession:
         it deliberately wins over BOTH the budget and an operator-set cap,
         because a lost ws_id or masked failure wedges the session outright
         (#883) while an admitted floor costs ~512 tokens against a margin
-        the pre-send ``_over_hard`` guard enforces regardless.
+        the pre-send hard-compaction guard enforces regardless.
 
         This ensures a single tool result cannot overflow the context window
         even when the conversation is already partially full.
@@ -8391,6 +8648,7 @@ class ChatSession:
         cancel_ref: list[Any] | None = None,
         lane: ModelLane | None = None,
         principal_id: str | None = None,
+        use_session_temperature: bool = True,
     ) -> ModelTurnResult:
         """Run a lightweight internal completion (title gen, compaction,
         extraction) through ``model_turn`` on the session's primary lane.
@@ -8425,7 +8683,10 @@ class ChatSession:
         ``temperature`` defaults to the session temperature (``self.temperature``)
         — the same operator/registry-resolved value the main turn uses — rather
         than a hard-coded constant: utility calls should not silently override an
-        explicit ``[models.*]`` temperature.  ``reasoning_effort`` ``None``
+        explicit ``[models.*]`` temperature. ``use_session_temperature=False``
+        leaves it unset for a distinct task-agent lane, allowing that lane's own
+        model configuration or backend default to apply instead of borrowing the
+        parent workstream's setting. ``reasoning_effort`` ``None``
         inherits the lane's full assignment scheme (operator rungs → model
         definition → omit) with NO code-supplied default: a code-chosen
         effort is an unvetted token on local vocabularies and can flip
@@ -8461,7 +8722,9 @@ class ChatSession:
             lane,
             turns,
             max_tokens=clamped,
-            temperature=self.temperature if temperature is None else temperature,
+            temperature=(
+                self.temperature if temperature is None and use_session_temperature else temperature
+            ),
             reasoning_effort=None if suppress_reasoning else reasoning_effort,
             # The abort seam (default None): compaction passes a fresh
             # per-attempt _CancelRef so a user Stop closes the in-flight
@@ -8667,14 +8930,6 @@ class ChatSession:
     # _MAX_RETRIES above.
     _MID_STREAM_RETRIES = 2
     _RETRY_BASE_DELAY = 1.0  # seconds
-
-    # Chunked-compaction tuning (see _summarize_blocks / _summary_input_budget_chars).
-    _SUMMARY_SAFETY_MARGIN = 0.05  # fraction of context_window held back
-    _SUMMARY_BUDGET_FRACTION = 0.75  # derate for the uncalibrated _chars_per_token
-    _MAX_SUMMARY_DEPTH = 5  # recursion ceiling before bailing
-    _MIN_SUMMARY_BUDGET_CHARS = 2000  # floor so a tiny window still makes progress
-    _MIN_SUMMARY_OUTPUT_TOKENS = 512  # floor on summary output even on a tiny window
-    _MIN_CARRY_BUDGET_CHARS = 2000  # floor on verbatim carry (ask quote / wind-down spill)
 
     def _get_health_tracker(self) -> BackendHealthTracker | None:
         """Get the health tracker for this session's current backend.
@@ -10265,7 +10520,7 @@ class ChatSession:
             debt = self._tool_structural_debt
             self._cancel_event.set()
             self._generation += 1
-            self._clear_agent_contexts_before_generation(self._generation)
+            self._clear_agent_transients_before_generation(self._generation)
             self._cancel_event = threading.Event()
             if debt is not None:
                 try:
@@ -11550,8 +11805,8 @@ class ChatSession:
             # switch to a smaller one — can arrive already over the window before
             # the FIRST send.  The mid-turn and end-of-turn triggers only fire AFTER
             # a successful call, so without this the first post-resume send goes out
-            # blind.  Gate on the HARD ceiling alone (NOT _compaction_owed, whose
-            # advised-soft arm is the cooperative wind-down the model must still get
+            # blind.  Gate on the HARD ceiling alone (not the advised-soft arm, whose
+            # cooperative wind-down the model must still get
             # to act on), run it ONCE here, and preserve from the last USER turn to
             # the end — the just-sent message plus any nudge _emit_pending_user_nudges
             # appended after it — so it isn't summarized out from under its own reply.
@@ -11562,7 +11817,7 @@ class ChatSession:
             # guarantee: the char-based estimate under-counts dense/CJK history on an
             # uncalibrated resume, so the send-loop compact-and-retry below stays the
             # backstop.
-            if self._over_hard(self._estimated_prompt_tokens()):
+            if self._compaction_policy().over_hard(self._estimated_prompt_tokens()):
                 boundaries = self._find_turn_boundaries()
                 preserve = len(self.messages) - boundaries[-1] if boundaries else 1
                 self._do_auto_compact(
@@ -11928,12 +12183,12 @@ class ChatSession:
                     if self._generation != my_generation:
                         return
                     # Auto-compact when the context exceeds the threshold, so the
-                    # next turn starts with headroom.  Bare-soft check (NOT
-                    # _compaction_owed()): the turn already ended, so there's no
+                    # next turn starts with headroom.  Bare-soft check (not the
+                    # cooperative owed policy): the turn already ended, so there's no
                     # model cooperation to wait for and the latch was just
                     # consumed above — compact whenever over soft.  None-safe via
                     # _estimated_prompt_tokens(), so no _last_usage guard.
-                    if self._over_soft(self._estimated_prompt_tokens()):
+                    if self._compaction_policy().over_soft(self._estimated_prompt_tokens()):
                         # carry_spill: when the model stopped to let us compact,
                         # its final turn is the plan spill the advisory asked
                         # for — copy it across verbatim, don't just paraphrase.
@@ -12135,7 +12390,9 @@ class ChatSession:
                 # guard is ever converted, keep the "am I still the active
                 # generation" reading rather than "was I superseded".
                 pre_attempted_compact = False
-                if self._generation == my_generation and self._compaction_owed():
+                if self._generation == my_generation and self._compaction_policy().owed(
+                    self._estimated_prompt_tokens(), advised=self._compaction_advised
+                ):
                     self._do_auto_compact("mid-turn", preserve_tail=1, my_generation=my_generation)
                     pre_attempted_compact = True
                 truncation_budget = self._remaining_token_budget()
@@ -12220,7 +12477,7 @@ class ChatSession:
                         # inviting the blind re-runs #865/#866 exist to
                         # prevent.  Worst case is bounded by the model's
                         # own batch width and lands on the pre-send
-                        # ``_over_hard`` guard / ctx-overflow retry: one
+                        # hard-compaction guard / ctx-overflow retry: one
                         # extra compaction round-trip, traded for never
                         # losing a handle or a disposition.
                         _floor = (
@@ -14080,23 +14337,14 @@ class ChatSession:
         served_tool_def_chars = (
             tool_def_chars if tool_def_chars is not None else self._tool_def_chars()
         )
-        text_chars = 0
-        image_count = 0
-        for m in all_msgs:
-            tc, ic, _doc = self._msg_text_chars(m)
-            text_chars += tc
-            image_count += ic
-        text_chars += served_tool_def_chars
-        image_tokens = image_count * self._IMAGE_TOKENS
-        text_prompt_tok = prompt_tok - image_tokens
-        if text_prompt_tok <= 0:
-            log.debug(
-                "Image token estimate (%d) >= prompt_tokens (%d), skipping calibration",
-                image_tokens,
-                prompt_tok,
-            )
-        elif text_chars > 0:
-            self._chars_per_token = text_chars / text_prompt_tok
+        self._chars_per_token = calibrated_chars_per_token(
+            prompt_tokens=prompt_tok,
+            messages=all_msgs,
+            tool_def_chars=served_tool_def_chars,
+            measure=self._msg_text_chars,
+            fallback=self._chars_per_token,
+            image_tokens=self._IMAGE_TOKENS,
+        )
 
         calibration_key = (
             self._provenance_calibration_key(provenance)
@@ -14161,509 +14409,82 @@ class ChatSession:
 
     # -- Conversation compaction ------------------------------------------------
 
-    # Shared "## Output format" section for both compactor prompts — the section
-    # list plus its trailing blank line.  Single-sourced so the two prompts can't
-    # drift (the merge prompt's "explicitly stated" line had already lost "the
-    # user").
-    _COMPACT_OUTPUT_FORMAT = (
-        "1. **Output format** — use these exact sections, omit any that are empty:\n"
-        "   - **## Decisions**: Choices made (architecture, libraries, approaches).\n"
-        "   - **## Files**: Files read, created, or modified, with brief notes.\n"
-        "   - **## Key code**: Exact function names, class names, variable names, "
-        "and short code snippets the assistant will need. "
-        "Preserve identifiers verbatim — do NOT paraphrase.\n"
-        "   - **## Tool results**: Important tool outputs (errors, search matches, "
-        "file contents) that inform ongoing work.\n"
-        "   - **## Open tasks**: What the user asked for that is not yet done, "
-        "with enough context to continue.\n"
-        "   - **## User preferences**: Workflow preferences, constraints, or "
-        "instructions the user stated.\n"
-        "   - **## Memories to save**: Corrections, preferences, or learnings "
-        "the user expressed that should be persisted across sessions. "
-        "Format each as: `name: description — content`. "
-        "Only include items the user explicitly stated, not inferences.\n\n"
-    )
-
-    # System prompt for the depth-0 summary call (the conversation compactor).
-    _COMPACTOR_SYSTEM_PROMPT = (
-        "# Conversation Compactor\n\n"
-        "Your output REPLACES the conversation history — the assistant "
-        "will continue from your summary with no access to the original messages.\n\n"
-        + _COMPACT_OUTPUT_FORMAT
-        + "2. **Density rules:**\n"
-        "   - Every token should carry information.\n"
-        "   - Preserve exact paths, identifiers, and numbers — never paraphrase these.\n"
-        "   - Omit pleasantries, acknowledgments, and reasoning that led to dead ends.\n"
-        "   - If a tool call's result was an error that was later resolved, "
-        "keep only the resolution.\n\n"
-        "3. **Common mistakes to avoid:**\n"
-        "   - Paraphrasing file paths, function names, or variable names\n"
-        "   - Including dead-end explorations or superseded decisions\n"
-        "   - Omitting the open tasks section when work remains\n"
-        "   - Being verbose — this is a summary, not a transcript"
-    )
-
-    # System prompt for recursion levels (depth > 0): merge partial summaries of
-    # consecutive slices of ONE conversation back into a single summary.
-    _COMPACTOR_MERGE_SYSTEM_PROMPT = (
-        "# Summary Merger\n\n"
-        "You are given several partial summaries of ONE conversation, produced by "
-        "compacting consecutive slices in order. Merge these partial summaries into a "
-        "single summary that REPLACES the conversation history — the assistant will "
-        "continue from your merged summary with no access to the originals.\n\n"
-        + _COMPACT_OUTPUT_FORMAT
-        + "2. **Merge rules:**\n"
-        "   - Preserve every distinct decision, file, identifier, and open task across "
-        "all partials; later partials reflect more recent state, so on conflict prefer "
-        "the later one.\n"
-        "   - Deduplicate: fold repeated items into one, keeping the most specific.\n"
-        "   - Preserve exact paths, identifiers, and numbers — never paraphrase these.\n"
-        "   - Be dense; this is a summary, not a transcript."
-    )
-
-    # User-message wrapper prepended to every summary-call body (all depths).
-    _COMPACT_USER_PREFIX = "Compact the following conversation:\n\n"
-
-    @staticmethod
-    def _summary_tc_names(messages: list[dict[str, Any]]) -> dict[str, str]:
-        """Build a tool_call_id → tool_name lookup for labeling tool results.
-
-        Built over the full message set (not one batch) so a ``tool_use`` and its
-        later ``tool_result`` keep a consistent name even when chunking packs them
-        into different batches.
-        """
-        tc_names: dict[str, str] = {}
-        for m in messages:
-            for tc in m.get("tool_calls", []):
-                tc_id = tc.get("id", "")
-                tc_name = tc.get("function", {}).get("name", "unknown")
-                if tc_id:
-                    tc_names[tc_id] = tc_name
-        return tc_names
-
-    def _format_message_for_summary(
-        self, m: dict[str, Any], tc_names: dict[str, str]
-    ) -> str | None:
-        """Format one message into a summary line, or ``None`` when it carries no
-        renderable content.
-
-        ``tc_names`` (tool_call_id → tool_name, built by the caller over the full
-        selected set) labels tool results.  Long content is capped head+tail so a
-        single message can't dominate the summary input.
-        """
-        role = m["role"].upper()
-        content = m.get("content") or ""
-
-        # Flatten list content (image tool results) to text for summary
-        if isinstance(content, list):
-            text_parts = []
-            for p in content:
-                if p.get("type") == "text":
-                    text_parts.append(p["text"])
-                elif p.get("type") in ("image_url", "image"):
-                    # by-reference vision placeholder OR resolved inline image
-                    text_parts.append("[image]")
-            content = " ".join(text_parts)
-
-        if m.get("tool_calls"):
-            calls = []
-            for tc in m["tool_calls"]:
-                name = tc.get("function", {}).get("name", "?")
-                args = tc.get("function", {}).get("arguments", "")
-                calls.append(f"{name}({args})")
-            content += "\n[Called: " + ", ".join(calls) + "]"
-
-        # Label tool results with the tool name
-        if role == "TOOL":
-            tc_id = m.get("tool_call_id", "")
-            name = tc_names.get(tc_id, "tool")
-            role = f"TOOL[{name}]"
-
-        if content:
-            if len(content) > 2000:
-                content = content[:1000] + "\n...[truncated]...\n" + content[-500:]
-            return f"{role}: {content}"
-        return None
-
-    def _summary_blocks(self, messages: list[dict[str, Any]]) -> list[str]:
-        """Format messages into summary blocks — one string per renderable
-        message, in order (drops messages with no renderable content)."""
-        tc_names = self._summary_tc_names(messages)
-        return [
-            line
-            for m in messages
-            if (line := self._format_message_for_summary(m, tc_names)) is not None
-        ]
-
-    def _format_messages_for_summary(self, messages: list[dict[str, Any]]) -> str:
-        """Format messages into a readable string for the summarization prompt."""
-        return "\n\n".join(self._summary_blocks(messages))
-
-    def _summary_output_tokens(self, lane: ModelLane | None = None) -> int:
-        """Output-token reserve for a summary call, bounded so the input (the
-        history being summarized) always keeps the larger share of the window.
-
-        ``compact_max_tokens`` defaults to the full window (32768); clamped only
-        by ``max_output_tokens`` it would reserve the entire context for output
-        and leave no room to send anything to summarize — flooring the input
-        budget and making the summary call overflow (or bail as "irreducible")
-        on a small/default window.  Cap the reserve at half the window so
-        compaction can actually run; large windows are unaffected because
-        ``compact_max_tokens`` stays the binding limit there.
-        """
-        caps = require_lane_capabilities(lane or self._primary_lane())
-        hard_cap = (
-            min(self.compact_max_tokens, caps.max_output_tokens)
-            if caps.max_output_tokens
-            else self.compact_max_tokens
-        )
-        window_cap = max(self._MIN_SUMMARY_OUTPUT_TOKENS, self.context_window // 2)
-        return min(hard_cap, window_cap)
-
-    def _carry_budget_chars(self, carries: int = 1, lane: ModelLane | None = None) -> int:
-        """Per-carry char budget for content carried VERBATIM across a
-        compaction — the continuation hint's quote of the user's last
-        message, the wind-down spill, and (coordinators only) the
-        ``## Handles`` block.
-
-        A quarter of the window per carry, clamped so ALL concurrent carries
-        fit what the window spares after the summary output reserve AND the
-        fixed prompt overhead (system message + tool definitions — the same
-        terms the ``_estimated_prompt_tokens`` fallback counts, because they
-        ride every request): the carried text lands in the same
-        post-compaction prompt as all of those, so
-        ``overhead + reserve + carries·budget + margin ≤ window`` must hold
-        by construction — sizing carries independently (or ignoring the
-        overhead) stacks past the window at default config exactly when
-        spill and hint fire together, and the overflow backstop would then
-        re-compact WITHOUT the carries.  Floored at
-        ``_MIN_CARRY_BUDGET_CHARS`` so small windows still carry something
-        meaningful; when the floor exceeds the spare (a tiny window, or a
-        system prompt that fills it) the floor wins deliberately — carrying
-        something beats carrying nothing, and the overflow backstop absorbs
-        the worst case.  Chars via the calibrated ``_chars_per_token``.
-        """
-        reserve = self._summary_output_tokens(lane)
-        margin = int(self.context_window * self._SUMMARY_SAFETY_MARGIN)
-        lane_caps = require_lane_capabilities(lane) if lane is not None else None
-        overhead = self._system_tokens + self._tool_def_tokens(lane_caps)
-        spare = max(0, self.context_window - reserve - margin - overhead)
-        budget_tokens = min(self.context_window // 4, spare // max(1, carries))
-        return max(self._MIN_CARRY_BUDGET_CHARS, int(budget_tokens * self._chars_per_token))
-
-    def _summary_input_budget_chars(self, lane: ModelLane | None = None) -> int:
-        """Per-call input budget for a summary completion, in characters.
-
-        The summary runs on ``self.model`` via :meth:`_utility_completion`, so its
-        input + output must fit ``self.context_window``.  Sizing the *selection* by
-        the per-message token estimate (which disagrees with the head+tail-capped
-        formatted text) is what let a long conversation overflow the summary call
-        itself; this measures the call's real budget instead.
-
-        Reserve the output (the bounded :meth:`_summary_output_tokens` reserve),
-        the compactor prompt, and a safety margin; scale the remainder by
-        ``_SUMMARY_BUDGET_FRACTION`` to cover the uncalibrated ``_chars_per_token``
-        on the reactive path (no ``_last_usage`` yet); convert to chars; floor at
-        ``_MIN_SUMMARY_BUDGET_CHARS`` so a usable window still makes progress, but
-        never above the true input capacity — flooring past what actually fits
-        would reintroduce a summary-call overflow on a pathologically small
-        window (the call bails as "irreducible" instead).
-        """
-        output_reserve = self._summary_output_tokens(lane)
-        prompt_chars = len(self._COMPACTOR_SYSTEM_PROMPT) + len(self._COMPACT_USER_PREFIX)
-        prompt_tokens = int(prompt_chars / self._chars_per_token)
-        safety = int(self.context_window * self._SUMMARY_SAFETY_MARGIN)
-        input_tokens = self.context_window - output_reserve - prompt_tokens - safety
-        budget_tokens = max(0, int(input_tokens * self._SUMMARY_BUDGET_FRACTION))
-        budget_chars = max(
-            self._MIN_SUMMARY_BUDGET_CHARS, int(budget_tokens * self._chars_per_token)
-        )
-        # Cap the floor at the true input capacity: on a pathologically small
-        # window the floor would otherwise push the summary call (input + output
-        # reserve + prompt) past context_window instead of letting it bail.
-        return min(budget_chars, max(0, int(input_tokens * self._chars_per_token)))
-
-    @staticmethod
-    def _truncate_block(block: str, budget: int) -> str:
-        """Hard-truncate a single oversized block to ``budget`` chars, keeping
-        the head and tail around a marker that reports the ORIGINAL size — the
-        reader (the summarizer, or on the verbatim-carry paths the
-        post-compaction model) sees how much is missing, not just that a cut
-        happened.
-
-        Used for a lone block that can't fit any summary batch, and for the
-        verbatim carries (ask quote / wind-down spill).  The result is always
-        ``<= budget``.
-        """
-        if len(block) <= budget:
-            # Already fits — return as-is.  Without this, a budget wider than the
-            # block makes the head slice ``block[:head]`` and tail slice
-            # ``block[-tail:]`` overlap and DUPLICATE content around the marker.
-            return block
-        marker = f"\n…[truncated — {len(block):,} chars total]…\n"
-        if budget <= len(marker):
-            return block[:budget]
-        keep = budget - len(marker)
-        head = (keep * 2) // 3
-        tail = keep - head
-        return block[:head] + marker + block[-tail:] if tail else block[:head] + marker
-
-    def _pack_blocks(self, blocks: list[str], budget_chars: int) -> list[list[str]]:
-        """Greedily pack formatted blocks into batches that each fit ``budget_chars``.
-
-        In order, no reordering and no drops: blocks accumulate into the current
-        batch until the next one (plus the ``"\\n\\n"`` join) would overflow, then a
-        new batch starts.  A lone block larger than the budget gets its own batch,
-        hard-truncated via :meth:`_truncate_block`.  Never emits an empty batch.
-
-        ``current_len`` tracks ``len("\\n\\n".join(current))`` exactly, so every
-        returned batch's joined length is ``<= budget_chars``.
-        """
-        budget = max(1, budget_chars)
-        sep = len("\n\n")
-        batches: list[list[str]] = []
-        current: list[str] = []
-        current_len = 0
-        for block in blocks:
-            if len(block) > budget:
-                # Oversized lone block: flush the in-progress batch, then emit it
-                # alone, hard-truncated (head + tail preserved).
-                if current:
-                    batches.append(current)
-                    current = []
-                    current_len = 0
-                batches.append([self._truncate_block(block, budget)])
-                continue
-            added = len(block) + (sep if current else 0)
-            if current and current_len + added > budget:
-                batches.append(current)
-                current = [block]
-                current_len = len(block)
-            else:
-                current.append(block)
-                current_len += added
-        if current:
-            batches.append(current)
-        return batches
-
-    def _summarize_once(
+    def _build_summary_runtime(
         self,
-        system_prompt: str,
-        body: str,
-        my_generation: int = 0,
+        lane: ModelLane,
         *,
-        lane: ModelLane | None = None,
-    ) -> _SummaryResult:
-        """Run one summary completion and return its text plus producer.
+        my_generation: int = 0,
+        context_window: int | None = None,
+        chars_per_token: float | None = None,
+        continuation_overhead_tokens: int | None = None,
+        principal_id: str | None = None,
+        reasoning_effort: str | None = None,
+        cancel_ref_factory: Callable[[], list[Any]] | None = None,
+        check_cancelled: Callable[[], None] | None = None,
+        backoff_or_cancelled: Callable[[float], None] | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+        use_session_temperature: bool = True,
+    ) -> SummaryRuntime:
+        """Adapt one lifecycle owner's immutable state to the shared engine."""
 
-        Owns the retry loop (transient errors only, exponential backoff).
-        Raises on a non-retryable error or retry exhaustion so the caller
-        can abort the whole compaction before any message swap.
-        """
-        summary_msgs = [
-            Turn.system(system_prompt),
-            Turn.user(self._COMPACT_USER_PREFIX + body),
-        ]
-        lane = lane or self._primary_lane()
-        principal_id = self._generation_principals.get(my_generation) if my_generation else None
-        result: ModelTurnResult | None = None
-        for attempt in range(self._MAX_RETRIES + 1):
-            try:
-                result = self._utility_completion(
-                    summary_msgs,
-                    max_tokens=self._summary_output_tokens(lane),
-                    # Fresh per-attempt abort seam: _CancelRef.append
-                    # registers the summary HTTP stream in _cancel_stream
-                    # eagerly (and closes on arrival if a Stop already
-                    # landed), so cancel() aborts the blocked read instead
-                    # of waiting out a whole model call — the force-stop
-                    # orphan window collapses from one summary call to the
-                    # next checkpoint.  A fresh generation-scoped ref per
-                    # attempt; the boundary checks in
-                    # _summarize_batch/_backoff guarantee a superseded
-                    # compaction makes no further calls, so it can never
-                    # clobber a successor's registration.
-                    cancel_ref=_CancelRef(self, my_generation),
-                    lane=lane,
-                    principal_id=principal_id,
-                )
-                break
-            except Exception as e:
-                # A closed-by-cancel stream surfaces as a provider error —
-                # map it to the cancel BEFORE the retry policy reads it, so
-                # a Stop on the final attempt ends the compaction as
-                # cancelled, never as a red "Compaction failed" (the main
-                # drain path makes the same closed-stream→GenerationCancelled
-                # translation).
-                self._check_cancelled(my_generation)
-                ename = type(e).__name__
-                if self._stop_retrying(e, attempt, lane):
-                    # Overflow is deterministic — let _summarize_batch subdivide
-                    # instead of retrying an identical oversized call.
-                    raise
-                delay = self._RETRY_BASE_DELAY * (2**attempt)
-                self._compaction_event(
-                    my_generation, {"phase": "progress", "retry_in": delay, "error": ename}
-                )
-                self._backoff_or_cancelled(delay, my_generation)
-        if result is None:
-            raise RuntimeError("summary retry ladder exhausted without a result")
-        # Inline think tags are already segregated at the drain seam; the
-        # trim is summary formatting (tag-free output is deliberately
-        # byte-identical at the seam, so edge whitespace is trimmed here
-        # before the summary is persisted and re-joined into merge input).
-        summary = (result.content or "").strip()
-        if result.finish_reason == "length":
-            self._compaction_event(
-                my_generation, {"phase": "progress", "warning": "summary_truncated"}
+        caps = require_lane_capabilities(lane)
+        resolved_principal = (
+            self._generation_principals.get(my_generation)
+            if principal_id is None and my_generation
+            else principal_id
+        )
+        make_cancel_ref = cancel_ref_factory or (lambda: _CancelRef(self, my_generation))
+
+        def _complete(
+            system_prompt: str,
+            user_prompt: str,
+            max_tokens: int,
+        ) -> ModelTurnResult:
+            return self._utility_completion(
+                [Turn.system(system_prompt), Turn.user(user_prompt)],
+                max_tokens=max_tokens,
+                cancel_ref=make_cancel_ref(),
+                lane=lane,
+                principal_id=resolved_principal,
+                reasoning_effort=reasoning_effort,
+                use_session_temperature=use_session_temperature,
             )
-        return _SummaryResult(
-            text=summary,
-            producer=result.producer,
-            # Lightweight seam fakes predating provenance remain valid; every
-            # production ModelTurnResult carries the field.
-            provenance=getattr(result, "provenance", TurnProvenance()),
+
+        progress: Callable[[dict[str, Any]], None]
+        if on_progress is None:
+
+            def progress(payload: dict[str, Any]) -> None:
+                self._compaction_event(my_generation, payload)
+
+        else:
+            progress = on_progress
+        return SummaryRuntime(
+            context_window=context_window or self.context_window,
+            chars_per_token=(self._chars_per_token if chars_per_token is None else chars_per_token),
+            compact_max_tokens=self.compact_max_tokens,
+            lane_max_output_tokens=caps.max_output_tokens,
+            continuation_overhead_tokens=(
+                self._system_tokens + self._tool_def_tokens(caps)
+                if continuation_overhead_tokens is None
+                else continuation_overhead_tokens
+            ),
+            complete=_complete,
+            stop_retrying=lambda error, attempt: self._stop_retrying(error, attempt, lane),
+            is_context_overflow=_is_ctx_overflow,
+            check_cancelled=(
+                check_cancelled
+                if check_cancelled is not None
+                else lambda: self._check_cancelled(my_generation)
+            ),
+            backoff_or_cancelled=(
+                backoff_or_cancelled
+                if backoff_or_cancelled is not None
+                else lambda delay: self._backoff_or_cancelled(delay, my_generation)
+            ),
+            on_progress=progress,
+            max_retries=self._MAX_RETRIES,
+            retry_base_delay=self._RETRY_BASE_DELAY,
         )
-
-    def _summarize_blocks(
-        self,
-        blocks: list[str],
-        *,
-        depth: int = 0,
-        my_generation: int = 0,
-        lane: ModelLane | None = None,
-    ) -> _SummaryResult:
-        """Summarize ``blocks`` into one dense summary, chunking + recursing so no
-        single model call exceeds the model window.
-
-        Blocks are packed to the char budget (:meth:`_summary_input_budget_chars`)
-        and each batch is summarized; the partials are recursively merged one level
-        deeper until they collapse to a single summary.  That char budget is only an
-        *estimate* — it divides by the uncalibrated ``_chars_per_token`` (which sits
-        at an optimistic 4.0 on resume) — so a batch that fits by chars can still
-        overflow the *token* window.  :meth:`_summarize_batch` absorbs that: an
-        over-window multi-block batch is split in half and each half summarized
-        (recursing as needed), then the partials merged (chunking, not truncation),
-        and only a lone block that overflows by itself is head/tail-truncated.
-
-        Bails with :class:`_CompactionIrreducibleError` only at the recursion
-        ceiling ``_MAX_SUMMARY_DEPTH`` (or when a floored lone block still overflows)
-        — the caller turns that into a ``return False`` rather than fabricate a
-        summary.
-        """
-        lane = lane or self._primary_lane()
-        system_prompt = (
-            self._COMPACTOR_SYSTEM_PROMPT if depth == 0 else self._COMPACTOR_MERGE_SYSTEM_PROMPT
-        )
-        # Recursion ceiling FIRST — before packing and the single-batch base case —
-        # so it also bounds the per-block-split merge, which can re-pack into one
-        # batch and would otherwise recurse without ever consulting the ceiling.
-        if depth >= self._MAX_SUMMARY_DEPTH:
-            raise _CompactionIrreducibleError
-        batches = self._pack_blocks(blocks, self._summary_input_budget_chars(lane))
-        if len(batches) == 1:
-            return self._summarize_batch(system_prompt, batches[0], depth, my_generation, lane=lane)
-
-        # More than one batch: recurse-merge the per-batch summaries.  A block-count
-        # guard would be wrong here — _summarize_batch's binary subdivision can
-        # legitimately leave one batch per block — so termination rides the depth
-        # ceiling above plus the progressive-shrink-to-floor bail in _summarize_batch.
-        total = len(batches)
-        summaries: list[str] = []
-        for k, batch in enumerate(batches, start=1):
-            # depth 0 = summarizing transcript batches; depth > 0 = merging
-            # partial summaries.  The web card renders depth 0 as a
-            # determinate part-k-of-N bar and deeper levels as a merge note.
-            self._compaction_event(
-                my_generation, {"phase": "progress", "part": k, "total": total, "depth": depth}
-            )
-            partial = self._summarize_batch(system_prompt, batch, depth, my_generation, lane=lane)
-            summaries.append(partial.text)
-        return self._summarize_blocks(
-            summaries,
-            depth=depth + 1,
-            my_generation=my_generation,
-            lane=lane,
-        )
-
-    def _summarize_batch(
-        self,
-        system_prompt: str,
-        batch: list[str],
-        depth: int,
-        my_generation: int = 0,
-        *,
-        lane: ModelLane | None = None,
-    ) -> _SummaryResult:
-        """Summarize one packed batch, subdividing on a token-window overflow.
-
-        The char budget that produced ``batch`` is only an estimate, so the model
-        call can overflow the real token window.  When a multi-block batch overflows,
-        it is split in HALF and each half summarized (recursing if a half still
-        overflows), then the two partials merged — binary subdivision, so an
-        over-window batch of N blocks costs ~log2(N) levels and a near-optimal number
-        of leaf calls, NOT N per-block calls (which on a wide rehydrated resume meant
-        hundreds of serial summaries).  A lone block that overflows even by itself is
-        head/tail-truncated progressively (halving the budget down to the floor, the
-        single-block analogue of the binary subdivision above) so it keeps as much as
-        the window allows; only if even the floor still overflows is the window too
-        small to compact anything and we bail irreducible.
-        """
-        # Cooperative cancellation: a cancel mid-compaction aborts here.  It raises
-        # GenerationCancelled (a BaseException), so _compact_messages' ``except
-        # Exception`` can't swallow it and the message-swap below never runs — the
-        # history is left untouched.  my_generation matters for the force-cancel
-        # orphan: a successor's claim REPLACES the cancel event, so the event arm
-        # alone would let an abandoned compaction keep issuing summary calls —
-        # the generation arm is what retires it at the next batch boundary.
-        self._check_cancelled(my_generation)
-        lane = lane or self._primary_lane()
-        try:
-            return self._summarize_once(system_prompt, "\n\n".join(batch), my_generation, lane=lane)
-        except Exception as e:
-            if not _is_ctx_overflow(e):
-                raise
-            if len(batch) > 1:
-                # Token-overflow despite the char budget: split the batch in HALF
-                # and summarize each (each half recurses + halves again if it still
-                # overflows), then merge.  Binary subdivision keeps each leaf as full
-                # as fits — a wide over-window batch costs ~log2(N) calls, not one
-                # model call per block.
-                mid = len(batch) // 2
-                left = self._summarize_batch(
-                    system_prompt, batch[:mid], depth, my_generation, lane=lane
-                )
-                right = self._summarize_batch(
-                    system_prompt, batch[mid:], depth, my_generation, lane=lane
-                )
-                return self._summarize_blocks(
-                    [left.text, right.text],
-                    depth=depth + 1,
-                    my_generation=my_generation,
-                    lane=lane,
-                )
-            # A lone block overflows by itself: the char budget over-estimated how
-            # many tokens it holds.  Shrink progressively — halve the truncation
-            # budget and retry, keeping as much of the message as the real window
-            # allows — mirroring the multi-block binary subdivision above rather than
-            # slamming straight to the 2 000-char floor (which would discard far more
-            # than the window actually forces).  Bail irreducible only once even the
-            # floor still overflows.
-            budget = max(self._MIN_SUMMARY_BUDGET_CHARS, len(batch[0]) // 2)
-            while True:
-                try:
-                    return self._summarize_once(
-                        system_prompt,
-                        self._truncate_block(batch[0], budget),
-                        my_generation,
-                        lane=lane,
-                    )
-                except Exception as e2:
-                    if not _is_ctx_overflow(e2):
-                        raise
-                    if budget <= self._MIN_SUMMARY_BUDGET_CHARS:
-                        raise _CompactionIrreducibleError from e2
-                    budget = max(self._MIN_SUMMARY_BUDGET_CHARS, budget // 2)
 
     # -- Coordinator handles across a compaction --------------------------------
     #
@@ -14800,7 +14621,9 @@ class ChatSession:
 
         Rows are whole handles, so truncation drops them at their boundary and
         names how many went: cutting head+tail through a list the way
-        :meth:`_truncate_block` does would leave a half-copied id, which is worse
+        :meth:`CompactionEngine.truncate_block
+        <turnstone.core.compaction.CompactionEngine.truncate_block>` does would leave a
+        half-copied id, which is worse
         than an absent one (it renders a call that can't resolve).  ``more``
         formats the count with an authoritative-source pointer, so the block is
         never the last word on what exists.
@@ -14860,6 +14683,13 @@ class ChatSession:
             return ""
         return prefix + tasks + children
 
+    def _next_compaction_id(self) -> int:
+        """Allocate a session-local id for one compaction attempt."""
+
+        with self._generation_lock:
+            self._compaction_seq += 1
+            return self._compaction_seq
+
     def _compact_messages(
         self,
         auto: bool = False,
@@ -14886,8 +14716,14 @@ class ChatSession:
         threshold, so a pct there would fabricate a trigger explanation
         contradicting the overflow notice printed a line above it.
         """
+        compaction_id = self._next_compaction_id()
         trigger = "auto" if auto else "manual"
-        start_payload: dict[str, Any] = {"phase": "start", "trigger": trigger}
+        start_payload: dict[str, Any] = {
+            "phase": "start",
+            "trigger": trigger,
+            "compaction_id": compaction_id,
+            "target": "workstream",
+        }
         if auto:
             start_payload["where"] = where
             if threshold_pct is not None:
@@ -14909,7 +14745,13 @@ class ChatSession:
         ):
             raise GenerationCancelled()
         try:
-            return self._compact_messages_impl(auto, preserve_tail, my_generation, carry_spill)
+            return self._compact_messages_impl(
+                auto,
+                preserve_tail,
+                my_generation,
+                carry_spill,
+                compaction_id=compaction_id,
+            )
         except ConversationPersistenceError:
             # The compaction state swap and successful END were already
             # accepted atomically with a pending marker row. Durability poison
@@ -14942,16 +14784,19 @@ class ChatSession:
                 trigger=trigger,
                 my_generation=my_generation,
                 emit_error=(trigger == "manual"),
+                compaction_id=compaction_id,
             )
             raise
 
     def _compaction_event(self, my_generation: int, payload: dict[str, Any]) -> int | None:
         """Emit one compaction lifecycle event stamped with its owning id.
 
-        ``compaction_id`` (the owning generation) ties every progress/end
-        event to the compaction that started it, and ``superseded`` marks
-        events from a generation that is no longer current (a
-        force-abandoned worker running out its last summary call).
+        ``compaction_id`` ties every progress/end event to the attempt that
+        started it; it is deliberately distinct from ``my_generation`` because
+        parallel task agents can compact concurrently and one generation can
+        compact more than once. ``my_generation`` remains the publication
+        owner, and ``superseded`` marks events from an owner that is no longer
+        current (a force-abandoned worker running out its last summary call).
         :meth:`SessionUIBase.on_compaction <turnstone.core.session_ui_base.SessionUIBase.on_compaction>`
         consumes ``superseded`` (never enqueued): a superseded event must
         not drive the activity-pill restore or animate a successor's card.
@@ -14959,15 +14804,13 @@ class ChatSession:
         events are never marked superseded (matching ``_check_cancelled``).
 
         Failed ends additionally carry ``notice`` — the single display-
-        policy site: renderers show the failure message only when it is
-        true, instead of each re-deriving suppression from reason/trigger/
-        superseded (the cross-runtime drift trap the old hand-synced
-        cli.py/conversation.js clauses documented).  Error-reason ends are
-        suppressed because :meth:`_compaction_bailed` already fired the one
-        red ``on_error`` row; cancelled-auto ends because the surrounding
-        send prints its own "[Generation cancelled]"; superseded ends
-        because nobody is waiting on a force-abandoned compaction and its
-        notice mid-turn reads as the LIVE work being cancelled.
+        policy site: renderers show the failure message only when it is true,
+        instead of each re-deriving suppression from reason/trigger/superseded.
+        Workstream error ends are suppressed because
+        :meth:`_compaction_bailed` already fired the one red ``on_error`` row.
+        A task-agent error has no unscoped error twin and therefore remains a
+        targeted notice for its nested card. Cancelled-auto and superseded ends
+        stay silent because their owners already expose the terminal state.
         """
         # Classification and emission are one generation publication.  Without
         # the shared lock, a force successor could claim after ``stale`` was
@@ -14982,33 +14825,52 @@ class ChatSession:
                 phase != "end" and (stale or self._cancel_event.is_set())
             ):
                 return None
+            raw_compaction_id = payload.get("compaction_id")
+            compaction_id = (
+                raw_compaction_id
+                if isinstance(raw_compaction_id, int) and not isinstance(raw_compaction_id, bool)
+                else my_generation
+            )
+            target = str(payload.get("target") or "workstream")
             event: dict[str, Any] = {
-                "compaction_id": my_generation,
-                "superseded": stale,
                 **payload,
+                "compaction_id": compaction_id,
+                "target": target,
+                "superseded": stale,
             }
-            if phase == "end" and not payload.get("ok"):
+            if target == "task_agent":
+                # SessionUIBase consumes this internal owner witness before
+                # fanout; it keeps reconnect snapshots exact when a provider
+                # reuses a task call id across force-successor generations.
+                event["_generation"] = my_generation
+            if not event.get("parent_call_id"):
+                event.pop("parent_call_id", None)
+            if phase == "end" and not payload.get("ok") and "notice" not in payload:
                 event["notice"] = (
                     not stale
-                    and payload.get("reason") != "error"
+                    and (payload.get("reason") != "error" or target == "task_agent")
                     and not (
                         payload.get("reason") == "cancelled" and payload.get("trigger") == "auto"
                     )
                 )
             # getattr-guarded like on_generation_claimed/on_aux_usage: a
-            # duck-typed SessionUI predating the hook must not hit an
+            # duck-typed SessionUI without the hook must not hit an
             # AttributeError that wedges every long session at its first
-            # auto-compaction.  This probe only catches DUCK-typed UIs — an
-            # explicit ``class MyUI(SessionUI)`` inherits the protocol
-            # member as a real method and never lands in the None arm, which
-            # is why the protocol default body renders the same classic
-            # lines itself (see SessionUI.on_compaction): both compat routes
-            # converge on render_compaction_event_as_info, policy
-            # single-sited.
+            # auto-compaction. This probe only catches duck-typed UIs. An
+            # explicit ``class MyUI(SessionUI)`` inherits the protocol member
+            # as a real method and never lands in the None arm, so the protocol
+            # default body renders the same foreground lines itself. Both paths
+            # converge on render_compaction_event_as_info, with policy kept in
+            # one place.
             emit = getattr(self.ui, "on_compaction", None)
             try:
                 if emit is None:
-                    # Pre-hook UIs get the classic info lines back (an
+                    # A UI without the targeted lifecycle cannot place task
+                    # progress under its parent card. Silence is safer than
+                    # misrepresenting it as a workstream-level compaction.
+                    if target != "workstream":
+                        return None
+                    # UIs without the hook get the original info lines (an
                     # auto-compaction must never swap history with zero
                     # announcement — the pre-1.8 lines reached every UI
                     # unconditionally).  Invoked for superseded END events too:
@@ -15017,7 +14879,7 @@ class ChatSession:
                     # ``on_info`` is getattr-guarded like the hook itself — the
                     # never-crash property is the floor; a UI with neither hook
                     # keeps compacting silently.  Deliberately NOT dual-emitted
-                    # for hook-aware UIs or SSE: pre-1.8 SSE/SDK clients that
+                    # for hook-aware UIs or SSE: older SSE/SDK clients that
                     # ignore unknown `compaction` events lose these lines — a
                     # documented 1.8 breaking change (CHANGELOG); dual emission
                     # would double-render on every current client.
@@ -15031,8 +14893,8 @@ class ChatSession:
                     return None
                 result = emit(event)
             except Exception:
-                # The single raise-proofing site for EVERY lifecycle emission
-                # (both compat routes, all phases): a raising duck-typed hook
+                # The single raise-proofing site for every lifecycle emission
+                # (both fallback paths, all phases): a raising duck-typed hook
                 # must degrade to a lost render, never to a lost EVENT —
                 # unguarded, a raising failed-END emit voided the
                 # exactly-one-end contract through the wrapper backstop
@@ -15061,6 +14923,7 @@ class ChatSession:
         trigger: str,
         my_generation: int,
         emit_error: bool = True,
+        compaction_id: int | None = None,
     ) -> bool:
         """Emit a failed-compaction ``end`` event and return ``False``.
 
@@ -15109,6 +14972,8 @@ class ChatSession:
                     "reason": reason,
                     "message": message,
                     "trigger": trigger,
+                    "compaction_id": (my_generation if compaction_id is None else compaction_id),
+                    "target": "workstream",
                 },
             )
         return False
@@ -15119,18 +14984,23 @@ class ChatSession:
         preserve_tail: int = 0,
         my_generation: int = 0,
         carry_spill: bool = False,
+        *,
+        compaction_id: int | None = None,
     ) -> bool:
         """Compact conversation history by summarizing it into a summary turn.
 
-        Summarizes the whole selection via :meth:`_summarize_blocks`, which packs
-        to the char-budget estimate and, when a batch still overflows the real token
-        window, binary-subdivides it (:meth:`_summarize_batch`) — so the summary call
+        Summarizes the whole selection through the shared
+        :class:`~turnstone.core.compaction.CompactionEngine`, which packs to the
+        char-budget estimate and, when a batch still overflows the real token
+        window, binary-subdivides it — so the summary call
         recovers from an under-estimate by chunking rather than overflowing, and the
         most-recent messages are no longer silently dropped.
 
         When auto=True (triggered by context limit), appends a continuation
         hint quoting the last user message — verbatim up to
-        :meth:`_carry_budget_chars` — so the model can resume seamlessly.
+        :meth:`CompactionEngine.carry_budget_chars
+        <turnstone.core.compaction.CompactionEngine.carry_budget_chars>` — so the model
+        can resume seamlessly.
 
         ``preserve_tail`` keeps the last N messages verbatim (re-appended after
         the summary) instead of summarizing them — used to keep an in-flight
@@ -15154,6 +15024,8 @@ class ChatSession:
         """
         # Presentation label derived from the one semantic flag — deriving
         # locally makes an auto=True/trigger="manual" drift impossible.
+        if compaction_id is None:
+            compaction_id = self._next_compaction_id()
         trigger = "auto" if auto else "manual"
         if len(self.messages) < 2:
             return self._compaction_bailed(
@@ -15161,6 +15033,7 @@ class ChatSession:
                 "Not enough messages to compact.",
                 trigger=trigger,
                 my_generation=my_generation,
+                compaction_id=compaction_id,
             )
 
         # Optionally keep the last ``preserve_tail`` messages verbatim — e.g. an
@@ -15194,13 +15067,14 @@ class ChatSession:
         # selection — not a fitting prefix — also fixes the latent drop of the
         # most-recent (unselected) messages.
         to_summarize_dicts = dicts_from_turns(to_summarize)
-        blocks = self._summary_blocks(to_summarize_dicts)
+        blocks = self._compaction_engine.summary_blocks(to_summarize_dicts)
         if not blocks:
             return self._compaction_bailed(
                 "not_enough_messages",
                 "Not enough messages to compact.",
                 trigger=trigger,
                 my_generation=my_generation,
+                compaction_id=compaction_id,
             )
 
         # Pin one semantic lane for the complete recursive transaction.  A
@@ -15209,6 +15083,22 @@ class ChatSession:
         # still abort the old client's in-flight transaction; failure leaves
         # history untouched, and the next compaction resolves the new lane.
         compaction_lane = self._primary_lane()
+
+        def _publish_summary_progress(progress: dict[str, Any]) -> None:
+            self._compaction_event(
+                my_generation,
+                {
+                    **progress,
+                    "compaction_id": compaction_id,
+                    "target": "workstream",
+                },
+            )
+
+        summary_runtime = self._build_summary_runtime(
+            compaction_lane,
+            my_generation=my_generation,
+            on_progress=_publish_summary_progress,
+        )
 
         def _thinking_start() -> None:
             try:
@@ -15223,21 +15113,25 @@ class ChatSession:
         ):
             raise GenerationCancelled()
         try:
-            summary_result = self._summarize_blocks(
+            summary_result = self._compaction_engine.summarize_blocks(
                 blocks,
-                my_generation=my_generation,
-                lane=compaction_lane,
+                summary_runtime,
             )
-        except _CompactionIrreducibleError:
+        except CompactionIrreducibleError:
             return self._compaction_bailed(
                 "irreducible",
                 "Messages too large to fit in summary context.",
                 trigger=trigger,
                 my_generation=my_generation,
+                compaction_id=compaction_id,
             )
         except Exception as e:
             return self._compaction_bailed(
-                "error", f"Compaction failed: {e}", trigger=trigger, my_generation=my_generation
+                "error",
+                f"Compaction failed: {e}",
+                trigger=trigger,
+                my_generation=my_generation,
+                compaction_id=compaction_id,
             )
         finally:
 
@@ -15262,6 +15156,7 @@ class ChatSession:
                 "Compaction produced an empty summary; keeping history.",
                 trigger=trigger,
                 my_generation=my_generation,
+                compaction_id=compaction_id,
             )
 
         # The verbatim carries: the wind-down spill and the continuation-hint
@@ -15291,7 +15186,9 @@ class ChatSession:
         task_lines, child_lines = self._coordinator_handle_rows()
         handles = bool(task_lines or child_lines)
         carries = (1 if spill_text else 0) + (1 if last_user_content else 0) + (1 if handles else 0)
-        carry_budget = self._carry_budget_chars(carries, compaction_lane) if carries else 0
+        carry_budget = (
+            self._compaction_engine.carry_budget_chars(summary_runtime, carries) if carries else 0
+        )
 
         summary = summary_result.text
 
@@ -15304,7 +15201,7 @@ class ChatSession:
         carry_truncated = False
         if spill_text:
             carry_truncated = len(spill_text) > carry_budget
-            summary += "\n\n## Wind-down (verbatim)\n" + self._truncate_block(
+            summary += "\n\n## Wind-down (verbatim)\n" + self._compaction_engine.truncate_block(
                 spill_text, carry_budget
             )
 
@@ -15315,7 +15212,9 @@ class ChatSession:
             # few-hundred-char clip amputates it.  Beyond the budget keep head
             # + tail around an honest marker.
             carry_truncated = carry_truncated or len(last_user_content) > carry_budget
-            last_user_content = self._truncate_block(last_user_content, carry_budget)
+            last_user_content = self._compaction_engine.truncate_block(
+                last_user_content, carry_budget
+            )
             summary += (
                 f"\n\n## Continue\n"
                 f"The user's last message was: {last_user_content}\n"
@@ -15497,6 +15396,8 @@ class ChatSession:
                             "phase": "end",
                             "ok": True,
                             "trigger": trigger,
+                            "compaction_id": compaction_id,
+                            "target": "workstream",
                             "before_tokens": before_tokens,
                             "after_tokens": after_tokens,
                             "summary": summary,
@@ -15523,6 +15424,8 @@ class ChatSession:
                         "phase": "end",
                         "ok": True,
                         "trigger": trigger,
+                        "compaction_id": compaction_id,
+                        "target": "workstream",
                         "before_tokens": before_tokens,
                         "after_tokens": after_tokens,
                         "summary": summary,
@@ -24278,25 +24181,37 @@ class ChatSession:
             return
         fn = getattr(self.ui, "on_agent_context", None)
         if fn is not None:
-            fn(
-                parent_call_id,
-                prompt_tokens,
-                context_window,
-                generation=generation,
-            )
+            try:
+                fn(
+                    parent_call_id,
+                    prompt_tokens,
+                    context_window,
+                    generation=generation,
+                )
+            except Exception:
+                # Context telemetry is advisory. A custom UI hook must not
+                # reclassify a completed model call or a committed compaction
+                # as failed after the provider/context state already changed.
+                log.debug(
+                    "session.agent_context.publish_failed ws=%s call_id=%s generation=%d",
+                    self._ws_id[:8],
+                    parent_call_id,
+                    generation,
+                    exc_info=True,
+                )
 
-    def _clear_agent_context(self, parent_call_id: str | None, *, generation: int) -> None:
+    def _clear_agent_transients(self, parent_call_id: str | None, *, generation: int) -> None:
         """Best-effort clear of generation-scoped task-agent reconnect state."""
         if not parent_call_id:
             return
-        fn = getattr(self.ui, "clear_agent_context", None)
+        fn = getattr(self.ui, "clear_agent_transients", None)
         if fn is not None:
             try:
                 fn(parent_call_id, generation=generation)
             except Exception:
                 # A custom UI hook must not suppress the task's authoritative
                 # terminal result. SessionUIBase's implementation is
-                # in-memory/infallible; this guard preserves the compatibility
+                # in-memory/infallible; this guard preserves the fault-isolation
                 # posture of every other optional task-agent UI hook.
                 log.debug(
                     "session.agent_context.cleanup_failed ws=%s call_id=%s generation=%d",
@@ -24306,9 +24221,9 @@ class ChatSession:
                     exc_info=True,
                 )
 
-    def _clear_agent_contexts_before_generation(self, generation: int) -> None:
+    def _clear_agent_transients_before_generation(self, generation: int) -> None:
         """Best-effort purge of reconnect state owned by retired workers."""
-        fn = getattr(self.ui, "clear_agent_contexts_before_generation", None)
+        fn = getattr(self.ui, "clear_agent_transients_before_generation", None)
         if fn is None:
             return
         try:
@@ -24345,134 +24260,16 @@ class ChatSession:
         The one format for sub-agent output clips — the in-loop 16k clip and the
         recall per-step cap — distinct from the token-budget-aware
         :meth:`_truncate_output`."""
-        if len(text) <= cap:
-            return text
-        return text[:cap] + f"\n\n... (truncated from {len(text)} chars)"
+        return _clip_agent_text(text, cap)
 
-    @staticmethod
-    def _iter_agent_tool_results(
-        agent_turns: list[Turn],
-    ) -> Iterator[tuple[ToolCall, Turn | None]]:
-        """Yield ``(tool_call, result_turn_or_None)`` for every sub-tool the
-        sub-agent issued, in order, pairing each call to its result FIFO per
-        call_id.  Parented runs mint session-unique ids
-        (``{parent}::r{run}s{step}::{provider_id}``, see :meth:`_run_agent`),
-        so for them this is a plain unique-key pairing; the FIFO queue stays as
-        honest pairing for id-colliding input a mint never touched (an
-        unparented run, or turns constructed directly), where last-wins would
-        collapse distinct calls onto one result.  Shared by
-        :meth:`_project_agent_steps` (recall) and :meth:`_cancel_ledger`
-        (cancel disposition)."""
-        pending: dict[str, collections.deque[Turn]] = {}
-        for t in agent_turns:
-            if t.role is Role.TOOL and t.tool_call_id:
-                pending.setdefault(t.tool_call_id, collections.deque()).append(t)
-        for t in agent_turns:
-            if t.role is not Role.ASSISTANT:
-                continue
-            for tc in t.tool_calls:
-                q = pending.get(tc.id)
-                yield tc, (q.popleft() if q else None)
+    def _stash_agent_steps(self, call_id: str | None, steps: list[dict[str, Any]]) -> None:
+        """Retain one already-bounded task recall projection when supported."""
 
-    @staticmethod
-    def _record_unstarted_agent_tools(
-        agent_turns: list[Turn],
-        started_tool_ids: list[str],
-    ) -> None:
-        """Close issued-but-never-started child calls with a NONE ledger row.
-
-        Task-agent tools execute sequentially.  A Stop can win while a call is
-        waiting for intent judging or human approval; that call and every later
-        sibling were never invoked, so labeling the first missing result as
-        in-flight UNKNOWN fabricates possible effects.  Started calls without a
-        result remain gaps.  A counter keeps direct/unparented tests honest when
-        a provider reuses a call id; parented production runs use minted ids.
-        """
-        remaining_started = collections.Counter(started_tool_ids)
-        for tool_call, result in list(ChatSession._iter_agent_tool_results(agent_turns)):
-            if result is not None:
-                if remaining_started[tool_call.id] > 0:
-                    remaining_started[tool_call.id] -= 1
-                continue
-            if remaining_started[tool_call.id] > 0:
-                remaining_started[tool_call.id] -= 1
-                continue
-            agent_turns.append(
-                Turn.tool(
-                    tool_call.id,
-                    "(cancelled before execution; no side effects)",
-                    is_error=True,
-                    effect_status=EffectStatus.NONE,
-                )
-            )
-
-    @staticmethod
-    def _project_agent_steps(agent_turns: list[Turn]) -> list[dict[str, Any]]:
-        """Project a finished sub-agent's trajectory into recall step items for
-        the task card — one per sub-tool call, matched to its result (FIFO per
-        call_id via :meth:`_iter_agent_tool_results`).
-
-        Reads the tool turn's payload directly rather than via ``Turn.text``,
-        which raises on a multimodal ``list[dict]`` result (the deferred-finding
-        landmine); a non-``str`` payload becomes a light placeholder so the
-        recall stays text-only and ``/history`` doesn't carry image bytes.  Each
-        step's output AND arguments are capped (:data:`_AGENT_STEP_OUTPUT_CAP`)
-        and the step COUNT (:data:`_AGENT_STEP_COUNT_CAP`); on overflow the most
-        RECENT steps are kept (a sub-agent's latest edits/writes matter more on
-        recall than its opening searches) behind an honest leading marker — so
-        the stash stays memory-bounded even for a 100+-tool agent and never
-        silently under-reports its step count."""
-        pairs = list(ChatSession._iter_agent_tool_results(agent_turns))
-        dropped = max(0, len(pairs) - _AGENT_STEP_COUNT_CAP)
-        # Build dicts only for the retained tail, not the dropped head.
-        tail = pairs[-_AGENT_STEP_COUNT_CAP:] if dropped else pairs
-        steps: list[dict[str, Any]] = []
-        if dropped:
-            # Leading marker naming how many earlier steps fell out — honest, and
-            # correct now that the RETAINED steps are the recent ones.
-            steps.append(
-                {
-                    "id": "",
-                    "name": "…",
-                    "arguments": "{}",
-                    "output": f"(+{dropped} earlier steps not retained)",
-                    "is_error": False,
-                }
-            )
-        for tc, res in tail:
-            output, is_error = "", False
-            if res is not None:
-                is_error = res.is_error
-                raw = (
-                    res.content[0].text
-                    if res.content and isinstance(res.content[0], TextBlock)
-                    else ""
-                )
-                output = raw if isinstance(raw, str) else "[non-text result]"
-            steps.append(
-                {
-                    "id": tc.id,
-                    "name": tc.name,
-                    # Clip arguments too: a write_file/edit_file call carries full
-                    # file content here, which the per-step output cap alone would
-                    # leave unbounded in the in-memory stash.
-                    "arguments": ChatSession._clip_with_count(tc.arguments, _AGENT_STEP_OUTPUT_CAP),
-                    "output": ChatSession._clip_with_count(output, _AGENT_STEP_OUTPUT_CAP),
-                    "is_error": is_error,
-                }
-            )
-        return steps
-
-    def _stash_agent_trajectory(self, call_id: str | None, agent_turns: list[Turn]) -> None:
-        """Retain a finished task agent's projected sub-trajectory for ``/history``
-        card recall (getattr-guarded → no-op on CLI / eval / fixtures).  Called
-        from ``_exec_task``'s ``finally`` so it captures the full record on
-        success and the partial one on cancel/error — both honest."""
         if not call_id:
             return
         fn = getattr(self.ui, "stash_agent_trajectory", None)
         if fn is not None:
-            fn(call_id, self._project_agent_steps(agent_turns))
+            fn(call_id, steps)
 
     def _run_agent(
         self,
@@ -24486,6 +24283,7 @@ class ChatSession:
         principal_id: str | None = None,
         origin_cancel_event: threading.Event | None = None,
         origin_generation: int = 0,
+        execution_journal: _TaskExecutionJournal | None = None,
     ) -> str:
         """Run one autonomous child under an independently abortable scope.
 
@@ -24494,12 +24292,12 @@ class ChatSession:
         without a registered provider-stream handle.
         """
         parent_event = self._cancel_event if origin_cancel_event is None else origin_cancel_event
+        journal = execution_journal or _TaskExecutionJournal(agent_turns)
         with self._registered_parallel_model_cancel_scope(
             parent_event,
             origin_generation,
         ) as cancel_scope:
             context_token = _active_task_agent_cancel_scope.set(cancel_scope)
-            started_tool_ids: list[str] = []
             try:
                 cancel_scope.check()
                 try:
@@ -24514,7 +24312,7 @@ class ChatSession:
                         principal_id=principal_id,
                         cancel_scope=cancel_scope,
                         origin_generation=origin_generation,
-                        started_tool_ids=started_tool_ids,
+                        execution_journal=journal,
                     )
                 except GenerationCancelled:
                     # Model-issued calls that never crossed their execute
@@ -24522,7 +24320,7 @@ class ChatSession:
                     # UNKNOWN. Fill those ledger rows before the parent builds
                     # its cancellation disposition; calls that did start and
                     # never returned deliberately remain gaps.
-                    self._record_unstarted_agent_tools(agent_turns, started_tool_ids)
+                    journal.materialize_unstarted(agent_turns)
                     raise
             finally:
                 _active_task_agent_cancel_scope.reset(context_token)
@@ -24540,7 +24338,7 @@ class ChatSession:
         *,
         cancel_scope: _ParallelModelCancelScope,
         origin_generation: int,
-        started_tool_ids: list[str],
+        execution_journal: _TaskExecutionJournal,
     ) -> str:
         """Run an autonomous agent loop.
 
@@ -24582,10 +24380,17 @@ class ChatSession:
         if auto_tools is None:
             auto_tools = TASK_AUTO_TOOLS
         max_tool_turns = self.agent_max_turns
+        # ``execution_journal`` is bounded cancellation/recall truth.
+        # ``context_turns`` is the bounded trajectory sent back to the model and
+        # may be replaced by compaction; ``agent_turns`` retains only raw turns
+        # since the latest replacement for direct-call diagnostics. The initial
+        # system/skill/delegation prefix is immutable controller context.
+        context_turns = list(agent_turns)
+        agent_prefix = tuple(agent_turns)
 
         # Resolve agent model: explicit per-call override wins, then the
-        # per-kind registry override (task_model), then the legacy single-
-        # knob agent_model, then the session's primary model.
+        # per-kind registry override (task_model), then the session-wide
+        # agent_model fallback, then the session's primary model.
         if agent_alias is not None:
             if self._registry is None or not self._registry.has_alias(agent_alias):
                 raise ValueError(f"Unknown agent_alias '{agent_alias}'")
@@ -24636,6 +24441,7 @@ class ChatSession:
         # invocation; the native lane carried here serves the WITHIN-RUN
         # reasoning continuity of the agent's own tool loop.
         same_lane = (lane.alias or "") == (primary_lane.alias or "")
+        agent_reasoning_effort = reasoning_effort or (self.reasoning_effort if same_lane else None)
         # Keep the initiating principal pinned for the whole sub-agent run,
         # but defer each credential mint until model_turn has acquired this
         # alias's admission slot.  A long queue can outlive a bearer token;
@@ -24643,7 +24449,13 @@ class ChatSession:
         # without consulting a later shared-workstream actor.
         cancel_scope.check()
         lane = self._lane_for_backend_auth_principal(lane, agent_principal)
-        agent_context_window = self._context_window_for_lane(lane) if parent_call_id else 0
+        agent_context_window = self._context_window_for_lane(lane)
+        context_estimator = PromptTokenEstimator(
+            measure=self._msg_text_chars,
+            tool_def_chars=serialized_tool_chars(tools),
+            image_tokens=self._IMAGE_TOKENS,
+        )
+        compaction_policy = self._compaction_policy(agent_context_window)
 
         def _api_call(
             turns: list[Turn],
@@ -24675,8 +24487,7 @@ class ChatSession:
                         tools=_tools,
                         max_tokens=self.max_tokens,
                         temperature=self.temperature if same_lane else None,
-                        reasoning_effort=reasoning_effort
-                        or (self.reasoning_effort if same_lane else None),
+                        reasoning_effort=agent_reasoning_effort,
                         mint=mint,
                         wire_id_map=wire_id_map,
                         cancel_ref=cancel_scope.cancel_ref,
@@ -24697,6 +24508,13 @@ class ChatSession:
                     # after its originating run was cancelled.
                     cancel_scope.check()
                     agent_usage = agent_result.usage
+                    if agent_usage is not None:
+                        context_estimator.observe(
+                            prompt_tokens=agent_usage.prompt_tokens,
+                            messages=turns,
+                            wire_messages=agent_result.wire_msgs,
+                            tool_def_chars=agent_result.tool_def_chars,
+                        )
                     if agent_usage is not None and parent_call_id:
                         published = self._publish_for_generation(
                             origin_generation,
@@ -24751,7 +24569,7 @@ class ChatSession:
             # therefore conservatively tracked as started/UNKNOWN until a
             # result establishes a tighter disposition.
             cancel_scope.check()
-            started_tool_ids.append(str(prepared.get("call_id") or ""))
+            execution_journal.mark_started(str(prepared.get("call_id") or ""))
             result: tuple[str, Any] = prepared["execute"](execute_item)
             return result
 
@@ -24766,6 +24584,309 @@ class ChatSession:
             )
             cancel_scope.check()
             return guarded
+
+        compaction_advised = False
+        # Cooperative soft compaction is admitted once per effect epoch.  A
+        # successful summary is not itself progress: if its irreducible prefix
+        # remains over soft, re-arming before another tool result creates an
+        # unbounded model -> summary -> model loop that never advances ``turn``.
+        tool_progress_epoch = 0
+        compacted_epoch: int | None = None
+        failed_compaction_signature: tuple[int, int, int, int] | None = None
+
+        def _context_signature(
+            prospective_turns: tuple[Turn, ...] = (),
+            *,
+            tool_def_chars: int | None = None,
+        ) -> tuple[int, int, int, int]:
+            request_turns = [*context_turns, *prospective_turns]
+            next_tool_chars = (
+                context_estimator.tool_def_chars if tool_def_chars is None else tool_def_chars
+            )
+            used = context_estimator.estimate_with_tool_defs(
+                request_turns,
+                tool_def_chars=next_tool_chars,
+            )
+            return len(context_turns), len(prospective_turns), next_tool_chars, used
+
+        def _task_compaction_event(
+            compaction_id: int,
+            payload: dict[str, Any],
+        ) -> None:
+            if not parent_call_id:
+                return
+            self._compaction_event(
+                origin_generation,
+                {
+                    **payload,
+                    "compaction_id": compaction_id,
+                    "target": "task_agent",
+                    "parent_call_id": parent_call_id,
+                },
+            )
+
+        def _agent_summary_runtime(
+            compaction_id: int,
+            *,
+            continuation_tool_def_chars: int | None = None,
+        ) -> SummaryRuntime:
+            prefix_tokens = context_estimator.tokens_for(agent_prefix)
+            tool_chars = (
+                context_estimator.tool_def_chars
+                if continuation_tool_def_chars is None
+                else continuation_tool_def_chars
+            )
+            tool_tokens = int(tool_chars / context_estimator.chars_per_token)
+            return self._build_summary_runtime(
+                lane,
+                my_generation=origin_generation,
+                context_window=agent_context_window,
+                chars_per_token=context_estimator.chars_per_token,
+                continuation_overhead_tokens=prefix_tokens + tool_tokens,
+                principal_id=agent_principal,
+                reasoning_effort=agent_reasoning_effort,
+                cancel_ref_factory=lambda: cancel_scope.cancel_ref,
+                check_cancelled=cancel_scope.check,
+                backoff_or_cancelled=cancel_scope.backoff_or_cancelled,
+                on_progress=functools.partial(_task_compaction_event, compaction_id),
+                use_session_temperature=same_lane,
+            )
+
+        def _compact_agent_context(
+            where: str,
+            *,
+            carry_spill: bool = False,
+            prospective_turns: tuple[Turn, ...] = (),
+            next_tool_def_chars: int | None = None,
+        ) -> bool:
+            """Summarize and atomically replace only this agent's model context."""
+
+            nonlocal compaction_advised, compacted_epoch, failed_compaction_signature
+            cancel_scope.check()
+            signature = _context_signature(
+                prospective_turns,
+                tool_def_chars=next_tool_def_chars,
+            )
+            if signature == failed_compaction_signature:
+                return False
+            # There must be work beyond the immutable harness prefix to reclaim.
+            if len(context_turns) <= len(agent_prefix):
+                failed_compaction_signature = signature
+                return False
+            compaction_advised = False
+            # The immutable controller prefix is reattached verbatim below, so
+            # summarize only the replaceable suffix. Including the task prompt
+            # in both places wastes the reclaimed budget and lets a paraphrase
+            # compete with the authoritative delegation contract.
+            blocks = self._compaction_engine.summary_blocks(
+                dicts_from_turns(context_turns[len(agent_prefix) :])
+            )
+            if not blocks:
+                failed_compaction_signature = signature
+                return False
+            compaction_id = self._next_compaction_id()
+            runtime = _agent_summary_runtime(
+                compaction_id,
+                continuation_tool_def_chars=next_tool_def_chars,
+            )
+            start_payload: dict[str, Any] = {
+                "phase": "start",
+                "trigger": "auto",
+                "where": where,
+            }
+            if where != "context overflow":
+                start_payload["pct"] = round(self.auto_compact_pct * 100)
+            if not self._publish_for_generation(
+                origin_generation,
+                functools.partial(_task_compaction_event, compaction_id, start_payload),
+                allow_cancelled=False,
+            ):
+                raise GenerationCancelled()
+
+            settled = False
+
+            def _settle(payload: dict[str, Any]) -> None:
+                nonlocal settled
+                if settled:
+                    return
+                # Mark first: the common emitter is raise-proof, but custom test
+                # doubles should not turn one attempted terminal edge into two.
+                settled = True
+                _task_compaction_event(compaction_id, payload)
+
+            try:
+                summary_result = self._compaction_engine.summarize_blocks(blocks, runtime)
+                if not summary_result.text.strip():
+                    failed_compaction_signature = signature
+                    _settle(
+                        {
+                            "phase": "end",
+                            "ok": False,
+                            "reason": "empty_summary",
+                            "message": "Task-agent context compaction returned an empty summary.",
+                            "trigger": "auto",
+                        }
+                    )
+                    self.ui.on_info(f"[{label}] context compaction returned an empty summary")
+                    return False
+
+                summary = summary_result.text
+                if carry_spill and context_turns:
+                    spill = context_turns[-1]
+                    spill_text = spill.text.strip() if spill.role is Role.ASSISTANT else ""
+                    if spill_text:
+                        carry_budget = self._compaction_engine.carry_budget_chars(runtime)
+                        summary += "\n\n## Wind-down (verbatim)\n" + (
+                            self._compaction_engine.truncate_block(spill_text, carry_budget)
+                        )
+
+                compacted = turns_from_dicts(
+                    [
+                        {
+                            "role": "user",
+                            "content": COMPACTION_SUMMARY_LABEL,
+                            "_source": COMPACTION_SOURCE,
+                        },
+                        {
+                            "role": "assistant",
+                            "content": summary,
+                            "_source": COMPACTION_SOURCE,
+                            "_provenance": summary_result.provenance.to_meta(),
+                        },
+                        {
+                            "role": "user",
+                            "content": NUDGE_TASK_COMPACTION_RESUME,
+                            "_source": "compaction_resume",
+                        },
+                    ]
+                )
+                cancel_scope.check()
+                replacement = [*agent_prefix, *compacted]
+                # Stage every fallible derivation before replacing either live
+                # trajectory. An unexpected estimator/provenance error therefore
+                # yields a failed END while leaving the old context intact.
+                context_estimator.invalidate()
+                next_tool_chars = (
+                    context_estimator.tool_def_chars
+                    if next_tool_def_chars is None
+                    else next_tool_def_chars
+                )
+                after_tokens = context_estimator.estimate_with_tool_defs(
+                    [*replacement, *prospective_turns],
+                    tool_def_chars=next_tool_chars,
+                )
+
+                context_turns[:] = replacement
+                # The bounded journal now owns cancellation/recall truth for
+                # every resolved pre-compaction call. Drop their raw
+                # assistant/native blocks, tool payloads, and provider-id restore
+                # entries referenced only by the discarded model context.
+                agent_turns[:] = list(agent_prefix)
+                wire_id_map.clear()
+                # Exact file contents have left the model context. Clear only
+                # this ContextVar-owned task set; siblings/parent are untouched.
+                self._current_read_files.clear()
+                failed_compaction_signature = None
+                compacted_epoch = tool_progress_epoch
+                if parent_call_id:
+                    published = self._publish_for_generation(
+                        origin_generation,
+                        functools.partial(
+                            self._paint_agent_context,
+                            parent_call_id,
+                            after_tokens,
+                            agent_context_window,
+                            generation=origin_generation,
+                        ),
+                        allow_cancelled=False,
+                    )
+                    if not published:
+                        raise GenerationCancelled()
+                _settle(
+                    {
+                        "phase": "end",
+                        "ok": True,
+                        "trigger": "auto",
+                        "before_tokens": signature[3],
+                        "after_tokens": after_tokens,
+                    }
+                )
+                return True
+            except CompactionIrreducibleError:
+                failed_compaction_signature = signature
+                _settle(
+                    {
+                        "phase": "end",
+                        "ok": False,
+                        "reason": "irreducible",
+                        "message": "Task-agent context could not be reduced.",
+                        "trigger": "auto",
+                    }
+                )
+                self.ui.on_info(f"[{label}] context compaction could not reduce the trajectory")
+                return False
+            except Exception as error:
+                failed_compaction_signature = signature
+                _settle(
+                    {
+                        "phase": "end",
+                        "ok": False,
+                        "reason": "error",
+                        "message": "Task-agent context compaction failed.",
+                        "trigger": "auto",
+                    }
+                )
+                log.warning(
+                    "task_agent.compaction_failed",
+                    label=label,
+                    where=where,
+                    error_type=type(error).__name__,
+                )
+                return False
+            except BaseException:
+                _settle(
+                    {
+                        "phase": "end",
+                        "ok": False,
+                        "reason": "cancelled",
+                        "message": "Task-agent context compaction cancelled.",
+                        "trigger": "auto",
+                    }
+                )
+                raise
+
+        def _maybe_compact_agent_context() -> None:
+            nonlocal compaction_advised
+            if len(context_turns) <= len(agent_prefix):
+                return
+            used = context_estimator.estimate(context_turns)
+            if compacted_epoch == tool_progress_epoch:
+                return
+            if compaction_policy.owed(used, advised=compaction_advised):
+                _compact_agent_context("mid-turn")
+            elif compaction_policy.over_soft(used):
+                context_turns.append(
+                    turn_from_dict(
+                        make_system_turn(
+                            "compaction_pending",
+                            format_nudge("compaction_pending"),
+                        )
+                    )
+                )
+                compaction_advised = True
+
+        def _api_call_with_compaction(
+            _tools: list[dict[str, Any]] | None = tools,
+        ) -> ModelTurnResult:
+            try:
+                return _api_call(context_turns, _tools=_tools)
+            except Exception as error:
+                if _is_ctx_overflow(error) and _compact_agent_context(
+                    "context overflow",
+                    next_tool_def_chars=serialized_tool_chars(_tools or []),
+                ):
+                    return _api_call(context_turns, _tools=_tools)
+                raise
 
         turn = 0
         # Mint tags for sub-tool ids.  ``run_seq`` is session-unique per
@@ -24822,8 +24943,9 @@ class ChatSession:
         mint: Callable[[str], str] | None = _mint_sub_id if parent_call_id else None
         while max_tool_turns < 0 or turn < max_tool_turns:
             cancel_scope.check()
+            _maybe_compact_agent_context()
             try:
-                result = _api_call(agent_turns)
+                result = _api_call_with_compaction()
             except Exception as e:
                 # Terminal API error: overflow, or any non-retryable error that
                 # escaped the retry loop above.  Salvage the sub-agent's partial work
@@ -24836,7 +24958,7 @@ class ChatSession:
                 # propagates past this ``except Exception``.
                 overflow = _is_ctx_overflow(e)
                 note = "context limit reached" if overflow else f"error ({type(e).__name__})"
-                salvage = last_assistant_text(agent_turns)
+                salvage = execution_journal.latest_assistant_text
                 if salvage:
                     self.ui.on_info(f"[{label}] {note}, returning partial work")
                     return _finish_synthesis(salvage)
@@ -24865,8 +24987,24 @@ class ChatSession:
             # (:func:`turnstone.core.model_turn.finalize_provider_blocks`).
             cancel_scope.check()
             agent_turns.append(result.turn)
+            context_turns.append(result.turn)
+            execution_journal.record_assistant(result.turn)
+            if result.usage is not None:
+                context_estimator.append_exact(
+                    result.turn,
+                    result.usage.completion_tokens,
+                )
 
             if not result.tool_calls:
+                if compaction_advised and _compact_agent_context(
+                    "cooperative wind-down",
+                    carry_spill=True,
+                ):
+                    # The committed summary replaced this no-tool turn. Do not
+                    # keep its provider-native payload alive through the resume
+                    # request merely because the loop local still points at it.
+                    del result
+                    continue
                 content = _non_blank_or(result.content, "(no output)")
                 self.ui.on_info(f"[{label} done] {len(content)} chars")
                 return _finish_synthesis(content)
@@ -24881,6 +25019,7 @@ class ChatSession:
                 # not only the execute path — so a guard-branch error's
                 # output_warning still nests under the task card.
                 self._note_agent_child(tc_dict["id"], parent_call_id)
+                execution_journal.register_child(tc_dict["id"])
 
                 # is_error for the recalled step: the guard / prepare / unknown
                 # branches produce explicit error text; the execute paths record
@@ -24890,6 +25029,7 @@ class ChatSession:
                 is_tool_error = False
                 child_effect_status: EffectStatus | None = None
                 cancelled_before_execution = False
+                prepared: dict[str, Any] | None = None
                 output: Any
                 # Guard 1: block recursive agent calls.
                 if tool_name == "task_agent":
@@ -24946,7 +25086,7 @@ class ChatSession:
                         # gate, exactly like the main loop.
                         agent_judge_cancel = self._evaluate_intent(
                             [prepared],
-                            conversation=agent_turns,
+                            conversation=context_turns,
                             agent_gate=True,
                             principal_id=agent_principal,
                             cancel_ref=cancel_scope.cancel_ref,
@@ -25029,6 +25169,12 @@ class ChatSession:
                         effect_status=child_effect_status,
                     )
                 )
+                journal_step = execution_journal.record_result(
+                    tc_dict["id"],
+                    "(tool result observed; output processing was interrupted)",
+                    is_error=is_tool_error,
+                    effect_status=child_effect_status,
+                )
                 if cancelled_before_execution:
                     raise GenerationCancelled()
 
@@ -25074,19 +25220,43 @@ class ChatSession:
                     is_error=is_tool_error,
                     effect_status=child_effect_status,
                 )
+                execution_journal.update_step(journal_step, output, is_error=is_tool_error)
+                context_turns.append(agent_turns[result_turn_index])
+                self._clear_agent_children(
+                    parent_call_id,
+                    child_ids={tc_dict["id"]},
+                )
+                execution_journal.release_child(tc_dict["id"])
+            # Successful compaction runs at the top of the next iteration.
+            # Drop the just-completed provider response and last tool locals
+            # before that summary/model call so the context swap is also a real
+            # reachability boundary for multimodal/native payloads.
+            del result, tc_dict, prepared, output
             turn += 1
+            tool_progress_epoch += 1
 
         # Exhausted tool turns — force a final synthesis response.
         cancel_scope.check()
         self.ui.on_info(f"[{label}] turn limit reached, requesting synthesis...")
-        agent_turns.append(
-            Turn.user(
-                "You have reached the tool call limit. "
-                "Provide your complete response now using "
-                "the information you have gathered so far."
-            )
+        synthesis_turn = Turn.user(
+            "You have reached the tool call limit. "
+            "Provide your complete response now using "
+            "the information you have gathered so far."
         )
-        result = _api_call(agent_turns, _tools=[])
+        if len(context_turns) > len(agent_prefix) and compaction_policy.over_soft(
+            context_estimator.estimate_with_tool_defs(
+                [*context_turns, synthesis_turn],
+                tool_def_chars=0,
+            )
+        ):
+            _compact_agent_context(
+                "turn-limit synthesis",
+                prospective_turns=(synthesis_turn,),
+                next_tool_def_chars=0,
+            )
+        agent_turns.append(synthesis_turn)
+        context_turns.append(synthesis_turn)
+        result = _api_call_with_compaction(_tools=[])
         cancel_scope.check()
         content = _non_blank_or(result.content, "(no output)")
         self.ui.on_info(f"[{label} done] {len(content)} chars")
@@ -25192,6 +25362,7 @@ class ChatSession:
                 skill_body = skill_body[:_MAX_SKILL_CONTENT]
             agent_turns.append(Turn.user(self._TASK_SKILL_CAPABILITY_PREAMBLE + skill_body))
         agent_turns.append(Turn.user(prompt))
+        execution_journal = _TaskExecutionJournal(agent_turns)
         self._begin_agent_scope()
         # Per-sub-agent file-read tracking.  COPY the parent's current set in (so
         # the agent can edit a file the parent already read for it — no spurious
@@ -25215,6 +25386,7 @@ class ChatSession:
                 principal_id=item.get("_principal_id"),
                 origin_cancel_event=item.get("_origin_cancel_event"),
                 origin_generation=origin_generation,
+                execution_journal=execution_journal,
             )
 
             # Self-report the task_agent's OWN result.  The parent run-loop only
@@ -25228,7 +25400,7 @@ class ChatSession:
                 # listener must observe either the active snapshot followed by
                 # this result, or no snapshot plus this result — never a
                 # synthetic active reading after the terminal replay.
-                self._clear_agent_context(call_id, generation=origin_generation)
+                self._clear_agent_transients(call_id, generation=origin_generation)
                 self._report_tool_result(call_id, "task_agent", result)
 
             if not self._publish_for_generation(
@@ -25239,23 +25411,21 @@ class ChatSession:
                 raise GenerationCancelled()
             return call_id, result
         except GenerationCancelled:
-            # Fold back an honest disposition built from the agent's own
-            # ledger.  ``agent_turns`` is mutated in place by
-            # ``_run_agent`` (it appends every assistant turn and tool
-            # result), so at this catch point it holds the full record of
-            # what the sub-agent did before cancel — including a partial
-            # result from a tool that was SIGKILL'd mid-flight.  The old
+            # Fold back an honest disposition from the bounded execution
+            # journal. It retains exact current-batch gaps and aggregate typed
+            # outcomes even after raw pre-compaction payloads were released,
+            # including a partial result from a tool SIGKILL'd mid-flight. The old
             # bare "(task interrupted by user)" string discarded all of
             # that and fabricated an *outcome*: downstream it read as
             # "nothing happened" and invited a re-dispatch / double-send.
             # See the cancellation appendix in HYPOTHESIS.md ("ρ may
             # fabricate the acknowledgment but must not fabricate the
             # outcome … unknown, never none").
-            disposition = self._cancelled_agent_disposition(agent_turns, "task")
+            disposition = execution_journal.cancelled_disposition("task")
 
             def _publish_cancelled() -> None:
-                self._clear_agent_context(call_id, generation=origin_generation)
-                status = self._cancelled_agent_status(agent_turns)
+                self._clear_agent_transients(call_id, generation=origin_generation)
+                status = execution_journal.cancelled_status()
                 receipt = _CancelledToolResult(
                     detail=disposition,
                     effect_status=status,
@@ -25308,7 +25478,7 @@ class ChatSession:
             msg = f"Task error: {e}"
 
             def _publish_error() -> None:
-                self._clear_agent_context(call_id, generation=origin_generation)
+                self._clear_agent_transients(call_id, generation=origin_generation)
                 self._report_tool_result(call_id, "task_agent", msg, is_error=True)
 
             self._publish_for_generation(
@@ -25331,172 +25501,23 @@ class ChatSession:
             _active_shell_owner.reset(shell_token)
             self._background_shells.reap(owner=shell_owner)
             self._end_agent_scope()
-            child_ids = {tc.id for tc, _result in self._iter_agent_tool_results(agent_turns)}
-            self._clear_agent_children(call_id, child_ids=child_ids)
+            self._clear_agent_children(
+                call_id,
+                child_ids=execution_journal.active_child_ids,
+            )
             # This is pure exact-owner cleanup, not publication. A retiring
             # predecessor must still drop its own reading after a force claim;
             # the generation stored beside the entry protects a successor that
             # reused the same public call id.
-            self._clear_agent_context(call_id, generation=origin_generation)
+            self._clear_agent_transients(call_id, generation=origin_generation)
 
             def _stash() -> None:
                 try:
-                    self._stash_agent_trajectory(call_id, agent_turns)
+                    self._stash_agent_steps(call_id, execution_journal.project_steps())
                 except Exception:
                     log.debug("task_agent.stash_failed call_id=%s", call_id, exc_info=True)
 
             self._publish_for_generation(origin_generation, _stash)
-
-    @staticmethod
-    def _cancel_effect_ledger(
-        agent_turns: list[Turn],
-    ) -> tuple[list[tuple[str, bool, EffectStatus | None]], int | None]:
-        """Read issued child calls, observed results, and typed effects.
-
-        Returns ``(name, was_answered, effect_status)`` in issue order plus
-        the first in-flight gap.  An answered UNKNOWN is distinct from a gap:
-        the controller received a result, but the child tool itself could not
-        establish whether its side effect landed.
-
-        ``_run_agent`` runs a turn's tool_calls sequentially (cancel raises at
-        the per-tool checkpoint, or mid-tool for a SIGKILL'd bash), so the first
-        gap is the call that was executing when cancel landed: everything before
-        it returned, everything after never started. (The LAST gap would invert
-        unknown/none on a multi-call turn.) Shared by the disposition string and
-        its typed status so the two can't disagree.
-
-        Pairs via :meth:`_iter_agent_tool_results`: parented runs carry minted
-        unique ids, and on un-minted id-colliding input (unparented / direct
-        construction) the FIFO still reads a half-answered colliding pair as
-        one answered + one in-flight gap, not (set-membership) both answered.
-        """
-        issued = [
-            (
-                (tc.name or "tool").strip(),
-                res is not None,
-                res.effect_status if res is not None else None,
-            )
-            for tc, res in ChatSession._iter_agent_tool_results(agent_turns)
-        ]
-        first_gap = next((i for i, (_n, ans, _status) in enumerate(issued) if not ans), None)
-        return issued, first_gap
-
-    @staticmethod
-    def _cancel_ledger(
-        agent_turns: list[Turn],
-    ) -> tuple[list[tuple[str, bool]], int | None]:
-        """Compatibility projection of :meth:`_cancel_effect_ledger`.
-
-        Existing recall/cancellation callers that only need answered-vs-missing
-        retain the compact pair shape; disposition and status use the typed
-        ledger directly.
-        """
-        issued, first_gap = ChatSession._cancel_effect_ledger(agent_turns)
-        return [(name, answered) for name, answered, _status in issued], first_gap
-
-    def _cancelled_agent_status(self, agent_turns: list[Turn]) -> EffectStatus:
-        """Typed twin of :meth:`_cancelled_agent_disposition`: ``none`` if the
-        agent never acted or every issued action is confirmed no-effect,
-        ``unknown`` if a tool was in flight when cancel landed (its effect
-        unobserved), else ``partial`` — at least one issued call returned a
-        durable or ordinary result, but the agent was stopped before finishing.
-        """
-        issued, first_gap = self._cancel_effect_ledger(agent_turns)
-        if not issued:
-            return EffectStatus.NONE
-        if first_gap is not None or any(
-            status is EffectStatus.UNKNOWN for _name, _answered, status in issued
-        ):
-            return EffectStatus.UNKNOWN
-        if all(
-            answered and status in (EffectStatus.NONE, EffectStatus.ROLLED_BACK)
-            for _name, answered, status in issued
-        ):
-            return EffectStatus.NONE
-        return EffectStatus.PARTIAL
-
-    def _cancelled_agent_disposition(self, agent_turns: list[Turn], label: str) -> str:
-        """Build an honest, deterministic disposition for a cancelled sub-agent.
-
-        A cancelled agent must not report a fabricated *outcome*.  The bare
-        "(interrupted)" string read downstream as *the task did not happen*
-        — which causes a double-send as readily as a dropped record causes
-        an orphan (cancellation appendix, HYPOTHESIS.md).  Instead we fold
-        back the agent's actual ledger: which tool actions completed, which
-        never started, and an explicit ``UNKNOWN`` flag on the in-flight
-        action — the FIRST issued call without a result.  ``_run_agent``
-        executes a turn's tool_calls sequentially, so on cancel everything
-        before the first gap completed, the gap itself was executing (its
-        side effect may or may not have landed, its result never observed),
-        and everything after it never ran.
-
-        Pure string assembly over the in-memory ``agent_turns`` — no
-        model call, because we are on the cancel path and the gate is
-        closed.  The owner (parent / coordinator) reads this to decide what,
-        if anything, to compensate.
-        """
-        issued, first_gap = self._cancel_effect_ledger(agent_turns)
-        if not issued:
-            return f"({label} cancelled by user before any action — no side effects)"
-
-        def _summ(names: list[str]) -> str:
-            counts: dict[str, int] = {}
-            for n in names:
-                counts[n] = counts.get(n, 0) + 1
-            return ", ".join(f"{n}×{c}" if c > 1 else n for n, c in counts.items())
-
-        parts = [f"({label} cancelled by user before completion)"]
-        answered = [entry for entry in issued if entry[1]]
-        completed = [
-            name
-            for name, _was_answered, status in answered
-            if status in (None, EffectStatus.COMMITTED)
-        ]
-        partial = [
-            name for name, _was_answered, status in answered if status is EffectStatus.PARTIAL
-        ]
-        no_effect = [
-            name for name, _was_answered, status in answered if status is EffectStatus.NONE
-        ]
-        rolled_back = [
-            name for name, _was_answered, status in answered if status is EffectStatus.ROLLED_BACK
-        ]
-        unresolved = [
-            name for name, _was_answered, status in answered if status is EffectStatus.UNKNOWN
-        ]
-        if completed:
-            parts.append("Completed before cancel: " + _summ(completed) + ".")
-        if partial:
-            parts.append("Partially completed before cancel: " + _summ(partial) + ".")
-        if no_effect:
-            parts.append("Confirmed no effect before cancel: " + _summ(no_effect) + ".")
-        if rolled_back:
-            parts.append("Completed and rolled back before cancel: " + _summ(rolled_back) + ".")
-        if unresolved:
-            parts.append(
-                "Results received with UNKNOWN effects before cancel: "
-                + _summ(unresolved)
-                + ". Those actions may have completed, partially executed, or caused "
-                "side effects; reconcile before re-running."
-            )
-        if first_gap is None:
-            # Every issued call returned a result — cancel landed between turns,
-            # so there is no in-flight boundary.  Typed UNKNOWN results above
-            # remain unresolved even though they were answered.
-            return "\n".join(parts)
-        boundary = issued[first_gap][0]
-        not_run = [
-            name for name, was_answered, _status in issued[first_gap + 1 :] if not was_answered
-        ]
-        parts.append(
-            f"In flight at cancel: {boundary} — outcome UNKNOWN. It may have "
-            "completed, partially executed, or caused side effects before the "
-            "agent was stopped; its result was never observed. Do not assume "
-            "it did or did not happen — reconcile before re-running."
-        )
-        if not_run:
-            parts.append("Not started (cancelled first): " + _summ(not_run) + ".")
-        return "\n".join(parts)
 
     def _audit_memory_event(
         self,

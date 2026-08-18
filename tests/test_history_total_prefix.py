@@ -29,6 +29,7 @@ from turnstone.core import session as session_module
 from turnstone.core import session_worker
 from turnstone.core.attachment_buffer import get_attachment_buffer
 from turnstone.core.attachments import Attachment, resolve_staged_attachments
+from turnstone.core.compaction import SummaryResult
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.trajectory import turns_from_dicts
 
@@ -378,9 +379,9 @@ def test_compaction_end_crossing_is_visible_to_fresh_history_handoff(tmp_db: Any
     registration: Any = None
     with (
         patch.object(
-            session,
-            "_summarize_blocks",
-            return_value=session_module._SummaryResult(
+            session._compaction_engine,
+            "summarize_blocks",
+            return_value=SummaryResult(
                 text=summary,
                 producer="openai-compatible",
             ),
@@ -735,9 +736,9 @@ def test_compaction_marker_lost_ack_has_one_success_end_and_one_row(tmp_db: Any)
 
     with (
         patch.object(
-            session,
-            "_summarize_blocks",
-            return_value=session_module._SummaryResult(text=summary, producer="kernel"),
+            session._compaction_engine,
+            "summarize_blocks",
+            return_value=SummaryResult(text=summary, producer="kernel"),
         ),
         patch.object(session.ui, "on_compaction", side_effect=[41, 42]) as compaction_events,
         patch.object(get_storage(), "get_compaction_watermark", return_value=2),

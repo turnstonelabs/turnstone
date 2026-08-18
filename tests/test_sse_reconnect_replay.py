@@ -857,6 +857,70 @@ def test_handler_replay_ok_uses_buffered_agent_context_only() -> None:
     assert "id: 1" in blob
 
 
+def _start_task_compaction(ui: Any) -> None:
+    ui.on_compaction(
+        {
+            "phase": "start",
+            "trigger": "auto",
+            "target": "task_agent",
+            "parent_call_id": "task-A",
+            "compaction_id": 17,
+            "_generation": 2,
+        }
+    )
+
+
+def test_handler_fresh_connect_replays_active_task_compaction() -> None:
+    """Task compaction progress is recoverable without becoming history."""
+    ui = _make_ui()
+    _start_task_compaction(ui)
+
+    _, blob = _drain_handler_yields(ui, max_yields=4)
+
+    assert blob.count('"type": "compaction"') == 1
+    assert '"target": "task_agent"' in blob
+    assert '"parent_call_id": "task-A"' in blob
+    assert '"compaction_id": 17' in blob
+    assert "_generation" not in blob
+
+
+def test_handler_truncated_replays_active_task_compaction(monkeypatch: Any) -> None:
+    """An evicted task-compaction start is restored from transient state."""
+    import collections
+
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
+    ui = _make_ui()
+    ui._event_buffer = collections.deque(maxlen=3)
+    _start_task_compaction(ui)
+    for i in range(8):
+        ui.on_content_token(str(i))
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "1"},
+        max_yields=6,
+    )
+
+    assert "replay_truncated" in blob
+    assert blob.count('"type": "compaction"') == 1
+    assert '"compaction_id": 17' in blob
+
+
+def test_handler_replay_ok_uses_buffered_task_compaction_only() -> None:
+    """Covered reconnects must not add a synthetic compaction duplicate."""
+    ui = _make_ui()
+    _start_task_compaction(ui)
+
+    _, blob = _drain_handler_yields(
+        ui,
+        headers={"Last-Event-ID": "0"},
+        max_yields=3,
+    )
+
+    assert blob.count('"type": "compaction"') == 1
+    assert "id: 1" in blob
+
+
 def test_handler_tokenless_fresh_path_forces_old_client_history_repair() -> None:
     """A pre-handoff browser repairs in place without a reconnect loop."""
     ui = _make_ui()

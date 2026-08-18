@@ -32,6 +32,7 @@ from turnstone.core.session import (
     _CancelledToolResult,
     _CancelRef,
     _StreamTurnConsumer,
+    _TaskExecutionJournal,
     _tool_turn_meta,
 )
 from turnstone.core.session_manager import SessionManager
@@ -1556,12 +1557,13 @@ class TestTaskAgentStreamAbort:
             generation = kwargs["origin_generation"]
             if generation == old_generation:
                 session._current_read_files.add("old-generation.txt")
-                agent_turns.append(
-                    Turn.assistant(
-                        "",
-                        tool_calls=(ToolCall(id="old-action", name="bash", arguments="{}"),),
-                    )
+                issued = Turn.assistant(
+                    "",
+                    tool_calls=(ToolCall(id="old-action", name="bash", arguments="{}"),),
                 )
+                agent_turns.append(issued)
+                kwargs["execution_journal"].record_assistant(issued)
+                kwargs["execution_journal"].mark_started("old-action")
                 old_running.set()
                 if not release_old.wait(2):
                     raise RuntimeError("old task wrapper was not released")
@@ -1661,12 +1663,14 @@ class TestTaskAgentStreamAbort:
 
             with owners_lock:
                 owners[key] = _active_shell_owner.get()
-            agent_turns.append(
-                Turn.assistant(
-                    "",
-                    tool_calls=(ToolCall(id=child_id, name="bash", arguments="{}"),),
-                )
+            issued = Turn.assistant(
+                "",
+                tool_calls=(ToolCall(id=child_id, name="bash", arguments="{}"),),
             )
+            agent_turns.append(issued)
+            kwargs["execution_journal"].record_assistant(issued)
+            kwargs["execution_journal"].mark_started(child_id)
+            kwargs["execution_journal"].register_child(child_id)
             session._note_agent_child(child_id, parent_call_id)
             ready.set()
             if not release.wait(2):
@@ -1674,6 +1678,12 @@ class TestTaskAgentStreamAbort:
             if key == "old":
                 raise GenerationCancelled()
             agent_turns.append(Turn.tool(child_id, "done"))
+            kwargs["execution_journal"].record_result(
+                child_id,
+                "done",
+                is_error=False,
+                effect_status=None,
+            )
             return "fresh result"
 
         def record_reap(*, owner):
@@ -2103,7 +2113,7 @@ class TestTaskAgentStreamAbort:
         generation_event = session._cancel_event
         parent_call_id = "task-with-unknown-child"
         issued_child_ids: list[str] = []
-        stashed_turns: list[Turn] = []
+        stashed_steps: list[dict[str, object]] = []
         outcomes: list[object] = []
         second_request = _BlockingAgentStream()
 
@@ -2159,8 +2169,8 @@ class TestTaskAgentStreamAbort:
             patch.object(session, "_prepare_tool", side_effect=prepare_child),
             patch.object(
                 session,
-                "_stash_agent_trajectory",
-                side_effect=lambda _call_id, turns: stashed_turns.extend(turns),
+                "_stash_agent_steps",
+                side_effect=lambda _call_id, steps: stashed_steps.extend(steps),
             ),
         ):
             thread = self._start_task(session, item, outcomes)
@@ -2182,10 +2192,10 @@ class TestTaskAgentStreamAbort:
         assert "Results received with UNKNOWN effects before cancel: read_file." in disposition
         assert "Completed before cancel: read_file." not in disposition
 
-        child_turns = [turn for turn in stashed_turns if turn.role is Role.TOOL]
-        assert len(child_turns) == 1
-        assert child_turns[0].tool_call_id == issued_child_ids[0]
-        assert child_turns[0].effect_status is EffectStatus.UNKNOWN
+        assert len(stashed_steps) == 1
+        assert stashed_steps[0]["id"] == issued_child_ids[0]
+        assert stashed_steps[0]["is_error"] is True
+        assert "Outcome UNKNOWN" in str(stashed_steps[0]["output"])
         assert issued_child_ids[0] not in session._tool_status
         assert session._cancelled_tool_results[parent_call_id] == _CancelledToolResult(
             detail=disposition,
@@ -4787,32 +4797,35 @@ class TestCancelledAgentDisposition:
     def _result(call_id, text="ok"):
         return Turn.tool(call_id, text)
 
+    @staticmethod
+    def _journal(turns, *started_ids):
+        journal = _TaskExecutionJournal(turns)
+        for call_id in started_ids:
+            journal.mark_started(call_id)
+        journal.materialize_unstarted(turns)
+        return journal
+
     def test_status_none_when_no_actions(self):
         """Typed twin of the disposition: a task cancelled before any action is
         NONE, not UNKNOWN — the complement of the in-flight case."""
-        session = _make_session()
-        assert session._cancelled_agent_status([]) is EffectStatus.NONE
+        assert self._journal([]).cancelled_status() is EffectStatus.NONE
 
     def test_status_unknown_when_in_flight(self):
-        session = _make_session()
         msgs = [self._assistant("t1", "bash")]  # issued, no result → in flight
-        assert session._cancelled_agent_status(msgs) is EffectStatus.UNKNOWN
+        assert self._journal(msgs, "t1").cancelled_status() is EffectStatus.UNKNOWN
 
     def test_status_partial_when_all_answered(self):
         """Every issued call returned but the agent was stopped before finishing
         — effects are known (not UNKNOWN) yet the task is incomplete: PARTIAL."""
-        session = _make_session()
         msgs = [self._assistant("t1", "bash"), self._result("t1")]
-        assert session._cancelled_agent_status(msgs) is EffectStatus.PARTIAL
+        assert self._journal(msgs).cancelled_status() is EffectStatus.PARTIAL
 
     def test_no_actions_reports_no_side_effects(self, tmp_db):
-        session = _make_session()
-        out = session._cancelled_agent_disposition([], "task")
+        out = self._journal([]).cancelled_disposition("task")
         assert "no side effects" in out
         assert "UNKNOWN" not in out
 
     def test_marks_in_flight_action_unknown(self, tmp_db):
-        session = _make_session()
         # bash completed; web_fetch was in flight (issued, no result yet) —
         # the first unanswered call is the in-flight boundary.
         msgs = [
@@ -4820,7 +4833,7 @@ class TestCancelledAgentDisposition:
             self._result("t1"),
             self._assistant("t2", "web_fetch"),
         ]
-        out = session._cancelled_agent_disposition(msgs, "task")
+        out = self._journal(msgs, "t2").cancelled_disposition("task")
         assert out != "(task interrupted by user)"
         assert "Completed before cancel: bash." in out
         assert "In flight at cancel: web_fetch" in out
@@ -4829,9 +4842,8 @@ class TestCancelledAgentDisposition:
     def test_unanswered_tool_is_in_flight_unknown(self, tmp_db):
         # An output-flowing bash SIGKILL'd mid-stream raises (no result row) —
         # it is the in-flight boundary and must read UNKNOWN, never completed.
-        session = _make_session()
         msgs = [self._assistant("t1", "bash")]  # issued, no result
-        out = session._cancelled_agent_disposition(msgs, "task")
+        out = self._journal(msgs, "t1").cancelled_disposition("task")
         assert "In flight at cancel: bash" in out
         assert "UNKNOWN" in out
         assert "Completed before cancel" not in out
@@ -4840,9 +4852,8 @@ class TestCancelledAgentDisposition:
         # Every issued call returned a result — cancel landed between turns,
         # nothing in flight. Each result carries its own disposition; the
         # summary just lists what completed, with no UNKNOWN boundary.
-        session = _make_session()
         msgs = [self._assistant("t1", "bash"), self._result("t1", "(killed)")]
-        out = session._cancelled_agent_disposition(msgs, "task")
+        out = self._journal(msgs).cancelled_disposition("task")
         assert "Completed before cancel: bash." in out
         assert "In flight at cancel" not in out
 
@@ -4850,11 +4861,11 @@ class TestCancelledAgentDisposition:
         # Regression (bug-1): a turn issues [bash, web_fetch] executed
         # sequentially; cancel hits during bash (unanswered, side effects
         # possible) and web_fetch never runs. The in-flight UNKNOWN must be
-        # bash (the FIRST gap), and web_fetch must read "not started" — NOT
+        # bash, and the journal's executor witness must record web_fetch as
+        # confirmed no-effect — NOT
         # the inverse. The old code took the LAST issued call, labelling the
         # never-run web_fetch UNKNOWN and the actually-in-flight bash "not
         # started" — inviting a re-run of the destructive bash.
-        session = _make_session()
         msgs = [
             Turn.assistant(
                 "",
@@ -4864,16 +4875,15 @@ class TestCancelledAgentDisposition:
                 ),
             )
         ]  # neither answered: bash raised mid-flight, web_fetch never ran
-        out = session._cancelled_agent_disposition(msgs, "task")
+        out = self._journal(msgs, "t1").cancelled_disposition("task")
         assert "In flight at cancel: bash" in out
         assert "In flight at cancel: web_fetch" not in out
-        assert "Not started (cancelled first): web_fetch." in out
+        assert "Confirmed no effect before cancel: web_fetch." in out
 
-    def test_counts_and_not_started(self, tmp_db):
+    def test_counts_and_confirmed_unstarted(self, tmp_db):
         # Turn 1 completes [bash, bash, read_file]; turn 2 issues
         # [web_fetch (in flight), search (never ran)]. Exercises the ×N
         # count summary, the first-gap boundary, and not-started.
-        session = _make_session()
         msgs = [
             Turn.assistant(
                 "",
@@ -4894,20 +4904,32 @@ class TestCancelledAgentDisposition:
                 ),
             ),
         ]
-        out = session._cancelled_agent_disposition(msgs, "task")
+        out = self._journal(msgs, "t4").cancelled_disposition("task")
         assert "Completed before cancel: bash×2, read_file." in out
         assert "In flight at cancel: web_fetch" in out
-        assert "Not started (cancelled first): search." in out
+        assert "Confirmed no effect before cancel: search." in out
 
     def test_exec_task_routes_cancel_to_disposition(self, tmp_db):
         """_exec_task converts a GenerationCancelled from _run_agent into the
-        honest disposition, reading the in-place-mutated agent_turns."""
+        honest disposition from the production execution journal."""
         session = _make_session()
 
         def fake_run_agent(agent_turns, **kwargs):
-            agent_turns.append(self._assistant("t1", "bash"))
-            agent_turns.append(self._result("t1"))
-            agent_turns.append(self._assistant("t2", "web_fetch"))
+            journal = kwargs["execution_journal"]
+            first = self._assistant("t1", "bash")
+            first_result = self._result("t1")
+            second = self._assistant("t2", "web_fetch")
+            agent_turns.extend((first, first_result, second))
+            journal.record_assistant(first)
+            journal.mark_started("t1")
+            journal.record_result(
+                "t1",
+                first_result.text,
+                is_error=first_result.is_error,
+                effect_status=first_result.effect_status,
+            )
+            journal.record_assistant(second)
+            journal.mark_started("t2")
             raise GenerationCancelled()
 
         with patch.object(session, "_run_agent", side_effect=fake_run_agent):
@@ -4945,10 +4967,14 @@ class TestCancelledAgentDisposition:
         session = _make_session(ui=ui)
         generation = session._claim_generation()
         issued_child = self._assistant("child-1", "bash")
-        expected_disposition = session._cancelled_agent_disposition([issued_child], "task")
+        expected_journal = self._journal([issued_child], "child-1")
+        expected_disposition = expected_journal.cancelled_disposition("task")
 
         def fake_run_agent(agent_turns, **kwargs):
             agent_turns.append(issued_child)
+            journal = kwargs["execution_journal"]
+            journal.record_assistant(issued_child)
+            journal.mark_started("child-1")
             raise GenerationCancelled()
 
         prepared = {
