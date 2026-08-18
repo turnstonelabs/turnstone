@@ -142,6 +142,7 @@ SSE events are deserialized into typed dataclasses. Use `event.type` to discrimi
 | `state_change` | `StateChangeEvent` | `state` ∈ `running`/`thinking`/`attention`/`idle`/`error` |
 | `in_progress_snapshot` | `InProgressSnapshotEvent` | `content`, `reasoning` (one-shot mid-stream refresh resume) |
 | `agent_context` | `AgentContextEvent` | `parent_call_id`, `prompt_tokens`, `context_window` (replace the latest reading for a running task agent; discard it on the matching `tool_result`) |
+| `compaction` | `CompactionEvent` | `target`, `parent_call_id`, `compaction_id`, `phase`, `ok`, `notice`; events without `target` are workstream events, while `task_agent` is transient nested progress and omits its private `summary` |
 | `approval_resolved` | `ApprovalResolvedEvent` | `cycle_id`, `call_ids`, `approved`, `feedback`, `always` |
 | `cancelled` | `CancelledEvent` | — |
 | `history_resync` | `HistoryResyncEvent` | `reason`, optional `ws_id` |

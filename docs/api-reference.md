@@ -624,44 +624,64 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 {"type": "info", "message": "Session cleared."}
 ```
 
-**`compaction`** -- context-compaction lifecycle (manual `/compact` and
-auto-compaction). `phase: "start"` opens the operation (`trigger` is
-`"manual"` or `"auto"`; auto adds `where` — e.g. `"mid-turn"` — and, when
-the percentage threshold actually fired, `pct`; the context-overflow retry
-path compacts without a `pct` since no threshold was evaluated).
+**`compaction`** -- context-compaction lifecycle. `target` is
+`"workstream"` for manual `/compact` and foreground auto-compaction, or
+`"task_agent"` for a delegated agent's transient model context. Task-agent
+events also carry `parent_call_id`, which keys the existing task card. A
+missing `target` means `"workstream"`. `phase: "start"` opens the operation
+(`trigger` is `"manual"` or `"auto"`; auto adds `where` — e.g. `"mid-turn"`
+— and, when the percentage threshold actually fired, `pct`; the
+context-overflow retry path compacts without a `pct` since no threshold was
+evaluated).
 `phase: "progress"` reports chunked summarization (`part`/`total`/`depth`,
 where depth 0 summarizes transcript batches and deeper levels merge partial
 summaries), a transient-error retry wait (`retry_in` seconds + `error`), or
 `warning: "summary_truncated"`. `phase: "end"` settles it: `ok: true`
-carries `before_tokens`/`after_tokens` and the produced `summary`;
+carries `before_tokens`/`after_tokens`; workstream ends also carry the produced
+`summary`, while task-agent ends deliberately omit it because that summary is
+private transient model context;
 `ok: false` carries a `reason`
 (`"not_enough_messages"` / `"irreducible"` / `"empty_summary"` /
-`"cancelled"` / `"error"`) and a human-readable `message` — for
-`reason: "error"` the same message is also emitted as a paired typed
-`error` event (that is the renderable error surface; the end event is
-card-teardown). Failed ends also carry `notice`: the emitter-computed
-display verdict — show `message` only when it is `true` (the server
-suppresses error-reason, superseded, and cancelled-auto notices once,
-centrally, so clients don't re-derive that policy). Every end (ok or
-failed) carries `trigger`, and every event carries `compaction_id` — an
-opaque integer correlating the start/progress/end of one compaction run (a
-client that force-stopped one compaction can use it to ignore stragglers
-from the abandoned run). End events also carry `superseded`: `true` marks
+`"cancelled"` / `"error"`) and a human-readable `message`. A workstream
+`reason: "error"` end is paired with a typed `error` event, so its `notice`
+is false and the end only tears down the compaction card. A task-agent error
+has no workstream-level `error` twin: its targeted end carries `notice: true`
+so the message renders inside the parent task card. Failed ends always carry
+the emitter-computed `notice` verdict; clients display `message` only when it
+is true rather than reconstructing policy from `reason`, `trigger`, and
+`superseded`. Superseded failures and automatic cancellation stay silent.
+Every end (ok or failed) carries `trigger`, and every event carries
+`compaction_id` — an
+opaque session-local integer correlating the start/progress/end of one
+compaction attempt. It is independent of the send generation, so concurrent
+task agents and repeated compactions in one turn receive distinct IDs (a client
+that force-stopped one compaction can use it to ignore stragglers from the
+abandoned run). End events also carry `superseded`: `true` marks
 a force-abandoned compaction retiring after a successor generation took
 over (an OK end's result card still stands: the history swap happened).
 Superseded start/progress events are never emitted.
-Exactly one `start` and one `end` are emitted per attempt,
+Exactly one `start` and one `end` are emitted per admitted attempt,
 so clients can key an in-progress affordance (progress bar) on the pair. A
-successful end is also persisted: the summary replays from `/history` as a
+successful **workstream** end is also persisted: the summary replays from
+`/history` as a
 `role: "system"`, `source: "compaction"` entry whose `meta` carries
 `{watermark, before_tokens, after_tokens, trigger}` and whose `event_id`
-matches the end event's id (dedup across repaint + replay).
+matches the end event's id (dedup across repaint + replay). Task-agent
+compaction is nested progress only: fresh/truncated SSE recovery includes its
+latest active lifecycle edge, and the matching parent `tool_result` retires it.
+Its summary is used only as the task's next private model context: it is absent
+from the workstream transcript, persistence, task recall, and every event.
 
 ```json
-{"type": "compaction", "phase": "start", "compaction_id": 7, "trigger": "auto", "where": "mid-turn", "pct": 80}
-{"type": "compaction", "phase": "progress", "compaction_id": 7, "part": 2, "total": 5, "depth": 0}
-{"type": "compaction", "phase": "end", "ok": true, "compaction_id": 7, "trigger": "auto",
+{"type": "compaction", "target": "workstream", "phase": "start", "compaction_id": 7, "trigger": "auto", "where": "mid-turn", "pct": 80}
+{"type": "compaction", "target": "workstream", "phase": "progress", "compaction_id": 7, "part": 2, "total": 5, "depth": 0}
+{"type": "compaction", "target": "workstream", "phase": "end", "ok": true, "compaction_id": 7, "trigger": "auto",
  "before_tokens": 128400, "after_tokens": 9200, "summary": "## Decisions\n..."}
+{"type": "compaction", "target": "task_agent", "parent_call_id": "call_task_abc123",
+ "phase": "start", "compaction_id": 8, "trigger": "auto", "where": "mid-turn", "pct": 80}
+{"type": "compaction", "target": "task_agent", "parent_call_id": "call_task_abc123",
+ "phase": "end", "ok": true, "compaction_id": 8, "trigger": "auto",
+ "before_tokens": 115000, "after_tokens": 18000}
 ```
 
 **`error`** -- an error message.
@@ -789,9 +809,10 @@ either the event-ring delta after its cursor or a synthetic recovery replay.
 The synthetic replay includes `connected`, cached `status`, every pending
 approval cycle, the current `state_change`, an optional
 `in_progress_snapshot` with partial content/reasoning, and the latest
-`agent_context` reading for each running task agent. A matching `tool_result`
-ends that reading. Conversation history stays on the REST `/history` endpoint;
-completed task-agent readings are not retained.
+`agent_context` reading and active targeted `compaction` edge for each running
+task agent. A matching `tool_result` ends both transient states. Conversation
+history stays on the REST `/history` endpoint; completed task-agent readings
+and compactions are not retained.
 
 ---
 

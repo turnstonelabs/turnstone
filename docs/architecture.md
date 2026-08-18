@@ -367,11 +367,12 @@ eviction from discarding that recovery state. Soft close returns 409 and leaves
 the workstream loaded; hard delete remains the explicit discard boundary.
 
 `on_stream_discarded` removes a failed attempt's partial projection before a
-mid-stream retry. `on_system_turn` and `on_compaction` return the assigned SSE
-event ID when the frontend has one; persistence stamps the corresponding row
-with that cursor so reconnect replay and `/history` agree. The `judge_event`
-argument is the intent-judge generation identity used to reject stale verdicts
-from a prior approval round.
+mid-stream retry. `on_system_turn` and workstream-targeted `on_compaction`
+return the assigned SSE event ID when the frontend has one; persistence stamps
+the corresponding row with that cursor so reconnect replay and `/history`
+agree. Task-targeted compaction also receives an SSE ID for stream ordering but
+has no durable row. The `judge_event` argument is the intent-judge generation
+identity used to reject stale verdicts from a prior approval round.
 
 `on_rename` is called by the `/name` command (on success) and after a successful `/resume` (if the resumed session has an alias or title). `WebUI.on_rename` broadcasts a `ws_rename` event on the global SSE channel and updates the in-memory `Workstream.name`; `TerminalUI.on_rename` is a no-op.
 
@@ -755,6 +756,18 @@ then returns the final content as the tool result.
   stops calling tools or hits `finish_reason: "length"`.
 - **Retry**: each API call in the agent loop uses the same retry+backoff logic
   as the main loop's per-lane ladder (`_model_turn_with_retry`).
+- **Context compaction**: the task lane resolves its own context window and
+  applies the same soft warning, hard ceiling, recursive summarizer, and
+  compact-and-retry overflow backstop as the foreground. The immutable
+  system/skill/delegation prefix is reattached verbatim; only the autonomous
+  suffix is summarized. The replaceable model context is separate from a
+  purpose-built execution journal: it keeps the exact unresolved call batch,
+  aggregate effect dispositions across a bounded tool-name set, and the latest
+  100 clipped recall steps with bounded, digest-disambiguated identifiers.
+  Resolved raw provider blocks and large tool payloads can therefore be released
+  after compaction without erasing cancellation evidence. Successful replacement
+  clears that task's file-read set and adds a resume nudge requiring exact files
+  to be read again.
 - **Finish reason handling**: `finish_reason: "length"` stops the agent early
   and returns whatever content was generated. `finish_reason: "content_filter"`
   returns a placeholder.
@@ -1603,8 +1616,10 @@ Every model call streams (#831); retry lives at two stacked layers:
   `model_turn`) use the same pattern: 4 total attempts (1 initial + 3 retries,
   `_MAX_RETRIES = 3`), exponential backoff base 1 second
   (`delay = 1s * 2^attempt`), `ui.on_info()` on retry, exception
-  propagates on final failure. `_compact_messages()` wraps its drained
-  call in the same loop.
+  propagates on final failure. `CompactionEngine.summarize_once()` owns the
+  equivalent cancellable retry ladder for summary calls; its owner-supplied
+  `SummaryRuntime` provides retry classification and backoff while routing
+  progress to the foreground or task-agent lifecycle owner.
 - **`model_turn`'s drain ladder** — inside every single-shot call,
   mid-stream deaths (errors raised while draining, e.g.
   `IncompleteStreamError`) are re-issued up to 2 more times with a
@@ -1635,8 +1650,10 @@ Agent sub-sessions (`_run_agent()`) check `finish_reason` on each
 drained turn and stop the agent early on `"length"` or
 `"content_filter"`.
 
-`_compact_messages()` checks `finish_reason` on the compaction response and
-warns if the summary was truncated.
+`CompactionEngine.summarize_once()` also checks the summary call's
+`finish_reason`; on `"length"` it emits a `summary_truncated` warning through
+the owner's compaction-progress callback for both foreground and task-agent
+compaction.
 
 ### State Emission on Errors
 
@@ -1985,8 +2002,15 @@ summarizing the selected trajectory into a structured summary. Manual
 the send generation that triggered it. Both use the same cancellation,
 publication, and FIFO durability fences as a model turn.
 
-Compaction pins one `ModelLane` for the complete operation. Blocks are packed
-to an estimated window budget; a real provider overflow recursively
+Foreground and task-agent compaction share the lifecycle-agnostic policy,
+provider-calibrated estimator, input packing, retry, and recursive summarizer
+in `turnstone/core/compaction.py`; their lifecycle owners remain separate.
+Foreground owns a durable conversation swap and checkpoint. A task agent owns
+only its private replaceable model context beside the bounded execution journal
+described above.
+
+Each compaction pins one `ModelLane` for the complete operation. Blocks are
+packed to an estimated window budget; a real provider overflow recursively
 subdivides the batch and merges partial summaries rather than silently dropping
 the newest messages. The summary preserves:
 
@@ -2021,11 +2045,15 @@ message loss.
 
 Cancellation or generation supersession before the final commit leaves both
 the live trajectory and checkpoint untouched. Typed `compaction` lifecycle
-events (`start`, `progress`, exactly one `end`) let SSE clients correlate and
-retire one run even when a force-abandoned predecessor finishes after a
-successor generation begins. After a successful swap, `_read_files` is cleared
-so edits require fresh file reads against content no longer present in the
-bounded model context.
+events (`start`, `progress`, exactly one `end`) carry a session-local
+`compaction_id` and a `target`. Workstream events own the durable transcript
+card; task-agent events carry `parent_call_id`, render transiently under that
+task card, and never expose or persist their private summary. The independent
+attempt ID lets clients retire one run even when task agents compact in
+parallel, a generation compacts repeatedly, or a force-abandoned predecessor
+finishes after its successor. After a successful swap, the relevant file-read
+set is cleared so edits require fresh file reads against content no longer
+present in the bounded model context.
 
 ---
 

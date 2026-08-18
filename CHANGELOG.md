@@ -12,6 +12,18 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
+## [Unreleased]
+
+### Added
+
+- **Task-agent compaction.** Long-running agents now receive the same soft
+  warning, hard compaction, recursive overflow recovery, and visible progress
+  as the foreground while retaining bounded execution evidence for cancellation
+  disposition and task recall. The generalized `compaction` lifecycle targets
+  either the workstream or a parent task card; task compaction is transient and
+  never persists the agent's private summary. Python and TypeScript SDKs expose
+  the target fields.
+
 ## [1.8.0]
 
 Turnstone 1.8 focuses on dependable long-running workstreams: one model-call
