@@ -30,6 +30,12 @@ the 1.7 line are not repeated here.
 
 ### Added
 
+- **Trusted private hosts for MCP OAuth discovery.** Operators can allow exact,
+  controlled private-network hostnames or IP addresses through
+  `TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS` and the MCP Servers admin page.
+  Environment entries remain read-only and merge with database-managed entries;
+  the exception preserves HTTPS, same-origin, port, userinfo, and dangerous-address
+  protections.
 - **Immutable memory-index snapshots (#902).** At the first real model call, a
   workstream captures the complete memory metadata visible to its acting user
   and project. That index stays cache-stable for the life of the workstream;

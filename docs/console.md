@@ -521,7 +521,13 @@ The tab has two views toggled via a pill control: **Servers** and
 - **Servers view** -- lists all installed MCP servers with source badges
   (CONFIG, MANUAL, REGISTRY), transport badges, tool/resource/prompt
   counts, per-node connection status, and CRUD actions for DB-managed
-  servers
+  servers. The **Trusted private OAuth hosts** panel manages exact-host
+  exceptions for operator-controlled MCP/OAuth services on private networks.
+  Entries supplied through `TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS` are
+  labeled **environment** and cannot be changed in the UI; manually added
+  entries are stored in the database and can be removed. See
+  [MCP OAuth: Private-network OAuth hosts](mcp-oauth.md#private-network-oauth-hosts)
+  for the security boundary and deployment syntax
 - **Registry view** -- search the official MCP Registry to discover and
   install servers. Results show server name, description, version, source
   type badges (remote/npm/pypi), and Install/Installed/Update buttons.
