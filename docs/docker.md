@@ -281,6 +281,7 @@ interface, or anyone who can reach it can search through your instance.
 | `TURNSTONE_WORKSPACE` | `/workspace` (image env) | Directory named as the user's workspace in the model's tool descriptions; informational only — see [Working directory](#working-directory) |
 | `SKIP_PERMISSIONS` | — | Set to any value to auto-approve all tool calls (dev only) |
 | `MCP_CONFIG` | — | Path to an MCP server config file |
+| `TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS` | — | Comma- or newline-separated exact hostnames/IPs allowed to resolve to private addresses during MCP OAuth discovery. Set on every server and console container. Environment entries are read-only in the MCP Servers UI and merge with database-managed entries. See [MCP OAuth](mcp-oauth.md#private-network-oauth-hosts). |
 | `TURNSTONE_IMAGE_TAG` | `latest` | ghcr.io image tag — production stack |
 
 ## Building

@@ -31,6 +31,7 @@ class SettingDef:
     help: str = ""  # plain-English explanation for non-experts
     reference_url: str = ""  # link to arXiv, docs, or provider reference
     strict_int: bool = False  # reject bool/float/non-canonical strings before int coercion
+    seed_from_env: bool = True  # false when env values must remain live/read-only
 
 
 # Default auto-compaction trigger as a fraction of the context window.  Shared
@@ -486,6 +487,18 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Override the MCP Registry URL for enterprise/private registries. "
             "Leave empty to use the official registry at registry.modelcontextprotocol.io.",
             reference_url="https://registry.modelcontextprotocol.io",
+        ),
+        SettingDef(
+            "mcp.oauth_trusted_private_hosts",
+            "str",
+            "",
+            "Exact private-network hosts trusted for MCP OAuth discovery",
+            "mcp",
+            help="Comma- or newline-separated exact hostnames or IP addresses. This allows "
+            "OAuth discovery for operator-controlled MCP services that resolve to private "
+            "addresses. HTTPS and the remaining SSRF protections still apply. Environment "
+            "entries are merged separately and cannot be edited here.",
+            seed_from_env=False,
         ),
         # -- ratelimit ------------------------------------------------------
         SettingDef(
@@ -1052,6 +1065,11 @@ def validate_value(key: str, raw_value: Any) -> Any:
     # Choices validation
     if defn.choices is not None and typed not in defn.choices:
         raise ValueError(f"{key}: {typed!r} not in {defn.choices}")
+
+    if key == "mcp.oauth_trusted_private_hosts":
+        from turnstone.core.mcp_private_hosts import parse_trusted_private_hosts
+
+        typed = "\n".join(parse_trusted_private_hosts(typed))
 
     return typed
 
