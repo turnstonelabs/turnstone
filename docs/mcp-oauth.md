@@ -52,6 +52,54 @@ Switching `auth_type` away from `oauth_user` / `oauth_obo` **deletes** that serv
 | Scopes | No | Space-separated default scope set requested at the authorize endpoint. Per-tool step-up may union additional scopes from a server's `insufficient_scope` response. |
 | Audience | No | RFC 8707 `resource=` parameter sent on every authorize and token request. Defaults to the MCP server URL when unset. Validate against the `aud` claim in returned JWT tokens. |
 
+### Private-network OAuth hosts
+
+OAuth discovery rejects endpoints that resolve to private addresses by default. This
+prevents an untrusted MCP server or discovery document from turning Turnstone into an
+SSRF proxy to internal services. If an MCP resource server or authorization server is
+deliberately hosted on your private network, add its **exact hostname or IP address** to
+the trusted private-host list.
+
+For automated deployments, set the following environment variable on every
+`turnstone-server` and `turnstone-console` process:
+
+```bash
+TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS=gitlab.internal.example,auth.internal.example
+```
+
+The value is a comma- or newline-separated list. Entries must contain only an exact
+hostname or IP address. URLs, ports, paths, credentials, and wildcards are rejected:
+
+```text
+gitlab.internal.example       # accepted
+192.168.5.120                 # accepted
+https://gitlab.internal       # rejected: URL
+gitlab.internal:443           # rejected: port
+*.internal.example            # rejected: wildcard
+```
+
+Administrators with `admin.mcp` permission can add additional entries under
+**Admin → MCP Servers → Servers → Trusted private OAuth hosts**. User-managed entries
+are stored in the database and propagated to cluster nodes. Environment entries are
+merged first, shown with an **environment** source label, and are read-only in the Web
+UI. If the same host appears in both sources, the environment entry wins. The combined
+list is limited to 100 hosts.
+
+This is a narrow private-address exception, not a general SSRF bypass:
+
+- matching is case-insensitive and exact; there is no suffix or wildcard matching;
+- HTTPS is still required, apart from Turnstone's existing genuine-loopback development
+  exception;
+- discovered endpoints must still satisfy issuer same-origin/trusted-host and port
+  checks;
+- embedded credentials remain forbidden; and
+- link-local, multicast, unspecified, reserved, and metadata-service addresses remain
+  refused even when their hostname is listed.
+
+Only list hosts whose DNS and services are controlled by the deployment operator.
+Removing a user-managed entry takes effect without a restart. Environment entries must
+be changed in the process configuration and the affected processes restarted.
+
 ### Encryption key
 
 ```toml
@@ -168,6 +216,7 @@ Every transition that changes what a stored row *means* deletes the rows outrigh
 | `mcp_consent_required` even after consenting | Token persistence failed, or refresh-token rejected by AS | Check audit log for `mcp_server.oauth.persist_failed` or `mcp_server.oauth.token_revoked`. Re-consent via settings modal. |
 | `mcp_token_undecryptable_key_unknown` | Encryption key rotated without keeping the previous key in the keyring | Add the previous key back to `mcp_token_encryption_keys` until all rows have been re-encrypted, then drop. |
 | `mcp_oauth_url_insecure` | MCP server URL is `http://` (not `https://`) on a non-loopback host | Use `https://`. Per-user bearers must not transit cleartext. |
+| `PRM URL rejected: endpoint URL resolves to non-public address` | The MCP server or OAuth discovery endpoint deliberately resolves to a private address but is not trusted | Add its exact host under **MCP Servers → Trusted private OAuth hosts**, or set `TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS` on every server and console process. Do not add a wildcard or full URL. |
 | Tools fail in scheduled / Discord / Slack runs | OAuth-MCP requires browser-based consent | Users must pre-consent via the web UI. Phase 9 dashboard badge surfaces deferred consents from these runs on next login. |
 | Circuit breaker open repeatedly | Transport-level errors on the MCP server (DNS, TLS, 5xx) | Check the per-server error pill; auth errors do not trip the breaker. |
 | **`oauth_obo`**: every tool call fails, log shows `obo_misconfigured` | Server row has no Audience, or `obo_grant_profile` is unset/unknown | Set the Audience on the server row; set `[oidc] obo_grant_profile` to `entra` or `rfc8693`. |

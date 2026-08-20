@@ -167,6 +167,9 @@ services:
       TURNSTONE_DB_BACKEND: *db-backend
       TURNSTONE_DB_URL: *db-url
       TURNSTONE_CONSOLE_URL: http://console:8090
+      # Exact private-network hosts trusted during MCP OAuth discovery. The
+      # console exposes these as read-only environment entries in the admin UI.
+      TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS: "${TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS:-}"
       # Separate from TURNSTONE_CONSOLE_URL: this is the canonical responder
       # base embedded in ACME directory/order URLs for cross-host enrollment.
       TURNSTONE_ACME_EXTERNAL_URL: "${TURNSTONE_ACME_EXTERNAL_URL:-}"
@@ -308,6 +311,9 @@ services:
       TURNSTONE_SEARXNG_URL: ${TURNSTONE_SEARXNG_URL:-http://searxng:8080}
       MODEL: ${MODEL:-}
       MCP_CONFIG: ${MCP_CONFIG:-}
+      # Must match the console value so OAuth discovery behaves consistently
+      # on every node that handles token refresh or connection work.
+      TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS: "${TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS:-}"
       SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
       TURNSTONE_NODE_ID: node-1
       TURNSTONE_ADVERTISE_URL: http://node-1:8080

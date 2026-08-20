@@ -297,6 +297,27 @@ API tokens are unaffected by this setting.
 
 ---
 
+## MCP OAuth SSRF boundary
+
+MCP protected-resource and authorization-server metadata is untrusted network
+input. Turnstone therefore resolves and classifies every discovery URL before
+fetching it, requires HTTPS outside the genuine-loopback development case,
+checks discovered endpoint origin and port, rejects embedded credentials, and
+refuses link-local/metadata, multicast, unspecified, and reserved addresses.
+
+Private addresses are denied by default. Deployments with an intentionally
+private MCP or authorization server can allow an **exact**, operator-controlled
+hostname or IP through the MCP Servers admin page or
+`TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS`. This opt-in relaxes only the
+private-address classification for the listed host; it does not disable the
+other checks above. Wildcards, URLs, and ports are not accepted. Environment
+entries are read-only in the UI and merge with database-managed entries.
+
+See [MCP OAuth: Private-network OAuth hosts](mcp-oauth.md#private-network-oauth-hosts)
+for configuration, precedence, and examples.
+
+---
+
 ## Token Detection Order
 
 The auth middleware inspects the `Authorization: Bearer <token>` header
