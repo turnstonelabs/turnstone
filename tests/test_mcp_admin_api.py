@@ -33,14 +33,17 @@ from turnstone.console.server import (
     admin_create_mcp_server,
     admin_delete_mcp_server,
     admin_get_mcp_server,
+    admin_get_mcp_trusted_private_hosts,
     admin_import_mcp_config,
     admin_list_mcp_servers,
     admin_mcp_reconnect_one,
     admin_mcp_refresh_one,
     admin_mcp_reload,
     admin_update_mcp_server,
+    admin_update_mcp_trusted_private_hosts,
 )
 from turnstone.core.auth import AuthResult
+from turnstone.core.config_store import ConfigStore
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
@@ -125,6 +128,15 @@ _ROUTES = [
                 "/api/admin/mcp-servers/reload",
                 admin_mcp_reload,
                 methods=["POST"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/trusted-private-hosts",
+                admin_get_mcp_trusted_private_hosts,
+            ),
+            Route(
+                "/api/admin/mcp-servers/trusted-private-hosts",
+                admin_update_mcp_trusted_private_hosts,
+                methods=["PUT"],
             ),
             Route(
                 "/api/admin/mcp-servers/{name}/refresh",
@@ -240,6 +252,7 @@ def client(storage):
         middleware=[Middleware(_InjectAuthMiddleware)],
     )
     app.state.auth_storage = storage
+    app.state.config_store = ConfigStore(storage)
     _install_token_store(app, storage)
     # Default: OIDC enabled under the entra profile so oauth_obo writes pass the
     # requirement gate. Per-test overrides install rfc8693 / disabled / bad
@@ -256,6 +269,7 @@ def client_no_perm(storage):
         middleware=[Middleware(_InjectAuthNoMcpMiddleware)],
     )
     app.state.auth_storage = storage
+    app.state.config_store = ConfigStore(storage)
     _install_token_store(app, storage)
     return TestClient(app)
 
@@ -333,6 +347,69 @@ class TestListMcpServers:
         names = [s["name"] for s in r.json()["servers"]]
         assert "server-a" in names
         assert "server-b" in names
+
+
+class TestTrustedPrivateHosts:
+    endpoint = "/v1/api/admin/mcp-servers/trusted-private-hosts"
+
+    def test_get_merges_environment_and_manual_sources(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS",
+            "gitlab.internal.example",
+        )
+        saved = client.put(self.endpoint, json={"hosts": ["manual.internal.example"]})
+        assert saved.status_code == 200
+
+        response = client.get(self.endpoint)
+        assert response.status_code == 200
+        assert response.json()["hosts"] == [
+            {
+                "host": "gitlab.internal.example",
+                "source": "environment",
+                "readonly": True,
+            },
+            {
+                "host": "manual.internal.example",
+                "source": "manual",
+                "readonly": False,
+            },
+        ]
+
+    def test_put_cannot_replace_or_duplicate_environment_hosts(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS",
+            "gitlab.internal.example",
+        )
+        response = client.put(
+            self.endpoint,
+            json={"hosts": ["gitlab.internal.example", "user.internal.example"]},
+        )
+        assert response.status_code == 200
+        assert response.json()["hosts"] == [
+            {
+                "host": "gitlab.internal.example",
+                "source": "environment",
+                "readonly": True,
+            },
+            {
+                "host": "user.internal.example",
+                "source": "manual",
+                "readonly": False,
+            },
+        ]
+
+    def test_put_rejects_urls_and_wildcards(self, client: TestClient) -> None:
+        for invalid in ("https://gitlab.internal", "*.internal"):
+            response = client.put(self.endpoint, json={"hosts": [invalid]})
+            assert response.status_code == 400
+
+    def test_requires_admin_mcp_permission(self, client_no_perm: TestClient) -> None:
+        assert client_no_perm.get(self.endpoint).status_code == 403
+        assert client_no_perm.put(self.endpoint, json={"hosts": []}).status_code == 403
 
 
 # ---------------------------------------------------------------------------

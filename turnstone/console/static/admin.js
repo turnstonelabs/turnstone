@@ -4696,8 +4696,11 @@ let _mcpCurrentView = "servers";
 let _registryResults = [];
 let _registryCursor = null;
 let _registryQuery = "";
+let _mcpTrustedPrivateHosts = [];
+let _mcpPrivateHostsWired = false;
 
 function loadAdminMcp() {
+  loadMcpTrustedPrivateHosts();
   authFetch("/v1/api/admin/mcp-servers")
     .then(function (r) {
       if (!r.ok) throw new Error("Failed");
@@ -4722,6 +4725,132 @@ function loadAdminMcp() {
         '<div class="dashboard-empty">Failed to load MCP servers</div>',
       );
     });
+}
+
+function loadMcpTrustedPrivateHosts() {
+  _wireMcpPrivateHosts();
+  authFetch("/v1/api/admin/mcp-servers/trusted-private-hosts")
+    .then(function (r) {
+      if (!r.ok) {
+        return r.json().then(function (data) {
+          throw new Error(data.error || "Failed to load trusted private hosts");
+        });
+      }
+      return r.json();
+    })
+    .then(function (data) {
+      _mcpTrustedPrivateHosts = data.hosts || [];
+      _renderMcpTrustedPrivateHosts();
+      _setMcpPrivateHostStatus("");
+    })
+    .catch(function (error) {
+      _setMcpPrivateHostStatus(error.message || "Failed to load trusted private hosts", true);
+    });
+}
+
+function _wireMcpPrivateHosts() {
+  if (_mcpPrivateHostsWired) return;
+  const form = document.getElementById("mcp-private-host-form");
+  const input = document.getElementById("mcp-private-host-input");
+  if (!form || !input) return;
+  _mcpPrivateHostsWired = true;
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    const host = input.value.trim();
+    if (!host) return;
+    const manual = _mcpTrustedPrivateHosts
+      .filter(function (entry) {
+        return entry.source === "manual";
+      })
+      .map(function (entry) {
+        return entry.host;
+      });
+    manual.push(host);
+    _saveMcpTrustedPrivateHosts(manual, function () {
+      input.value = "";
+      input.focus();
+    });
+  });
+}
+
+function _saveMcpTrustedPrivateHosts(manualHosts, onSuccess) {
+  _setMcpPrivateHostStatus("Saving...");
+  authFetch("/v1/api/admin/mcp-servers/trusted-private-hosts", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hosts: manualHosts }),
+  })
+    .then(function (r) {
+      return r.json().then(function (data) {
+        if (!r.ok) throw new Error(data.error || "Failed to save trusted private hosts");
+        return data;
+      });
+    })
+    .then(function (data) {
+      _mcpTrustedPrivateHosts = data.hosts || [];
+      _renderMcpTrustedPrivateHosts();
+      _setMcpPrivateHostStatus("Trusted private hosts saved.");
+      if (onSuccess) onSuccess();
+    })
+    .catch(function (error) {
+      _setMcpPrivateHostStatus(error.message || "Failed to save trusted private hosts", true);
+    });
+}
+
+function _renderMcpTrustedPrivateHosts() {
+  const list = document.getElementById("mcp-private-host-list");
+  if (!list) return;
+  list.replaceChildren();
+  if (!_mcpTrustedPrivateHosts.length) {
+    const empty = document.createElement("span");
+    empty.className = "dashboard-empty";
+    empty.textContent = "No private hosts are trusted.";
+    list.appendChild(empty);
+    return;
+  }
+  _mcpTrustedPrivateHosts.forEach(function (entry) {
+    const row = document.createElement("div");
+    row.className = "mcp-private-host-row";
+    row.setAttribute("role", "listitem");
+
+    const host = document.createElement("code");
+    host.className = "mcp-private-host-name";
+    host.textContent = entry.host;
+    row.appendChild(host);
+
+    const source = document.createElement("span");
+    source.className = "scope-badge " +
+      (entry.source === "environment" ? "mcp-host-source-environment" : "mcp-host-source-manual");
+    source.textContent = entry.source === "environment" ? "environment" : "manual";
+    row.appendChild(source);
+
+    if (!entry.readonly) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "admin-action-btn admin-action-btn-ghost mcp-private-host-remove";
+      remove.textContent = "Remove";
+      remove.setAttribute("aria-label", "Remove trusted private host " + entry.host);
+      remove.addEventListener("click", function () {
+        const remaining = _mcpTrustedPrivateHosts
+          .filter(function (candidate) {
+            return candidate.source === "manual" && candidate.host !== entry.host;
+          })
+          .map(function (candidate) {
+            return candidate.host;
+          });
+        _saveMcpTrustedPrivateHosts(remaining);
+      });
+      row.appendChild(remove);
+    }
+    list.appendChild(row);
+  });
+}
+
+function _setMcpPrivateHostStatus(message, isError) {
+  const status = document.getElementById("mcp-private-host-status");
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("is-error", Boolean(isError));
 }
 
 function _wireMcpTokenDropButtons(el, attr, opts) {

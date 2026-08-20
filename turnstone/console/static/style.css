@@ -3017,6 +3017,95 @@ h3.skill-spec-heading {
 }
 
 /* -- MCP Registry result cards -------------------------------------------- */
+.mcp-private-hosts {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--cyan);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+}
+.mcp-private-hosts h3 {
+  margin: 0 0 5px;
+  color: var(--fg-bright);
+  font-family: var(--font-ui);
+  font-size: 13px;
+}
+.mcp-private-hosts-copy p {
+  max-width: 900px;
+  margin: 0 0 12px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.mcp-private-hosts-copy code,
+.mcp-private-host-name {
+  font-family: var(--font-mono);
+}
+.mcp-private-host-form {
+  display: flex;
+  gap: 8px;
+  max-width: 620px;
+  margin-bottom: 10px;
+}
+.mcp-private-host-form input {
+  flex: 1;
+  min-width: 180px;
+  padding: 7px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.mcp-private-host-form input:focus-visible {
+  border-color: var(--cyan);
+  outline: 2px solid rgba(103, 232, 249, 0.2);
+  outline-offset: 1px;
+}
+.mcp-private-host-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.mcp-private-host-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 5px 6px 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-highlight);
+}
+.mcp-private-host-name {
+  overflow-wrap: anywhere;
+  color: var(--fg-bright);
+  font-size: 11px;
+}
+.mcp-host-source-environment {
+  color: var(--cyan);
+  border-color: rgba(103, 232, 249, 0.25);
+}
+.mcp-host-source-manual {
+  color: var(--magenta);
+  border-color: rgba(192, 132, 252, 0.25);
+}
+.mcp-private-host-remove {
+  padding: 2px 6px;
+  font-size: 9px;
+}
+.mcp-private-host-status {
+  min-height: 16px;
+  margin-top: 6px;
+  color: var(--green);
+  font-size: 10px;
+}
+.mcp-private-host-status.is-error {
+  color: var(--red);
+}
+
 .mcp-reg-card {
   display: grid;
   grid-template-columns: 1fr auto;
