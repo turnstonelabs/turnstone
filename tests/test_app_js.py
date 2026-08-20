@@ -29,6 +29,25 @@ _REDACT_CREDENTIALS_JS = (
 )
 _CONSOLE_APP_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/app.js"
 _CONSOLE_INDEX = Path(__file__).resolve().parent.parent / "turnstone/console/static/index.html"
+_CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/admin.js"
+
+
+def test_mcp_private_hosts_ui_explains_sources_and_uses_safe_dom_rendering() -> None:
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    script = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+
+    assert 'id="mcp-private-host-form"' in html
+    assert 'id="mcp-private-host-list"' in html
+    assert "TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS" in html
+    assert "operator-controlled" in html
+    assert "/v1/api/admin/mcp-servers/trusted-private-hosts" in script
+    assert 'entry.source === "environment"' in script
+    assert "if (!entry.readonly)" in script
+    renderer_start = script.index("function _renderMcpTrustedPrivateHosts()")
+    renderer_end = script.index("function _setMcpPrivateHostStatus", renderer_start)
+    renderer = script[renderer_start:renderer_end]
+    assert ".textContent = entry.host" in renderer
+    assert "innerHTML" not in renderer
 
 
 def _pane_method_offset(body: str, name: str) -> int:
@@ -752,7 +771,6 @@ _KB_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/kb.js
 _COORD_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator/coordinator.js"
 )
-_CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/admin.js"
 _CONSOLE_GOVERNANCE_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/console/static/governance.js"
 )

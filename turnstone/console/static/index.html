@@ -1246,6 +1246,56 @@
                 </span>
               </div>
               <div id="mcp-view-servers" role="tabpanel">
+                <section
+                  class="mcp-private-hosts"
+                  aria-labelledby="mcp-private-hosts-title"
+                >
+                  <div class="mcp-private-hosts-copy">
+                    <h3 id="mcp-private-hosts-title">
+                      Trusted private OAuth hosts
+                    </h3>
+                    <p id="mcp-private-hosts-help">
+                      Allow OAuth discovery for operator-controlled MCP services
+                      that resolve to private network addresses. Add only exact
+                      hostnames or IP addresses you control. HTTPS, same-origin,
+                      port, userinfo, and dangerous-address protections remain
+                      enabled. Entries loaded from
+                      <code>TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS</code> are
+                      read-only.
+                    </p>
+                  </div>
+                  <form
+                    id="mcp-private-host-form"
+                    class="mcp-private-host-form"
+                    aria-describedby="mcp-private-hosts-help"
+                  >
+                    <label class="sr-only" for="mcp-private-host-input"
+                      >Exact private hostname or IP address</label
+                    >
+                    <input
+                      id="mcp-private-host-input"
+                      type="text"
+                      autocomplete="off"
+                      spellcheck="false"
+                      placeholder="gitlab.internal.example"
+                    />
+                    <button class="admin-action-btn" type="submit">Add host</button>
+                  </form>
+                  <div
+                    id="mcp-private-host-list"
+                    class="mcp-private-host-list"
+                    role="list"
+                    aria-live="polite"
+                  >
+                    <span class="dashboard-empty">Loading trusted hosts...</span>
+                  </div>
+                  <div
+                    id="mcp-private-host-status"
+                    class="mcp-private-host-status"
+                    role="status"
+                    aria-live="polite"
+                  ></div>
+                </section>
                 <div class="admin-colheaders mcp-grid" aria-hidden="true">
                   <span class="admin-col admin-col-mname">NAME</span>
                   <span class="admin-col admin-col-mtransport">TRANSPORT</span>

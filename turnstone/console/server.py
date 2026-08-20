@@ -10954,6 +10954,94 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
     return JSONResponse({"servers": result})
 
 
+def _trusted_private_hosts_response(config_store: Any) -> dict[str, Any]:
+    from turnstone.core.mcp_private_hosts import (
+        MCP_TRUSTED_PRIVATE_HOSTS_ENV,
+        configured_trusted_private_hosts,
+    )
+
+    return {
+        "hosts": configured_trusted_private_hosts(config_store),
+        "environment_variable": MCP_TRUSTED_PRIVATE_HOSTS_ENV,
+        "help": (
+            "Add only exact hostnames or IP addresses for operator-controlled MCP OAuth "
+            "services that deliberately resolve to a private network. This exception "
+            "allows private addresses for those hosts only; HTTPS, same-origin, port, "
+            "userinfo, and dangerous-address protections remain enabled."
+        ),
+    }
+
+
+async def admin_get_mcp_trusted_private_hosts(request: Request) -> JSONResponse:
+    """GET the merged environment and user-managed private OAuth hosts."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store is None:
+        return JSONResponse({"error": "Configuration store unavailable"}, status_code=503)
+    try:
+        return JSONResponse(_trusted_private_hosts_response(config_store))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def admin_update_mcp_trusted_private_hosts(request: Request) -> JSONResponse:
+    """PUT user-managed private OAuth hosts without mutating environment entries."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.mcp_private_hosts import (
+        MAX_TRUSTED_PRIVATE_HOSTS,
+        MCP_TRUSTED_PRIVATE_HOSTS_ENV,
+        MCP_TRUSTED_PRIVATE_HOSTS_SETTING,
+        merge_trusted_private_hosts,
+        normalize_trusted_private_host,
+        parse_trusted_private_hosts,
+    )
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store is None:
+        return JSONResponse({"error": "Configuration store unavailable"}, status_code=503)
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    raw_hosts = body.get("hosts")
+    if not isinstance(raw_hosts, list) or any(not isinstance(host, str) for host in raw_hosts):
+        return JSONResponse({"error": "hosts must be a list of strings"}, status_code=400)
+    if len(raw_hosts) > MAX_TRUSTED_PRIVATE_HOSTS:
+        return JSONResponse(
+            {"error": f"at most {MAX_TRUSTED_PRIVATE_HOSTS} hosts are allowed"},
+            status_code=400,
+        )
+    try:
+        environment_hosts = set(
+            parse_trusted_private_hosts(os.environ.get(MCP_TRUSTED_PRIVATE_HOSTS_ENV))
+        )
+        manual_hosts = list(dict.fromkeys(normalize_trusted_private_host(h) for h in raw_hosts))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    manual_hosts = [host for host in manual_hosts if host not in environment_hosts]
+    try:
+        merge_trusted_private_hosts(
+            environment_value=os.environ.get(MCP_TRUSTED_PRIVATE_HOSTS_ENV),
+            manual_value="\n".join(manual_hosts),
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    config_store.set(
+        MCP_TRUSTED_PRIVATE_HOSTS_SETTING,
+        "\n".join(manual_hosts),
+        changed_by=_auth_user_id(request),
+    )
+    await _publish_config_change(request)
+    return JSONResponse(_trusted_private_hosts_response(config_store))
+
+
 async def admin_create_mcp_server(request: Request) -> JSONResponse:
     """POST /v1/api/admin/mcp-servers — create an MCP server definition."""
     import uuid
@@ -15835,7 +15923,9 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
     """
     from turnstone.core.settings_registry import SETTINGS
 
-    for key in SETTINGS:
+    for key, defn in SETTINGS.items():
+        if not defn.seed_from_env:
+            continue
         env_name = "TURNSTONE_" + key.replace(".", "_").upper()
         env_val = os.environ.get(env_name)
         if env_val is None:
@@ -16425,6 +16515,15 @@ def create_app(
                         "/api/admin/mcp-servers/reload",
                         admin_mcp_reload,
                         methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/trusted-private-hosts",
+                        admin_get_mcp_trusted_private_hosts,
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/trusted-private-hosts",
+                        admin_update_mcp_trusted_private_hosts,
+                        methods=["PUT"],
                     ),
                     Route(
                         "/api/admin/mcp-servers/{name}/refresh",
