@@ -87,6 +87,7 @@ def test_interactive_stale_backstop_waits_for_replay_tail_runtime(
 
     script = """
 function resetCompactionHolder() {}
+function setReasoningActivity() {}
 function streamingRender(body, text) { body.textContent = text; }
 function streamingRenderFinalize(body, text) { body.textContent = text; }
 """
@@ -452,6 +453,13 @@ function makeRow(callId) {
   return { batch, row };
 }
 function _tryMcpErrorBlock() { return null; }
+function clearConvVerdictPending() { return false; }
+function setToolOutputReviewState(row, output) {
+  const incomplete = String(output || "").includes("Output review did not complete");
+  if (incomplete) row.dataset.outputReviewIncomplete = "true";
+  else delete row.dataset.outputReviewIncomplete;
+  return incomplete;
+}
 function buildConvResult(output, opts) {
   const node = makeNode("output");
   node.output = output;
@@ -512,6 +520,12 @@ function _appendJudgePendingLineTo() {}
 function _announceAssertive() {}
 function _announcePolite() {}
 function _toolAnnounceText() { return "tool"; }
+function setConvBatchExpanded() { return false; }
+function markConvRowResultSettled() {
+  return { becameSettled: false, autoFolded: false };
+}
+function getTranscriptPresentation() { return "default"; }
+function convBatchSummaryText() { return "tool batch"; }
 
 const toolRows = new Map();
 const latestToolRowElements = new Map();
@@ -801,8 +815,22 @@ function buildToolDiv(item) {
 }
 function indexLabel() { return ""; }
 function buildConvVerdict() { return makeNode("verdict"); }
+function clearConvVerdictPending() { return false; }
+function setToolOutputReviewState(row, output) {
+  const incomplete = String(output || "").includes("Output review did not complete");
+  if (incomplete) row.dataset.outputReviewIncomplete = "true";
+  else delete row.dataset.outputReviewIncomplete;
+  return incomplete;
+}
 function toolAnnounce() {}
 function _toolAnnounceText() { return "tool"; }
+function setConvBatchExpanded() { return false; }
+function markConvRowResultSettled() {
+  return { becameSettled: false, autoFolded: false };
+}
+function getTranscriptPresentation() { return "default"; }
+function canAutoFoldTranscriptBatch() { return false; }
+function convBatchSummaryText() { return "tool batch"; }
 
 const handleEvent = %(handle)s;
 const appendToolOutput = %(append)s;
@@ -831,8 +859,9 @@ const pane = {
       indexLatestToolRow(latestRows, this._toolResultNodes, row.dataset.callId, row);
     });
   },
-  _relinkAgentCards() {},
-  _streamEl() { return null; },
+      _relinkAgentCards() {},
+      _markAgentStepExceptional() { return false; },
+      _streamEl() { return null; },
   isNearBottom() { return false; },
   scrollToBottom() {},
   appendToolOutput,

@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 from tests._js_harness_helpers import node_skip
+from tests.test_transcript_presentation_js import _FAKE_DOM
 
 _CONVERSATION_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
@@ -30,7 +31,20 @@ def test_exports_the_shared_helpers() -> None:
     """The three helpers both panes import must be exported — drop one and the
     importing pane module fails to load entirely."""
     body = _body()
-    for name in ("stripAnsi", "buildWatchResultCard", "buildSystemNudgeMarker"):
+    for name in (
+        "stripAnsi",
+        "buildWatchResultCard",
+        "buildSystemNudgeMarker",
+        "buildConvBatchDisclosure",
+        "clearConvVerdictPending",
+        "convBatchSummaryText",
+        "isConvBatchCompactEligible",
+        "isConvVerdictCompactBlocker",
+        "markConvRowResultSettled",
+        "setReasoningActivity",
+        "setConvBatchExpanded",
+        "setToolOutputReviewState",
+    ):
         assert f"export function {name}" in body, f"{name} must be exported"
 
 
@@ -78,7 +92,342 @@ def test_agent_card_exposes_hidden_context_badge() -> None:
     assert 'context.className = "conv-agent-context";' in body
     assert "context.hidden = true;" in body
     assert 'context.setAttribute("aria-hidden", "true");' in body
-    assert "return { wrap, body, label, context, toggle };" in body
+    assert 'issue.className = "conv-agent-step-issue";' in body
+    assert "issue.hidden = true;" in body
+    assert "return { wrap, body, label, context, issue, toggle };" in body
+
+
+@node_skip
+def test_compact_batch_settlement_disclosure_and_fail_open_behavior() -> None:
+    script = (
+        _FAKE_DOM
+        + f"""
+const conv = await import({json.dumps(_CONVERSATION_JS.as_uri())});
+const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};
+
+for (const [verdict, expected] of [
+  [{{ risk_level: "low", recommendation: "approve" }}, false],
+  [{{ risk_level: "medium", recommendation: "approve" }}, false],
+  [{{ risk_level: "high", recommendation: "approve" }}, true],
+  [{{ risk_level: "critical", recommendation: "approve" }}, true],
+  [{{ risk_level: "low", recommendation: "deny" }}, true],
+  [{{ risk_level: "low", recommendation: "review" }}, true],
+  [{{ risk_level: "low", recommendation: "future-value" }}, true],
+  [{{ risk_level: "low" }}, true],
+]) {{
+  assert(
+    conv.isConvVerdictCompactBlocker(verdict) === expected,
+    "verdict blocker classification drifted",
+  );
+}}
+
+const reasoning = new FakeElement("div");
+reasoning.setAttribute("role", "article");
+reasoning.setAttribute("aria-label", "reasoning");
+const reasoningTrace = new FakeElement("div");
+reasoningTrace.className = "msg-body";
+reasoningTrace.setAttribute("aria-hidden", "false");
+reasoning.appendChild(reasoningTrace);
+assert(conv.setReasoningActivity(reasoning, true), "reasoning did not activate");
+assert(reasoning.dataset.reasoningActive === "true", "activity marker missing");
+assert(reasoning.getAttribute("role") === "article", "row role was replaced");
+assert(
+  reasoning.getAttribute("aria-label") === "reasoning",
+  "row label was replaced",
+);
+assert(reasoning.getAttribute("aria-live") === null, "row became a live region");
+assert(reasoningTrace.getAttribute("aria-hidden") === "true", "streamed trace stayed exposed");
+const reasoningStatus = reasoning.querySelector(".reasoning-activity-status");
+assert(reasoningStatus, "dedicated activity status missing");
+assert(reasoningStatus.parentNode === reasoning, "activity status is not a trace sibling");
+assert(reasoningStatus.getAttribute("role") === "status", "activity role missing");
+assert(reasoningStatus.getAttribute("aria-live") === "polite", "activity live mode missing");
+assert(reasoningStatus.getAttribute("aria-atomic") === "true", "activity status is not atomic");
+assert(
+  reasoningStatus.getAttribute("aria-label") === "Model reasoning in progress",
+  "activity label missing",
+);
+const stableStatusText = reasoningStatus.textContent;
+reasoningTrace.textContent += "first token";
+reasoningTrace.textContent += " second token";
+assert(reasoningStatus.textContent === stableStatusText, "token stream mutated live status");
+assert(!conv.setReasoningActivity(reasoning, true), "duplicate activation transitioned");
+assert(conv.setReasoningActivity(reasoning, false), "reasoning did not settle");
+assert(!Object.hasOwn(reasoning.dataset, "reasoningActive"), "activity marker survived");
+assert(reasoningTrace.getAttribute("aria-hidden") === "false", "trace visibility was not restored");
+assert(!reasoning.querySelector(".reasoning-activity-status"), "activity status survived");
+
+function batchWithRows(count, state = "conv-batch--approved") {{
+  const batch = conv.buildConvBatchShell({{
+    parallel: count > 1,
+    kickerText: "Tool",
+    summaryText: count > 1 ? "bash + " + (count - 1) + " more" : "bash",
+  }});
+  batch.classList.add(state);
+  const rows = [];
+  for (let i = 0; i < count; i += 1) {{
+    const row = new FakeElement("div");
+    row.className = "conv-row";
+    batch.appendChild(row);
+    rows.push(row);
+  }}
+  html.appendChild(batch);
+  return {{ batch, rows, disclosure: batch.querySelector(".conv-batch-disclosure") }};
+}}
+
+let item = batchWithRows(2);
+let first = conv.markConvRowResultSettled(item.rows[0]);
+assert(!first.becameSettled, "partial batch settled early");
+assert(!Object.hasOwn(item.batch.dataset, "resultsSettled"), "partial marker leaked");
+let final = conv.markConvRowResultSettled(item.rows[1]);
+assert(final.becameSettled && final.autoFolded, "routine batch did not auto-fold");
+assert(item.batch.dataset.compactFolded === "true", "explicit fold marker missing");
+assert(item.disclosure.getAttribute("aria-expanded") === "false", "fold ARIA drifted");
+assert(item.disclosure.textContent === "Completed · Show details", "fold label drifted");
+const duplicate = conv.markConvRowResultSettled(item.rows[1]);
+assert(!duplicate.becameSettled && !duplicate.autoFolded, "duplicate result transitioned");
+item.disclosure.click();
+assert(!Object.hasOwn(item.batch.dataset, "compactFolded"), "manual expand failed");
+assert(item.disclosure.getAttribute("aria-expanded") === "true", "expand ARIA drifted");
+item.disclosure.click();
+assert(item.batch.dataset.compactFolded === "true", "manual re-fold failed");
+
+const addedA = new FakeElement("div");
+addedA.className = "conv-row";
+const addedB = new FakeElement("div");
+addedB.className = "conv-row";
+item.batch.append(addedA, addedB);
+conv.markConvRowResultSettled(addedA);
+assert(!Object.hasOwn(item.batch.dataset, "resultsSettled"), "unresolved upgrade stayed settled");
+assert(!Object.hasOwn(item.batch.dataset, "compactFolded"), "unresolved upgrade stayed folded");
+
+const emptyBatch = conv.buildConvBatchShell({{ kickerText: "Tool" }});
+emptyBatch.classList.add("conv-batch--approved");
+emptyBatch.dataset.resultsSettled = "true";
+assert(!conv.isConvBatchCompactEligible(emptyBatch), "zero-row batch became eligible");
+
+item = batchWithRows(1);
+const agent = new FakeElement("div");
+agent.className = "conv-agent";
+const nestedRow = new FakeElement("div");
+nestedRow.className = "conv-row";
+agent.appendChild(nestedRow);
+item.rows[0].appendChild(agent);
+const nested = conv.markConvRowResultSettled(nestedRow);
+assert(!nested.becameSettled, "nested row settled the parent batch");
+assert(!Object.hasOwn(nestedRow.dataset, "resultSettled"), "nested row was stamped");
+final = conv.markConvRowResultSettled(item.rows[0]);
+assert(final.becameSettled, "nested row blocked direct-row settlement");
+assert(final.autoFolded, "routine nested agent did not fold");
+
+const stampedTaskRow = conv.buildConvRow({{ func_name: "task_agent" }});
+assert(stampedTaskRow.dataset.toolName === "task_agent", "task agent identity was not stamped");
+for (const recallRetained of [false, true]) {{
+  item = batchWithRows(1);
+  item.rows[0].dataset.toolName = "task_agent";
+  if (recallRetained) {{
+    const recalledAgent = new FakeElement("div");
+    recalledAgent.className = "conv-agent";
+    recalledAgent.dataset.state = "done";
+    item.rows[0].appendChild(recalledAgent);
+  }}
+  final = conv.markConvRowResultSettled(item.rows[0]);
+  const scenario = recallRetained ? "retained" : "unknown";
+  assert(final.becameSettled && !final.autoFolded, scenario + " task agent folded");
+  assert(!conv.isConvBatchCompactEligible(item.batch), scenario + " task agent was eligible");
+}}
+
+item = batchWithRows(1);
+const exceptionalAgent = new FakeElement("div");
+exceptionalAgent.className = "conv-agent";
+exceptionalAgent.dataset.state = "done";
+exceptionalAgent.dataset.agentStepExceptional = "true";
+item.rows[0].appendChild(exceptionalAgent);
+final = conv.markConvRowResultSettled(item.rows[0]);
+assert(final.becameSettled && !final.autoFolded, "exceptional child agent folded");
+assert(!conv.isConvBatchCompactEligible(item.batch), "exceptional child agent was eligible");
+
+for (const effect of ["none", "unknown", "partial", "rolled_back", "future-value"]) {{
+  item = batchWithRows(1);
+  item.rows[0].dataset.effectStatus = effect;
+  final = conv.markConvRowResultSettled(item.rows[0]);
+  assert(final.becameSettled && !final.autoFolded, effect + " effect folded");
+  assert(!conv.isConvBatchCompactEligible(item.batch), effect + " effect eligible");
+}}
+for (const effect of [null, "committed"]) {{
+  item = batchWithRows(1);
+  if (effect) item.rows[0].dataset.effectStatus = effect;
+  final = conv.markConvRowResultSettled(item.rows[0]);
+  assert(final.autoFolded, String(effect) + " routine effect did not fold");
+}}
+
+item = batchWithRows(1);
+item.rows[0].dataset.effectStatus = "committed";
+assert(
+  conv.setToolOutputReviewState(
+    item.rows[0],
+    "Tool result was observed before cancellation. Effect status: committed. " +
+      "Output review did not complete, so result content was omitted.",
+  ),
+  "unreviewed cancellation receipt was not classified",
+);
+final = conv.markConvRowResultSettled(item.rows[0]);
+assert(final.becameSettled && !final.autoFolded, "unreviewed receipt folded");
+assert(!conv.isConvBatchCompactEligible(item.batch), "unreviewed receipt was eligible");
+assert(
+  !conv.setToolOutputReviewState(item.rows[0], "ordinary accepted output"),
+  "ordinary output was classified as unreviewed",
+);
+assert(
+  !Object.hasOwn(item.rows[0].dataset, "outputReviewIncomplete"),
+  "replacement output retained stale review state",
+);
+
+for (const state of [
+  "conv-batch--pending",
+  "conv-batch--running",
+  "conv-batch--denied",
+  "conv-batch--error",
+]) {{
+  item = batchWithRows(1);
+  item.batch.classList.add(state);
+  final = conv.markConvRowResultSettled(item.rows[0]);
+  assert(!final.autoFolded, state + " batch folded");
+}}
+
+for (const blocker of [
+  {{ className: "conv-actions" }},
+  {{ className: "conv-warning" }},
+  {{ className: "conv-row error" }},
+  {{ className: "conv-row-result--error" }},
+  {{ className: "conv-row-status--error" }},
+  {{ className: "conv-status--error" }},
+  {{ className: "conv-batch--pending" }},
+  {{ className: "conv-batch--running" }},
+  {{ className: "conv-agent", state: "running" }},
+  {{ className: "conv-agent", agentExceptional: true }},
+  {{ className: "compaction-running" }},
+  {{ className: "conv-agent-compaction-notice" }},
+  {{ className: "conv-verdict--high" }},
+  {{ className: "conv-verdict--critical" }},
+  {{ className: "conv-verdict-rec--deny" }},
+  {{ className: "conv-verdict-rec--review" }},
+  {{ ariaBusy: true }},
+]) {{
+  item = batchWithRows(1);
+  const node = new FakeElement("div");
+  node.className = blocker.className || "";
+  if (blocker.state) node.dataset.state = blocker.state;
+  if (blocker.agentExceptional) node.dataset.agentStepExceptional = "true";
+  if (blocker.ariaBusy) node.setAttribute("aria-busy", "true");
+  item.rows[0].appendChild(node);
+  final = conv.markConvRowResultSettled(item.rows[0]);
+  assert(!final.autoFolded, (blocker.className || "aria-busy") + " folded");
+}}
+
+item = batchWithRows(1);
+const spinner = new FakeElement("span");
+spinner.className = "conv-verdict-spinner";
+item.rows[0].appendChild(spinner);
+final = conv.markConvRowResultSettled(item.rows[0]);
+assert(final.becameSettled && !final.autoFolded, "judging batch folded");
+spinner.remove();
+assert(conv.isConvBatchCompactEligible(item.batch), "settled batch did not become eligible");
+assert(!Object.hasOwn(item.batch.dataset, "compactFolded"), "spinner removal collapsed batch");
+
+item = batchWithRows(1);
+const pendingBadge = new FakeElement("div");
+pendingBadge.className = "conv-verdict";
+const pendingSpinner = new FakeElement("span");
+pendingSpinner.className = "conv-verdict-spinner";
+pendingBadge.appendChild(pendingSpinner);
+item.rows[0].appendChild(pendingBadge);
+assert(conv.clearConvVerdictPending(item.rows[0]), "terminal result did not clear judge spinner");
+assert(!item.rows[0].querySelector(".conv-verdict"), "empty pending badge survived");
+final = conv.markConvRowResultSettled(item.rows[0]);
+assert(final.autoFolded, "stale live judge spinner prevented terminal fold");
+
+item = batchWithRows(1);
+const siblingBadge = new FakeElement("div");
+siblingBadge.className = "conv-verdict conv-verdict--low";
+const siblingLabel = new FakeElement("span");
+siblingLabel.className = "conv-verdict-risk";
+const siblingSpinner = new FakeElement("span");
+siblingSpinner.className = "conv-verdict-spinner";
+siblingBadge.append(siblingLabel, siblingSpinner);
+const provisionalOutput = new FakeElement("pre");
+provisionalOutput.className = "tool-output";
+item.batch.append(provisionalOutput, siblingBadge);
+assert(conv.clearConvVerdictPending(item.rows[0]), "batch-level judge spinner survived");
+assert(siblingBadge.parentNode === item.batch, "landed batch verdict was removed");
+assert(!siblingBadge.querySelector(".conv-verdict-spinner"), "batch spinner survived");
+
+item = batchWithRows(2);
+const laterBadge = new FakeElement("div");
+laterBadge.className = "conv-verdict";
+const laterSpinner = new FakeElement("span");
+laterSpinner.className = "conv-verdict-spinner";
+laterBadge.appendChild(laterSpinner);
+item.batch.appendChild(laterBadge);
+assert(!conv.clearConvVerdictPending(item.rows[0]), "cleanup crossed into the next row");
+assert(laterSpinner.parentNode === laterBadge, "later row's judge spinner was removed");
+
+item = batchWithRows(1);
+const childAgent = new FakeElement("div");
+childAgent.className = "conv-agent";
+const childBadge = new FakeElement("div");
+childBadge.className = "conv-verdict";
+const childSpinner = new FakeElement("span");
+childSpinner.className = "conv-verdict-spinner";
+childBadge.appendChild(childSpinner);
+childAgent.appendChild(childBadge);
+item.rows[0].appendChild(childAgent);
+assert(!conv.clearConvVerdictPending(item.rows[0]), "parent consumed nested judge spinner");
+assert(childSpinner.parentNode === childBadge, "nested judge spinner was removed");
+
+item = batchWithRows(1);
+const detail = new FakeElement("button");
+item.rows[0].appendChild(detail);
+detail.focus();
+final = conv.markConvRowResultSettled(item.rows[0]);
+assert(!final.autoFolded, "focused detail folded");
+
+item = batchWithRows(1);
+const media = new FakeElement("audio");
+media.paused = false;
+media.pause = () => {{ media.paused = true; }};
+item.rows[0].appendChild(media);
+document.activeElement = null;
+final = conv.markConvRowResultSettled(item.rows[0]);
+assert(!final.autoFolded, "playing media auto-folded");
+item.disclosure.click();
+assert(media.paused, "manual fold did not pause media");
+assert(item.batch.dataset.compactFolded === "true", "manual media fold failed");
+
+item.disclosure.focus();
+conv.setConvBatchExpanded(item.batch, true, {{ blocker: true }});
+const head = item.batch.children[0];
+assert(document.activeElement === head, "late blocker stranded disclosure focus");
+const actions = new FakeElement("div");
+actions.className = "conv-actions";
+item.batch.appendChild(actions);
+assert(!conv.isConvBatchCompactEligible(item.batch), "late actions remained eligible");
+actions.remove();
+assert(!Object.hasOwn(item.batch.dataset, "compactFolded"), "blocker removal re-folded");
+
+const orphan = new FakeElement("div");
+orphan.className = "conv-row";
+const orphanResult = conv.markConvRowResultSettled(orphan);
+assert(orphanResult.batch === null && !orphanResult.becameSettled, "orphan did not fail open");
+"""
+    )
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 @node_skip

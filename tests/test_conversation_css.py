@@ -14,8 +14,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parent.parent
 _CSS = _ROOT / "turnstone/shared_static/conversation.css"
+_CHAT_CSS = _ROOT / "turnstone/shared_static/chat.css"
 _INTERACTIVE_CSS = _ROOT / "turnstone/shared_static/interactive.css"
 _PAGES = (
     _ROOT / "turnstone/console/static/index.html",
@@ -102,6 +105,78 @@ def test_spinner_keyframe_is_self_contained() -> None:
     # appear is an actual dependency on it (a reference or a redefinition).
     assert "animation: ts-spin" not in body
     assert "@keyframes ts-spin" not in body
+
+
+_COMPACT_FAIL_OPEN_TOKENS = (
+    ".conv-batch--pending",
+    ".conv-batch--running",
+    ".conv-batch--denied",
+    ".conv-batch--error",
+    '[aria-busy="true"]',
+    ".conv-actions",
+    ".conv-verdict-spinner",
+    ".conv-warning",
+    ".conv-row.error",
+    ".conv-row-result--error",
+    ".conv-row-status--error",
+    ".conv-status--error",
+    '.conv-row[data-tool-name="task_agent"]',
+    '.conv-agent[data-state="running"]',
+    '[data-agent-step-exceptional="true"]',
+    ".compaction-running",
+    ".conv-agent-compaction-notice",
+    '[data-output-review-incomplete="true"]',
+    ".conv-verdict--high",
+    ".conv-verdict--critical",
+    ".conv-verdict-rec--deny",
+    ".conv-verdict-rec--review",
+    '[data-effect-status="committed"]',
+)
+
+
+def _compact_section(css: str) -> str:
+    start = css.index("/* Compact transcript presentation.")
+    end = css.index("/* Row container.", start)
+    return css[start:end]
+
+
+def _assert_compact_fail_open_contract(section: str) -> None:
+    assert ':root[data-transcript-presentation="compact"]' in section
+    assert "[data-transcript-root]" in section
+    assert '[data-results-settled="true"]' in section
+    assert '[data-compact-folded="true"]' in section
+    assert "> :not(.conv-batch-head)" in section
+    for token in _COMPACT_FAIL_OPEN_TOKENS:
+        assert section.count(token) >= 2, f"compact selectors lost mirrored fail-open term {token}"
+
+
+def test_compact_batch_fold_is_explicit_scoped_and_fail_open() -> None:
+    _assert_compact_fail_open_contract(_compact_section(_css()))
+
+
+@pytest.mark.parametrize("token", _COMPACT_FAIL_OPEN_TOKENS)
+def test_compact_contract_guard_detects_each_missing_exclusion(token: str) -> None:
+    section = _compact_section(_css()).replace(token, "")
+    with pytest.raises(AssertionError):
+        _assert_compact_fail_open_contract(section)
+
+
+def test_compact_message_density_cannot_match_shell_status_messages() -> None:
+    css = re.sub(r"\s+", " ", _CHAT_CSS.read_text(encoding="utf-8"))
+    prefix = ':root[data-transcript-presentation="compact"] [data-transcript-root]'
+    assert prefix + " .msg {" in css
+    assert prefix + " .msg.reasoning {" in css
+    assert prefix + ' .msg.reasoning[data-reasoning-active="true"] {' in css
+    assert prefix + ' .msg.reasoning[data-reasoning-active="true"] > .msg-body {' in css
+    assert (
+        prefix + ' .msg.reasoning[data-reasoning-active="true"] > .reasoning-activity-status {'
+        in css
+    )
+    assert prefix + ' .msg.reasoning[data-reasoning-active="true"] > * {' not in css
+    assert ".reasoning-activity-status {" in css
+    assert "@keyframes transcript-reasoning-spin" in css
+    assert "prefers-reduced-motion: reduce" in css
+    assert ':root[data-transcript-presentation="compact"] .msg {' not in css
 
 
 def test_linked_by_console_and_both_standalone_pages() -> None:

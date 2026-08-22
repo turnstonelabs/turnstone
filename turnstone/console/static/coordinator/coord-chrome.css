@@ -26,6 +26,53 @@
   overflow: hidden;
 }
 
+/* The L-shell owns the shared presentation control for pane-hosted
+   coordinators.  The rail-less standalone fallback gets this small neutral
+   toolbar instead; keeping it outside the live status region prevents a mode
+   toggle from being announced as coordinator state. */
+#coord-standalone-toolbar {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--hair);
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+#coord-standalone-toolbar .transcript-presentation-toggle {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  background: var(--panel-2);
+  color: var(--ink-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+#coord-standalone-toolbar
+  .transcript-presentation-toggle[aria-pressed="true"] {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel-2));
+}
+#coord-standalone-toolbar .transcript-presentation-toggle:hover {
+  border-color: var(--accent-dim);
+  color: var(--ink);
+}
+#coord-standalone-toolbar .transcript-presentation-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+#coord-standalone-toolbar .transcript-presentation-glyph {
+  font-size: 16px;
+  line-height: 1;
+  transform: scaleX(1.1);
+}
+
 /* Main layout — chat pane (2fr) + sidebar (1fr) with shared
    #coord-main and #coord-body flex wiring. */
 #coord-body {

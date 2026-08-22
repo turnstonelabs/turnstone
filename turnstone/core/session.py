@@ -1221,6 +1221,7 @@ class _TaskExecutionJournal:
             maxlen=_AGENT_STEP_COUNT_CAP
         )
         self._dropped_steps = 0
+        self._dropped_steps_exceptional = False
         self._pending: list[_PendingAgentCall] = []
         self._pending_by_id: dict[str, collections.deque[_PendingAgentCall]] = {}
         self._latest_assistant_text = ""
@@ -1290,6 +1291,9 @@ class _TaskExecutionJournal:
             self._pending.append(pending)
             self._pending_by_id.setdefault(tool_call.id, collections.deque()).append(pending)
             if len(self._recent_steps) == _AGENT_STEP_COUNT_CAP:
+                evicted = self._recent_steps[0]
+                if self._recall_step_is_exceptional(evicted):
+                    self._dropped_steps_exceptional = True
                 self._dropped_steps += 1
             self._recent_steps.append(recall_step)
 
@@ -1328,8 +1332,29 @@ class _TaskExecutionJournal:
             self._effect_names.add(aggregate_name)
         counts = self._effect_counts.setdefault(effect_status, collections.Counter())
         counts[aggregate_name] += 1
+        # Recall only needs typed disposition when it is exceptional.  A
+        # successful COMMITTED child is already the default presentation, so
+        # omitting it preserves the existing bounded-stash budget while NONE /
+        # UNKNOWN / PARTIAL / ROLLED_BACK remain available to fail open.
+        if effect_status not in (None, EffectStatus.COMMITTED):
+            pending.recall_step["effect_status"] = effect_status.value
         self.update_step(pending.recall_step, output, is_error=is_error)
+        # A parallel batch can evict a still-pending step before its result
+        # arrives. Preserve that late truth on the synthetic dropped marker;
+        # identity comparison avoids confusing equal provider-generated rows.
+        if self._recall_step_is_exceptional(pending.recall_step) and not any(
+            step is pending.recall_step for step in self._recent_steps
+        ):
+            self._dropped_steps_exceptional = True
         return pending.recall_step
+
+    @staticmethod
+    def _recall_step_is_exceptional(step: dict[str, Any]) -> bool:
+        effect_status = step.get("effect_status")
+        return bool(step.get("is_error")) or effect_status not in (
+            None,
+            EffectStatus.COMMITTED.value,
+        )
 
     @staticmethod
     def update_step(step: dict[str, Any] | None, output: Any, *, is_error: bool) -> None:
@@ -1364,15 +1389,18 @@ class _TaskExecutionJournal:
     def project_steps(self) -> list[dict[str, Any]]:
         retained = [dict(step) for step in self._recent_steps]
         if self._dropped_steps:
+            marker: dict[str, Any] = {
+                "id": "",
+                "name": "…",
+                "arguments": "{}",
+                "output": f"(+{self._dropped_steps} earlier steps not retained)",
+                "is_error": False,
+            }
+            if self._dropped_steps_exceptional:
+                marker["contains_exceptional"] = True
             retained.insert(
                 0,
-                {
-                    "id": "",
-                    "name": "…",
-                    "arguments": "{}",
-                    "output": f"(+{self._dropped_steps} earlier steps not retained)",
-                    "is_error": False,
-                },
+                marker,
             )
         return retained
 

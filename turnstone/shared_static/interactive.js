@@ -28,6 +28,7 @@ import {
   resetCompactionHolder,
   buildSystemNudgeMarker,
   buildConvBatchShell,
+  buildConvBatchDisclosure,
   buildConvRow,
   buildConvCmd,
   buildConvVerdict,
@@ -38,9 +39,22 @@ import {
   formatAgentContextTokens,
   agentContextIsWarning,
   buildPreviewChip,
+  clearConvVerdictPending,
+  convBatchSummaryText,
+  isConvVerdictCompactBlocker,
+  markConvRowResultSettled,
+  setReasoningActivity,
+  setConvBatchExpanded,
+  setToolOutputReviewState,
   batchKicker,
   indexLabel,
 } from "./conversation.js";
+import {
+  canAutoFoldTranscriptBatch,
+  getTranscriptPresentation,
+  preserveTranscriptBottomPin,
+  registerTranscriptScroller,
+} from "./transcript_presentation.js";
 import { redactCredentials, tryPrettyJson } from "./redact_credentials.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "./mcp_error.js";
 import { authFetch } from "./auth.js";
@@ -506,6 +520,7 @@ class Pane {
 
   reset() {
     this.currentAssistantEl = null;
+    setReasoningActivity(this.currentReasoningEl, false);
     this.currentReasoningEl = null;
     this.contentBuffer = "";
     this.setBusy(false);
@@ -994,6 +1009,10 @@ class Pane {
     if (!evt.call_id || evt.risk_level === "none") return;
     const toolDiv = this._toolRow(evt.call_id);
     if (!toolDiv) return;
+    const warningBatch = toolDiv.closest(".conv-batch");
+    if (warningBatch) {
+      setConvBatchExpanded(warningBatch, true, { blocker: true });
+    }
     // Shared DOM-builder with replayHistory \u2014 single source of truth for
     // role / class / escape semantics.  Argument shape mirrors the
     // server-side output_assessment dict AND the replay payload built by
@@ -1029,33 +1048,36 @@ class Pane {
     // path keeps working.
     const vRow = this._toolRow(verdict.call_id);
     const vScope = (vRow && vRow.closest(".conv-batch")) || this.messagesEl;
-    const badge = vScope.querySelector(
-      '.conv-verdict[data-call-id="' + escapedId + '"]',
-    );
-    if (!badge) {
-      // Badge no longer in DOM (tool block replaced by output) — toast the
-      // late-arriving verdict so the user still sees it.
-      const conf = Math.round((verdict.confidence || 0) * 100);
-      const rec = verdict.recommendation || "review";
-      const func = verdict.func_name || "";
-      showToast(
-        "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
-        rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
+    const verdictBatch = vRow ? vRow.closest(".conv-batch") : null;
+    preserveTranscriptBottomPin(this.messagesEl, () => {
+      if (verdictBatch && isConvVerdictCompactBlocker(verdict)) {
+        setConvBatchExpanded(verdictBatch, true, { blocker: true });
+      }
+      const badge = vScope.querySelector(
+        '.conv-verdict[data-call-id="' + escapedId + '"]',
       );
-      return;
-    }
-    // Replace the badge (+ its detail sibling) with a freshly-built one so the
-    // landed LLM verdict, its risk stripe, and the detail all refresh at once.
-    const detail = badge.nextElementSibling;
-    if (detail && detail.classList.contains("conv-verdict-detail")) {
-      detail.remove();
-    }
-    badge.replaceWith(buildConvVerdict(verdict, { judgePending: false }));
+      if (!badge) {
+        // Badge no longer in DOM (tool block replaced by output) — toast the
+        // late-arriving verdict so the user still sees it.
+        const conf = Math.round((verdict.confidence || 0) * 100);
+        const rec = verdict.recommendation || "review";
+        const func = verdict.func_name || "";
+        showToast(
+          "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
+          rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
+        );
+        return;
+      }
+      // Replace the badge (+ its detail sibling) with a freshly-built one so the
+      // landed LLM verdict, its risk stripe, and the detail all refresh at once.
+      const detail = badge.nextElementSibling;
+      if (detail && detail.classList.contains("conv-verdict-detail")) {
+        detail.remove();
+      }
+      badge.replaceWith(buildConvVerdict(verdict, { judgePending: false }));
 
-    this.updateVerdictGlow(
-      verdict.recommendation,
-      vRow ? vRow.closest(".conv-batch") : null,
-    );
+      this.updateVerdictGlow(verdict.recommendation, verdictBatch);
+    });
   }
 
   updateVerdictGlow(recommendation, batchEl) {
@@ -1309,6 +1331,9 @@ class Pane {
     this.messagesEl.setAttribute("role", "log");
     this.messagesEl.setAttribute("aria-live", "polite");
     this.messagesEl.setAttribute("aria-label", "Chat messages");
+    this._unregisterTranscriptScroller = registerTranscriptScroller(
+      this.messagesEl,
+    );
     // Track "pinned to bottom" from actual scrolls (user or programmatic)
     // instead of reading scroller geometry per event — see isNearBottom().
     // Passive: never blocks the compositor thread.
@@ -2323,18 +2348,26 @@ class Pane {
 
       case "reasoning":
         this.removeThinkingIndicator();
+        let reasoningBody = null;
         if (!this.currentReasoningEl) {
           this.currentReasoningEl = document.createElement("div");
           this.currentReasoningEl.className = "msg reasoning";
+          reasoningBody = document.createElement("div");
+          reasoningBody.className = "msg-body";
+          this.currentReasoningEl.appendChild(reasoningBody);
           this.messagesEl.appendChild(this.currentReasoningEl);
+        } else {
+          reasoningBody = this.currentReasoningEl.querySelector(".msg-body");
         }
-        this.currentReasoningEl.textContent += evt.text;
+        setReasoningActivity(this.currentReasoningEl, true);
+        if (reasoningBody) reasoningBody.textContent += evt.text;
         this.scrollToBottom();
         break;
 
       case "content":
         this.removeThinkingIndicator();
         if (this.currentReasoningEl) {
+          setReasoningActivity(this.currentReasoningEl, false);
           this.currentReasoningEl = null;
         }
         if (!this.currentAssistantEl) {
@@ -2371,6 +2404,7 @@ class Pane {
         const doneBuffer = this.contentBuffer;
         this.currentAssistantBodyEl = null;
         this.currentAssistantEl = null;
+        setReasoningActivity(this.currentReasoningEl, false);
         this.currentReasoningEl = null;
         this.contentBuffer = "";
         // Finalize the completed streaming segment's markdown.  This fires
@@ -2404,14 +2438,27 @@ class Pane {
         // streamed view back to a shorter prefix.
         this.removeThinkingIndicator();
         if (evt.reasoning) {
+          let snapshotReasoningBody = null;
           if (!this.currentReasoningEl) {
             this.currentReasoningEl = document.createElement("div");
             this.currentReasoningEl.className = "msg reasoning";
+            snapshotReasoningBody = document.createElement("div");
+            snapshotReasoningBody.className = "msg-body";
+            this.currentReasoningEl.appendChild(snapshotReasoningBody);
             this.messagesEl.appendChild(this.currentReasoningEl);
+          } else {
+            snapshotReasoningBody =
+              this.currentReasoningEl.querySelector(".msg-body");
           }
-          const curReason = this.currentReasoningEl.textContent || "";
-          if (curReason.length < evt.reasoning.length) {
-            this.currentReasoningEl.textContent = evt.reasoning;
+          setReasoningActivity(this.currentReasoningEl, true);
+          const curReason = snapshotReasoningBody
+            ? snapshotReasoningBody.textContent || ""
+            : "";
+          if (
+            snapshotReasoningBody &&
+            curReason.length < evt.reasoning.length
+          ) {
+            snapshotReasoningBody.textContent = evt.reasoning;
           }
         }
         if (evt.content) {
@@ -2419,6 +2466,7 @@ class Pane {
           // the "case content" invariant of clearing currentReasoningEl
           // when content begins.
           if (this.currentReasoningEl) {
+            setReasoningActivity(this.currentReasoningEl, false);
             this.currentReasoningEl = null;
           }
           if (!this.currentAssistantEl) {
@@ -2443,6 +2491,7 @@ class Pane {
           this._actingUserId = evt.acting_user_id;
         }
         if (evt.state === "idle" || evt.state === "error") {
+          setReasoningActivity(this.currentReasoningEl, false);
           this.setBusy(false);
           // A context event received while its call id still resolved to a
           // prior terminal row is retained briefly for a possible successor
@@ -2722,6 +2771,7 @@ class Pane {
         clearTimeout(this._cancelTimeout);
         clearTimeout(this._forceTimeout);
         this.currentAssistantEl = null;
+        setReasoningActivity(this.currentReasoningEl, false);
         this.currentReasoningEl = null;
         this.contentBuffer = "";
         this.stopBtn.disabled = true;
@@ -3656,6 +3706,7 @@ class Pane {
     // preserves the pane, and preserved DOM keeps valid refs.
     this.currentAssistantEl = null;
     this.currentAssistantBodyEl = null;
+    setReasoningActivity(this.currentReasoningEl, false);
     this.currentReasoningEl = null;
     this.contentBuffer = "";
     // In-progress compaction card: the transcript wipe orphaned it; live
@@ -3977,6 +4028,9 @@ class Pane {
               );
             }
           }
+          if (resultTarget) {
+            setToolOutputReviewState(resultTarget, msg.content);
+          }
           if (msg.tool_call_id && resultTarget) {
             if (msg.effect_status) {
               resultTarget.dataset.effectStatus = String(msg.effect_status);
@@ -3997,6 +4051,11 @@ class Pane {
           if (resultAgentWrap) {
             resultAgentWrap.dataset.state = msg.is_error ? "error" : "done";
             this._syncAgentToggleLabel(resultAgentWrap);
+          }
+          if (resultTarget) {
+            // Replay is already historical: stage a fold even while Default is
+            // selected, but never announce completion from the replay loop.
+            markConvRowResultSettled(resultTarget, { autoFold: true });
           }
         }
         if (msg.event_id != null) {
@@ -4208,7 +4267,11 @@ class Pane {
     // place); else build fresh.
     const announced = this._takeAnnouncedBlock(items);
     const block = announced || document.createElement("div");
-    if (announced) announced.replaceChildren();
+    if (announced) {
+      announced.replaceChildren();
+      delete announced.dataset.resultsSettled;
+      delete announced.dataset.compactFolded;
+    }
     block.removeAttribute("aria-busy");
     block.className =
       "conv-batch " +
@@ -4336,6 +4399,12 @@ class Pane {
     });
     const statusHost = entry.blockEls[0];
     if (statusHost) {
+      if (!approved) {
+        this._markAgentStepExceptional(statusHost, {
+          denied: true,
+          effectStatus: "none",
+        });
+      }
       statusHost.appendChild(
         buildConvStatus({ approved, always, feedback: feedback || "" }),
       );
@@ -4455,6 +4524,10 @@ class Pane {
     holder.pending = null;
     card.wrap.hidden = false;
     if (evt.phase === "start") {
+      const parentBatch = card.wrap.closest(".conv-batch");
+      if (parentBatch) {
+        setConvBatchExpanded(parentBatch, true, { blocker: true });
+      }
       const prior = card.wrap.querySelector(".conv-agent-compaction-notice");
       if (prior) prior.remove();
     }
@@ -4507,6 +4580,10 @@ class Pane {
       return false; // parent row not painted yet — fall back top-level
     }
     if (mode === "approve") {
+      const parentBatch = card.wrap.closest(".conv-batch");
+      if (parentBatch) {
+        setConvBatchExpanded(parentBatch, true, { blocker: true });
+      }
       // Cards default to collapsed, but a pending approval is BLOCKING — it
       // can't hide behind the toggle or the turn stalls on a prompt the user
       // never sees.  Force the card open (sync aria with the data attribute).
@@ -4526,6 +4603,11 @@ class Pane {
         row = buildToolDiv(item, "");
         card.body.appendChild(row);
       }
+      this._markAgentStepExceptional(row, {
+        isError: !!(item.is_error || item.error),
+        denied: !!item.denied,
+        effectStatus: item.effect_status,
+      });
       if (mode === "approve") {
         const verdict =
           item.judge_verdict || item.heuristic_verdict || item.verdict;
@@ -4594,6 +4676,12 @@ class Pane {
         // Same-turn row rebuild: showInlineToolBlock's replaceChildren on the
         // pending->resolved upgrade detached our card.  Re-attach the SAME card
         // so its already-rendered steps survive the upgrade.
+        if (card.wrap.dataset.state === "running") {
+          const parentBatch = parentRow.closest(".conv-batch");
+          if (parentBatch) {
+            setConvBatchExpanded(parentBatch, true, { blocker: true });
+          }
+        }
         parentRow.appendChild(card.wrap);
         this._syncAgentContext(parentCallId, card);
         this._syncAgentCompaction(parentCallId, card);
@@ -4608,6 +4696,10 @@ class Pane {
     card = buildAgentCardBody();
     card.wrap.dataset.state = "running";
     if (contextOnly) card.wrap.dataset.contextOnly = "true";
+    const parentBatch = parentRow.closest(".conv-batch");
+    if (parentBatch) {
+      setConvBatchExpanded(parentBatch, true, { blocker: true });
+    }
     parentRow.appendChild(card.wrap);
     this._agentCards.set(parentCallId, card);
     this._syncAgentToggleLabel(card);
@@ -4616,11 +4708,38 @@ class Pane {
     return card;
   }
 
+  _markAgentStepExceptional(row, details) {
+    details = details || {};
+    const effectStatus =
+      details.effectStatus == null ? "" : String(details.effectStatus);
+    if (
+      !details.isError &&
+      !details.denied &&
+      !details.exceptional &&
+      (!effectStatus || effectStatus === "committed")
+    ) {
+      return false;
+    }
+    const card = row && row.closest ? row.closest(".conv-agent") : null;
+    if (!card) return false;
+    const parentBatch = card.closest(".conv-batch");
+    if (parentBatch) {
+      setConvBatchExpanded(parentBatch, true, { blocker: true });
+    }
+    const changed = card.dataset.agentStepExceptional !== "true";
+    card.dataset.agentStepExceptional = "true";
+    const issue = card.querySelector(".conv-agent-step-issue");
+    if (issue) issue.hidden = false;
+    this._syncAgentToggleLabel(card);
+    return changed;
+  }
+
   _syncAgentToggleLabel(card) {
     const wrap = card.wrap || card;
     const toggle = card.toggle || wrap.querySelector(".conv-agent-toggle");
     const label = card.label || wrap.querySelector(".conv-agent-label");
     const context = card.context || wrap.querySelector(".conv-agent-context");
+    const issue = card.issue || wrap.querySelector(".conv-agent-step-issue");
     if (!toggle || !label) return;
     const parts = ["Show or hide sub-agent steps", label.textContent || "0 steps"];
     const state = wrap.dataset.state;
@@ -4633,6 +4752,9 @@ class Pane {
           ? "Warning: " + context.title
           : context.title,
       );
+    }
+    if (issue && !issue.hidden) {
+      parts.push("contains an exceptional child step");
     }
     toggle.setAttribute("aria-label", parts.join(". "));
   }
@@ -4814,7 +4936,14 @@ class Pane {
     // errors don't decide it (an agent can recover and synthesize fine).
     const card = buildAgentCardBody();
     steps.forEach((step) => {
-      card.body.appendChild(buildToolDiv(synthToolItem(step), ""));
+      const stepRow = buildToolDiv(synthToolItem(step), "");
+      card.body.appendChild(stepRow);
+      this._markAgentStepExceptional(stepRow, {
+        isError: !!step.is_error,
+        denied: !!step.denied,
+        exceptional: !!step.contains_exceptional,
+        effectStatus: step.effect_status,
+      });
       const out = stripAnsi(String(step.output || "")).trim();
       if (out) {
         card.body.appendChild(renderCollapsibleOutput(out, !!step.is_error));
@@ -4878,23 +5007,39 @@ class Pane {
       if (!target && tools.length) target = tools[tools.length - 1];
     }
     if (!target) return false;
+    const parentBlock = target.closest(".conv-batch");
+    const stripped = stripAnsi(output || "").trim();
+    const isDenied =
+      target.classList.contains("conv-batch--denied") ||
+      (parentBlock && parentBlock.classList.contains("conv-batch--denied")) ||
+      /^Denied by user/.test(stripped) ||
+      /^Blocked/.test(stripped);
+    this._markAgentStepExceptional(target, {
+      isError: !!isError,
+      denied: isDenied,
+      effectStatus: opts.effectStatus,
+    });
 
     if (accepted) {
-      const targetBatch = target.closest(".conv-batch");
+      clearConvVerdictPending(target);
+      setToolOutputReviewState(target, output);
       // Stop can synthesize a final result after tool_pending but before the
       // authoritative tool_info/approval event consumes the early shell. Once
       // this exact shell owns an accepted row it is committed transcript DOM,
       // not replaceable early paint. Retire map ownership without removing it;
       // a later turn may legitimately reuse the same provider call id.
-      if (targetBatch && this.announcedBlocks) {
+      if (parentBlock && this.announcedBlocks) {
         for (const [key, announced] of this.announcedBlocks.entries()) {
-          if (announced === targetBatch) {
+          if (announced === parentBlock) {
             this.announcedBlocks.delete(key);
             break;
           }
         }
       }
       if (opts.effectStatus) {
+        if (opts.effectStatus !== "committed" && parentBlock) {
+          setConvBatchExpanded(parentBlock, true, { blocker: true });
+        }
         target.dataset.effectStatus = String(opts.effectStatus);
       } else {
         delete target.dataset.effectStatus;
@@ -4928,18 +5073,12 @@ class Pane {
       this._toolResultNodes.delete(callId);
     }
 
-    const stripped = stripAnsi(output || "").trim();
     // Skip rendering for denied/blocked tool results — the ✗ denied
     // badge from resolveApproval already shows the denial reason; the
     // SSE tool_result event would otherwise duplicate the text.  Mirror
     // the guard in the history-replay path (the live path used to be
     // safe because no tool_result event was ever emitted for denied
     // items, but we now emit one so _tool_error_flags gets set).
-    const parentBlock = target.closest(".conv-batch");
-    const isDenied =
-      (parentBlock && parentBlock.classList.contains("conv-batch--denied")) ||
-      /^Denied by user/.test(stripped) ||
-      /^Blocked/.test(stripped);
     const resultNodes = [];
     let insertCursor = target;
     const insertResult = (node) => {
@@ -4981,6 +5120,7 @@ class Pane {
       parentBlock &&
       !parentBlock.classList.contains("conv-batch--denied")
     ) {
+      setConvBatchExpanded(parentBlock, true, { blocker: true });
       parentBlock.classList.add("conv-batch--error");
       appendToolErrorBadge(parentBlock);
     }
@@ -4999,7 +5139,24 @@ class Pane {
     if (callId) {
       this._toolResultNodes.set(callId, { row: target, nodes: resultNodes });
     }
-    if (resultNodes.length) this.scrollToBottom(stick);
+    let settlement = null;
+    if (accepted) {
+      const compact = getTranscriptPresentation() === "compact";
+      const allowAutoFold =
+        !compact ||
+        canAutoFoldTranscriptBatch(this.messagesEl, parentBlock, {
+          atBottom: stick,
+        });
+      settlement = markConvRowResultSettled(target, {
+        autoFold: allowAutoFold,
+      });
+      if (compact && settlement.autoFolded) {
+        toolAnnounce("Completed: " + convBatchSummaryText(parentBlock));
+      }
+    }
+    if (resultNodes.length || (settlement && settlement.autoFolded)) {
+      this.scrollToBottom(stick);
+    }
     return true;
   }
 
@@ -5611,6 +5768,7 @@ function _convApprovalHead(kickerText, items) {
   summary.textContent =
     items.length >= 2 ? first + " + " + (items.length - 1) + " more" : first;
   head.appendChild(summary);
+  head.appendChild(buildConvBatchDisclosure());
   return head;
 }
 
@@ -6012,6 +6170,10 @@ function createInteractivePane(root, wsId, opts) {
       if (pane._resizeObs) {
         pane._resizeObs.disconnect();
         pane._resizeObs = null;
+      }
+      if (pane._unregisterTranscriptScroller) {
+        pane._unregisterTranscriptScroller();
+        pane._unregisterTranscriptScroller = null;
       }
       if (pane.el && pane.el.parentNode) {
         pane.el.parentNode.removeChild(pane.el);

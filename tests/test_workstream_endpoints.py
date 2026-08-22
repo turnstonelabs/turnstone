@@ -1515,12 +1515,21 @@ class TestHistoryAgentStepsOverlay:
         self._save_task_agent_turn(_inject_storage, ws_id)
         steps = [
             {
+                "id": "",
+                "name": "…",
+                "arguments": "{}",
+                "output": "(+1 earlier step not retained)",
+                "is_error": False,
+                "contains_exceptional": True,
+            },
+            {
                 "id": "task1::c1",
                 "name": "search",
                 "arguments": "{}",
                 "output": "12 matches",
                 "is_error": False,
-            }
+                "effect_status": "committed",
+            },
         ]
         mock_ws = _live_history_workstream(ws_id)
         mock_ws.ui.get_agent_trajectory = lambda cid: steps if cid == "task1" else None

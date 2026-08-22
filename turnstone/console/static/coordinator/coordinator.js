@@ -42,8 +42,21 @@ import {
   buildConvResult,
   buildPreviewChip,
   batchKicker,
+  clearConvVerdictPending,
+  convBatchSummaryText,
   indexLabel,
+  isConvVerdictCompactBlocker,
+  markConvRowResultSettled,
+  setReasoningActivity,
+  setConvBatchExpanded,
+  setToolOutputReviewState,
 } from "/shared/conversation.js";
+import {
+  getTranscriptPresentation,
+  mountTranscriptPresentationToggle,
+  preserveTranscriptBottomPin,
+  registerTranscriptScroller,
+} from "/shared/transcript_presentation.js";
 import { redactCredentials } from "/shared/redact_credentials.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "/shared/mcp_error.js";
 import {
@@ -378,6 +391,15 @@ function buildCoordChrome(root, opts) {
     ],
   );
 
+  if (opts.standalone) {
+    root.append(
+      el("div", {
+        id: "coord-standalone-toolbar",
+        role: "toolbar",
+        "aria-label": "Viewer controls",
+      }),
+    );
+  }
   root.append(el("div", { id: "coord-body" }, [main, sidebar]));
   if (opts.standalone) {
     root.append(
@@ -397,6 +419,17 @@ function createCoordinatorPane(root, wsId, opts) {
   }
   buildCoordChrome(root, opts);
 
+  let unmountTranscriptPresentation = null;
+  if (opts && opts.standalone) {
+    const toolbar = root.querySelector("#coord-standalone-toolbar");
+    if (toolbar) {
+      unmountTranscriptPresentation = mountTranscriptPresentationToggle(
+        toolbar,
+        { className: "ghost" },
+      );
+    }
+  }
+
   if (opts && opts.standalone) {
     // Rail-less page: mount the pending-consent chip in the status bar —
     // the persistent signal the L-shell gets from the rail badge (#874).
@@ -415,6 +448,7 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   const messagesEl = root.querySelector("#coord-messages");
+  const unregisterTranscriptScroller = registerTranscriptScroller(messagesEl);
   const coordMain = root.querySelector("#coord-main");
   const composerMount = root.querySelector("#coord-composer-mount");
   const composer = new Composer(composerMount, {
@@ -1601,6 +1635,17 @@ function createCoordinatorPane(root, wsId, opts) {
       // state.  Per-row check (not a counter) keeps the logic
       // resilient to out-of-order replay + late SSE deliveries.
       _unsetBatchRunningIfAllResults(entry.batch);
+      const settlement =
+        opts && opts.accepted
+          ? markConvRowResultSettled(entry.row, { autoFold: true })
+          : null;
+      if (
+        getTranscriptPresentation() === "compact" &&
+        settlement &&
+        settlement.autoFolded
+      ) {
+        _announcePolite("Completed: " + convBatchSummaryText(entry.batch));
+      }
       // Result blocks grow scrollHeight; without this the user pinned
       // at the bottom loses their pin when the row inflates.  appendMsg
       // already routes through _scheduleScroll on the legacy path; this
@@ -1748,7 +1793,8 @@ function createCoordinatorPane(root, wsId, opts) {
       if (!tierEl) {
         tierEl = document.createElement("span");
         tierEl.className = "conv-batch-tier";
-        head.appendChild(tierEl);
+        const disclosure = head.querySelector(".conv-batch-disclosure");
+        head.insertBefore(tierEl, disclosure || null);
       }
       if (tierEl.textContent !== label) tierEl.textContent = label;
     } else if (tierEl) {
@@ -1770,6 +1816,10 @@ function createCoordinatorPane(root, wsId, opts) {
   // reflect execution outcome, not the static item payload.
   function _refreshRowStatus(row, item) {
     if (!row || !item) return;
+    if (item.error && !item.needs_approval) {
+      const batch = row.closest(".conv-batch");
+      if (batch) setConvBatchExpanded(batch, true, { blocker: true });
+    }
     const callLine = row.querySelector(".conv-row-call");
     if (callLine) {
       callLine.querySelectorAll(".conv-row-status").forEach((p) => p.remove());
@@ -1839,6 +1889,8 @@ function createCoordinatorPane(root, wsId, opts) {
     // The chip's risk / flags / redaction / tier / reasoning are all built by
     // the shared buildConvWarning (reasoning is now inline, not a <details>).
     if (!row || !oa) return;
+    const batch = row.closest(".conv-batch");
+    if (batch) setConvBatchExpanded(batch, true, { blocker: true });
     const existing = row.querySelector(".conv-warning");
     const chip = buildConvWarning(oa);
     if (existing) existing.replaceWith(chip);
@@ -1880,49 +1932,63 @@ function createCoordinatorPane(root, wsId, opts) {
     if (verdict && row.dataset.verdictSig === sig) {
       return row.querySelector(".conv-verdict");
     }
-    row.dataset.verdictSig = sig;
+    const renderVerdict = () => {
+      if (verdict && isConvVerdictCompactBlocker(verdict)) {
+        const batch = row.closest(".conv-batch");
+        if (batch) setConvBatchExpanded(batch, true, { blocker: true });
+      }
+      row.dataset.verdictSig = sig;
 
-    // Drop any prior verdict badge + its detail sibling before rebuilding.
-    const prevBadge = row.querySelector(".conv-verdict");
-    if (prevBadge) {
-      const prevDetail = prevBadge.nextElementSibling;
-      if (prevDetail && prevDetail.classList.contains("conv-verdict-detail")) {
-        prevDetail.remove();
+      // Drop any prior verdict badge + its detail sibling before rebuilding.
+      const prevBadge = row.querySelector(".conv-verdict");
+      if (prevBadge) {
+        const prevDetail = prevBadge.nextElementSibling;
+        if (prevDetail && prevDetail.classList.contains("conv-verdict-detail")) {
+          prevDetail.remove();
+        }
+        prevBadge.remove();
       }
-      prevBadge.remove();
-    }
-    if (verdict) {
-      const frag = buildConvVerdict(verdict);
-      const callEl = row.querySelector(".conv-row-call");
-      if (callEl && callEl.nextSibling) {
-        row.insertBefore(frag, callEl.nextSibling);
-      } else {
-        row.appendChild(frag);
+      if (verdict) {
+        const frag = buildConvVerdict(verdict);
+        const callEl = row.querySelector(".conv-row-call");
+        if (callEl && callEl.nextSibling) {
+          row.insertBefore(frag, callEl.nextSibling);
+        } else {
+          row.appendChild(frag);
+        }
       }
-    }
-    // Persist the verdict's tier on the row so the batch's header
-    // tier badge can escalate from ⚙ heuristic → ⚖ llm when a later
-    // intent_verdict lands an LLM verdict.  Default to "heuristic"
-    // when tier is absent — heuristic verdicts ship without an
-    // explicit tier marker on every server emitter.
-    if (verdict) {
-      row.dataset.verdictTier = verdict.tier || "heuristic";
-      if (verdict.judge_model) {
-        row.dataset.verdictModel = verdict.judge_model;
+      // Persist the verdict's tier on the row so the batch's header
+      // tier badge can escalate from ⚙ heuristic → ⚖ llm when a later
+      // intent_verdict lands an LLM verdict.  Default to "heuristic"
+      // when tier is absent — heuristic verdicts ship without an
+      // explicit tier marker on every server emitter.
+      if (verdict) {
+        row.dataset.verdictTier = verdict.tier || "heuristic";
+        if (verdict.judge_model) {
+          row.dataset.verdictModel = verdict.judge_model;
+        } else {
+          delete row.dataset.verdictModel;
+        }
       } else {
+        delete row.dataset.verdictTier;
         delete row.dataset.verdictModel;
       }
-    } else {
-      delete row.dataset.verdictTier;
-      delete row.dataset.verdictModel;
-    }
-    _refreshBatchTier(row.closest(".conv-batch"));
-    return row.querySelector(".conv-verdict");
+      _refreshBatchTier(row.closest(".conv-batch"));
+      return row.querySelector(".conv-verdict");
+    };
+    // History and initial batch construction render detached rows.  Their
+    // eventual append already participates in _scheduleScroll(); measuring the
+    // live scroller here would force layout and enqueue one rAF per verdict.
+    return row.isConnected
+      ? preserveTranscriptBottomPin(messagesEl, renderVerdict)
+      : renderVerdict();
   }
 
   function _appendJudgePendingLineTo(row) {
     // Clear any prior verdict, then render the spinner-only badge (neutral
     // stripe -- risk isn't known until the judge lands).
+    const batch = row.closest(".conv-batch");
+    if (batch) setConvBatchExpanded(batch, true, { blocker: true });
     _appendVerdictLineTo(row, null);
     const frag = buildConvVerdict(null, { judgePending: true });
     const callEl = row.querySelector(".conv-row-call");
@@ -1935,10 +2001,21 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function _appendResultToRow(row, output, isError, opts) {
     if (!row) return null;
+    const batch = row.closest(".conv-batch");
+    const exceptionalEffect =
+      opts &&
+      opts.accepted &&
+      opts.effectStatus &&
+      String(opts.effectStatus) !== "committed";
+    if ((isError || exceptionalEffect) && batch) {
+      setConvBatchExpanded(batch, true, { blocker: true });
+    }
     row
       .querySelectorAll(".conv-row-result")
       .forEach((existing) => existing.remove());
     if (opts && opts.accepted) {
+      clearConvVerdictPending(row);
+      setToolOutputReviewState(row, output);
       if (opts.effectStatus) {
         row.dataset.effectStatus = String(opts.effectStatus);
       } else {
@@ -1950,7 +2027,6 @@ function createCoordinatorPane(root, wsId, opts) {
       // Lift the row's error onto the enclosing batch so the left
       // stripe + status pill (--error) cue the operator at the batch
       // level too.  Idempotent — re-fires don't stack.
-      const batch = row.closest(".conv-batch");
       if (batch) batch.classList.add("conv-batch--error");
     }
     // Structured MCP error envelope (consent / re-consent / forbidden /
@@ -2110,6 +2186,7 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function _setBatchRunning(batch) {
     if (!batch) return;
+    setConvBatchExpanded(batch, true, { blocker: true });
     batch.classList.add("conv-batch--running");
     const kicker = batch.querySelector(".conv-batch-kicker");
     if (kicker) {
@@ -2144,6 +2221,9 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function _morphBatchResolved(batch, opts) {
     if (!batch) return;
+    if (!opts.approved) {
+      setConvBatchExpanded(batch, true, { blocker: true });
+    }
     batch.classList.remove("conv-batch--pending");
     batch.classList.add(
       opts.approved ? "conv-batch--approved" : "conv-batch--denied",
@@ -2251,6 +2331,7 @@ function createCoordinatorPane(root, wsId, opts) {
       //                            turn that was actually auto-
       //                            approved + in-flight at reload)
       if (opts.pending && !existing.classList.contains("conv-batch--pending")) {
+        setConvBatchExpanded(existing, true, { blocker: true });
         existing.classList.remove(
           "conv-batch--approved",
           "conv-batch--denied",
@@ -2439,6 +2520,7 @@ function createCoordinatorPane(root, wsId, opts) {
   let currentReasoningBuf = "";
 
   function appendContentToken(text) {
+    setReasoningActivity(currentReasoningEl, false);
     if (!currentAssistantEl) {
       currentAssistantEl = appendMsg("assistant", "", { label: "assistant" });
       currentAssistantBuf = "";
@@ -2477,6 +2559,7 @@ function createCoordinatorPane(root, wsId, opts) {
       currentReasoningBuf = "";
       messagesEl.setAttribute("aria-live", "off");
     }
+    setReasoningActivity(currentReasoningEl, true);
     currentReasoningBuf += text;
     const body = currentReasoningEl.querySelector(".msg-body");
     if (body) body.textContent = currentReasoningBuf;
@@ -2501,6 +2584,7 @@ function createCoordinatorPane(root, wsId, opts) {
     }
     currentAssistantEl = null;
     currentAssistantBuf = "";
+    setReasoningActivity(currentReasoningEl, false);
     currentReasoningEl = null;
     currentReasoningBuf = "";
     messagesEl.setAttribute("aria-live", "polite");
@@ -2572,6 +2656,11 @@ function createCoordinatorPane(root, wsId, opts) {
   // plus the cancel-timer cleanup wired via the onIdle hook above).
   function setBusy(b, source) {
     const next = !!b;
+    if (!next) {
+      setReasoningActivity(currentReasoningEl, false);
+      currentReasoningEl = null;
+      currentReasoningBuf = "";
+    }
     // Who asserted busy: "server" (default — state events and every
     // existing/future writer) or "optimistic" (ONLY coordSend's pre-POST
     // flip). The deferred/queue_full settle arms may clear busy solely
@@ -3528,6 +3617,7 @@ function createCoordinatorPane(root, wsId, opts) {
     suspendStream();
     currentAssistantEl = null;
     currentAssistantBuf = "";
+    setReasoningActivity(currentReasoningEl, false);
     currentReasoningEl = null;
     currentReasoningBuf = "";
     // Drop the live cursor for the reconnect: the full render below
@@ -3712,12 +3802,14 @@ function createCoordinatorPane(root, wsId, opts) {
             });
             messagesEl.setAttribute("aria-live", "off");
           }
+          setReasoningActivity(currentReasoningEl, true);
           currentReasoningBuf = ev.reasoning;
           var rbody = currentReasoningEl.querySelector(".msg-body");
           if (rbody) rbody.textContent = currentReasoningBuf;
           _scheduleScroll();
         }
         if (ev.content && ev.content.length > currentAssistantBuf.length) {
+          setReasoningActivity(currentReasoningEl, false);
           if (!currentAssistantEl) {
             currentAssistantEl = appendMsg("assistant", "", {
               label: "assistant",
@@ -4004,6 +4096,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // transitions we didn't initiate (cross-tab cancel, judge
         // reset, idle-after-error). Mirrors the interactive pane.
         if (ev.state === "idle" || ev.state === "error") {
+          setReasoningActivity(currentReasoningEl, false);
           setBusy(false);
           // Deferred replay_truncated re-sync: the truncation arrived while a
           // turn was mid-stream (refetching then would have detached the live
@@ -4153,6 +4246,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // Force Stop after 2s. state_change → idle is what actually
         // clears busy; the 10s safety timer covers the connection-drop
         // case.
+        setReasoningActivity(currentReasoningEl, false);
         if (!busy) break;
         clearTimeout(cancelTimeoutId);
         clearTimeout(forceTimeoutId);
@@ -6796,6 +6890,7 @@ function createCoordinatorPane(root, wsId, opts) {
             });
           }
           _unsetBatchRunningIfAllResults(occurrence.row.closest(".conv-batch"));
+          markConvRowResultSettled(occurrence.row, { autoFold: true });
         } else {
           appendToolResult(
             toolName,
@@ -6989,6 +7084,11 @@ function createCoordinatorPane(root, wsId, opts) {
     removeVisibilityHandler();
     if (_childObserver && _childObserver.disconnect)
       _childObserver.disconnect();
+    unregisterTranscriptScroller();
+    if (unmountTranscriptPresentation) {
+      unmountTranscriptPresentation();
+      unmountTranscriptPresentation = null;
+    }
   }
 
   // Reconnect a DEAD stream NOW (reset backoff), leaving a live one alone —

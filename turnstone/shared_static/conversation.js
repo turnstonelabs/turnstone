@@ -415,6 +415,329 @@ export function indexLabel(idx, n) {
 // left indent (a real bug if a caller passes pre-indented text).
 // ===========================================================================
 
+const activeReasoningState = new WeakMap();
+const OUTPUT_REVIEW_INCOMPLETE_TEXT = "Output review did not complete";
+
+function _reasoningTrace(row) {
+  let trace = row.querySelector(".msg-body");
+  if (trace) return trace;
+  // Normalize the legacy/direct-text shape defensively.  Live callers create
+  // .msg-body themselves, but keeping the shared seam self-contained prevents
+  // a future renderer from putting token mutations back inside the status.
+  const text = row.textContent || "";
+  row.textContent = "";
+  trace = document.createElement("div");
+  trace.className = "msg-body";
+  trace.textContent = text;
+  row.appendChild(trace);
+  return trace;
+}
+
+// The streamed trace and the model-activity announcement must be separate
+// accessibility subtrees.  Tokens mutate only the aria-hidden trace while a
+// static sibling status announces once; settlement restores the completed
+// trace for ordinary, non-live navigation.
+export function setReasoningActivity(row, active) {
+  if (!row) return false;
+  if (active) {
+    if (row.dataset.reasoningActive === "true") return false;
+    const trace = _reasoningTrace(row);
+    const status = document.createElement("span");
+    status.className = "reasoning-activity-status";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.setAttribute("aria-atomic", "true");
+    status.setAttribute("aria-label", "Model reasoning in progress");
+    status.textContent = "Reasoning";
+    activeReasoningState.set(row, {
+      trace,
+      traceHidden: trace.getAttribute("aria-hidden"),
+      status,
+    });
+    trace.setAttribute("aria-hidden", "true");
+    row.dataset.reasoningActive = "true";
+    row.appendChild(status);
+    return true;
+  }
+  if (row.dataset.reasoningActive !== "true") return false;
+  delete row.dataset.reasoningActive;
+  const prior = activeReasoningState.get(row) || {};
+  const trace = prior.trace || row.querySelector(".msg-body");
+  if (trace) {
+    if (prior.traceHidden == null) trace.removeAttribute("aria-hidden");
+    else trace.setAttribute("aria-hidden", prior.traceHidden);
+  }
+  const status = prior.status || row.querySelector(".reasoning-activity-status");
+  if (status) status.remove();
+  activeReasoningState.delete(row);
+  return true;
+}
+
+const COMPACT_BLOCKER_SELECTOR = [
+  ".conv-actions",
+  ".conv-verdict-spinner",
+  ".conv-warning",
+  ".conv-row.error",
+  ".conv-row-result--error",
+  ".conv-row-status--error",
+  ".conv-status--error",
+  ".conv-batch--pending",
+  ".conv-batch--running",
+  '.conv-row[data-tool-name="task_agent"]',
+  '.conv-agent[data-state="running"]',
+  '[data-agent-step-exceptional="true"]',
+  ".compaction-running",
+  ".conv-agent-compaction-notice",
+  '[data-output-review-incomplete="true"]',
+  '[aria-busy="true"]',
+  ".conv-verdict--high",
+  ".conv-verdict--critical",
+  ".conv-verdict-rec--deny",
+  ".conv-verdict-rec--review",
+].join(", ");
+
+// A judge-pending spinner is provisional. Once the canonical accepted tool
+// result arrives, execution is terminal and that spinner must not remain as a
+// permanent compact blocker. A late intent_verdict can still replace/rebuild
+// the verdict and re-expand the batch when its disposition is exceptional.
+export function clearConvVerdictPending(row) {
+  if (!row) return false;
+  let badge = Array.from(row.children || []).find((child) =>
+    child.classList.contains("conv-verdict"),
+  );
+  if (!badge && row.parentNode) {
+    const siblings = Array.from(row.parentNode.children || []);
+    const start = siblings.indexOf(row);
+    for (let index = start + 1; index < siblings.length; index += 1) {
+      const candidate = siblings[index];
+      if (candidate.classList.contains("conv-row")) break;
+      if (candidate.classList.contains("conv-verdict")) {
+        badge = candidate;
+        break;
+      }
+    }
+  }
+  if (!badge) return false;
+  const spinner = badge.querySelector(".conv-verdict-spinner");
+  if (!spinner) return false;
+  spinner.remove();
+  if (!(badge.children || []).length) badge.remove();
+  return true;
+}
+
+// Cancellation can replace a real executor receipt with controller-authored
+// text because output review never completed. Effect disposition is
+// orthogonal: even a committed effect remains unresolved for presentation,
+// so stamp a dedicated fail-open marker instead of overloading effectStatus.
+export function setToolOutputReviewState(row, output) {
+  if (!row) return false;
+  const incomplete = String(output == null ? "" : output).includes(
+    OUTPUT_REVIEW_INCOMPLETE_TEXT,
+  );
+  if (incomplete) row.dataset.outputReviewIncomplete = "true";
+  else delete row.dataset.outputReviewIncomplete;
+  return incomplete;
+}
+
+function _directConvRows(batch) {
+  return Array.from(batch.children || []).filter((child) =>
+    child.classList.contains("conv-row"),
+  );
+}
+
+function _convBatchHead(batch) {
+  return Array.from(batch.children || []).find((child) =>
+    child.classList.contains("conv-batch-head"),
+  );
+}
+
+function _convBatchDisclosure(batch) {
+  return batch.querySelector(".conv-batch-disclosure");
+}
+
+export function convBatchSummaryText(batch) {
+  const summary = batch.querySelector(".conv-batch-summary");
+  const text = summary ? String(summary.textContent || "").trim() : "";
+  return text || "tool batch";
+}
+
+export function isConvVerdictCompactBlocker(verdict) {
+  if (!verdict) return false;
+  const risk = normalizeRiskLevel(verdict.risk_level);
+  const recommendation = verdict.recommendation || "review";
+  return (
+    risk === "high" ||
+    risk === "critical" ||
+    recommendation !== "approve"
+  );
+}
+
+function _playingBatchMedia(batch) {
+  return Array.from(batch.querySelectorAll("audio, video")).filter(
+    (media) => media.paused === false && media.ended !== true,
+  );
+}
+
+function _batchHasProtectedFocus(batch) {
+  const active = document.activeElement;
+  if (!active || !batch.contains(active)) return false;
+  const head = _convBatchHead(batch);
+  return !head || !head.contains(active);
+}
+
+function _focusConvBatchHead(batch) {
+  const head = _convBatchHead(batch);
+  if (!head || typeof head.focus !== "function") return;
+  const temporary = !head.hasAttribute("tabindex");
+  if (temporary) head.setAttribute("tabindex", "-1");
+  head.focus({ preventScroll: true });
+  if (temporary) {
+    head.addEventListener(
+      "blur",
+      () => {
+        head.removeAttribute("tabindex");
+      },
+      { once: true },
+    );
+  }
+}
+
+function _syncConvBatchDisclosure(batch, expanded) {
+  const disclosure = _convBatchDisclosure(batch);
+  if (!disclosure) return;
+  const action = expanded ? "Hide" : "Show";
+  const summary = convBatchSummaryText(batch);
+  disclosure.setAttribute("aria-expanded", expanded ? "true" : "false");
+  disclosure.setAttribute(
+    "aria-label",
+    action + " completed tool details for " + summary,
+  );
+  disclosure.title = action + " completed tool details";
+  disclosure.textContent = "Completed · " + action + " details";
+}
+
+// Structural compact eligibility is independent of the selected presentation:
+// Default may stage a fold marker without hiding anything so a later switch to
+// Compact is immediate.  Every ambiguous or exceptional state fails open.
+export function isConvBatchCompactEligible(batch) {
+  if (!batch || !batch.classList.contains("conv-batch")) return false;
+  if (batch.dataset.resultsSettled !== "true") return false;
+  if (
+    !batch.classList.contains("conv-batch--approved") &&
+    !batch.classList.contains("conv-batch--auto")
+  ) {
+    return false;
+  }
+  for (const state of [
+    "conv-batch--pending",
+    "conv-batch--running",
+    "conv-batch--denied",
+    "conv-batch--error",
+  ]) {
+    if (batch.classList.contains(state)) return false;
+  }
+  if (batch.getAttribute("aria-busy") === "true") return false;
+  const rows = _directConvRows(batch);
+  if (!rows.length) return false;
+  for (const row of rows) {
+    if (row.dataset.resultSettled !== "true") return false;
+    if (
+      Object.prototype.hasOwnProperty.call(row.dataset, "effectStatus") &&
+      row.dataset.effectStatus !== "committed"
+    ) {
+      return false;
+    }
+  }
+  return !batch.querySelector(COMPACT_BLOCKER_SELECTOR);
+}
+
+// The only disclosure-state mutator.  Automatic folds preserve focused detail
+// and playing media; an explicit fold pauses media first.  A late blocker can
+// make the disclosure itself inapplicable, so its focused button hands off to
+// the surviving batch head before the renderer adds that blocker.
+export function setConvBatchExpanded(batch, expanded, options) {
+  options = options || {};
+  if (!batch || !batch.classList.contains("conv-batch")) return false;
+  const disclosure = _convBatchDisclosure(batch);
+  if (
+    expanded &&
+    options.blocker &&
+    disclosure &&
+    document.activeElement === disclosure
+  ) {
+    _focusConvBatchHead(batch);
+  }
+  const playing = _playingBatchMedia(batch);
+  if (!expanded && !options.manual) {
+    if (_batchHasProtectedFocus(batch) || playing.length) return false;
+  }
+  if (!expanded && options.manual) {
+    for (const media of playing) {
+      try {
+        media.pause();
+      } catch (_) {
+        // A detached/broken media element must not strand disclosure state.
+      }
+    }
+  }
+  const wasExpanded = batch.dataset.compactFolded !== "true";
+  if (expanded) delete batch.dataset.compactFolded;
+  else batch.dataset.compactFolded = "true";
+  _syncConvBatchDisclosure(batch, expanded);
+  return wasExpanded !== expanded;
+}
+
+// Project accepted terminal-result truth onto the row/batch DOM.  The caller
+// must apply effect/error/warning/running state before this finalization step.
+export function markConvRowResultSettled(row, options) {
+  options = options || {};
+  const batch =
+    row && row.classList && row.classList.contains("conv-row")
+      ? row.closest(".conv-batch")
+      : null;
+  const result = { becameSettled: false, autoFolded: false, batch };
+  if (!batch) return result;
+  if ((row.parentElement || row.parentNode) !== batch) return result;
+
+  row.dataset.resultSettled = "true";
+  const rows = _directConvRows(batch);
+  if (
+    !rows.length ||
+    rows.some((candidate) => candidate.dataset.resultSettled !== "true")
+  ) {
+    if (batch.dataset.resultsSettled === "true") {
+      delete batch.dataset.resultsSettled;
+      setConvBatchExpanded(batch, true);
+    }
+    return result;
+  }
+  if (batch.dataset.resultsSettled === "true") return result;
+
+  batch.dataset.resultsSettled = "true";
+  result.becameSettled = true;
+  if (options.autoFold !== false && isConvBatchCompactEligible(batch)) {
+    result.autoFolded = setConvBatchExpanded(batch, false);
+  }
+  return result;
+}
+
+export function buildConvBatchDisclosure() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "conv-batch-disclosure";
+  button.setAttribute("aria-expanded", "true");
+  button.setAttribute("aria-label", "Hide completed tool details");
+  button.title = "Hide completed tool details";
+  button.textContent = "Completed · Hide details";
+  button.addEventListener("click", () => {
+    const batch = button.closest(".conv-batch");
+    if (!batch || !isConvBatchCompactEligible(batch)) return;
+    const expanded = batch.dataset.compactFolded === "true";
+    setConvBatchExpanded(batch, expanded, { manual: true });
+  });
+  return button;
+}
+
 // Empty batch shell (.conv-batch) + header strip (kicker / summary / tier).
 // The caller appends rows + actions/status and flips the state modifier
 // (--pending/--auto/--running/--approved/--denied/--error).  opts:
@@ -448,6 +771,7 @@ export function buildConvBatchShell(opts) {
     tier.textContent = opts.tierText;
     head.appendChild(tier);
   }
+  head.appendChild(buildConvBatchDisclosure());
   batch.appendChild(head);
   return batch;
 }
@@ -1004,7 +1328,12 @@ export function buildAgentCardBody() {
   context.className = "conv-agent-context";
   context.hidden = true;
   context.setAttribute("aria-hidden", "true");
-  toggle.append(caret, label, context);
+  const issue = document.createElement("span");
+  issue.className = "conv-agent-step-issue";
+  issue.hidden = true;
+  issue.textContent = "child issue";
+  issue.title = "Contains an exceptional child step";
+  toggle.append(caret, label, context, issue);
   const body = document.createElement("div");
   body.className = "conv-agent-body";
   body.id = bodyId;
@@ -1014,5 +1343,5 @@ export function buildAgentCardBody() {
     toggle.setAttribute("aria-expanded", collapsed ? "true" : "false");
   });
   wrap.append(toggle, body);
-  return { wrap, body, label, context, toggle };
+  return { wrap, body, label, context, issue, toggle };
 }

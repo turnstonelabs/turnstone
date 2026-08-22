@@ -474,8 +474,9 @@ def project_history_messages(
       :func:`decorate_tool_call`;
     - ``reasoning`` passes through (already stamped upstream — this
       projection NEVER reads ``_provider_content``, which is gone by now);
-    - tool results: surface ``advisories``, coerce list content to a
-      string, derive ``denied`` / ``is_error`` from the content prefix;
+    - tool results: surface ``advisories`` and the typed effect disposition,
+      coerce list content to a string, derive ``denied`` / ``is_error`` from
+      the content prefix;
     - ``denied`` propagates from a tool result to its parent assistant
       turn; ``pending`` marks the last assistant tool-call turn ONLY when
       the workstream is genuinely awaiting approval for it
@@ -655,6 +656,13 @@ def project_history_messages(
             result_call_id = msg.get("tool_call_id")
             if result_call_id:
                 entry["tool_call_id"] = str(result_call_id)
+            # Typed effect disposition -> the same top-level field carried by
+            # accepted tool_result SSE events. Compact presentation uses it to
+            # keep interrupted/partial/rolled-back outcomes expanded; dropping
+            # it here made those rows fold only after a page reload.
+            effect_status = msg.get("_effect_status")
+            if effect_status:
+                entry["effect_status"] = str(effect_status)
             # Preview-pane descriptor → top-level ``preview``, mirroring the
             # live ``tool_result`` SSE event's field so replay renders the
             # same reopen chip the live path did.

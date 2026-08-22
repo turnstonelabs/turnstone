@@ -15,6 +15,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from tests._js_harness_helpers import extract_braced as _extract_braced
 from tests._js_harness_helpers import strip_js_comments as _strip_comments
 from turnstone.console.server import coordinator_page
 
@@ -1244,6 +1245,118 @@ def test_coordinator_chrome_builder_and_thin_page():
     assert "coord-chrome.css" in index_html, "standalone must link the migrated chrome CSS"
     assert "standalone: true" in index_html
     assert (base / "coord-chrome.css").exists(), "the migrated chrome stylesheet must exist"
+
+
+def test_compact_presentation_coordinator_wiring_and_ordering():
+    """Coordinator retains its own result lifecycle but shares presentation.
+
+    The running-state cleanup must precede settlement, which must precede the
+    coordinator's existing forced scroll. Replay stages the same fold without
+    a completion announcement, and only the rail-less page mounts a control.
+    """
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator"
+    body = (base / "coordinator.js").read_text(encoding="utf-8")
+    css = (base / "coord-chrome.css").read_text(encoding="utf-8")
+
+    for symbol in (
+        "clearConvVerdictPending",
+        "getTranscriptPresentation",
+        "mountTranscriptPresentationToggle",
+        "preserveTranscriptBottomPin",
+        "registerTranscriptScroller",
+        "isConvVerdictCompactBlocker",
+        "markConvRowResultSettled",
+        "setReasoningActivity",
+        "setConvBatchExpanded",
+    ):
+        assert symbol in body
+
+    chrome = _extract_braced(body, "function buildCoordChrome(root, opts) {")
+    toolbar = chrome.index('id: "coord-standalone-toolbar"')
+    coord_body = chrome.index('id: "coord-body"')
+    assert "if (opts.standalone)" in chrome[:toolbar]
+    assert toolbar < coord_body
+    assert 'role: "toolbar"' in chrome
+    assert "mountTranscriptPresentationToggle" not in chrome
+    assert "#coord-standalone-toolbar" in css
+
+    create = _extract_braced(body, "function createCoordinatorPane(root, wsId, opts) {")
+    mount = create.index("mountTranscriptPresentationToggle(")
+    assert create.rfind("if (opts && opts.standalone)", 0, mount) >= 0
+    assert 'querySelector("#coord-status-bar")' in create
+    status_mount = create.index('querySelector("#coord-status-bar")')
+    assert mount < status_mount, "the presentation control must not enter the live status region"
+    assert "registerTranscriptScroller(messagesEl)" in create
+
+    live = _extract_braced(
+        body,
+        "  function appendToolResult(name, callId, output, isError, opts) {",
+    )
+    append = live.index("_appendResultToRow(")
+    running_cleanup = live.index("_unsetBatchRunningIfAllResults(", append)
+    settlement = live.index("markConvRowResultSettled(", running_cleanup)
+    forced_scroll = live.index("_scheduleScroll()", settlement)
+    assert append < running_cleanup < settlement < forced_scroll
+    assert "settlement.autoFolded" in live
+    assert 'getTranscriptPresentation() === "compact"' in live
+    assert '_announcePolite("Completed: "' in live
+
+    replay = _extract_braced(body, "  async function refetchHistory(seedCursor = false) {")
+    occurrence = replay.index("if (occurrence && occurrence.row)")
+    replay_append = replay.index("_appendResultToRow(", occurrence)
+    replay_cleanup = replay.index("_unsetBatchRunningIfAllResults(", replay_append)
+    replay_settlement = replay.index("markConvRowResultSettled(", replay_cleanup)
+    assert replay_append < replay_cleanup < replay_settlement
+    assert '_announcePolite("Completed: "' not in replay[occurrence:replay_settlement]
+
+    tier = _extract_braced(body, "  function _refreshBatchTierImmediate(batch) {")
+    assert 'querySelector(".conv-batch-disclosure")' in tier
+    assert "head.insertBefore(tierEl, disclosure || null)" in tier
+
+    result = _extract_braced(
+        body,
+        "  function _appendResultToRow(row, output, isError, opts) {",
+    )
+    assert result.index("clearConvVerdictPending(row)") < result.index("row.dataset.effectStatus")
+    assert result.index("setToolOutputReviewState(row, output)") < result.index(
+        "row.dataset.effectStatus"
+    )
+    assert result.index("setConvBatchExpanded(") < result.index(
+        'batch.classList.add("conv-batch--error")'
+    )
+    warning = _extract_braced(body, "  function _attachOutputWarningChip(row, oa) {")
+    assert warning.index("setConvBatchExpanded(") < warning.index("buildConvWarning(")
+    pending = _extract_braced(body, "  function _appendJudgePendingLineTo(row) {")
+    assert pending.index("setConvBatchExpanded(") < pending.index("buildConvVerdict(null")
+
+    verdict = _extract_braced(body, "  function _appendVerdictLineTo(row, verdict) {")
+    pin = verdict.index("preserveTranscriptBottomPin(")
+    assert "row.isConnected" in verdict[:pin]
+    assert verdict.index("setConvBatchExpanded(") < verdict.index("buildConvVerdict(verdict)") < pin
+    assert "? preserveTranscriptBottomPin(messagesEl, renderVerdict)" in verdict
+    assert ": renderVerdict();" in verdict
+
+    destroy = _extract_braced(body, "  function destroy() {")
+    assert "unregisterTranscriptScroller();" in destroy
+    assert "unmountTranscriptPresentation();" in destroy
+
+    reasoning = _extract_braced(body, "  function appendReasoningToken(text) {")
+    assert "setReasoningActivity(currentReasoningEl, true)" in reasoning
+    content = _extract_braced(body, "  function appendContentToken(text) {")
+    assert "setReasoningActivity(currentReasoningEl, false)" in content
+    finish = _extract_braced(body, "  function finishAssistantStream() {")
+    assert "setReasoningActivity(currentReasoningEl, false)" in finish
+    busy = _extract_braced(body, "  function setBusy(b, source) {")
+    assert "if (!next) {" in busy
+    assert "setReasoningActivity(currentReasoningEl, false);" in busy
+    assert "currentReasoningEl = null;" in busy
+    assert 'currentReasoningBuf = "";' in busy
+    cancelled = body[body.index('case "cancelled"') : body.index('case "clear_ui"')]
+    assert cancelled.index("setReasoningActivity(currentReasoningEl, false)") < cancelled.index(
+        "if (!busy) break"
+    )
 
 
 def test_coordinator_close_409_uses_plain_retry_copy():

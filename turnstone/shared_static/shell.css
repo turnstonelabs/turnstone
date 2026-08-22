@@ -422,6 +422,16 @@
   border-color: var(--accent-dim);
   color: var(--ink);
 }
+.rail-foot .transcript-presentation-toggle[aria-pressed="true"] {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel-2));
+}
+.transcript-presentation-glyph {
+  font-size: 16px;
+  line-height: 1;
+  transform: scaleX(1.1);
+}
 /* The user chip is a menu button (click → Log out); reset native button
    chrome so it reads as the rail's identity line, not a form control. */
 .user-chip {
@@ -1407,7 +1417,7 @@
   .app.rail-collapsed .proj-grp:not(.open) .proj-grp-items {
     display: block;
   }
-  /* footer stacks: theme toggle above the avatar-only user chip */
+  /* footer stacks: presentation + theme toggles above the avatar-only chip */
   .app.rail-collapsed .rail-foot {
     flex-direction: column;
     gap: 6px;

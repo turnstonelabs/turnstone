@@ -34,6 +34,7 @@ import { authFetch } from "./auth.js";
 // would 404 and abort the whole shell module.
 import { createInteractivePane } from "./interactive.js";
 import { createPreviewPane } from "./preview.js";
+import { mountTranscriptPresentationToggle } from "./transcript_presentation.js";
 
 function make(tag, className, text) {
   const node = document.createElement(tag);
@@ -515,11 +516,13 @@ async function mountShell() {
     shell.connSlot.replaceWith(statusBarEl);
   }
 
-  // Relocate ONLY the theme toggle into the rail footer (id + onclick
-  // preserved), then retire the now-empty header.  The Admin button is dropped
+  // Mount the viewer-local transcript toggle, then relocate ONLY the legacy
+  // theme control into the rail footer (id + onclick preserved) and retire the
+  // now-empty header.  The Admin button is dropped
   // — Manage already surfaces every admin tab, so a separate footer button is
   // redundant.  Logout moves into the user menu (the #logout-btn stays in the
   // hidden header for its wired onclick + auth.js race-guards; the menu clicks it).
+  mountTranscriptPresentationToggle(shell.foot, { className: "ico-btn" });
   const themeBtn = document.getElementById("theme-toggle");
   if (themeBtn) shell.foot.append(themeBtn);
 

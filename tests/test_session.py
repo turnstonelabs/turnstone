@@ -4613,6 +4613,31 @@ class TestTaskExecutionJournalProjection:
         assert steps[1]["is_error"] is True
         assert steps[1]["output"] == "boom"
 
+    def test_exceptional_effect_status_preserved_for_compact_recall_safety(self):
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        turns = [
+            Turn.assistant(
+                tool_calls=(
+                    ToolCall(id="c1", name="notify", arguments="{}"),
+                    ToolCall(id="c2", name="read_file", arguments="{}"),
+                )
+            ),
+            Turn.tool(
+                "c1",
+                "Denied by user",
+                effect_status=EffectStatus.NONE,
+            ),
+            Turn.tool(
+                "c2",
+                "read complete",
+                effect_status=EffectStatus.COMMITTED,
+            ),
+        ]
+        steps = _TaskExecutionJournal(turns).project_steps()
+        assert steps[0]["effect_status"] == "none"
+        assert "effect_status" not in steps[1]
+
     def test_multimodal_result_placeholdered_not_crashed(self):
         # A vision tool result is a list[dict] mis-stored as TextBlock.text; the
         # projection must NOT call Turn.text (would TypeError) — it reads the
@@ -4712,9 +4737,64 @@ class TestTaskExecutionJournalProjection:
         assert len(steps) == _AGENT_STEP_COUNT_CAP + 1
         assert steps[0]["name"] == "…"
         assert "5 earlier steps not retained" in steps[0]["output"]
+        assert "contains_exceptional" not in steps[0]
         # c0..c4 dropped; c5 is the first retained, the newest call is last.
         assert steps[1]["id"] == "c5"
         assert steps[-1]["id"] == f"c{_AGENT_STEP_COUNT_CAP + 4}"
+
+    def test_evicted_noncommitted_step_marks_summary_exceptional(self):
+        from turnstone.core.session import _AGENT_STEP_COUNT_CAP
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        journal = _TaskExecutionJournal([])
+        for i in range(_AGENT_STEP_COUNT_CAP + 1):
+            call_id = f"c{i}"
+            journal.record_assistant(
+                Turn.assistant(tool_calls=(ToolCall(id=call_id, name="bash", arguments="{}"),))
+            )
+            journal.mark_started(call_id)
+            journal.record_result(
+                call_id,
+                "Denied by user" if i == 0 else "ok",
+                is_error=False,
+                effect_status=(EffectStatus.NONE if i == 0 else EffectStatus.COMMITTED),
+            )
+
+        steps = journal.project_steps()
+        assert steps[0]["contains_exceptional"] is True
+        assert not any(step.get("effect_status") for step in steps[1:])
+
+    def test_pending_step_that_fails_after_eviction_marks_summary_exceptional(self):
+        from turnstone.core.session import _AGENT_STEP_COUNT_CAP
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        journal = _TaskExecutionJournal([])
+        journal.record_assistant(
+            Turn.assistant(tool_calls=(ToolCall(id="c0", name="bash", arguments="{}"),))
+        )
+        journal.mark_started("c0")
+        for i in range(1, _AGENT_STEP_COUNT_CAP + 1):
+            call_id = f"c{i}"
+            journal.record_assistant(
+                Turn.assistant(tool_calls=(ToolCall(id=call_id, name="bash", arguments="{}"),))
+            )
+            journal.mark_started(call_id)
+            journal.record_result(
+                call_id,
+                "ok",
+                is_error=False,
+                effect_status=EffectStatus.COMMITTED,
+            )
+
+        journal.record_result(
+            "c0",
+            "late failure",
+            is_error=True,
+            effect_status=EffectStatus.COMMITTED,
+        )
+        steps = journal.project_steps()
+        assert steps[0]["contains_exceptional"] is True
+        assert not any(step.get("is_error") for step in steps[1:])
 
 
 class TestAgentTrajectoryStashWiring:

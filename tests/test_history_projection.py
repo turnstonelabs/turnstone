@@ -189,6 +189,34 @@ class TestProjectHistoryMessages:
     projected wire shape both UIs consume.
     """
 
+    def test_tool_effect_status_matches_accepted_sse_projection(self) -> None:
+        """Reload must retain the accepted event's fail-open disposition.
+
+        Compact presentation keeps ``unknown``/``partial``/``rolled_back``
+        rows expanded. Dropping this side channel from /history made the same
+        row collapse after a reload even though it stayed open live.
+        """
+        raw = [
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "stopped",
+                "_effect_status": "unknown",
+            },
+            {"role": "tool", "tool_call_id": "c2", "content": "ordinary"},
+            {
+                "role": "assistant",
+                "content": "not a tool result",
+                "_effect_status": "partial",
+            },
+        ]
+
+        history = project_history_messages(raw)
+
+        assert history[0]["effect_status"] == "unknown"
+        assert "effect_status" not in history[1]
+        assert "effect_status" not in history[2]
+
     def test_projects_storage_shape_to_wire_shape(self) -> None:
         raw: list[dict[str, Any]] = [
             {

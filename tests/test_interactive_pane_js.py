@@ -1437,6 +1437,109 @@ def test_accepted_tool_event_recorded_only_when_painted() -> None:
     assert gate < record
 
 
+def test_compact_presentation_live_replay_and_lifecycle_wiring() -> None:
+    """The interactive renderer owns settlement timing and late blockers.
+
+    Shared DOM tests cover the fold state machine itself; this pins the pane's
+    load-bearing call order so effect/error truth is present before settlement,
+    replay stays silent, and teardown releases the registered scroller.
+    """
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    for symbol in (
+        "canAutoFoldTranscriptBatch",
+        "clearConvVerdictPending",
+        "getTranscriptPresentation",
+        "preserveTranscriptBottomPin",
+        "registerTranscriptScroller",
+        "markConvRowResultSettled",
+        "setReasoningActivity",
+        "setConvBatchExpanded",
+    ):
+        assert symbol in body
+
+    live = _extract_braced(
+        body,
+        "  appendToolOutput(callId, name, output, isError, preview, opts = {}) {",
+    )
+    settle = live.index("markConvRowResultSettled(target")
+    assert live.index("clearConvVerdictPending(target)") < settle
+    assert live.index("setToolOutputReviewState(target, output)") < settle
+    assert live.index("target.dataset.effectStatus") < settle
+    assert live.index("this._markAgentStepExceptional(") < settle
+    assert live.index('parentBlock.classList.add("conv-batch--error")') < settle
+    assert "const allowAutoFold" in live
+    assert "canAutoFoldTranscriptBatch(" in live
+    assert "_batchLiesBelowViewport" not in body
+    assert settle < live.index('toolAnnounce("Completed: "')
+    assert "settlement.autoFolded" in live
+
+    replay = _extract_braced(body, "  replayHistory(messages) {")
+    replay_settle = replay.index("markConvRowResultSettled(resultTarget")
+    assert replay.index("setToolOutputReviewState(resultTarget, msg.content)") < replay_settle
+    assert replay.index("resultTarget.dataset.effectStatus") < replay_settle
+    assert replay.index('lastToolBlock.classList.add("conv-batch--error")') < replay_settle
+    assert replay.index("_buildOutputWarningEl(assessment.assessment)") < replay_settle
+    assert 'toolAnnounce("Completed: "' not in replay
+
+    upgrade = _extract_braced(
+        body,
+        "  showInlineToolBlock(items, autoApproved, judgePending, cycleId) {",
+    )
+    reset = upgrade.index("announced.replaceChildren()")
+    assert reset < upgrade.index("delete announced.dataset.resultsSettled")
+    assert reset < upgrade.index("delete announced.dataset.compactFolded")
+
+    warning = _extract_braced(body, "  showOutputWarning(evt) {")
+    assert warning.index("setConvBatchExpanded(") < warning.index("_buildOutputWarningEl(")
+    verdict = _extract_braced(body, "  updateVerdictBadge(verdict) {")
+    pin = verdict.index("preserveTranscriptBottomPin(")
+    assert pin < verdict.index("setConvBatchExpanded(") < verdict.index("badge.replaceWith(")
+    nested = _extract_braced(
+        body,
+        "  _routeAgentItems(items, mode, judgePending, cycleId) {",
+    )
+    assert nested.index("setConvBatchExpanded(") < nested.index("row.appendChild(actions)")
+    assert "this._markAgentStepExceptional(row" in nested
+
+    replay_agent = _extract_braced(body, "  _replayAgentCard(row, steps) {")
+    assert "const stepRow = buildToolDiv(" in replay_agent
+    assert "this._markAgentStepExceptional(stepRow" in replay_agent
+    assert "effectStatus: step.effect_status" in replay_agent
+    assert "exceptional: !!step.contains_exceptional" in replay_agent
+
+    marker = _extract_braced(body, "  _markAgentStepExceptional(row, details) {")
+    assert "!details.isError" in marker
+    assert "!details.denied" in marker
+    assert "!details.exceptional" in marker
+    assert 'effectStatus === "committed"' in marker
+    assert 'card.dataset.agentStepExceptional = "true";' in marker
+    assert "issue.hidden = false;" in marker
+    assert marker.index("setConvBatchExpanded(") < marker.index(
+        'card.dataset.agentStepExceptional = "true";'
+    )
+
+    resolution = _extract_braced(
+        body,
+        "  resolveApproval(approved, always, feedback, skipPost, cycleId) {",
+    )
+    marker_call = resolution.index("this._markAgentStepExceptional(")
+    assert marker_call < resolution.index("buildConvStatus(")
+
+    assert "this._unregisterTranscriptScroller = registerTranscriptScroller(" in body
+    cleanup = body.index("if (pane._unregisterTranscriptScroller) {")
+    assert cleanup < body.index("pane._unregisterTranscriptScroller();", cleanup)
+
+    reasoning_case = body[body.index('case "reasoning"') : body.index('case "content"')]
+    assert "setReasoningActivity(this.currentReasoningEl, true)" in reasoning_case
+    assert 'reasoningBody.className = "msg-body"' in reasoning_case
+    assert "reasoningBody.textContent += evt.text" in reasoning_case
+    assert "this.currentReasoningEl.textContent += evt.text" not in reasoning_case
+    content_case = body[body.index('case "content"') : body.index('case "stream_end"')]
+    assert "setReasoningActivity(this.currentReasoningEl, false)" in content_case
+    stream_case = body[body.index('case "stream_end"') : body.index('case "in_progress_snapshot"')]
+    assert "setReasoningActivity(this.currentReasoningEl, false)" in stream_case
+
+
 def test_task_agent_context_badge_is_keyed_idempotent_and_terminal_safe() -> None:
     """Live and synthetic readings share one keyed reducer.
 
