@@ -1861,7 +1861,8 @@ def _poll_title(cdp: CDP, timeout: float) -> str:
 def _storm_scripts() -> tuple[Any, ...]:
     """A bash storm plus task agents with and without nested sub-tools.
 
-    Both agents report warning-level prompt usage. The browser therefore proves
+    Both agents report warning-level prompt usage. The nested agent therefore
+    cooperatively compacts and resumes before finishing. The browser proves
     live and refresh-restored context badges, accessibility, nested routing,
     recycled-id relinking, and context-only terminal cleanup.
     """
@@ -1912,6 +1913,11 @@ def _storm_scripts() -> tuple[Any, ...]:
         task,
         sub,
         {**final_text_script("sub done"), "prompt_tokens": 27_000},
+        # The warning-level no-tool response above cooperatively winds down.
+        # Supply the private summary call and the resumed agent completion
+        # before the parent harness continues.
+        final_text_script("task compaction summary"),
+        final_text_script("sub done after compaction"),
         final_text_script("all done"),
         no_step_task,
         {**final_text_script("direct answer"), "prompt_tokens": 27_000},
@@ -1962,6 +1968,9 @@ def run_storm(chrome: str) -> str:
             return f"RECOVERY-FAILED-STORM-context-resume-late-calls{calls_at_resume}"
 
         node.wait_turn(ws_id, timeout=40)
+        calls_after_nested = node.model_call_count(ws_id)
+        if calls_after_nested != 8:
+            return f"RECOVERY-FAILED-STORM-context-compaction-calls{calls_after_nested}"
         if not _poll_until(
             lambda: cdp.evaluate("!!window.__pane && !window.__pane.busy"),
             5,
