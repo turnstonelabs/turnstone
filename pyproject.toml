@@ -26,7 +26,14 @@ dependencies = [
     # Version 3 moves the default transport to HTTPX2. Keep major upgrades
     # deliberate because the stream retry boundary depends on that contract.
     "openai>=3,<4",
-    "anthropic>=0.117",  # tracks the release current at claude-opus-5 onboarding; hard runtime floor is still 0.105 (mid-conversation system blocks) — Opus 5 itself needs no new SDK surface (model ids are opaque strings; "refusal" has been in the StopReason literal since ~0.95). Raise this when adopting fast mode / server-side fallbacks / advisor / mid-conversation tool changes, which DO need newer typed params.
+    # 0.117 tracks the release current at Claude Opus 5 onboarding; the hard runtime
+    # floor remains 0.105 (mid-conversation system blocks). Opus 5 itself needs no new
+    # SDK surface: model IDs are opaque strings, and "refusal" has been in StopReason
+    # since about 0.95. Raise the floor when adopting fast mode, server-side fallbacks,
+    # advisor, or mid-conversation tool changes, which need newer typed parameters.
+    # Version 1 moves to HTTPX2 and removes Messages sampling kwargs, so migrate the
+    # provider boundary before removing the cap.
+    "anthropic>=0.117,<1",
     "httpx>=0.28",
     # Direct because the provider boundary catches this exception family;
     # OpenAI v3's transitive dependency alone is not an import contract.
