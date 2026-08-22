@@ -7961,6 +7961,117 @@ class TestMemoryIndexSnapshotLifecycle:
 
         assert get_storage().get_memory_index_snapshot(session.ws_id) is not None
 
+    def test_first_capture_waits_through_catalog_prefix_churn(self, tmp_db):
+        """Cold MCP catalog callbacks may invalidate several capture plans."""
+        session = _make_registered_session(ws_id="catalog-churn-index", user_id="owner")
+        generation = session._claim_generation(principal_id="owner")
+        session._memory_index_admission_generation = generation
+        candidate = {
+            "content": '<memory-index format="1" entries="0" project_id=""></memory-index>',
+            "principal_id": "owner",
+            "project_id": "",
+            "project_name": "",
+            "entry_count": 0,
+            "char_count": 66,
+            "invalid_description_count": 0,
+        }
+        attempts = 0
+
+        def acquire(
+            _ws_id: str,
+            _principal_id: str,
+            *,
+            commit_context: Any,
+        ) -> dict[str, Any]:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 4:
+                session._invalidate_system_prefix()
+            with commit_context(candidate):
+                pass
+            return candidate
+
+        with (
+            patch(
+                "turnstone.core.session.acquire_memory_index_snapshot",
+                side_effect=acquire,
+            ),
+            patch.object(session, "_backoff_or_cancelled") as backoff,
+        ):
+            session._admit_memory_index_request(
+                session._primary_lane(),
+                my_generation=generation,
+                principal_id="owner",
+            )
+
+        assert attempts == 5
+        assert backoff.call_args_list == [
+            call(0.025, generation),
+            call(0.05, generation),
+            call(0.1, generation),
+            call(0.2, generation),
+        ]
+        assert session._memory_index_snapshot == candidate
+        assert "<memory-index" in self._index_text(session)
+
+    def test_first_capture_stop_during_catalog_backoff_aborts_retry(self, tmp_db):
+        """Stop during catalog churn prevents another admission attempt."""
+        from turnstone.core.session import GenerationCancelled
+
+        session = _make_registered_session(ws_id="catalog-churn-stop", user_id="owner")
+        generation = session._claim_generation(principal_id="owner")
+        session._memory_index_admission_generation = generation
+        candidate = {
+            "content": '<memory-index format="1" entries="0" project_id=""></memory-index>',
+            "principal_id": "owner",
+            "project_id": "",
+            "project_name": "",
+            "entry_count": 0,
+            "char_count": 66,
+            "invalid_description_count": 0,
+        }
+        attempts = 0
+
+        def acquire(
+            _ws_id: str,
+            _principal_id: str,
+            *,
+            commit_context: Any,
+        ) -> dict[str, Any]:
+            nonlocal attempts
+            attempts += 1
+            session._invalidate_system_prefix()
+            with commit_context(candidate):
+                pass
+            return candidate
+
+        real_backoff = session._backoff_or_cancelled
+
+        def cancel_then_backoff(delay: float, my_generation: int) -> None:
+            session.cancel()
+            real_backoff(delay, my_generation)
+
+        with (
+            patch(
+                "turnstone.core.session.acquire_memory_index_snapshot",
+                side_effect=acquire,
+            ),
+            patch.object(
+                session,
+                "_backoff_or_cancelled",
+                side_effect=cancel_then_backoff,
+            ) as backoff,
+            pytest.raises(GenerationCancelled),
+        ):
+            session._admit_memory_index_request(
+                session._primary_lane(),
+                my_generation=generation,
+                principal_id="owner",
+            )
+
+        assert attempts == 1
+        backoff.assert_called_once_with(0.025, generation)
+
     def test_raced_existing_snapshot_refusal_reports_truthful_remediation(self, tmp_db):
         from turnstone.core.personas import PersonaSnapshot
         from turnstone.core.storage import get_storage

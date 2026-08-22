@@ -1968,6 +1968,19 @@ class _MemoryIndexPlanStaleError(RuntimeError):
         self.snapshot = snapshot
 
 
+# First-turn memory-index capture can overlap asynchronous MCP catalog
+# priming. Resource/prompt callbacks deliberately invalidate the cached
+# system prefix, which makes the in-flight candidate stale and rolls its
+# transaction back. A cold enterprise catalog can publish several of those
+# callbacks over a few seconds, so three immediate retries are not enough.
+# Back off outside both the storage transaction and the model-capacity lease;
+# this gives catalog publication a bounded window to settle without weakening
+# the prefix epoch fence.
+_MEMORY_INDEX_ADMISSION_RETRIES = 12
+_MEMORY_INDEX_ADMISSION_RETRY_BASE_DELAY = 0.025
+_MEMORY_INDEX_ADMISSION_RETRY_MAX_DELAY = 0.5
+
+
 # ``list_nodes`` reserves four top-level kwargs for control parameters
 # (filters / paging / output verbosity / liveness toggle).  Anything
 # else the model passes at the top level is treated as a flat filter
@@ -6888,7 +6901,7 @@ class ChatSession:
             return
         if snapshot is None:
             project_witness: dict[str, Any] | None = None
-            for _attempt in range(3):
+            for attempt in range(_MEMORY_INDEX_ADMISSION_RETRIES):
                 admission = self._plan_first_memory_index_admission(
                     lane=lane,
                     principal_id=principal_id,
@@ -6907,6 +6920,14 @@ class ChatSession:
                     break
                 except _MemoryIndexPlanStaleError as stale:
                     project_witness = stale.snapshot
+                    if attempt + 1 < _MEMORY_INDEX_ADMISSION_RETRIES:
+                        self._backoff_or_cancelled(
+                            min(
+                                _MEMORY_INDEX_ADMISSION_RETRY_BASE_DELAY * (2**attempt),
+                                _MEMORY_INDEX_ADMISSION_RETRY_MAX_DELAY,
+                            ),
+                            my_generation,
+                        )
             else:
                 raise RuntimeError("memory context could not be refreshed safely")
             if snapshot is None:
