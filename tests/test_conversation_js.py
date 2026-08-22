@@ -15,8 +15,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from tests._js_harness_helpers import node_skip
-from tests.test_transcript_presentation_js import _FAKE_DOM
+from tests._js_harness_helpers import FAKE_DOM, node_skip
 
 _CONVERSATION_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
@@ -100,7 +99,7 @@ def test_agent_card_exposes_hidden_context_badge() -> None:
 @node_skip
 def test_compact_batch_settlement_disclosure_and_fail_open_behavior() -> None:
     script = (
-        _FAKE_DOM
+        FAKE_DOM
         + f"""
 const conv = await import({json.dumps(_CONVERSATION_JS.as_uri())});
 const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};

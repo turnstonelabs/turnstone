@@ -13,6 +13,176 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+FAKE_DOM = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tagName = String(tag || "div").toUpperCase();
+    this.parentNode = null;
+    this.children = [];
+    this.dataset = {};
+    this.attributes = {};
+    this.className = "";
+    this.textContent = "";
+    this.title = "";
+    this.type = "";
+    this.paused = true;
+    this.ended = false;
+    this.scrollHeight = 0;
+    this.scrollTop = 0;
+    this.clientHeight = 0;
+    this._connected = false;
+    this._listeners = new Map();
+    this.classList = {
+      contains: (name) => this.className.split(/\s+/).filter(Boolean).includes(name),
+      add: (...names) => {
+        const set = new Set(this.className.split(/\s+/).filter(Boolean));
+        names.forEach((name) => set.add(name));
+        this.className = Array.from(set).join(" ");
+      },
+      remove: (...names) => {
+        const drop = new Set(names);
+        this.className = this.className
+          .split(/\s+/)
+          .filter((name) => name && !drop.has(name))
+          .join(" ");
+      },
+      toggle: (name, force) => {
+        const next = force == null ? !this.classList.contains(name) : !!force;
+        if (next) this.classList.add(name);
+        else this.classList.remove(name);
+        return next;
+      },
+    };
+  }
+  get isConnected() { return this._connected; }
+  _setConnected(value) {
+    this._connected = value;
+    this.children.forEach((child) => child._setConnected(value));
+  }
+  appendChild(child) {
+    if (child.parentNode) child.remove();
+    this.children.push(child);
+    child.parentNode = this;
+    child._setConnected(this._connected);
+    return child;
+  }
+  append(...children) { children.forEach((child) => this.appendChild(child)); }
+  remove() {
+    if (!this.parentNode) return;
+    const i = this.parentNode.children.indexOf(this);
+    if (i >= 0) this.parentNode.children.splice(i, 1);
+    this.parentNode = null;
+    this._setConnected(false);
+  }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return this.attributes[name] ?? null; }
+  hasAttribute(name) { return Object.hasOwn(this.attributes, name); }
+  removeAttribute(name) { delete this.attributes[name]; }
+  addEventListener(name, fn, options) {
+    if (!this._listeners.has(name)) this._listeners.set(name, []);
+    this._listeners.get(name).push({ fn, once: !!(options && options.once) });
+  }
+  removeEventListener(name, fn) {
+    const rows = this._listeners.get(name) || [];
+    this._listeners.set(name, rows.filter((row) => row.fn !== fn));
+  }
+  dispatch(name) {
+    const rows = [...(this._listeners.get(name) || [])];
+    for (const row of rows) {
+      row.fn({ target: this });
+      if (row.once) this.removeEventListener(name, row.fn);
+    }
+  }
+  click() { this.dispatch("click"); }
+  focus() { document.activeElement = this; }
+  contains(node) {
+    for (let current = node; current; current = current.parentNode) {
+      if (current === this) return true;
+    }
+    return false;
+  }
+  _matches(selector) {
+    selector = selector.trim();
+    const attr = selector.match(/^(?:\.([\w-]+))?\[([\w-]+)="([^"]*)"\]$/);
+    if (attr) {
+      if (attr[1] && !this.classList.contains(attr[1])) return false;
+      const name = attr[2];
+      const value = name.startsWith("data-")
+        ? this.dataset[name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())]
+        : this.getAttribute(name);
+      return String(value) === attr[3];
+    }
+    if (selector.startsWith(".")) {
+      return selector.slice(1).split(".").every((name) => this.classList.contains(name));
+    }
+    return this.tagName.toLowerCase() === selector.toLowerCase();
+  }
+  closest(selector) {
+    for (let current = this; current; current = current.parentNode) {
+      if (current._matches(selector)) return current;
+    }
+    return null;
+  }
+  querySelectorAll(selector) {
+    const selectors = selector.split(",").map((part) => part.trim());
+    const found = [];
+    const visit = (node) => {
+      for (const child of node.children) {
+        if (selectors.some((part) => child._matches(part))) found.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return found;
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  getClientRects() { return this._visible === false ? [] : [{}]; }
+}
+
+const html = new FakeElement("html");
+html._setConnected(true);
+globalThis.document = {
+  documentElement: html,
+  activeElement: null,
+  createElement: (tag) => new FakeElement(tag),
+};
+const storage = new Map();
+let failGet = false;
+let failSet = false;
+globalThis.localStorage = {
+  getItem: (key) => {
+    if (failGet) throw new Error("get blocked");
+    return storage.has(key) ? storage.get(key) : null;
+  },
+  setItem: (key, value) => {
+    if (failSet) throw new Error("set blocked");
+    storage.set(key, String(value));
+  },
+};
+const windowListeners = new Map();
+globalThis.window = {
+  addEventListener: (name, fn) => windowListeners.set(name, fn),
+};
+globalThis.requestAnimationFrame = (fn) => { fn(); return 1; };
+const resizeObservers = [];
+globalThis.ResizeObserver = class {
+  constructor(fn) {
+    this.fn = fn;
+    this.targets = new Set();
+    this.disconnected = false;
+    resizeObservers.push(this);
+  }
+  observe(target) { this.targets.add(target); }
+  disconnect() { this.disconnected = true; this.targets.clear(); }
+};
+globalThis.triggerResize = (target) => {
+  for (const observer of resizeObservers) {
+    if (!observer.disconnected && observer.targets.has(target)) observer.fn([]);
+  }
+};
+"""
+
+
 def has_node() -> bool:
     return shutil.which("node") is not None
 
