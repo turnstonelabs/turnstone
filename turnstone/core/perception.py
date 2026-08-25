@@ -154,6 +154,7 @@ def describe_cached(
     parts: list[dict[str, Any]],
     prompt: str = _DESCRIBE_PROMPT,
     cancel_ref: Any = None,
+    result_suffix: str = "",
 ) -> str:
     """Memoized :func:`describe` for the wire fallback.
 
@@ -164,7 +165,9 @@ def describe_cached(
     reload from reusing output produced by an older backend/auth policy. Returns
     ``""`` on a backend failure (a placeholder is rendered upstream) and does
     *not* cache failures. Cancellation propagates as control flow so Stop can
-    abort the parent turn.
+    abort the parent turn. A nonempty ``result_suffix`` is appended to a
+    successful description before memoization; PDF rasterization uses this to
+    preserve its deterministic cutoff notice on later cache hits.
     A completed-but-EMPTY description memoizes like any other result — one
     perceive per key, ever (an all-reasoning pass pins the placeholder; the
     remediation is server-side: a reasoning parser or the template thinking
@@ -196,6 +199,8 @@ def describe_cached(
         log.warning("perception fallback failed (alias=%s): %s", lane.alias, exc)
         return ""
     refuse_aborted_request(cancel_ref)
+    if text and result_suffix and result_suffix not in text:
+        text = f"{text}\n\n{result_suffix}"
     with _cache_lock:
         refuse_aborted_request(cancel_ref)
         # Re-check under the lock: the describe call ran unlocked, and a

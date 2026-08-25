@@ -154,6 +154,14 @@ class ModelAdmissionError(RuntimeError):
     """
 
 
+class ModelContextLimitError(RuntimeError):
+    """A fully prepared local request cannot fit the serving lane's context.
+
+    This is checked after attachment materialization but before the provider
+    capacity lease. It is a local request-shape outcome, not backend health.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Lane resolution — the ONE place capability / extra-params / flag lookup
 # happens.  ``ChatSession`` delegates its wrappers here; the judges build
@@ -1148,6 +1156,7 @@ def model_turn(
     deferred_names: frozenset[str] | None = None,
     prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None = None,
     admit_request: Callable[[ModelLane], None] | None = None,
+    validate_wire: Callable[[list[dict[str, Any]], ModelLane], None] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
@@ -1182,6 +1191,10 @@ def model_turn(
     Keeping nested perception/audio work outside the outer alias's gate avoids
     self-deadlock at a limit of one. Turn IR itself never carries inline media
     bytes.
+
+    *validate_wire* is the final local context backstop. It sees the fully
+    materialized and caller-prepared wire immediately before capacity admission;
+    a failure propagates without touching backend health or transport state.
 
     *mint* rewrites each returned tool call's id (provider-original →
     caller-scoped) before the Turn is built; the native blocks keep the
@@ -1364,6 +1377,11 @@ def model_turn(
                 cfg=cfg,
             )
             _raise_if_aborted(cancel_ref, lane)
+        else:
+            dispatched_wire = served_wire
+        if validate_wire is not None:
+            validate_wire(dispatched_wire, lane)
+            _raise_if_aborted(cancel_ref, lane)
         lease = lane.admission.acquire(cancel_ref=cancel_ref) if lane.admission else None
         drain_error: Exception | None = None
         with lease if lease is not None else contextlib.nullcontext():
@@ -1376,8 +1394,6 @@ def model_turn(
                 cancel_ref=cancel_ref,
             )
             _raise_if_aborted(cancel_ref, lane)
-            if admit_request is None:
-                dispatched_wire = served_wire
             _raise_if_aborted(cancel_ref, lane)
             mark_dispatch = getattr(cancel_ref, "mark_dispatch", None)
             if callable(mark_dispatch):

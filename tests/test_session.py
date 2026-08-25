@@ -11859,6 +11859,274 @@ def test_main_model_lane_pins_the_initiating_principal_before_auth_resolution():
     )
 
 
+@pytest.mark.parametrize(
+    ("reference_count", "aggregate_chars"),
+    [(1, 500_000), (2, 500_000)],
+)
+def test_main_model_lane_passes_per_occurrence_pdf_text_budget(
+    reference_count: int,
+    aggregate_chars: int,
+) -> None:
+    from turnstone.core.media_materialization import PDF_EXTRACTED_TEXT_PART_OVERHEAD_CHARS
+    from turnstone.core.session import _TokenCalibration
+    from turnstone.core.trajectory import AttachmentRef
+
+    session = _make_session(context_window=200_000)
+    session.messages.append(
+        Turn(
+            Role.USER,
+            tuple(AttachmentRef(attachment_id="pdf", kind="pdf") for _ in range(reference_count)),
+        )
+    )
+    serving_lane = session._primary_lane()
+    session._token_calibrations[session._token_calibration_key(serving_lane)] = _TokenCalibration(
+        chars_per_token=5.0
+    )
+    consumer = MagicMock()
+    seen: dict[str, Any] = {}
+
+    def fake_model_turn(_lane, *_args, **kwargs):
+        resolver = kwargs["resolve_attachments"]
+        budget_factory = resolver.keywords["pdf_text_budget_chars"]
+        seen["pdf_text_budget_chars"] = budget_factory()
+        seen["validate_wire"] = kwargs["validate_wire"]
+        return MagicMock()
+
+    with patch("turnstone.core.session.model_turn", side_effect=fake_model_turn):
+        session._model_turn_with_retry(
+            serving_lane,
+            None,
+            consumer,
+            lambda wire, _lane: wire,
+            principal_id="user-a",
+        )
+
+    expected = (
+        aggregate_chars - reference_count * PDF_EXTRACTED_TEXT_PART_OVERHEAD_CHARS
+    ) // reference_count
+    assert seen["pdf_text_budget_chars"] == expected
+    assert callable(seen["validate_wire"])
+
+
+def test_attachment_pdf_budget_fits_repeated_final_extracted_documents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from turnstone.core.lowering import sanitize_tool_call_arguments
+    from turnstone.core.media_materialization import PdfSource, materialize_pdf
+    from turnstone.core.providers._protocol import ModelCapabilities
+    from turnstone.core.trajectory import AttachmentRef, resolve_attachment_parts
+
+    reference_count = 6
+    session = _make_session(context_window=8_192, max_tokens=2_048)
+    session.messages.append(
+        Turn(
+            Role.USER,
+            tuple(AttachmentRef(attachment_id="pdf", kind="pdf") for _ in range(reference_count)),
+        )
+    )
+    lane = session._primary_lane()
+    caps = ModelCapabilities()
+    budget = session._utility_budget_snapshot(lane)
+    prefix_cap = session._attachment_pdf_text_budget_chars(caps, [], budget)
+
+    # Deliberately violate the low-level mock's raw-prefix contract. The
+    # materializer must still cap the exact post-neutralization wire form.
+    monkeypatch.setattr(
+        "turnstone.core.pdf.extract_pdf_text",
+        lambda _data, *, max_chars: "x" * (max_chars + 1_000),
+    )
+    materialized = materialize_pdf(
+        PdfSource(data=b"%PDF", filename="n" * 1_000, content_hash="pdf"),
+        caps,
+        perceive=lambda _source, _parts: None,
+        max_extracted_chars=prefix_cap,
+    )
+    prepared = session._prepare_lowered_wire_messages(
+        [
+            *session._system_messages_for_lane(caps),
+            *sanitize_tool_call_arguments(dicts_from_turns(session.messages)),
+        ],
+        caps=caps,
+    )
+    final_wire = resolve_attachment_parts(prepared, {"pdf": materialized.content})
+
+    session._validate_model_input_budget(
+        final_wire,
+        lane,
+        tools=[],
+        max_tokens=2_048,
+        budget=budget,
+    )
+
+
+def test_final_pdf_validation_does_not_double_count_audio_fallback() -> None:
+    from turnstone.core.session import _usable_input_capacity
+
+    session = _make_session(context_window=8_192, max_tokens=2_048)
+    lane = session._primary_lane()
+    budget = session._utility_budget_snapshot(lane)
+    wire = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "document": {
+                        "name": "report.pdf",
+                        "media_type": "application/pdf",
+                        "data": "AAAA",
+                    },
+                },
+                {"type": "text", "text": "x" * 20_000},
+            ],
+            "_attachments_meta": [
+                {"kind": "pdf", "size_bytes": 32_000_000},
+                {"kind": "audio", "size_bytes": 25_000_000},
+            ],
+        }
+    ]
+    capacity = _usable_input_capacity(budget.context_window, 2_048)
+    pdf_only_projection = session._without_pdf_reference_estimates(wire)
+    old_used = session._estimate_wire_prompt_tokens(
+        pdf_only_projection,
+        chars_per_token=budget.chars_per_token,
+        tools=None,
+    )
+    final_projection = session._without_consumed_media_reference_estimates(wire)
+    final_used = session._estimate_wire_prompt_tokens(
+        final_projection,
+        chars_per_token=budget.chars_per_token,
+        tools=None,
+    )
+
+    assert old_used > capacity >= final_used
+    session._validate_model_input_budget(
+        wire,
+        lane,
+        tools=None,
+        max_tokens=2_048,
+        budget=budget,
+    )
+
+
+def test_attachment_pdf_text_budget_yields_to_existing_prompt() -> None:
+    session = _make_session(context_window=8_192, max_tokens=2_048)
+    lane = session._primary_lane()
+    session.messages.append(Turn.user("x" * 30_000))
+
+    budget = session._attachment_pdf_text_budget_chars(
+        session._get_capabilities(),
+        [],
+        session._utility_budget_snapshot(lane),
+    )
+
+    assert budget == 0
+
+
+def test_final_materialized_wire_is_rejected_before_strict_backend_dispatch() -> None:
+    from turnstone.core.model_turn import ModelContextLimitError, model_turn
+    from turnstone.core.providers._protocol import ModelCapabilities
+    from turnstone.core.trajectory import AttachmentRef
+
+    session = _make_session(context_window=8_192, max_tokens=2_048)
+    provider = seam_provider("must not dispatch")
+    lane = replace_session_lane(
+        session,
+        provider=provider,
+        capabilities=ModelCapabilities(context_window=8_192),
+    )
+    turn = Turn(Role.USER, (AttachmentRef(attachment_id="pdf", kind="pdf"),))
+
+    def resolve(_ids: list[str]) -> dict[str, Any]:
+        return {
+            "pdf": {
+                "type": "document",
+                "document": {
+                    "name": "report.pdf (extracted text)",
+                    "media_type": "text/plain",
+                    "data": "x" * 24_576,
+                },
+            }
+        }
+
+    def validate(wire, serving_lane) -> None:
+        session._validate_model_input_budget(
+            wire,
+            serving_lane,
+            tools=None,
+            max_tokens=2_048,
+            budget=session._utility_budget_snapshot(serving_lane),
+        )
+
+    with pytest.raises(ModelContextLimitError, match="context window"):
+        model_turn(
+            lane,
+            [turn],
+            max_tokens=2_048,
+            resolve_attachments=resolve,
+            validate_wire=validate,
+        )
+
+    provider.create_streaming.assert_not_called()
+
+
+def test_final_wire_validator_does_not_tokenize_native_pdf_base64_as_text() -> None:
+    session = _make_session(context_window=8_192, max_tokens=2_048)
+    lane = session._primary_lane()
+    wire = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "document": {
+                        "name": "report.pdf",
+                        "media_type": "application/pdf",
+                        "data": "x" * 1_000_000,
+                    },
+                }
+            ],
+        }
+    ]
+
+    session._validate_model_input_budget(
+        wire,
+        lane,
+        tools=None,
+        max_tokens=2_048,
+        budget=session._utility_budget_snapshot(lane),
+    )
+
+
+def test_final_wire_validator_does_not_charge_consumed_pdf_metadata() -> None:
+    session = _make_session(context_window=8_192, max_tokens=2_048)
+    lane = session._primary_lane()
+    wire = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+            "_attachments_meta": [
+                {
+                    "attachment_id": "pdf",
+                    "kind": "pdf",
+                    "size_bytes": 1_000_000,
+                }
+            ],
+        }
+    ]
+
+    session._validate_model_input_budget(
+        wire,
+        lane,
+        tools=None,
+        max_tokens=2_048,
+        budget=session._utility_budget_snapshot(lane),
+    )
+
+
 def test_fallback_lane_pins_the_initiating_principal_during_resolution():
     session = _make_session()
     generation = session._claim_generation()
@@ -12215,26 +12483,69 @@ def test_utility_completion_never_guesses_a_toggle_key():
     assert (kw["extra_params"] or {}).get("chat_template_kwargs") is None
 
 
-def test_web_fetch_extraction_inherits_session_max_tokens_and_effort():
-    """web_fetch's extraction call must inherit the session/registry max_tokens
-    and reasoning_effort rather than forcing constants.  Hard-coding
-    max_tokens=8192 / reasoning_effort="low" broke local-inference models whose
-    registry entry advertises a tighter output limit or a reasoning config the
-    forced values fought — this lane now behaves like the main turn."""
+def test_utility_completion_forwards_request_local_attachment_resolver():
+    """Transient media materializes at model_turn without entering Turn IR."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+    from turnstone.core.trajectory import AttachmentRef
+
+    session = _make_session()
+    provider = MagicMock()
+    provider.provider_name = "openai-compatible"
+    provider.create_streaming.return_value = as_stream(CompletionResult(content="answer"))
+    replace_session_lane(
+        session,
+        provider=provider,
+        capabilities=ModelCapabilities(supports_pdf=True),
+    )
+    turn = Turn(Role.USER, (AttachmentRef("request-local", "pdf"),))
+    part = {
+        "type": "document",
+        "document": {
+            "name": "request.pdf",
+            "media_type": "application/pdf",
+            "data": "JVBERi0=",
+        },
+    }
+
+    session._utility_completion(
+        [turn],
+        resolve_attachments=lambda ids: {"request-local": part} if ids else {},
+    )
+
+    sent = provider.create_streaming.call_args.kwargs["messages"]
+    assert sent[0]["content"] == [part]
+    assert turn.content == (AttachmentRef("request-local", "pdf"),)
+
+
+def test_web_fetch_text_extraction_uses_pinned_lane_sampling_snapshot():
+    """Text extraction keeps the lane's sampling knobs across a live rebind."""
     from unittest.mock import patch
 
     from turnstone.core.providers._protocol import CompletionResult
 
-    session = _make_session(max_tokens=512, reasoning_effort="high")
+    session = _make_session(max_tokens=512, temperature=0.3, reasoning_effort="high")
     session._acting_user_id = "user-b"
+    estimate = session._estimate_wire_prompt_tokens
+
+    def estimate_then_mutate(*args, **kwargs):
+        result = estimate(*args, **kwargs)
+        session.temperature = 0.9
+        session.reasoning_effort = "low"
+        return result
 
     resp = MagicMock()
     resp.raise_for_status.return_value = None
     resp.headers = {"content-type": "text/plain"}
     resp.text = "The page body that holds the answer."
+    resp.content = resp.text.encode()
 
     with (
         patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=resp),
+        patch.object(
+            session,
+            "_estimate_wire_prompt_tokens",
+            side_effect=estimate_then_mutate,
+        ),
         patch.object(
             session,
             "_utility_completion",
@@ -12255,7 +12566,11 @@ def test_web_fetch_extraction_inherits_session_max_tokens_and_effort():
     # 512 < context_window // 4 (8192), so the tighter session value passes
     # through unclamped — inheritance, not the old hard-coded 8192.
     assert kw["max_tokens"] == 512
-    assert kw["reasoning_effort"] == "high"  # session value, not the old "low"
+    assert kw["lane"].temperature == 0.3
+    assert kw["lane"].reasoning_effort == "high"
+    assert "temperature" not in kw
+    assert "reasoning_effort" not in kw
+    assert kw["use_session_temperature"] is False
     assert kw["principal_id"] == "user-a"
 
 
@@ -12275,6 +12590,7 @@ def test_web_fetch_extraction_caps_max_tokens_to_window_reserve():
     resp.raise_for_status.return_value = None
     resp.headers = {"content-type": "text/plain"}
     resp.text = "The page body that holds the answer."
+    resp.content = resp.text.encode()
 
     with (
         patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=resp),
@@ -12288,6 +12604,661 @@ def test_web_fetch_extraction_caps_max_tokens_to_window_reserve():
 
     _, kw = uc.call_args
     assert kw["max_tokens"] == 2048  # context_window // 4, not the 16384 session value
+    assert kw["lane"].model == session.model
+    assert callable(kw["validate_wire"])
+
+
+def test_web_fetch_text_uses_context_scaled_document_budget_and_final_guard() -> None:
+    from turnstone.core.providers._protocol import CompletionResult
+    from turnstone.core.trajectory import dicts_from_turns
+
+    session = _make_session(max_tokens=2_048, context_window=8_192)
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.headers = {"content-type": "text/plain"}
+    response.text = "z" * 100_000
+    response.content = response.text.encode()
+    captured: dict[str, Any] = {}
+
+    def complete(turns, **kwargs):
+        captured["turns"] = turns
+        captured["kwargs"] = kwargs
+        kwargs["validate_wire"](dicts_from_turns(turns), kwargs["lane"])
+        return CompletionResult(content="Extracted answer.")
+
+    with (
+        patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=response),
+        patch.object(session, "_utility_completion", side_effect=complete),
+    ):
+        _, answer = session._exec_web_fetch(
+            {
+                "call_id": "text-budget",
+                "url": "https://example.com/",
+                "question": "What does it say?",
+            }
+        )
+
+    assert answer == "Extracted answer."
+    sent_text = captured["turns"][1].content[0].text
+    assert 0 < sent_text.count("z") <= int(8_192 * 0.5 * 4.0)
+    assert "chars truncated" in sent_text
+    assert captured["kwargs"]["max_tokens"] == 2_048
+
+
+def test_web_fetch_text_zero_document_budget_skips_extraction() -> None:
+    session = _make_session()
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.headers = {"content-type": "text/plain"}
+    response.text = "source content"
+    response.content = response.text.encode()
+
+    with (
+        patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=response),
+        patch("turnstone.core.session._document_text_budget_chars", return_value=0),
+        patch.object(session, "_utility_completion") as utility,
+    ):
+        _, answer = session._exec_web_fetch(
+            {"call_id": "text-no-budget", "url": "https://example.com/"}
+        )
+
+    assert answer == "Error: fetched content cannot fit within the active model's document budget"
+    utility.assert_not_called()
+
+
+def _pdf_fetch_response(
+    body: bytes = b"%PDF-1.4 fetched body",
+    *,
+    content_type: str = "application/pdf",
+) -> MagicMock:
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.headers = {"content-type": content_type}
+    response.content = body
+    response.text = "PDF bytes must not be decoded through the text route."
+    return response
+
+
+def _capture_pdf_utility(captured: dict[str, Any], *, answer: str = "PDF answer."):
+    from turnstone.core.providers._protocol import CompletionResult
+    from turnstone.core.trajectory import AttachmentRef, dicts_from_turns, materialize_attachments
+
+    def complete(turns, **kwargs):
+        captured["turns"] = turns
+        captured["kwargs"] = kwargs
+        ref = next(block for block in turns[1].content if isinstance(block, AttachmentRef))
+        resolved = kwargs["resolve_attachments"]([ref.attachment_id])
+        captured["content"] = resolved[ref.attachment_id]
+        validate_wire = kwargs.get("validate_wire")
+        if validate_wire is not None:
+            wire = materialize_attachments(dicts_from_turns(turns), kwargs["resolve_attachments"])
+            validate_wire(wire, kwargs["lane"])
+        return CompletionResult(content=answer)
+
+    return complete
+
+
+class TestWebFetchPdf:
+    @pytest.mark.parametrize(
+        ("context_window", "chars_per_token", "context_share", "expected"),
+        [
+            (4_096, 4.0, 0.5, 8_192),
+            (8_000, 4.0, 0.5, 16_000),
+            (200_000, 4.0, 0.5, 400_000),
+            (1_100_000, 4.0, 0.5, 2_200_000),
+            (1_000_000, 5.0, 0.5, 2_500_000),
+        ],
+    )
+    def test_document_text_budget_scales_continuously_with_lane_context(
+        self,
+        context_window: int,
+        chars_per_token: float,
+        context_share: float,
+        expected: int,
+    ) -> None:
+        from turnstone.core.session import _document_text_budget_chars, _UtilityBudgetSnapshot
+
+        budget = _UtilityBudgetSnapshot(
+            context_window=context_window,
+            chars_per_token=chars_per_token,
+            max_tokens=4_096,
+        )
+
+        assert _document_text_budget_chars(budget, context_share=context_share) == expected
+
+    def test_pdf_text_budget_stops_at_worker_output_envelope(self) -> None:
+        from turnstone.core.pdf import PDF_TEXT_CHAR_CAP
+        from turnstone.core.session import _document_text_budget_chars, _UtilityBudgetSnapshot
+
+        budget = _UtilityBudgetSnapshot(
+            context_window=10_000_000,
+            chars_per_token=4.0,
+            max_tokens=4_096,
+        )
+
+        assert (
+            _document_text_budget_chars(
+                budget,
+                context_share=0.5,
+                hard_char_cap=PDF_TEXT_CHAR_CAP,
+            )
+            == PDF_TEXT_CHAR_CAP
+        )
+
+    @pytest.mark.parametrize("content_type", ["application/pdf", "text/plain"])
+    def test_web_fetch_pdf_magic_uses_native_ephemeral_document(
+        self,
+        content_type: str,
+    ) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        replace_session_lane(
+            session,
+            capabilities=ModelCapabilities(supports_pdf=True),
+        )
+        before = list(session.messages)
+        captured: dict[str, Any] = {}
+        response = _pdf_fetch_response(content_type=content_type)
+
+        with (
+            patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=response),
+            patch.object(
+                session,
+                "_utility_completion",
+                side_effect=_capture_pdf_utility(captured),
+            ),
+        ):
+            call_id, answer = session._exec_web_fetch(
+                {
+                    "call_id": "pdf-native",
+                    "url": "https://example.com/report",
+                    "question": "What does it say?",
+                }
+            )
+
+        assert (call_id, answer) == ("pdf-native", "PDF answer.")
+        part = captured["content"]
+        assert part["type"] == "document"
+        assert part["document"]["media_type"] == "application/pdf"
+        assert base64.b64decode(part["document"]["data"]) == response.content
+        assert session.messages == before
+        assert response.content not in answer.encode()
+
+    def test_zero_local_text_budget_does_not_reject_native_pdf(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        replace_session_lane(
+            session,
+            capabilities=ModelCapabilities(supports_pdf=True),
+        )
+        captured: dict[str, Any] = {}
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch("turnstone.core.session._document_text_budget_chars", return_value=0),
+            patch.object(
+                session,
+                "_utility_completion",
+                side_effect=_capture_pdf_utility(captured),
+            ),
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "pdf-native-no-text-budget", "url": "https://example.com/a"}
+            )
+
+        assert answer == "PDF answer."
+        assert captured["content"]["document"]["media_type"] == "application/pdf"
+
+    def test_web_fetch_pdf_header_without_magic_keeps_text_route(self) -> None:
+        from turnstone.core.providers._protocol import CompletionResult
+
+        session = _make_session()
+        response = _pdf_fetch_response(body=b"not a PDF", content_type="application/pdf")
+        response.text = "ordinary decoded text"
+
+        with (
+            patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=response),
+            patch("turnstone.core.session.materialize_pdf") as materialize,
+            patch.object(
+                session,
+                "_utility_completion",
+                return_value=CompletionResult(content="Text answer."),
+            ) as utility,
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "not-pdf", "url": "https://example.com/not-pdf"}
+            )
+
+        assert answer == "Text answer."
+        materialize.assert_not_called()
+        assert utility.call_args.kwargs.get("resolve_attachments") is None
+        assert "ordinary decoded text" in utility.call_args.args[0][1].content[0].text
+
+    def test_web_fetch_vision_pdf_sends_ordered_page_images(self, monkeypatch) -> None:
+        from turnstone.core.media_materialization import PDF_RASTER_TRUNCATION_NOTICE
+        from turnstone.core.pdf import PdfRasterizedPages
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        replace_session_lane(
+            session,
+            capabilities=ModelCapabilities(supports_vision=True),
+        )
+        monkeypatch.setattr(
+            "turnstone.core.pdf.rasterize_pdf",
+            lambda _data, **_kwargs: PdfRasterizedPages(
+                [b"page-one", b"page-two"],
+                truncated=True,
+            ),
+        )
+        captured: dict[str, Any] = {}
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch.object(
+                session,
+                "_utility_completion",
+                side_effect=_capture_pdf_utility(captured),
+            ),
+        ):
+            session._exec_web_fetch({"call_id": "pdf-vision", "url": "https://example.com/a"})
+
+        parts = captured["content"]
+        assert [part["type"] for part in parts] == ["image_url", "image_url", "text"]
+        encoded = [part["image_url"]["url"].rsplit(",", 1)[1] for part in parts[:2]]
+        assert [base64.b64decode(value) for value in encoded] == [b"page-one", b"page-two"]
+        assert parts[-1]["text"] == PDF_RASTER_TRUNCATION_NOTICE
+
+    def test_web_fetch_explicit_empty_principal_stays_ownerless(
+        self,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        session._acting_user_id = "mutable-user"
+        replace_session_lane(session, capabilities=ModelCapabilities())
+        seen: dict[str, Any] = {}
+
+        def perceive(_source, _parts, *, cancel_ref, principal_id):
+            seen["perception_principal"] = principal_id
+            return "perceived content"
+
+        monkeypatch.setattr(session, "_pdf_perception_text", perceive)
+        captured: dict[str, Any] = {}
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch.object(
+                session,
+                "_utility_completion",
+                side_effect=_capture_pdf_utility(captured),
+            ),
+        ):
+            session._exec_web_fetch(
+                {
+                    "call_id": "pdf-ownerless",
+                    "url": "https://example.com/a",
+                    "_principal_id": "",
+                }
+            )
+
+        assert seen["perception_principal"] == ""
+        assert captured["kwargs"]["principal_id"] == ""
+        assert "perceived content" in captured["content"]["text"]
+
+    def test_web_fetch_local_pdf_text_uses_context_limit_and_trust_neutralization(
+        self,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core import fence
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session(context_window=8_192)
+        replace_session_lane(session, capabilities=ModelCapabilities())
+        marker = f"[start {fence.SYSTEM_REMINDER_TAG}_deadbeef]"
+        extracted = marker + "x" * 50_100
+
+        def extract(_data, *, max_chars, **_kwargs):
+            dropped = len(extracted) - max_chars
+            return extracted[:max_chars] + f"\n\n... [{dropped} chars truncated] ...\n"
+
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", extract)
+        captured: dict[str, Any] = {}
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch.object(
+                session,
+                "_utility_completion",
+                side_effect=_capture_pdf_utility(captured),
+            ),
+        ):
+            session._exec_web_fetch({"call_id": "pdf-text", "url": "https://example.com/a"})
+
+        data = captured["content"]["document"]["data"]
+        assert data.startswith("[\\start")
+        assert f"[{len(extracted) - 15_704} chars truncated]" in data
+
+    def test_web_fetch_zero_local_pdf_text_budget_skips_extraction_model(
+        self,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        replace_session_lane(session, capabilities=ModelCapabilities())
+
+        def extract(_data, *, max_chars, **_kwargs):
+            assert max_chars == 0
+            return "\n\n... [42 chars truncated] ...\n"
+
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", extract)
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch("turnstone.core.session._document_text_budget_chars", return_value=0),
+            patch.object(session, "_utility_completion") as utility,
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "pdf-no-budget", "url": "https://example.com/a"}
+            )
+
+        assert (
+            answer == "Error: fetched content cannot fit within the active model's document budget"
+        )
+        utility.assert_not_called()
+
+    def test_web_fetch_unreadable_pdf_fails_without_primary_extraction(
+        self,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        replace_session_lane(session, capabilities=ModelCapabilities())
+        monkeypatch.setattr(
+            "turnstone.core.pdf.extract_pdf_text",
+            lambda _data, **_kwargs: "",
+        )
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch.object(session, "_utility_completion") as utility,
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "pdf-empty", "url": "https://example.com/a"}
+            )
+
+        assert answer.startswith("Error: fetched PDF could not be read")
+        utility.assert_not_called()
+
+    def test_web_fetch_pdf_resource_limit_fails_without_primary_extraction(
+        self,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core.pdf import PdfWorkLimitError
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        replace_session_lane(session, capabilities=ModelCapabilities())
+
+        def limited(_data, **_kwargs):
+            raise PdfWorkLimitError("bounded worker stopped")
+
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", limited)
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch.object(session, "_utility_completion") as utility,
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "pdf-limited", "url": "https://example.com/a"}
+            )
+
+        assert answer == "Error: fetched PDF exceeded local processing safety limits"
+        utility.assert_not_called()
+
+    def test_web_fetch_pdf_snapshot_survives_mutable_session_changes(
+        self,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core.media_materialization import materialize_pdf as real_materialize
+        from turnstone.core.providers._protocol import ModelCapabilities
+        from turnstone.core.session import _TokenCalibration
+
+        session = _make_session(
+            context_window=8_192,
+            max_tokens=512,
+            temperature=0.3,
+            reasoning_effort="high",
+        )
+        expected_lane = replace_session_lane(
+            session,
+            capabilities=ModelCapabilities(),
+        )
+        session._token_calibrations[session._token_calibration_key(expected_lane)] = (
+            _TokenCalibration(chars_per_token=10.0)
+        )
+
+        def extract(_data, *, max_chars, **_kwargs):
+            return "x" * max_chars + f"\n\n... [{70_000 - max_chars} chars truncated] ...\n"
+
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", extract)
+        captured: dict[str, Any] = {}
+
+        def materialize_then_rebind(*args, **kwargs):
+            result = real_materialize(*args, **kwargs)
+            replace_session_lane(session, model="new-model", capabilities=ModelCapabilities())
+            session.context_window = 65_536
+            session.max_tokens = 16_384
+            session.temperature = 0.9
+            session.reasoning_effort = "low"
+            return result
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch("turnstone.core.session.materialize_pdf", side_effect=materialize_then_rebind),
+            patch.object(
+                session,
+                "_utility_completion",
+                side_effect=_capture_pdf_utility(captured),
+            ),
+        ):
+            session._exec_web_fetch({"call_id": "pdf-snapshot", "url": "https://example.com/a"})
+
+        kwargs = captured["kwargs"]
+        assert kwargs["lane"] is expected_lane
+        assert kwargs["max_tokens"] == 512
+        assert kwargs["lane"].temperature == 0.3
+        assert kwargs["lane"].reasoning_effort == "high"
+        assert "temperature" not in kwargs
+        assert "reasoning_effort" not in kwargs
+        assert kwargs["use_session_temperature"] is False
+        extracted = captured["content"]["document"]["data"]
+        assert extracted.endswith("\n\n... [30200 chars truncated] ...\n")
+
+    def test_web_fetch_pdf_product_cap_rejects_before_materialization(
+        self,
+        monkeypatch,
+    ) -> None:
+        session = _make_session()
+        monkeypatch.setattr("turnstone.core.session.PDF_SIZE_CAP", 8)
+        response = _pdf_fetch_response(body=b"%PDF-1234")
+
+        with (
+            patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=response),
+            patch("turnstone.core.session.materialize_pdf") as materialize,
+            patch.object(session, "_utility_completion") as utility,
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "pdf-large", "url": "https://example.com/a"}
+            )
+
+        assert answer == "Error: fetched PDF is too large (9 bytes; cap 8)"
+        materialize.assert_not_called()
+        utility.assert_not_called()
+
+    def test_web_fetch_perception_cache_hit_skips_second_pdf_render(
+        self,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core import perception
+        from turnstone.core.media_materialization import PDF_RASTER_TRUNCATION_NOTICE
+        from turnstone.core.pdf import PdfRasterizedPages
+        from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+        perception._clear_perception_cache_for_test()
+        session = _make_session()
+        replace_session_lane(session, capabilities=ModelCapabilities())
+        provider = MagicMock()
+        provider.provider_name = "openai-compatible"
+        provider.get_capabilities.return_value = ModelCapabilities(supports_vision=True)
+        provider.retryable_error_names = frozenset()
+        provider.create_streaming.return_value = as_stream(
+            CompletionResult(content="cached perception")
+        )
+        session._config_store = MagicMock()
+        session._config_store.get = lambda key, *args: (
+            "omni" if key == "perception.model_alias" else ""
+        )
+        session._registry = MagicMock()
+        session._registry.has_alias = lambda alias: alias == "omni"
+        session._registry.resolve_binding = lambda alias: (
+            object(),
+            "omni-model",
+            object(),
+            provider,
+            7,
+        )
+        rasterize = MagicMock(return_value=PdfRasterizedPages([b"page"], truncated=True))
+        monkeypatch.setattr("turnstone.core.pdf.rasterize_pdf", rasterize)
+        response = _pdf_fetch_response()
+        captured: list[dict[str, Any]] = []
+
+        def capture(*args, **kwargs):
+            current: dict[str, Any] = {}
+            result = _capture_pdf_utility(current, answer="answer")(*args, **kwargs)
+            captured.append(current)
+            return result
+
+        with (
+            patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=response),
+            patch.object(
+                session,
+                "_utility_completion",
+                side_effect=capture,
+            ),
+        ):
+            session._exec_web_fetch({"call_id": "pdf-cache-1", "url": "https://example.com/a"})
+            session._exec_web_fetch({"call_id": "pdf-cache-2", "url": "https://example.com/a"})
+
+        rasterize.assert_called_once()
+        provider.create_streaming.assert_called_once()
+        assert len(captured) == 2
+        assert all(PDF_RASTER_TRUNCATION_NOTICE in item["content"]["text"] for item in captured)
+
+    def test_web_fetch_pdf_perception_cancellation_skips_primary_extraction(
+        self,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core.deadline import StreamAbortRef
+        from turnstone.core.providers._protocol import ModelCapabilities
+        from turnstone.core.session import GenerationCancelled
+
+        session = _make_session()
+        generation = session._claim_generation()
+        cancel_ref = StreamAbortRef(session._cancel_event)
+        replace_session_lane(session, capabilities=ModelCapabilities())
+
+        def cancel_perception(*args, **kwargs):
+            cancel_ref.abort()
+            raise ConnectionError("perception stream closed")
+
+        monkeypatch.setattr(session, "_pdf_perception_text", cancel_perception)
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch.object(session, "_utility_completion") as utility,
+            pytest.raises(GenerationCancelled),
+        ):
+            session._exec_web_fetch(
+                {
+                    "call_id": "pdf-cancel",
+                    "url": "https://example.com/a",
+                    "_origin_generation": generation,
+                    "_model_cancel_ref": cancel_ref,
+                }
+            )
+
+        utility.assert_not_called()
+
+    def test_web_fetch_pdf_primary_cancellation_remains_controller_flow(self) -> None:
+        from turnstone.core.deadline import StreamAbortRef
+        from turnstone.core.providers._protocol import ModelCapabilities
+        from turnstone.core.session import GenerationCancelled
+
+        session = _make_session()
+        generation = session._claim_generation()
+        cancel_ref = StreamAbortRef(session._cancel_event)
+        replace_session_lane(
+            session,
+            capabilities=ModelCapabilities(supports_pdf=True),
+        )
+
+        def cancel_extraction(*args, **kwargs):
+            assert kwargs["cancel_ref"] is cancel_ref
+            cancel_ref.abort()
+            raise ConnectionError("primary extraction stream closed")
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch.object(session, "_utility_completion", side_effect=cancel_extraction),
+            patch.object(session, "_report_tool_result") as report,
+            pytest.raises(GenerationCancelled),
+        ):
+            session._exec_web_fetch(
+                {
+                    "call_id": "pdf-primary-cancel",
+                    "url": "https://example.com/a",
+                    "_origin_generation": generation,
+                    "_model_cancel_ref": cancel_ref,
+                }
+            )
+
+        report.assert_not_called()
 
 
 def test_web_fetch_final_report_is_atomic_against_successor_claim():
@@ -12336,6 +13307,7 @@ def test_web_fetch_final_report_is_atomic_against_successor_claim():
     response.raise_for_status.return_value = None
     response.headers = {"content-type": "text/plain"}
     response.text = "The fetched page body."
+    response.content = response.text.encode()
 
     def run_fetch() -> None:
         try:
@@ -12456,6 +13428,7 @@ def _fake_fetched_page() -> MagicMock:
     resp.raise_for_status = MagicMock()
     resp.headers = {"content-type": "text/plain"}
     resp.text = "Page body."
+    resp.content = resp.text.encode()
     return resp
 
 

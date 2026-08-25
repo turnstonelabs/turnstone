@@ -320,14 +320,53 @@ Search file contents for a regex pattern.
 
 ### web_fetch
 
-Fetch a URL and extract specific information from it.
+Fetch a web page or PDF and extract specific information from it.
 
 | Parameter  | Type   | Required | Description |
 |------------|--------|----------|-------------|
 | `url`      | string | yes      | The URL to fetch (must start with `http://` or `https://`). |
-| `question` | string | yes      | What to extract or answer from the page content. |
+| `question` | string | yes      | What to extract or answer from the page or PDF. |
 
-- **What it does**: Fetches the URL, strips HTML to plain text, and uses the LLM to extract the answer to the question from the page content. Every redirect hop is SSRF-screened before it is requested. Private/internal addresses are refused by default; enable `tools.allow_private_network` (console Settings → Tools) to make them approvable for self-hosted setups whose services live on the local network — the approval prompt marks such requests, and a public site redirecting into private space is refused regardless. Cloud metadata endpoints and link-local, multicast and reserved addresses are refused even with the opt-in enabled, including as a redirect target from a private address you approved. An address is judged by what it actually reaches, so an IPv6 transition address (NAT64, 6to4, Teredo) wrapping an internal IPv4 is treated exactly as that IPv4 would be.
+- **What it does**: Fetches the URL and uses the LLM to answer the question from
+  the fetched content. HTML is stripped to plain text. A response whose bytes
+  begin with PDF magic uses the attachment PDF ladder: native document input
+  when the active model supports it, ordered page images for a vision model,
+  configured perception, then local text extraction. If none can read the PDF,
+  the tool returns an explicit error instead of asking the model to infer from
+  an empty document. Local PDF rendering and text extraction run in a one-shot
+  child under memory, CPU, wall-time, and output limits; exceeding that shared
+  attachment safety envelope fails the fetch explicitly. Decoded HTML/plain
+  text and locally extracted PDF text use at most half the active model lane's
+  calibrated context after prompt, response, and safety reserves; the final
+  request is checked again before provider I/O. If no document allowance
+  remains, the tool returns an error instead of invoking extraction without
+  source content. The fixed worker output envelope is an additional PDF-only
+  host-safety ceiling. Rasterization supplies at most ten pages and explicitly
+  tells the model when later pages were omitted; that notice survives the
+  perception cache. Fetched PDFs are request-local and are not added to
+  conversation history or attachment storage. Every redirect hop is
+  SSRF-screened before it is requested.
+  Private/internal addresses are refused by default; enable
+  `tools.allow_private_network` (console Settings → Tools)
+  to make them approvable for self-hosted setups whose services live on the
+  local network. The approval prompt marks such requests, and a public site
+  redirecting into private space is refused regardless. Cloud metadata
+  endpoints and link-local, multicast and reserved addresses are refused even
+  with the opt-in enabled, including as a redirect target from a private address
+  you approved. An address is judged by what it actually reaches, so an IPv6
+  transition address (NAT64, 6to4, Teredo) wrapping an internal IPv4 is treated
+  exactly as that IPv4 would be.
+- **Deployment requirements for local PDF processing**: The bounded PDF worker
+  needs a writable temporary directory (`/tmp`, or the directory selected by
+  `TMPDIR`) and permission to create one child process and lower its own resource
+  limits. A hardened container with `readOnlyRootFilesystem: true` should mount
+  a writable `emptyDir` at `/tmp`; a custom seccomp policy must permit the
+  process/limit syscalls used for fork/exec, `setsid`, `setrlimit`, and
+  `prlimit64`. The worker intentionally ignores Python environment variables,
+  so venv, system-site, and ordinary default user-site dependencies work, but
+  dependencies reachable only through a custom `PYTHONUSERBASE` do not. Install
+  Turnstone and its PDF dependencies into the same venv or a standard site
+  directory instead. Models receiving PDFs natively do not start this worker.
 - **Auto-approve**: No -- requires user confirmation (makes network requests).
 - **Agent availability**: `task_agent`.
 

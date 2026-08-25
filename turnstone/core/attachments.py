@@ -23,6 +23,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core import fence
+
 if TYPE_CHECKING:
     from starlette.responses import JSONResponse
 
@@ -409,6 +411,55 @@ def safe_attachment_label(name: str | None, *, default: str = "file", max_len: i
         cleaned = cleaned.replace(ch, "")
     cleaned = " ".join(cleaned.split())[:max_len].strip()
     return cleaned or default
+
+
+def neutralize_untrusted_fences(text: str) -> str:
+    """Defang every session-trusted marker in model-visible untrusted text."""
+    safe = fence.neutralize(text, fence.SYSTEM_REMINDER_TAG, opening=True)
+    return fence.neutralize(safe, fence.SENDER_LABEL_TAG, opening=True)
+
+
+def neutralize_attachment_part(part: Any) -> Any:
+    """Return an attachment part with textual trust-marker forgeries defanged.
+
+    Attachment placeholders are materialized after ordinary message folding and
+    before model admission, so their text cannot rely on the folding pass for
+    this boundary. Only model-visible text and document strings are inspected;
+    binary image/audio data and base64 PDF payloads retain their exact bytes.
+    """
+    if isinstance(part, list):
+        safe_parts: list[Any] | None = None
+        for idx, item in enumerate(part):
+            safe = neutralize_attachment_part(item)
+            if safe is not item:
+                if safe_parts is None:
+                    safe_parts = list(part)
+                safe_parts[idx] = safe
+        return part if safe_parts is None else safe_parts
+    if not isinstance(part, dict):
+        return part
+    if part.get("type") == "text" and isinstance(part.get("text"), str):
+        text = part["text"]
+        safe = neutralize_untrusted_fences(text)
+        return part if safe == text else {**part, "text": safe}
+    if part.get("type") != "document" or not isinstance(part.get("document"), dict):
+        return part
+    document = part["document"]
+    safe_document: dict[str, Any] | None = None
+    for field in ("name", "data"):
+        value = document.get(field)
+        if not isinstance(value, str):
+            continue
+        # PDF data is base64 and therefore contains no bracketed marker. Skip
+        # the potentially large payload rather than scanning it pointlessly.
+        if field == "data" and document.get("media_type") == "application/pdf":
+            continue
+        safe = neutralize_untrusted_fences(value)
+        if safe != value:
+            if safe_document is None:
+                safe_document = dict(document)
+            safe_document[field] = safe
+    return part if safe_document is None else {**part, "document": safe_document}
 
 
 def unreadable_placeholder(filename: str) -> dict[str, Any]:

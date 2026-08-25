@@ -1380,6 +1380,7 @@ class TestTaskAgentStreamAbort:
         response = MagicMock()
         response.headers = {"content-type": "text/plain"}
         response.text = "page body"
+        response.content = response.text.encode()
         outcomes = []
         items = [
             {
@@ -1424,6 +1425,7 @@ class TestTaskAgentStreamAbort:
         response = MagicMock()
         response.headers = {"content-type": "text/plain"}
         response.text = "page body"
+        response.content = response.text.encode()
         seen_refs = []
 
         def complete_after_cancel(*_args, **kwargs):
@@ -1807,6 +1809,7 @@ class TestTaskAgentStreamAbort:
         response = MagicMock()
         response.headers = {"content-type": "text/plain"}
         response.text = "page body"
+        response.content = response.text.encode()
 
         def fetch(*_args, **_kwargs):
             session.cancel()
@@ -1860,6 +1863,7 @@ class TestTaskAgentStreamAbort:
         response = MagicMock()
         response.headers = {"content-type": "text/plain"}
         response.text = "page body"
+        response.content = response.text.encode()
         seen_refs = []
 
         def cancelled_utility(*_args, **kwargs):

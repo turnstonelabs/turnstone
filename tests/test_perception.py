@@ -265,6 +265,27 @@ def test_describe_cached_memoizes_by_principal_alias_generation_and_hash() -> No
     )
 
 
+def test_describe_cached_memoizes_success_suffix() -> None:
+    prov = _StubProvider(content="desc")
+    binding = _binding(prov)
+
+    first = perception.describe_cached(
+        binding=binding,
+        principal_id="user-a",
+        content_hash="h-suffix",
+        parts=_parts(),
+        result_suffix="[partial source]",
+    )
+    cached = perception.describe_peek(
+        principal_id="user-a",
+        binding=binding,
+        content_hash="h-suffix",
+    )
+
+    assert first == cached == "desc\n\n[partial source]"
+    assert prov.calls == 1
+
+
 def test_describe_cached_does_not_cache_failures() -> None:
     prov = _StubProvider(content="recovered", fail_times=1)
     kw: dict[str, Any] = {

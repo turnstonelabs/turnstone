@@ -539,6 +539,28 @@ class TestCapabilityGatedFallback:
         assert part["type"] == "text"
         assert "no extractable text" in part["text"]
 
+    def test_pdf_resource_limit_is_durable_placeholder(
+        self,
+        tmp_db,
+        mock_openai_client,
+        monkeypatch,
+    ):
+        from turnstone.core.pdf import PdfWorkLimitError
+
+        s = _make_session(mock_openai_client)
+
+        def limited(_data):
+            raise PdfWorkLimitError("bounded worker stopped")
+
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", limited)
+        part = s._wire_content_part(
+            self._att("pdf", b"%PDF", "r.pdf", "application/pdf"),
+            ModelCapabilities(supports_pdf=False),
+        )
+
+        assert part["type"] == "text"
+        assert "exceeded safety limits" in part["text"]
+
     def test_audio_native_when_supported(self, tmp_db, mock_openai_client):
         s = _make_session(mock_openai_client)
         part = s._wire_content_part(
@@ -958,6 +980,96 @@ class TestResolveAttachmentsPerSendCache:
         assert native["aT"]["type"] == "document"
         assert isinstance(rasterized["aT"], list)
 
+    def test_extracted_pdf_text_budget_is_part_of_cache_key(
+        self,
+        tmp_db,
+        mock_openai_client,
+        monkeypatch,
+    ) -> None:
+        s = _make_session(mock_openai_client)
+        attachments = [
+            {**self._att(), "attachment_id": "a1"},
+            {**self._att(), "attachment_id": "a2"},
+        ]
+        monkeypatch.setattr("turnstone.core.session.get_attachments", lambda ids: attachments)
+        monkeypatch.setattr(s, "_pdf_perception_text", lambda *_args, **_kwargs: None)
+        limits: list[int] = []
+
+        def extract(_data, *, max_chars):
+            limits.append(max_chars)
+            return "bounded text"
+
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", extract)
+        caps = ModelCapabilities()
+        s._wire_part_cache = {}
+
+        first = s._resolve_attachments(
+            ["a1", "a2"],
+            caps,
+            pdf_text_budget_chars=20_000,
+        )
+        again = s._resolve_attachments(
+            ["a1", "a2"],
+            caps,
+            pdf_text_budget_chars=20_000,
+        )
+        narrower = s._resolve_attachments(
+            ["a1", "a2"],
+            caps,
+            pdf_text_budget_chars=12_000,
+        )
+
+        assert first == again == narrower
+        assert limits == [20_000, 20_000, 12_000, 12_000]
+
+    @pytest.mark.parametrize(
+        ("caps", "expected_rasters"),
+        [
+            (ModelCapabilities(supports_pdf=True), 0),
+            (ModelCapabilities(supports_vision=True), 1),
+        ],
+    )
+    def test_cap_independent_pdf_modes_survive_budget_changes(
+        self,
+        tmp_db,
+        mock_openai_client,
+        monkeypatch,
+        caps,
+        expected_rasters,
+    ) -> None:
+        s = _make_session(mock_openai_client)
+        fetches = 0
+        rasters = 0
+
+        def fetch(_ids):
+            nonlocal fetches
+            fetches += 1
+            return [self._att()]
+
+        def raster(_data):
+            nonlocal rasters
+            rasters += 1
+            return [b"page"]
+
+        monkeypatch.setattr("turnstone.core.session.get_attachments", fetch)
+        monkeypatch.setattr("turnstone.core.pdf.rasterize_pdf", raster)
+        s._wire_part_cache = {}
+
+        first = s._resolve_attachments(
+            ["aT"],
+            caps,
+            pdf_text_budget_chars=40_000,
+        )
+        narrower = s._resolve_attachments(
+            ["aT"],
+            caps,
+            pdf_text_budget_chars=24_000,
+        )
+
+        assert first == narrower
+        assert fetches == 1
+        assert rasters == expected_rasters
+
 
 class TestByReferenceMediaBudget:
     """bug-2: by-reference pdf/audio are charged a bounded budget — not zero
@@ -980,3 +1092,55 @@ class TestByReferenceMediaBudget:
         # content loop, so counting it here too would double-charge).
         assert doc_chars == 16_000 + 16_000 + 500
         assert images == 0
+
+    def test_inline_document_keeps_sibling_audio_charge(self):
+        document = {
+            "data": "AAAA",
+            "name": "report.pdf",
+            "media_type": "application/pdf",
+        }
+        msg = {
+            "role": "user",
+            "content": [
+                {"type": "document", "document": document},
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "AA==", "format": "wav"},
+                },
+            ],
+            # Final validation has already removed the consumed PDF row, but
+            # resolve_attachment_parts deliberately preserves sibling metadata.
+            "_attachments_meta": [{"kind": "audio", "size_bytes": 25_000_000}],
+        }
+
+        projected = ChatSession._without_consumed_media_reference_estimates([msg])[0]
+        _text, _images, doc_chars = ChatSession._msg_text_chars(projected)
+
+        inline_chars = sum(len(value) for value in document.values())
+        assert doc_chars == inline_chars + 16_000
+
+    def test_inline_audio_fallback_drops_consumed_audio_charge(self):
+        document = {
+            "data": "AAAA",
+            "name": "report.pdf",
+            "media_type": "application/pdf",
+        }
+        fallback = "[Transcript of audio attachment 'meeting.wav']\n\nhello"
+        msg = {
+            "role": "user",
+            "content": [
+                {"type": "document", "document": document},
+                {"type": "text", "text": fallback},
+            ],
+            "_attachments_meta": [
+                {"kind": "pdf", "size_bytes": 32_000_000},
+                {"kind": "audio", "size_bytes": 25_000_000},
+            ],
+        }
+
+        projected = ChatSession._without_consumed_media_reference_estimates([msg])[0]
+        text_chars, _images, doc_chars = ChatSession._msg_text_chars(projected)
+
+        assert "_attachments_meta" not in projected
+        assert text_chars == len("user") + len(fallback)
+        assert doc_chars == sum(len(value) for value in document.values())

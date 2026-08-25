@@ -388,6 +388,11 @@ def test_request_admission_and_preparation_run_before_capacity_lease() -> None:
         order.append("prepare")
         return messages
 
+    def validate(messages: list[dict[str, Any]], _lane: ModelLane) -> None:
+        assert not gate.held
+        assert messages[0]["content"][0]["type"] == "image_url"
+        order.append("validate")
+
     def resolve_auth(_alias: str, _cfg: Any) -> str:
         assert gate.held
         order.append("auth")
@@ -416,6 +421,7 @@ def test_request_admission_and_preparation_run_before_capacity_lease() -> None:
         admit_request=admit,
         prepare_wire=prepare,
         resolve_attachments=resolve,
+        validate_wire=validate,
     )
 
     assert result.content == "ok"
@@ -423,6 +429,7 @@ def test_request_admission_and_preparation_run_before_capacity_lease() -> None:
         "admit",
         "materialize",
         "prepare",
+        "validate",
         "acquire",
         "enter",
         "auth",

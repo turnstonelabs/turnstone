@@ -1286,15 +1286,9 @@ def attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
         # base64 bytes (vs. a text doc's utf-8 ``data``).  Per-provider
         # translators branch on ``application/pdf`` (Phase 2); the client-side
         # fallback for non-PDF models lands in Phase 3.
-        b64 = base64.b64encode(raw).decode("ascii")
-        return {
-            "type": "document",
-            "document": {
-                "name": att.get("filename") or "",
-                "media_type": "application/pdf",
-                "data": b64,
-            },
-        }
+        from turnstone.core.media_materialization import native_pdf_part
+
+        return native_pdf_part(raw, att.get("filename") or "")
     if kind == "audio" and isinstance(raw, bytes):
         # OpenAI-style ``input_audio`` part — passes through the openai-compat
         # lane untouched (omni models); other lanes translate / fall back in
