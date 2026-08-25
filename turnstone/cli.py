@@ -1425,6 +1425,7 @@ def main() -> None:
             registry_generation=registry_generation,
             model_alias=effective_alias,
             model_binding=model_binding,
+            ws_id=ws_id,
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
