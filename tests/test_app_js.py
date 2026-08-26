@@ -32,15 +32,36 @@ _CONSOLE_INDEX = Path(__file__).resolve().parent.parent / "turnstone/console/sta
 _CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/admin.js"
 
 
-def test_mcp_private_hosts_ui_explains_sources_and_uses_safe_dom_rendering() -> None:
+def test_mcp_private_hosts_ui_lives_in_mcp_settings_and_uses_safe_dom_rendering() -> None:
     html = _CONSOLE_INDEX.read_text(encoding="utf-8")
     script = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
 
-    assert 'id="mcp-private-host-form"' in html
-    assert 'id="mcp-private-host-list"' in html
-    assert "TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS" in html
-    assert "operator-controlled" in html
+    assert 'id="mcp-private-host-form"' not in html
+    assert 'id="mcp-private-host-list"' not in html
+
+    settings_renderer_start = script.index("function _renderMcpTrustedPrivateHostsSetting(")
+    settings_renderer_end = script.index("function _renderSettingRow(", settings_renderer_start)
+    settings_renderer = script[settings_renderer_start:settings_renderer_end]
+    assert 'class="settings-row settings-row-mcp-private-hosts"' in settings_renderer
+    assert 'id="mcp-private-host-form"' in settings_renderer
+    assert 'id="mcp-private-host-list"' in settings_renderer
+    assert "TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS" in settings_renderer
+    assert "escapeHtml(item.help)" in settings_renderer
+
+    mcp_loader_start = script.index("function loadAdminMcp()")
+    mcp_loader_end = script.index("function loadMcpTrustedPrivateHosts()", mcp_loader_start)
+    assert "loadMcpTrustedPrivateHosts()" not in script[mcp_loader_start:mcp_loader_end]
+
+    settings_loader_start = script.index("function loadSettings()")
+    settings_loader_end = script.index("function _renderSettings(", settings_loader_start)
+    settings_loader = script[settings_loader_start:settings_loader_end]
+    assert '_consoleHasPermission("admin.mcp")' in settings_loader
+    assert "loadMcpTrustedPrivateHosts()" in settings_loader
+    assert 'items[j].key === "mcp.oauth_trusted_private_hosts" &&' in script, (
+        "settings-only admins must retain the standard Settings editor"
+    )
     assert "/v1/api/admin/mcp-servers/trusted-private-hosts" in script
+    assert 'form.dataset.wired === "true"' in script
     assert 'entry.source === "environment"' in script
     assert "if (!entry.readonly)" in script
     renderer_start = script.index("function _renderMcpTrustedPrivateHosts()")

@@ -284,9 +284,11 @@ declared type (`int`, `float`, `str`, `bool`), optional `min_value`/`max_value`
 range, optional `choices` list, and an `is_secret` flag.
 
 `mcp.oauth_trusted_private_hosts` stores only the user-managed portion of the
-MCP OAuth private-host allow-list. The dedicated MCP Servers panel is the
-recommended editor because it displays the merged source of each entry. Unlike
-ordinary ConfigStore environment seeding,
+MCP OAuth private-host allow-list. Open **Admin → Settings**, expand **MCP**, and
+use the `oauth_trusted_private_hosts` row. Its specialized editor displays the
+merged source of each entry. Administrators without `admin.mcp` permission see
+the standard Settings text editor for the database-managed value. Unlike ordinary
+ConfigStore environment seeding,
 `TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS` remains a live, read-only deployment
 source and is never copied into the database. See
 [MCP OAuth: Private-network OAuth hosts](mcp-oauth.md#private-network-oauth-hosts).

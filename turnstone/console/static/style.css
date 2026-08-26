@@ -3016,53 +3016,25 @@ h3.skill-spec-heading {
   box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.15);
 }
 
-/* -- MCP Registry result cards -------------------------------------------- */
-.mcp-private-hosts {
-  margin: 0 0 16px;
-  padding: 14px 16px;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--cyan);
-  border-radius: var(--radius-sm);
-  background: var(--bg-surface);
+/* -- Trusted private OAuth hosts setting --------------------------------- */
+.settings-row-mcp-private-hosts {
+  grid-template-columns: 200px minmax(0, 1fr);
 }
-.mcp-private-hosts h3 {
-  margin: 0 0 5px;
-  color: var(--fg-bright);
-  font-family: var(--font-ui);
-  font-size: 13px;
+.settings-mcp-private-hosts-input {
+  min-width: 0;
 }
-.mcp-private-hosts-copy p {
-  max-width: 900px;
-  margin: 0 0 12px;
-  color: var(--fg-dim);
-  font-size: 11px;
-  line-height: 1.5;
-}
-.mcp-private-hosts-copy code,
 .mcp-private-host-name {
   font-family: var(--font-mono);
 }
 .mcp-private-host-form {
   display: flex;
   gap: 8px;
-  max-width: 620px;
+  max-width: 480px;
   margin-bottom: 10px;
 }
 .mcp-private-host-form input {
   flex: 1;
   min-width: 180px;
-  padding: 7px 9px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  color: var(--fg);
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-.mcp-private-host-form input:focus-visible {
-  border-color: var(--cyan);
-  outline: 2px solid rgba(103, 232, 249, 0.2);
-  outline-offset: 1px;
 }
 .mcp-private-host-list {
   display: flex;
@@ -3105,6 +3077,17 @@ h3.skill-spec-heading {
 .mcp-private-host-status.is-error {
   color: var(--red);
 }
+
+@media (max-width: 700px) {
+  .settings-row-mcp-private-hosts {
+    grid-template-columns: 1fr;
+  }
+  .mcp-private-host-form {
+    max-width: none;
+  }
+}
+
+/* -- MCP Registry result cards -------------------------------------------- */
 
 .mcp-reg-card {
   display: grid;

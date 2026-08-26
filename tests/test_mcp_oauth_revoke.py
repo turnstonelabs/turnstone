@@ -343,6 +343,7 @@ class TestAttemptUpstreamRevokeNeverRaises:
             },
             "server_id_for_audit": "srv-id-1",
             "refresh_token": "r-secret",
+            "trusted_private_hosts": frozenset(),
         }
 
     def test_attempt_upstream_revoke_swallows_unexpected_exception(self) -> None:

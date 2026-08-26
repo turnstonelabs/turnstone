@@ -4086,6 +4086,7 @@ function loadSettings() {
       }
 
       _renderSettings(el, grouped);
+      if (_consoleHasPermission("admin.mcp")) loadMcpTrustedPrivateHosts();
     })
     .catch(function (err) {
       // NOTE: escapeHtml sanitises err.message before insertion.
@@ -4120,7 +4121,11 @@ function _renderSettings(container, grouped) {
       '<div class="settings-section-body" id="settings-body-' + sec + '">';
 
     for (let j = 0; j < items.length; j++) {
-      html += _renderSettingRow(items[j]);
+      html +=
+        items[j].key === "mcp.oauth_trusted_private_hosts" &&
+        _consoleHasPermission("admin.mcp")
+          ? _renderMcpTrustedPrivateHostsSetting(items[j])
+          : _renderSettingRow(items[j]);
     }
 
     html += "</div></div>";
@@ -4199,6 +4204,52 @@ function _renderSettings(container, grouped) {
       _resetSetting(this.getAttribute("data-reset-key"));
     });
   }
+}
+
+function _renderMcpTrustedPrivateHostsSetting(item) {
+  const escapedKey = escapeHtml(item.key);
+  const shortKey = "oauth_trusted_private_hosts";
+  const helpId = escapedKey + "-help";
+
+  let html =
+    '<div class="settings-row settings-row-mcp-private-hosts" data-row-key="' +
+    escapedKey +
+    '">';
+  html += '<div class="settings-label-col">';
+  html += '<div class="settings-label">' + shortKey;
+  html +=
+    ' <button type="button" class="settings-help-btn" data-help-target="' +
+    helpId +
+    '" aria-label="Help for ' +
+    shortKey +
+    '" aria-expanded="false" title="More info"></button>';
+  html += "</div>";
+  html += '<div class="settings-desc">' + escapeHtml(item.description) + "</div>";
+  html +=
+    '<div id="' +
+    helpId +
+    '" class="settings-help-popover" style="display:none">' +
+    '<span class="settings-help-text">' +
+    escapeHtml(item.help) +
+    " Entries loaded from <code>TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS</code> are read-only.</span>" +
+    "</div></div>";
+  html += '<div class="settings-input settings-mcp-private-hosts-input">';
+  html +=
+    '<form id="mcp-private-host-form" class="mcp-private-host-form" aria-describedby="' +
+    helpId +
+    '">' +
+    '<label class="sr-only" for="mcp-private-host-input">Exact private hostname or IP address</label>' +
+    '<input id="mcp-private-host-input" type="text" autocomplete="off" spellcheck="false" ' +
+    'aria-label="Exact private hostname or IP address" placeholder="gitlab.internal.example">' +
+    '<button class="settings-save-btn visible" type="submit">add</button>' +
+    "</form>";
+  html +=
+    '<div id="mcp-private-host-list" class="mcp-private-host-list" role="list" aria-live="polite">' +
+    '<span class="dashboard-empty">Loading trusted hosts...</span></div>';
+  html +=
+    '<div id="mcp-private-host-status" class="mcp-private-host-status" role="status" aria-live="polite"></div>';
+  html += "</div></div>";
+  return html;
 }
 
 function _renderSettingRow(item) {
@@ -4697,10 +4748,8 @@ let _registryResults = [];
 let _registryCursor = null;
 let _registryQuery = "";
 let _mcpTrustedPrivateHosts = [];
-let _mcpPrivateHostsWired = false;
 
 function loadAdminMcp() {
-  loadMcpTrustedPrivateHosts();
   authFetch("/v1/api/admin/mcp-servers")
     .then(function (r) {
       if (!r.ok) throw new Error("Failed");
@@ -4749,11 +4798,11 @@ function loadMcpTrustedPrivateHosts() {
 }
 
 function _wireMcpPrivateHosts() {
-  if (_mcpPrivateHostsWired) return;
   const form = document.getElementById("mcp-private-host-form");
   const input = document.getElementById("mcp-private-host-input");
   if (!form || !input) return;
-  _mcpPrivateHostsWired = true;
+  if (form.dataset.wired === "true") return;
+  form.dataset.wired = "true";
   form.addEventListener("submit", function (event) {
     event.preventDefault();
     const host = input.value.trim();
@@ -4827,7 +4876,7 @@ function _renderMcpTrustedPrivateHosts() {
     if (!entry.readonly) {
       const remove = document.createElement("button");
       remove.type = "button";
-      remove.className = "admin-action-btn admin-action-btn-ghost mcp-private-host-remove";
+      remove.className = "settings-reset-btn mcp-private-host-remove";
       remove.textContent = "Remove";
       remove.setAttribute("aria-label", "Remove trusted private host " + entry.host);
       remove.addEventListener("click", function () {

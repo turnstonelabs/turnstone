@@ -78,12 +78,13 @@ gitlab.internal:443           # rejected: port
 *.internal.example            # rejected: wildcard
 ```
 
-Administrators with `admin.mcp` permission can add additional entries under
-**Admin → MCP Servers → Servers → Trusted private OAuth hosts**. User-managed entries
-are stored in the database and propagated to cluster nodes. Environment entries are
-merged first, shown with an **environment** source label, and are read-only in the Web
-UI. If the same host appears in both sources, the environment entry wins. The combined
-list is limited to 100 hosts.
+Administrators with `admin.settings` and `admin.mcp` permissions can add
+additional entries under **Admin → Settings → MCP** using the
+`oauth_trusted_private_hosts` row. User-managed entries are stored in the database
+and propagated to cluster nodes. Environment entries are merged first, shown with
+an **environment** source label, and are read-only in the Web UI. If the same host
+appears in both sources, the environment entry wins. The combined list is limited
+to 100 hosts.
 
 This is a narrow private-address exception, not a general SSRF bypass:
 
@@ -216,7 +217,7 @@ Every transition that changes what a stored row *means* deletes the rows outrigh
 | `mcp_consent_required` even after consenting | Token persistence failed, or refresh-token rejected by AS | Check audit log for `mcp_server.oauth.persist_failed` or `mcp_server.oauth.token_revoked`. Re-consent via settings modal. |
 | `mcp_token_undecryptable_key_unknown` | Encryption key rotated without keeping the previous key in the keyring | Add the previous key back to `mcp_token_encryption_keys` until all rows have been re-encrypted, then drop. |
 | `mcp_oauth_url_insecure` | MCP server URL is `http://` (not `https://`) on a non-loopback host | Use `https://`. Per-user bearers must not transit cleartext. |
-| `PRM URL rejected: endpoint URL resolves to non-public address` | The MCP server or OAuth discovery endpoint deliberately resolves to a private address but is not trusted | Add its exact host under **MCP Servers → Trusted private OAuth hosts**, or set `TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS` on every server and console process. Do not add a wildcard or full URL. |
+| `PRM URL rejected: endpoint URL resolves to non-public address` | The MCP server or OAuth discovery endpoint deliberately resolves to a private address but is not trusted | Add its exact host under **Settings → MCP → oauth_trusted_private_hosts**, or set `TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS` on every server and console process. Do not add a wildcard or full URL. |
 | Tools fail in scheduled / Discord / Slack runs | OAuth-MCP requires browser-based consent | Users must pre-consent via the web UI. Phase 9 dashboard badge surfaces deferred consents from these runs on next login. |
 | Circuit breaker open repeatedly | Transport-level errors on the MCP server (DNS, TLS, 5xx) | Check the per-server error pill; auth errors do not trip the breaker. |
 | **`oauth_obo`**: every tool call fails, log shows `obo_misconfigured` | Server row has no Audience, or `obo_grant_profile` is unset/unknown | Set the Audience on the server row; set `[oidc] obo_grant_profile` to `entra` or `rfc8693`. |
