@@ -818,7 +818,7 @@ class TestTrustedPrivateHosts:
                 await discover_authorization_server(
                     server_name="private-gitlab",
                     server_url="https://gitlab.internal.example/mcp",
-                    override_url="https://gitlab.internal.example",
+                    override_url=None,
                     cached_issuer=None,
                     http_client=client,
                     storage=storage,
@@ -827,5 +827,8 @@ class TestTrustedPrivateHosts:
                     trusted_private_hosts=frozenset({"other.internal.example"}),
                 )
 
-        with pytest.raises(MCPOAuthDiscoveryError, match="non-public address"):
+        with pytest.raises(
+            MCPOAuthDiscoveryError,
+            match=r"non-public address.*add 'gitlab\.internal\.example' to Settings → MCP → oauth_trusted_private_hosts",
+        ):
             asyncio.run(_run())

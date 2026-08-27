@@ -59,6 +59,7 @@ from turnstone.core.model_registry import (
 )
 from turnstone.core.oauth_ssrf import (
     OAuthSSRFError,
+    OAuthSSRFPrivateAddressError,
     sanitize_log_text,
     validate_discovered_endpoint_async,
     validate_url_no_ssrf_async,
@@ -86,6 +87,27 @@ def _configured_trusted_private_hosts(app_state: Any) -> frozenset[str]:
             reason=sanitize_log_text(str(exc)),
         )
         return frozenset()
+
+
+def _private_host_remediation(url: str) -> str:
+    """Return the operator action for a private-address discovery rejection."""
+    hostname = urllib.parse.urlparse(url).hostname
+    if not hostname:
+        return ""
+    return (
+        " To allow this exact host, add "
+        f"'{hostname}' to Settings → MCP → oauth_trusted_private_hosts."
+    )
+
+
+def _discovery_url_rejection(
+    prefix: str, url: str, exc: OAuthSSRFError
+) -> MCPOAuthDiscoveryError:
+    """Preserve strict validation errors and guide private-host remediation."""
+    remediation = (
+        _private_host_remediation(url) if isinstance(exc, OAuthSSRFPrivateAddressError) else ""
+    )
+    return MCPOAuthDiscoveryError(f"{prefix}: {exc}{remediation}")
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +269,7 @@ async def _fetch_prm_issuer(
             allow_private=url_uses_trusted_private_host(prm_url, trusted_private_hosts),
         )
     except OAuthSSRFError as exc:
-        raise MCPOAuthDiscoveryError(f"PRM URL rejected: {exc}") from exc
+        raise _discovery_url_rejection("PRM URL rejected", prm_url, exc) from exc
 
     try:
         resp = await http_client.get(prm_url, timeout=_DEFAULT_HTTP_TIMEOUT)
@@ -270,7 +292,7 @@ async def _fetch_prm_issuer(
                 allow_private=url_uses_trusted_private_host(challenge_url, trusted_private_hosts),
             )
         except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"PRM challenge URL rejected: {exc}") from exc
+            raise _discovery_url_rejection("PRM challenge URL rejected", challenge_url, exc) from exc
         try:
             resp = await http_client.get(challenge_url, timeout=_DEFAULT_HTTP_TIMEOUT)
         except httpx.HTTPError as exc:
@@ -307,7 +329,7 @@ async def _fetch_prm_issuer(
             allow_private=url_uses_trusted_private_host(issuer_url, trusted_private_hosts),
         )
     except OAuthSSRFError as exc:
-        raise MCPOAuthDiscoveryError(f"PRM issuer URL rejected: {exc}") from exc
+        raise _discovery_url_rejection("PRM issuer URL rejected", issuer_url, exc) from exc
 
     return issuer_url
 
@@ -333,7 +355,7 @@ async def _fetch_as_metadata(
             allow_private=url_uses_trusted_private_host(issuer, trusted_private_hosts),
         )
     except OAuthSSRFError as exc:
-        raise MCPOAuthDiscoveryError(f"AS issuer URL rejected: {exc}") from exc
+        raise _discovery_url_rejection("AS issuer URL rejected", issuer, exc) from exc
 
     # MCP auth permits OpenID Connect discovery as a fallback to RFC 8414.
     # Major IdPs (notably Microsoft Entra) serve ONLY the OIDC document
@@ -410,7 +432,9 @@ async def _fetch_as_metadata(
                 allow_private=url_uses_trusted_private_host(endpoint_url, trusted_private_hosts),
             )
         except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"AS {name} rejected (url={endpoint_url}): {exc}") from exc
+            raise _discovery_url_rejection(
+                f"AS {name} rejected (url={endpoint_url})", endpoint_url, exc
+            ) from exc
 
     for opt_name, opt_url in (
         ("registration_endpoint", registration_endpoint),
@@ -427,7 +451,9 @@ async def _fetch_as_metadata(
                 allow_private=url_uses_trusted_private_host(opt_url, trusted_private_hosts),
             )
         except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"AS {opt_name} rejected (url={opt_url}): {exc}") from exc
+            raise _discovery_url_rejection(
+                f"AS {opt_name} rejected (url={opt_url})", opt_url, exc
+            ) from exc
 
     code_methods_raw = doc.get("code_challenge_methods_supported", [])
     if not isinstance(code_methods_raw, list):
@@ -515,7 +541,7 @@ async def discover_authorization_server(
                 allow_private=url_uses_trusted_private_host(override_url, trusted_private_hosts),
             )
         except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"override AS URL rejected: {exc}") from exc
+            raise _discovery_url_rejection("override AS URL rejected", override_url, exc) from exc
         issuer = override_url
     elif cached_issuer:
         # Defense-in-depth: re-run SSRF validation on the cached value.
