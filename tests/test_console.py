@@ -1613,7 +1613,7 @@ class TestConsoleProxy:
         app.state.proxy_client = MagicMock()
 
         with TestClient(app) as client:
-            resp = client.get(f"/node/node-a/{mount}/katex-0.18.4/{suffix}")
+            resp = client.get(f"/node/node-a/{mount}/katex-0.18.5/{suffix}")
 
         assert resp.status_code == 400
         assert resp.headers["cache-control"] == "no-store"
@@ -1715,10 +1715,10 @@ class TestConsoleProxy:
         upstream = httpx.Response(
             status_code,
             content=b"transient failure",
-            request=httpx.Request("GET", "http://n:1/shared/katex-0.18.4/missing.css"),
+            request=httpx.Request("GET", "http://n:1/shared/katex-0.18.5/missing.css"),
         )
 
-        resp = _proxy_static_response(upstream, "katex-0.18.4/missing.css")
+        resp = _proxy_static_response(upstream, "katex-0.18.5/missing.css")
 
         assert resp.status_code == status_code
         assert resp.headers["cache-control"] == "no-store"
@@ -1743,10 +1743,10 @@ class TestConsoleProxy:
             200,
             content=b"asset",
             headers={"cache-control": upstream_policy},
-            request=httpx.Request("GET", "http://n:1/shared/katex-0.18.4/katex.js"),
+            request=httpx.Request("GET", "http://n:1/shared/katex-0.18.5/katex.js"),
         )
 
-        resp = _proxy_static_response(upstream, "katex-0.18.4/katex.js")
+        resp = _proxy_static_response(upstream, "katex-0.18.5/katex.js")
 
         assert resp.headers["cache-control"] == expected
 
