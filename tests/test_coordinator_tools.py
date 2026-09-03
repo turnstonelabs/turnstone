@@ -367,6 +367,28 @@ def test_inspect_exec_dispatches_to_client(coord_session):
     assert "child-x" in output
 
 
+def test_inspect_exec_sizes_the_formatter_to_the_fold_cap(coord_session):
+    """The tiered formatter is handed the cap the result fold will apply, so it
+    degrades to a tier the fold admits whole instead of the fold splicing a
+    marker into the middle of a tier that fit the formatter's own budget."""
+    sess, coord, _ui = coord_session
+    coord.inspect.return_value = {
+        "ws_id": "child-x",
+        "skill_id": "general",
+        "state": "idle",
+        "messages": [{"role": "assistant", "content": "m" * 2000} for _ in range(30)],
+    }
+    item = sess._prepare_tool(_tc("inspect_workstream", {"ws_id": "child-x", "message_limit": 30}))
+
+    with patch.object(sess, "_remaining_token_budget", return_value=2000):
+        _call_id, output = sess._exec_inspect_workstream(item)
+
+    cap = sess._tool_result_truncation_limit(batch_budget_tokens=2000)
+    assert len(output) <= cap
+    assert '"_tier":"full"' not in output
+    assert "chars truncated" not in output
+
+
 # ---------------------------------------------------------------------------
 # send_to_workstream
 # ---------------------------------------------------------------------------
@@ -1595,8 +1617,8 @@ def test_spawn_batch_evaluate_intent_truncates_long_messages(coord_session, monk
     children = item["func_args"]["children"]
     assert len(children) == 1
     msg = children[0]["initial_message"]
-    assert msg.startswith("x" * 300)
-    assert "200 of 500 chars omitted" in msg
+    assert msg.count("x") == 300
+    assert msg.endswith("…[200 of 500 chars omitted]")
 
 
 def test_spawn_batch_evaluate_intent_handles_empty_children_defensively(coord_session, monkeypatch):

@@ -18,6 +18,13 @@ from typing import Any
 
 from turnstone.core.model_turn import ModelTurnResult
 from turnstone.core.trajectory import Turn, TurnProvenance
+from turnstone.core.truncation import truncate_text
+
+
+def _compaction_marker(_omitted: int, original: int, _limit: int) -> str:
+    """Size marker for compaction projections: the total is what a summary needs."""
+
+    return f"\n…[truncated — {original:,} chars total]…\n"
 
 
 class CompactionIrreducibleError(Exception):
@@ -316,8 +323,14 @@ class CompactionEngine:
             role = f"TOOL[{tool_names.get(call_id, 'tool')}]"
         if not content:
             return None
-        if len(content) > 2000:
-            content = content[:1000] + "\n...[truncated]...\n" + content[-500:]
+
+        content = truncate_text(
+            content,
+            2000,
+            mode="head_tail",
+            head_fraction=2 / 3,
+            marker_factory=_compaction_marker,
+        ).text
         return f"{role}: {content}"
 
     def summary_blocks(self, messages: Sequence[dict[str, Any]]) -> list[str]:
@@ -393,15 +406,13 @@ class CompactionEngine:
     def truncate_block(block: str, budget: int) -> str:
         """Fit one oversized block head+tail around an honest size marker."""
 
-        if len(block) <= budget:
-            return block
-        marker = f"\n…[truncated — {len(block):,} chars total]…\n"
-        if budget <= len(marker):
-            return block[:budget]
-        keep = budget - len(marker)
-        head = (keep * 2) // 3
-        tail = keep - head
-        return block[:head] + marker + block[-tail:] if tail else block[:head] + marker
+        return truncate_text(
+            block,
+            budget,
+            mode="head_tail",
+            head_fraction=2 / 3,
+            marker_factory=_compaction_marker,
+        ).text
 
     def pack_blocks(self, blocks: Sequence[str], budget_chars: int) -> list[list[str]]:
         """Greedily pack ordered blocks without drops or oversized batches.

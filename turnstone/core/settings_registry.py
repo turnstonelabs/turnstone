@@ -44,6 +44,12 @@ DEFAULT_AUTO_COMPACT_PCT = 0.8
 # approval batches cannot drift.
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 0
 
+# The largest tool-result cap any surface may request. ``turnstone.core.session``
+# sizes its streaming executors' edge retention from this value (half of it at
+# each edge), so every cap up to it renders faithfully from retained edges; a
+# larger cap could only be honored for outputs that were held whole.
+TOOL_TRUNCATION_MAX_CHARS = 16 * 1024 * 1024
+
 
 def _build_registry() -> dict[str, SettingDef]:
     """Build the settings registry from declarative definitions."""
@@ -219,9 +225,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools.truncation",
             "int",
             0,
-            "Tool output truncation limit in chars (0 = auto, 50% of context window)",
+            "Tool output truncation limit in chars (0 = auto: 20% of the remaining input budget per result)",
             "tools",
             min_value=0,
+            max_value=TOOL_TRUNCATION_MAX_CHARS,
             help="Limits how much output from a tool (e.g. a long command result) gets sent back "
             "to the model. Prevents large outputs from consuming the entire context window.",
         ),
@@ -990,10 +997,12 @@ def validate_key(key: str) -> SettingDef:
     return defn
 
 
-def validate_value(key: str, raw_value: Any) -> Any:
+def validate_value(key: str, raw_value: Any, *, clamp_range: bool = False) -> Any:
     """Coerce and validate *raw_value* against the setting definition.
 
-    Returns the typed value.  Raises ValueError on invalid input.
+    Returns the typed value.  Raises ValueError on invalid input, except that
+    with ``clamp_range`` a numeric value outside the declared range is clamped
+    to the nearest bound instead.
     """
     defn = validate_key(key)
 
@@ -1036,19 +1045,15 @@ def validate_value(key: str, raw_value: Any) -> Any:
         raise ValueError(f"Cannot convert {raw_value!r} to {defn.type} for {key}") from exc
 
     # Range validation
-    if typed is not None:
-        if (
-            defn.min_value is not None
-            and isinstance(typed, (int, float))
-            and typed < defn.min_value
-        ):
-            raise ValueError(f"{key}: {typed} < minimum {defn.min_value}")
-        if (
-            defn.max_value is not None
-            and isinstance(typed, (int, float))
-            and typed > defn.max_value
-        ):
-            raise ValueError(f"{key}: {typed} > maximum {defn.max_value}")
+    if typed is not None and isinstance(typed, (int, float)):
+        if defn.min_value is not None and typed < defn.min_value:
+            if not clamp_range:
+                raise ValueError(f"{key}: {typed} < minimum {defn.min_value}")
+            typed = type(typed)(defn.min_value)
+        if defn.max_value is not None and typed > defn.max_value:
+            if not clamp_range:
+                raise ValueError(f"{key}: {typed} > maximum {defn.max_value}")
+            typed = type(typed)(defn.max_value)
 
     # Choices validation
     if defn.choices is not None and typed not in defn.choices:
@@ -1062,10 +1067,10 @@ def serialize_value(value: Any) -> str:
     return json.dumps(value)
 
 
-def deserialize_value(key: str, json_str: str) -> Any:
+def deserialize_value(key: str, json_str: str, *, clamp_range: bool = False) -> Any:
     """JSON-decode and type-coerce against registry."""
     raw = json.loads(json_str)
     defn = SETTINGS.get(key)
     if defn is None:
         return raw  # Unknown key — return raw
-    return validate_value(key, raw)
+    return validate_value(key, raw, clamp_range=clamp_range)

@@ -12,6 +12,7 @@ Pure registry tests — no ChatSession.  Session wiring is covered in
 """
 
 import re
+import sys
 import threading
 import time
 
@@ -25,6 +26,7 @@ from tests._proc_helpers import poll_until as _wait_until
 # that monkeypatch module attributes (os.killpg, subprocess.Popen, ...).
 from turnstone.core import background_shells as bg_mod
 from turnstone.core.background_shells import (
+    _DRAIN_CHUNK_CHARS,
     BackgroundShellRegistry,
     FilterExecError,
     FilterTimeoutError,
@@ -118,6 +120,98 @@ def test_output_is_complete_once_completed(registry):
     assert _wait_status(shell, "completed")
     read = registry.read(shell.shell_id)
     assert [ln.strip() for ln in read.lines] == ["alpha", "beta"]
+
+
+def test_bounded_pipe_fragments_remain_one_logical_line(registry):
+    size = _DRAIN_CHUNK_CHARS + 137
+    shell = registry.spawn(
+        f"{sys.executable} -c \"import sys; sys.stdout.write('x' * {size} + '\\\\n')\""
+    )
+    assert _wait_status(shell, "completed")
+
+    read = registry.read(shell.shell_id)
+
+    assert read.new_line_count == 1
+    assert read.dropped_lines == 0
+    assert len(read.lines) == 1
+    assert read.lines[0] == "x" * size + "\n"
+
+
+def test_read_bounded_by_chars_consumes_only_the_returned_lines(registry):
+    shell = registry.spawn("printf 'aaaa\\nbbbb\\ncccc\\ndddd\\n'")
+    assert _wait_status(shell, "completed")
+
+    first = registry.read(shell.shell_id, max_chars=10)
+    assert first.lines == ["aaaa\n", "bbbb\n"]
+    assert first.new_line_count == 2 and first.unread_lines == 2
+
+    second = registry.read(shell.shell_id, max_chars=10)
+    assert second.lines == ["cccc\n", "dddd\n"]
+    assert second.unread_lines == 0
+
+    assert registry.read(shell.shell_id, max_chars=10).lines == []
+
+
+def test_read_bound_always_returns_one_line(registry):
+    shell = registry.spawn("printf 'a-long-line\\nshort\\n'")
+    assert _wait_status(shell, "completed")
+
+    read = registry.read(shell.shell_id, max_chars=3)
+
+    assert read.lines == ["a-long-line\n"]
+    assert read.unread_lines == 1
+
+
+def test_read_bound_with_filter_consumes_skipped_lines_before_the_cut(registry):
+    shell = registry.spawn("printf 'keep-1\\nskip\\nkeep-2\\nskip\\nkeep-3\\n'")
+    assert _wait_status(shell, "completed")
+
+    first = registry.read(shell.shell_id, filter_pattern="keep", max_chars=14)
+    assert first.lines == ["keep-1\n", "keep-2\n"]
+    assert first.new_line_count == 4 and first.unread_lines == 1
+
+    second = registry.read(shell.shell_id, filter_pattern="keep", max_chars=14)
+    assert second.lines == ["keep-3\n"]
+    assert second.new_line_count == 1 and second.unread_lines == 0
+
+
+def test_over_long_line_record_survives_the_lines_around_it(registry):
+    """A bounded line record is half the buffer, so it neither evicts every
+    earlier unread line on arrival nor is evicted by the line after it."""
+    registry._max_buffer_chars = 4096  # noqa: SLF001 - the spawn reads it
+    shell = registry.spawn(
+        "for i in $(seq 1 20); do echo line-$i; done; "
+        "head -c 10000 /dev/zero | tr '\\0' x; echo; echo after"
+    )
+    assert _wait_status(shell, "completed")
+
+    read = registry.read(shell.shell_id)
+
+    assert read.dropped_lines == 0
+    assert len(read.lines) == 22 and read.lines[-1] == "after\n"
+    record = read.lines[-2]
+    assert len(record) <= 2048 and record.count("\n") == 1
+    assert "line exceeded 2048 char limit" in record
+
+
+def test_filtered_bounded_read_scans_a_bounded_span(registry):
+    """A filtered read scans at most eight times what it can return, so each
+    call is bounded and still advances the cursor until the match arrives."""
+    shell = registry.spawn("for i in $(seq 1 2000); do echo noise-$i; done; echo match")
+    assert _wait_status(shell, "completed")
+
+    first = registry.read(shell.shell_id, filter_pattern="match", max_chars=400)
+    assert first.lines == []
+    assert 200 <= first.new_line_count <= 400
+    assert first.unread_lines == 2001 - first.new_line_count
+
+    reads = 1
+    read = first
+    while read.unread_lines and reads < 50:
+        read = registry.read(shell.shell_id, filter_pattern="match", max_chars=400)
+        reads += 1
+    assert read.lines == ["match\n"] and read.unread_lines == 0
+    assert 5 <= reads <= 12
 
 
 def test_leader_exit_reaps_backgrounded_grandchild(registry, tmp_path):
@@ -611,6 +705,36 @@ def test_filter_matches_only_within_line_cap_and_reports_clipping(registry):
     assert read.lines == []
     assert read.new_line_count == 1
     assert read.clipped_lines == 1
+
+
+def test_filter_does_not_gain_a_fresh_window_at_pipe_chunk_boundary(registry):
+    size = _DRAIN_CHUNK_CHARS + 64
+    shell = registry.spawn(
+        f"{sys.executable} -c \"import sys; sys.stdout.write('x' * {size} + 'needle\\\\n')\""
+    )
+    assert _wait_status(shell, "completed")
+
+    read = registry.read(shell.shell_id, filter_pattern="needle")
+
+    assert read.lines == []
+    assert read.new_line_count == 1
+    assert read.clipped_lines == 1
+
+
+def test_overlong_logical_line_is_bounded_and_signalled() -> None:
+    reg = BackgroundShellRegistry(max_buffer_chars=4096)
+    try:
+        shell = reg.spawn(f"{sys.executable} -c \"import sys; sys.stdout.write('x' * 20000)\"")
+        assert _wait_status(shell, "completed")
+
+        read = reg.read(shell.shell_id)
+
+        assert read.new_line_count == 1
+        assert len(read.lines) == 1
+        assert len(read.lines[0]) <= 4096
+        assert "chars truncated" in read.lines[0]
+    finally:
+        reg.close()
 
 
 def test_concurrent_reads_never_double_deliver(registry):

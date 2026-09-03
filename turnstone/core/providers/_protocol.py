@@ -17,6 +17,7 @@ from turnstone.core.streaming_text import (
     split_inline_reasoning,
     strip_blank_edge_lines,
 )
+from turnstone.core.truncation import truncate_text
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -855,9 +856,16 @@ def _join_reasoning_with_cap(parts: list[str]) -> str:
     if not parts:
         return ""
     joined = "\n".join(parts)
-    if len(joined) > MAX_REASONING_DISPLAY_CHARS:
-        return joined[:MAX_REASONING_DISPLAY_CHARS]
-    return joined
+
+    def _reasoning_marker(omitted: int, _original: int, _limit: int) -> str:
+        return f"\n… [{omitted:,} reasoning chars omitted from display]"
+
+    return truncate_text(
+        joined,
+        MAX_REASONING_DISPLAY_CHARS,
+        mode="head",
+        marker_factory=_reasoning_marker,
+    ).text
 
 
 def _lookup_capabilities(

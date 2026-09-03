@@ -1,6 +1,6 @@
 {
   "name": "bash_output",
-  "description": "Read new output from a background shell started with bash(run_in_background=true). Returns only output produced since your previous bash_output call for that shell, plus its status (running / completed / killed) and exit code once it has exited. Stderr lines are prefixed with [stderr]. Poll this to monitor a long-running process. In the main session a system notice announces when the shell exits, so you do not need to poll a shell you are merely waiting on; inside a task agent there is no notice — poll before you finish.",
+  "description": "Read new output from a background shell started with bash(run_in_background=true). Returns only output produced since your previous bash_output call for that shell, plus its status (running / completed / killed) and exit code once it has exited. Stderr lines are prefixed with [stderr]. A read returns whole lines up to what fits the context allowance; lines beyond that stay unread and the result says how many remain, so call again to continue. If a read is nonetheless cut, the elided portion was consumed and cannot be re-read; use filter to narrow future reads. Poll this to monitor a long-running process. In the main session a system notice announces when the shell exits, so you do not need to poll a shell you are merely waiting on; inside a task agent there is no notice — poll before you finish.",
   "parameters": {
     "type": "object",
     "properties": {

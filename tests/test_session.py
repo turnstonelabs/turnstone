@@ -33,8 +33,10 @@ from turnstone.core.model_turn import (
 from turnstone.core.session import (
     _IMAGE_EXTENSIONS,
     _IMAGE_SIZE_CAP,
+    _MAX_SKILL_CONTENT,
     _MEMORY_MIXED_BATCH_ERROR,
     ChatSession,
+    _clip_skill_content,
     _TaskExecutionJournal,
 )
 from turnstone.core.storage import get_storage
@@ -435,6 +437,12 @@ class TestTaskExec:
     task-agent identity), NEVER the skill; a ``skill=`` rides a distinct
     capability turn.  Operating guidance (one-shot, tool-use over narration,
     no follow-ups) always layers on top."""
+
+    def test_skill_clip_discloses_omitted_guidance_inside_cap(self) -> None:
+        clipped = _clip_skill_content("x" * (_MAX_SKILL_CONTENT + 1000))
+
+        assert len(clipped) <= _MAX_SKILL_CONTENT
+        assert "skill guidance truncated from" in clipped
 
     @staticmethod
     def _capture_exec_turns(session, item):
@@ -2434,9 +2442,10 @@ class TestEvaluateIntentProjection:
             "content": body,
         }
         fa = _project_func_args(item, budget=1000)
-        assert fa["content"].startswith("A" * 1000)
-        # honest about exactly how much was dropped
-        assert "4,000 of 5,000 chars omitted" in fa["content"]
+        # The budget is spent on source characters; the counted note is extra
+        # to it and exact about the source characters it displaced.
+        assert fa["content"].count("A") == 1000
+        assert fa["content"].endswith("…[4,000 of 5,000 chars omitted]")
 
     def test_edit_projection_marks_overflow_when_budget_exhausted(self) -> None:
         """A batch of huge edits collapses its tail to an honest count rather
@@ -3620,6 +3629,329 @@ class TestAgentOutputGuard:
 
             mock_eval.assert_not_called()
 
+    def test_agent_loop_marks_a_result_the_guard_shrank_below_the_clip(self):
+        """Redaction can shrink the guard window below the clip; the result
+        must still read as cut, with its true size, never as complete."""
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.session import _AGENT_GUARD_WINDOW_CHARS, _AGENT_TOOL_OUTPUT_CAP
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
+        body = "".join(chr(65 + i % 26) for i in range(3200))
+        block = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            + "\n".join(body[i : i + 64] for i in range(0, 3200, 64))
+            + "\n-----END RSA PRIVATE KEY-----\n"
+        )
+        huge = block * 9 + "y" * (_AGENT_GUARD_WINDOW_CHARS * 2)
+        landed: list[str] = []
+
+        client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "name": "read_file",
+                        "arguments": '{"path": "/tmp/test"}',
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "Done"},
+        )
+
+        def fake_prepare(tc_dict, **kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: ("call_1", huge),
+            }
+
+        original_tool = Turn.tool
+
+        def recording_tool(call_id, content, *args, **kwargs):
+            if isinstance(content, str):
+                landed.append(content)
+            return original_tool(call_id, content, *args, **kwargs)
+
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            patch("turnstone.core.session.Turn.tool", side_effect=recording_tool),
+        ):
+            session._run_agent(
+                [Turn.user("test")],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="test",
+            )
+
+        result = [c for c in landed if "[REDACTED" in c][-1]
+        assert len(result) < _AGENT_TOOL_OUTPUT_CAP
+        assert "PRIVATE KEY-----" not in result
+        assert result.endswith(f"(truncated from {len(huge)} chars)")
+        assert result.count("truncated from") == 1
+
+    def test_agent_loop_bash_output_clip_carries_the_consumed_notice(self):
+        """A task agent's cut ``bash_output`` delta says the elided output was
+        consumed, like the main fold's marker does."""
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.session import _AGENT_TOOL_OUTPUT_CAP, _BASH_OUTPUT_CONSUMED_NOTICE
+
+        session = _make_session()
+        client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
+        delta = "bash_1 (running)\n" + "line\n" * _AGENT_TOOL_OUTPUT_CAP
+        landed: list[str] = []
+
+        client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "name": "bash_output",
+                        "arguments": '{"id": "bash_1"}',
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "Done"},
+        )
+
+        def fake_prepare(tc_dict, **kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "bash_output",
+                "needs_approval": False,
+                "execute": lambda p: ("call_1", delta),
+            }
+
+        original_tool = Turn.tool
+
+        def recording_tool(call_id, content, *args, **kwargs):
+            if isinstance(content, str):
+                landed.append(content)
+            return original_tool(call_id, content, *args, **kwargs)
+
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            patch("turnstone.core.session.Turn.tool", side_effect=recording_tool),
+        ):
+            session._run_agent(
+                [Turn.user("test")],
+                tools=[{"type": "function", "function": {"name": "bash_output"}}],
+                label="test",
+            )
+
+        result = [c for c in landed if c.startswith("bash_1")][-1]
+        assert len(result) <= _AGENT_TOOL_OUTPUT_CAP
+        assert f"(truncated from {len(delta)} chars)" in result
+        assert _BASH_OUTPUT_CONSUMED_NOTICE in result
+
+    def _run_agent_bash_capture(self, session, capture, guard=None):
+        """Run one agent turn whose ``bash`` tool returns ``capture``; return
+        the tool-turn contents that landed and the texts the guard scanned."""
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
+        landed: list[str] = []
+        scanned: list[str] = []
+        client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [{"id": "call_1", "name": "bash", "arguments": '{"command": "x"}'}],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "Done"},
+        )
+
+        def fake_prepare(tc_dict, **kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "bash",
+                "needs_approval": False,
+                "execute": lambda p: ("call_1", capture),
+            }
+
+        def recording_guard(_call_id, text, *_args, **_kwargs):
+            scanned.append(text)
+            return (guard(text) if guard else text), None
+
+        original_tool = Turn.tool
+
+        def recording_tool(call_id, content, *args, **kwargs):
+            if isinstance(content, str):
+                landed.append(content)
+            return original_tool(call_id, content, *args, **kwargs)
+
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            patch.object(session, "_evaluate_output", side_effect=recording_guard),
+            patch("turnstone.core.session.Turn.tool", side_effect=recording_tool),
+        ):
+            session._run_agent(
+                [Turn.user("test")],
+                tools=[{"type": "function", "function": {"name": "bash"}}],
+                label="test",
+            )
+        return landed, scanned
+
+    def test_agent_guard_scans_the_text_the_clip_will_reveal(self):
+        """A capture's window is rendered from its source in the clip's head
+        mode before the guard runs, so the guard scans exactly what the agent
+        receives: a secret beyond the executor rendering's head but within the
+        clip's reach is redacted rather than revealed by the clip."""
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.session import _AGENT_TOOL_OUTPUT_CAP
+        from turnstone.core.truncation import BoundedTextBuffer
+
+        session = _make_session()
+        session._judge_config = JudgeConfig(output_guard=True, output_guard_llm=False)
+        buffer = BoundedTextBuffer(20_000)
+        buffer.append("a" * 12_000 + "SECRET-TOKEN" + "b" * 88_000)
+        capture = buffer.projected()
+        assert "SECRET-TOKEN" not in capture
+
+        landed, scanned = self._run_agent_bash_capture(
+            session, capture, guard=lambda text: text.replace("SECRET-TOKEN", "[REDACTED]")
+        )
+
+        result = [c for c in landed if c.startswith("a")][-1]
+        assert len(result) <= _AGENT_TOOL_OUTPUT_CAP
+        assert "SECRET-TOKEN" not in result
+        assert "[REDACTED]" in result
+        assert any("SECRET-TOKEN" in text for text in scanned)
+
+    def test_agent_receives_a_capture_its_window_can_hold_complete(self):
+        """A capture rendered at the executor's retention is re-rendered from
+        its source for the agent, so an output the guard window can hold
+        arrives complete rather than as the executor's bounded rendering."""
+        from turnstone.core.truncation import BoundedTextBuffer
+
+        session = _make_session()
+        buffer = BoundedTextBuffer(1000)
+        buffer.append("x" * 1500)
+        capture = buffer.projected()
+        assert "chars truncated" in capture
+
+        landed, _scanned = self._run_agent_bash_capture(session, capture)
+
+        assert [c for c in landed if c.startswith("x")][-1] == "x" * 1500
+
+    def test_agent_loop_guard_scans_a_bounded_window(self):
+        """The guard evaluates a bounded window of the result, never an
+        unbounded string a tool server controls."""
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.session import _AGENT_GUARD_WINDOW_CHARS, _AGENT_TOOL_OUTPUT_CAP
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
+        seen_lengths: list[int] = []
+
+        def recording_guard(_call_id, output, *_args, **_kwargs):
+            seen_lengths.append(len(output))
+            return output, None
+
+        with patch.object(session, "_evaluate_output", side_effect=recording_guard):
+            client.chat.completions.create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "read_file",
+                            "arguments": '{"path": "/tmp/test"}',
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": "Done"},
+            )
+            huge = "x" * (_AGENT_TOOL_OUTPUT_CAP * 4)
+
+            def fake_prepare(tc_dict, **kwargs):
+                return {
+                    "call_id": tc_dict["id"],
+                    "func_name": "read_file",
+                    "needs_approval": False,
+                    "execute": lambda p: ("call_1", huge),
+                }
+
+            with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+                session._run_agent(
+                    [Turn.user("test")],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    label="test",
+                )
+
+        assert seen_lengths and max(seen_lengths) <= _AGENT_GUARD_WINDOW_CHARS
+
+    def test_agent_loop_guard_window_reaches_past_the_clip(self):
+        """A credential that straddles the clip boundary is seen whole by the
+        guard and redacted, while the clip marker still reports the result's
+        true size and the guard never scans more than its bounded window."""
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.session import _AGENT_GUARD_WINDOW_CHARS, _AGENT_TOOL_OUTPUT_CAP
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
+        token = "ghp_" + "a" * 36
+        huge = "x" * (_AGENT_TOOL_OUTPUT_CAP - 10) + token + "y" * (_AGENT_GUARD_WINDOW_CHARS * 3)
+        seen_lengths: list[int] = []
+        landed: list[str] = []
+        real_guard = session._evaluate_output
+
+        def recording_guard(call_id, output, *args, **kwargs):
+            seen_lengths.append(len(output))
+            return real_guard(call_id, output, *args, **kwargs)
+
+        with patch.object(session, "_evaluate_output", side_effect=recording_guard):
+            client.chat.completions.create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "read_file",
+                            "arguments": '{"path": "/tmp/test"}',
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": "Done"},
+            )
+
+            def fake_prepare(tc_dict, **kwargs):
+                return {
+                    "call_id": tc_dict["id"],
+                    "func_name": "read_file",
+                    "needs_approval": False,
+                    "execute": lambda p: ("call_1", huge),
+                }
+
+            original_tool = Turn.tool
+
+            def recording_tool(call_id, content, *args, **kwargs):
+                if isinstance(content, str):
+                    landed.append(content)
+                return original_tool(call_id, content, *args, **kwargs)
+
+            with (
+                patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+                patch("turnstone.core.session.Turn.tool", side_effect=recording_tool),
+            ):
+                session._run_agent(
+                    [Turn.user("test")],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    label="test",
+                )
+
+        assert seen_lengths and max(seen_lengths) <= _AGENT_GUARD_WINDOW_CHARS
+        clipped = [c for c in landed if c.startswith("x" * 100)]
+        assert clipped, landed
+        result = clipped[-1]
+        assert token not in result
+        assert "ghp_" not in result
+        assert f"(truncated from {len(huge)} chars)" in result
+
     def test_synthesis_only_path_is_guarded(self):
         """When the sub-agent emits text directly (no tool calls), the
         synthesis still flows through _evaluate_output.  This is the
@@ -4653,6 +4985,18 @@ class TestTaskExecutionJournalProjection:
         steps = _TaskExecutionJournal(turns).project_steps()
         assert steps[0]["output"] == "[non-text result]"
 
+    def test_update_step_keeps_the_producer_size(self):
+        from turnstone.core.session import _AGENT_STEP_OUTPUT_CAP, _TaskExecutionJournal
+
+        step = {"output": "", "is_error": False}
+        clipped = "a" * (_AGENT_STEP_OUTPUT_CAP + 500) + "\n\n... (truncated from 1000000 chars)"
+
+        _TaskExecutionJournal.update_step(step, clipped, is_error=False, original_chars=1_000_000)
+
+        assert step["output"].endswith("(truncated from 1000000 chars)")
+        assert step["output"].count("truncated from") == 1
+        assert len(step["output"]) <= _AGENT_STEP_OUTPUT_CAP
+
     def test_output_capped(self):
         from turnstone.core.session import _AGENT_STEP_OUTPUT_CAP
         from turnstone.core.trajectory import ToolCall, Turn
@@ -5424,6 +5768,59 @@ class TestEvaluateOutputLLMStage:
         # signal that the LLM cannot override.
         assert assessment is not None
         assert "credential_leak" in assessment.flags
+
+    def test_disabled_secret_redaction_never_claims_bytes_changed(self) -> None:
+        """Raw-by-policy output and every guard projection agree it stayed raw."""
+
+        from turnstone.core.judge import JudgeConfig
+
+        records: list[dict[str, object]] = []
+        warnings: list[dict[str, object]] = []
+
+        class _PolicyUI(NullUI):
+            def record_output_assessment(
+                self,
+                call_id,
+                assessment,
+                *,
+                tier="heuristic",
+                reasoning="",
+                judge_model="",
+                latency_ms=0,
+                confidence=0.0,
+            ):
+                del call_id, tier, reasoning, judge_model, latency_ms, confidence
+                records.append(dict(assessment))
+
+            def on_output_warning(self, call_id, assessment):
+                warnings.append({"call_id": call_id, **assessment})
+
+        session = _make_session(
+            judge_config=JudgeConfig(
+                output_guard=True,
+                output_guard_llm=False,
+                redact_secrets=False,
+            ),
+            ui=_PolicyUI(),
+        )
+        secret = "OPENAI_API_KEY=sk-proj-aaaaaaaaaaaaaaaaaaaa123456"
+
+        output, assessment = session._evaluate_output("call-raw", secret, "bash")
+
+        assert output == secret
+        assert assessment is not None
+        assert assessment.sanitized is None
+        assert records[0]["redacted"] is False
+        assert warnings[0]["redacted"] is False
+        guard_specs = [
+            spec
+            for spec in session._collect_advisories(assessment, "bash", False)
+            if spec[0] == "output_guard"
+        ]
+        assert len(guard_specs) == 1
+        _source, content, meta = guard_specs[0]
+        assert meta["redacted"] is False
+        assert "Credentials have been redacted" not in content
 
     def test_rate_limit_drops_excess_judge_calls(self) -> None:
         """sec-4: when the per-session token bucket is exhausted, the LLM
@@ -8823,6 +9220,18 @@ class TestMemoryAccessTouch:
 
 
 class TestMetacognitiveBuffers:
+    def test_interjection_marker_is_inside_declared_cap(self, tmp_db) -> None:
+        from turnstone.core.workstream import INTERJECTION_CAP_CHARS
+
+        session = _make_session()
+        cleaned, _priority, _msg_id = session.queue_message(
+            "x" * (INTERJECTION_CAP_CHARS + 100),
+            queue_msg_id="bounded-interjection",
+        )
+
+        assert len(cleaned) == INTERJECTION_CAP_CHARS
+        assert cleaned.endswith("…")
+
     """Nudges drain through advisory channels, not the system message."""
 
     def test_pending_buffers_initialised_empty(self, tmp_db):
@@ -11642,6 +12051,27 @@ class TestSearchOutputBudget:
         # so the final emission stays at or below ``_SEARCH_OUTPUT_BUDGET``
         # without needing ``_truncate_output`` as a backstop.
         assert len(out) <= _SEARCH_OUTPUT_BUDGET
+
+    def test_budget_argument_sizes_the_ladder(self):
+        """The executor hands the formatter the fold's cap, so the ladder
+        degrades to a tier the fold admits whole."""
+        from turnstone.core.session import _SEARCH_OUTPUT_BUDGET, _format_search_results
+
+        records = [(f, str(i), "x" * 60) for f in ("a.py", "b.py", "c.py") for i in range(200)]
+
+        out = _format_search_results(records, capped=False, budget=2_000)
+
+        assert len(out) <= 2_000
+        assert "600 matches across 3 files" in out
+
+        session = _make_session()
+        with (
+            patch.object(session, "_remaining_token_budget", return_value=2_000),
+            patch("turnstone.core.session._format_search_results", return_value="ok") as fmt,
+        ):
+            _run_exec_search(session, (b"a.py:1:hit\n", 0, b"", False))
+        cap = session._tool_result_truncation_limit(batch_budget_tokens=2_000)
+        assert fmt.call_args.kwargs["budget"] == min(_SEARCH_OUTPUT_BUDGET, cap)
 
     def test_tier3_counts_only_when_too_many_files(self):
         """Thousands of files × matches → degrade to per-file counts."""

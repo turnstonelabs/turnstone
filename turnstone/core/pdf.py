@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import struct
 import subprocess
 import sys
 import tempfile
@@ -36,8 +35,11 @@ from turnstone.core._pdf_worker import (
     MAX_RASTER_PAGES,
     MAX_SOURCE_BYTES,
     MAX_TEXT_CHARS,
+    RASTER_LENGTH,
+    TEXT_LENGTH,
 )
 from turnstone.core.log import get_logger
+from turnstone.core.truncation import truncate_edges
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -46,7 +48,6 @@ log = get_logger(__name__)
 
 _MAX_WALL_SECONDS = 30.0
 _POLL_SECONDS = 0.05
-_RASTER_LENGTH = struct.Struct("!I")
 _PDF_WORKER_PATH = Path(__file__).with_name("_pdf_worker.py").resolve(strict=True)
 
 # Public safety ceiling for callers that layer a narrower presentation budget
@@ -203,6 +204,31 @@ def _worker_bytes(
             _PDF_WORKER_SLOT.release()
 
 
+def _pdf_text_marker(omitted: int, _original: int, _limit: int) -> str:
+    return f"\n\n... [{omitted} chars truncated] ...\n"
+
+
+def _render_pdf_text(prefix: str, total_chars: int, limit: int) -> str:
+    """Fit the worker's bounded prefix and an omission marker inside ``limit``.
+
+    A zero allowance still returns the marker: it is a receipt of what was
+    dropped rather than source text, and an empty result would read
+    downstream as a PDF with no text at all.
+    """
+
+    text = truncate_edges(
+        prefix=prefix,
+        suffix="",
+        original_chars=total_chars,
+        limit_chars=limit,
+        mode="head",
+        marker_factory=_pdf_text_marker,
+    ).text
+    if text or not total_chars:
+        return text
+    return _pdf_text_marker(total_chars, total_chars, limit)
+
+
 def extract_pdf_text(
     data: bytes,
     *,
@@ -223,7 +249,11 @@ def extract_pdf_text(
             ["--max-chars", str(limit)],
             check_cancelled=check_cancelled,
         )
-        return output.decode("utf-8")
+        if len(output) < TEXT_LENGTH.size:
+            raise _PdfInvalidError
+        (total_chars,) = TEXT_LENGTH.unpack_from(output)
+        prefix = output[TEXT_LENGTH.size :].decode("utf-8")
+        return _render_pdf_text(prefix, total_chars, limit)
     except (_PdfInvalidError, UnicodeDecodeError):
         log.warning("PDF text extraction failed")
         return ""
@@ -268,10 +298,10 @@ def rasterize_pdf(
         truncated = False
         offset = 0
         while offset < len(output):
-            if len(output) - offset < _RASTER_LENGTH.size:
+            if len(output) - offset < RASTER_LENGTH.size:
                 raise PdfWorkLimitError("PDF worker returned malformed raster data")
-            (length,) = _RASTER_LENGTH.unpack_from(output, offset)
-            offset += _RASTER_LENGTH.size
+            (length,) = RASTER_LENGTH.unpack_from(output, offset)
+            offset += RASTER_LENGTH.size
             # A zero-length terminal frame is the worker's explicit signal
             # that it observed another source page beyond ``page_limit``.
             if length == 0:

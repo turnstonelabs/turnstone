@@ -22,6 +22,7 @@ import httpx
 
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_crypto import is_user_scoped_auth
+from turnstone.core.truncation import truncate_text
 
 if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager
@@ -33,6 +34,23 @@ log = get_logger(__name__)
 # before the caller's ``max_results`` slice. bm25.py defines the same cap
 # independently (kept separate so bm25 stays httpx-free) — keep the two in sync.
 _RERANK_POOL = 50
+_RESULT_SNIPPET_CHARS = 500
+
+
+def _format_snippet(value: Any) -> str:
+    """Return one honestly bounded search-result evidence snippet."""
+
+    text = str(value or "").strip()
+
+    def _snippet_marker(omitted: int, _original: int, _limit: int) -> str:
+        return f"\n… [{omitted:,} snippet chars omitted]"
+
+    return truncate_text(
+        text,
+        _RESULT_SNIPPET_CHARS,
+        mode="head",
+        marker_factory=_snippet_marker,
+    ).text
 
 
 class WebSearchClient(Protocol):
@@ -124,9 +142,9 @@ def _format_searxng(
 
     # Infoboxes (Wikipedia/Wikidata side panels). One is plenty of context.
     for box in data.get("infoboxes") or []:
-        content = (box.get("content") or "").strip()
+        content = _format_snippet(box.get("content"))
         if content:
-            parts.append(content[:500])
+            parts.append(content)
             break
 
     results = data.get("results") or []
@@ -137,7 +155,7 @@ def _format_searxng(
         for i, r in enumerate(results[:max_results], 1):
             title = r.get("title", "")
             url = r.get("url", "")
-            content = (r.get("content") or "")[:500]
+            content = _format_snippet(r.get("content"))
             lines.append(f"{i}. [{title}]({url})\n   {content}")
         parts.append("\n".join(lines))
 

@@ -33,7 +33,22 @@ MAX_WATCHES_PER_WS = 5
 MIN_INTERVAL = 10  # seconds
 MAX_INTERVAL = 86_400  # 24 hours
 DEFAULT_MAX_POLLS = 100
-MAX_OUTPUT_SIZE = 65_536  # truncate stored/dispatched output at 64 KB
+MAX_OUTPUT_SIZE = 65_536  # truncate stored/dispatched output at 64K characters
+# A capped rendering is the head at the cap followed by this marker, and polls
+# compare by that head alone (``evaluate_condition``), so a growing log with an
+# unchanged head still reads as unchanged, and a previous poll persisted by an
+# earlier release with a differently worded marker compares equal too.
+_WATCH_TRUNCATION_MARKER = f"\n[truncated at {MAX_OUTPUT_SIZE} chars]"
+
+
+def _bound_watch_output(output: str) -> str:
+    """``output`` whole, or its head at the cap followed by the fixed marker."""
+
+    if len(output) <= MAX_OUTPUT_SIZE:
+        return output
+    return output[:MAX_OUTPUT_SIZE] + _WATCH_TRUNCATION_MARKER
+
+
 # Cap on delivery re-attempts for a fire whose workstream can't be
 # reached (evicted + transiently unrestorable — all restore slots busy).
 # On exhaustion the held reminder is dropped and one poll is charged to
@@ -167,7 +182,8 @@ def evaluate_condition(
     Returns ``(fired, reason)`` where *fired* is ``True`` when the watch
     should report a result and *reason* is a human-readable explanation.
     """
-    changed = output != prev_output
+    # Compare by the head at the cap: the marker after it is not evidence.
+    changed = prev_output is None or output[:MAX_OUTPUT_SIZE] != prev_output[:MAX_OUTPUT_SIZE]
 
     if expr is None:
         # Default: fire on any change (skip first poll where prev is None)
@@ -695,9 +711,9 @@ class WatchRunner:
         # Run command
         output, exit_code = self._run_command(sanitize_command(command))
 
-        # Truncate to avoid unbounded storage / context window usage
-        if len(output) > MAX_OUTPUT_SIZE:
-            output = output[:MAX_OUTPUT_SIZE] + f"\n[truncated at {MAX_OUTPUT_SIZE} bytes]"
+        # Bound storage and context use with the fixed-shape rendering that
+        # consecutive polls, and earlier releases' stored polls, compare by.
+        output = _bound_watch_output(output)
 
         # Evaluate condition
         fired, reason = evaluate_condition(stop_on, output, exit_code, prev_output)

@@ -32,6 +32,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._session_helpers import make_session
+from turnstone.core.compaction import CompactionEngine
 from turnstone.core.session import COMPACTION_SOURCE, COMPACTION_SUMMARY_LABEL
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import turns_from_dicts
@@ -86,6 +87,22 @@ def _carry_budget_chars(session, carries: int = 1) -> int:
 
 def _summary_output_tokens(session) -> int:
     return session._compaction_engine.summary_output_tokens(_summary_runtime(session))
+
+
+def test_summary_message_projection_is_honest_and_exact_cap() -> None:
+    source = "A" * 2500 + "Z" * 2500
+
+    rendered = CompactionEngine.format_message_for_summary(
+        {"role": "tool", "tool_call_id": "call-1", "content": source},
+        {"call-1": "bash"},
+    )
+
+    assert rendered is not None
+    prefix = "TOOL[bash]: "
+    assert rendered.startswith(prefix + "A")
+    assert rendered.endswith("Z")
+    assert len(rendered) <= len(prefix) + 2000
+    assert "truncated — 5,000 chars total" in rendered
 
 
 # ---------------------------------------------------------------------------

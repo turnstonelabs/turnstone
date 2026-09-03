@@ -185,6 +185,12 @@ class TestValidateValueRange:
         with pytest.raises(ValueError, match="maximum"):
             validate_value("tools.timeout", 9999)  # max_value=3600
 
+    def test_clamp_range(self):
+        assert validate_value("tools.timeout", 9999, clamp_range=True) == 3600
+        assert validate_value("tools.timeout", 0, clamp_range=True) == 1
+        with pytest.raises(ValueError):
+            validate_value("tools.timeout", "not a number", clamp_range=True)
+
     def test_min_value_float(self):
         with pytest.raises(ValueError, match="minimum"):
             validate_value("model.temperature", -0.1)  # min_value=0.0

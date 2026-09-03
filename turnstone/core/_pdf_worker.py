@@ -31,13 +31,15 @@ MAX_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_TEXT_PAGES = 100
 # Keep the character ceiling derived from the fixed output-byte envelope rather
 # than from today's model context sizes. UTF-8 needs at most four bytes per
-# Unicode scalar; leave room for the truncation marker.
-_TEXT_OUTPUT_MARKER_RESERVE_BYTES = 1024
-MAX_TEXT_CHARS = (MAX_FILE_BYTES - _TEXT_OUTPUT_MARKER_RESERVE_BYTES) // 4
+# Unicode scalar; leave room for the size header.
+_TEXT_OUTPUT_HEADER_RESERVE_BYTES = 1024
+MAX_TEXT_CHARS = (MAX_FILE_BYTES - _TEXT_OUTPUT_HEADER_RESERVE_BYTES) // 4
 
 _TEXT_CHUNK_CHARS = 64 * 1024
 _WHITESPACE_RUN = re.compile(r"\s+|\S+")
-_RASTER_LENGTH = struct.Struct("!I")
+RASTER_LENGTH = struct.Struct("!I")
+# Text output: the true character count, then the bounded UTF-8 prefix.
+TEXT_LENGTH = struct.Struct("!Q")
 _RESOURCE_LIMIT_ERRNOS = frozenset(
     getattr(errno, name) for name in ("EFBIG", "ENOMEM", "ENOSPC", "EDQUOT") if hasattr(errno, name)
 )
@@ -181,10 +183,9 @@ def _extract_text(input_path: Path, output_path: Path, max_chars: int) -> None:
             total_len += len(marker)
             prefix_len = _append_prefix(prefix, prefix_len, marker, max_chars)
 
-        text = prefix.getvalue()
-        if total_len > max_chars:
-            text += f"\n\n... [{total_len - max_chars} chars truncated] ...\n"
-        encoded = text.encode("utf-8")
+        # The worker reports the true size and hands over the bounded prefix;
+        # the parent renders the omission marker with the shared primitive.
+        encoded = TEXT_LENGTH.pack(total_len) + prefix.getvalue().encode("utf-8")
         if len(encoded) > MAX_FILE_BYTES:
             raise _ResourceLimitError("text output exceeds byte cap")
         output_path.write_bytes(encoded)
@@ -195,19 +196,19 @@ def _extract_text(input_path: Path, output_path: Path, max_chars: int) -> None:
 
 
 def _write_raster_page(output: BinaryIO, png: bytes, written: int) -> int:
-    next_written = written + _RASTER_LENGTH.size + len(png)
+    next_written = written + RASTER_LENGTH.size + len(png)
     if next_written > MAX_FILE_BYTES:
         raise _ResourceLimitError("raster output exceeds byte cap")
-    output.write(_RASTER_LENGTH.pack(len(png)))
+    output.write(RASTER_LENGTH.pack(len(png)))
     output.write(png)
     return next_written
 
 
 def _write_raster_truncation(output: BinaryIO, written: int) -> None:
     """Write the terminal zero-length frame denoting omitted source pages."""
-    if written + _RASTER_LENGTH.size > MAX_FILE_BYTES:
+    if written + RASTER_LENGTH.size > MAX_FILE_BYTES:
         raise _ResourceLimitError("raster output exceeds byte cap")
-    output.write(_RASTER_LENGTH.pack(0))
+    output.write(RASTER_LENGTH.pack(0))
 
 
 def _rasterize(

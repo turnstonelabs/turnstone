@@ -9825,7 +9825,7 @@ async def admin_list_settings(request: Request) -> JSONResponse:
         row = stored.get(key)
         if row:
             try:
-                val = deserialize_value(key, row["value"])
+                val = deserialize_value(key, row["value"], clamp_range=True)
             except (ValueError, KeyError):
                 val = row["value"]
             info = {
@@ -14589,7 +14589,7 @@ async def admin_list_judge_settings(request: Request) -> JSONResponse:
         row = stored.get(key)
         if row:
             try:
-                val = deserialize_value(key, row["value"])
+                val = deserialize_value(key, row["value"], clamp_range=True)
             except (ValueError, KeyError):
                 val = row["value"]
             entry = {

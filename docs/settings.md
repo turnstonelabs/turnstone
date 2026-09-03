@@ -283,6 +283,12 @@ Settings are addressed by dotted key (e.g. `memory.relevance_k`). Each has a
 declared type (`int`, `float`, `str`, `bool`), optional `min_value`/`max_value`
 range, optional `choices` list, and an `is_secret` flag.
 
+A stored value outside a setting's range is clamped to the nearest bound when
+settings load, with a warning, so a bound tightened by an upgrade never
+silently replaces an operator's choice with the default. Values of the wrong
+type or outside a `choices` list are skipped with a warning and the default
+applies.
+
 ---
 
 ## Storage

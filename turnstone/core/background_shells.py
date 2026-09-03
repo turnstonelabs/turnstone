@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from turnstone.core.log import get_logger
+from turnstone.core.truncation import BoundedTextBuffer
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -57,8 +58,9 @@ ShellStatus = Literal["running", "completed", "killed"]
 # Live (status == "running") shells per session.  A hard backstop against a
 # runaway loop of spawns on a multi-tenant node, not an operator knob.
 _DEFAULT_MAX_SHELLS = 8
-# Rolling per-shell buffer cap, in characters.  Oldest whole lines drop
-# first; the newest line always survives even if it alone exceeds the cap.
+# Rolling per-shell buffer cap, in characters.  The pipe drain bounds each
+# logical line to this size before insertion; oldest whole lines then drop
+# first, while the newest bounded line always survives.
 _DEFAULT_MAX_BUFFER_CHARS = 200_000
 # How long to wait for the drain threads after the group kill forces their
 # pipes to EOF.  A grandchild that double-``setsid``-escaped the group can
@@ -90,6 +92,16 @@ _MAX_EXITED_RECORDS = 32
 _MAX_FILTER_PATTERN_CHARS = 512
 _FILTER_MAX_LINE_CHARS = 4096
 _FILTER_TIMEOUT_S = 2.0
+# A filtered, bounded read hands the helper at most this many times the
+# characters it can return, so one call pays for one bounded pass and still
+# advances the cursor at least that far; the rest of the delta stays unread.
+_FILTER_SCAN_MULTIPLE = 8
+# A producer can emit an arbitrarily long line.  Iterating a text pipe by line
+# asks ``TextIOWrapper`` to allocate that whole line before the callback sees
+# it, defeating every downstream buffer cap.  Bounded ``readline`` chunks keep
+# the parent allocation finite while preserving ordinary newline-delimited
+# output exactly.
+_DRAIN_CHUNK_CHARS = 64 * 1024
 
 # Runs inside ``sys.executable -c``: reads {pattern, lines} as JSON on
 # stdin (lines already truncated parent-side), writes the MATCHING INDEXES
@@ -119,8 +131,11 @@ class FilterExecError(RuntimeError):
     """The filter helper process failed for a non-pattern reason."""
 
 
-def _filter_lines_bounded(pattern: re.Pattern[str], lines: list[str], shell_id: str) -> list[str]:
-    """Apply ``pattern`` per line with a wall-clock bound.
+def _filter_line_indexes_bounded(
+    pattern: re.Pattern[str], lines: list[str], shell_id: str
+) -> list[int]:
+    """Apply ``pattern`` per line with a wall-clock bound; return the indexes
+    of the matching lines, in order.
 
     A catastrophic-backtracking pattern would wedge the (auto-approved)
     tool call — the exact never-returns class #816 removed — and it cannot
@@ -221,11 +236,11 @@ def _filter_lines_bounded(pattern: re.Pattern[str], lines: list[str], shell_id: 
             "the filter could not be applied (helper returned malformed data); "
             "no output was consumed — retry, or read without a filter"
         ) from None
-    return [lines[i] for i in indexes if isinstance(i, int) and 0 <= i < len(lines)]
+    return [i for i in indexes if isinstance(i, int) and 0 <= i < len(lines)]
 
 
 def drain_pipe_lines(pipe: Any, on_line: Callable[[str], None]) -> None:
-    """Read ``pipe`` line-by-line until EOF, forwarding each to ``on_line``.
+    """Read ``pipe`` in newline-aware bounded chunks, forwarding each chunk.
 
     The drain half of the shared bash recipe (see :func:`spawn_group_leader`
     for the spawn half): both variants of the tool tolerate the same two
@@ -236,10 +251,64 @@ def drain_pipe_lines(pipe: Any, on_line: Callable[[str], None]) -> None:
     remaining output while reporting a clean success.)
     """
     try:
-        for line in pipe:
-            on_line(line)
+        while chunk := pipe.readline(_DRAIN_CHUNK_CHARS):
+            on_line(chunk)
     except (ValueError, OSError):
         log.debug("bash.drain_read_error", exc_info=True)
+
+
+def _line_omission_marker(omitted: int, _original: int, limit: int) -> str:
+    """The marker inside one bounded shell-line record.  It carries no newline,
+    so the record stays a single line for the cursor, the filter, and the
+    ``[stderr]`` prefix."""
+
+    return f" ... [{omitted} chars truncated — line exceeded {limit} char limit] ... "
+
+
+def drain_pipe_logical_lines(
+    pipe: Any,
+    on_line: Callable[[str], None],
+    *,
+    max_line_chars: int,
+) -> None:
+    """Drain bounded chunks while forwarding one bounded record per line.
+
+    ``TextIOWrapper.readline(size)`` returns continuation fragments when one
+    physical line exceeds ``size``.  Background-shell cursors and filters are
+    defined over logical lines, so those fragments must not independently
+    advance the cursor or receive fresh filter windows.  Reassembly itself is
+    bounded: an arbitrarily long newline-free producer is consumed in
+    :data:`_DRAIN_CHUNK_CHARS` pieces while :class:`BoundedTextBuffer` retains
+    only enough head/tail evidence to render ``max_line_chars`` characters and
+    an explicit omission marker, one without a newline so the record is still
+    one line.  A final line without its newline (EOF, or a read error
+    mid-line) is still delivered as one bounded record.
+
+    Foreground bash uses :func:`drain_pipe_lines` for both of its pipes: its
+    capture is bounded as a whole rather than per line, so the result fold
+    stays its single cut.
+    """
+
+    line_buffer: BoundedTextBuffer | None = None
+
+    def on_chunk(chunk: str) -> None:
+        nonlocal line_buffer
+        if line_buffer is None:
+            if chunk.endswith("\n") and len(chunk) <= max_line_chars:
+                # The common case: one chunk is one whole line within the
+                # bound.  Forward it as is; the bounded reassembly below is
+                # for lines that span chunks or exceed the bound.
+                on_line(chunk)
+                return
+            line_buffer = BoundedTextBuffer(max_line_chars)
+        line_buffer.append(chunk)
+        if chunk.endswith("\n"):
+            on_line(line_buffer.render(marker_factory=_line_omission_marker).text)
+            line_buffer = None
+
+    drain_pipe_lines(pipe, on_chunk)
+    if line_buffer is not None:
+        on_line(line_buffer.render(marker_factory=_line_omission_marker).text)
 
 
 def spawn_group_leader(
@@ -291,10 +360,13 @@ class ShellRead:
     """One delta read: lines since the previous read, plus shell state.
 
     ``lines`` is post-filter (what the caller shows); ``new_line_count`` is
-    the pre-filter delta size — the cursor advanced past all of them, so a
-    filtered-out line is consumed, never deferred to a later read.
-    ``dropped_lines`` counts lines lost to the buffer cap before they were
-    ever read (an explicit gap, not silence).
+    the pre-filter count of lines this read consumed — the cursor advanced
+    past all of them, so a filtered-out line is consumed, never deferred to
+    a later read.  A read bounded by ``max_chars`` consumes whole lines up
+    to the bound, scans a bounded span of the delta when filtering, and
+    leaves ``unread_lines`` for the next call.  ``dropped_lines`` counts
+    lines lost to the buffer cap before they were ever read (an explicit gap,
+    not silence).
     """
 
     shell_id: str
@@ -308,6 +380,7 @@ class ShellRead:
     # reads; the caller surfaces it so a "none matching" answer over
     # clipped evidence is never silent.
     clipped_lines: int = 0
+    unread_lines: int = 0
 
 
 class BackgroundShell:
@@ -378,7 +451,10 @@ class BackgroundShell:
             self._buffered_chars += len(line)
             self._total_lines += 1
             # Drop oldest whole lines past the cap, but always keep the
-            # newest — a single oversized line must not empty the buffer.
+            # newest.  Production drains bound one logical line to half the
+            # cap before this point, so a bounded record survives its
+            # neighbours; keeping the defensive len > 1 rule also makes direct
+            # callers degrade to one oversized record instead of no evidence.
             while self._buffered_chars > self._max_buffer_chars and len(self._buffer) > 1:
                 dropped = self._buffer.popleft()
                 self._buffered_chars -= len(dropped)
@@ -564,8 +640,13 @@ class BackgroundShellRegistry:
 
     @staticmethod
     def _drain(pipe: Any, shell: BackgroundShell, is_stderr: bool) -> None:
-        drain_pipe_lines(
-            pipe, lambda line: shell._append(f"[stderr] {line}" if is_stderr else line)
+        # One logical line is bounded to half the buffer, so the record of an
+        # over-long line neither evicts every unread line before it nor is
+        # evicted by the line after it.
+        drain_pipe_logical_lines(
+            pipe,
+            lambda line: shell._append(f"[stderr] {line}" if is_stderr else line),
+            max_line_chars=max(1, shell._max_buffer_chars // 2),
         )
 
     def _wait_for_exit(
@@ -657,7 +738,12 @@ class BackgroundShellRegistry:
             return [s for s in self._shells.values() if s.owner == owner]
 
     def read(
-        self, shell_id: str, *, owner: str | None = None, filter_pattern: str | None = None
+        self,
+        shell_id: str,
+        *,
+        owner: str | None = None,
+        filter_pattern: str | None = None,
+        max_chars: int | None = None,
     ) -> ShellRead:
         """Return output produced since the last read of ``shell_id``.
 
@@ -669,6 +755,14 @@ class BackgroundShellRegistry:
         :class:`UnknownShellError` outside the caller's scope, ``re.error``
         for a bad pattern, and :class:`FilterTimeoutError` for a pattern
         that blows the time bound (catastrophic backtracking).
+
+        ``max_chars`` bounds what is returned in whole lines (always at
+        least one) and then bounds what is consumed too: the cursor advances
+        only past the last returned line, so the rest of the delta stays
+        readable by the next call instead of being cut away by a consumer's
+        cap.  A filtered read scans a bounded span of the delta, at most
+        :data:`_FILTER_SCAN_MULTIPLE` times the bound, so each call is bounded
+        and still advances the cursor.
         """
         shell = self._get(shell_id, owner)
         pattern: re.Pattern[str] | None = None
@@ -684,23 +778,45 @@ class BackgroundShellRegistry:
         # each return the full delta as "new".
         with shell.read_serial:
             delta, gap, new_cursor, status, exit_code = shell._snapshot_delta()
-            clipped = 0
+            span = len(delta)
             if pattern is None:
-                shown = delta
+                candidates = list(range(span))
             else:
+                if max_chars is not None:
+                    scanned = 0
+                    for index, line in enumerate(delta):
+                        scanned += len(line)
+                        if index and scanned > _FILTER_SCAN_MULTIPLE * max_chars:
+                            span = index
+                            break
                 # Raises FilterTimeoutError / FilterExecError BEFORE the
                 # commit below — a failed filter consumes nothing.
-                shown = _filter_lines_bounded(pattern, delta, shell.shell_id)
-                clipped = sum(1 for ln in delta if len(ln) > _FILTER_MAX_LINE_CHARS)
-            shell._commit_cursor(new_cursor)
+                candidates = _filter_line_indexes_bounded(pattern, delta[:span], shell.shell_id)
+            consumed = span
+            shown: list[str] = []
+            shown_chars = 0
+            for index in candidates:
+                line = delta[index]
+                if max_chars is not None and shown and shown_chars + len(line) > max_chars:
+                    # The bound is met in whole lines: this line and the rest
+                    # of the delta stay unread for the next call.
+                    consumed = index
+                    break
+                shown.append(line)
+                shown_chars += len(line)
+            clipped = 0
+            if pattern is not None:
+                clipped = sum(1 for ln in delta[:consumed] if len(ln) > _FILTER_MAX_LINE_CHARS)
+            shell._commit_cursor(new_cursor - len(delta) + consumed)
         return ShellRead(
             shell_id=shell.shell_id,
             status=status,
             exit_code=exit_code,
             lines=shown,
-            new_line_count=len(delta),
+            new_line_count=consumed,
             dropped_lines=gap,
             clipped_lines=clipped,
+            unread_lines=len(delta) - consumed,
         )
 
     # -- Termination ---------------------------------------------------------

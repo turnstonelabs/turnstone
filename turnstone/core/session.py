@@ -19,6 +19,7 @@ import difflib
 import functools
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import queue
@@ -219,6 +220,7 @@ from turnstone.core.session_worker import WorkerClaim, current_worker_claim
 from turnstone.core.settings_registry import (
     DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     DEFAULT_AUTO_COMPACT_PCT,
+    TOOL_TRUNCATION_MAX_CHARS,
 )
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
@@ -267,6 +269,17 @@ from turnstone.core.trajectory import (
     turn_from_dict,
     turn_to_dict,
     turns_from_dicts,
+)
+from turnstone.core.truncation import (
+    BoundedTextBuffer,
+    ProjectedText,
+    TextProjectionSource,
+    TruncationMarker,
+    TruncationResult,
+    default_truncation_marker,
+    join_projection_sources,
+    source_chars,
+    truncate_text,
 )
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import fetch_with_ssrf_guard, screen_url, strip_html
@@ -1122,11 +1135,17 @@ def _encode_image_data_uri(raw: bytes, mime: str) -> str:
 
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
+_RECALL_RESULT_CONTENT_CAP: int = 2000
 
 # Cap on a sub-agent tool's RAW output before it enters the trajectory (the
 # in-loop truncation in _run_agent) — bounds what the sub-agent's own model sees
 # on its next turn.  Distinct from (and larger than) the recall per-step cap.
 _AGENT_TOOL_OUTPUT_CAP: int = 16000
+# The output guard scans this much of a task-agent tool result before the
+# clip.  Wider than the clip so a credential straddling the clip boundary is
+# seen whole and redacted, yet bounded so a tool server never chooses how much
+# text the guard scans.
+_AGENT_GUARD_WINDOW_CHARS: int = 2 * _AGENT_TOOL_OUTPUT_CAP
 
 # Request-local attachment id used only inside one PDF-aware web fetch. The
 # transient turn is never persisted, so this needs request consistency rather
@@ -1153,12 +1172,95 @@ _AGENT_EFFECT_NAME_COUNT_CAP: int = 64
 _AGENT_OTHER_TOOL_NAMES = "<other tool names>"
 
 
-def _clip_agent_text(text: str, cap: int) -> str:
-    """Head-clip task-agent text with one honest truncation marker."""
+def _clip_skill_content(text: str) -> str:
+    """Bound injected skill guidance without impersonating completeness."""
 
-    if len(text) <= cap:
-        return text
-    return text[:cap] + f"\n\n... (truncated from {len(text)} chars)"
+    def _skill_marker(_omitted: int, original: int, _limit: int) -> str:
+        return f"\n\n... [skill guidance truncated from {original:,} chars]"
+
+    return truncate_text(
+        text,
+        _MAX_SKILL_CONTENT,
+        mode="head",
+        marker_factory=_skill_marker,
+    ).text
+
+
+def _clip_recall_content(text: str) -> str:
+    """Bound one recalled history row with an honest source-size marker."""
+
+    def _recall_marker(_omitted: int, original: int, _limit: int) -> str:
+        return f"... [history item truncated; {original:,} chars total]"
+
+    return truncate_text(
+        text,
+        _RECALL_RESULT_CONTENT_CAP,
+        mode="head",
+        marker_factory=_recall_marker,
+    ).text
+
+
+def _with_consumed_notice(marker: str, limit: int, *, widest: str) -> str:
+    """``marker`` plus the ``bash_output`` consumed notice when the cap leaves
+    room for both and some source text; a tighter cap keeps the plain honest
+    marker instead of a severed notice.
+
+    The decision is sized against ``widest``, the longest marker the factory
+    can produce for this result, never against ``marker`` itself: a factory
+    whose length toggles with the omitted count cannot settle in the
+    primitive's fixed point, and its count would lag the cut."""
+
+    body = marker.rstrip("\n")
+    with_notice = body + "\n" + _BASH_OUTPUT_CONSUMED_NOTICE + marker[len(body) :]
+    widest_with_notice = len(widest) + len(_BASH_OUTPUT_CONSUMED_NOTICE) + 1
+    if limit >= widest_with_notice + len(widest):
+        return with_notice
+    return marker
+
+
+def _bash_output_truncation_marker(omitted: int, original: int, limit: int) -> str:
+    """The fold marker for a cut ``bash_output`` delta."""
+
+    return _with_consumed_notice(
+        default_truncation_marker(omitted, original, limit),
+        limit,
+        widest=default_truncation_marker(original, original, limit),
+    )
+
+
+def _agent_truncation_marker(_omitted: int, original: int, _limit: int) -> str:
+    return f"\n\n... (truncated from {original} chars)"
+
+
+def _agent_bash_output_marker(omitted: int, original: int, limit: int) -> str:
+    marker = _agent_truncation_marker(omitted, original, limit)
+    return _with_consumed_notice(marker, limit, widest=marker)
+
+
+def _clip_agent_text(
+    text: str,
+    cap: int,
+    *,
+    original_chars: int | None = None,
+    tool_name: str = "",
+) -> str:
+    """Head-clip task-agent text with one honest truncation marker.
+
+    ``original_chars`` is the true size when ``text`` is already a bounded
+    slice of a larger result, so the marker still reports that size.  A cut
+    ``bash_output`` delta also says that its elided output was consumed."""
+
+    return truncate_text(
+        text,
+        cap,
+        mode="head",
+        marker_factory=(
+            _agent_bash_output_marker
+            if tool_name in _CONSUMED_RESULT_TOOLS
+            else _agent_truncation_marker
+        ),
+        original_chars=original_chars,
+    ).text
 
 
 def _bound_agent_identity(text: str, cap: int) -> str:
@@ -1168,7 +1270,7 @@ def _bound_agent_identity(text: str, cap: int) -> str:
         return text
     digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
     marker = f"…[{digest}]"
-    return text[: max(0, cap - len(marker))] + marker
+    return truncate_text(text, cap, mode="head", marker_factory=lambda *_: marker).text
 
 
 @dataclasses.dataclass(slots=True)
@@ -1335,11 +1437,25 @@ class _TaskExecutionJournal:
         )
 
     @staticmethod
-    def update_step(step: dict[str, Any] | None, output: Any, *, is_error: bool) -> None:
+    def update_step(
+        step: dict[str, Any] | None,
+        output: Any,
+        *,
+        is_error: bool,
+        original_chars: int | None = None,
+    ) -> None:
+        """Record a step's result.  ``original_chars`` is the producer's true
+        size when ``output`` is already a clipped rendering, so the recall
+        marker reports that size rather than the earlier clip's."""
+
         if step is None:
             return
-        raw_output = output if isinstance(output, str) else "[non-text result]"
-        step["output"] = _clip_agent_text(raw_output, _AGENT_STEP_OUTPUT_CAP)
+        if isinstance(output, str):
+            step["output"] = _clip_agent_text(
+                output, _AGENT_STEP_OUTPUT_CAP, original_chars=original_chars
+            )
+        else:
+            step["output"] = "[non-text result]"
         step["is_error"] = is_error
 
     def materialize_unstarted(self, agent_turns: list[Turn]) -> None:
@@ -1512,6 +1628,62 @@ _active_commit_origin_generation: contextvars.ContextVar[int] = contextvars.Cont
 # Tools exempt from consecutive-identical-call repeat detection: delta-cursor
 # readers whose repeated identical call is the documented polling pattern.
 _REPEAT_EXEMPT_TOOLS: frozenset[str] = frozenset({"bash_output"})
+_REPEAT_WARNING: str = (
+    "\n\n⚠ Warning: this is an identical repeat of a previous tool call. "
+    "The result is the same. Try a different approach."
+)
+
+
+# A JSON-shaped result starts with ``{`` or ``[`` after optional whitespace.
+# Matched in place: ``lstrip()`` on a ``str`` subclass copies the rendering.
+_LEADING_JSON_RE = re.compile(r"\s*[\[{]")
+
+
+# Automatic main-session tool-result share: one fifth of the batch's remaining
+# input allowance for every result, and one fifth of the context window as the
+# session ceiling every automatic cap stays under. No single result may take
+# more: a batch of results must leave room for its siblings and for the
+# model's own turn, and one result also rides the event stream as a single
+# server-sent event whose consumers bound event size. A tool whose formatter
+# owns a degradation ladder (search, inspect_workstream) is handed an estimate
+# of this cap up front so the ladder degrades to a tier the fold admits whole.
+# This is admission policy, not renderer policy: the result fold is the only
+# place a main-session result is cut, so its omission marker always reports
+# the producer's real output size.
+_TOOL_RESULT_SHARE: float = 0.20
+
+# Tools whose executor consumed the result's source in producing it, so a
+# dropped result could never be re-read: their cut carries the consumed
+# notice, and at an exhausted allowance they take the guaranteed floor instead
+# of the drop notice.
+_CONSUMED_RESULT_TOOLS: frozenset[str] = frozenset({"bash_output"})
+
+
+def _result_marker_factory(tool_name: str) -> TruncationMarker:
+    if tool_name in _CONSUMED_RESULT_TOOLS:
+        return _bash_output_truncation_marker
+    return default_truncation_marker
+
+
+# Carried by the marker that cuts a ``bash_output`` delta, in the main fold
+# and in a task agent's clip alike: unlike foreground bash (re-run to re-see),
+# the delta cursor has already consumed the elided output, and without saying
+# so a "no new output" follow-up reads as "nothing was missed".
+_BASH_OUTPUT_CONSUMED_NOTICE: str = (
+    "[the truncated output was consumed and cannot be re-read; use filter to narrow future reads]"
+)
+# Room the bounded ``bash_output`` read leaves under its cap for the result's
+# own header line, notes, and the unread footer.
+_BASH_OUTPUT_READ_RESERVE_CHARS: int = 256
+
+
+def _auto_tool_truncation_chars(context_window: int, chars_per_token: float) -> int:
+    """The automatic session-wide tool-result ceiling for one context window."""
+
+    return min(
+        int(context_window * chars_per_token * _TOOL_RESULT_SHARE),
+        TOOL_TRUNCATION_MAX_CHARS,
+    )
 
 
 # Tools whose results are orchestration *handles* — control-determining state
@@ -1537,6 +1709,12 @@ _STRUCTURAL_FLOOR_TOOLS: frozenset[str] = frozenset(
 # docs/architecture.md ("Tool Output Truncation") enumerates the floor
 # tools and these sizes in prose — keep it in sync when either changes.
 _TRUNCATION_FLOOR_CHARS: int = 2048
+# The smallest allowance at which a cut result still carries a counted
+# omission marker (~65 chars) and at least as much source as marker.  Below
+# it the exact-cap renderer can only produce a bare fragment ("x…") that reads
+# as a complete result, so such an allowance takes the zero-budget doors
+# instead: the grace pool for small results, the drop notice for the rest.
+_MIN_COUNTED_RESULT_CHARS: int = 128
 # Per-BATCH grace pool (chars) funding verbatim admission of small
 # NON-structural results at zero budget (denial notices, spawn acks —
 # destroying a result smaller than the ~310-char drop notice is a net
@@ -1732,8 +1910,10 @@ def _parse_search_records(stdout: bytes) -> list[tuple[str, str, str]]:
 def _format_search_results(
     records: list[tuple[str, str, str]],
     capped: bool,
+    *,
+    budget: int = _SEARCH_OUTPUT_BUDGET,
 ) -> str:
-    """Format match records with tiered degradation when output > budget.
+    """Format match records with tiered degradation when output > ``budget``.
 
     Tier 1: full ``path:line:content`` lines, stream-emitted with a running
     cost check that short-circuits as soon as the budget would be exceeded.
@@ -1764,7 +1944,7 @@ def _format_search_results(
         for lineno, content in matches:
             line = f"{path}:{lineno}:{content}"
             cost = len(line) + 1
-            if used + cost + len(summary) > _SEARCH_OUTPUT_BUDGET:
+            if used + cost + len(summary) > budget:
                 overflow = True
                 break
             chunks.append(line)
@@ -1775,7 +1955,7 @@ def _format_search_results(
         return "\n".join(chunks) + summary
 
     # Tier 2 header is added on return; budget for it up front so the
-    # final emission stays strictly within ``_SEARCH_OUTPUT_BUDGET`` and
+    # final emission stays strictly within ``budget`` and
     # ``_truncate_output``'s head+tail strategy never kicks in (that
     # strategy silently drops middle files alphabetically — exactly the
     # shape we're trying to avoid for search results).
@@ -1801,7 +1981,7 @@ def _format_search_results(
         80,
         sum(len(p) + len(ln) + len(c) + 3 for p, ln, c in sample) // max(1, len(sample)),
     )
-    estimated_k = max(1, _SEARCH_OUTPUT_BUDGET // max(1, files * (avg + 1)))
+    estimated_k = max(1, budget // max(1, files * (avg + 1)))
     # Iterate the ladder starting from the highest rung that's ≤ our
     # estimate. If the chosen K's actual emission doesn't fit (the
     # estimate ignored the header and over-counts compression from
@@ -1815,7 +1995,7 @@ def _format_search_results(
     for k in candidates:
         header = _tier2_header(k)
         # Budget for header + the "\n\n" separator on return.
-        body_budget = _SEARCH_OUTPUT_BUDGET - len(header) - 2
+        body_budget = budget - len(header) - 2
         chunks2: list[str] = []
         used2 = 0
         fit = True
@@ -1844,8 +2024,8 @@ def _format_search_results(
         tier3_header += " (raw output capped; counts may underreport.)"
     # Budget for header + the "\n\n" separator + the trailing
     # "(plus N more files)" line so the final emission stays within
-    # ``_SEARCH_OUTPUT_BUDGET`` even when the count list is enormous.
-    tier3_body_budget = _SEARCH_OUTPUT_BUDGET - len(tier3_header) - 2 - _SEARCH_TIER3_TAIL_RESERVE
+    # ``budget`` even when the count list is enormous.
+    tier3_body_budget = budget - len(tier3_header) - 2 - _SEARCH_TIER3_TAIL_RESERVE
     body_lines: list[str] = []
     body_used = 0
     shown = 0
@@ -2128,6 +2308,7 @@ _DOC_BUDGET_CHAR_CAP = 16_000
 _PDF_ATTACHMENT_CONTEXT_SHARE = 0.5
 _WEB_FETCH_DOCUMENT_CONTEXT_SHARE = 0.5
 _DOCUMENT_BUDGET_PLANNING_MARGIN_PCT = 0.01
+_WEB_FETCH_TEXT_CHAR_CAP = 10 * 1024 * 1024
 _PDF_CACHE_CAP_INDEPENDENT: Literal["independent"] = "independent"
 
 _WireContentPart = dict[str, Any] | list[dict[str, Any]]
@@ -3026,12 +3207,17 @@ class ChatSession:
         self._compaction_advised = False
         self.agent_max_turns = agent_max_turns
         self._chars_per_token = 4.0  # calibrated from API usage
-        # Tool output truncation: 0 means auto (50% of context_window in chars)
+        # Tool output truncation: 0 keeps the automatic ceiling of one fifth of
+        # the context window; the result fold further narrows automatic
+        # results to one fifth of its remaining input allowance. A positive
+        # operator override applies uniformly instead.
         self._manual_tool_truncation = tool_truncation > 0
         if tool_truncation > 0:
-            self.tool_truncation = tool_truncation
+            self.tool_truncation = min(tool_truncation, TOOL_TRUNCATION_MAX_CHARS)
         else:
-            self.tool_truncation = int(context_window * self._chars_per_token * 0.5)
+            self.tool_truncation = _auto_tool_truncation_chars(
+                context_window, self._chars_per_token
+            )
         self.show_reasoning = True
         self.debug = False
         self.auto_approve = False
@@ -5004,7 +5190,9 @@ class ChatSession:
                 self.context_window = new_cfg.context_window
                 # Recompute auto tool truncation for new context window.
                 if not self._manual_tool_truncation:
-                    self.tool_truncation = int(new_cfg.context_window * self._chars_per_token * 0.5)
+                    self.tool_truncation = _auto_tool_truncation_chars(
+                        new_cfg.context_window, self._chars_per_token
+                    )
         if binding_changed:
             # A generation-only rebind resolving the identical binding
             # stamps silently: recomposing and logging on every unrelated
@@ -5799,7 +5987,7 @@ class ChatSession:
         else:
             self._calibrated_msg_count = 0
         if not self._manual_tool_truncation:
-            self.tool_truncation = int(self.context_window * ratio * 0.5)
+            self.tool_truncation = _auto_tool_truncation_chars(self.context_window, ratio)
 
     def _invalidate_token_calibration_anchors(self) -> None:
         """Forget prompt-prefix counts after changing history or its prefix.
@@ -5949,6 +6137,85 @@ class ChatSession:
             raise GenerationCancelled()
         return compacted
 
+    def _tool_result_truncation_limit(self, *, batch_budget_tokens: int) -> int:
+        """Return the pre-context cap for one main-session tool result.
+
+        A positive operator ``tool_truncation`` override remains the single
+        uniform cap. In automatic mode every result receives one fifth of the
+        batch's remaining input allowance, under the session ceiling.
+        """
+
+        if self._manual_tool_truncation:
+            return self.tool_truncation
+        remaining_chars = max(0, int(max(0, batch_budget_tokens) * self._chars_per_token))
+        # A share too small to carry a counted marker is decided at admission:
+        # :meth:`_allowance_is_exhausted` routes such a result through the
+        # zero-budget doors rather than rendering a bare fragment.
+        return min(self.tool_truncation, int(remaining_chars * _TOOL_RESULT_SHARE))
+
+    def _executor_capture_chars(self) -> int:
+        """Characters a streaming executor retains at each edge of its output.
+
+        Half the session cap, rounded up, so the two edges together can render
+        any cap the result fold applies on this session and the fold stays the
+        single cut at every size while a capture never holds more than a fold
+        here could show; and never less than a task agent's guard window, so
+        an agent's head clip is never narrower than the window it was guarded
+        over.
+        """
+
+        return max((self.tool_truncation + 1) // 2, _AGENT_GUARD_WINDOW_CHARS)
+
+    def _bounded_result(self, output: str) -> str:
+        """``output`` with at most the executor retention held at each edge.
+
+        A plain result larger than the two edges is projected to the edges the
+        streaming executors keep, so controller text can be added to it
+        without copying the whole result; the fold still renders from those
+        edges with the true size.
+        """
+
+        retention = self._executor_capture_chars()
+        if isinstance(output, ProjectedText) or len(output) <= 2 * retention:
+            return output
+        return TextProjectionSource(output[:retention], output[-retention:], len(output)).projected(
+            retention
+        )
+
+    def _executor_cap_estimate(self) -> int:
+        """The cap an executor sizes its own output to before the fold sees it.
+
+        Inside a task agent that is the agent's own clip.  Otherwise it is the
+        fold's cap under the running allowance: an estimate, made before
+        siblings in the batch and a mid-turn compaction can move it, that an
+        executor uses to avoid producing what the fold could not admit, never
+        as the cap itself.  The fold still decides.
+        """
+
+        if _active_task_agent_cancel_scope.get() is not None:
+            return _AGENT_TOOL_OUTPUT_CAP
+        remaining = self._remaining_token_budget()
+        return min(
+            self._tool_result_truncation_limit(batch_budget_tokens=remaining),
+            int(remaining * self._chars_per_token),
+        )
+
+    def _formatter_budget(self, formatter_budget: int) -> int:
+        """The budget handed to a tool's own degradation ladder.
+
+        The ladder is sized to the fold's cap so it degrades to a tier the fold
+        admits whole rather than the fold head/tail-clipping what the ladder
+        kept on purpose.  An estimate too small to carry a counted marker
+        predicts a mid-turn compaction, not the cap the fold will apply after
+        it, so the ladder keeps its own budget there and the fold's doors
+        decide.
+        """
+
+        estimate = self._executor_cap_estimate()
+        if estimate < _MIN_COUNTED_RESULT_CHARS:
+            return formatter_budget
+        return min(formatter_budget, estimate)
+
     def _truncate_output(
         self,
         output: str,
@@ -5958,7 +6225,7 @@ class ChatSession:
         """Truncate tool output, keeping head + tail.
 
         The effective limit is the *minimum* of:
-        - ``self.tool_truncation`` (fixed cap, defaults to 50% of context)
+        - ``self.tool_truncation`` (fixed cap, defaults to 20% of context)
         - ``remaining_budget_tokens`` converted to chars (if provided)
 
         raised to at least ``floor_chars`` when given.  The floor is the
@@ -5990,35 +6257,169 @@ class ChatSession:
         (deliberate — see #883 discussion); re-running after compaction is
         the recovery path for read-only calls.
         """
+        return self._truncate_output_result(
+            output,
+            remaining_budget_tokens=remaining_budget_tokens,
+            floor_chars=floor_chars,
+        ).text
+
+    def _truncate_output_result(
+        self,
+        output: str,
+        remaining_budget_tokens: int | None = None,
+        floor_chars: int = 0,
+        maximum_chars: int | None = None,
+        *,
+        exhausted: bool = False,
+        original_chars: int | None = None,
+        marker_factory: TruncationMarker = default_truncation_marker,
+    ) -> TruncationResult:
+        """Structured twin of :meth:`_truncate_output`.
+
+        Callers that need to react to source loss must consume
+        :attr:`TruncationResult.truncated`; comparing rendered string lengths is
+        invalid because an honest omission marker can be longer than the source
+        fragment it replaces. ``maximum_chars`` lets the result-fold policy
+        narrow one surface without changing the session-wide operator cap.
+        ``exhausted`` is the admission's verdict that the allowance cannot
+        carry a counted marker (:meth:`_allowance_is_exhausted`), so the floor
+        or the drop notice applies instead of a bare fragment.
+        ``original_chars`` is the producer's true size when ``output`` is a
+        transformed rendering that no longer carries its own source.
+        """
+
+        limit = self.tool_truncation
+        if maximum_chars is not None:
+            limit = min(limit, max(0, int(maximum_chars)))
         if not output:
             # Nothing to truncate and nothing to account: an empty result
             # always passes.  Without this, a zero-budget batch would
             # replace a 0-char result with the ~310-char drop notice —
             # false ("none of it could be added") and net-negative.
-            return output
-        limit = self.tool_truncation
+            return TruncationResult("", 0, max(0, limit), 0)
         if remaining_budget_tokens is not None:
-            budget_chars = int(remaining_budget_tokens * self._chars_per_token)
-            limit = min(limit, budget_chars)
+            limit = min(limit, int(remaining_budget_tokens * self._chars_per_token))
+        if exhausted:
+            limit = 0
         limit = max(limit, floor_chars)
         if limit <= 0:
-            return (
+            produced = source_chars(output) if original_chars is None else original_chars
+            notice = (
                 f"Error: tool result dropped — context budget exhausted. The call ran "
-                f"and produced a {len(output)}-char result, but none of it could be "
+                f"and produced a {produced}-char result, but none of it could be "
                 f"added to the conversation. Do not assume the call failed and do not "
                 f"re-run side-effecting calls. Compact or wrap up; re-issue read-only "
                 f"calls afterwards if their output is still needed."
             )
-        if len(output) <= limit:
-            return output
-        half = limit // 2
-        omitted = len(output) - limit
-        return (
-            output[:half]
-            + f"\n\n... [{omitted} chars truncated — output exceeded "
-            + f"{limit} char limit] ...\n\n"
-            + output[-half:]
+            # The controller receipt is not source content and intentionally
+            # survives a zero-character source allowance (#883).  Metadata
+            # still records that no source character was retained.
+            return TruncationResult(notice, produced, 0, produced)
+        return truncate_text(
+            output,
+            limit,
+            mode="head_tail",
+            original_chars=original_chars,
+            marker_factory=marker_factory,
         )
+
+    def _admit_tool_result(
+        self,
+        tool_name: str,
+        tc_id: str,
+        output: str,
+        *,
+        budget_tokens: int,
+        maximum_chars: int,
+        verbatim_pool: int,
+    ) -> tuple[TruncationResult, int]:
+        """One result's admission into the batch: the exhaustion test, decided
+        once for the floor and the cut alike, its floor and the grace pool left
+        after funding it, then the cut."""
+
+        exhausted = self._allowance_is_exhausted(
+            output, budget_tokens=budget_tokens, maximum_chars=maximum_chars
+        )
+        floor, verbatim_pool = self._admission_floor(
+            tool_name, tc_id, output, exhausted=exhausted, verbatim_pool=verbatim_pool
+        )
+        truncation = self._truncate_output_result(
+            output,
+            remaining_budget_tokens=budget_tokens,
+            floor_chars=floor,
+            maximum_chars=maximum_chars,
+            exhausted=exhausted,
+            marker_factory=_result_marker_factory(tool_name),
+        )
+        return truncation, verbatim_pool
+
+    def _allowance_is_exhausted(
+        self, output: str, *, budget_tokens: int, maximum_chars: int
+    ) -> bool:
+        """Whether the allowance cannot carry ``output`` with a counted marker.
+
+        Below ``_MIN_COUNTED_RESULT_CHARS`` a cut result would render as a
+        bare fragment (``x…``) that reads as complete, so such an allowance is
+        treated the way a zero budget is: small results pass verbatim through
+        the grace pool and larger ones get the honest drop notice.  In
+        automatic mode the share-derived surface cap counts too; a manual cap
+        is the operator's choice and is never treated as exhausted.  Size is
+        the producer's, so a bounded capture's rendering never reads as small.
+        """
+
+        cap = int(max(0, budget_tokens) * self._chars_per_token)
+        if not self._manual_tool_truncation:
+            cap = min(cap, max(0, int(maximum_chars)))
+        return cap < _MIN_COUNTED_RESULT_CHARS and source_chars(output) > cap
+
+    def _admission_floor(
+        self,
+        tool_name: str,
+        tc_id: str,
+        output: str,
+        *,
+        exhausted: bool,
+        verbatim_pool: int,
+    ) -> tuple[int, int]:
+        """One result's guaranteed floor and the grace pool left after funding
+        it.  Shared by the drain and its post-guard replay so a result passes
+        the same doors in both passes.
+
+        Structural handles and error dispositions get the guaranteed floor:
+        neither may be zero-dropped (a lost ws_id stalls orchestration, a
+        masked failure reads as success — #883).  At an exhausted allowance
+        so does a result whose executor consumed its source in producing it
+        (a ``bash_output`` delta): dropped, it could never be re-read, so it
+        is cut to the floor with its consumed notice instead, while at a live
+        allowance its surface cap governs.  All three are DELIBERATELY
+        per-result, with NO aggregate cap (unlike the grace pool): capping
+        structural floors would re-open #883 for wide fan-outs (every
+        parallel spawn's handle is needed or its child orphans), and capping
+        error floors would mask failures behind a success-leaning notice —
+        inviting the blind re-runs #865/#866 exist to prevent.  Worst case is
+        bounded by the model's own batch width and lands on the pre-send
+        hard-compaction guard / ctx-overflow retry: one extra compaction
+        round-trip, traded for never losing a handle or a disposition.
+
+        The per-batch grace pool admits small NON-structural results verbatim
+        at an exhausted allowance by funding their own size as the floor,
+        until the pool is spent — bounding THIS door's collective admission
+        where an unconditioned small-pass would let N small results bypass
+        the per-output bookkeeping entirely.  The pool bounds only the
+        small-result door; the structural/error floors are per-result by
+        design (ruling above).
+        """
+
+        if tool_name in _STRUCTURAL_FLOOR_TOOLS or self._tool_error_flags.get(tc_id, False):
+            return _TRUNCATION_FLOOR_CHARS, verbatim_pool
+        if exhausted and tool_name in _CONSUMED_RESULT_TOOLS:
+            return _TRUNCATION_FLOOR_CHARS, verbatim_pool
+        # The producer's size, never a bounded capture's rendering: a
+        # multi-megabyte capture is not a small result.
+        size = source_chars(output)
+        if exhausted and size <= _TRUNCATION_FLOOR_CHARS and verbatim_pool >= size:
+            return size, verbatim_pool - size
+        return 0, verbatim_pool
 
     def request_title_refresh(
         self,
@@ -6565,7 +6966,9 @@ class ChatSession:
             max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
         ]
         if not self._manual_tool_truncation:
-            self.tool_truncation = int(self.context_window * self._chars_per_token * 0.5)
+            self.tool_truncation = _auto_tool_truncation_chars(
+                self.context_window, self._chars_per_token
+            )
         resume_diagnostics = lane_diagnostics(self._primary_lane())
         log.info(
             "Resuming ws=%s: %d messages, provider=%s, model=%s",
@@ -6628,8 +7031,8 @@ class ChatSession:
             if bound_cfg is not None:
                 self.context_window = bound_cfg.context_window
                 if not self._manual_tool_truncation:
-                    self.tool_truncation = int(
-                        bound_cfg.context_window * self._chars_per_token * 0.5
+                    self.tool_truncation = _auto_tool_truncation_chars(
+                        bound_cfg.context_window, self._chars_per_token
                     )
                 bound_diagnostics = lane_diagnostics(self._primary_lane())
                 log.info(
@@ -7419,7 +7822,7 @@ class ChatSession:
             tpl = self._skill_content
             if len(tpl) > _MAX_SKILL_CONTENT:
                 log.warning("skill_content.truncated", length=len(tpl))
-                tpl = tpl[:_MAX_SKILL_CONTENT]
+                tpl = _clip_skill_content(tpl)
             if not self._skill_name:
                 # Default (always-on) skills: keep in the identity system prefix.
                 dev_parts.append("")
@@ -12733,9 +13136,19 @@ class ChatSession:
                     allow_cancelled=False,
                 ):
                     raise GenerationCancelled()
+                # The partial captured the raw result list; release it so the
+                # executors' complete outputs do not outlive their admission.
+                del apply_post_execute_advisories
 
                 # Map tool_call_id → tool name for logging
-                _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
+                # Providers may pad a name with whitespace; dispatch strips it,
+                # so every result-policy lookup keyed by this map (structural
+                # floors, surface shares, the bash_output notice, guard audit
+                # rows) must see the same normalized name.
+                _tc_names = {
+                    c["id"]: str(c.get("function", {}).get("name", "") or "").strip()
+                    for c in tool_calls
+                }
                 # Tool arguments (JSON string) per call_id — threaded into the
                 # LLM judge so it can reason about output-vs-request plausibility.
                 _tc_args = {c["id"]: c.get("function", {}).get("arguments", "") for c in tool_calls}
@@ -12828,63 +13241,55 @@ class ChatSession:
                         # this window) — retrying cannot help, so burn the
                         # remaining attempts for this send.
                         zero_budget_compact_attempts = _ZERO_BUDGET_COMPACT_CAP_PER_SEND
-                _truncated: dict[str, str] = {}
-                # Per-batch grace pool: small NON-structural results are
-                # admitted verbatim at zero budget by funding their own
-                # size as the floor, until the pool is spent — bounding
-                # THIS door's collective admission where an unconditioned
-                # small-pass would let N small results bypass the
-                # per-output bookkeeping below entirely.  The pool bounds
-                # only the small-result door; the structural/error floors
-                # below are per-result by design (ruling at their site).
-                zero_budget_verbatim_pool = _ZERO_BUDGET_VERBATIM_POOL_CHARS
-                for tc_id, output in results:
-                    if isinstance(output, str):
-                        # Structural handles and error dispositions get the
-                        # guaranteed floor: neither may be zero-dropped (a
-                        # lost ws_id stalls orchestration, a masked failure
-                        # reads as success — #883).  ``_tool_error_flags``
-                        # is still populated here; the per-result loop
-                        # below pops it to build the persisted turn.
-                        # DELIBERATELY per-result, with NO aggregate cap
-                        # (unlike the grace pool): capping structural
-                        # floors would re-open #883 for wide fan-outs
-                        # (every parallel spawn's handle is needed or its
-                        # child orphans), and capping error floors would
-                        # mask failures behind a success-leaning notice —
-                        # inviting the blind re-runs #865/#866 exist to
-                        # prevent.  Worst case is bounded by the model's
-                        # own batch width and lands on the pre-send
-                        # hard-compaction guard / ctx-overflow retry: one
-                        # extra compaction round-trip, traded for never
-                        # losing a handle or a disposition.
-                        _floor = (
-                            _TRUNCATION_FLOOR_CHARS
-                            if (
-                                _tc_names.get(tc_id, "") in _STRUCTURAL_FLOOR_TOOLS
-                                or self._tool_error_flags.get(tc_id, False)
+                # Surface percentages derive from one post-compaction snapshot
+                # so parallel siblings have the same nominal cap. The running
+                # ``truncation_budget`` below is still debited after every
+                # result and remains the aggregate hard backstop.
+                batch_truncation_budget = truncation_budget
+                # Per-result admission records for the post-guard re-cut: the
+                # drain's rendering and its coverage.  The executor's complete
+                # result is released here rather than held across the guard's
+                # judge round trips.
+                _admissions: dict[str, TruncationResult] = {}
+                maximum = self._tool_result_truncation_limit(
+                    batch_budget_tokens=batch_truncation_budget
+                )
+
+                def _admit_batch(
+                    names: dict[str, Any],
+                    cap: int,
+                    admissions: dict[str, TruncationResult],
+                ) -> None:
+                    # A helper so no executor result outlives its admission
+                    # in a loop variable while the guard's judge round trips
+                    # run.
+                    nonlocal results, truncation_budget
+                    verbatim_pool = _ZERO_BUDGET_VERBATIM_POOL_CHARS
+                    admitted: list[tuple[str, Any]] = []
+                    for tc_id, output in results:
+                        if isinstance(output, str):
+                            # ``_tool_error_flags`` is still populated here;
+                            # the per-result loop below pops it to build the
+                            # persisted turn.
+                            truncation, verbatim_pool = self._admit_tool_result(
+                                names.get(tc_id, ""),
+                                tc_id,
+                                output,
+                                budget_tokens=truncation_budget,
+                                maximum_chars=cap,
+                                verbatim_pool=verbatim_pool,
                             )
-                            else 0
-                        )
-                        if (
-                            _floor == 0
-                            and truncation_budget <= 0
-                            and len(output) <= _TRUNCATION_FLOOR_CHARS
-                            and zero_budget_verbatim_pool >= len(output)
-                        ):
-                            _floor = len(output)
-                            zero_budget_verbatim_pool -= len(output)
-                        truncated = self._truncate_output(
-                            output,
-                            remaining_budget_tokens=truncation_budget,
-                            floor_chars=_floor,
-                        )
-                        _truncated[tc_id] = truncated
-                        truncation_budget = max(
-                            0,
-                            truncation_budget - int(len(truncated) / self._chars_per_token),
-                        )
-                results = [(tc_id, _truncated.get(tc_id, output)) for tc_id, output in results]
+                            admissions[tc_id] = truncation
+                            truncation_budget = max(
+                                0,
+                                truncation_budget
+                                - math.ceil(len(truncation.text) / self._chars_per_token),
+                            )
+                            output = truncation.text
+                        admitted.append((tc_id, output))
+                    results = admitted
+
+                _admit_batch(_tc_names, maximum, _admissions)
 
                 # Pre-evaluate the guard stage concurrently when LLM is
                 # enabled and there are multiple string outputs (perf-2).
@@ -12958,6 +13363,43 @@ class ChatSession:
                     # here rather than fold into its successor's trajectory.
                     self._check_cancelled(my_generation)
                     guarded_results.append((_ri, tc_id, output, assessment))
+
+                # Redaction can lengthen a cut result past its cap: a short
+                # secret becomes a longer marker.  Such a result is cut again
+                # at the drain's limit by splitting the guarded rendering at
+                # the drain's marker and re-rendering the two edges, so the
+                # second cut never runs into the first marker and the omitted
+                # count still includes the middle the drain removed.  A result
+                # the guard left alone, one the drain admitted whole, or one
+                # whose text no longer locates the marker exactly once passes
+                # as the guard left it: what the guard produced is what the
+                # model sees, and the pre-send hard-compaction guard remains
+                # the backstop for a batch that grew past its allowance.
+                recut: list[tuple[int, str, Any, OutputAssessment | None]] = []
+                for _ri, tc_id, output, assessment in guarded_results:
+                    rendered = _admissions.get(tc_id)
+                    if (
+                        rendered is not None
+                        and isinstance(output, str)
+                        and rendered.truncated
+                        and rendered.limit_chars > 0
+                        and len(output) > rendered.limit_chars
+                        and output.count(rendered.marker) == 1
+                    ):
+                        head, _marker, tail = output.partition(rendered.marker)
+                        output = (
+                            TextProjectionSource(
+                                head, tail, len(head) + len(tail) + rendered.omitted_chars
+                            )
+                            .render(
+                                rendered.limit_chars,
+                                marker_factory=_result_marker_factory(_tc_names.get(tc_id, "")),
+                            )
+                            .text
+                        )
+                    recut.append((_ri, tc_id, output, assessment))
+                guarded_results = recut
+                _admissions.clear()
 
                 def _fold_tool_batch(
                     fold_results: list[tuple[int, str, Any, Any]],
@@ -16739,6 +17181,12 @@ class ChatSession:
         # follow attribute access below without re-asserting succeeded.
         llm = llm_verdict if (llm_verdict is not None and llm_verdict.succeeded) else None
         wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
+        if not wants_redaction:
+            # ``sanitized`` means "redaction was applied" to every consumer
+            # below (audit rows, the acted assessment, the returned text), so
+            # a redacted copy the configuration declines is dropped here, at
+            # the one producer, rather than gated at each consumer.
+            heuristic = dataclasses.replace(heuristic, sanitized=None)
 
         # Persistence — one row per (call_id, tier).  Heuristic row when it
         # has signal; the LLM row carries the judge's OWN verdict on success
@@ -17174,7 +17622,12 @@ class ChatSession:
         # shared bound — the /send defer-fidelity check refuses fold-ins
         # that could hit this truncation).
         if len(cleaned) > INTERJECTION_CAP_CHARS:
-            cleaned = cleaned[:INTERJECTION_CAP_CHARS] + "..."
+            cleaned = truncate_text(
+                cleaned,
+                INTERJECTION_CAP_CHARS,
+                mode="head",
+                marker_factory=lambda _omitted, _original, _limit: "…",
+            ).text
         # Full UUID hex (128 bits) rather than a truncated prefix — this id is
         # the ``send_id`` tracking token threaded through the turn, so the wide
         # space keeps the birthday bound comfortable.
@@ -20463,18 +20916,14 @@ class ChatSession:
                 # any different signature breaks a streak, so an exempt call
                 # interleaved between identical bash calls must keep those
                 # bash calls from reading as consecutive.
-                exempt = tc["function"]["name"] in _REPEAT_EXEMPT_TOOLS
-                raw = tc["function"]["name"] + ":" + tc["function"]["arguments"]
+                exempt = str(tc["function"]["name"] or "").strip() in _REPEAT_EXEMPT_TOOLS
+                raw = str(tc["function"]["name"] or "").strip() + ":" + tc["function"]["arguments"]
                 sig = hashlib.sha256(raw.encode()).hexdigest()
-                is_json = output.lstrip().startswith(("{", "["))
+                is_json = _LEADING_JSON_RE.match(output) is not None
                 if self._repeat_detector.record(sig) and not exempt:
                     _repeat_detected = True
                     if not is_json:
-                        output += (
-                            "\n\n⚠ Warning: this is an identical repeat of a "
-                            "previous tool call. The result is the same. "
-                            "Try a different approach."
-                        )
+                        output = self._bounded_result(output) + _REPEAT_WARNING
                         results[i] = (tc_id, output)
                     # The operator-context system turn after the tool batch
                     # carries the operator-visible signal; the tool-name
@@ -21000,7 +21449,10 @@ class ChatSession:
         }
 
     def _exec_inspect_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
-        from turnstone.console.coordinator_client import _format_inspect_tiered
+        from turnstone.console.coordinator_client import (
+            _INSPECT_OUTPUT_BUDGET,
+            _format_inspect_tiered,
+        )
 
         call_id = item["call_id"]
         ws_id = item["ws_id"]
@@ -21017,13 +21469,17 @@ class ChatSession:
         # Tiered output: full → compact (head/tail-snipped messages) →
         # skeleton (counts + last-assistant preview).  First tier that
         # fits the budget wins; the LLM sees a ``_tier`` field on every
-        # non-error response.  ``_truncate_output`` remains the safety
-        # net for the (rare) skeleton-exceeds-budget case — guarding
-        # against a single-field blowup we didn't anticipate.
-        output = _format_inspect_tiered(result)
+        # non-error response.  The budget is the smaller of the formatter's
+        # own and the fold's cap (``_formatter_budget``), so the tier chosen
+        # is one the fold admits whole; the fold's generic head/tail cut,
+        # which would splice a marker into the JSON, remains the safety net
+        # for the (rare) skeleton-exceeds-budget case.
+        output = _format_inspect_tiered(
+            result, budget=self._formatter_budget(_INSPECT_OUTPUT_BUDGET)
+        )
         desc = f"{result.get('state', '?')} ({len(result.get('messages', []))} msgs)"
         self._report_tool_result(call_id, "inspect_workstream", desc)
-        return call_id, self._truncate_output(output)
+        return call_id, output
 
     def _prepare_send_to_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
@@ -21399,7 +21855,7 @@ class ChatSession:
                 " (truncated — more may exist; re-run with a narrower filter or larger limit)"
             )
         self._report_tool_result(call_id, "list_workstreams", summary)
-        return call_id, self._truncate_output(output)
+        return call_id, output
 
     def _prepare_list_nodes(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
@@ -21486,7 +21942,7 @@ class ChatSession:
         if truncated:
             summary += " (truncated — narrow filters or raise limit)"
         self._report_tool_result(call_id, "list_nodes", summary)
-        return call_id, self._truncate_output(output)
+        return call_id, output
 
     # -- skills tool ----------------------------------------------------------
     #
@@ -21762,7 +22218,7 @@ class ChatSession:
             else json.dumps(result, separators=(",", ":"), default=str)
         )
         self._report_tool_result(call_id, "skills", summary)
-        return call_id, self._truncate_output(output)
+        return call_id, output
 
     @staticmethod
     def _skills_tags_text(raw: Any) -> str:
@@ -21853,7 +22309,7 @@ class ChatSession:
         projected["readonly"] = bool(row.get("readonly"))
         output = json.dumps(projected, separators=(",", ":"), default=str)
         self._report_tool_result(call_id, "skills", f"got {name}")
-        return call_id, self._truncate_output(output)
+        return call_id, output
 
     # -- load -------------------------------------------------------------------
 
@@ -23001,7 +23457,7 @@ class ChatSession:
             summary = action
         is_error = "error" in result
         self._report_tool_result(call_id, "tasks", summary, is_error=is_error)
-        return call_id, self._truncate_output(output)
+        return call_id, output
 
     def _prepare_wait_for_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Thin pass-through to ``CoordinatorClient.wait_for_workstream``.
@@ -23180,7 +23636,7 @@ class ChatSession:
                 "resolved": resolved_count,
             },
         )
-        return call_id, self._truncate_output(output)
+        return call_id, output
 
     def _emit_wait_event(self, event_type: str, payload: dict[str, Any]) -> None:
         """Fan out a ``wait_*`` SSE event via the session UI.
@@ -23574,8 +24030,13 @@ class ChatSession:
             mcp_error = True
             self.ui.on_error(output)
 
-        output = self._truncate_output(output)
-        self._report_tool_result(call_id, func_name, output, is_error=mcp_error, status=mcp_status)
+        self._report_tool_result(
+            call_id,
+            func_name,
+            self._truncate_output(output),
+            is_error=mcp_error,
+            status=mcp_status,
+        )
         return call_id, output
 
     @staticmethod
@@ -23665,8 +24126,9 @@ class ChatSession:
             mcp_error = True
             self.ui.on_error(output)
 
-        output = self._truncate_output(output)
-        self._report_tool_result(call_id, "read_resource", output, is_error=mcp_error)
+        self._report_tool_result(
+            call_id, "read_resource", self._truncate_output(output), is_error=mcp_error
+        )
         return call_id, output
 
     def _prepare_use_prompt(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -23762,8 +24224,9 @@ class ChatSession:
             mcp_error = True
             self.ui.on_error(output)
 
-        output = self._truncate_output(output)
-        self._report_tool_result(call_id, "use_prompt", output, is_error=mcp_error)
+        self._report_tool_result(
+            call_id, "use_prompt", self._truncate_output(output), is_error=mcp_error
+        )
         return call_id, output
 
     # -- Execute methods (do the work, report output via UI) -------------------
@@ -23776,15 +24239,49 @@ class ChatSession:
         cancel = self._cancel_event
         call_id, command = item["call_id"], item["command"]
         timeout = item.get("timeout") or self.tool_timeout
+        # stdout and stderr are captured separately and presented as stdout
+        # followed by the stderr lines: with one arrival-ordered capture a
+        # stderr record could land inside an unfinished stdout line.  Each
+        # capture retains bounded edges, and the two are joined as edges too,
+        # so the fold still cuts once against the command's true output size.
+        retention = self._executor_capture_chars()
+        stdout_capture = BoundedTextBuffer(retention)
+        stderr_capture = BoundedTextBuffer(retention)
+        # One gate closes the capture.  Set in the ``finally`` below, it turns
+        # late drain callbacks into discard-only drains (neither buffered nor
+        # forwarded to the UI) once this execution closure ends, so an escaped
+        # grandchild cannot mutate a result, grow memory, or emit into later
+        # turns after return; the pipe still drains and the child never blocks
+        # on a full pipe.  Bound before the ``try`` so the finally's ``.set()``
+        # cannot raise ``UnboundLocalError`` on a failed spawn.
+        capture_closed = threading.Event()
+
+        def _captured_output() -> str:
+            out, err = stdout_capture.source(), stderr_capture.source()
+            if err.original_chars == 0:
+                source = out
+            elif out.original_chars == 0:
+                source = err
+            else:
+                source = join_projection_sources(
+                    out, err, separator="\n", retention_chars=retention
+                )
+            # Below the retention this is the complete output.  Above it, a
+            # lossy rendering keeps its source edges attached so the fold
+            # renders once against the true size; stripping would hand back a
+            # plain string and lose them.
+            text = source.projected(retention)
+            if isinstance(text, ProjectedText):
+                return text
+            return text.strip()
+
         try:
             # Pre-bind so the ``finally`` can't raise ``UnboundLocalError``
-            # and mask the real error if the spawn below fails.  The chunk
-            # gate pre-binds with them — its .set() runs in the same
-            # finally, and setting it when no drain ever started is a
-            # harmless no-op.
+            # and mask the real error if the spawn below fails.
             proc: subprocess.Popen[str] | None = None
+            pgid: int | None = None
             script_path: str | None = None
-            emit_done = threading.Event()
+            group_kill_attempted = False
             try:
                 from turnstone.core.env import scrubbed_env
 
@@ -23798,6 +24295,7 @@ class ChatSession:
                 )
                 with self._procs_lock:
                     self._active_procs.add(proc)
+
                 # Drain stdout and stderr in background threads.  Reading the
                 # pipes to EOF in the foreground is unsafe: a command that
                 # backgrounds a long-lived child (``server &``) leaks the pipe
@@ -23806,41 +24304,41 @@ class ChatSession:
                 # timeout defeated once the tracked ``bash`` has exited.  Instead
                 # we wait on the tracked process bounded by ``timeout`` and tear
                 # down its whole session group on exit, reaping any such survivor.
-                stdout_parts: list[str] = []
-                stderr_lines: list[str] = []
-
-                # End-of-stream tolerance lives in the shared
-                # ``drain_pipe_lines`` (the drain half of the recipe both
-                # bash variants share); only the sinks differ — stdout also
-                # streams to the UI.
+                # End-of-stream tolerance lives in the shared chunk drain
+                # (the drain half of the recipe both bash variants share).
+                # stdout also streams to the UI; stderr receives one
+                # ``[stderr]`` prefix per line, placed at each line start, so
+                # a line spanning several chunks is still prefixed once.
                 #
-                # ``emit_done`` gates the UI half only: once set (after the
-                # join window, before ANY report path), the drain callback
-                # stops forwarding lines to the UI but keeps collecting
-                # ``stdout_parts`` so the pipe always drains and the child
-                # never blocks on a full pipe.  Without the gate, a drain
-                # thread that outlives its join (``bash.drain_leaked``
-                # below — a double-``setsid`` grandchild holding stdout
-                # open) keeps emitting into LATER turns: the UI batches
-                # chunks per call_id, some local providers REUSE call_ids
-                # across turns, and the client grafts stray chunks under
-                # the completed row.  The execution closure is the one
-                # identity that id reuse can't confuse, so the leak is
-                # closed here at the source rather than with a UI-side
-                # closed-call ledger (which per-turn resets or LRU churn
-                # would silently re-open).  Residual race: a line already
-                # past the check when the event sets — at most one line,
-                # equivalent to the pre-batching behaviour.  (The event is
-                # pre-bound next to ``proc`` above so the finally's .set()
-                # can't UnboundLocalError on a failed spawn.)
-                def _on_stdout(line: str) -> None:
-                    stdout_parts.append(line)
-                    if emit_done.is_set():
+                # Without the gate, a drain thread that outlives its join
+                # (``bash.drain_leaked`` below — a double-``setsid`` grandchild
+                # holding stdout open) keeps emitting into LATER turns: the UI
+                # batches chunks per call_id, some local providers REUSE
+                # call_ids across turns, and the client grafts stray chunks
+                # under the completed row.  The execution closure is the one
+                # identity that id reuse can't confuse, so the leak is closed
+                # here at the source rather than with a UI-side closed-call
+                # ledger (which per-turn resets or LRU churn would silently
+                # re-open).  Residual race: a line already past the check when
+                # the event sets — at most one line, equivalent to the
+                # pre-batching behaviour.
+                def _on_stdout(chunk: str) -> None:
+                    if capture_closed.is_set():
                         return
+                    stdout_capture.append(chunk)
                     try:
-                        self.ui.on_tool_output_chunk(call_id, line)
+                        self.ui.on_tool_output_chunk(call_id, chunk)
                     except Exception:
                         log.debug("UI callback error during tool output", exc_info=True)
+
+                stderr_at_line_start = True
+
+                def _on_stderr(chunk: str) -> None:
+                    nonlocal stderr_at_line_start
+                    text = f"[stderr] {chunk}" if stderr_at_line_start else chunk
+                    stderr_at_line_start = chunk.endswith("\n")
+                    if not capture_closed.is_set():
+                        stderr_capture.append(text)
 
                 assert proc.stdout is not None and proc.stderr is not None
                 stdout_thread = threading.Thread(
@@ -23851,7 +24349,7 @@ class ChatSession:
                 )
                 stderr_thread = threading.Thread(
                     target=drain_pipe_lines,
-                    args=(proc.stderr, stderr_lines.append),
+                    args=(proc.stderr, _on_stderr),
                     name=f"bash-drain-err-{call_id}",
                     daemon=True,
                 )
@@ -23885,6 +24383,7 @@ class ChatSession:
                 # Terminate the whole session group on every exit path: reaps a
                 # backgrounded child that would otherwise leak (ports, PIDs) or
                 # hold the output pipe open, and forces the drain threads to EOF.
+                group_kill_attempted = True
                 with contextlib.suppress(OSError, ProcessLookupError):
                     os.killpg(pgid, signal.SIGKILL)
 
@@ -23913,14 +24412,21 @@ class ChatSession:
                 # still forwarding chunks past its own result (the exact
                 # cross-turn grafting the gate exists to prevent).  On the
                 # normal path this is the same post-join position.
-                emit_done.set()
+                capture_closed.set()
+                if pgid is not None and not group_kill_attempted:
+                    # An exception after spawn but before the ordinary group
+                    # teardown (for example thread exhaustion) must not leave
+                    # the command or a background descendant running.
+                    with contextlib.suppress(OSError, ProcessLookupError):
+                        os.killpg(pgid, signal.SIGKILL)
                 if proc is not None:
                     with self._procs_lock:
                         self._active_procs.discard(proc)
                 # ``spawn_group_leader`` already unlinked on a failed fork —
                 # ``script_path`` stays None on that path.
                 if script_path is not None:
-                    os.unlink(script_path)
+                    with contextlib.suppress(OSError):
+                        os.unlink(script_path)
 
             if timed_out.is_set():
                 raise subprocess.TimeoutExpired(cmd="bash", timeout=timeout)
@@ -23933,26 +24439,25 @@ class ChatSession:
                 # unobserved: record outcome UNKNOWN and
                 # mark it an error, not a clean empty success — a destructive
                 # command killed here must not read as "did not run" on
-                # replay.  Keep whatever partial stdout we captured.
-                partial = "".join(stdout_parts).strip()
+                # replay. Keep whatever bounded output we captured.
+                partial = _captured_output()
                 msg = (
                     "Cancelled by user. Outcome UNKNOWN — the command was "
                     "stopped mid-execution; it may have run partially or had "
                     "side effects. Do not assume it did not run."
                 )
                 if partial:
-                    msg += "\n\nPartial output before cancel:\n" + self._truncate_output(partial)
+                    # Concatenation keeps a capture's source: a projection
+                    # extends its edges, so the fold still renders from them.
+                    msg = msg + "\n\nPartial output before cancel:\n" + partial
                 self._report_tool_result(
-                    call_id, "bash", msg, is_error=True, status=EffectStatus.UNKNOWN
+                    call_id,
+                    "bash",
+                    self._truncate_output(msg),
+                    is_error=True,
+                    status=EffectStatus.UNKNOWN,
                 )
                 return call_id, msg
-
-            output = "".join(stdout_parts)
-            if stderr_lines:
-                tagged = "".join(f"[stderr] {line}" for line in stderr_lines)
-                output += ("\n" if output else "") + tagged
-            output = output.strip()
-            output = self._truncate_output(output)
 
             # With stop_on_error, any non-zero exit is a real failure (set -e
             # killed the script).  Without it, exit code 1 is often benign
@@ -23961,10 +24466,16 @@ class ChatSession:
                 bash_error = proc.returncode != 0
             else:
                 bash_error = proc.returncode not in (0, 1)
+            output = _captured_output()
             if proc.returncode != 0:
-                output += f"\n[exit code: {proc.returncode}]"
+                output = output + f"\n[exit code: {proc.returncode}]"
 
-            self._report_tool_result(call_id, "bash", output, is_error=bash_error)
+            self._report_tool_result(
+                call_id,
+                "bash",
+                self._truncate_output(output),
+                is_error=bash_error,
+            )
 
             return call_id, output if output else "(no output)"
 
@@ -23973,14 +24484,18 @@ class ChatSession:
             # mid-flight kill as the cooperative-cancel branch above, so its
             # side effects are equally unobserved.  Read UNKNOWN, never a flat
             # failure that invites a blind re-run (HYPOTHESIS.md effect-record
-            # appendix: unknown, never none).  Keep any partial stdout captured
+            # appendix: unknown, never none). Keep any bounded output captured
             # before the kill, exactly as the cancel path does.
             msg = f"Command timed out after {timeout}s. {TIMEOUT_OUTCOME_CLAUSE}"
-            partial = "".join(stdout_parts).strip()
+            partial = _captured_output()
             if partial:
-                msg += "\n\nPartial output before timeout:\n" + self._truncate_output(partial)
+                msg = msg + "\n\nPartial output before timeout:\n" + partial
             self._report_tool_result(
-                call_id, "bash", msg, is_error=True, status=EffectStatus.UNKNOWN
+                call_id,
+                "bash",
+                self._truncate_output(msg),
+                is_error=True,
+                status=EffectStatus.UNKNOWN,
             )
             return call_id, msg
         except Exception as e:
@@ -24035,9 +24550,20 @@ class ChatSession:
         """Delta read of a background shell: only output since the last read."""
         call_id, shell_id = item["call_id"], item["shell_id"]
         filter_arg = item.get("filter")
+        # Read whole lines up to what the consumer will admit, the fold's cap
+        # or a task agent's own clip, leaving the rest unread for the next
+        # call: a delta the consumer has to cut has already been consumed past
+        # the cut.  The cap is an estimate that siblings in the batch or a
+        # mid-turn compaction can move, so the fold's marker with its consumed
+        # notice and, at an exhausted allowance, the guaranteed floor remain
+        # the backstops; an exhausted estimate reads at most one line.
+        read_cap = self._executor_cap_estimate()
         try:
             read = self._background_shells.read(
-                shell_id, owner=_active_shell_owner.get(), filter_pattern=filter_arg
+                shell_id,
+                owner=_active_shell_owner.get(),
+                filter_pattern=filter_arg,
+                max_chars=max(0, read_cap - _BASH_OUTPUT_READ_RESERVE_CHARS),
             )
         except UnknownShellError as e:
             msg = f"Error: {e}"
@@ -24086,18 +24612,16 @@ class ChatSession:
             parts.append(f"{read.new_line_count} new line(s), none matching the filter.")
         else:
             parts.append("No new output since the last read.")
-        full = "\n".join(parts)
-        output = self._truncate_output(full)
-        if len(output) < len(full):
-            # Unlike foreground bash (re-run to re-see), the delta cursor has
-            # already consumed the elided middle — say so, or a "no new
-            # output" follow-up reads as "nothing was missed".
-            output += (
-                "\n[the truncated middle was consumed and cannot be re-read; "
-                "use filter to narrow future reads]"
+        if read.unread_lines:
+            parts.append(
+                f"[{read.unread_lines} more line(s) remain unread; call bash_output again "
+                "to continue]"
             )
-        self._report_tool_result(call_id, "bash_output", output)
-        return call_id, output
+        full = "\n".join(parts)
+        # The result fold applies the context cap once and, when it has to cut
+        # this delta, appends the consumed-middle notice inside that cap.
+        self._report_tool_result(call_id, "bash_output", self._truncate_output(full))
+        return call_id, full
 
     def _exec_kill_shell(self, item: dict[str, Any]) -> tuple[str, str]:
         """Kill a background shell's whole process group."""
@@ -24225,7 +24749,6 @@ class ChatSession:
         for i, line in enumerate(lines, start=start):
             numbered.append(f"{i:>4}\t{line.rstrip()}")
         output = "\n".join(numbered)
-        output = self._truncate_output(output)
 
         desc = f"{len(lines)} lines"
         if offset is not None or limit is not None:
@@ -24436,8 +24959,13 @@ class ChatSession:
                 self._report_tool_result(call_id, "search", "all matches malformed", is_error=True)
                 return call_id, _SEARCH_ALL_TRUNCATED_MSG
 
-            output = _format_search_results(records, capped)
-            output = self._truncate_output(output)  # belt-and-suspenders
+            # The ladder is sized to the fold's cap (``_formatter_budget``)
+            # so it degrades to a tier the fold admits whole instead of the
+            # fold head/tail-clipping middle files the formatter kept on
+            # purpose.
+            output = _format_search_results(
+                records, capped, budget=self._formatter_budget(_SEARCH_OUTPUT_BUDGET)
+            )
 
             match_count = len(records)
             desc = f"{match_count} matches"
@@ -24489,18 +25017,17 @@ class ChatSession:
             lines_a, lines_b = lines_b, lines_a
             path_a, label_b = label_b, path_a
 
-        # Stream diff with early cutoff to avoid large allocations
-        max_chars = self.tool_truncation or 262_144
-        chunks: list[str] = []
-        total_chars = 0
+        # Stream the generated diff through the shared bounded edge buffer so
+        # a huge diff is never materialized whole.  The two retained edges
+        # together cover any cap the result fold can apply, so the fold stays
+        # the single truncation point and its marker reports the diff's real
+        # size.
+        diff_buffer = BoundedTextBuffer(self._executor_capture_chars())
         line_count = 0
         for line in difflib.unified_diff(lines_a, lines_b, fromfile=path_a, tofile=label_b, n=ctx):
             line_count += 1
-            if total_chars < max_chars:
-                chunks.append(line)
-                total_chars += len(line)
-        output = "".join(chunks) if chunks else "(no differences)"
-        output = self._truncate_output(output)
+            diff_buffer.append(line)
+        output = diff_buffer.projected() if line_count else "(no differences)"
         desc = f"{line_count} diff lines" if line_count else "identical"
         self._report_tool_result(call_id, "diff_file", desc)
         return call_id, output
@@ -24629,14 +25156,6 @@ class ChatSession:
         fn = getattr(self.ui, "end_agent_scope", None)
         if fn is not None:
             fn()
-
-    @staticmethod
-    def _clip_with_count(text: str, cap: int) -> str:
-        """Head-clip ``text`` to ``cap`` chars with a uniform truncation marker.
-        The one format for sub-agent output clips — the in-loop 16k clip and the
-        recall per-step cap — distinct from the token-budget-aware
-        :meth:`_truncate_output`."""
-        return _clip_agent_text(text, cap)
 
     def _stash_agent_steps(self, call_id: str | None, steps: list[dict[str, Any]]) -> None:
         """Retain one already-bounded task recall projection when supported."""
@@ -25554,9 +26073,37 @@ class ChatSession:
                 if cancelled_before_execution:
                     raise GenerationCancelled()
 
-                # Output guard: evaluate before truncation so the guard
-                # sees full output (credentials split by truncation would
-                # evade detection).  Agent outputs are always str.
+                # Executors hand back their complete result.  The guard scans
+                # a bounded window of it that reaches past the clip below, so
+                # a credential straddling the clip boundary is seen whole and
+                # redacted, while a tool server never controls how much text
+                # the guard scans.  The true size is kept for the clip marker.
+                # Agents operate autonomously; they can refine their queries
+                # if the clip loses important detail.
+                original_chars: int | None = None
+                if isinstance(output, str):
+                    original_chars = (
+                        output.source.original_chars
+                        if isinstance(output, ProjectedText)
+                        else len(output)
+                    )
+                    if isinstance(output, ProjectedText) or len(output) > _AGENT_GUARD_WINDOW_CHARS:
+                        # A capture arrives as a rendering with its source
+                        # attached: render the window from that source here,
+                        # in the head mode the clip below uses, so the guard
+                        # scans exactly the text the agent will receive and
+                        # nothing the clip could reveal afterwards.  The
+                        # window carries the marker from the start: should
+                        # redaction shrink it below the clip, the result still
+                        # reads as cut, with its true size.
+                        output = _clip_agent_text(
+                            output,
+                            _AGENT_GUARD_WINDOW_CHARS,
+                            original_chars=original_chars,
+                            tool_name=tool_name,
+                        )
+
+                # Output guard on the window.  Agent outputs are always str.
                 cancel_scope.check()
                 if self._judge_cfg and self._judge_cfg.output_guard and isinstance(output, str):
                     output, _ = self._evaluate_output(
@@ -25568,12 +26115,13 @@ class ChatSession:
                         principal_id=agent_principal,
                         cancel_ref=cancel_scope.cancel_ref,
                     )
-
-                # Truncate large tool outputs to avoid blowing context limits.
-                # Agents operate autonomously; they can refine their queries
-                # if truncation loses important detail.
                 if isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP:
-                    output = self._clip_with_count(output, _AGENT_TOOL_OUTPUT_CAP)
+                    output = _clip_agent_text(
+                        output,
+                        _AGENT_TOOL_OUTPUT_CAP,
+                        original_chars=original_chars,
+                        tool_name=tool_name,
+                    )
 
                 # NOTE: for a vision tool result ``output`` is a list[dict] of
                 # inline content parts (read_file on an image).  It lowers back
@@ -25596,7 +26144,9 @@ class ChatSession:
                     is_error=is_tool_error,
                     effect_status=child_effect_status,
                 )
-                execution_journal.update_step(journal_step, output, is_error=is_tool_error)
+                execution_journal.update_step(
+                    journal_step, output, is_error=is_tool_error, original_chars=original_chars
+                )
                 context_turns.append(agent_turns[result_turn_index])
                 self._clear_agent_children(
                     parent_call_id,
@@ -25735,7 +26285,7 @@ class ChatSession:
                     agent="task",
                     skill=skill_data.get("name", ""),
                 )
-                skill_body = skill_body[:_MAX_SKILL_CONTENT]
+                skill_body = _clip_skill_content(skill_body)
             agent_turns.append(Turn.user(self._TASK_SKILL_CAPABILITY_PREAMBLE + skill_body))
         agent_turns.append(Turn.user(prompt))
         execution_journal = _TaskExecutionJournal(agent_turns)
@@ -26220,9 +26770,7 @@ class ChatSession:
             lines = []
             for ts, sid, role, content, tool_name in conv_rows:
                 label = f"{role}({tool_name})" if tool_name else role
-                text = (content or "")[:2000]
-                if content and len(content) > 2000:
-                    text += f"... ({len(content)} chars total)"
+                text = _clip_recall_content(content or "")
                 own = " (earlier in this conversation, compacted)" if sid == self._ws_id else ""
                 lines.append(f"[{ts} {sid}]{own} {label}: {text}")
             header = f"Conversations ({len(conv_rows)} matches"
@@ -26233,8 +26781,7 @@ class ChatSession:
         else:
             output = f"No conversation history found for '{query}'."
 
-        output = self._truncate_output(output)
-        self._report_tool_result(call_id, "recall", output)
+        self._report_tool_result(call_id, "recall", self._truncate_output(output))
         return call_id, output
 
     # -- Notify tool -----------------------------------------------------------
@@ -26890,9 +27437,6 @@ class ChatSession:
                 text = resp.text
                 if "html" in ct:
                     text = strip_html(text)
-                # Cap decoded text at 10,485,760 characters.
-                if len(text) > 10 * 1024 * 1024:
-                    text = text[: 10 * 1024 * 1024]
 
         except httpx.HTTPStatusError as e:
             msg = f"Error: fetch failed: HTTP {e.response.status_code}"
@@ -27080,9 +27624,21 @@ class ChatSession:
         )
         if max_content <= 0:
             return _no_document_budget()
-        if len(text) > max_content:
-            # Prefer the beginning — page content is usually top-heavy.
-            text = text[:max_content] + f"\n\n... [{len(text) - max_content} chars truncated] ...\n"
+
+        def _web_text_marker(omitted: int, _original: int, limit: int) -> str:
+            return (
+                f"\n\n... [{omitted:,} page chars truncated at {limit:,}-char extraction cap] ...\n"
+            )
+
+        # Prefer the beginning — page content is usually top-heavy. Apply the
+        # fixed decode backstop and lane-scaled document share in one honest
+        # projection so neither stage can silently hide a second cutoff.
+        text = truncate_text(
+            text,
+            min(max_content, _WEB_FETCH_TEXT_CHAR_CAP),
+            mode="head",
+            marker_factory=_web_text_marker,
+        ).text
 
         extraction_turns = [
             Turn.system(extraction_system),
@@ -27311,8 +27867,7 @@ class ChatSession:
             self._report_tool_result(call_id, "web_search", msg, is_error=True)
             return call_id, msg
 
-        output = self._truncate_output(output)
-        self._report_tool_result(call_id, "web_search", output)
+        self._report_tool_result(call_id, "web_search", self._truncate_output(output))
         return call_id, output
 
     def handle_command(
@@ -27592,7 +28147,9 @@ class ChatSession:
                 if cfg is not None:
                     self.context_window = cfg.context_window
                     if not self._manual_tool_truncation:
-                        self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
+                        self.tool_truncation = _auto_tool_truncation_chars(
+                            cfg.context_window, self._chars_per_token
+                        )
                     # Re-resolve the sampling knobs for the new alias through
                     # the SAME shared resolvers session_factory uses, so
                     # switching away from a model with overrides doesn't leak

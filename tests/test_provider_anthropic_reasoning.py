@@ -81,6 +81,7 @@ class TestExtractReasoningText:
         blocks = [{"type": "thinking", "thinking": long_text, "signature": "s"}]
         result = anthropic.extract_reasoning_text(blocks)
         assert len(result) == _MAX_REASONING_DISPLAY_CHARS
+        assert "reasoning chars omitted from display" in result
 
     def test_just_under_cap_not_truncated(self, anthropic: AnthropicProvider) -> None:
         text = "y" * (_MAX_REASONING_DISPLAY_CHARS - 1)

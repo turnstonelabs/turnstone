@@ -9,13 +9,20 @@ EOF) bounded by ``tool_timeout`` and kills the whole session group on exit, so
 the call always returns and never leaks the background child.
 """
 
+import io
 import threading
 import time
 
 from tests._proc_helpers import kill_pid as _kill_pid
 from tests._proc_helpers import pid_alive as _pid_alive
 from tests._session_helpers import NullUI, make_session
+from turnstone.core.background_shells import (
+    _DRAIN_CHUNK_CHARS,
+    drain_pipe_lines,
+    drain_pipe_logical_lines,
+)
 from turnstone.core.trajectory import EffectStatus
+from turnstone.core.truncation import BoundedTextBuffer, ProjectedText
 
 
 def _run_in_thread(fn, timeout):
@@ -29,6 +36,135 @@ def _run_in_thread(fn, timeout):
     t.start()
     t.join(timeout)
     return (not t.is_alive()), box.get("result")
+
+
+def test_drain_bounds_a_single_line_before_callback() -> None:
+    source = "x" * (_DRAIN_CHUNK_CHARS * 3 + 17)
+    chunks: list[str] = []
+
+    drain_pipe_lines(io.StringIO(source), chunks.append)
+
+    assert "".join(chunks) == source
+    assert len(chunks) == 4
+    assert max(map(len, chunks)) <= _DRAIN_CHUNK_CHARS
+
+
+def test_logical_line_drain_delivers_whole_lines_across_chunks() -> None:
+    long_line = "e" * (_DRAIN_CHUNK_CHARS * 2 + 5)
+    source = f"{long_line}\nshort\n"
+    lines: list[str] = []
+
+    drain_pipe_logical_lines(io.StringIO(source), lines.append, max_line_chars=len(source))
+
+    assert lines == [f"{long_line}\n", "short\n"]
+
+
+def test_logical_line_drain_bounds_a_line_that_fits_one_chunk() -> None:
+    """The whole-line fast path honors the bound too: a line within it passes
+    verbatim, a longer one is the same bounded record a spanning line gets."""
+    lines: list[str] = []
+
+    drain_pipe_logical_lines(io.StringIO("bb\nccccc\n"), lines.append, max_line_chars=3)
+
+    assert lines[0] == "bb\n"
+    assert len(lines[1]) <= 3
+
+
+def test_logical_line_drain_keeps_an_over_long_line_one_record() -> None:
+    """An over-long line is bounded with a marker that carries no newline, so
+    the record is still one line for the cursor, the filter, and the prefix."""
+    lines: list[str] = []
+
+    drain_pipe_logical_lines(
+        io.StringIO("x" * 1000 + "\nshort\n"), lines.append, max_line_chars=200
+    )
+
+    assert len(lines) == 2 and lines[1] == "short\n"
+    record = lines[0]
+    assert len(record) <= 200
+    assert record.count("\n") == 1 and record.endswith("\n")
+    assert "chars truncated — line exceeded 200 char limit" in record
+
+
+def test_bounded_buffer_snapshots_never_lose_or_reorder_chunks() -> None:
+    """Snapshots race the producer: every chunk appended before a snapshot is
+    in it, and the final capture is the producer's exact stream."""
+    buffer = BoundedTextBuffer(1 << 20)
+    total = 100_000
+
+    def produce() -> None:
+        for i in range(total):
+            buffer.append(f"{i}\n")
+
+    producer = threading.Thread(target=produce)
+    producer.start()
+    seen = 0
+    while producer.is_alive():
+        snapshot = buffer.source()
+        assert snapshot.original_chars >= seen
+        seen = snapshot.original_chars
+    producer.join()
+
+    final = buffer.source()
+    expected = "".join(f"{i}\n" for i in range(total))
+    assert final.original_chars == len(expected)
+    assert final.prefix == expected
+
+
+def test_executor_capture_retention_is_half_the_session_cap_or_the_agent_window() -> None:
+    """Each edge retains half the session cap, rounded up, so the two edges
+    always cover the cap and a capture never holds more than a fold on that
+    session could show; and never less than a task agent's guard window."""
+    from turnstone.core.session import _AGENT_GUARD_WINDOW_CHARS
+
+    session = make_session()
+    session.tool_truncation = 100_001
+    assert session._executor_capture_chars() == 50_001
+
+    manual = make_session(tool_truncation=1000)
+    assert manual._executor_capture_chars() == _AGENT_GUARD_WINDOW_CHARS
+
+
+def test_foreground_stderr_long_line_gets_one_prefix():
+    """A stderr line spanning several drain chunks is one logical line and
+    therefore carries exactly one ``[stderr]`` prefix in the captured output."""
+    session = make_session(tool_timeout=30)
+    session.tool_truncation = 1 << 20
+    width = _DRAIN_CHUNK_CHARS * 2 + 5
+    command = f"head -c {width} /dev/zero | tr '\\0' e >&2; echo >&2; echo ok"
+
+    finished, result = _run_in_thread(
+        lambda: session._exec_bash({"call_id": "c1", "command": command}),
+        timeout=15,
+    )
+    assert finished, "_exec_bash did not return"
+    assert result is not None
+    _, output = result
+    assert output.count("[stderr]") == 1
+    assert "e" * width in output
+    assert "ok" in output
+
+
+def test_bounded_bash_capture_carries_true_size_through_a_smaller_fold_cut():
+    """Output beyond the executor retention keeps its edges and true size, so a
+    later, smaller fold cut reports omission against the command's real output."""
+    session = make_session(tool_timeout=30)
+    session.tool_truncation = 600
+    command = "head -c 100000 /dev/zero | tr '\\0' x"
+
+    finished, result = _run_in_thread(
+        lambda: session._exec_bash({"call_id": "c1", "command": command}),
+        timeout=15,
+    )
+    assert finished, "_exec_bash did not return"
+    assert result is not None
+    _, output = result
+    assert isinstance(output, ProjectedText)
+    assert output.source.original_chars == 100_000
+    fold = session._truncate_output_result(output, maximum_chars=150)
+    assert len(fold.text) <= 150
+    assert fold.original_chars == 100_000
+    assert f"[{100_000 - fold.retained_chars} chars truncated" in fold.text
 
 
 def test_backgrounded_child_does_not_hang_and_is_reaped(tmp_path):
@@ -132,7 +268,7 @@ def test_leaked_drain_stops_emitting_chunks_after_return(tmp_path):
     """A double-``setsid`` grandchild escapes the session-group kill and
     holds the stdout pipe open past the drain join (``bash.drain_leaked``)
     — the leaked drain thread must STOP forwarding chunks to the UI once
-    ``_exec_bash`` returns (the ``emit_done`` gate).  Without the gate,
+    ``_exec_bash`` returns (the ``capture_closed`` gate).  Without the gate,
     its lines land in later turns' panes: the UI batches per call_id,
     some providers reuse call_ids across turns, and the client grafts
     stray chunks under the completed row.
@@ -174,7 +310,7 @@ def test_leaked_drain_stops_emitting_chunks_after_return(tmp_path):
         # gate keeps forwarding ~10 lines/sec and still fails loudly.
         assert len(chunks) <= seen_at_return + 1, (
             "leaked drain thread kept forwarding chunks to the UI after "
-            "the tool returned — the emit_done gate is not holding"
+            "the tool returned — the capture_closed gate is not holding"
         )
     finally:
         deadline = time.monotonic() + 5
@@ -229,3 +365,67 @@ def test_popen_failure_reports_cleanly(monkeypatch):
     call_id, output = session._exec_bash({"call_id": "c1", "command": "echo hi"})
     assert call_id == "c1"
     assert "cannot fork" in output
+
+
+def test_foreground_stderr_beyond_retention_keeps_its_true_size():
+    """stderr is bounded by the same executor retention as stdout rather than
+    per line: one over-long stderr line reaches the fold with its edges, one
+    prefix, and the command's real size, so the fold's marker is honest."""
+    session = make_session(tool_timeout=30)
+    session.tool_truncation = 600
+    command = "head -c 100000 /dev/zero | tr '\\0' e >&2"
+
+    finished, result = _run_in_thread(
+        lambda: session._exec_bash({"call_id": "c1", "command": command}),
+        timeout=15,
+    )
+    assert finished, "_exec_bash did not return"
+    assert result is not None
+    _, output = result
+    assert isinstance(output, ProjectedText)
+    assert output.source.original_chars == 100_000 + len("[stderr] ")
+    assert output.count("[stderr]") == 1
+    fold = session._truncate_output_result(output, maximum_chars=150)
+    assert fold.original_chars == 100_000 + len("[stderr] ")
+    assert f"[{fold.original_chars - fold.retained_chars} chars truncated" in fold.text
+
+
+def test_stderr_never_lands_inside_a_long_stdout_line():
+    """A stdout line longer than one drain chunk must reach the model intact.
+    stderr is presented after stdout, never spliced into it by arrival order."""
+    session = make_session(tool_timeout=30)
+    session.tool_truncation = 1 << 20
+    width = _DRAIN_CHUNK_CHARS * 3 + 11
+    command = f"head -c {width} /dev/zero | tr '\\0' x; echo; echo warn >&2; echo tail"
+
+    finished, result = _run_in_thread(
+        lambda: session._exec_bash({"call_id": "c1", "command": command}),
+        timeout=15,
+    )
+    assert finished, "_exec_bash did not return"
+    assert result is not None
+    _, output = result
+    assert "x" * width + "\n" in output
+    assert output.index("tail") < output.index("[stderr] warn")
+    assert output.count("[stderr]") == 1
+
+
+def test_exit_code_note_keeps_a_lossy_capture_rerenderable():
+    """The exit-code note is appended to the projection, not to a flattened
+    string, so the fold still renders the failure from the true edges."""
+    session = make_session(tool_timeout=30)
+    session.tool_truncation = 600
+    command = "head -c 100000 /dev/zero | tr '\\0' x; exit 3"
+
+    finished, result = _run_in_thread(
+        lambda: session._exec_bash({"call_id": "c1", "command": command}),
+        timeout=15,
+    )
+    assert finished, "_exec_bash did not return"
+    assert result is not None
+    _, output = result
+    assert isinstance(output, ProjectedText)
+    assert output.endswith("[exit code: 3]")
+    fold = session._truncate_output_result(output, maximum_chars=150)
+    assert fold.text.endswith("[exit code: 3]")
+    assert fold.original_chars == 100_000 + len("\n[exit code: 3]")

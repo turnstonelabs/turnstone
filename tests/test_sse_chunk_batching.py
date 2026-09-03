@@ -153,7 +153,7 @@ def test_result_finishes_the_stream_and_drops_the_entry(wide_window: None) -> No
     on the wire and the per-call entry (window clock included) is
     dropped.  A chunk arriving AFTER the terminal — only reachable
     through the producer gate's one-line race, since ``_exec_bash``'s
-    ``emit_done`` stops the leaked drain thread at the source — simply
+    ``capture_closed`` stops the leaked drain thread at the source — simply
     re-buffers and emits, identical to pre-batching behaviour for the
     same line.  (The UI deliberately keeps NO closed-call ledger: keyed
     on call_id it would either discard a reusing provider's NEW stream

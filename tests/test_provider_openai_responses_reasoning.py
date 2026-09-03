@@ -101,6 +101,7 @@ class TestExtractReasoningText:
         ]
         result = provider.extract_reasoning_text(blocks)
         assert len(result) == _MAX_REASONING_DISPLAY_CHARS
+        assert "reasoning chars omitted from display" in result
 
     def test_malformed_summary_entry_skipped(self, provider: OpenAIResponsesProvider) -> None:
         blocks = [

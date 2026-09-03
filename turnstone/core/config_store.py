@@ -50,6 +50,7 @@ class ConfigStore:
         self._storage = storage
         self._node_id = node_id
         self._cache: dict[str, Any] = {}
+        self._clamp_warned: set[str] = set()
         # Serialize the storage operation and its cache publication as one
         # mutation.  ``_lock`` stays short-lived so coherent snapshot readers
         # never wait on database I/O; writers always nest mutation -> state.
@@ -85,9 +86,23 @@ class ConfigStore:
             new_cache: dict[str, Any] = {}
             for key, json_val in raw.items():
                 try:
-                    new_cache[key] = deserialize_value(key, json_val)
+                    # A stored value outside the registry's range (a bound
+                    # tightened after the value was written) is clamped, never
+                    # silently replaced by the default.
+                    value = deserialize_value(key, json_val, clamp_range=True)
                 except (ValueError, KeyError):
                     log.warning("Skipping invalid setting: %s", key)
+                    continue
+                new_cache[key] = value
+                if key not in self._clamp_warned:
+                    try:
+                        deserialize_value(key, json_val)
+                    except ValueError:
+                        # Once per key per process: the row stays out of range
+                        # until an operator rewrites it, and every reload would
+                        # otherwise repeat the warning.
+                        self._clamp_warned.add(key)
+                        log.warning("Clamped out-of-range setting %s to %r", key, value)
             with self._lock:
                 self._cache = new_cache
                 self._version += 1

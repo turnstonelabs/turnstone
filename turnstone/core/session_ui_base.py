@@ -1087,7 +1087,7 @@ class SessionUIBase:
 
         Late chunks from a LEAKED drain thread (past its join timeout,
         ``bash.drain_leaked``) are gated at the PRODUCER — the
-        ``emit_done`` event in ``_exec_bash``'s stdout closure — not
+        ``capture_closed`` gate in ``_exec_bash``'s stdout closure — not
         here: the execution closure is the one identity that call_id
         reuse across turns can't confuse, whereas a UI-side
         closed-call ledger keyed on call_id would either discard a

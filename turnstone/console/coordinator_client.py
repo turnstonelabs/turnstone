@@ -2208,10 +2208,10 @@ def _serialize_messages(
 # learns which tier it got via the ``_tier`` field in the response
 # (no API change to the coordinator tool).
 #
-# Budget chosen well under ``tool_truncation`` (typically 256 KB+) so
-# the head+tail safety net never fires for inspect_workstream — that
-# strategy silently drops middle messages, which is exactly the
-# pathology this formatter exists to avoid.
+# The executor passes the smaller of this budget and the cap the result
+# fold will apply, so the head+tail safety net never fires for a tier
+# that fit — that strategy silently drops middle messages, which is
+# exactly the pathology this formatter exists to avoid.
 
 _INSPECT_OUTPUT_BUDGET: int = 32_768
 # Per-message head/tail snip when Tier 2 needs to compress content.

@@ -65,6 +65,17 @@ class TestSet:
         with pytest.raises(ValueError, match="maximum"):
             store.set("tools.timeout", 9999)
 
+    def test_stored_value_above_a_tightened_maximum_is_clamped_on_load(self, storage):
+        """A bound tightened after the value was written clamps it with a
+        warning; it never silently reverts to the default."""
+        from turnstone.core.settings_registry import TOOL_TRUNCATION_MAX_CHARS
+
+        storage.upsert_system_setting("tools.truncation", str(TOOL_TRUNCATION_MAX_CHARS + 1))
+
+        store = ConfigStore(storage)
+
+        assert store.get("tools.truncation") == TOOL_TRUNCATION_MAX_CHARS
+
 
 # ---------------------------------------------------------------------------
 # set() + get() round-trips

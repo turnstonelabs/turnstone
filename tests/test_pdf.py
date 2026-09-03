@@ -78,9 +78,14 @@ class TestExtractPdfText:
         assert extract_pdf_text(b"") == ""
 
     def test_character_cap_is_applied_inside_worker(self) -> None:
-        assert extract_pdf_text(_minimal_pdf("abcdefghij"), max_chars=4) == (
-            "abcd\n\n... [6 chars truncated] ...\n"
-        )
+        assert extract_pdf_text(_minimal_pdf("abcdefghij"), max_chars=4) == "abc…"
+
+    def test_character_marker_fits_inside_nontrivial_cap(self) -> None:
+        result = extract_pdf_text(_minimal_pdf("x" * 100), max_chars=64)
+
+        assert len(result) <= 64
+        assert result.startswith("x")
+        assert "chars truncated" in result
 
     def test_resource_exit_is_typed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class ResourceLimitedProcess:
@@ -138,6 +143,30 @@ class TestExtractPdfText:
         assert process.killed
 
 
+class TestTextHeaderProtocol:
+    def test_parent_renders_the_marker_from_the_worker_prefix(self) -> None:
+        assert extract_pdf_text(_minimal_pdf("abcdefghij"), max_chars=8) == "abcdefg…"
+
+    def test_zero_allowance_returns_the_marker_as_a_receipt(self) -> None:
+        result = extract_pdf_text(_minimal_pdf("abcdefghij"), max_chars=0)
+
+        assert result == "\n\n... [10 chars truncated] ...\n"
+
+    def test_marker_counts_the_true_size(self) -> None:
+        from turnstone.core.pdf import _render_pdf_text
+
+        text = _render_pdf_text("a" * 1000, 123456, 1000)
+
+        head, _, rest = text.partition("\n\n... [")
+        assert len(text) == 1000
+        assert int(rest.split(" ")[0]) == 123456 - len(head)
+
+    def test_short_worker_output_reads_as_unreadable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("turnstone.core.pdf._worker_bytes", lambda *a, **k: b"abc")
+
+        assert extract_pdf_text(_minimal_pdf("abcdefghij")) == ""
+
+
 class TestRasterizePdf:
     def test_renders_pages_to_png(self) -> None:
         pages = rasterize_pdf(_minimal_pdf("Hello PDF"))
@@ -159,7 +188,7 @@ class TestRasterizePdf:
 
 class TestPdfWorkerEnvelope:
     def test_text_character_ceiling_is_derived_from_output_bytes(self) -> None:
-        expected = (_pdf_worker.MAX_FILE_BYTES - _pdf_worker._TEXT_OUTPUT_MARKER_RESERVE_BYTES) // 4
+        expected = (_pdf_worker.MAX_FILE_BYTES - _pdf_worker._TEXT_OUTPUT_HEADER_RESERVE_BYTES) // 4
         assert expected == _pdf_worker.MAX_TEXT_CHARS
 
     def test_worker_retains_user_site_dependencies(

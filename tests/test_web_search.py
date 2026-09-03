@@ -11,6 +11,7 @@ from turnstone.core.web_search import (
     MCPSearchClient,
     SearXNGClient,
     _format_searxng,
+    _format_snippet,
     resolve_web_search_client,
 )
 
@@ -109,6 +110,13 @@ class TestFormatSearXNG:
         out = _format_searxng(data, "q")
         assert "No results for 'q'" in out
         assert "duckduckgo" in out and "google" in out
+
+    def test_long_snippet_has_honest_exact_cap(self):
+        snippet = _format_snippet("x" * 700)
+
+        assert len(snippet) <= 500
+        assert snippet.startswith("x")
+        assert "snippet chars omitted" in snippet
 
 
 # ---------------------------------------------------------------------------

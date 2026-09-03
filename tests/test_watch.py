@@ -98,6 +98,46 @@ class TestValidateCondition:
 
 
 # ---------------------------------------------------------------------------
+# output cap
+# ---------------------------------------------------------------------------
+
+
+def test_capped_output_compares_equal_when_only_the_omitted_tail_grew():
+    """The default stop condition compares consecutive polls.  A growing log
+    whose first 64K is unchanged must still read as unchanged, so the cap's
+    marker cannot carry a count that differs from poll to poll."""
+    from turnstone.core.watch import (
+        _WATCH_TRUNCATION_MARKER,
+        MAX_OUTPUT_SIZE,
+        _bound_watch_output,
+    )
+
+    head = "L" * (MAX_OUTPUT_SIZE + 100)
+    first = _bound_watch_output(head + "x" * 100)
+    second = _bound_watch_output(head + "x" * 250)
+
+    assert first == second
+    assert first == head[:MAX_OUTPUT_SIZE] + _WATCH_TRUNCATION_MARKER
+    assert _bound_watch_output(head[:MAX_OUTPUT_SIZE]) == head[:MAX_OUTPUT_SIZE]
+    # Any overflow, including one smaller than the marker, takes the capped
+    # shape rather than passing whole.
+    for over in (1, len(_WATCH_TRUNCATION_MARKER)):
+        assert (
+            _bound_watch_output(head[: MAX_OUTPUT_SIZE + over])
+            == head[:MAX_OUTPUT_SIZE] + _WATCH_TRUNCATION_MARKER
+        )
+    # Polls compare by the head at the cap, so a previous poll persisted by an
+    # earlier release with a differently worded marker still compares equal.
+    legacy = head[:MAX_OUTPUT_SIZE] + f"\n[truncated at {MAX_OUTPUT_SIZE} bytes]"
+    fired, _ = evaluate_condition(None, first, 0, legacy)
+    assert not fired
+    fired, _ = evaluate_condition(None, first, 0, "L" * 10 + "x")
+    assert fired
+    fired, _ = evaluate_condition(None, second, 0, first)
+    assert not fired
+
+
+# ---------------------------------------------------------------------------
 # evaluate_condition
 # ---------------------------------------------------------------------------
 

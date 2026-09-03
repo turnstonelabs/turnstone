@@ -186,6 +186,16 @@ class TestRecallExecScope:
         assert "(earlier in this conversation, compacted)" in own_line
         assert "(earlier in this conversation, compacted)" not in other_line
 
+    def test_long_history_hit_has_honest_exact_cap(self):
+        session = make_session(user_id="owner")
+        content = "x" * 5000
+        rows = [("2026-07-02T10:00:00", "ws-other", "user", content, None)]
+
+        _, output = self._run_recall(session, rows)
+
+        assert "history item truncated; 5,000 chars total" in output
+        assert "x" * 2000 not in output
+
 
 def test_resume_nudge_teaches_recall():
     """The model is told the summary is a digest and recall reaches the
