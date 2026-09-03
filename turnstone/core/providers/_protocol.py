@@ -618,6 +618,25 @@ class ModelCapabilities:
     # stop_reason AND no ``message_stop``), Responses (no terminal
     # ``response.completed``/``response.incomplete`` event).
     finish_reason_optional: bool = False
+    # Preserved thinking (claude-fable-5-1 / claude-mythos-5-1): a thinking
+    # block's signature records the conversation prefix that produced it
+    # (top-level ``system``, the ``tools`` set, every earlier message), and
+    # a replayed block whose prefix has since changed fails the API's
+    # conversation check.  Organizations created on or after 2026-08-31 are
+    # enforced -- the default there is a 400 on the whole request, retried
+    # bodies fail the same way.  Older organizations only record the
+    # mismatch until a request sets the control, which opts it in.  This
+    # harness has not been audited append-only (client-side compaction
+    # alone rewrites earlier turns), and the documented production
+    # setting is an explicit choice either way, so a
+    # row with this flag sends the ``thinking-binding-controls-2026-08-01``
+    # beta and ``thinking.block_binding.prefix_mismatch_behavior=
+    # "drop_block"``: the API drops the first mismatched block and every
+    # later one, the request proceeds, and the model re-plans without that
+    # reasoning (dropped blocks are unbilled).  Wire shape verified on SDK
+    # 0.116 through a mock transport -- the control is untyped below 1.x
+    # and rides the plain ``thinking`` dict.  Never set on a compat lane.
+    thinking_prefix_bound: bool = False
 
 
 # The session effort knob is ORDINAL — snapping must respect this order.

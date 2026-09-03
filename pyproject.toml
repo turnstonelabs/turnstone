@@ -32,7 +32,9 @@ dependencies = [
     # since about 0.95. Raise the floor when adopting fast mode, server-side fallbacks,
     # advisor, or mid-conversation tool changes, which need newer typed parameters.
     # Version 1 moves to HTTPX2 and removes Messages sampling kwargs, so migrate the
-    # provider boundary before removing the cap.
+    # provider boundary before removing the cap. Claude Fable 5.1 needs nothing typed
+    # either: its thinking block-binding control is typed only in the 1.x beta
+    # namespace and rides the plain thinking dict (verified on 0.116).
     "anthropic>=0.117,<1",
     "httpx>=0.28",
     # Direct because the provider boundary catches this exception family;

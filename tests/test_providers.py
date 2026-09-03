@@ -2020,6 +2020,7 @@ class TestAnthropicHelpers:
         assert caps.supports_vision is True
         assert caps.supports_reasoning_replay is True
         assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is False
 
     def test_capabilities_fable_5_dated(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
@@ -2030,6 +2031,38 @@ class TestAnthropicHelpers:
         assert caps.supports_temperature is False
         assert caps.thinking_display == "summarized"
         assert caps.supports_mid_conversation_system is True
+        # A dated fable-5 snapshot must not slide onto the fable-5-1 row.
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_fable_5_1(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5-1")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_fable_5_1_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5-1-20260901")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.thinking_prefix_bound is True
 
     def test_capabilities_opus_5(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
@@ -6370,3 +6403,146 @@ def test_commercial_lanes_declare_server_parses_reasoning():
     ]:
         caps = create_provider(name).get_capabilities(model)
         assert caps.server_parses_reasoning is False, (name, model)
+
+
+# ===========================================================================
+# TestAnthropicThinkingPrefixBinding
+# ===========================================================================
+
+
+class TestAnthropicThinkingPrefixBinding:
+    """``thinking_prefix_bound`` rows opt into drop_block + the controls beta."""
+
+    _BETA = "thinking-binding-controls-2026-08-01"
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def _kwargs(self, model: str) -> dict[str, Any]:
+        caps = self.provider.get_capabilities(model)
+        return self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=None,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model=model,
+            tools=None,
+        )
+
+    def test_fable_5_1_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-fable-5-1")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
+
+    def test_fable_5_sends_neither(self) -> None:
+        kwargs = self._kwargs("claude-fable-5")
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert "extra_headers" not in kwargs
+
+    def test_caller_beta_header_is_joined_not_replaced(self) -> None:
+        from tests._wire_capture import RecordingClient
+
+        client = RecordingClient()
+        gen = self.provider.create_streaming(
+            client=client,
+            model="claude-fable-5-1",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            extra_headers={"anthropic-beta": "other-beta-2026-01-01", "x-trace": "t1"},
+        )
+        gen.close()
+        headers = client.captured["payload"]["extra_headers"]
+        assert headers == {
+            "anthropic-beta": f"{self._BETA},other-beta-2026-01-01",
+            "x-trace": "t1",
+        }
+
+    def test_caller_beta_header_joins_case_insensitively(self) -> None:
+        from tests._wire_capture import RecordingClient
+
+        client = RecordingClient()
+        gen = self.provider.create_streaming(
+            client=client,
+            model="claude-fable-5-1",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            extra_headers={"Anthropic-Beta": "other-beta-2026-01-01"},
+        )
+        gen.close()
+        headers = client.captured["payload"]["extra_headers"]
+        assert headers == {"anthropic-beta": f"{self._BETA},other-beta-2026-01-01"}
+
+    def test_caller_headers_pass_through_on_unbound_rows(self) -> None:
+        from tests._wire_capture import RecordingClient
+
+        client = RecordingClient()
+        gen = self.provider.create_streaming(
+            client=client,
+            model="claude-fable-5",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            extra_headers={"x-trace": "t1"},
+        )
+        gen.close()
+        assert client.captured["payload"]["extra_headers"] == {"x-trace": "t1"}
+
+    def test_real_sdk_puts_control_on_the_wire(self) -> None:
+        """Drive the real SDK: the untyped control must reach the HTTP body
+        verbatim and the beta must land as a request header (the SDK
+        floor is below the release that types ``block_binding``)."""
+        import anthropic
+        import httpx
+
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["beta"] = request.headers.get("anthropic-beta")
+            captured["body"] = json.loads(request.content)
+            sse = (
+                "event: message_start\n"
+                'data: {"type":"message_start","message":{"id":"m","type":"message",'
+                '"role":"assistant","model":"claude-fable-5-1","content":[],'
+                '"stop_reason":null,"stop_sequence":null,'
+                '"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+                "event: message_delta\n"
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn",'
+                '"stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
+                "event: message_stop\n"
+                'data: {"type":"message_stop"}\n\n'
+            )
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=sse.encode()
+            )
+
+        client = anthropic.Anthropic(
+            api_key="test-key",
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        try:
+            chunks = list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-fable-5-1",
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=64,
+                )
+            )
+        finally:
+            client.close()
+        assert captured["beta"] == self._BETA
+        assert captured["body"]["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        finishes = [c.finish_reason for c in chunks if c.finish_reason]
+        assert finishes == ["stop"]
