@@ -68,6 +68,20 @@ def _public_addr_patch():
     return patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))])
 
 
+def _private_addr_patch():
+    return patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("192.168.5.120", 0))])
+
+
+def _private_as_metadata_doc() -> dict[str, Any]:
+    return {
+        "issuer": "https://gitlab.internal.example",
+        "authorization_endpoint": "https://gitlab.internal.example/oauth/authorize",
+        "token_endpoint": "https://gitlab.internal.example/oauth/token",
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    }
+
+
 def _mk_storage_mock(server_id: str = "srv-id") -> MagicMock:
     storage = MagicMock()
     storage.update_mcp_server.return_value = True
@@ -736,4 +750,85 @@ class TestASMetadataRevocationEndpoint:
                 )
 
         with pytest.raises(MCPOAuthDiscoveryError, match="revocation_endpoint"):
+            asyncio.run(_run())
+
+
+class TestTrustedPrivateHosts:
+    def test_exact_trusted_private_resource_host_allows_prm_discovery(self) -> None:
+        async def _get(url: str, *args: Any, **kwargs: Any) -> MagicMock:
+            if url.endswith("/.well-known/oauth-protected-resource"):
+                return _mk_response(
+                    200,
+                    {"authorization_servers": ["https://gitlab.internal.example"]},
+                )
+            if url.endswith("/.well-known/oauth-authorization-server"):
+                return _mk_response(200, _private_as_metadata_doc())
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(side_effect=_get)
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _private_addr_patch():
+                return await discover_authorization_server(
+                    server_name="private-gitlab",
+                    server_url="https://gitlab.internal.example/mcp",
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    trusted_private_hosts=frozenset({"gitlab.internal.example"}),
+                )
+
+        metadata = asyncio.run(_run())
+        assert metadata.issuer == "https://gitlab.internal.example"
+
+    def test_exact_trusted_private_host_allows_discovery(self) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _private_as_metadata_doc()))
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _private_addr_patch():
+                return await discover_authorization_server(
+                    server_name="private-gitlab",
+                    server_url="https://gitlab.internal.example/mcp",
+                    override_url="https://gitlab.internal.example",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    trusted_private_hosts=frozenset({"gitlab.internal.example"}),
+                )
+
+        metadata = asyncio.run(_run())
+        assert metadata.token_endpoint == "https://gitlab.internal.example/oauth/token"
+
+    def test_unlisted_private_host_remains_rejected(self) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _private_as_metadata_doc()))
+        storage = _mk_storage_mock()
+
+        async def _run() -> None:
+            with _private_addr_patch():
+                await discover_authorization_server(
+                    server_name="private-gitlab",
+                    server_url="https://gitlab.internal.example/mcp",
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    trusted_private_hosts=frozenset({"other.internal.example"}),
+                )
+
+        with pytest.raises(
+            MCPOAuthDiscoveryError,
+            match=r"non-public address.*add 'gitlab\.internal\.example' to Settings → MCP → oauth_trusted_private_hosts",
+        ):
             asyncio.run(_run())

@@ -48,6 +48,10 @@ from turnstone.core.mcp_http_parsers import (
     is_valid_scope_token,
     parse_www_authenticate_bearer,
 )
+from turnstone.core.mcp_private_hosts import (
+    trusted_private_host_set,
+    url_uses_trusted_private_host,
+)
 from turnstone.core.model_registry import (
     MODEL_AUTH_TEXT_MAX_LEN,
     sanitize_backend_auth_scopes,
@@ -55,6 +59,7 @@ from turnstone.core.model_registry import (
 )
 from turnstone.core.oauth_ssrf import (
     OAuthSSRFError,
+    OAuthSSRFPrivateAddressError,
     sanitize_log_text,
     validate_discovered_endpoint_async,
     validate_url_no_ssrf_async,
@@ -70,6 +75,39 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = get_logger(__name__)
+
+
+def _configured_trusted_private_hosts(app_state: Any) -> frozenset[str]:
+    """Read the live merged allow-list, failing closed on invalid config."""
+    try:
+        return trusted_private_host_set(getattr(app_state, "config_store", None))
+    except ValueError as exc:
+        log.error(
+            "mcp_server.oauth.trusted_private_hosts_invalid",
+            reason=sanitize_log_text(str(exc)),
+        )
+        return frozenset()
+
+
+def _private_host_remediation(url: str) -> str:
+    """Return the operator action for a private-address discovery rejection."""
+    hostname = urllib.parse.urlparse(url).hostname
+    if not hostname:
+        return ""
+    return (
+        " To allow this exact host, add "
+        f"'{hostname}' to Settings → MCP → oauth_trusted_private_hosts."
+    )
+
+
+def _discovery_url_rejection(
+    prefix: str, url: str, exc: OAuthSSRFError
+) -> MCPOAuthDiscoveryError:
+    """Preserve strict validation errors and guide private-host remediation."""
+    remediation = (
+        _private_host_remediation(url) if isinstance(exc, OAuthSSRFPrivateAddressError) else ""
+    )
+    return MCPOAuthDiscoveryError(f"{prefix}: {exc}{remediation}")
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +241,7 @@ async def _fetch_prm_issuer(
     server_url: str,
     *,
     http_client: httpx.AsyncClient,
+    trusted_private_hosts: frozenset[str],
 ) -> str:
     """Fetch the protected-resource metadata document and return its ``authorization_servers[0]``.
 
@@ -224,9 +263,13 @@ async def _fetch_prm_issuer(
     prm_url = base.rstrip("/") + "/.well-known/oauth-protected-resource"
 
     try:
-        await validate_url_no_ssrf_async(prm_url, allow_http=True)
+        await validate_url_no_ssrf_async(
+            prm_url,
+            allow_http=True,
+            allow_private=url_uses_trusted_private_host(prm_url, trusted_private_hosts),
+        )
     except OAuthSSRFError as exc:
-        raise MCPOAuthDiscoveryError(f"PRM URL rejected: {exc}") from exc
+        raise _discovery_url_rejection("PRM URL rejected", prm_url, exc) from exc
 
     try:
         resp = await http_client.get(prm_url, timeout=_DEFAULT_HTTP_TIMEOUT)
@@ -243,9 +286,13 @@ async def _fetch_prm_issuer(
                 "server returned 401 without resource_metadata in WWW-Authenticate"
             )
         try:
-            await validate_url_no_ssrf_async(challenge_url, allow_http=True)
+            await validate_url_no_ssrf_async(
+                challenge_url,
+                allow_http=True,
+                allow_private=url_uses_trusted_private_host(challenge_url, trusted_private_hosts),
+            )
         except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"PRM challenge URL rejected: {exc}") from exc
+            raise _discovery_url_rejection("PRM challenge URL rejected", challenge_url, exc) from exc
         try:
             resp = await http_client.get(challenge_url, timeout=_DEFAULT_HTTP_TIMEOUT)
         except httpx.HTTPError as exc:
@@ -276,9 +323,13 @@ async def _fetch_prm_issuer(
     # SSRF protection on the issuer URL itself — same-origin / trust-list
     # checks happen in ``_fetch_as_metadata``.
     try:
-        await validate_url_no_ssrf_async(issuer_url, allow_http=True)
+        await validate_url_no_ssrf_async(
+            issuer_url,
+            allow_http=True,
+            allow_private=url_uses_trusted_private_host(issuer_url, trusted_private_hosts),
+        )
     except OAuthSSRFError as exc:
-        raise MCPOAuthDiscoveryError(f"PRM issuer URL rejected: {exc}") from exc
+        raise _discovery_url_rejection("PRM issuer URL rejected", issuer_url, exc) from exc
 
     return issuer_url
 
@@ -288,6 +339,7 @@ async def _fetch_as_metadata(
     *,
     http_client: httpx.AsyncClient,
     trusted_hosts: frozenset[str],
+    trusted_private_hosts: frozenset[str],
 ) -> ASMetadata:
     """Fetch ``.well-known/oauth-authorization-server`` for *issuer*.
 
@@ -297,9 +349,13 @@ async def _fetch_as_metadata(
     :class:`MCPOAuthDiscoveryError` otherwise.
     """
     try:
-        issuer_parsed = await validate_url_no_ssrf_async(issuer, allow_http=True)
+        issuer_parsed = await validate_url_no_ssrf_async(
+            issuer,
+            allow_http=True,
+            allow_private=url_uses_trusted_private_host(issuer, trusted_private_hosts),
+        )
     except OAuthSSRFError as exc:
-        raise MCPOAuthDiscoveryError(f"AS issuer URL rejected: {exc}") from exc
+        raise _discovery_url_rejection("AS issuer URL rejected", issuer, exc) from exc
 
     # MCP auth permits OpenID Connect discovery as a fallback to RFC 8414.
     # Major IdPs (notably Microsoft Entra) serve ONLY the OIDC document
@@ -373,9 +429,12 @@ async def _fetch_as_metadata(
                 issuer_parsed,
                 allow_http=allow_http,
                 trusted_endpoint_hosts=trusted_hosts,
+                allow_private=url_uses_trusted_private_host(endpoint_url, trusted_private_hosts),
             )
         except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"AS {name} rejected (url={endpoint_url}): {exc}") from exc
+            raise _discovery_url_rejection(
+                f"AS {name} rejected (url={endpoint_url})", endpoint_url, exc
+            ) from exc
 
     for opt_name, opt_url in (
         ("registration_endpoint", registration_endpoint),
@@ -389,9 +448,12 @@ async def _fetch_as_metadata(
                 issuer_parsed,
                 allow_http=allow_http,
                 trusted_endpoint_hosts=trusted_hosts,
+                allow_private=url_uses_trusted_private_host(opt_url, trusted_private_hosts),
             )
         except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"AS {opt_name} rejected (url={opt_url}): {exc}") from exc
+            raise _discovery_url_rejection(
+                f"AS {opt_name} rejected (url={opt_url})", opt_url, exc
+            ) from exc
 
     code_methods_raw = doc.get("code_challenge_methods_supported", [])
     if not isinstance(code_methods_raw, list):
@@ -453,6 +515,7 @@ async def discover_authorization_server(
     server_id: str,
     trusted_hosts: frozenset[str],
     metadata_cache: dict[str, tuple[ASMetadata, float]] | None = None,
+    trusted_private_hosts: frozenset[str] = frozenset(),
 ) -> ASMetadata:
     """Resolve the issuer URL and load AS metadata for an MCP server.
 
@@ -472,9 +535,13 @@ async def discover_authorization_server(
     issuer: str
     if override_url:
         try:
-            await validate_url_no_ssrf_async(override_url, allow_http=True)
+            await validate_url_no_ssrf_async(
+                override_url,
+                allow_http=True,
+                allow_private=url_uses_trusted_private_host(override_url, trusted_private_hosts),
+            )
         except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"override AS URL rejected: {exc}") from exc
+            raise _discovery_url_rejection("override AS URL rejected", override_url, exc) from exc
         issuer = override_url
     elif cached_issuer:
         # Defense-in-depth: re-run SSRF validation on the cached value.
@@ -482,7 +549,11 @@ async def discover_authorization_server(
         # we cached it (or the operator edited the row to point at a
         # private host), drop the cache and fall through to PRM.
         try:
-            await validate_url_no_ssrf_async(cached_issuer, allow_http=True)
+            await validate_url_no_ssrf_async(
+                cached_issuer,
+                allow_http=True,
+                allow_private=url_uses_trusted_private_host(cached_issuer, trusted_private_hosts),
+            )
         except OAuthSSRFError as exc:
             log.warning(
                 "mcp_server.oauth.cached_issuer_rejected",
@@ -502,11 +573,19 @@ async def discover_authorization_server(
                         server_name=server_name,
                         exc_info=True,
                     )
-            issuer = await _fetch_prm_issuer(server_url, http_client=http_client)
+            issuer = await _fetch_prm_issuer(
+                server_url,
+                http_client=http_client,
+                trusted_private_hosts=trusted_private_hosts,
+            )
         else:
             issuer = cached_issuer
     else:
-        issuer = await _fetch_prm_issuer(server_url, http_client=http_client)
+        issuer = await _fetch_prm_issuer(
+            server_url,
+            http_client=http_client,
+            trusted_private_hosts=trusted_private_hosts,
+        )
 
     if metadata_cache is not None:
         cached = metadata_cache.get(issuer)
@@ -516,7 +595,10 @@ async def discover_authorization_server(
                 return metadata
 
     metadata = await _fetch_as_metadata(
-        issuer, http_client=http_client, trusted_hosts=trusted_hosts
+        issuer,
+        http_client=http_client,
+        trusted_hosts=trusted_hosts,
+        trusted_private_hosts=trusted_private_hosts,
     )
 
     if metadata_cache is not None:
@@ -3752,6 +3834,7 @@ async def _refresh_and_persist(
             server_id=server_id,
             trusted_hosts=frozenset(),
             metadata_cache=metadata_cache,
+            trusted_private_hosts=_configured_trusted_private_hosts(app_state),
         )
     except MCPOAuthDiscoveryError as exc:
         raise MCPOAuthRefreshFailed(f"discovery failed during refresh: {exc}") from exc
@@ -4290,6 +4373,7 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
             server_id=server_id,
             trusted_hosts=frozenset(),
             metadata_cache=metadata_cache,
+            trusted_private_hosts=_configured_trusted_private_hosts(request.app.state),
         )
     except MCPOAuthDiscoveryError as exc:
         log.warning("mcp_server.oauth.discovery_failed", server_name=server_name, exc_info=True)
@@ -4534,6 +4618,7 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
             server_id=server_id,
             trusted_hosts=frozenset(),
             metadata_cache=metadata_cache,
+            trusted_private_hosts=_configured_trusted_private_hosts(request.app.state),
         )
     except MCPOAuthDiscoveryError as exc:
         log.warning(
@@ -4802,6 +4887,7 @@ async def _attempt_upstream_revoke(
     server_row: dict[str, Any],
     server_id_for_audit: str,
     refresh_token: str,
+    trusted_private_hosts: frozenset[str],
 ) -> None:
     """Best-effort RFC 7009 upstream revoke for ``user_revoked`` flow.
 
@@ -4838,6 +4924,7 @@ async def _attempt_upstream_revoke(
                 server_id=server_id_for_audit,
                 trusted_hosts=frozenset(),
                 metadata_cache=metadata_cache,
+                trusted_private_hosts=trusted_private_hosts,
             )
         except MCPOAuthDiscoveryError as exc:
             log.info(
@@ -5013,6 +5100,7 @@ async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Respons
                     server_row=server_row,
                     server_id_for_audit=server_id_for_audit,
                     refresh_token=refresh_token_for_revoke,
+                    trusted_private_hosts=_configured_trusted_private_hosts(request.app.state),
                 ),
                 name="mcp-oauth-upstream-revoke",
             )

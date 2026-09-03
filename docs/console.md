@@ -477,7 +477,14 @@ in-flight requests keep their original definition snapshot; see
 [Settings](settings.md#model-definition-reloads) for the full contract. The **Nodes** tab edits per-node
 metadata, and the **TLS** tab manages CA and leaf certificates for the
 internal mTLS fabric.  The **Settings** tab edits ConfigStore values
-live; edits apply without restart.
+live; edits apply without restart. Under its **MCP** section, the
+`oauth_trusted_private_hosts` row manages exact-host exceptions for
+operator-controlled MCP/OAuth services on private networks. Entries supplied
+through `TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS` are labeled **environment**
+and cannot be changed in the UI; manually added entries are stored in the
+database and can be removed. See
+[MCP OAuth: Private-network OAuth hosts](mcp-oauth.md#private-network-oauth-hosts)
+for the security boundary and deployment syntax.
 
 **Users tab:**
 

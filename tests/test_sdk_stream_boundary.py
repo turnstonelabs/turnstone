@@ -8,7 +8,8 @@ transports (no network, no live backend):
    Completions and Responses chunk iterators unwrapped.
 2. OpenAI v3's runtime-only legacy-client path preserves the old ``httpx``
    exception family when an application explicitly injects that client.
-3. The Anthropic ``messages.stream()`` helper propagates the ``httpx`` shape.
+3. The Anthropic ``messages.stream()`` helper propagates the transport-error
+   shape selected by that SDK release (``httpx`` or ``httpx2``).
 4. Closing an OpenAI v3 default client from another thread while a read is
    blocked (the ``ModelRegistry.reload()`` shape) completes safely; a later
    wire release surfaces as an ``httpx2.TransportError`` on the blocked
@@ -162,6 +163,27 @@ def _httpx2_dying_transport(payload: str, requests: list) -> httpx2.MockTranspor
         )
 
     return httpx2.MockTransport(handler)
+
+
+def _anthropic_dying_http_client(payload: str, requests: list):
+    """Build a mock client from the transport family Anthropic requires.
+
+    Anthropic SDK 1.x moved its default transport from ``httpx`` to
+    ``httpx2``.  ``DefaultHttpxClient`` is the SDK's public transport class,
+    so its base class is a stable way for this cross-version boundary probe
+    to select matching mock request, response, and exception types.
+    """
+    if issubclass(anthropic.DefaultHttpxClient, httpx2.Client):
+        return (
+            httpx2.Client(transport=_httpx2_dying_transport(payload, requests)),
+            httpx2.ReadError,
+            httpx2.TransportError,
+        )
+    return (
+        httpx.Client(transport=_dying_transport(payload, requests)),
+        httpx.ReadError,
+        httpx.TransportError,
+    )
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses"])
@@ -490,10 +512,13 @@ def test_openai_v3_legacy_httpx_midbody_death_keeps_legacy_error_family():
 
 def test_anthropic_midbody_death_is_unwrapped_readerror_and_no_rerequest():
     requests: list = []
+    http_client, read_error, transport_error = _anthropic_dying_http_client(
+        ANTHROPIC_EVENTS, requests
+    )
     client = anthropic.Anthropic(
         api_key="probe",
         base_url="http://probe.invalid",
-        http_client=httpx.Client(transport=_dying_transport(ANTHROPIC_EVENTS, requests)),
+        http_client=http_client,
         max_retries=2,
     )
     texts = []
@@ -503,7 +528,7 @@ def test_anthropic_midbody_death_is_unwrapped_readerror_and_no_rerequest():
         client.messages.stream(
             model="m", max_tokens=64, messages=[{"role": "user", "content": "hi"}]
         ) as stream,
-        pytest.raises(httpx.ReadError) as excinfo,
+        pytest.raises(read_error) as excinfo,
     ):
         for event in stream:
             if getattr(event, "type", "") == "content_block_delta":
@@ -511,7 +536,7 @@ def test_anthropic_midbody_death_is_unwrapped_readerror_and_no_rerequest():
                 if getattr(delta, "type", "") == "text_delta":
                     texts.append(delta.text)
     assert type(excinfo.value).__name__ == "ReadError"
-    assert isinstance(excinfo.value, httpx.TransportError)
+    assert isinstance(excinfo.value, transport_error)
     assert texts == ["hello"]
     assert len(requests) == 1
 
@@ -727,9 +752,10 @@ class TestEagerAppendContract:
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         requests: list = []
+        http_client, _, _ = _anthropic_dying_http_client(ANTHROPIC_EVENTS, requests)
         client = anthropic.Anthropic(
             api_key="probe",
-            http_client=httpx.Client(transport=_dying_transport(ANTHROPIC_EVENTS, requests)),
+            http_client=http_client,
         )
         self._armed_at_return(AnthropicProvider(), client)
         assert len(requests) == 1

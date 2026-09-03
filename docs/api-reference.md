@@ -2505,10 +2505,59 @@ the `admin.settings` permission.
 | DELETE | `/v1/api/admin/mcp-servers/{server_id}` | Delete an MCP server definition. |
 | POST | `/v1/api/admin/mcp-servers/reload` | Tell all cluster nodes to re-read the `mcp_servers` DB table and reconcile (add new, remove stale, reconnect changed). |
 | POST | `/v1/api/admin/mcp-servers/import` | Import servers from a pasted JSON config. Body: `{config: {mcpServers: {...}}}`. Skips existing names. |
+| GET | `/v1/api/admin/mcp-servers/trusted-private-hosts` | Return the merged MCP OAuth private-host allow-list with source and read-only metadata. |
+| PUT | `/v1/api/admin/mcp-servers/trusted-private-hosts` | Replace only the user-managed portion of the MCP OAuth private-host allow-list. Body: `{hosts: ["gitlab.internal.example"]}`. |
 
 Permission: `admin.mcp`
 
 Secrets (`env`, `headers` fields) are masked with `***` by default. Use `?reveal=true` on GET endpoints to see actual values.
+
+#### Trusted private OAuth hosts
+
+`GET /v1/api/admin/mcp-servers/trusted-private-hosts` returns both deployment
+entries from `TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS` and entries managed by
+users through the API/Web UI:
+
+```json
+{
+  "hosts": [
+    {
+      "host": "gitlab.internal.example",
+      "source": "environment",
+      "readonly": true
+    },
+    {
+      "host": "auth.internal.example",
+      "source": "manual",
+      "readonly": false
+    }
+  ],
+  "environment_variable": "TURNSTONE_MCP_OAUTH_TRUSTED_PRIVATE_HOSTS",
+  "help": "Add only exact hostnames or IP addresses ..."
+}
+```
+
+`PUT /v1/api/admin/mcp-servers/trusted-private-hosts` replaces the complete
+**manual** list:
+
+```json
+{
+  "hosts": ["auth.internal.example", "192.168.5.120"]
+}
+```
+
+The response has the same merged shape as GET. Environment entries are never
+changed by PUT and take precedence over duplicate manual entries. Each value
+must be an exact hostname or IP address; schemes, ports, paths, credentials,
+and wildcards return `400`. The merged environment and manual list may contain
+at most 100 unique hosts. A malformed deployment environment value makes GET
+fail closed with `500`; correct the environment variable and restart the
+affected process. Both methods require `admin.mcp`; missing configuration
+storage returns `503`.
+
+Trusting a host relaxes only private-address rejection during MCP OAuth
+discovery. See [MCP OAuth: Private-network OAuth hosts](mcp-oauth.md#private-network-oauth-hosts)
+for the remaining SSRF protections.
 
 ---
 
