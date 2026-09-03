@@ -55,6 +55,7 @@ from turnstone.core.mcp_crypto import (
 )
 from turnstone.core.mcp_oauth import (
     get_obo_access_token_classified,
+    json_http_client,
     mint_obo_access_token,
     model_mint_refusal_cause,
     model_obo_cache_server,
@@ -161,7 +162,9 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
     if cfg.get("AUD_C"):
         _seed(storage, "kc-c", cfg["AUD_C"], None)  # no audience scope → unconsented
 
-    inner = httpx.AsyncClient(timeout=20.0)
+    # The production client factory, so the run proves the wire posture the
+    # console and nodes actually use (JSON-preferring Accept) against a live IdP.
+    inner = json_http_client(20.0)
     client = _CountingClient(inner)
     app_state = SimpleNamespace(
         auth_storage=storage,
@@ -339,6 +342,61 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
         await inner.aclose()
 
 
+class _RecordingGet:
+    """Duck-typed GET client that records every URL discovery fetches."""
+
+    def __init__(self, inner: httpx.AsyncClient) -> None:
+        self._inner = inner
+        self.urls: list[str] = []
+
+    async def get(self, url: Any, *args: Any, **kwargs: Any) -> httpx.Response:
+        self.urls.append(str(url))
+        return await self._inner.get(url, *args, **kwargs)
+
+
+async def _discovery_probe(cfg: dict[str, str]) -> None:
+    """D1 — AS metadata discovery against the realm issuer, a path-bearing issuer.
+
+    A realm issuer carries a path, which is the shape that failed before
+    this branch. Discovery must resolve it, land on a document that
+    advertises S256, and report the endpoints of that realm. The realm is
+    loopback, which the SSRF check admits as the development lane, so no
+    allowance is patched in.
+    """
+    import time
+
+    from turnstone.core.mcp_oauth import _DISCOVERY_TOTAL_BUDGET, _fetch_as_metadata
+
+    issuer = cfg["KC_ISSUER"]
+    want_token_endpoint = issuer.rstrip("/") + "/protocol/openid-connect/token"
+    inner = json_http_client(20.0)
+    recorder = _RecordingGet(inner)
+    try:
+        try:
+            meta = await _fetch_as_metadata(
+                issuer,
+                http_client=recorder,  # type: ignore[arg-type]
+                trusted_hosts=frozenset(),
+                deadline=time.monotonic() + _DISCOVERY_TOTAL_BUDGET,
+            )
+        except Exception as exc:
+            record(
+                "FAILED", f"D1 AS discovery: {type(exc).__name__}: {exc} fetched={recorder.urls}"
+            )
+            return
+        resolved = recorder.urls[-1] if recorder.urls else None
+        s256 = "S256" in meta.code_challenge_methods_supported
+        ok = meta.token_endpoint == want_token_endpoint and s256 and meta.issuer == issuer
+        record(
+            "VERIFIED" if ok else "FAILED",
+            f"D1 AS discovery for a path-bearing issuer: token_endpoint={meta.token_endpoint} "
+            f"want={want_token_endpoint} issuer_ok={meta.issuer == issuer} s256={s256} "
+            f"document={resolved} probes={len(recorder.urls)}",
+        )
+    finally:
+        await inner.aclose()
+
+
 def main() -> int:
     required = [
         "KC_TOKEN_ENDPOINT",
@@ -360,6 +418,7 @@ def main() -> int:
     refresh_token = _password_login(cfg)
 
     asyncio.run(_run(cfg, refresh_token))
+    asyncio.run(_discovery_probe(cfg))
 
     print("\n=== summary ===")
     for status, msg in RESULTS:

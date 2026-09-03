@@ -60,6 +60,7 @@ from turnstone.core.mcp_oauth import (
     get_user_access_token_classified,
     invalidate_model_mint_memo,
     is_user_scoped_auth,
+    json_http_client,
     mint_app_access_token,
     mint_obo_access_token,
 )
@@ -1216,7 +1217,7 @@ class MCPClientManager:
 
     async def _connect_all(self) -> None:
         """Connect to every configured server (runs on the background loop)."""
-        self._model_auth_http_client = httpx.AsyncClient(timeout=10.0)
+        self._model_auth_http_client = json_http_client(10.0)
         if self._app_state is not None:
             self._app_state.obo_http_client = self._model_auth_http_client
         self._exit_stack = AsyncExitStack()

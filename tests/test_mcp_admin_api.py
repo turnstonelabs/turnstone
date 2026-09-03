@@ -1641,6 +1641,160 @@ class TestUpdateMcpServer:
 # ---------------------------------------------------------------------------
 
 
+class TestOAuthUrlCanonicalization:
+    """User-scoped rows store the canonical RFC 8707 resource identifier.
+
+    The stored value is what discovery derives its metadata URL from and
+    what every token request sends as ``resource=``, so the row shows the
+    value on the wire. A spelling-only difference is the same resource: it
+    must not purge user tokens or drop the cached issuer, while a real URL
+    or authorization-server change must drop the cached issuer.
+    """
+
+    def _create(self, client, name: str, url: str, auth_type: str = "oauth_user"):
+        return client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": name,
+                "transport": "streamable-http",
+                "url": url,
+                "auth_type": auth_type,
+                "oauth_client_id": "cli_seed",
+            },
+        )
+
+    def test_create_stores_canonical_form(self, client, storage):
+        r = self._create(client, "canon-create", "https://MCP.Example.com:443/sse/")
+        assert r.status_code == 200, r.text
+        row = storage.get_mcp_server(r.json()["server_id"])
+        assert row["url"] == "https://mcp.example.com/sse/"
+
+    @pytest.mark.parametrize(
+        "url",
+        ["https://mcp.example.com/sse#v2", "https://u:p@mcp.example.com/sse"],
+        ids=["fragment", "credentials"],
+    )
+    def test_create_rejects_fragment_and_credentials(self, client, url):
+        r = self._create(client, "canon-reject", url)
+        assert r.status_code == 400, r.text
+        assert r.json()["error"].startswith("url:")
+
+    def test_create_keeps_typed_form_for_static_rows(self, client, storage):
+        r = self._create(client, "canon-static", "https://MCP.Example.com/", auth_type="static")
+        assert r.status_code == 200, r.text
+        assert storage.get_mcp_server(r.json()["server_id"])["url"] == "https://MCP.Example.com/"
+
+    def test_spelling_only_update_neither_purges_nor_clears_cache(self, client, storage):
+        from unittest.mock import patch
+
+        r = self._create(client, "canon-spell", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        storage.update_mcp_server(sid, oauth_as_issuer_cached="https://as.example.com")
+
+        with patch.object(
+            storage,
+            "delete_mcp_oauth_rows_by_server_name",
+            wraps=storage.delete_mcp_oauth_rows_by_server_name,
+        ) as purge:
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"url": "https://ORIG.example.com:443/sse"},
+            )
+        assert r2.status_code == 200, r2.text
+        row = storage.get_mcp_server(sid)
+        assert row["url"] == "https://orig.example.com/sse"
+        assert row["oauth_as_issuer_cached"] == "https://as.example.com"
+        purge.assert_not_called()
+
+    def test_url_change_purges_and_clears_cached_issuer(self, client, storage):
+        from unittest.mock import patch
+
+        r = self._create(client, "canon-move", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        storage.update_mcp_server(sid, oauth_as_issuer_cached="https://as.example.com")
+
+        with patch.object(
+            storage,
+            "delete_mcp_oauth_rows_by_server_name",
+            wraps=storage.delete_mcp_oauth_rows_by_server_name,
+        ) as purge:
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"url": "https://orig.example.com/mcp"},
+            )
+        assert r2.status_code == 200, r2.text
+        row = storage.get_mcp_server(sid)
+        assert row["url"] == "https://orig.example.com/mcp"
+        assert row["oauth_as_issuer_cached"] is None
+        purge.assert_called_once_with("canon-move")
+
+    def test_as_override_change_clears_cached_issuer_without_purge(self, client, storage):
+        from unittest.mock import patch
+
+        r = self._create(client, "canon-as", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        storage.update_mcp_server(sid, oauth_as_issuer_cached="https://as.example.com")
+
+        with patch.object(
+            storage,
+            "delete_mcp_oauth_rows_by_server_name",
+            wraps=storage.delete_mcp_oauth_rows_by_server_name,
+        ) as purge:
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"oauth_authorization_server_url": "https://as2.example.com"},
+            )
+        assert r2.status_code == 200, r2.text
+        row = storage.get_mcp_server(sid)
+        assert row["oauth_authorization_server_url"] == "https://as2.example.com"
+        assert row["oauth_as_issuer_cached"] is None
+        purge.assert_not_called()
+
+    def test_update_rejects_fragment(self, client, storage):
+        r = self._create(client, "canon-upd-reject", "https://orig.example.com/sse")
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://orig.example.com/sse#x"},
+        )
+        assert r2.status_code == 400, r2.text
+        assert storage.get_mcp_server(sid)["url"] == "https://orig.example.com/sse"
+
+    def test_flip_into_oauth_user_without_url_canonicalizes_stored_value(self, client, storage):
+        # A static row keeps its typed spelling; flipping it to oauth_user
+        # without re-sending ``url`` must still store the canonical form.
+        r = self._create(
+            client, "canon-flip", "https://MCP.Example.com:443/sse", auth_type="static"
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_user", "oauth_client_id": "cli_flip"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert storage.get_mcp_server(sid)["url"] == "https://mcp.example.com/sse"
+
+    def test_flip_into_oauth_user_without_url_rejects_fragment(self, client, storage):
+        r = self._create(
+            client, "canon-flip-frag", "https://mcp.example.com/sse#frag", auth_type="static"
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_user", "oauth_client_id": "cli_flip"},
+        )
+        assert r2.status_code == 400, r2.text
+        row = storage.get_mcp_server(sid)
+        assert row["auth_type"] == "static"
+        assert row["url"] == "https://mcp.example.com/sse#frag"
+
+
 class TestDeleteMcpServer:
     def test_delete_existing(self, client):
         created = _create_server(client, name="del-test")

@@ -276,6 +276,23 @@ class TestRefreshFailureClassification:
         assert result.kind == "refresh_failed"
         assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
 
+    def test_invalid_target_keeps_token(self, storage: SQLiteBackend) -> None:
+        """``invalid_target`` (RFC 8707 §2.2) means the AS will not cover the
+        ``resource=`` asked for — an operator-side fix (the Server URL or the
+        Audience on the row), not a dead grant. Re-consenting would send the
+        same value, so the token is kept and the failure stays ambiguous."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_target"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+
     def test_permanent_revoke_audits_even_when_row_concurrently_deleted(
         self, storage: SQLiteBackend
     ) -> None:

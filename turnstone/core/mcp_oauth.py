@@ -61,7 +61,7 @@ from turnstone.core.oauth_ssrf import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Mapping
 
     from starlette.requests import Request
     from starlette.responses import Response
@@ -92,6 +92,11 @@ _OBO_DEFAULT_TTL_SECONDS = 300
 
 # Limits on PRM/AS body sizes — defensive against runaway responses.
 _MAX_DISCOVERY_BODY_BYTES = 256 * 1024
+# Whole-discovery probe budget. Each candidate location gets the standard
+# per-request timeout, but a hard-down host must not let a browser-facing
+# consent handler (or a refresh holding the per-(user, server) lock) sit
+# through one timeout per candidate.
+_DISCOVERY_TOTAL_BUDGET = 20.0
 # Tighter cap for token-endpoint and DCR responses — these never carry
 # JWKS-style payloads and are bounded in well-formed AS implementations.
 _MAX_TOKEN_BODY_BYTES = 64 * 1024
@@ -179,9 +184,138 @@ class ASMetadata:
     token_endpoint_auth_methods_supported: tuple[str, ...]
 
 
+def json_http_client(timeout: float = _DEFAULT_HTTP_TIMEOUT) -> httpx.AsyncClient:
+    """Return the ``httpx.AsyncClient`` every OAuth request in this module goes through.
+
+    Every request here consumes a JSON body: discovery documents, dynamic
+    client registration, token exchange, refresh, revocation, and the OBO
+    grant legs. Some token endpoints content-negotiate and answer a bare
+    ``Accept: */*`` with a form-encoded body the parsers cannot read, so
+    the JSON preference is the client default rather than a per-call
+    literal that the next call site would forget. httpx applies a
+    per-request ``headers=`` over this default, so a caller can still
+    override it.
+    """
+    return httpx.AsyncClient(timeout=timeout, headers={"Accept": "application/json"})
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
+
+
+# ``urlsplit`` is non-validating: it silently DELETES tabs and newlines
+# anywhere in the input and ignores leading control characters, so
+# ``https://mcp.exa\nmple.com`` parses as ``https://mcp.example.com`` — a
+# different host than the bytes say. Every identity check in this module
+# compares parsed output, so an unusable identifier must be refused on the
+# raw string before it is parsed, or the comparison is made against
+# something the peer never sent. Space is included: a URI has none.
+_URL_UNSAFE_CHARS = frozenset(chr(code) for code in range(0x21)) | {chr(0x7F)}
+
+
+def _has_unsafe_url_syntax(raw: str) -> bool:
+    """True when *raw* holds a character ``urlsplit`` would drop or ignore."""
+    return any(ch in _URL_UNSAFE_CHARS for ch in raw)
+
+
+def canonical_resource(server_url: str, *, strict: bool = False) -> str:
+    """Return the canonical RFC 8707 resource identifier for an MCP server URL.
+
+    One definition feeds the three places the identifier is used: deriving
+    the RFC 9728 protected-resource metadata URL, comparing that document's
+    declared ``resource``, and the ``resource=`` parameter sent on every
+    authorize, code-exchange, and refresh request. Reading the row value
+    independently at each site is how they came to disagree.
+
+    Applies only the normalization the specifications define for the
+    identifier. Scheme and host are case-folded and the scheme's default
+    port dropped (RFC 3986 §6.2.2.1 and §6.2.3; MCP authorization tells
+    clients to accept uppercase scheme and host). A root-only ``/`` is
+    removed (RFC 9728 §3.1 removes a terminating slash before inserting the
+    well-known string; MCP prefers the form without it). Every other path
+    is kept byte-for-byte, trailing slash included: it is also the
+    connection path, and ``/MCP`` and ``/mcp`` are different resources. The
+    query is kept.
+
+    Surrounding whitespace, a fragment and embedded credentials have no
+    place in a resource identifier (RFC 8707 §2 forbids the fragment; an
+    audience value must never carry a credential). *strict* decides how
+    they are handled:
+    ``True`` at a write boundary, and for any identifier a remote server
+    declares, raises :class:`ValueError`; the default strips them, so a row
+    stored before this validation existed still resolves — and resolves to
+    a more correct identifier than earlier releases sent. A missing scheme
+    or host, or an invalid port, always raises.
+    """
+    if strict and server_url != server_url.strip():
+        raise ValueError("server URL must not be surrounded by whitespace")
+    candidate = server_url.strip()
+    # Before parsing, and in both modes: a URL whose bytes do not survive
+    # parsing intact is malformed, not merely unfashionable.
+    if _has_unsafe_url_syntax(candidate):
+        raise ValueError("server URL must not contain control characters or spaces")
+    parsed = urllib.parse.urlsplit(candidate)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError(f"server URL is not absolute: {server_url}")
+    if strict:
+        # By the delimiter's presence, not by a non-empty component: a bare
+        # trailing ``#`` is a fragment component, and RFC 8707 §2 forbids it.
+        if "#" in candidate:
+            raise ValueError("server URL must not contain a fragment")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("server URL must not contain embedded credentials")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"server URL port is invalid: {server_url}") from exc
+    scheme = parsed.scheme.lower()
+    # ``hostname`` is already lower-cased and, for IPv6, stripped of its
+    # brackets; the authority needs them back.
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    netloc = host if port is None or port == default_port else f"{host}:{port}"
+    path = "" if parsed.path == "/" else parsed.path
+    return urllib.parse.urlunsplit((scheme, netloc, path, parsed.query, ""))
+
+
+def _canonical_server_url(server_row: Mapping[str, Any]) -> str:
+    """Canonical resource identifier for a server row, in the flow's error type.
+
+    Every flow reads the row once, here, and hands the canonical string to
+    discovery, the token builders, and the audience check, so a stored
+    value that predates canonicalization at the console boundary is still
+    normalized exactly once. Lenient by design: a legacy row carrying a
+    fragment or embedded credentials is healed rather than refused, since
+    refusing here would strand a working server on a value the console
+    accepted at the time. An empty URL passes through as ``""`` and is
+    refused by PRM discovery or ignored by the token builders as before.
+    """
+    raw = str(server_row.get("url") or "")
+    if not raw:
+        return raw
+    try:
+        return canonical_resource(raw)
+    except ValueError as exc:
+        raise MCPOAuthDiscoveryError(f"server URL rejected: {exc}") from exc
+
+
+def _well_known_url(identifier: str, suffix: str) -> str:
+    """Insert a well-known suffix before an identifier's path.
+
+    RFC 8414 and RFC 9728 use the same transformation: an identifier such
+    as ``https://example.com/tenant/`` becomes
+    ``https://example.com/.well-known/<suffix>/tenant/``.  The root-only
+    slash is removed, while a resource path's trailing slash and query are
+    significant and therefore preserved. Callers normalize identifiers whose
+    own specification requires a trailing slash to be removed.
+    """
+    parsed = urllib.parse.urlsplit(identifier)
+    identifier_path = "" if parsed.path == "/" else parsed.path
+    metadata_path = f"/.well-known/{suffix}{identifier_path}"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, metadata_path, parsed.query, ""))
 
 
 def _parse_prm_url_from_www_authenticate(header: str) -> str | None:
@@ -199,70 +333,47 @@ def _parse_prm_url_from_www_authenticate(header: str) -> str | None:
     return params.get("resource_metadata") or None
 
 
-async def _fetch_prm_issuer(
-    server_url: str,
-    *,
-    http_client: httpx.AsyncClient,
-) -> str:
-    """Fetch the protected-resource metadata document and return its ``authorization_servers[0]``.
-
-    Tries the well-known PRM URL relative to the server URL first; if
-    the server returns 401 with a ``WWW-Authenticate: Bearer
-    resource_metadata="..."`` header, follows that URL.
-
-    The caller is responsible for passing the resulting issuer to
-    :func:`_fetch_as_metadata` along with its ``trusted_hosts`` list —
-    PRM itself is anchored on the resource-server origin, so trust
-    expansion only matters for AS-metadata endpoint validation.
-
-    Raises :class:`MCPOAuthDiscoveryError` on validation failure.
-    """
-    parsed = urllib.parse.urlparse(server_url)
-    if not parsed.scheme or not parsed.hostname:
-        raise MCPOAuthDiscoveryError(f"server URL is not absolute: {server_url}")
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    prm_url = base.rstrip("/") + "/.well-known/oauth-protected-resource"
-
-    try:
-        await validate_url_no_ssrf_async(prm_url, allow_http=True)
-    except OAuthSSRFError as exc:
-        raise MCPOAuthDiscoveryError(f"PRM URL rejected: {exc}") from exc
-
-    try:
-        resp = await http_client.get(prm_url, timeout=_DEFAULT_HTTP_TIMEOUT)
-    except httpx.HTTPError as exc:
-        raise MCPOAuthDiscoveryError(f"PRM fetch failed: {exc}") from exc
-
-    if resp.status_code == 401:
-        # 401 with Bearer challenge — follow resource_metadata URL.
-        challenge_url = _parse_prm_url_from_www_authenticate(
-            resp.headers.get("www-authenticate", "")
-        )
-        if challenge_url is None:
-            raise MCPOAuthDiscoveryError(
-                "server returned 401 without resource_metadata in WWW-Authenticate"
-            )
-        try:
-            await validate_url_no_ssrf_async(challenge_url, allow_http=True)
-        except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"PRM challenge URL rejected: {exc}") from exc
-        try:
-            resp = await http_client.get(challenge_url, timeout=_DEFAULT_HTTP_TIMEOUT)
-        except httpx.HTTPError as exc:
-            raise MCPOAuthDiscoveryError(f"PRM challenge fetch failed: {exc}") from exc
-    if resp.status_code != 200:
-        raise MCPOAuthDiscoveryError(f"PRM returned HTTP {resp.status_code}")
-
+def _json_object_body(resp: httpx.Response, label: str) -> dict[str, Any]:
+    """Return a bounded, parsed JSON-object body, or raise the discovery error."""
     if len(resp.content) > _MAX_DISCOVERY_BODY_BYTES:
-        raise MCPOAuthDiscoveryError("PRM response body exceeds size limit")
-
+        raise MCPOAuthDiscoveryError(f"{label} response body exceeds size limit")
     try:
         doc = resp.json()
     except ValueError as exc:
-        raise MCPOAuthDiscoveryError(f"PRM body is not valid JSON: {exc}") from exc
-
+        raise MCPOAuthDiscoveryError(f"{label} body is not valid JSON: {exc}") from exc
     if not isinstance(doc, dict):
-        raise MCPOAuthDiscoveryError("PRM body is not a JSON object")
+        raise MCPOAuthDiscoveryError(f"{label} body is not a JSON object")
+    return doc
+
+
+def _prm_issuer_from_document(resp: httpx.Response, accepted_resources: frozenset[str]) -> str:
+    """Validate one protected-resource metadata response and return its issuer.
+
+    Raises :class:`MCPOAuthDiscoveryError` for an oversized, non-JSON, or
+    non-object body, a missing or invalid ``resource``, a ``resource`` that
+    does not canonicalize to a member of *accepted_resources*, or a missing
+    or empty ``authorization_servers``. Each cause has its own message
+    because the operator's remedy differs: a missing field is the server's
+    document, a mismatch is the row's URL.
+    """
+    doc = _json_object_body(resp, "PRM")
+
+    resource = doc.get("resource")
+    if not isinstance(resource, str) or not resource:
+        raise MCPOAuthDiscoveryError("PRM document is missing its resource identifier")
+    try:
+        # Strict: the leniency that heals a row written before this validation
+        # existed has no business accepting surrounding whitespace, a
+        # fragment, or embedded credentials from a document a remote server
+        # just handed us. RFC 9728 §3.3 wants the identifier discovery used,
+        # and none of those forms is it.
+        declared = canonical_resource(resource, strict=True)
+    except ValueError as exc:
+        raise MCPOAuthDiscoveryError(
+            f"PRM resource identifier is not a valid resource URL: {exc}"
+        ) from exc
+    if declared not in accepted_resources:
+        raise MCPOAuthDiscoveryError("PRM resource identifier does not match the server URL")
 
     auth_servers = doc.get("authorization_servers")
     if not isinstance(auth_servers, list) or not auth_servers:
@@ -272,78 +383,294 @@ async def _fetch_prm_issuer(
     issuer_url = auth_servers[0]
     if not isinstance(issuer_url, str) or not issuer_url:
         raise MCPOAuthDiscoveryError("PRM authorization_servers[0] is empty or non-string")
-
-    # SSRF protection on the issuer URL itself — same-origin / trust-list
-    # checks happen in ``_fetch_as_metadata``.
-    try:
-        await validate_url_no_ssrf_async(issuer_url, allow_http=True)
-    except OAuthSSRFError as exc:
-        raise MCPOAuthDiscoveryError(f"PRM issuer URL rejected: {exc}") from exc
-
     return issuer_url
 
 
-async def _fetch_as_metadata(
-    issuer: str,
+@dataclass(frozen=True)
+class _PRMCandidate:
+    """One protected-resource metadata location and what it may declare.
+
+    *accepted* is bound to the location because RFC 9728 §3.3 ties the
+    identifier to the URL it was derived from; carrying it alongside the
+    URL is what keeps a path-specific document from being validated
+    against the origin's expectation. *hops* is this candidate's own
+    ``WWW-Authenticate`` budget, so a chain of challenges off one location
+    cannot starve another location's challenge.
+    """
+
+    url: str
+    accepted: frozenset[str]
+    hops: int
+
+
+async def _fetch_prm_issuer(
+    server_url: str,
     *,
     http_client: httpx.AsyncClient,
-    trusted_hosts: frozenset[str],
-) -> ASMetadata:
-    """Fetch ``.well-known/oauth-authorization-server`` for *issuer*.
+    deadline: float,
+) -> str:
+    """Fetch the protected-resource metadata document and return its ``authorization_servers[0]``.
 
-    Validates the discovered ``authorization_endpoint`` and
-    ``token_endpoint`` are same-origin (or in ``trusted_hosts``).
-    Requires S256 code challenge support — raises
-    :class:`MCPOAuthDiscoveryError` otherwise.
+    One loop over candidate locations: the RFC 9728 path-specific
+    well-known URL first, then the origin-level URL MCP retains as a
+    compatibility fallback. Whatever a candidate does short of yielding a
+    usable document (SSRF rejection, transport error, non-200, unusable
+    body) is recorded and the loop advances, so a server whose
+    path-specific probe misbehaves in any way still reaches its origin
+    document. A 401 carrying ``WWW-Authenticate: Bearer
+    resource_metadata="..."`` queues that URL with the challenged
+    candidate's remaining hop budget and its accepted set; a URL already
+    fetched is never fetched twice, but its response is re-judged when a
+    later candidate expects something different of the same location.
+
+    What a document may declare is a property of where it was found. RFC
+    9728 §3.3 requires the ``resource`` to be the identifier the well-known
+    string was inserted into: the path-specific location must declare the
+    server's canonical identifier and the origin-level location must
+    declare the bare origin. Comparison is by
+    :func:`canonical_resource` on both sides, which is the case, port and
+    root-slash folding MCP tells clients to accept.
+
+    When no candidate yields a usable document, the error raised is the
+    first document-level rejection if any candidate returned a 200, since
+    that is the message an operator can act on, and otherwise the first
+    candidate's error.
+
+    The caller is responsible for passing the resulting issuer to
+    :func:`_fetch_as_metadata` along with its ``trusted_hosts`` list —
+    PRM itself is anchored on the resource-server origin, so trust
+    expansion only matters for AS-metadata endpoint validation.
+
+    Raises :class:`MCPOAuthDiscoveryError` on validation failure.
     """
     try:
-        issuer_parsed = await validate_url_no_ssrf_async(issuer, allow_http=True)
-    except OAuthSSRFError as exc:
-        raise MCPOAuthDiscoveryError(f"AS issuer URL rejected: {exc}") from exc
-
-    # MCP auth permits OpenID Connect discovery as a fallback to RFC 8414.
-    # Major IdPs (notably Microsoft Entra) serve ONLY the OIDC document
-    # (.well-known/openid-configuration) and 404 the oauth-authorization-server
-    # path — refusing to support them would lock out the most common
-    # enterprise AS. Try RFC 8414 first (preferred), then OIDC.
-    base = issuer.rstrip("/")
-    # (profile, url): ``profile`` records WHICH discovery document each candidate
-    # is so the S256 PKCE check below can apply the correct per-document
-    # defaulting rule — an absent ``code_challenge_methods_supported`` is only
-    # treated as "S256 supported" for the OIDC document (see below).
-    metadata_candidates = (
-        ("rfc8414", base + "/.well-known/oauth-authorization-server"),
-        ("oidc", base + "/.well-known/openid-configuration"),
-    )
-    resp = None
-    winning_profile: str | None = None
-    last_status: int | None = None
-    for profile, metadata_url in metadata_candidates:
-        try:
-            r = await http_client.get(metadata_url, timeout=_DEFAULT_HTTP_TIMEOUT)
-        except httpx.HTTPError as exc:
-            raise MCPOAuthDiscoveryError(f"AS metadata fetch failed: {exc}") from exc
-        if r.status_code == 200:
-            resp = r
-            winning_profile = profile
-            break
-        last_status = r.status_code
-    if resp is None:
-        raise MCPOAuthDiscoveryError(f"AS metadata returned HTTP {last_status}")
-    # Which discovery profile answered (rfc8414 vs oidc) is the load-bearing
-    # detail when debugging an enterprise AS (e.g. Entra serves only OIDC).
-    log.debug("mcp_server.oauth.as_metadata_discovered", profile=winning_profile)
-
-    if len(resp.content) > _MAX_DISCOVERY_BODY_BYTES:
-        raise MCPOAuthDiscoveryError("AS metadata response body exceeds size limit")
-
-    try:
-        doc = resp.json()
+        canonical = canonical_resource(server_url)
     except ValueError as exc:
-        raise MCPOAuthDiscoveryError(f"AS metadata body is not valid JSON: {exc}") from exc
+        raise MCPOAuthDiscoveryError(str(exc)) from exc
+    parsed = urllib.parse.urlsplit(canonical)
+    origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
-    if not isinstance(doc, dict):
-        raise MCPOAuthDiscoveryError("AS metadata body is not a JSON object")
+    path_prm_url = _well_known_url(canonical, "oauth-protected-resource")
+    candidates = [_PRMCandidate(path_prm_url, frozenset({canonical}), 1)]
+    origin_prm_url = _well_known_url(origin, "oauth-protected-resource")
+    if origin_prm_url != path_prm_url:
+        # RFC 9728 §3.3 binds a document to the identifier its URL was
+        # derived from, and this URL was derived from the origin, so the
+        # origin is the only thing it may declare. A server that serves
+        # only here and declares its path-bearing URL predates the
+        # path-specific location; it fails with the resource-mismatch
+        # message and the operator's remedy is the Authorization Server URL
+        # override, which skips PRM entirely.
+        candidates.append(_PRMCandidate(origin_prm_url, frozenset({origin}), 1))
+
+    fetched: dict[str, httpx.Response] = {}
+    document_error: MCPOAuthDiscoveryError | None = None
+    first_error: MCPOAuthDiscoveryError | None = None
+
+    def _record(exc: MCPOAuthDiscoveryError) -> None:
+        nonlocal first_error
+        first_error = first_error or exc
+
+    while candidates:
+        candidate = candidates.pop(0)
+        # A location already fetched is not fetched again, but the response
+        # is re-judged: the same URL can be reached as a challenge target
+        # carrying one expectation and as a derived candidate carrying
+        # another, and the second expectation is a real second chance.
+        cached = fetched.get(candidate.url)
+        if cached is not None:
+            resp = cached
+        else:
+            budget = _remaining_budget(deadline)
+            if budget <= 0:
+                _record(MCPOAuthDiscoveryError("PRM discovery exceeded its time budget"))
+                break
+            try:
+                await validate_url_no_ssrf_async(candidate.url, allow_http=True)
+            except OAuthSSRFError as exc:
+                _record(_discovery_error(f"PRM URL rejected: {exc}", exc))
+                continue
+            try:
+                resp = await http_client.get(candidate.url, timeout=budget)
+            except httpx.HTTPError as exc:
+                _record(_discovery_error(f"PRM fetch failed: {exc}", exc))
+                continue
+            fetched[candidate.url] = resp
+
+        if resp.status_code == 401:
+            challenge_url = _parse_prm_url_from_www_authenticate(
+                resp.headers.get("www-authenticate", "")
+            )
+            if challenge_url is None:
+                _record(
+                    MCPOAuthDiscoveryError(
+                        "server returned 401 without resource_metadata in WWW-Authenticate"
+                    )
+                )
+            elif candidate.hops > 0:
+                candidates.insert(
+                    0,
+                    _PRMCandidate(challenge_url, candidate.accepted, candidate.hops - 1),
+                )
+            else:
+                _record(MCPOAuthDiscoveryError("PRM challenge chain exceeded its hop budget"))
+            continue
+        if resp.status_code != 200:
+            _record(MCPOAuthDiscoveryError(f"PRM returned HTTP {resp.status_code}"))
+            continue
+
+        try:
+            issuer_url = _prm_issuer_from_document(resp, candidate.accepted)
+            # SSRF protection on the issuer URL itself — same-origin / trust-list
+            # checks happen in ``_fetch_as_metadata``.
+            await validate_url_no_ssrf_async(issuer_url, allow_http=True)
+        except MCPOAuthDiscoveryError as exc:
+            document_error = document_error or exc
+            continue
+        except OAuthSSRFError as exc:
+            document_error = document_error or _discovery_error(
+                f"PRM issuer URL rejected: {exc}", exc
+            )
+            continue
+        return issuer_url
+
+    raise (
+        document_error or first_error or MCPOAuthDiscoveryError("PRM discovery found no candidate")
+    )
+
+
+def _remaining_budget(deadline: float) -> float:
+    """Seconds left before *deadline*, clamped to the per-request timeout.
+
+    Each probe gets the smaller of the standard timeout and what is left of
+    the whole-discovery budget, so the budget is a real ceiling on wall
+    clock rather than a check between requests that a slow probe overruns.
+    """
+    return min(_DEFAULT_HTTP_TIMEOUT, max(0.0, deadline - time.monotonic()))
+
+
+def _discovery_error(message: str, cause: BaseException) -> MCPOAuthDiscoveryError:
+    """Build a discovery error that keeps *cause* on its chain when raised later."""
+    err = MCPOAuthDiscoveryError(message)
+    err.__cause__ = cause
+    return err
+
+
+def _issuer_template_matches(declared: str, requested: str) -> bool:
+    """True when *declared* is a placeholder template that expands to *requested*.
+
+    Multi-tenant providers publish a tenant-agnostic metadata document whose
+    ``issuer`` carries a placeholder (``https://as.example.com/{tenantid}/v2.0``)
+    rather than the tenant that was asked for, which a literal RFC 8414 §3.3
+    equality check would lock out.
+
+    The tolerance is deliberately narrow. Scheme and authority must match
+    exactly, so a placeholder can never stand in for the host or the
+    scheme — that would be the mix-up the equality rule exists to prevent.
+    A placeholder is only recognised as a WHOLE path segment, the segment
+    counts must be equal, every other segment must match literally, and at
+    least one placeholder must actually have been used, and a declared value
+    carrying a query, a fragment, or anything ``urlsplit`` would silently
+    drop never matches.
+    Comparison walks the segments rather than building a pattern, so a
+    document with many placeholders costs time linear in its length.
+    """
+    if _has_unsafe_url_syntax(declared):
+        return False
+    # By the delimiter's presence, as everywhere else: a bare trailing ``?``
+    # or ``#`` parses to an EMPTY component, which a truthiness check reads
+    # as absent, and RFC 8414 §2 forbids the components themselves. The
+    # template exception tolerates a placeholder, nothing more.
+    if "?" in declared or "#" in declared:
+        return False
+    declared_parts = urllib.parse.urlsplit(declared)
+    requested_parts = urllib.parse.urlsplit(requested)
+    if declared_parts.scheme != requested_parts.scheme:
+        return False
+    if declared_parts.netloc != requested_parts.netloc:
+        return False
+    declared_segments = declared_parts.path.split("/")
+    requested_segments = requested_parts.path.split("/")
+    if len(declared_segments) != len(requested_segments):
+        return False
+    used_placeholder = False
+    for declared_segment, requested_segment in zip(
+        declared_segments, requested_segments, strict=True
+    ):
+        inner = declared_segment[1:-1]
+        if (
+            len(declared_segment) > 2
+            and declared_segment.startswith("{")
+            and declared_segment.endswith("}")
+            and "{" not in inner
+            and "}" not in inner
+        ):
+            if not requested_segment:
+                return False
+            used_placeholder = True
+            continue
+        if declared_segment != requested_segment:
+            return False
+    return used_placeholder
+
+
+class _DiscoveryDocumentRejectedError(MCPOAuthDiscoveryError):
+    """This document is not the one we are looking for; try the next candidate.
+
+    Separate from a plain :class:`MCPOAuthDiscoveryError` so the candidate
+    loops can distinguish "not a usable metadata document" (advance) from a
+    refusal that must end discovery (a rejected endpoint, an AS that does
+    not advertise S256). Shopping further candidates after a security
+    refusal would let a laxer document win.
+    """
+
+
+def _as_metadata_from_document(
+    doc: dict[str, Any],
+    *,
+    profile: str,
+    issuer: str,
+    normalized_issuer: str,
+) -> ASMetadata:
+    """Validate one AS metadata document completely and build :class:`ASMetadata`.
+
+    A candidate wins only after this returns, so a catch-all 200 cannot
+    shadow the document that actually describes the issuer.
+
+    Raises :class:`_DiscoveryDocumentRejectedError` when the body is not this
+    issuer's metadata document (absent or mismatched ``issuer``, missing
+    endpoints) and the loop should try the next location. Raises a plain
+    :class:`MCPOAuthDiscoveryError` for a refusal that must stop discovery:
+    an endpoint that fails the same-origin or SSRF check, or an AS that
+    does not advertise S256.
+    """
+    # RFC 8414 §3.3: the document's ``issuer`` MUST equal the requested one,
+    # which is what prevents a catch-all document at a neighbouring path from
+    # deciding this issuer's endpoints. "Identical" is meant literally and the
+    # comparison is against the issuer AS REQUESTED, not the slash-stripped
+    # form used to build the well-known URL: ``…/tenant`` and ``…/tenant/``
+    # are different identifiers, and accepting either for the other is the
+    # leniency the rule exists to deny. The one tolerated deviation is a
+    # templated issuer, which multi-tenant providers publish on their
+    # tenant-agnostic document; every other mismatch means "not this issuer's
+    # document" and the loop moves on.
+    declared_issuer = doc.get("issuer")
+    if not isinstance(declared_issuer, str) or not declared_issuer:
+        raise _DiscoveryDocumentRejectedError("AS metadata document has no issuer")
+    exact = declared_issuer == issuer
+    templated = not exact and _issuer_template_matches(declared_issuer, issuer)
+    if not exact and not templated:
+        raise _DiscoveryDocumentRejectedError(
+            "AS metadata issuer does not match the requested issuer "
+            f"(declared={sanitize_log_text(declared_issuer, 120)!r}, "
+            f"requested={issuer!r})"
+        )
+    if templated:
+        log.info(
+            "mcp_server.oauth.as_metadata_templated_issuer",
+            requested=issuer,
+            declared=sanitize_log_text(declared_issuer),
+        )
 
     authorization_endpoint = str(doc.get("authorization_endpoint", ""))
     token_endpoint = str(doc.get("token_endpoint", ""))
@@ -359,50 +686,17 @@ async def _fetch_as_metadata(
     jwks_uri = str(jwks_uri_raw) if isinstance(jwks_uri_raw, str) else None
 
     if not authorization_endpoint or not token_endpoint:
-        raise MCPOAuthDiscoveryError("AS metadata missing required endpoints")
-
-    # Same-origin / trusted-host validation on each discovered endpoint.
-    allow_http = _is_localhost_issuer(issuer_parsed.hostname or "")
-    for name, endpoint_url in (
-        ("authorization_endpoint", authorization_endpoint),
-        ("token_endpoint", token_endpoint),
-    ):
-        try:
-            await validate_discovered_endpoint_async(
-                endpoint_url,
-                issuer_parsed,
-                allow_http=allow_http,
-                trusted_endpoint_hosts=trusted_hosts,
-            )
-        except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"AS {name} rejected (url={endpoint_url}): {exc}") from exc
-
-    for opt_name, opt_url in (
-        ("registration_endpoint", registration_endpoint),
-        ("revocation_endpoint", revocation_endpoint),
-    ):
-        if not opt_url:
-            continue
-        try:
-            await validate_discovered_endpoint_async(
-                opt_url,
-                issuer_parsed,
-                allow_http=allow_http,
-                trusted_endpoint_hosts=trusted_hosts,
-            )
-        except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"AS {opt_name} rejected (url={opt_url}): {exc}") from exc
+        raise _DiscoveryDocumentRejectedError("AS metadata missing required endpoints")
 
     code_methods_raw = doc.get("code_challenge_methods_supported", [])
     if not isinstance(code_methods_raw, list):
         code_methods_raw = []
     code_methods = tuple(str(m) for m in code_methods_raw)
-    if not code_methods and winning_profile == "oidc":
+    if not code_methods and profile == "oidc":
         # OIDC document (openid-configuration) only: it does not require
-        # advertising code_challenge_methods_supported, and some IdPs (Entra)
-        # omit it despite fully supporting S256, so treat absence as "S256
-        # supported" (mandated by OAuth 2.1 / MCP auth) rather than locking the
-        # AS out.
+        # advertising code_challenge_methods_supported, and some IdPs omit it
+        # despite fully supporting S256, so treat absence as "S256 supported"
+        # (mandated by OAuth 2.1 / MCP auth) rather than locking the AS out.
         #
         # For the RFC 8414 oauth-authorization-server document we deliberately
         # do NOT assume: an omitted field there is taken at face value as "no
@@ -416,6 +710,8 @@ async def _fetch_as_metadata(
         log.info("mcp_server.oauth.s256_assumed_absent_advertisement")
         code_methods = ("S256",)
     if "S256" not in code_methods:
+        # Fail closed rather than advancing: a laxer document at another
+        # location must not be able to win after this one refused.
         raise MCPOAuthDiscoveryError(
             "AS metadata does not advertise S256 PKCE — refusing to proceed"
         )
@@ -426,7 +722,7 @@ async def _fetch_as_metadata(
     auth_methods = tuple(str(m) for m in auth_methods_raw)
 
     return ASMetadata(
-        issuer=str(doc.get("issuer", issuer)),
+        issuer=issuer if templated else declared_issuer,
         authorization_endpoint=authorization_endpoint,
         token_endpoint=token_endpoint,
         registration_endpoint=registration_endpoint,
@@ -435,6 +731,142 @@ async def _fetch_as_metadata(
         code_challenge_methods_supported=code_methods,
         token_endpoint_auth_methods_supported=auth_methods,
     )
+
+
+async def _fetch_as_metadata(
+    issuer: str,
+    *,
+    http_client: httpx.AsyncClient,
+    trusted_hosts: frozenset[str],
+    deadline: float,
+) -> ASMetadata:
+    """Fetch and validate the authorization-server metadata document for *issuer*.
+
+    Tries each metadata location in turn and accepts a candidate only after
+    the whole document validates, so a catch-all 200 at one location cannot
+    shadow the document that actually describes the issuer. A location is
+    skipped on a transport error, a non-200, an unusable body, or a document
+    that is not this issuer's (see :func:`_as_metadata_from_document`); a
+    rejected endpoint or a missing S256 advertisement ends discovery rather
+    than shopping for a laxer document.
+
+    Validates the discovered ``authorization_endpoint`` and
+    ``token_endpoint`` are same-origin (or in ``trusted_hosts``).
+    """
+    try:
+        issuer_parsed = await validate_url_no_ssrf_async(issuer, allow_http=True)
+    except OAuthSSRFError as exc:
+        raise MCPOAuthDiscoveryError(f"AS issuer URL rejected: {exc}") from exc
+
+    # RFC 8414 §2 forbids a query or fragment in an issuer identifier, and
+    # neither can be spliced into a well-known URL, so they are refused here
+    # with a message that names the cause rather than a misleading 404 —
+    # judged by the delimiter's presence, since a bare trailing ``?`` or
+    # ``#`` still parses to an empty component. The raw guard runs first:
+    # this string is also what a document's ``issuer`` is compared against.
+    if _has_unsafe_url_syntax(issuer):
+        raise MCPOAuthDiscoveryError("AS issuer URL must not contain control characters or spaces")
+    if "?" in issuer or "#" in issuer:
+        raise MCPOAuthDiscoveryError("AS issuer URL must not contain a query or fragment")
+    normalized_issuer = issuer.rstrip("/")
+
+    # MCP lists three locations for a path-bearing issuer, in this order:
+    # the RFC 8414 document with the well-known segment inserted before the
+    # issuer path, then the OpenID Connect document inserted, then the
+    # OpenID Connect document appended (the legacy transformation major
+    # enterprise IdPs still serve). RFC 8414 §5 likewise says to try its own
+    # transformation before falling back to OpenID Connect Discovery.
+    # The appended RFC 8414 form is in no specification, but some realm-based
+    # servers answer only there and earlier releases probed it, so it stays
+    # as a compatibility candidate LAST, where it cannot preempt or delay a
+    # standard location. For a root issuer the inserted and appended forms
+    # coincide and are deduplicated, so such an issuer costs two requests.
+    # ``profile`` records WHICH document each candidate is, so the S256 check
+    # can apply the correct per-document defaulting rule.
+    metadata_candidates: list[tuple[str, str]] = []
+    for profile, suffix, append in (
+        ("rfc8414", "oauth-authorization-server", False),
+        ("oidc", "openid-configuration", False),
+        ("oidc", "openid-configuration", True),
+        ("rfc8414", "oauth-authorization-server", True),
+    ):
+        metadata_url = (
+            f"{normalized_issuer}/.well-known/{suffix}"
+            if append
+            else _well_known_url(normalized_issuer, suffix)
+        )
+        if all(metadata_url != seen for _, seen in metadata_candidates):
+            metadata_candidates.append((profile, metadata_url))
+
+    document_error: MCPOAuthDiscoveryError | None = None
+    first_error: MCPOAuthDiscoveryError | None = None
+    for profile, metadata_url in metadata_candidates:
+        budget = _remaining_budget(deadline)
+        if budget <= 0:
+            first_error = first_error or MCPOAuthDiscoveryError(
+                "AS metadata discovery exceeded its time budget"
+            )
+            break
+        try:
+            r = await http_client.get(metadata_url, timeout=budget)
+        except httpx.HTTPError as exc:
+            first_error = first_error or _discovery_error(f"AS metadata fetch failed: {exc}", exc)
+            continue
+        if r.status_code != 200:
+            first_error = first_error or MCPOAuthDiscoveryError(
+                f"AS metadata returned HTTP {r.status_code}"
+            )
+            continue
+        # A body that is not a JSON object is not a metadata document, so the
+        # loop advances; a document that IS one but fails validation is
+        # judged by ``_as_metadata_from_document``, which decides whether the
+        # loop may advance or discovery must stop.
+        try:
+            doc = _json_object_body(r, "AS metadata")
+        except MCPOAuthDiscoveryError as exc:
+            document_error = document_error or exc
+            continue
+        try:
+            metadata = _as_metadata_from_document(
+                doc,
+                profile=profile,
+                issuer=issuer,
+                normalized_issuer=normalized_issuer,
+            )
+        except _DiscoveryDocumentRejectedError as exc:
+            document_error = document_error or exc
+            continue
+
+        # Same-origin / trusted-host validation on each discovered endpoint.
+        # A rejection here ends discovery: the document named this issuer, so
+        # a neighbouring location cannot be a better answer for it.
+        allow_http = _is_localhost_issuer(issuer_parsed.hostname or "")
+        for name, endpoint_url in (
+            ("authorization_endpoint", metadata.authorization_endpoint),
+            ("token_endpoint", metadata.token_endpoint),
+            ("registration_endpoint", metadata.registration_endpoint),
+            ("revocation_endpoint", metadata.revocation_endpoint),
+        ):
+            if not endpoint_url:
+                continue
+            try:
+                await validate_discovered_endpoint_async(
+                    endpoint_url,
+                    issuer_parsed,
+                    allow_http=allow_http,
+                    trusted_endpoint_hosts=trusted_hosts,
+                )
+            except OAuthSSRFError as exc:
+                raise MCPOAuthDiscoveryError(
+                    f"AS {name} rejected (url={endpoint_url}): {exc}"
+                ) from exc
+
+        # Which discovery profile answered (rfc8414 vs oidc) is the load-bearing
+        # detail when debugging an enterprise AS that serves only one of them.
+        log.debug("mcp_server.oauth.as_metadata_discovered", profile=profile)
+        return metadata
+
+    raise document_error or first_error or MCPOAuthDiscoveryError("AS metadata found no candidate")
 
 
 def _is_localhost_issuer(hostname: str) -> bool:
@@ -469,62 +901,80 @@ async def discover_authorization_server(
     Persistent caching of the issuer (resolution step 2) lives on the
     ``mcp_servers`` row.
     """
-    issuer: str
-    if override_url:
-        try:
-            await validate_url_no_ssrf_async(override_url, allow_http=True)
-        except OAuthSSRFError as exc:
-            raise MCPOAuthDiscoveryError(f"override AS URL rejected: {exc}") from exc
-        issuer = override_url
-    elif cached_issuer:
-        # Defense-in-depth: re-run SSRF validation on the cached value.
-        # If the issuer's hostname has rebound to a private address since
-        # we cached it (or the operator edited the row to point at a
-        # private host), drop the cache and fall through to PRM.
-        try:
-            await validate_url_no_ssrf_async(cached_issuer, allow_http=True)
-        except OAuthSSRFError as exc:
-            log.warning(
-                "mcp_server.oauth.cached_issuer_rejected",
-                server_name=server_name,
-                reason=sanitize_log_text(str(exc)),
-            )
-            if server_id:
+    # One budget for the whole resolution: PRM probes and AS probes share it,
+    # so a hard-down host cannot spend it twice. The per-request deadline
+    # gives each probe an actionable error; the outer timeout in
+    # ``_resolve_issuer_and_metadata`` is what makes the budget a real
+    # wall-clock ceiling, since httpx timeouts bound inactivity per phase
+    # rather than the whole call, and DNS, SSRF and endpoint validation run
+    # outside them entirely.
+    deadline = time.monotonic() + _DISCOVERY_TOTAL_BUDGET
+    try:
+        async with asyncio.timeout(_DISCOVERY_TOTAL_BUDGET):
+            issuer: str
+            if override_url:
                 try:
-                    await asyncio.to_thread(
-                        storage.update_mcp_server,
-                        server_id,
-                        oauth_as_issuer_cached=None,
-                    )
-                except Exception:
-                    log.debug(
-                        "mcp_server.oauth.cached_issuer_clear_failed",
+                    await validate_url_no_ssrf_async(override_url, allow_http=True)
+                except OAuthSSRFError as exc:
+                    raise MCPOAuthDiscoveryError(f"override AS URL rejected: {exc}") from exc
+                issuer = override_url
+            elif cached_issuer:
+                # Defense-in-depth: re-run SSRF validation on the cached value.
+                # If the issuer's hostname has rebound to a private address since
+                # we cached it (or the operator edited the row to point at a
+                # private host), drop the cache and fall through to PRM.
+                try:
+                    await validate_url_no_ssrf_async(cached_issuer, allow_http=True)
+                except OAuthSSRFError as exc:
+                    log.warning(
+                        "mcp_server.oauth.cached_issuer_rejected",
                         server_name=server_name,
-                        exc_info=True,
+                        reason=sanitize_log_text(str(exc)),
                     )
-            issuer = await _fetch_prm_issuer(server_url, http_client=http_client)
-        else:
-            issuer = cached_issuer
-    else:
-        issuer = await _fetch_prm_issuer(server_url, http_client=http_client)
+                    if server_id:
+                        try:
+                            await asyncio.to_thread(
+                                storage.update_mcp_server,
+                                server_id,
+                                oauth_as_issuer_cached=None,
+                            )
+                        except Exception:
+                            log.debug(
+                                "mcp_server.oauth.cached_issuer_clear_failed",
+                                server_name=server_name,
+                                exc_info=True,
+                            )
+                    issuer = await _fetch_prm_issuer(
+                        server_url, http_client=http_client, deadline=deadline
+                    )
+                else:
+                    issuer = cached_issuer
+            else:
+                issuer = await _fetch_prm_issuer(
+                    server_url, http_client=http_client, deadline=deadline
+                )
 
-    if metadata_cache is not None:
-        cached = metadata_cache.get(issuer)
-        if cached is not None:
-            metadata, fetched_at = cached
-            if time.monotonic() - fetched_at < MCP_OAUTH_DISCOVERY_CACHE_TTL_SECONDS:
-                return metadata
+            if metadata_cache is not None:
+                cached = metadata_cache.get(issuer)
+                if cached is not None:
+                    metadata, fetched_at = cached
+                    if time.monotonic() - fetched_at < MCP_OAUTH_DISCOVERY_CACHE_TTL_SECONDS:
+                        return metadata
 
-    metadata = await _fetch_as_metadata(
-        issuer, http_client=http_client, trusted_hosts=trusted_hosts
-    )
+            metadata = await _fetch_as_metadata(
+                issuer, http_client=http_client, trusted_hosts=trusted_hosts, deadline=deadline
+            )
+    except TimeoutError as exc:
+        raise MCPOAuthDiscoveryError("discovery exceeded its time budget") from exc
 
     if metadata_cache is not None:
         metadata_cache[issuer] = (metadata, time.monotonic())
 
     # Persist the resolved issuer when the row had no cached value yet,
     # so subsequent calls skip PRM. We never overwrite an existing
-    # cached_issuer (admin clears it via re-edit).
+    # cached_issuer; the console clears it when the server URL or the AS
+    # override changes, which is when the cached value stops describing
+    # the row.
     if not cached_issuer and not override_url and server_id:
         try:
             await asyncio.to_thread(
@@ -935,7 +1385,11 @@ async def _hardened_token_post(
     to the honest re-login/admin remedy instead of looping "please retry".
     """
     try:
-        resp = await http_client.post(token_endpoint, data=data, timeout=_DEFAULT_HTTP_TIMEOUT)
+        resp = await http_client.post(
+            token_endpoint,
+            data=data,
+            timeout=_DEFAULT_HTTP_TIMEOUT,
+        )
     except httpx.HTTPError as exc:
         raise MCPOAuthRefreshFailed(f"{request_label} request failed: {exc}") from exc
 
@@ -2611,23 +3065,16 @@ async def get_obo_access_token_classified(
         # the login exchange and the first mint hit the same IdP origin
         # seconds apart by design. No long-lived mint client is kept: a fresh
         # one is opened per mint below (mints are ~hourly per (user, server),
-        # not hot-path). ``obo_http_client`` is an injection seam for tests /
-        # e2e harnesses; when unset a per-mint client is created here.
-        injected_client: httpx.AsyncClient | None = getattr(app_state, "obo_http_client", None)
+        # not hot-path). ``obo_http_client`` is the loop-owned client the node
+        # installs at connect time and the injection seam for the e2e
+        # harnesses; when unset a per-mint client is created.
         # One client for the whole mint: the rfc8693 leg makes TWO POSTs to the
         # same token endpoint, so a per-request transient would pay two TLS
-        # handshakes. When no client is injected (production), open a single
-        # transient here and thread it into both legs so the exchange leg reuses
+        # handshakes. ``_enter_mint_client`` yields the installed client or a
+        # single transient threaded into both legs, so the exchange leg reuses
         # the refresh leg's pooled connection.
         try:
-            async with contextlib.AsyncExitStack() as mint_stack:
-                mint_client: httpx.AsyncClient
-                if injected_client is not None:
-                    mint_client = injected_client
-                else:
-                    mint_client = await mint_stack.enter_async_context(
-                        httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT)
-                    )
+            async with _enter_mint_client(app_state) as mint_client:
                 tokens = await mint(
                     oidc_config=oidc_config,
                     credential_refresh_token=credential2["refresh_token"],
@@ -3018,12 +3465,17 @@ def _memoize_minted_token(
 
 @contextlib.asynccontextmanager
 async def _enter_mint_client(app_state: Any) -> Any:
-    """Yield the MCP-loop-owned mint client, with a temporary test fallback."""
+    """Yield the client installed as ``obo_http_client``, or a transient one.
+
+    The node installs its loop-owned client at connect time and the e2e
+    harnesses inject theirs; anything else gets a per-mint client from the
+    same factory, so every mint carries the module's JSON-preferring posture.
+    """
     injected_client: httpx.AsyncClient | None = getattr(app_state, "obo_http_client", None)
     if injected_client is not None:
         yield injected_client
         return
-    async with httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT) as mint_client:
+    async with json_http_client() as mint_client:
         yield mint_client
 
 
@@ -3734,7 +4186,6 @@ async def _refresh_and_persist(
         raise MCPOAuthRefreshFailed("mcp_oauth_http_client is not configured")
 
     server_id = str(server_row["server_id"])
-    server_url = str(server_row.get("url") or "")
     override_url = server_row.get("oauth_authorization_server_url") or None
     cached_issuer = server_row.get("oauth_as_issuer_cached") or None
     client_id = server_row.get("oauth_client_id") or ""
@@ -3742,6 +4193,7 @@ async def _refresh_and_persist(
         raise MCPOAuthRefreshFailed("server has no oauth_client_id")
     metadata_cache = getattr(app_state, "mcp_oauth_metadata_cache", None)
     try:
+        server_url = _canonical_server_url(server_row)
         as_metadata = await discover_authorization_server(
             server_name=server_name,
             server_url=server_url,
@@ -4275,11 +4727,11 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
 
     metadata_cache = getattr(request.app.state, "mcp_oauth_metadata_cache", None)
     server_id = str(server_row["server_id"])
-    server_url = str(server_row.get("url") or "")
     override_url = server_row.get("oauth_authorization_server_url") or None
     cached_issuer = server_row.get("oauth_as_issuer_cached") or None
 
     try:
+        server_url = _canonical_server_url(server_row)
         as_metadata = await discover_authorization_server(
             server_name=server_name,
             server_url=server_url,
@@ -4339,7 +4791,7 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
         return_url=return_url,
     )
 
-    audience = server_row.get("oauth_audience") or server_url
+    audience = server_row.get("oauth_audience") or str(server_row.get("url") or "")
     configured_scopes = str(server_row.get("oauth_scopes") or "")
     if requested_scopes:
         # Union: configured scopes + caller-supplied step-up scopes, deduped
@@ -4509,11 +4961,6 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
         return JSONResponse({"error": "OAuth HTTP client not initialised"}, status_code=503)
 
     server_id = str(server_row["server_id"])
-    server_url = str(server_row.get("url") or "")
-    # Resolve once — used for ``resource=`` (RFC 8707), ``audience=``
-    # (Auth0 form), JWT aud validation, and persistence on the user
-    # token row.
-    audience = server_row.get("oauth_audience") or server_url
     scopes = server_row.get("oauth_scopes") or ""
     client_id = server_row.get("oauth_client_id") or ""
     if not client_id:
@@ -4524,6 +4971,7 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
     cached_issuer = server_row.get("oauth_as_issuer_cached") or None
 
     try:
+        server_url = _canonical_server_url(server_row)
         as_metadata = await discover_authorization_server(
             server_name=server_name,
             server_url=server_url,
@@ -4550,6 +4998,13 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
             redirect_query=(f"mcp_oauth_error={urllib.parse.quote(sanitize_log_text(str(exc)))}"),
         )
 
+    # ``audience=`` is a registered API identifier at the authorization
+    # servers that use it instead of ``resource=``, not a resource URL, so
+    # its default stays the row's stored spelling —
+    # canonicalizing it could rename an identifier the operator registered.
+    # ``resource=`` uses the canonical value; the accepted-aud set below
+    # carries both.
+    audience = server_row.get("oauth_audience") or str(server_row.get("url") or "")
     redirect_uri = _build_redirect_uri(redirect_base)
 
     client_secret: str | None
@@ -4597,8 +5052,10 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
             redirect_query="mcp_oauth_error=missing+access+token",
         )
 
-    # Accept ``aud`` matching either the canonical resource URL (RFC
-    # 8707 form) OR the operator-set ``oauth_audience`` (Auth0 form).
+    # Accept ``aud`` matching the canonical resource URL (what ``resource=``
+    # carried) OR the ``oauth_audience`` value, which
+    # defaults to the row's stored spelling — so a token minted for either
+    # spelling of a not-yet-canonical row still passes.
     accepted_audiences = tuple({a for a in (server_url, audience) if a})
     if not _validate_token_audience(access_token, accepted_audiences):
         log.warning(
@@ -4830,7 +5287,7 @@ async def _attempt_upstream_revoke(
         try:
             as_metadata = await discover_authorization_server(
                 server_name=server_name,
-                server_url=str(server_row.get("url") or ""),
+                server_url=_canonical_server_url(server_row),
                 override_url=server_row.get("oauth_authorization_server_url") or None,
                 cached_issuer=server_row.get("oauth_as_issuer_cached") or None,
                 http_client=http_client,
@@ -5196,7 +5653,7 @@ async def initialize_mcp_oauth_state(app_state: Any) -> None:
     exists (the route handlers fast-path to 503 when ``mcp_token_store``
     is None).
     """
-    app_state.mcp_oauth_http_client = httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT)
+    app_state.mcp_oauth_http_client = json_http_client()
     app_state.mcp_oauth_refresh_locks = {}
     app_state.mcp_oauth_dcr_locks = {}
     app_state.mcp_oauth_metadata_cache = {}

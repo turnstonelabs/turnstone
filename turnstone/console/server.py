@@ -10432,6 +10432,51 @@ def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse |
     return None
 
 
+def _canonical_oauth_user_url(
+    auth_type: str | None, url: str, *, strict: bool = True
+) -> tuple[str, JSONResponse | None]:
+    """Canonicalize the MCP server URL for a user-scoped row at the write boundary.
+
+    Returns ``(url, None)`` unchanged for other auth types and for an empty
+    URL (presence is checked elsewhere). For ``oauth_user`` and
+    ``oauth_obo`` the stored value becomes the canonical RFC 8707 resource
+    identifier that discovery and every token request use, so the row
+    shows the value that goes on the wire, and a fragment or embedded
+    credentials are a 400 here with a plain message instead of an opaque
+    ``mcp_oauth_error`` redirect at the first consent.
+
+    *strict* is on whenever the request supplies the URL, so the operator
+    is told to fix what they typed. It is off when this write only inherits
+    an existing row's URL: an edit to some other field must not be refused
+    because the row predates this validation, so the stored value is healed
+    in place instead.
+    """
+    if not is_user_scoped_auth(auth_type) or not url:
+        return url, None
+    from turnstone.core.mcp_oauth import canonical_resource
+
+    try:
+        return canonical_resource(url, strict=strict), None
+    except ValueError as exc:
+        return url, JSONResponse({"error": f"url: {exc}"}, status_code=400)
+
+
+def _same_oauth_resource(existing_url: str, new_url: str) -> bool:
+    """True when two server URLs name the same RFC 8707 resource.
+
+    A stored value that predates canonicalization compares by canonical
+    form, so a spelling-only rewrite (host case, default port, root slash)
+    is not a URL change. A stored value that cannot be canonicalized
+    compares byte-for-byte, as it did before.
+    """
+    from turnstone.core.mcp_oauth import canonical_resource
+
+    try:
+        return canonical_resource(existing_url) == canonical_resource(new_url)
+    except ValueError:
+        return existing_url == new_url
+
+
 def _obo_profile(request: Request) -> str:
     """Deployment-level ``[oidc] obo_grant_profile`` (``""`` when OIDC absent).
 
@@ -11011,8 +11056,14 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     clean_audience = _clean_oauth_text(body.get("oauth_audience"), max_length=2048)
     clean_scopes = _clean_oauth_text(body.get("oauth_scopes"))
 
+    # A user-scoped row stores its URL in canonical RFC 8707 form (the value
+    # discovery and every token request use); other rows keep the typed value.
+    server_url, err_resp = _canonical_oauth_user_url(auth_type, str(body.get("url", "")).strip())
+    if err_resp is not None:
+        return err_resp
+
     # sec-1: oauth_user/oauth_obo must use https:// (loopback http allowed for dev).
-    err_resp = _enforce_oauth_user_https(auth_type, str(body.get("url", "")).strip())
+    err_resp = _enforce_oauth_user_https(auth_type, server_url)
     if err_resp is not None:
         return err_resp
 
@@ -11079,7 +11130,7 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         transport=transport,
         command=str(body.get("command", "")).strip(),
         args=json.dumps(args_list) if isinstance(args_list, list) else "[]",
-        url=str(body.get("url", "")).strip(),
+        url=server_url,
         headers=json.dumps(headers_dict) if isinstance(headers_dict, dict) else "{}",
         env=json.dumps(env_dict) if isinstance(env_dict, dict) else "{}",
         auto_approve=bool(body.get("auto_approve", False)),
@@ -11298,6 +11349,19 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
             ):
                 updates[_user_col] = updates.get(_user_col)
     updates.update(_oauth_columns_to_clear(target_auth))
+    # A user-scoped row stores its URL in canonical RFC 8707 form, judged on
+    # the post-update auth type and applied to the merged URL, so a flip into
+    # oauth_user that omits ``url`` canonicalizes (or rejects) the stored value
+    # exactly as a create would.
+    if is_user_scoped_auth(target_auth):
+        merged_url = str(updates.get("url", existing.get("url")) or "")
+        canonical_url, err_resp = _canonical_oauth_user_url(
+            target_auth, merged_url, strict="url" in updates or is_flip
+        )
+        if err_resp is not None:
+            return err_resp
+        if "url" in updates or canonical_url != merged_url:
+            updates["url"] = canonical_url
     # Renaming a pool-backed row needs the same per-user-token purge as
     # delete: the tokens are keyed on the OLD ``server_name`` and a row
     # later created with that old name (with attacker-controlled URL)
@@ -11314,11 +11378,22 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # mint/consent time, so sending them to a new URL is a token-binding
     # violation. A compromised admin who flips the URL to an attacker
     # endpoint would otherwise replay every user's bearer there silently.
+    # Compared by resource, not by spelling: the first re-save of a row stored
+    # before canonicalization rewrites `https://Host/` to `https://host` and
+    # must not read as a target change that purges every user's tokens.
     url_changing = (
         is_user_scoped_auth(old_auth)
         and "url" in updates
-        and existing.get("url", "") != updates["url"]
+        and not _same_oauth_resource(str(existing.get("url") or ""), updates["url"])
     )
+    # The cached AS issuer was discovered from the URL and the AS override
+    # the row had at the time; a change to either makes it describe a
+    # different row, and nothing else ever clears it.
+    as_url_changing = "oauth_authorization_server_url" in body and (
+        updates.get("oauth_authorization_server_url") or None
+    ) != (existing.get("oauth_authorization_server_url") or None)
+    if url_changing or as_url_changing:
+        updates["oauth_as_issuer_cached"] = None
     # Changing oauth_audience on a pool-backed row is a token-binding change too:
     # minted obo bearers (and oauth_user tokens) are audience-scoped, so cached
     # rows for the OLD audience must be purged or a privilege reduction silently

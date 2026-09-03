@@ -70,6 +70,16 @@ Gotcha: dev-mode Keycloak boot is slow on a loaded host — the script now waits
 kcadm auth (up to ~6 min) rather than a fixed sleep. Port 8091 (8090 = the dev
 console).
 
+Results — RUN 2026-09-03, ALL VERIFIED (exit 0): capture, E1–E7 and M1–M3
+with the same call counts as above, now through the product client factory
+(`json_http_client`, the JSON-preferring `Accept` posture the console and
+nodes use). New check **D1**: authorization-server metadata discovery against
+the realm issuer — a path-bearing issuer, the shape that failed before the
+discovery rework — resolved in 3 probes to the realm's own token endpoint
+with S256 advertised and the issuer confirmed. D1 calls `_fetch_as_metadata`
+directly, so it also catches signature drift no unit test covers: it caught
+the added `deadline` argument on the first run after that change.
+
 ## Leg 1 — Entra (`entra_spike.py`) — NEEDS TENANT ACCESS
 
 ### Tenant / app-registration setup (one-time, ~15 min)

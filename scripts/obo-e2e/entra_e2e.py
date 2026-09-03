@@ -46,9 +46,10 @@ import os
 import sys
 import tempfile
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import httpx
+if TYPE_CHECKING:
+    import httpx
 
 # Reuse the verified interactive-login machinery from the wire spike.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -59,7 +60,10 @@ from turnstone.core.mcp_crypto import (  # noqa: E402
     MCPTokenCipherConfig,
     MCPTokenStore,
 )
-from turnstone.core.mcp_oauth import get_obo_access_token_classified  # noqa: E402
+from turnstone.core.mcp_oauth import (  # noqa: E402
+    get_obo_access_token_classified,
+    json_http_client,
+)
 from turnstone.core.oidc import OIDCConfig  # noqa: E402
 from turnstone.core.storage._sqlite import SQLiteBackend  # noqa: E402
 
@@ -163,7 +167,9 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
     if aud_c:
         _seed_obo_server(storage, "e2e-c", aud_c)
 
-    inner = httpx.AsyncClient(timeout=20.0)
+    # The production client factory, so the run proves the wire posture the
+    # console and nodes actually use (JSON-preferring Accept) against live Entra.
+    inner = json_http_client(20.0)
     client = _CountingClient(inner)
     app_state = _make_app_state(storage, store, oidc_config, client)
     try:

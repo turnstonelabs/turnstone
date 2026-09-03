@@ -12,6 +12,39 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
+## [Unreleased]
+
+### Fixed
+
+- **MCP OAuth discovery for servers and issuers with paths (#1061, #1063).**
+  Protected-resource metadata is fetched from the RFC 9728 path-specific
+  location first and the origin-level location second, in one candidate loop
+  that advances past any unusable response and follows one
+  `WWW-Authenticate` challenge per location. Each document must declare the
+  identifier its own URL was derived from: the canonical RFC 8707
+  identifier at the path-specific location, the bare origin at the
+  origin-level one, parsed strictly rather than with the leniency that
+  heals an older stored row, and refused outright when the raw identifier
+  carries characters URL parsing would silently drop. Comparison folds scheme and host case, the
+  default port, and a root-only trailing slash.
+  Authorization-server metadata is tried at the locations MCP lists — the
+  RFC 8414 document with the well-known segment inserted, then the OpenID
+  Connect document inserted, then appended — followed by an appended-form
+  RFC 8414 compatibility probe, and a candidate wins only after its whole
+  document validates, so a catch-all response cannot shadow the document
+  that describes the issuer. A document whose `issuer` does not match the
+  requested one — identically, since a trailing slash makes a different
+  identifier — is skipped rather than trusted; a templated issuer, which
+  multi-tenant providers publish on their tenant-agnostic document, is
+  accepted and logged, with the placeholder confined to whole path segments
+  and never to the scheme or authority. Discovery runs under one wall-clock
+  budget.
+  User-scoped MCP server rows store the canonical URL, a spelling-only
+  change no longer purges user tokens, and a Server URL or Authorization
+  Server URL change clears the cached issuer. Every MCP OAuth HTTP client
+  sends `Accept: application/json` by default, so token endpoints that
+  content-negotiate return JSON on every grant leg.
+
 ## [1.8.1]
 
 Turnstone 1.8.1 strengthens long-running agent context and stable dependency
