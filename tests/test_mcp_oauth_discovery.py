@@ -169,6 +169,56 @@ def _discover_error(
     return client
 
 
+def _private_addr_patch(addr: str = "192.168.1.50"):
+    """Resolve every hostname to a private address."""
+    return patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", (addr, 0))])
+
+
+def _addr_map_patch(mapping: dict[str, list[str]], default: str = "93.184.216.34"):
+    """Resolve each hostname to the addresses named for it.
+
+    A single ``return_value`` cannot express "the server is private but its
+    authorization server is not", which is the shape the opt-in exists to
+    allow, nor a name answering with both a public and a private record.
+    """
+
+    def _getaddrinfo(host, *args, **kwargs):
+        addrs = mapping.get(host, [default])
+        return [(2, 1, 6, "", (a, 0)) for a in addrs]
+
+    return patch("socket.getaddrinfo", side_effect=_getaddrinfo)
+
+
+def _discover_private(
+    server_url: str,
+    get: Any,
+    *,
+    allow_private_network: bool,
+    override_url: str | None = None,
+    addr: str = "192.168.1.50",
+) -> tuple[ASMetadata, MagicMock]:
+    """Run discovery against private-resolving hosts; return (metadata, client)."""
+    client = MagicMock(spec=httpx.AsyncClient)
+    client.get = AsyncMock(side_effect=get)
+    storage = _mk_storage_mock()
+
+    async def _run() -> ASMetadata:
+        with _private_addr_patch(addr):
+            return await discover_authorization_server(
+                server_name="srv-x",
+                server_url=server_url,
+                override_url=override_url,
+                cached_issuer=None,
+                http_client=client,
+                storage=storage,
+                server_id="srv-id",
+                trusted_hosts=frozenset(),
+                allow_private_network=allow_private_network,
+            )
+
+    return asyncio.run(_run()), client
+
+
 # ---------------------------------------------------------------------------
 # PRM parser
 # ---------------------------------------------------------------------------
@@ -1722,3 +1772,419 @@ class TestASMetadataCandidates:
         assert meta.issuer == "https://as.example.com/common"
         events = [c.args[0] for c in log_mock.info.call_args_list]
         assert "mcp_server.oauth.as_metadata_templated_issuer" in events
+
+
+# ---------------------------------------------------------------------------
+# Private-network opt-in (``mcp.oauth_allow_private_network``)
+# ---------------------------------------------------------------------------
+
+
+class TestPrivateNetworkOptIn:
+    """The opt-in reaches what the operator typed, and nothing a peer named.
+
+    A deployment whose MCP server lives on an internal network is the case
+    this exists for. The line it must not cross: a document Turnstone
+    fetched naming a private authorization server would let a remote server
+    steer the deployment into its operator's own network, so that stays
+    refused whatever the setting says.
+    """
+
+    _AS_INSERT = "https://as.internal.example/.well-known/oauth-authorization-server"
+
+    def _as_doc(self, issuer: str = "https://as.internal.example") -> dict[str, Any]:
+        doc = _good_as_metadata_doc()
+        doc["issuer"] = issuer
+        for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+            doc[key] = doc[key].replace("https://as.example.com", issuer)
+        doc["registration_endpoint"] = f"{issuer}/register"
+        return doc
+
+    def test_setting_off_refuses_the_typed_server_with_a_hint(self) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock()
+        storage = _mk_storage_mock()
+
+        async def _run() -> None:
+            with _private_addr_patch():
+                await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    allow_private_network=False,
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="mcp.oauth_allow_private_network"):
+            asyncio.run(_run())
+        client.get.assert_not_called()
+
+    def test_setting_on_reaches_the_typed_server_and_override(self) -> None:
+        meta, client = _discover_private(
+            _SERVER,
+            _router({self._AS_INSERT: _mk_response(200, self._as_doc())}),
+            allow_private_network=True,
+            override_url="https://as.internal.example",
+        )
+        assert meta.token_endpoint == "https://as.internal.example/token"
+        assert _urls(client) == [self._AS_INSERT]
+
+    def _private_server_public_issuer(self, *, allow_private_network: bool):
+        """Private MCP server, public issuer — the feature's headline lane."""
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(
+            side_effect=_router(
+                {
+                    _PATH_PRM: _prm(_SERVER, issuer="https://as.example.com"),
+                    _AS_META: _mk_response(200, _good_as_metadata_doc()),
+                }
+            )
+        )
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _addr_map_patch({"mcp.example.com": ["192.168.1.50"]}):
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    allow_private_network=allow_private_network,
+                )
+
+        return _run, client
+
+    def test_setting_on_reaches_a_private_prm_location(self) -> None:
+        # The PRM URL is derived from the operator's own server URL, so it
+        # carries the opt-in; the issuer it names is public and needs none.
+        run, client = self._private_server_public_issuer(allow_private_network=True)
+        meta = asyncio.run(run())
+        assert meta.issuer == "https://as.example.com"
+        assert _urls(client) == [_PATH_PRM, _AS_META]
+
+    def test_the_same_lane_is_refused_with_the_setting_off(self) -> None:
+        # The negative half of the test above: without it, flipping the flag
+        # in the positive test would change nothing and prove nothing.
+        run, client = self._private_server_public_issuer(allow_private_network=False)
+        with pytest.raises(MCPOAuthDiscoveryError, match="mcp.oauth_allow_private_network"):
+            asyncio.run(run())
+        client.get.assert_not_called()
+
+    def test_mixed_public_and_private_records_are_refused(self) -> None:
+        # The name answers with both, so the request may land on either and
+        # the opt-in would not describe where it goes.
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock()
+        storage = _mk_storage_mock()
+
+        async def _run() -> None:
+            with _addr_map_patch({"mcp.example.com": ["93.184.216.34", "10.0.0.5"]}):
+                await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    allow_private_network=True,
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="private network"):
+            asyncio.run(_run())
+        client.get.assert_not_called()
+
+    def test_same_origin_challenge_keeps_the_opt_in(self) -> None:
+        # A challenge back to another location on the host the operator
+        # typed adds no reach, so refusing it would strand an internal
+        # server that points at its own alternate metadata location.
+        challenge_target = "https://mcp.example.com/custom/prm"
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(
+            side_effect=_router(
+                {
+                    _PATH_PRM: _challenge(challenge_target),
+                    challenge_target: _prm(_SERVER, issuer="https://as.example.com"),
+                    _AS_META: _mk_response(200, _good_as_metadata_doc()),
+                }
+            )
+        )
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _addr_map_patch({"mcp.example.com": ["192.168.1.50"]}):
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    allow_private_network=True,
+                )
+
+        meta = asyncio.run(_run())
+        assert meta.issuer == "https://as.example.com"
+        assert challenge_target in _urls(client)
+
+    def test_issuer_named_by_a_document_never_inherits_the_opt_in(self) -> None:
+        # The load-bearing boundary: the resource server is private and
+        # typed by the operator, but the issuer it names is not, so it is
+        # validated strictly even with the setting on.
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(
+            side_effect=_router(
+                {
+                    _PATH_PRM: _prm(_SERVER, issuer="https://as.internal.example"),
+                    # The refused issuer is a document-level rejection, so the
+                    # loop still tries the origin location before giving up.
+                    _ROOT_PRM: _mk_response(404),
+                }
+            )
+        )
+        storage = _mk_storage_mock()
+
+        async def _run() -> None:
+            with _private_addr_patch():
+                await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    allow_private_network=True,
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="Authorization Server URL"):
+            asyncio.run(_run())
+
+    def test_challenge_url_never_inherits_the_opt_in(self) -> None:
+        # Same rule one layer down: the challenge target is named by the
+        # server, so it is validated strictly and the loop moves on.
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(
+            side_effect=_router(
+                {
+                    _PATH_PRM: _challenge("https://meta.internal.example/prm"),
+                    _ROOT_PRM: _mk_response(404),
+                }
+            )
+        )
+        storage = _mk_storage_mock()
+
+        async def _run() -> None:
+            with _private_addr_patch():
+                await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    allow_private_network=True,
+                )
+
+        # The remedy must not be "enable the setting" — it is already on and
+        # could never have applied to a URL the server chose.
+        with pytest.raises(MCPOAuthDiscoveryError, match="never followed"):
+            asyncio.run(_run())
+        assert "https://meta.internal.example/prm" not in _urls(client)
+
+    @pytest.mark.parametrize("addr", ["169.254.169.254", "224.0.0.1", "0.0.0.0"])
+    def test_always_refused_lanes_stay_refused_under_the_opt_in(self, addr: str) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock()
+        storage = _mk_storage_mock()
+
+        async def _run() -> None:
+            with _private_addr_patch(addr):
+                await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    allow_private_network=True,
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="refused"):
+            asyncio.run(_run())
+        client.get.assert_not_called()
+
+    def test_reader_defaults_strict_without_a_config_store(self) -> None:
+        from types import SimpleNamespace
+
+        from turnstone.core.mcp_oauth import oauth_allow_private_network
+
+        assert oauth_allow_private_network(SimpleNamespace()) is False
+        assert oauth_allow_private_network(SimpleNamespace(config_store=None)) is False
+
+        store = MagicMock()
+        store.get.return_value = True
+        assert oauth_allow_private_network(SimpleNamespace(config_store=store)) is True
+        store.get.assert_called_once_with("mcp.oauth_allow_private_network")
+
+    def test_reader_survives_a_failing_config_store(self) -> None:
+        from types import SimpleNamespace
+
+        from turnstone.core.mcp_oauth import oauth_allow_private_network
+
+        store = MagicMock()
+        store.get.side_effect = RuntimeError("db down")
+        assert oauth_allow_private_network(SimpleNamespace(config_store=store)) is False
+
+    def test_every_discovery_call_site_passes_the_setting(self) -> None:
+        """No production call to discovery may omit the opt-in.
+
+        Each site defaults to ``False`` at every level, so dropping the
+        argument is type-clean and silent: connect and callback keep working
+        against an internal server and only the refresh hours later fails,
+        surfacing as a dead grant rather than a test failure. Checked at the
+        source because the alternative is four handler harnesses that would
+        still miss the fifth site someone adds.
+        """
+        import inspect
+        import re
+
+        from turnstone.core import mcp_oauth
+
+        source = inspect.getsource(mcp_oauth)
+        calls = re.findall(
+            r"await discover_authorization_server\((.*?)\n(\s*)\)", source, re.DOTALL
+        )
+        assert len(calls) == 4, f"expected 4 discovery call sites, found {len(calls)}"
+        for body, _indent in calls:
+            assert "allow_private_network=" in body, (
+                "a discovery call site does not pass allow_private_network; it would "
+                f"silently fall back to strict:\n{body}"
+            )
+
+    def test_refresh_reads_the_setting_from_app_state(self) -> None:
+        # The site that fails latest and loudest: a refresh runs long after
+        # consent, so a dropped read shows up as a dead grant.
+        from types import SimpleNamespace
+
+        from turnstone.core import mcp_oauth
+
+        seen: dict[str, Any] = {}
+
+        async def _fake_discover(**kwargs: Any) -> ASMetadata:
+            seen.update(kwargs)
+            raise MCPOAuthDiscoveryError("stop here")
+
+        store = MagicMock()
+        store.get.return_value = True
+        state = SimpleNamespace(
+            mcp_oauth_http_client=MagicMock(spec=httpx.AsyncClient),
+            mcp_oauth_metadata_cache=None,
+            config_store=store,
+        )
+
+        async def _run() -> None:
+            await mcp_oauth._refresh_and_persist(
+                app_state=state,
+                storage=MagicMock(),
+                token_store=MagicMock(),
+                user_id="u1",
+                server_name="srv-x",
+                server_row={
+                    "server_id": "srv-id",
+                    "url": _SERVER,
+                    "oauth_client_id": "cid",
+                },
+                refresh_value="rt",
+                existing_scopes="",
+            )
+
+        with (
+            patch.object(mcp_oauth, "discover_authorization_server", _fake_discover),
+            pytest.raises(mcp_oauth.MCPOAuthRefreshFailed),
+        ):
+            asyncio.run(_run())
+        assert seen["allow_private_network"] is True
+        store.get.assert_called_with("mcp.oauth_allow_private_network")
+
+    @pytest.mark.parametrize(
+        ("one", "other", "same"),
+        [
+            ("https://mcp.example.com/a", "https://MCP.Example.com/b", True),
+            ("https://mcp.example.com/a", "https://mcp.example.com:443/b", True),
+            ("http://mcp.example.com/a", "http://mcp.example.com:80/b", True),
+            ("https://[2001:db8::1]/a", "https://[2001:0DB8:0:0:0:0:0:1]/b", True),
+            ("https://mcp.example.com/a", "http://mcp.example.com/b", False),
+            ("https://mcp.example.com/a", "https://mcp.example.com:8443/b", False),
+            ("https://mcp.example.com/a", "https://other.example.com/b", False),
+            # Total by construction: these arrive from remote headers, and a
+            # malformed literal must refuse rather than escape as ValueError.
+            ("https://[::1", "https://mcp.example.com/b", False),
+            ("", "https://mcp.example.com/b", False),
+            ("not-a-url", "https://mcp.example.com/b", False),
+        ],
+    )
+    def test_origin_comparison_is_canonical_and_total(
+        self, one: str, other: str, same: bool
+    ) -> None:
+        from turnstone.core.mcp_oauth import _same_origin
+
+        assert _same_origin(one, other) is same
+
+    def test_malformed_challenge_refuses_without_escaping(self) -> None:
+        # A malformed address literal in a challenge header must not abort
+        # discovery before the origin location is tried.
+        meta, client = _discover_private(
+            _SERVER,
+            _router(
+                {
+                    _PATH_PRM: _challenge("https://[::1"),
+                    _ROOT_PRM: _prm("https://mcp.example.com", issuer="https://as.example.com"),
+                    _AS_META: _mk_response(200, _good_as_metadata_doc()),
+                }
+            ),
+            allow_private_network=True,
+            addr="93.184.216.34",
+        )
+        assert meta.issuer == "https://as.example.com"
+
+    def test_public_plus_metadata_address_keeps_the_absolute_refusal(self) -> None:
+        # A metadata address is refused absolutely; reporting it as a mixed
+        # private answer would offer a remedy that is already taken and could
+        # never apply.
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock()
+        storage = _mk_storage_mock()
+
+        async def _run() -> None:
+            with _addr_map_patch({"mcp.example.com": ["93.184.216.34", "169.254.169.254"]}):
+                await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    allow_private_network=True,
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="refused"):
+            asyncio.run(_run())
+        client.get.assert_not_called()

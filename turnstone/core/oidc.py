@@ -356,9 +356,10 @@ def load_oidc_config() -> OIDCConfig:
 
 # Appended to every private-address rejection in this module (issuer and
 # discovered endpoints alike): the login-flow URLs are operator-configured,
-# so pointing the operator at the opt-in is safe here — unlike ``mcp_oauth``,
-# where the URLs come from untrusted remote-server metadata and no such
-# opt-in exists.
+# so pointing the operator at the opt-in is safe here. ``mcp_oauth`` has its
+# own opt-in (``mcp.oauth_allow_private_network``) scoped the same way: it
+# reaches the URLs an operator typed on the server row, never one that came
+# out of remote-server metadata, which stays strict however it is set.
 _PRIVATE_NETWORK_HINT = (
     " — to allow a self-hosted IdP on a private network, set "
     "allow_private_network = true in the [oidc] section of config.toml "

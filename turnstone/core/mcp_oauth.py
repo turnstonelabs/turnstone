@@ -26,6 +26,7 @@ import concurrent.futures
 import contextlib
 import enum
 import hashlib
+import ipaddress
 import json
 import secrets
 import time
@@ -55,6 +56,7 @@ from turnstone.core.model_registry import (
 )
 from turnstone.core.oauth_ssrf import (
     OAuthSSRFError,
+    OAuthSSRFPrivateAddressError,
     sanitize_log_text,
     validate_discovered_endpoint_async,
     validate_url_no_ssrf_async,
@@ -97,6 +99,51 @@ _MAX_DISCOVERY_BODY_BYTES = 256 * 1024
 # consent handler (or a refresh holding the per-(user, server) lock) sit
 # through one timeout per candidate.
 _DISCOVERY_TOTAL_BUDGET = 20.0
+# Appended to a private-address refusal so the operator learns the remedy from
+# the error rather than from the source. Named for the setting, not the file:
+# this one is DB-backed and takes effect on the next attempt.
+# Operator-visible refusals travel through ``sanitize_log_text``, which caps
+# at 200 characters and escapes non-ASCII, so a remedy appended to the tail of
+# an SSRF message (already ~150 characters with the URL in it) is cut off
+# before it is ever read. These are built remedy-first and short, with the
+# underlying detail logged rather than rendered.
+_PRIVATE_REMEDY_ENABLE_SETTING = (
+    "enable mcp.oauth_allow_private_network in console settings to reach it"
+)
+_PRIVATE_REMEDY_SET_OVERRIDE = (
+    "set this server's Authorization Server URL, which is the only way to name "
+    "a private authorization server"
+)
+_PRIVATE_REMEDY_NEVER_FOLLOWED = (
+    "the server pointed discovery at a private address of its own choosing, which is never followed"
+)
+
+
+def _private_network_refusal(
+    what: str,
+    exc: OAuthSSRFPrivateAddressError,
+    *,
+    remedy: str,
+    server_name: str = "",
+) -> MCPOAuthDiscoveryError:
+    """Build a short, remedy-first refusal and log the address detail.
+
+    *remedy* is chosen by WHY the strict verdict was reached, not by the
+    exception's class: telling an operator to enable a setting that is
+    already on, and that could not have applied to this URL anyway, is
+    worse than saying nothing.
+    """
+    log.warning(
+        "mcp_server.oauth.private_address_refused",
+        server_name=server_name,
+        what=what,
+        reason=sanitize_log_text(str(exc)),
+    )
+    # ASCII separator: the operator-facing renderers unicode-escape, so an
+    # em dash would reach the console as a literal "\u2014".
+    return MCPOAuthDiscoveryError(f"{what} is on a private network - {remedy}")
+
+
 # Tighter cap for token-endpoint and DCR responses — these never carry
 # JWKS-style payloads and are bounded in well-formed AS implementations.
 _MAX_TOKEN_BODY_BYTES = 64 * 1024
@@ -212,6 +259,47 @@ def json_http_client(timeout: float = _DEFAULT_HTTP_TIMEOUT) -> httpx.AsyncClien
 # raw string before it is parsed, or the comparison is made against
 # something the peer never sent. Space is included: a URI has none.
 _URL_UNSAFE_CHARS = frozenset(chr(code) for code in range(0x21)) | {chr(0x7F)}
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_key(url: str) -> tuple[str, str, int | None] | None:
+    """Scheme, host and effective port for *url*, or ``None`` if unparseable.
+
+    Compared by the parts rather than the raw authority: an operator's host
+    typed one way and echoed back another — a different case, an explicit
+    ``:443``, another spelling of the same IPv6 address — is the same origin,
+    and treating it as a different one would refuse the very deployments this
+    exists to serve. Total by construction: these URLs arrive from remote
+    documents and headers, where ``urlsplit`` raises on a malformed address
+    literal, and a parse failure must be an ordinary refusal rather than an
+    exception escaping discovery.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.scheme or not host:
+        return None
+    scheme = parts.scheme.lower()
+    host = host.lower()
+    with contextlib.suppress(ValueError):
+        # ``2001:db8::1`` and ``2001:0DB8:0:0:0:0:0:1`` are one address; only
+        # the parsed form says so, and an internal server is exactly where a
+        # long-form literal turns up.
+        host = ipaddress.ip_address(host).compressed
+    return scheme, host, port if port is not None else _DEFAULT_PORTS.get(scheme)
+
+
+def _same_origin(one: str, other: str) -> bool:
+    """True when two URLs share a scheme, host and effective port.
+
+    A URL that cannot be parsed is never the same origin as anything, so a
+    caller gating an opt-in on this stays strict.
+    """
+    key = _origin_key(one)
+    return key is not None and key == _origin_key(other)
 
 
 def _has_unsafe_url_syntax(raw: str) -> bool:
@@ -275,10 +363,35 @@ def canonical_resource(server_url: str, *, strict: bool = False) -> str:
     host = parsed.hostname
     if ":" in host:
         host = f"[{host}]"
-    default_port = {"http": 80, "https": 443}.get(scheme)
+    default_port = _DEFAULT_PORTS.get(scheme)
     netloc = host if port is None or port == default_port else f"{host}:{port}"
     path = "" if parsed.path == "/" else parsed.path
     return urllib.parse.urlunsplit((scheme, netloc, path, parsed.query, ""))
+
+
+def oauth_allow_private_network(app_state: Any) -> bool:
+    """Live read of ``mcp.oauth_allow_private_network``.
+
+    Read per attempt, so an operator flipping it in the console applies to
+    the next discovery on any surface whose store has the new value. A node
+    learns it through the config-reload fan-out, which is best-effort: a
+    node that missed it keeps the old value until it restarts, and the
+    refusal will name a setting the console already shows as enabled.
+
+    A surface with no ``config_store`` reads as not opted in. That is a
+    conservative default rather than a statement about the surface: the CLI
+    opens the same database the console writes this setting to, so a CLI
+    that grew a store would pick the value up.
+    """
+    config_store = getattr(app_state, "config_store", None)
+    if config_store is None:
+        return False
+    try:
+        return bool(config_store.get("mcp.oauth_allow_private_network"))
+    except Exception:
+        # A settings read must never be the reason a token refresh fails.
+        log.debug("mcp_server.oauth.private_network_setting_read_failed", exc_info=True)
+        return False
 
 
 def _canonical_server_url(server_row: Mapping[str, Any]) -> str:
@@ -395,12 +508,16 @@ class _PRMCandidate:
     URL is what keeps a path-specific document from being validated
     against the origin's expectation. *hops* is this candidate's own
     ``WWW-Authenticate`` budget, so a chain of challenges off one location
-    cannot starve another location's challenge.
+    cannot starve another location's challenge. *allow_private* travels the
+    same way: a location derived from the operator's own server URL may be
+    private when the deployment has opted in, while one a remote document
+    named may never be, whatever the setting says.
     """
 
     url: str
     accepted: frozenset[str]
     hops: int
+    allow_private: bool
 
 
 async def _fetch_prm_issuer(
@@ -408,6 +525,8 @@ async def _fetch_prm_issuer(
     *,
     http_client: httpx.AsyncClient,
     deadline: float,
+    allow_private: bool = False,
+    server_name: str = "",
 ) -> str:
     """Fetch the protected-resource metadata document and return its ``authorization_servers[0]``.
 
@@ -436,6 +555,12 @@ async def _fetch_prm_issuer(
     that is the message an operator can act on, and otherwise the first
     candidate's error.
 
+    *allow_private* is the deployment's private-network opt-in and reaches
+    only the locations derived from the operator's own server URL. A URL a
+    remote document named — a challenge target, or the issuer this returns —
+    is validated strictly however the setting is set, so a resource server
+    can never steer the deployment at an address the operator did not type.
+
     The caller is responsible for passing the resulting issuer to
     :func:`_fetch_as_metadata` along with its ``trusted_hosts`` list —
     PRM itself is anchored on the resource-server origin, so trust
@@ -451,7 +576,7 @@ async def _fetch_prm_issuer(
     origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
     path_prm_url = _well_known_url(canonical, "oauth-protected-resource")
-    candidates = [_PRMCandidate(path_prm_url, frozenset({canonical}), 1)]
+    candidates = [_PRMCandidate(path_prm_url, frozenset({canonical}), 1, allow_private)]
     origin_prm_url = _well_known_url(origin, "oauth-protected-resource")
     if origin_prm_url != path_prm_url:
         # RFC 9728 §3.3 binds a document to the identifier its URL was
@@ -461,14 +586,15 @@ async def _fetch_prm_issuer(
         # path-specific location; it fails with the resource-mismatch
         # message and the operator's remedy is the Authorization Server URL
         # override, which skips PRM entirely.
-        candidates.append(_PRMCandidate(origin_prm_url, frozenset({origin}), 1))
+        candidates.append(_PRMCandidate(origin_prm_url, frozenset({origin}), 1, allow_private))
 
-    fetched: dict[str, httpx.Response] = {}
+    fetched: dict[tuple[str, bool], httpx.Response] = {}
     document_error: MCPOAuthDiscoveryError | None = None
+    private_error: MCPOAuthDiscoveryError | None = None
     first_error: MCPOAuthDiscoveryError | None = None
 
     def _record(exc: MCPOAuthDiscoveryError) -> None:
-        nonlocal first_error
+        nonlocal first_error, private_error
         first_error = first_error or exc
 
     while candidates:
@@ -477,7 +603,10 @@ async def _fetch_prm_issuer(
         # is re-judged: the same URL can be reached as a challenge target
         # carrying one expectation and as a derived candidate carrying
         # another, and the second expectation is a real second chance.
-        cached = fetched.get(candidate.url)
+        # Keyed by the candidate's verdict as well as its URL: a response
+        # fetched under the opt-in must not be reused for a candidate that
+        # was denied it, or the verdict the record carries never applies.
+        cached = fetched.get((candidate.url, candidate.allow_private))
         if cached is not None:
             resp = cached
         else:
@@ -486,7 +615,24 @@ async def _fetch_prm_issuer(
                 _record(MCPOAuthDiscoveryError("PRM discovery exceeded its time budget"))
                 break
             try:
-                await validate_url_no_ssrf_async(candidate.url, allow_http=True)
+                await validate_url_no_ssrf_async(
+                    candidate.url,
+                    allow_http=True,
+                    allow_private=candidate.allow_private,
+                    private_requires_all=True,
+                )
+            except OAuthSSRFPrivateAddressError as exc:
+                private_error = private_error or _private_network_refusal(
+                    "the MCP server's metadata location",
+                    exc,
+                    remedy=(
+                        _PRIVATE_REMEDY_NEVER_FOLLOWED
+                        if allow_private and not candidate.allow_private
+                        else _PRIVATE_REMEDY_ENABLE_SETTING
+                    ),
+                    server_name=server_name,
+                )
+                continue
             except OAuthSSRFError as exc:
                 _record(_discovery_error(f"PRM URL rejected: {exc}", exc))
                 continue
@@ -495,7 +641,7 @@ async def _fetch_prm_issuer(
             except httpx.HTTPError as exc:
                 _record(_discovery_error(f"PRM fetch failed: {exc}", exc))
                 continue
-            fetched[candidate.url] = resp
+            fetched[(candidate.url, candidate.allow_private)] = resp
 
         if resp.status_code == 401:
             challenge_url = _parse_prm_url_from_www_authenticate(
@@ -510,7 +656,17 @@ async def _fetch_prm_issuer(
             elif candidate.hops > 0:
                 candidates.insert(
                     0,
-                    _PRMCandidate(challenge_url, candidate.accepted, candidate.hops - 1),
+                    # A challenge URL is named by the server, so it inherits
+                    # the opt-in only when it stays on the origin the
+                    # operator typed: pointing at another location of the
+                    # same host adds no reach, while pointing anywhere else
+                    # is precisely the steering the scoping refuses.
+                    _PRMCandidate(
+                        challenge_url,
+                        candidate.accepted,
+                        candidate.hops - 1,
+                        candidate.allow_private and _same_origin(challenge_url, candidate.url),
+                    ),
                 )
             else:
                 _record(MCPOAuthDiscoveryError("PRM challenge chain exceeded its hop budget"))
@@ -527,6 +683,16 @@ async def _fetch_prm_issuer(
         except MCPOAuthDiscoveryError as exc:
             document_error = document_error or exc
             continue
+        except OAuthSSRFPrivateAddressError as exc:
+            # Named by the document, so the setting can never reach it however
+            # it is set; the override is the only remedy.
+            private_error = private_error or _private_network_refusal(
+                "the authorization server this MCP server names",
+                exc,
+                remedy=_PRIVATE_REMEDY_SET_OVERRIDE,
+                server_name=server_name,
+            )
+            continue
         except OAuthSSRFError as exc:
             document_error = document_error or _discovery_error(
                 f"PRM issuer URL rejected: {exc}", exc
@@ -534,8 +700,14 @@ async def _fetch_prm_issuer(
             continue
         return issuer_url
 
+    # An address refusal names a setting or a field the operator can act on,
+    # so it outranks a document-level complaint about a location that may not
+    # even be the right one.
     raise (
-        document_error or first_error or MCPOAuthDiscoveryError("PRM discovery found no candidate")
+        private_error
+        or document_error
+        or first_error
+        or MCPOAuthDiscoveryError("PRM discovery found no candidate")
     )
 
 
@@ -583,8 +755,13 @@ def _issuer_template_matches(declared: str, requested: str) -> bool:
     # template exception tolerates a placeholder, nothing more.
     if "?" in declared or "#" in declared:
         return False
-    declared_parts = urllib.parse.urlsplit(declared)
-    requested_parts = urllib.parse.urlsplit(requested)
+    try:
+        declared_parts = urllib.parse.urlsplit(declared)
+        requested_parts = urllib.parse.urlsplit(requested)
+    except ValueError:
+        # A malformed address literal in a document is a mismatch, not a
+        # crash: this runs on values a remote server chose.
+        return False
     if declared_parts.scheme != requested_parts.scheme:
         return False
     if declared_parts.netloc != requested_parts.netloc:
@@ -739,6 +916,7 @@ async def _fetch_as_metadata(
     http_client: httpx.AsyncClient,
     trusted_hosts: frozenset[str],
     deadline: float,
+    allow_private: bool = False,
 ) -> ASMetadata:
     """Fetch and validate the authorization-server metadata document for *issuer*.
 
@@ -752,9 +930,25 @@ async def _fetch_as_metadata(
 
     Validates the discovered ``authorization_endpoint`` and
     ``token_endpoint`` are same-origin (or in ``trusted_hosts``).
+
+    *allow_private* is set only when the issuer is the operator's own
+    override; an issuer a protected-resource document named is validated
+    strictly however the deployment's setting is set. The document's own
+    endpoints inherit the issuer's verdict, which is safe because they are
+    already bound same-origin to it.
     """
     try:
-        issuer_parsed = await validate_url_no_ssrf_async(issuer, allow_http=True)
+        issuer_parsed = await validate_url_no_ssrf_async(
+            issuer, allow_http=True, allow_private=allow_private, private_requires_all=True
+        )
+    except OAuthSSRFPrivateAddressError as exc:
+        raise _private_network_refusal(
+            "the authorization server",
+            exc,
+            remedy=(
+                _PRIVATE_REMEDY_ENABLE_SETTING if allow_private else _PRIVATE_REMEDY_SET_OVERRIDE
+            ),
+        ) from exc
     except OAuthSSRFError as exc:
         raise MCPOAuthDiscoveryError(f"AS issuer URL rejected: {exc}") from exc
 
@@ -850,11 +1044,18 @@ async def _fetch_as_metadata(
             if not endpoint_url:
                 continue
             try:
+                # The opt-in reaches an endpoint only on the issuer's own
+                # origin. ``validate_discovered_endpoint`` also admits the
+                # trusted-host lists, so forwarding it unconditionally would
+                # let a document name a private host from those lists — the
+                # invariant the docstring states, enforced rather than
+                # assumed.
                 await validate_discovered_endpoint_async(
                     endpoint_url,
                     issuer_parsed,
                     allow_http=allow_http,
                     trusted_endpoint_hosts=trusted_hosts,
+                    allow_private=allow_private and _same_origin(endpoint_url, issuer),
                 )
             except OAuthSSRFError as exc:
                 raise MCPOAuthDiscoveryError(
@@ -885,8 +1086,18 @@ async def discover_authorization_server(
     server_id: str,
     trusted_hosts: frozenset[str],
     metadata_cache: dict[str, tuple[ASMetadata, float]] | None = None,
+    allow_private_network: bool = False,
 ) -> ASMetadata:
     """Resolve the issuer URL and load AS metadata for an MCP server.
+
+    *allow_private_network* is the deployment opt-in
+    (``mcp.oauth_allow_private_network``). It reaches only the values the
+    operator typed on the row: the server URL that PRM locations are derived
+    from, and the authorization-server override. An issuer or endpoint named
+    by a fetched document is validated strictly whatever the setting says, so
+    a remote server can never expand the deployment's reach into private
+    space; the always-refused lanes (link-local, multicast, reserved, cloud
+    metadata) are refused under the opt-in too.
 
     Resolution order:
 
@@ -914,7 +1125,19 @@ async def discover_authorization_server(
             issuer: str
             if override_url:
                 try:
-                    await validate_url_no_ssrf_async(override_url, allow_http=True)
+                    await validate_url_no_ssrf_async(
+                        override_url,
+                        allow_http=True,
+                        allow_private=allow_private_network,
+                        private_requires_all=True,
+                    )
+                except OAuthSSRFPrivateAddressError as exc:
+                    raise _private_network_refusal(
+                        "the Authorization Server URL",
+                        exc,
+                        remedy=_PRIVATE_REMEDY_ENABLE_SETTING,
+                        server_name=server_name,
+                    ) from exc
                 except OAuthSSRFError as exc:
                     raise MCPOAuthDiscoveryError(f"override AS URL rejected: {exc}") from exc
                 issuer = override_url
@@ -945,13 +1168,21 @@ async def discover_authorization_server(
                                 exc_info=True,
                             )
                     issuer = await _fetch_prm_issuer(
-                        server_url, http_client=http_client, deadline=deadline
+                        server_url,
+                        http_client=http_client,
+                        deadline=deadline,
+                        allow_private=allow_private_network,
+                        server_name=server_name,
                     )
                 else:
                     issuer = cached_issuer
             else:
                 issuer = await _fetch_prm_issuer(
-                    server_url, http_client=http_client, deadline=deadline
+                    server_url,
+                    http_client=http_client,
+                    deadline=deadline,
+                    allow_private=allow_private_network,
+                    server_name=server_name,
                 )
 
             if metadata_cache is not None:
@@ -961,8 +1192,15 @@ async def discover_authorization_server(
                     if time.monotonic() - fetched_at < MCP_OAUTH_DISCOVERY_CACHE_TTL_SECONDS:
                         return metadata
 
+            # Only an operator-typed issuer carries the opt-in. A cached
+            # issuer was resolved from a PRM document, never from the
+            # override, so it is remote-named and stays strict.
             metadata = await _fetch_as_metadata(
-                issuer, http_client=http_client, trusted_hosts=trusted_hosts, deadline=deadline
+                issuer,
+                http_client=http_client,
+                trusted_hosts=trusted_hosts,
+                deadline=deadline,
+                allow_private=allow_private_network and bool(override_url),
             )
     except TimeoutError as exc:
         raise MCPOAuthDiscoveryError("discovery exceeded its time budget") from exc
@@ -4204,6 +4442,7 @@ async def _refresh_and_persist(
             server_id=server_id,
             trusted_hosts=frozenset(),
             metadata_cache=metadata_cache,
+            allow_private_network=oauth_allow_private_network(app_state),
         )
     except MCPOAuthDiscoveryError as exc:
         raise MCPOAuthRefreshFailed(f"discovery failed during refresh: {exc}") from exc
@@ -4742,6 +4981,7 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
             server_id=server_id,
             trusted_hosts=frozenset(),
             metadata_cache=metadata_cache,
+            allow_private_network=oauth_allow_private_network(request.app.state),
         )
     except MCPOAuthDiscoveryError as exc:
         log.warning("mcp_server.oauth.discovery_failed", server_name=server_name, exc_info=True)
@@ -4982,6 +5222,7 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
             server_id=server_id,
             trusted_hosts=frozenset(),
             metadata_cache=metadata_cache,
+            allow_private_network=oauth_allow_private_network(request.app.state),
         )
     except MCPOAuthDiscoveryError as exc:
         log.warning(
@@ -5253,6 +5494,9 @@ async def _attempt_upstream_revoke(
     *,
     http_client: httpx.AsyncClient,
     metadata_cache: dict[str, Any] | None,
+    # Strict unless the caller passes the deployment's opt-in, so a direct
+    # caller cannot widen the deployment's reach by omission.
+    allow_private_network: bool = False,
     storage: StorageBackend,
     token_store: MCPTokenStore,
     server_name: str,
@@ -5295,6 +5539,7 @@ async def _attempt_upstream_revoke(
                 server_id=server_id_for_audit,
                 trusted_hosts=frozenset(),
                 metadata_cache=metadata_cache,
+                allow_private_network=allow_private_network,
             )
         except MCPOAuthDiscoveryError as exc:
             log.info(
@@ -5464,6 +5709,7 @@ async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Respons
                 _attempt_upstream_revoke(
                     http_client=http_client,
                     metadata_cache=metadata_cache,
+                    allow_private_network=oauth_allow_private_network(request.app.state),
                     storage=storage,
                     token_store=token_store,
                     server_name=server_name,
@@ -5704,6 +5950,7 @@ __all__ = [
     "handle_mcp_oauth_revoke_connection",
     "initialize_mcp_oauth_state",
     "is_user_scoped_auth",
+    "oauth_allow_private_network",
     "pop_pending_state",
     "revoke_token_at_as",
 ]

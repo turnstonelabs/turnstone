@@ -52,6 +52,40 @@ Switching `auth_type` away from `oauth_user` / `oauth_obo` **deletes** that serv
 | Scopes | No | Space-separated default scope set requested at the authorize endpoint. Per-tool step-up may union additional scopes from a server's `insufficient_scope` response. |
 | Audience | No | The `audience=` parameter some authorization servers use instead of RFC 8707 `resource=` (which always carries the canonical Server URL). Defaults to the Server URL as stored. A returned JWT's `aud` claim is accepted if it matches either value. |
 
+### MCP servers on a private network
+
+Discovery refuses private and internal addresses by default, so an MCP
+server at `https://mcp.internal.example/mcp` fails at the first
+protected-resource metadata fetch. Enable **`mcp.oauth_allow_private_network`**
+(console Settings → MCP) to allow it. The opt-in is deliberately narrow:
+
+- it applies to what you typed on the server row — the **Server URL** that
+  metadata locations are derived from, and the **Authorization Server URL**
+  override;
+- an authorization server named by a document Turnstone fetched is still
+  refused when it is private, so a remote MCP server can never point your
+  deployment at your internal network. A fully internal deployment therefore
+  sets the Authorization Server URL override rather than relying on the MCP
+  server's metadata to name it;
+- cloud metadata endpoints and link-local, multicast and reserved addresses
+  stay refused with the setting on;
+- the `https://` requirement is unchanged. Per-user bearer tokens must not
+  transit cleartext, so an internal server needs a certificate the deployment
+  trusts — a local CA in the container trust store, or a TLS sidecar in front
+  of the MCP server.
+
+The setting is read per attempt, so flipping it takes effect on the next
+discovery with no restart. It is deployment-wide: it relaxes the address
+check for every `oauth_user` row, including a third-party server whose
+hostname happens to resolve to an internal address of yours. Enable it when
+you trust every OAuth MCP server configured on the deployment.
+
+Nodes learn the new value through a best-effort config-reload fan-out. A node
+that missed it — registered late, or unreachable at the time — keeps the old
+value until it restarts, and its refusals will name a setting the console
+already shows as enabled. Restart that node, or re-save the setting once it is
+reachable.
+
 ### Encryption key
 
 ```toml
@@ -170,6 +204,7 @@ Every transition that changes what a stored row *means* deletes the rows outrigh
 | `mcp_oauth_url_insecure` | MCP server URL is `http://` (not `https://`) on a non-loopback host | Use `https://`. Per-user bearers must not transit cleartext. |
 | `PRM resource identifier does not match the server URL` | The server's protected-resource metadata declares a different resource than the row's canonical Server URL (or, at the origin-level location, its origin) | Compare the Server URL path and spelling with what the server publishes at `/.well-known/oauth-protected-resource<path>`. |
 | `AS metadata returned HTTP 404` for an issuer with a path | None of the metadata locations answered | Set the Authorization Server URL override to the issuer exactly as the AS publishes it. A query string or fragment in the issuer is refused with its own message. |
+| `resolves to non-public address` on an internal MCP server | Discovery refuses private addresses by default | Enable `mcp.oauth_allow_private_network` (the error names it). If the refused address is the *authorization server* rather than the MCP server, set the Authorization Server URL override too — an issuer named by a fetched document never gets the opt-in. |
 | `AS metadata issuer does not match the requested issuer` | Every location that answered published a different `issuer` — usually a catch-all response, or an override whose spelling differs from what the AS declares (a trailing slash is a different identifier) | The error names both values; copy the `issuer` from the AS's own metadata document into the Authorization Server URL verbatim. |
 | Tools fail in scheduled / Discord / Slack runs | OAuth-MCP requires browser-based consent | Users must pre-consent via the web UI. Phase 9 dashboard badge surfaces deferred consents from these runs on next login. |
 | Circuit breaker open repeatedly | Transport-level errors on the MCP server (DNS, TLS, 5xx) | Check the per-server error pill; auth errors do not trip the breaker. |

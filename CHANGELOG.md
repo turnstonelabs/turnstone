@@ -14,6 +14,21 @@ frozen.
 
 ## [Unreleased]
 
+### Added
+
+- **MCP OAuth discovery for servers on a private network.** The new
+  `mcp.oauth_allow_private_network` setting (console Settings → MCP,
+  default off) lets an MCP server at an internal address complete OAuth
+  discovery. It applies only to what the operator typed on the row — the
+  server URL that metadata locations are derived from, and the
+  authorization-server override — so an authorization server named by a
+  fetched document is still refused when it is private. The switch itself is
+  deployment-wide and relaxes the address check for every OAuth MCP server.
+  A hostname resolving to both public and private addresses is refused
+  regardless, as are cloud metadata, link-local, multicast and reserved
+  addresses, and the `https://` requirement for per-user bearers is
+  unchanged. A refusal names the remedy that actually applies to it.
+
 ### Fixed
 
 - **MCP OAuth discovery for servers and issuers with paths (#1061, #1063).**

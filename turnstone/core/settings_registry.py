@@ -486,6 +486,27 @@ def _build_registry() -> dict[str, SettingDef]:
             reference_url="https://modelcontextprotocol.io",
         ),
         SettingDef(
+            "mcp.oauth_allow_private_network",
+            "bool",
+            False,
+            "Allow MCP OAuth discovery to reach private-network addresses",
+            "mcp",
+            help="When enabled, an MCP server whose URL points at a private or internal "
+            "address (a home-lab service, an internal host) can complete OAuth discovery "
+            "instead of being refused outright. Within a server row it applies only to what "
+            "you typed — the Server URL and the Authorization Server URL — so an "
+            "authorization server named by a document Turnstone fetched is still refused "
+            "when it is private, and you name an internal one by setting the Authorization "
+            "Server URL yourself. The switch is deployment-wide: it relaxes the address "
+            "check for EVERY OAuth MCP server, so a third-party server whose hostname "
+            "resolves to an internal address of yours would be probed there too. Turn it on "
+            "when you trust every OAuth MCP server configured here. A hostname answering "
+            "with both public and private addresses is refused either way, as are cloud "
+            "metadata endpoints and link-local, multicast and reserved addresses. Per-user "
+            "bearer tokens still require https:// on any non-loopback host, so an internal "
+            "server needs a certificate your deployment trusts.",
+        ),
+        SettingDef(
             "mcp.registry_url",
             "str",
             "",

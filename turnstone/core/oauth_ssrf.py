@@ -81,11 +81,13 @@ class OAuthSSRFError(Exception):
 class OAuthSSRFPrivateAddressError(OAuthSSRFError):
     """A hostname resolved to a non-public address, specifically.
 
-    A distinct subclass so callers with an operator-facing opt-in
-    (``[oidc] allow_private_network``) can catch this case and append the
-    remediation hint, while callers with no such opt-in (``mcp_oauth``,
-    where endpoint URLs come from untrusted remote-server metadata) keep
-    catching :class:`OAuthSSRFError` and stay strict.
+    A distinct subclass so callers with an operator-facing opt-in can catch
+    this case and name the remedy: ``[oidc] allow_private_network`` for the
+    deployment's own IdP, and ``mcp.oauth_allow_private_network`` for an MCP
+    server. The MCP opt-in reaches only the URLs an operator typed on the
+    server row; a URL that came out of remote-server metadata is validated
+    strictly whatever the setting says, so callers there still catch
+    :class:`OAuthSSRFError` and stay strict on that path.
     """
 
 
@@ -124,7 +126,11 @@ def effective_port(parsed: urllib.parse.ParseResult) -> int | None:
 
 
 def validate_url_no_ssrf(
-    url: str, *, allow_http: bool, allow_private: bool = False
+    url: str,
+    *,
+    allow_http: bool,
+    allow_private: bool = False,
+    private_requires_all: bool = False,
 ) -> urllib.parse.ParseResult:
     """Run the scheme/userinfo/SSRF checks shared by issuer and discovered URLs.
 
@@ -140,6 +146,14 @@ def validate_url_no_ssrf(
     IdP lives in those ranges. Non-public rejections raise the
     :class:`OAuthSSRFPrivateAddressError` subclass so callers that *have*
     an opt-in can point the operator at it.
+
+    ``private_requires_all=True`` narrows the opt-in to a hostname whose
+    records are ALL non-public. A name answering with both a public and a
+    private address is refused: the request may land on either, chosen by
+    whoever runs that name's DNS, so the opt-in would not describe where
+    the traffic goes and a public record could steer the caller into the
+    operator's network. The tools opt-in refuses the same shape at its
+    approval boundary.
 
     Both knobs judge an IPv6 transition address (NAT64, 6to4, Teredo,
     IPv4-mapped, IPv4-compatible) by the IPv4 address it routes to rather
@@ -190,6 +204,22 @@ def validate_url_no_ssrf(
         classified = resolve_and_classify(hostname)
     except ResolutionError as exc:
         raise OAuthSSRFError(f"endpoint {exc}: {url}") from exc
+
+    if allow_private and private_requires_all:
+        lanes = {lane for lane, _addr in classified}
+        # A NEVER record is refused absolutely by the loop below, with the
+        # message that says so. Reporting it here as a mixed private answer
+        # would hand the operator a remedy — enable the opt-in — that is both
+        # already taken and incapable of ever applying.
+        if (
+            AddressLane.NEVER not in lanes
+            and AddressLane.PUBLIC in lanes
+            and lanes != {AddressLane.PUBLIC}
+        ):
+            raise OAuthSSRFPrivateAddressError(
+                f"endpoint URL resolves to both public and non-public addresses, so it "
+                f"cannot be treated as a private-network target: {url}"
+            )
 
     for lane, addr in classified:
         # Ordered so the refusal names the real problem. Deciding the scheme
@@ -275,7 +305,11 @@ def validate_discovered_endpoint(
 
 
 async def validate_url_no_ssrf_async(
-    url: str, *, allow_http: bool, allow_private: bool = False
+    url: str,
+    *,
+    allow_http: bool,
+    allow_private: bool = False,
+    private_requires_all: bool = False,
 ) -> urllib.parse.ParseResult:
     """Async variant of :func:`validate_url_no_ssrf` for hot-path callers.
 
@@ -286,7 +320,11 @@ async def validate_url_no_ssrf_async(
     centralises that wrapping so callers don't repeat the idiom.
     """
     return await asyncio.to_thread(
-        validate_url_no_ssrf, url, allow_http=allow_http, allow_private=allow_private
+        validate_url_no_ssrf,
+        url,
+        allow_http=allow_http,
+        allow_private=allow_private,
+        private_requires_all=private_requires_all,
     )
 
 
