@@ -81,8 +81,12 @@ pip install turnstone
 # Terminal REPL
 turnstone --base-url http://localhost:8000/v1
 
-# Browser UI
-turnstone-server --port 8080 --base-url http://localhost:8000/v1
+# Browser UI — define models in the console Models tab, or in
+# ~/.config/turnstone/config.toml:
+#   [models.local]
+#   base_url = "http://localhost:8000/v1"
+#   model = "qwen3-32b"
+turnstone-server --port 8080
 
 # Cluster dashboard
 turnstone-console --port 8090
@@ -93,7 +97,7 @@ For PostgreSQL (recommended for production):
 ```bash
 export TURNSTONE_DB_BACKEND=postgresql
 export TURNSTONE_DB_URL="postgresql+psycopg://user:pass@localhost:5432/turnstone"
-turnstone-server --port 8080 --base-url http://localhost:8000/v1
+turnstone-server --port 8080
 ```
 
 ### Docker

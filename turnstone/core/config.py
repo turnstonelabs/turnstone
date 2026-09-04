@@ -369,10 +369,22 @@ def warn_migrated_settings() -> None:
 
     # Warn about removed settings whose config.toml keys are now ignored.
     # model.name → use model definitions (Models tab); model.context_window
-    # → set per-model in the Models tab (context_window column).
+    # → set per-model in the Models tab (context_window column); [api] →
+    # the server has no bootstrap endpoint, every model definition carries
+    # its own base_url and api_key (the CLI still reads [api]).
     removed_settings: dict[str, str] = {
         "model.name": "Use model definitions in the Models tab instead.",
         "model.context_window": "Set per-model in the Models tab instead.",
+        "api.base_url": (
+            "The server takes endpoints from model definitions; set base_url on "
+            "each [models.*] entry or in the Models tab (the turnstone CLI still "
+            "reads [api])."
+        ),
+        "api.api_key": (
+            "Set api_key on each [models.*] entry or in the Models tab; an empty "
+            "key falls back to OPENAI_API_KEY / ANTHROPIC_API_KEY, and a local "
+            "server needs none."
+        ),
     }
     for key, guidance in removed_settings.items():
         section, config_key = key.split(".", 1)

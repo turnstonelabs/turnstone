@@ -35,10 +35,11 @@ docker compose exec node-1 turnstone-admin create-user --username admin --name "
 
 ### Bring your own LLM
 
-Nodes boot **without** an LLM and appear in the console immediately. Add real
+Nodes boot **without** an LLM and appear in the console immediately. Add
 model backends (OpenAI, Anthropic, or a local/vLLM endpoint) from the console
-UI's **Models** tab. To set a node's bootstrap default instead, point
-`LLM_BASE_URL` / `OPENAI_API_KEY` at an OpenAI-compatible endpoint in `.env`.
+UI's **Models** tab, or as `[models.*]` entries in a node's `config.toml`. A
+definition that leaves `api_key` empty falls back to `OPENAI_API_KEY` from
+`.env`; a local server needs no key at all.
 
 ### Fewer nodes
 
@@ -77,9 +78,9 @@ jwt_secret = "dev-only-insecure-jwt-secret-change-me-for-real-deployments"
 backend = "postgresql"
 url = "postgresql+psycopg://turnstone:turnstone@localhost:5432/turnstone"
 
-[api]
+[models.local]
 base_url = "http://localhost:8000/v1"   # your local model endpoint
-api_key = "dummy"
+model = "qwen3-32b"
 ```
 
 Then start the server. The node identity isn't a secret, so it stays on the
@@ -178,11 +179,9 @@ overrides.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_BASE_URL` | `http://host.docker.internal:8000/v1` | Bootstrap OpenAI-compatible API URL (real backends go in the UI) |
-| `OPENAI_API_KEY` | `dummy` | API key (`dummy` for local servers) |
+| `OPENAI_API_KEY` | `dummy` | API key used by model definitions that leave `api_key` empty, and by `${OPENAI_API_KEY}` placeholders in a definition |
 | `TURNSTONE_SEARXNG_URL` | `http://searxng:8080` | SearxNG URL for the `web_search` tool (local/vLLM models only; Anthropic/OpenAI use native search). Defaults to the bundled `searxng` service; set to an external instance's URL. To turn web search off, clear `tools.searxng_url` in the admin Settings tab. |
 | `SEARXNG_IMAGE_TAG` | `latest` | Tag for the bundled `searxng/searxng` image |
-| `MODEL` | — | Override the default model alias |
 
 ### Auth & database
 

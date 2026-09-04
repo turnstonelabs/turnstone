@@ -79,8 +79,7 @@ pgbouncer --> postgres : transaction\npooling
 ' Environment variables
 note right of host
     **Environment Variables:**
-    * LLM_BASE_URL -- LLM endpoint
-    * OPENAI_API_KEY -- API key
+    * OPENAI_API_KEY -- API key for definitions without one
     * TURNSTONE_AUTH_TOKEN -- API auth
     * TURNSTONE_DB_URL -- PostgreSQL URL
     * POSTGRES_PASSWORD -- DB password

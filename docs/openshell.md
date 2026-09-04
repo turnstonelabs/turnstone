@@ -38,9 +38,18 @@ openshell sandbox run \
   --policy deploy/openshell/turnstone-policy.yaml \
   --inference-routes deploy/openshell/routes.yaml \
   --workdir /path/to/project \
-  -- python3 -m turnstone.server --host 0.0.0.0 --port 8080 \
-      --base-url https://inference.local
+  -- python3 -m turnstone.server --host 0.0.0.0 --port 8080
 ```
+
+with a model definition that points at the proxy — in `config.toml`:
+
+```toml
+[models.sandbox]
+base_url = "https://inference.local"
+model = "gpt-5"          # the id the route serves
+```
+
+or the same fields in the console Models tab.
 
 The `inference.local` hostname is intercepted by the OpenShell proxy before
 network policy evaluation -- no network policy entry is needed for it.
@@ -190,12 +199,12 @@ routes:
     api_key_env: ANTHROPIC_API_KEY
 ```
 
-2. Start with `--inference-routes` and point turnstone at `inference.local`:
+2. Start with `--inference-routes` and point a model definition at
+   `inference.local` (`base_url = "https://inference.local"`):
 
 ```bash
 openshell sandbox run \
   --inference-routes deploy/openshell/routes.yaml \
-  --base-url https://inference.local \
   ...
 ```
 

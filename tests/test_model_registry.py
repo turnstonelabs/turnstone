@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +27,7 @@ from turnstone.core.model_registry import (
     load_model_registry,
 )
 from turnstone.core.model_turn import resolve_model_binding
+from turnstone.core.providers import list_known_models
 from turnstone.core.trajectory import Turn
 from turnstone.core.workstream import WorkstreamKind
 
@@ -438,12 +440,13 @@ class TestLoadModelRegistry:
         ):
             load_model_registry()
 
-    def test_config_context_window_zero_inherits_detected(self) -> None:
+    def test_config_context_window_zero_inherits_cli_window(self) -> None:
         """``context_window = 0`` in a [models.*] entry is the auto-detect
-        sentinel: it must inherit the CLI/detected window, not stay a literal 0
-        (which would zero every downstream budget — judge lowering, session
-        compaction).  The DB loader normalizes 0->inherit; the config path must
-        match it (``.get(k, 0) or context_window``, not ``.get(k, default)``)."""
+        sentinel: it must never stay a literal 0 (which would zero every
+        downstream budget — judge lowering, session compaction). A caller
+        that supplies a bootstrap window — the CLI's ``--context-window`` or
+        its own detection — is the resolution; the server passes 0 and the
+        per-definition chain pinned in TestContextWindowAutoDetect runs."""
         fake_cfg: dict[str, Any] = {
             "models": {
                 "local": {
@@ -451,6 +454,7 @@ class TestLoadModelRegistry:
                     "model": "local-model",
                     "context_window": 0,  # auto-detect
                 },
+                "claude": {"provider": "anthropic", "model": _ANTHROPIC_ID},
             },
             "model": {"default": "local"},
         }
@@ -459,10 +463,16 @@ class TestLoadModelRegistry:
                 base_url="http://localhost:8000/v1",
                 api_key="dummy",
                 model="local-model",
-                context_window=40_000,  # the CLI-detected window
+                context_window=40_000,  # the CLI's own bootstrap window
             )
         _, _, cfg, _ = reg.resolve("local")
         assert cfg.context_window == 40_000  # inherited, not the literal 0
+        # A capability-table provider is resolved from the table even in the
+        # CLI: the bootstrap window applies to local servers only.
+        from turnstone.core.providers import create_provider
+
+        expected = create_provider("anthropic").get_capabilities(_ANTHROPIC_ID).context_window
+        assert reg.get_config("claude").context_window == expected
 
     def test_fallback_from_config(self) -> None:
         fake_cfg: dict[str, Any] = {
@@ -4097,6 +4107,44 @@ class TestDetectModelTimeout:
 
 
 class TestExtractContextWindow:
+    def test_gateway_context_length(self) -> None:
+        """OpenRouter-style listings carry ``context_length`` at the top level
+        and under ``top_provider``; neither is vLLM's or llama.cpp's key."""
+        from turnstone.core.model_registry import _extract_context_window
+
+        m = MagicMock()
+        m.id = "openai/gpt-5.6-luna"
+        m.model_dump.return_value = {
+            "id": "openai/gpt-5.6-luna",
+            "context_length": 1_050_000,
+            "top_provider": {"context_length": 1_050_000, "max_completion_tokens": 128_000},
+        }
+        assert _extract_context_window(m, "openai") == 1_050_000
+
+        m.model_dump.return_value = {"id": "x", "top_provider": {"context_length": 200_000}}
+        assert _extract_context_window(m, "openai") == 200_000
+
+        m.model_dump.return_value = {"id": "x", "context_length": True, "top_provider": {}}
+        assert _extract_context_window(m, "openai") is None
+
+    @pytest.mark.parametrize(
+        ("card", "expected"),
+        [
+            ({"id": "x", "context_window": 131072, "max_completion_tokens": 8192}, 131072),
+            ({"id": "x", "max_context_length": 262144}, 262144),
+            ({"id": "x", "max_model_len": 65536, "context_length": 131072}, 65536),
+            ({"id": "x", "owned_by": "ollama"}, None),
+        ],
+        ids=["groq", "mistral", "vllm-wins-over-gateway-key", "ollama-reports-nothing"],
+    )
+    def test_provider_key_matrix(self, card: dict[str, Any], expected: int | None) -> None:
+        from turnstone.core.model_registry import _extract_context_window
+
+        m = MagicMock()
+        m.id = card["id"]
+        m.model_dump.return_value = card
+        assert _extract_context_window(m, "openai") == expected
+
     def test_vllm_max_model_len(self) -> None:
         from turnstone.core.model_registry import _extract_context_window
 
@@ -4518,3 +4566,834 @@ def test_control_bearing_alias_refuses_to_load() -> None:
             mr_module._normalize_auth_mode(
                 "gw" + chr(1), mode, "api://gw" if mode != "static" else "", ""
             )
+
+
+# ---------------------------------------------------------------------------
+# context_window = 0 → per-definition auto-detection (#1052)
+# ---------------------------------------------------------------------------
+
+
+def _rendered(record: logging.LogRecord) -> str:
+    """Message text plus its args, however structlog captured them.
+
+    Under the test configuration the record carries the console-rendered
+    line with ``positional_args=(...)`` appended and empty ``args``; under a
+    plain stdlib configuration the args are formatted into the message.
+    Concatenating both makes the substring checks below hold either way.
+    """
+    return f"{record.getMessage()} {record.args!r}"
+
+
+# Model ids the commercial tables know, whatever they hold today.
+_COMMERCIAL_ID = list_known_models("openai")[0]
+_ANTHROPIC_ID = list_known_models("anthropic")[0]
+
+
+def _probe_result(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "reachable": True,
+        "model_found": True,
+        "available_models": ["local-model"],
+        "context_window": 262144,
+        "server_type": "vllm",
+        "error": None,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestContextWindowAutoDetect:
+    """``0`` is the Models tab's auto-detect sentinel. It must resolve to a
+    real number per definition — never stay 0 (zeroes every downstream
+    budget) and never inherit whatever the node's bootstrap endpoint said,
+    because the node no longer has one."""
+
+    @staticmethod
+    def _local_cfg(**entry: Any) -> dict[str, Any]:
+        local: dict[str, Any] = {
+            "base_url": "http://localhost:8000/v1",
+            "model": "local-model",
+            "context_window": 0,
+        }
+        local.update(entry)
+        return {"models": {"local": local}}
+
+    def test_table_provider_resolves_offline(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "claude": {
+                    "provider": "anthropic",
+                    "model": _ANTHROPIC_ID,
+                    "context_window": 0,
+                },
+                "gpt": {
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "model": _COMMERCIAL_ID,
+                },
+            }
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            patch("turnstone.core.model_registry.probe_model_endpoint") as probe,
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        probe.assert_not_called()
+        claude = reg.get_config("claude").context_window
+        gpt = reg.get_config("gpt").context_window
+        assert claude == create_provider("anthropic").get_capabilities(_ANTHROPIC_ID).context_window
+        assert gpt == create_provider("openai").get_capabilities(_COMMERCIAL_ID).context_window
+        assert claude > 0 and gpt > 0
+
+    def test_unlisted_commercial_model_falls_back_with_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A model id the table does not list gets the conservative fallback
+        and a warning — never the provider default, which can exceed the
+        real window (a 128k fine-tune budgeted at 200k hard-fails turns)."""
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "new": {
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "model": "ft:gpt-4o-mini-2024-07-18:acme::abc",
+                    "context_window": 0,
+                },
+                "gemini": {"provider": "google", "model": "gemini-3-something"},
+            }
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        assert reg.get_config("new").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert reg.get_config("gemini").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert any(
+            "'new'" in _rendered(r) and "no capability entry" in _rendered(r)
+            for r in caplog.records
+        )
+        assert any("'gemini'" in _rendered(r) for r in caplog.records)
+
+    def test_explicit_value_is_taken_verbatim(self) -> None:
+        with (
+            patch(
+                "turnstone.core.model_registry.load_config",
+                return_value=self._local_cfg(context_window=131072),
+            ),
+            patch("turnstone.core.model_registry.probe_model_endpoint") as probe,
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        probe.assert_not_called()
+        assert reg.get_config("local").context_window == 131072
+
+    def test_local_detection_off_falls_back(self) -> None:
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch("turnstone.core.model_registry.probe_model_endpoint") as probe,
+        ):
+            reg = load_model_registry()
+        probe.assert_not_called()
+        assert reg.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+
+    def test_local_probe_asks_the_definitions_own_endpoint(self) -> None:
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch(
+                "turnstone.core.model_registry.probe_model_endpoint",
+                return_value=_probe_result(),
+            ) as probe,
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        # Endpoint metadata only, on the loader's shorter budget, with the
+        # definition's own key (create_client supplies the local placeholder).
+        probe.assert_called_once_with(
+            "openai-compatible",
+            "http://localhost:8000/v1",
+            "",
+            target_model="local-model",
+            static_table=False,
+            timeout=mr_module._LOADER_PROBE_TIMEOUT,
+        )
+        assert reg.get_config("local").context_window == 262144
+
+    def test_local_probe_single_model_server_accepts_any_name(self) -> None:
+        """A one-model server is this model whatever it calls itself — the
+        common vLLM case where the served id is a path, not the alias name."""
+        result = _probe_result(model_found=False, available_models=["/models/qwen"])
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch("turnstone.core.model_registry.probe_model_endpoint", return_value=result),
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        assert reg.get_config("local").context_window == 262144
+
+    def test_local_probe_multi_model_needs_a_match(self, caplog: pytest.LogCaptureFixture) -> None:
+        result = _probe_result(model_found=False, available_models=["a", "b"])
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch("turnstone.core.model_registry.probe_model_endpoint", return_value=result),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        assert reg.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert any(
+            "'local'" in _rendered(r) and "not in the endpoint's model list" in _rendered(r)
+            for r in caplog.records
+        )
+
+    def test_local_probe_failure_warns_and_falls_back(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        result = _probe_result(reachable=False, context_window=None, error="connection refused")
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch("turnstone.core.model_registry.probe_model_endpoint", return_value=result),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        assert reg.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert any(
+            "'local'" in _rendered(r) and "connection refused" in _rendered(r)
+            for r in caplog.records
+        )
+
+    def test_local_probe_runs_on_every_load(self) -> None:
+        """A backend restarted with a different window is picked up by the
+        next hot-reload — nothing is cached across loads."""
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch(
+                "turnstone.core.model_registry.probe_model_endpoint",
+                side_effect=[_probe_result(), _probe_result(context_window=16384)],
+            ) as probe,
+        ):
+            first = load_model_registry(detect_context_windows=True)
+            second = load_model_registry(detect_context_windows=True)
+        assert probe.call_count == 2
+        assert first.get_config("local").context_window == 262144
+        assert second.get_config("local").context_window == 16384
+
+    def test_local_probe_miss_is_retried_on_next_load(self) -> None:
+        down = _probe_result(reachable=False, context_window=None, error="down")
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch(
+                "turnstone.core.model_registry.probe_model_endpoint",
+                side_effect=[down, _probe_result()],
+            ) as probe,
+        ):
+            first = load_model_registry(detect_context_windows=True)
+            second = load_model_registry(detect_context_windows=True)
+        assert probe.call_count == 2
+        assert first.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert second.get_config("local").context_window == 262144
+
+    def test_reload_probes_first_and_takes_a_new_window(self) -> None:
+        """A hot-reload asks the endpoint again, so a backend restarted with
+        a smaller window is picked up rather than served from the prior."""
+        running = ModelConfig(
+            alias="local",
+            base_url="http://localhost:8000/v1",
+            api_key="",
+            model="local-model",
+            provider="openai-compatible",
+            context_window=262144,
+            context_window_detected=True,
+        )
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch(
+                "turnstone.core.model_registry.probe_model_endpoint",
+                return_value=_probe_result(context_window=16384),
+            ) as probe,
+        ):
+            reg = load_model_registry(detect_context_windows=True, prior={"local": running})
+        probe.assert_called_once()
+        assert reg.get_config("local").context_window == 16384
+
+    def test_reload_keeps_the_detected_window_when_the_probe_misses(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A backend mid-restart during a hot-reload must not shrink live
+        sessions to the fallback: the definition keeps the window the running
+        registry detected, while endpoint and model are unchanged."""
+        running = ModelConfig(
+            alias="local",
+            base_url="http://localhost:8000/v1",
+            api_key="",
+            model="local-model",
+            provider="openai-compatible",
+            context_window=262144,
+            context_window_detected=True,
+        )
+        down = _probe_result(reachable=False, context_window=None, error="connection refused")
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch("turnstone.core.model_registry.probe_model_endpoint", return_value=down),
+            caplog.at_level(logging.INFO),
+        ):
+            reg = load_model_registry(detect_context_windows=True, prior={"local": running})
+        kept = reg.get_config("local")
+        assert kept.context_window == 262144
+        assert kept.context_window_detected is True
+        assert any("keeping the previously detected" in _rendered(r) for r in caplog.records)
+        assert not any(
+            r.levelno >= logging.WARNING and "'local'" in _rendered(r) for r in caplog.records
+        )
+
+    def test_identical_definitions_share_one_probe(self) -> None:
+        cfg = self._local_cfg()
+        cfg["models"]["twin"] = dict(cfg["models"]["local"])
+        cfg["models"]["other"] = dict(cfg["models"]["local"], model="other-model")
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=cfg),
+            patch(
+                "turnstone.core.model_registry.probe_model_endpoint",
+                return_value=_probe_result(),
+            ) as probe,
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        assert probe.call_count == 2  # local + twin share; other is distinct
+        assert reg.get_config("local").context_window == 262144
+        assert reg.get_config("twin").context_window == 262144
+
+    @pytest.mark.parametrize(
+        "prior_window",
+        [mr_module.FALLBACK_CONTEXT_WINDOW, 8192],
+        ids=["prior-fallback", "prior-explicit"],
+    )
+    def test_prior_that_was_not_detected_is_not_carried_on_a_miss(self, prior_window: int) -> None:
+        """A prior fallback is not a resolution, and an explicit prior window
+        (the operator just switched the definition to auto-detect) is not
+        either: when the probe misses, neither is carried forward."""
+        previous = ModelConfig(
+            alias="local",
+            base_url="http://localhost:8000/v1",
+            api_key="",
+            model="local-model",
+            provider="openai-compatible",
+            context_window=prior_window,
+        )
+        down = _probe_result(reachable=False, context_window=None, error="connection refused")
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch("turnstone.core.model_registry.probe_model_endpoint", return_value=down) as probe,
+        ):
+            reg = load_model_registry(detect_context_windows=True, prior={"local": previous})
+        probe.assert_called_once()
+        assert reg.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+
+    def test_probe_exception_is_a_miss_not_a_crash(self, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch(
+                "turnstone.core.model_registry.probe_model_endpoint",
+                side_effect=RuntimeError("can't start new thread"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        assert reg.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert any("raised RuntimeError" in _rendered(r) for r in caplog.records)
+
+    def test_probe_miss_with_changed_model_does_not_carry_forward(self) -> None:
+        running = ModelConfig(
+            alias="local",
+            base_url="http://localhost:8000/v1",
+            api_key="",
+            model="previous-model",
+            provider="openai-compatible",
+            context_window=262144,
+            context_window_detected=True,
+        )
+        down = _probe_result(reachable=False, context_window=None, error="connection refused")
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+            patch("turnstone.core.model_registry.probe_model_endpoint", return_value=down),
+        ):
+            reg = load_model_registry(detect_context_windows=True, prior={"local": running})
+        assert reg.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+
+    def test_probe_is_bounded_by_its_deadline(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A probe that outlives its deadline is abandoned on its daemon
+        thread — boot and a console sync wait at most one probe budget,
+        whatever the endpoint (or the resolver) does."""
+        release = threading.Event()
+        workers: list[threading.Thread] = []
+
+        def slow_probe(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            workers.append(threading.current_thread())
+            release.wait(5)
+            return _probe_result()
+
+        monkeypatch.setattr(mr_module, "_LOADER_PROBE_TIMEOUT", 0.05)
+        try:
+            with (
+                patch("turnstone.core.model_registry.load_config", return_value=self._local_cfg()),
+                patch("turnstone.core.model_registry.probe_model_endpoint", side_effect=slow_probe),
+                caplog.at_level(logging.WARNING),
+            ):
+                reg = load_model_registry(detect_context_windows=True)
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(5)
+        assert reg.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert any("did not answer within" in _rendered(r) for r in caplog.records)
+
+    def test_rerank_only_definition_is_not_probed(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A reranker has no chat window; it takes the fallback silently."""
+        cfg = self._local_cfg(capabilities={"supports_rerank": True})
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=cfg),
+            patch("turnstone.core.model_registry.probe_model_endpoint") as probe,
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        probe.assert_not_called()
+        assert reg.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert not any("'local'" in _rendered(r) for r in caplog.records)
+
+    def test_dynamic_auth_lane_is_not_probed(self, caplog: pytest.LogCaptureFixture) -> None:
+        cfg = self._local_cfg(auth_mode="rfc8693_obo", obo_audience="api://gw")
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=cfg),
+            patch("turnstone.core.model_registry.probe_model_endpoint") as probe,
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        probe.assert_not_called()
+        assert reg.get_config("local").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert any("per-call credential" in _rendered(r) for r in caplog.records)
+
+    def test_db_row_goes_through_the_same_chain(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "claude",
+                    "model": "claude-opus-4-6",
+                    "provider": "anthropic",
+                    "base_url": "",
+                    "api_key": "sk-db",
+                    "context_window": 0,
+                    "capabilities": "{}",
+                    "enabled": True,
+                },
+                {
+                    "alias": "local",
+                    "model": "local-model",
+                    "provider": "openai",
+                    "base_url": "http://localhost:8000/v1",
+                    "api_key": "",
+                    "context_window": 0,
+                    "capabilities": "{}",
+                    "enabled": True,
+                },
+            ]
+        )
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value={}),
+            patch(
+                "turnstone.core.model_registry.probe_model_endpoint",
+                return_value=_probe_result(),
+            ) as probe,
+        ):
+            reg = load_model_registry(storage=storage, detect_context_windows=True)
+        expected = create_provider("anthropic").get_capabilities("claude-opus-4-6").context_window
+        assert reg.get_config("claude").context_window == expected
+        assert reg.get_config("local").context_window == 262144
+        probe.assert_called_once()
+
+    def test_non_finite_context_window_is_treated_as_auto(self) -> None:
+        """TOML admits ``inf``; int() raises OverflowError, which must degrade
+        to auto-detect, not abort the load."""
+        assert mr_module._coerce_context_window(float("inf"), "x") == 0
+        assert mr_module._coerce_context_window(-5, "x") == 0
+        assert mr_module._coerce_context_window(True, "x") == 0
+        assert mr_module._coerce_context_window(131072.0, "x") == 131072
+
+    def test_invalid_context_window_is_treated_as_auto(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "claude": {
+                    "provider": "anthropic",
+                    "model": "claude-opus-4-6",
+                    "context_window": "lots",
+                }
+            }
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry()
+        assert reg.get_config("claude").context_window > 0
+        assert any("invalid context_window" in _rendered(r) for r in caplog.records)
+
+
+class TestLocalProviderPlaceholderKey:
+    """The server used to resolve ``--api-key or $OPENAI_API_KEY or "dummy"``
+    and hand the result to every definition with an empty key. That default
+    is gone, so ``create_client`` keeps the same precedence for local
+    providers — explicit key, then the SDK's env var, then the placeholder —
+    and the registry, the loader's probe and the console Detect button all
+    inherit it. Commercial providers stay on the SDK's own env-var rule."""
+
+    def test_openai_compatible_placeholder_when_env_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from turnstone.core.providers import LOCAL_PLACEHOLDER_API_KEY, create_client
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        client = create_client("openai-compatible", base_url="http://localhost:8000/v1", api_key="")
+        assert client.api_key == LOCAL_PLACEHOLDER_API_KEY
+
+    def test_openai_compatible_env_var_wins_over_placeholder(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from turnstone.core.providers import create_client
+
+        monkeypatch.setenv("OPENAI_API_KEY", "s3cret")
+        client = create_client("openai-compatible", base_url="http://localhost:8000/v1", api_key="")
+        assert client.api_key == "s3cret"
+
+    def test_explicit_key_wins_over_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from turnstone.core.providers import create_client
+
+        monkeypatch.setenv("OPENAI_API_KEY", "s3cret")
+        client = create_client(
+            "openai-compatible", base_url="http://localhost:8000/v1", api_key="row-key"
+        )
+        assert client.api_key == "row-key"
+
+    def test_anthropic_compatible_placeholder_when_env_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from turnstone.core.providers import LOCAL_PLACEHOLDER_API_KEY, create_client
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        client = create_client("anthropic-compatible", base_url="http://localhost:8000", api_key="")
+        assert client.api_key == LOCAL_PLACEHOLDER_API_KEY
+
+    def test_commercial_provider_keeps_sdk_rule(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No placeholder for api.openai.com: with neither key nor env var the
+        SDK refuses, exactly as before."""
+        from turnstone.core.providers import create_client
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(Exception, match="api_key"):
+            create_client("openai", base_url="https://api.openai.com/v1", api_key="")
+
+    def test_openai_compatible_requires_base_url(self) -> None:
+        """Without a base_url the SDK would default to the commercial API and
+        carry a local server's prompts there; refuse at construction, as the
+        anthropic-compatible arm already does."""
+        from turnstone.core.providers import create_client
+
+        with pytest.raises(ValueError, match="openai-compatible requires base_url"):
+            create_client("openai-compatible", base_url="", api_key="k")
+
+    def test_registry_passes_the_definition_key_through(self) -> None:
+        cfg = ModelConfig(
+            alias="m",
+            base_url="http://localhost:8000/v1",
+            api_key="",
+            model="x",
+            provider="openai-compatible",
+        )
+        reg = ModelRegistry(models={"m": cfg}, default="m")
+        with patch("turnstone.core.model_registry.create_client") as cc:
+            reg.get_client("m")
+        cc.assert_called_once_with(
+            "openai-compatible", base_url="http://localhost:8000/v1", api_key=""
+        )
+
+
+class TestProbeEndpointOnly:
+    """The loader's probe must never lift a commercial table window onto a
+    local server that happens to serve a commercial model id."""
+
+    @staticmethod
+    def _fake_client(model_id: str) -> MagicMock:
+        model = MagicMock()
+        model.id = model_id
+        model.model_dump.return_value = {"id": model_id, "owned_by": "llama.cpp"}
+        fast = MagicMock()
+        fast.models.list.return_value = MagicMock(data=[model])
+        client = MagicMock()
+        client.with_options.return_value = fast
+        return client
+
+    def test_static_table_off_reports_no_window(self) -> None:
+        with patch(
+            "turnstone.core.providers.create_client", return_value=self._fake_client(_COMMERCIAL_ID)
+        ):
+            probed = mr_module.probe_model_endpoint(
+                "openai-compatible",
+                "http://localhost:8000/v1",
+                "",
+                _COMMERCIAL_ID,
+                static_table=False,
+            )
+        assert probed["model_found"] is True
+        assert probed["context_window"] is None
+
+    def test_static_table_on_is_the_detect_button_behaviour(self) -> None:
+        from turnstone.core.providers import lookup_model_capabilities
+
+        with patch(
+            "turnstone.core.providers.create_client", return_value=self._fake_client(_COMMERCIAL_ID)
+        ):
+            probed = mr_module.probe_model_endpoint(
+                "openai-compatible", "http://localhost:8000/v1", "", _COMMERCIAL_ID
+            )
+        known = lookup_model_capabilities("openai", _COMMERCIAL_ID)
+        assert known is not None
+        assert probed["context_window"] == known["context_window"]
+
+    def test_gateway_listing_resolves_through_the_loader(self) -> None:
+        """A gateway definition (OpenRouter shape) with context_window = 0
+        gets the gateway's number from its own listing — no static table."""
+        model = MagicMock()
+        model.id = "openai/gpt-5.6-luna"
+        model.model_dump.return_value = {
+            "id": "openai/gpt-5.6-luna",
+            "context_length": 1_050_000,
+            "top_provider": {"context_length": 1_050_000},
+        }
+        fast = MagicMock()
+        fast.models.list.return_value = MagicMock(data=[model])
+        client = MagicMock()
+        client.with_options.return_value = fast
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "router": {
+                    "provider": "openai",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "k",
+                    "model": "openai/gpt-5.6-luna",
+                    "context_window": 0,
+                }
+            }
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            patch("turnstone.core.providers.create_client", return_value=client),
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        router = reg.get_config("router")
+        assert router.provider == "openai-compatible"
+        assert router.context_window == 1_050_000
+        assert router.context_window_detected is True
+
+    def test_loader_probe_leaves_commercial_id_unresolved(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "gw": {
+                    "base_url": "http://localhost:8000/v1",
+                    "model": _COMMERCIAL_ID,
+                    "context_window": 0,
+                }
+            }
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            patch(
+                "turnstone.core.providers.create_client",
+                return_value=self._fake_client(_COMMERCIAL_ID),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        assert reg.get_config("gw").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+        assert any("does not report a context window" in _rendered(r) for r in caplog.records)
+
+
+class TestEntryWithoutEndpoint:
+    """The server used to hand its own ``--base-url`` / ``[api]`` endpoint
+    down to every entry that named neither ``base_url`` nor ``provider``.
+    That endpoint is gone and the default provider without a base_url is
+    the commercial OpenAI API, so such an entry — almost certainly written
+    for a local server — is refused rather than retargeted. The CLI still
+    passes its own ``base_url`` and inherits as before."""
+
+    def test_server_load_skips_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "local": {"model": "qwen", "context_window": 8192},
+                "claude": {"provider": "anthropic", "model": "claude-opus-4-6"},
+            },
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry()
+        assert not reg.has_alias("local")
+        assert reg.has_alias("claude")  # a commercial provider needs no base_url
+        assert any(
+            "'local'" in _rendered(r) and "neither base_url nor provider" in _rendered(r)
+            for r in caplog.records
+        )
+
+    def test_empty_or_unset_base_url_is_skipped(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A base_url that resolves to nothing — an empty value or an unset
+        ${VAR} — would send the entry to the provider's public endpoint."""
+        monkeypatch.delenv("TURNSTONE_TEST_UNSET_URL", raising=False)
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "env": {"model": "qwen", "base_url": "${TURNSTONE_TEST_UNSET_URL}"},
+                "blank": {"model": "qwen", "base_url": ""},
+                "ok": {"model": "qwen", "base_url": "http://localhost:8000/v1"},
+            },
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry()
+        assert reg.list_aliases() == ["ok"]
+        assert sum("empty base_url" in _rendered(r) for r in caplog.records) == 2
+
+    def test_local_provider_without_base_url_is_skipped_in_both_branches(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An openai-compatible definition with no endpoint would fail on a
+        user's first turn; the loader refuses it, config entry or DB row."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "row",
+                    "model": "qwen",
+                    "provider": "openai-compatible",
+                    "base_url": "",
+                    "api_key": "",
+                    "context_window": 8192,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        fake_cfg: dict[str, Any] = {
+            "models": {"entry": {"model": "qwen", "provider": "openai-compatible"}},
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.list_aliases() == []
+        assert sum("without a base_url" in _rendered(r) for r in caplog.records) == 2
+
+    def test_db_row_with_unset_url_variable_is_skipped(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("TURNSTONE_TEST_UNSET_URL", raising=False)
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "row",
+                    "model": _COMMERCIAL_ID,
+                    "provider": "openai",
+                    "base_url": "${TURNSTONE_TEST_UNSET_URL}",
+                    "api_key": "",
+                    "context_window": 8192,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value={}),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.list_aliases() == []
+        assert any("${VAR} is unset" in _rendered(r) for r in caplog.records)
+
+    def test_table_provider_entry_that_relied_on_api_section_loads_with_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Empty base_url is the normal shape for a commercial provider, so the
+        entry loads — but the log says it now targets the public endpoint."""
+        fake_cfg: dict[str, Any] = {
+            "api": {"base_url": "http://localhost:8000/v1"},
+            "models": {"claude": {"provider": "anthropic", "model": _ANTHROPIC_ID}},
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry()
+        assert reg.get_config("claude").base_url == ""
+        assert any(
+            "'claude'" in _rendered(r) and "public endpoint" in _rendered(r) for r in caplog.records
+        )
+
+    def test_openai_entry_that_relied_on_api_section_is_refused(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """provider = "openai" with no base_url is the commercial API. While the
+        file still carries [api] base_url the entry was written to inherit it,
+        so it is refused; without [api] the same entry is the commercial API."""
+        entry: dict[str, Any] = {"provider": "openai", "model": _COMMERCIAL_ID}
+        with (
+            patch(
+                "turnstone.core.model_registry.load_config",
+                return_value={
+                    "api": {"base_url": "http://localhost:8000/v1"},
+                    "models": {"m": entry},
+                },
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(allow_empty=True)
+        assert reg.list_aliases() == []
+        assert any("[api] base_url" in _rendered(r) for r in caplog.records)
+
+        with patch(
+            "turnstone.core.model_registry.load_config", return_value={"models": {"m": entry}}
+        ):
+            reg = load_model_registry()
+        assert reg.get_config("m").provider == "openai"
+        assert reg.get_config("m").base_url == ""
+
+    def test_cli_load_inherits_without_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake_cfg: dict[str, Any] = {
+            "models": {"local": {"model": "qwen", "context_window": 8192}},
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(base_url="http://localhost:8000/v1")
+        assert reg.get_config("local").base_url == "http://localhost:8000/v1"
+        assert not any("neither base_url nor provider" in _rendered(r) for r in caplog.records)
+
+
+def test_unknown_provider_does_not_crash_the_load(caplog: pytest.LogCaptureFixture) -> None:
+    """A typo'd provider has always failed at first use, not at boot; the
+    window resolver must keep it that way."""
+    fake_cfg: dict[str, Any] = {
+        "models": {"typo": {"provider": "openia", "model": "gpt-5", "context_window": 0}}
+    }
+    with (
+        patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+        caplog.at_level(logging.WARNING),
+    ):
+        reg = load_model_registry(detect_context_windows=True)
+    assert reg.get_config("typo").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
+    assert any("not recognised" in _rendered(r) for r in caplog.records)

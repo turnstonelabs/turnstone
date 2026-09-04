@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
@@ -139,6 +140,17 @@ def create_provider(
     )
 
 
+# Providers whose models live on an operator-run server: no capability
+# table, the window comes from the endpoint, and a bearer is optional.
+LOCAL_PROVIDERS: frozenset[str] = frozenset({"openai-compatible", "anthropic-compatible"})
+
+# Bearer an SDK client is built with for a local provider when the
+# definition has no key and the SDK's environment variable is unset. vLLM /
+# llama.cpp ignore it unless started with an API key; the SDKs refuse to
+# construct with neither a key nor their env var.
+LOCAL_PLACEHOLDER_API_KEY = "dummy"
+
+
 def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
     """Create an SDK client for the given provider.
 
@@ -147,11 +159,30 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
     ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``).  Passing an empty
     string would short-circuit the SDK's env-var check and raise a
     "Missing credentials" error even when the env var is set.
+
+    A local provider with neither a key nor the env var gets
+    :data:`LOCAL_PLACEHOLDER_API_KEY` so the client still constructs; a
+    commercial provider in that state fails the way the SDK dictates.
     """
     resolved_key: str | None = api_key if api_key else None
+    if resolved_key is None and provider_name in LOCAL_PROVIDERS:
+        env_name = (
+            "ANTHROPIC_API_KEY" if provider_name == "anthropic-compatible" else "OPENAI_API_KEY"
+        )
+        if not os.environ.get(env_name):
+            resolved_key = LOCAL_PLACEHOLDER_API_KEY
     if provider_name in ("openai", "openai-compatible", "google", "xai"):
         from openai import OpenAI
 
+        if provider_name == "openai-compatible" and not base_url:
+            # The lane targets an operator-run server; without a base_url the
+            # SDK would default to https://api.openai.com/v1 and send the
+            # prompts meant for that server to the commercial API. Same
+            # posture as the anthropic-compatible arm below.
+            raise ValueError(
+                "openai-compatible requires base_url (the server's /v1 root, "
+                "e.g. http://your-vllm-host:8000/v1)"
+            )
         if not base_url and provider_name == "google":
             from turnstone.core.providers._google import GOOGLE_DEFAULT_BASE_URL
 
@@ -203,7 +234,7 @@ def lookup_model_capabilities(provider: str, model: str) -> dict[str, Any] | Non
     """
     import dataclasses
 
-    if provider in ("openai-compatible", "anthropic-compatible"):
+    if provider in LOCAL_PROVIDERS:
         return None
     prov = create_provider(provider)
     caps = prov.get_capabilities(model)

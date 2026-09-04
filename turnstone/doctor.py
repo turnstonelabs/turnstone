@@ -82,8 +82,6 @@ _RELEVANT_ENV_VARS: tuple[str, ...] = (
     "TURNSTONE_JWT_SECRET",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
-    "LLM_BASE_URL",
-    "MODEL",
     "TURNSTONE_HOST_IP",
     "TURNSTONE_CONSOLE_URL",
     "TURNSTONE_ACME_EXTERNAL_URL",
@@ -326,7 +324,6 @@ class ConfigFileInfo:
     path: Path
     sections: list[str]
     db: dict[str, str]  # backend/url/path from [database], if present (real values)
-    api: dict[str, str]  # base_url/api_key from [api], if present (real values)
 
 
 @dataclass
@@ -429,13 +426,13 @@ def _systemd_units() -> list[str]:
     return units
 
 
-def _parse_config_sections(path: Path) -> tuple[list[str], dict[str, str], dict[str, str]]:
+def _parse_config_sections(path: Path) -> tuple[list[str], dict[str, str]]:
     """Return (section names, [database] subset, [api] subset) for a config.toml."""
     try:
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
     except (OSError, tomllib.TOMLDecodeError):
-        return [], {}, {}
+        return [], {}
     sections = sorted(k for k, v in data.items() if isinstance(v, dict))
     db: dict[str, str] = {}
     dbsec = data.get("database")
@@ -444,14 +441,7 @@ def _parse_config_sections(path: Path) -> tuple[list[str], dict[str, str], dict[
             v = dbsec.get(k)
             if v:
                 db[k] = str(v)
-    api: dict[str, str] = {}
-    apisec = data.get("api")
-    if isinstance(apisec, dict):
-        for k in ("base_url", "api_key"):
-            v = apisec.get(k)
-            if v:
-                api[k] = str(v)
-    return sections, db, api
+    return sections, db
 
 
 def _discover_config_files(project_dir: Path, env: dict[str, str]) -> list[ConfigFileInfo]:
@@ -478,8 +468,8 @@ def _discover_config_files(project_dir: Path, env: dict[str, str]) -> list[Confi
         if rp in seen:
             continue
         seen.add(rp)
-        sections, db, api = _parse_config_sections(rp)
-        out.append(ConfigFileInfo(path=rp, sections=sections, db=db, api=api))
+        sections, db = _parse_config_sections(rp)
+        out.append(ConfigFileInfo(path=rp, sections=sections, db=db))
     return out
 
 
@@ -974,58 +964,43 @@ def family_of(provider: str) -> str | None:
     return None
 
 
-def _read_api_creds(profile: InstallProfile, env: dict[str, str]) -> tuple[str, str]:
-    """Resolve (base_url, api_key) from config.toml [api] then env, for brain seeding.
-
-    Reads the ``[api]`` block already parsed into each ``ConfigFileInfo`` at
-    discovery time (the config files aren't re-opened). The pair is taken from the
-    *first* config file that defines either field, as a unit — so base_url and
-    api_key never get mixed across two different config sources (which would form
-    an endpoint/key pair that exists in no real config). Any field still missing
-    is then filled from the environment, matching Turnstone's config→env order.
-    """
-    base_url = api_key = ""
-    for cf in profile.config_files:
-        if cf.api.get("base_url") or cf.api.get("api_key"):
-            base_url = cf.api.get("base_url", "")
-            api_key = cf.api.get("api_key", "")
-            break
-    base_url = base_url or env.get("LLM_BASE_URL", "")
-    api_key = api_key or env.get("OPENAI_API_KEY", "") or env.get("ANTHROPIC_API_KEY", "")
-    return base_url, api_key
-
-
 def resolve_doctor_brain(
     profile: InstallProfile,
     storage: Any,
     storage_err: str,
     *,
-    env: dict[str, str] | None = None,
     validate: bool = True,
 ) -> tuple[_DoctorLLM | None, BackendVerdict]:
-    """Build doctor's LLM from the cluster's config (the first diagnostic).
+    """Build doctor's LLM from the cluster's model definitions (the first diagnostic).
 
     Returns (brain, verdict). ``brain`` is None when resolution fails, in which
     case ``verdict.detail`` explains why and the caller should fall back to
     interactive provider selection.
     """
-    env = dict(env if env is not None else os.environ)
     if storage is None:
         return None, BackendVerdict(False, f"storage unreachable: {storage_err}")
 
     try:
+        from turnstone.core.config import load_config, set_config_path
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.model_registry import load_model_registry
 
         cs = ConfigStore(storage=storage, node_id="")
         alias = str(cs.get("model.default_alias", "") or "")
-        base_url, api_key = _read_api_creds(profile, env)
+        # The same sources a node uses — DB definitions overlaid with
+        # config.toml [models.*] — and nothing else: a node has no bootstrap
+        # endpoint, so doctor must not invent one from [api] or the env. When
+        # the config the loader resolves on its own defines no models, the
+        # node's may live where it does not look (/etc/turnstone under
+        # systemd, a project dir); the
+        # discovery pass found it, so read [models.*] from there.
+        if not load_config("models"):
+            for cf in profile.config_files:
+                if "models" in cf.sections:
+                    set_config_path(str(cf.path))
+                    break
         registry = load_model_registry(
-            base_url=base_url,
-            api_key=api_key,
-            model=env.get("MODEL", ""),
-            storage=storage,
-            allow_empty=True,
+            storage=storage, allow_empty=True, detect_context_windows=True
         )
         client, model_name, cfg, _ = registry.resolve(alias or None)
     except Exception as exc:  # noqa: BLE001 - any failure means "no usable model"
@@ -1618,7 +1593,7 @@ reachable from the console.
 - **Database unreachable**: nodes crash-loop or the console shows no nodes → check \
 `TURNSTONE_DB_URL`, the postgres container/port, and credentials.
 - **LLM backend down**: chats error or hang → use `check_llm_backend` against the \
-node's `LLM_BASE_URL`.
+base_url of the node's model definition (console Models tab).
 - **Port conflict**: a service won't bind → `check_port`.
 - **TLS / ACME**: browser cert errors → Caddy fronts the console with a local CA; \
 nodes enroll via the console's plain-HTTP ACME endpoint.

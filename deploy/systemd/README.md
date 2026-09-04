@@ -37,6 +37,8 @@ uv pip install --python /opt/turnstone-venv 'turnstone @ git+https://github.com/
 #   …or from a local checkout:  uv pip install --python /opt/turnstone-venv /path/to/turnstone
 
 # 3. Secrets — match the cluster's JWT secret + DB credentials (kept out of env).
+#    Model backends and their API keys are configured in the console UI's
+#    Models tab (or as [models.*] entries here); the node has no bootstrap endpoint.
 install -d -m 750 -o turnstone -g turnstone /etc/turnstone
 cat > /etc/turnstone/config.toml <<'TOML'
 [auth]
@@ -44,9 +46,6 @@ jwt_secret = "<same secret as the cluster>"
 [database]
 backend = "postgresql"
 url = "postgresql+psycopg://turnstone:<password>@<compose-host-ip>:5432/turnstone"
-[api]
-base_url = "http://localhost:8000/v1"   # a real model backend is configured in the console UI
-api_key = "dummy"
 TOML
 chown turnstone:turnstone /etc/turnstone/config.toml
 chmod 600 /etc/turnstone/config.toml

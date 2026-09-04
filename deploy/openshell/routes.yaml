@@ -12,8 +12,12 @@
 #     --inference-routes deploy/openshell/routes.yaml \
 #     ...
 #
-# Then start turnstone with:
-#   python3 -m turnstone.server --base-url https://inference.local
+# Then point a model definition at the proxy — in config.toml:
+#   [models.sandbox]
+#   base_url = "https://inference.local"
+#   model = "gpt-5"                       # the id the route below serves
+# (or the same fields in the console Models tab) — and start turnstone:
+#   python3 -m turnstone.server
 #
 # CUSTOMIZE: uncomment one of the provider blocks below.
 

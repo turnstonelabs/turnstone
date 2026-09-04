@@ -17,8 +17,9 @@ Type=exec
 User=turnstone
 Group=turnstone
 
-# Secrets live in config.toml — JWT secret, Postgres URL+password, LLM API key —
-# kept out of os.environ so a prompt-injected tool can't dump them via `env`.
+# Secrets live in config.toml — JWT secret, Postgres URL+password, and any
+# [models.*] API keys — kept out of os.environ so a prompt-injected tool can't
+# dump them via `env`. Model backends are otherwise configured in the console.
 Environment=TURNSTONE_CONFIG=/etc/turnstone/config.toml
 Environment=TURNSTONE_LOG_LEVEL=info
 

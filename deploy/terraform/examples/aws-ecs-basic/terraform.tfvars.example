@@ -6,10 +6,9 @@ vpc_id             = "vpc-0123456789abcdef0"
 private_subnet_ids = ["subnet-aaa111", "subnet-bbb222"]
 public_subnet_ids  = ["subnet-ccc333", "subnet-ddd444"]
 
-# LLM provider configuration.
-# For OpenAI: https://api.openai.com/v1
-# For a self-hosted vLLM instance: http://your-vllm-host:8000/v1
-llm_base_url   = "https://api.openai.com/v1"
+# LLM API key. Model backends (OpenAI, a self-hosted vLLM, ...) are defined
+# in the console Models tab; a definition that leaves api_key empty falls
+# back to this value.
 openai_api_key = "sk-..."
 
 # --- Optional ---

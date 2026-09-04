@@ -73,10 +73,10 @@ migrate:
   affinity: {}
   tolerations: []
 
-# -- LLM provider configuration
+# -- LLM API key (optional). Model backends are defined in the console
+# Models tab; a definition that leaves api_key empty falls back to the
+# OPENAI_API_KEY this feeds (a local server needs none).
 llm:
-  baseUrl: ""
-  provider: openai
   apiKey: ""
   existingSecret: ""
 

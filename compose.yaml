@@ -23,8 +23,8 @@
 #
 # Bring your own LLM: nodes boot without one and show up in the console
 # immediately. Add model backends (OpenAI / Anthropic / local vLLM) from the
-# console UI's Models tab, or point LLM_BASE_URL / OPENAI_API_KEY (below) at an
-# OpenAI-compatible endpoint.
+# console UI's Models tab; OPENAI_API_KEY (below) backs definitions that leave
+# api_key empty (local servers need none).
 #
 # Fewer nodes (lighter machines):
 #     docker compose up postgres console caddy channel node-1 node-2 node-3
@@ -288,9 +288,6 @@ services:
         turnstone-server
         --host 0.0.0.0
         --port 8080
-        --base-url "$${LLM_BASE_URL}"
-        --api-key "$${OPENAI_API_KEY}"
-        $${MODEL:+--model $$MODEL}
         $${SKIP_PERMISSIONS:+--skip-permissions}
         $${MCP_CONFIG:+--mcp-config $$MCP_CONFIG}
     volumes:
@@ -300,13 +297,13 @@ services:
       TURNSTONE_JWT_SECRET: *jwt-secret
       TURNSTONE_DB_BACKEND: *db-backend
       TURNSTONE_DB_URL: *db-url
-      # Bootstrap LLM defaults — real backends are configured in the console UI.
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
+      # Model backends are configured in the console Models tab. A definition
+      # that leaves api_key empty falls back to this variable (local servers
+      # need none); so does a ${OPENAI_API_KEY} placeholder in a definition.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
       # web_search backend. Defaults to the bundled searxng service; point at an
       # external SearxNG by setting TURNSTONE_SEARXNG_URL in .env (empty disables).
       TURNSTONE_SEARXNG_URL: ${TURNSTONE_SEARXNG_URL:-http://searxng:8080}
-      MODEL: ${MODEL:-}
       MCP_CONFIG: ${MCP_CONFIG:-}
       SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
       TURNSTONE_NODE_ID: node-1

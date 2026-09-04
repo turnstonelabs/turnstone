@@ -15,8 +15,9 @@
 #     --policy deploy/openshell/turnstone-policy.yaml \
 #     --inference-routes deploy/openshell/routes.yaml \
 #     --workdir /project \
-#     -- python3 -m turnstone.server --host 0.0.0.0 --port 8080 \
-#         --base-url https://inference.local
+#     -- python3 -m turnstone.server --host 0.0.0.0 --port 8080
+#   with a model definition whose base_url is https://inference.local
+#   (config.toml [models.*] or the console Models tab).
 #
 # Note: inference.local is intercepted by the OpenShell proxy before
 # network policy evaluation — no network_policies entry is needed for it.

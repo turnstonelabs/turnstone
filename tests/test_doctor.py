@@ -29,7 +29,6 @@ from turnstone.doctor import (
     _mask_secrets,
     _parse_config_sections,
     _primary_kind,
-    _read_api_creds,
     _redact_url_credentials,
     _relevant_env,
     _resolve_db_config,
@@ -604,12 +603,10 @@ class TestPreflightHelpers:
             'url = "postgresql://u:p@h/db"\n'
             '[api]\nbase_url = "http://localhost:8000/v1"\napi_key = "sk-test"\n'
         )
-        sections, db, api = _parse_config_sections(cfg)
+        sections, db = _parse_config_sections(cfg)
         assert "auth" in sections and "database" in sections and "api" in sections
         assert db["backend"] == "postgresql"
         assert db["url"] == "postgresql://u:p@h/db"
-        assert api["base_url"] == "http://localhost:8000/v1"
-        assert api["api_key"] == "sk-test"
 
     def test_discover_config_files(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "fakehome")
@@ -620,7 +617,7 @@ class TestPreflightHelpers:
 
     def test_resolve_db_config_config_wins_over_env(self) -> None:
         cf = ConfigFileInfo(
-            path=Path("/x"), sections=["database"], db={"backend": "postgresql", "url": "u"}, api={}
+            path=Path("/x"), sections=["database"], db={"backend": "postgresql", "url": "u"}
         )
         out = _resolve_db_config([cf], {"TURNSTONE_DB_BACKEND": "sqlite"})
         assert out["backend"] == "postgresql"
@@ -637,7 +634,7 @@ class TestPreflightHelpers:
             '[database]\nbackend = "postgresql"\nsslmode = "verify-full"\n'
             'sslrootcert = "/c/ca.crt"\nsslcert = "/c/client.crt"\nsslkey = "/c/client.key"\n'
         )
-        _sections, db, _api = _parse_config_sections(cfg)
+        _sections, db = _parse_config_sections(cfg)
         assert db["sslmode"] == "verify-full"
         assert db["sslrootcert"] == "/c/ca.crt"
 
@@ -646,7 +643,6 @@ class TestPreflightHelpers:
             path=Path("/x"),
             sections=["database"],
             db={"backend": "postgresql", "url": "u", "sslmode": "verify-full"},
-            api={},
         )
         out = _resolve_db_config([cf], {"TURNSTONE_DB_SSLCERT": "/env/client.crt"})
         assert out["sslmode"] == "verify-full"  # config
@@ -681,49 +677,6 @@ class TestPreflightHelpers:
         urls = _derive_health_urls({})
         assert "http://localhost:8080/health" in urls
         assert "http://localhost:8090/health" in urls
-
-    def test_read_api_creds_reads_parsed_api_field(self, tmp_path: Path) -> None:
-        # perf-5: creds come from the already-parsed ConfigFileInfo.api (first
-        # non-empty wins) — the file is never re-opened (it doesn't even exist here).
-        cf = ConfigFileInfo(
-            path=tmp_path / "config.toml",
-            sections=["api"],
-            db={},
-            api={"base_url": "http://localhost:8000/v1", "api_key": "sk-cfg"},
-        )
-        profile = _make_profile(tmp_path, config_files=[cf])
-        base_url, api_key = _read_api_creds(profile, {})
-        assert base_url == "http://localhost:8000/v1"
-        assert api_key == "sk-cfg"
-
-    def test_read_api_creds_env_fallback(self, tmp_path: Path) -> None:
-        profile = _make_profile(tmp_path, config_files=[])
-        base_url, api_key = _read_api_creds(
-            profile, {"LLM_BASE_URL": "http://env/v1", "OPENAI_API_KEY": "sk-env"}
-        )
-        assert base_url == "http://env/v1"
-        assert api_key == "sk-env"
-
-    def test_read_api_creds_pair_from_single_source(self, tmp_path: Path) -> None:
-        # Two config files: the first defines only base_url, the second only
-        # api_key. The pair must come from ONE source (the first that defines
-        # either field) — never a base_url+api_key spliced across both files.
-        cf1 = ConfigFileInfo(
-            path=tmp_path / "a.toml",
-            sections=["api"],
-            db={},
-            api={"base_url": "http://endpoint-a/v1"},
-        )
-        cf2 = ConfigFileInfo(
-            path=tmp_path / "b.toml",
-            sections=["api"],
-            db={},
-            api={"api_key": "sk-from-b"},
-        )
-        profile = _make_profile(tmp_path, config_files=[cf1, cf2])
-        base_url, api_key = _read_api_creds(profile, {})
-        assert base_url == "http://endpoint-a/v1"
-        assert api_key == ""  # not spliced from the unrelated second file
 
     def test_detect_install_profile_classifies_compose(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -897,6 +850,51 @@ class TestResolveDoctorBrain:
 
 class TestResolveBrainIntegration:
     """End-to-end against an ephemeral SQLite DB seeded with one model."""
+
+    def test_reads_models_from_the_discovered_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A node's config.toml can live where the loader does not look on
+        its own (/etc/turnstone); doctor must read [models.*] from the file
+        its discovery pass found, exactly as that node does."""
+        import turnstone.core.config as config_mod
+        from turnstone.core.storage import init_storage, reset_storage
+
+        cfg = tmp_path / "etc-config.toml"
+        cfg.write_text(
+            """[models.local]
+base_url = "http://localhost:9/v1"
+model = "cfg-model"
+context_window = 8192
+"""
+        )
+        monkeypatch.setattr(config_mod, "_config_path", None)
+        monkeypatch.setattr(config_mod, "_cache", None)
+        # The ambient config (never this machine's ~/.config file) defines
+        # no models — only the CLI's [api] — so the discovered node file is
+        # the one consulted for [models.*].
+        ambient = tmp_path / "ambient.toml"
+        ambient.write_text(
+            """[api]
+base_url = "http://laptop:8000/v1"
+"""
+        )
+        monkeypatch.setenv("TURNSTONE_CONFIG", str(ambient))
+        db_path = str(tmp_path / "doctor-cfg.db")
+        reset_storage()
+        st = init_storage("sqlite", path=db_path, run_migrations=True)
+        try:
+            monkeypatch.setattr("turnstone.doctor._validate_connection", lambda llm: (True, ""))
+            profile = _make_profile(
+                tmp_path,
+                config_files=[ConfigFileInfo(path=cfg, sections=["models"], db={})],
+                db_config={"backend": "sqlite", "url": "", "path": db_path},
+            )
+            brain, verdict = resolve_doctor_brain(profile, st, "")
+            assert brain is not None, verdict.detail
+            assert brain.model == "cfg-model"
+        finally:
+            reset_storage()
 
     def test_resolves_seeded_model(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from turnstone.core.storage import init_storage, reset_storage

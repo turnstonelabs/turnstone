@@ -8488,6 +8488,25 @@ function detectModel() {
         if (parseInt(ctxInput.value, 10) === 0) {
           ctxInput.value = d.context_window;
         }
+      } else if (d.fallback_context_window) {
+        // The endpoint reports no window. Leaving 0 here would read as
+        // "auto-detect will handle it" while the node would silently run
+        // with the fallback; put that number in the field so it is seen
+        // and corrected before the first call.
+        const ctxInput = document.getElementById("model-ctx-window");
+        const filled = parseInt(ctxInput.value, 10) === 0;
+        if (filled) ctxInput.value = d.fallback_context_window;
+        resultDiv.appendChild(
+          _detectResultLine(
+            "\u26A0 Context window: this endpoint does not report one" +
+              (filled
+                ? " \u2014 set to " +
+                  d.fallback_context_window.toLocaleString() +
+                  " (what the node would use); enter the model's real size before saving"
+                : "; the node will use the value entered above"),
+            "yellow",
+          ),
+        );
       }
       if (d.server_type) {
         resultDiv.appendChild(

@@ -256,7 +256,7 @@ connection, Redis, auth secrets, server bind address). These stay in
 
 | Category | Section | Where |
 |----------|---------|-------|
-| API credentials | `[api]` | config.toml / env |
+| API credentials (CLI only) | `[api]` | config.toml / env — the server takes endpoints from model definitions |
 | Database | `[database]` | config.toml / env |
 | Auth | `[auth]` | config.toml / env |
 | Console bind | `[console]` | config.toml / env |

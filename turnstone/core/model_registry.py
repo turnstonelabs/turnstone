@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import re
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -22,9 +23,28 @@ if TYPE_CHECKING:
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
-from turnstone.core.providers import LLMProvider, create_client, create_provider
+from turnstone.core.providers import (
+    LOCAL_PROVIDERS,
+    LLMProvider,
+    create_client,
+    create_provider,
+)
 
 log = get_logger(__name__)
+
+# Window used when a model definition leaves ``context_window`` at 0 (the
+# Models tab's "auto-detect") and nothing can supply a number: the provider
+# has no capability table and its endpoint did not report one. Deliberately
+# conservative — an overestimate overflows the real window and hard-fails
+# the turn, an underestimate only compacts early.
+FALLBACK_CONTEXT_WINDOW = 32768
+
+# Per-endpoint budget for the startup / hot-reload window probe. Shorter than
+# the admin Detect button's 10 s: a reachable server answers ``/v1/models``
+# in milliseconds, and an unreachable one should not hold boot or a console
+# sync for long. Probes run concurrently, so this is also the wall-clock cost
+# of a load whose endpoints are all down.
+_LOADER_PROBE_TIMEOUT = 5.0
 
 
 @contextlib.contextmanager
@@ -263,7 +283,12 @@ class ModelConfig:
     base_url: str
     api_key: str = field(repr=False)
     model: str
-    context_window: int = 32768
+    context_window: int = FALLBACK_CONTEXT_WINDOW
+    # True when ``context_window`` came from this definition's own endpoint
+    # (auto-detect), so a hot-reload can keep it without asking again. An
+    # explicit, table or fallback window is never carried into a later
+    # auto-detect resolution.
+    context_window_detected: bool = False
     provider: str = "openai"
     capabilities: dict[str, Any] = field(default_factory=dict)
     source: str = ""  # "config", "db", or "" (CLI default)
@@ -1010,15 +1035,221 @@ def _resolve_openai_provider(provider: str, base_url: str) -> str:
     return provider
 
 
+def _coerce_context_window(raw: Any, alias: str) -> int:
+    """Read a definition's ``context_window``; garbage and negatives become 0."""
+    if raw is None or isinstance(raw, bool):
+        return 0
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        log.warning("Model '%s' has invalid context_window %r, auto-detecting", alias, raw)
+        return 0
+    return max(0, value)
+
+
+def _probe_context_window(cfg: ModelConfig) -> tuple[int | None, str]:
+    """Ask *cfg*'s own endpoint for its window.
+
+    Returns ``(window, note)`` on a hit — *note* is empty, or says the
+    number came from a single-model server whose served id differs from
+    the definition — and ``(None, why)`` on a miss. Endpoint metadata only
+    (vLLM ``max_model_len``, llama.cpp ``n_ctx_train``): the commercial
+    OpenAI table is never consulted for a local server, so a model served
+    under a commercial id cannot inherit that model's window.
+
+    The round trip runs on a daemon thread under a wall-clock deadline: the
+    SDK timeout bounds the socket phases, but a wedged resolver would pin a
+    non-daemon worker past process exit.
+    """
+    from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
+
+    try:
+        result = run_with_deadline(
+            lambda: probe_model_endpoint(
+                cfg.provider,
+                cfg.base_url,
+                cfg.api_key,
+                target_model=cfg.model,
+                static_table=False,
+                timeout=_LOADER_PROBE_TIMEOUT,
+            ),
+            timeout=_LOADER_PROBE_TIMEOUT + 1.0,
+            poll=0.05,
+            thread_name="ctx-probe-io",
+        )
+    except DeadlineExceededError:
+        return None, f"the endpoint probe did not answer within {_LOADER_PROBE_TIMEOUT:.0f} s"
+    except Exception as exc:  # noqa: BLE001 - a probe failure is a miss, never a boot crash
+        return None, f"the endpoint probe raised {type(exc).__name__}"
+    if result.get("error"):
+        return None, f"the endpoint probe failed ({result['error']})"
+    ctx = result.get("context_window")
+    if not isinstance(ctx, int) or ctx <= 0:
+        return None, "the endpoint does not report a context window"
+    if result.get("model_found"):
+        return ctx, ""
+    # A single-model server is this model whatever it calls itself (vLLM
+    # often serves a path, not the alias name); on a multi-model endpoint
+    # the number must belong to this model.
+    listed = result.get("available_models") or []
+    if len(listed) == 1:
+        return ctx, f"single-model server, served as {listed[0]!r}"
+    return None, f"model {cfg.model!r} is not in the endpoint's model list"
+
+
+def _same_endpoint(a: ModelConfig, b: ModelConfig) -> bool:
+    return (a.provider, a.base_url.rstrip("/"), a.model) == (
+        b.provider,
+        b.base_url.rstrip("/"),
+        b.model,
+    )
+
+
+def _resolve_context_windows(
+    configs: dict[str, ModelConfig],
+    *,
+    detect: bool,
+    inherited: int = 0,
+    prior: Mapping[str, ModelConfig] | None = None,
+) -> dict[str, ModelConfig]:
+    """Replace every ``context_window == 0`` with an auto-detected window.
+
+    ``0`` is the Models tab's "auto-detect" sentinel. In order:
+
+    1. A definition with a capability-table provider (anthropic, openai,
+       xai) takes its table entry. Google publishes no table, so its
+       definitions need an explicit window.
+    2. A caller-supplied *inherited* window — the CLI's own bootstrap
+       detection or ``--context-window`` — applies to the local-server
+       definitions the CLI would otherwise probe.
+    3. A local-server definition is asked directly when *detect* is set —
+       one ``/v1/models`` round trip against its own endpoint, identical
+       definitions sharing one probe, concurrently on bounded daemon
+       threads — so a backend restarted with a different window is picked
+       up by the next hot-reload.
+    4. When that probe misses, a definition the registry being hot-reloaded
+       (*prior*) had detected from the same endpoint and model keeps that
+       window: a backend mid-restart cannot shrink live sessions. A prior
+       that was explicit, or a fallback, is not carried.
+    5. Anything still unresolved — an unlisted commercial id, a silent or
+       unreachable endpoint — gets :data:`FALLBACK_CONTEXT_WINDOW` and a
+       warning naming the alias and the reason. A rerank-only definition has
+       no chat window and takes the fallback silently.
+    """
+    from dataclasses import replace
+
+    from turnstone.core.providers import lookup_model_capabilities
+
+    unresolved: dict[str, str] = {}
+    to_probe: list[str] = []
+    for alias, cfg in list(configs.items()):
+        if cfg.context_window > 0:
+            continue
+        if cfg.capabilities.get("supports_rerank"):
+            configs[alias] = replace(cfg, context_window=FALLBACK_CONTEXT_WINDOW)
+            continue
+        if cfg.provider not in LOCAL_PROVIDERS:
+            try:
+                known = lookup_model_capabilities(cfg.provider, cfg.model)
+            except ValueError:
+                # An unrecognised provider string fails at first use, as it
+                # always has; the window must not turn it into a boot crash.
+                unresolved[alias] = f"provider {cfg.provider!r} is not recognised"
+                continue
+            if known is None:
+                # The provider default would be a guess that can exceed the
+                # real window and hard-fail turns; say so instead.
+                unresolved[alias] = f"{cfg.provider} has no capability entry for {cfg.model!r}"
+                continue
+            configs[alias] = replace(cfg, context_window=int(known["context_window"]))
+            continue
+        if inherited > 0:
+            configs[alias] = replace(cfg, context_window=inherited)
+            continue
+        if _is_dynamic_auth_mode(cfg.auth_mode):
+            unresolved[alias] = "the endpoint needs a per-call credential, so it is not probed"
+        elif not cfg.base_url:
+            unresolved[alias] = "the definition has no base_url"
+        elif not detect:
+            unresolved[alias] = "endpoint detection is off in this process"
+        else:
+            to_probe.append(alias)
+
+    if to_probe:
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Identical definitions (same endpoint, credential and model) share
+        # one round trip; each worker only waits on its own deadline-bounded
+        # daemon thread, so the pool drains within a few probe budgets
+        # however many endpoints are down.
+        by_identity: dict[tuple[str, str, str, str, str], list[str]] = {}
+        for alias in to_probe:
+            cfg = configs[alias]
+            key = (cfg.provider, cfg.base_url.rstrip("/"), cfg.api_key, cfg.auth_mode, cfg.model)
+            by_identity.setdefault(key, []).append(alias)
+        groups = list(by_identity.values())
+        with ThreadPoolExecutor(
+            max_workers=min(16, len(groups)), thread_name_prefix="ctx-probe"
+        ) as pool:
+            outcomes = list(
+                pool.map(_probe_context_window, [configs[aliases[0]] for aliases in groups])
+            )
+        for aliases, (ctx, note) in zip(groups, outcomes, strict=True):
+            for alias in aliases:
+                if ctx is None:
+                    unresolved[alias] = note
+                    continue
+                cfg = configs[alias]
+                configs[alias] = replace(cfg, context_window=ctx, context_window_detected=True)
+                log.info(
+                    "Model '%s': context_window %s (detected from %s%s)",
+                    alias,
+                    f"{ctx:,}",
+                    cfg.base_url,
+                    f"; {note}" if note else "",
+                )
+
+    for alias, why in unresolved.items():
+        cfg = configs[alias]
+        previous = prior.get(alias) if prior else None
+        if (
+            previous is not None
+            and previous.context_window_detected
+            and _same_endpoint(previous, cfg)
+        ):
+            configs[alias] = replace(
+                cfg, context_window=previous.context_window, context_window_detected=True
+            )
+            log.info(
+                "Model '%s': keeping the previously detected context_window %s (%s)",
+                alias,
+                f"{previous.context_window:,}",
+                why,
+            )
+            continue
+        emit = log.warning if detect else log.debug
+        emit(
+            "Model '%s': context_window is 0 (auto-detect) but %s — using %s until "
+            "context_window is set on the model definition",
+            alias,
+            why,
+            f"{FALLBACK_CONTEXT_WINDOW:,}",
+        )
+        configs[alias] = replace(configs[alias], context_window=FALLBACK_CONTEXT_WINDOW)
+    return configs
+
+
 def load_model_registry(
     base_url: str = "",
     api_key: str = "",
     model: str = "",
-    context_window: int = 32768,
+    context_window: int = 0,
     provider: str = "openai",
     storage: Any | None = None,
     strict: bool = False,
     allow_empty: bool = False,
+    detect_context_windows: bool = False,
+    prior: Mapping[str, ModelConfig] | None = None,
 ) -> ModelRegistry:
     """Build a ModelRegistry from CLI args, ``config.toml``, and database.
 
@@ -1029,8 +1260,9 @@ def load_model_registry(
        alias in-memory only — the DB rows are never modified.
     2. Database model definitions (``source="db"``), loaded when
        *storage* is provided.
-    3. CLI ``--base-url`` / ``--api-key`` / ``--model`` always create a
-       ``"default"`` entry.
+    3. The CLI's ``--base-url`` / ``--api-key`` / ``--model`` synthesize a
+       ``"default"`` entry when nothing else defines a model. The server
+       passes none of these: its models come from the DB and config.toml only.
     4. ``[model].default``, ``[model].fallback``, ``[model].agent_model``,
        ``[model].task_model``, ``[model].task_effort`` control routing.
        ``task_model`` overrides ``agent_model`` for the task sub-agent;
@@ -1050,12 +1282,25 @@ def load_model_registry(
     node boots and registers with no models yet, to be configured live via the
     admin panel.  The CLI leaves it False — a REPL with no model is unusable
     and there's no live panel to fix it.
+
+    ``context_window``: the CLI's bootstrap window. It sizes the synthesized
+    ``"default"`` entry and, when non-zero, every
+    local-server definition whose own ``context_window`` is ``0``. The
+    server passes ``0``, and ``0`` (the Models tab's "auto-detect") is then
+    resolved per definition by :func:`_resolve_context_windows` — from the
+    provider's capability table, from the registry being hot-reloaded
+    (``prior``), or from the definition's own endpoint when
+    ``detect_context_windows`` is set (server boot and hot-reload, console,
+    doctor). Callers that must not touch the network leave it False and
+    unresolved local definitions fall back to :data:`FALLBACK_CONTEXT_WINDOW`.
     """
     import json as _json
 
     cfg = load_config()
     models_section: dict[str, Any] = cfg.get("models", {})
     model_section: dict[str, Any] = cfg.get("model", {})
+    api_section = cfg.get("api")
+    api_base_url_present = isinstance(api_section, dict) and bool(api_section.get("base_url"))
 
     configs: dict[str, ModelConfig] = {}
 
@@ -1076,12 +1321,31 @@ def load_model_registry(
                 row_server_compat = caps.pop("server_compat", {})
                 if not isinstance(row_server_compat, dict):
                     row_server_compat = {}
-                row_base_url = _resolve_env_vars(row.get("base_url", ""))
+                raw_row_base_url = str(row.get("base_url") or "")
+                row_base_url = _resolve_env_vars(raw_row_base_url)
+                if raw_row_base_url and not row_base_url:
+                    # An unset ${VAR} would resolve to the provider's public
+                    # endpoint under a credential meant for the local server.
+                    log.warning(
+                        "Model '%s' has a base_url whose ${VAR} is unset — export it or "
+                        "set the URL in the Models tab; skipping",
+                        alias,
+                    )
+                    continue
                 row_provider = _resolve_openai_provider(row.get("provider", "openai"), row_base_url)
+                if row_provider in LOCAL_PROVIDERS and not row_base_url:
+                    # The console refuses this at save time; a row that predates
+                    # that check would only fail on a user's first turn.
+                    log.warning(
+                        "Model '%s' is a %s definition without a base_url — set it in "
+                        "the Models tab; skipping",
+                        alias,
+                        row_provider,
+                    )
+                    continue
                 row_model = row["model"]
-                # 0 = auto-detect: inherit CLI-detected context_window,
-                # same fallback chain as config.toml models
-                row_ctx = row.get("context_window", 0) or context_window
+                # 0 = auto-detect, resolved per definition below
+                row_ctx = _coerce_context_window(row.get("context_window"), alias)
                 # Per-model sampling overrides (None = use global default)
                 row_temperature = row.get("temperature")
                 row_max_tokens = row.get("max_tokens")
@@ -1139,7 +1403,31 @@ def load_model_registry(
         if not model_name:
             log.warning("Model entry '%s' has no model name, skipping", alias)
             continue
+        if not base_url and "base_url" not in entry and "provider" not in entry:
+            # No caller endpoint to inherit, and the default provider without
+            # a base_url is the commercial OpenAI API: an entry written for a
+            # local server would send its prompts there. Refuse it instead.
+            log.warning(
+                "Model '%s' names neither base_url nor provider — set base_url "
+                "(local server) or provider (commercial API) on the [models.%s] "
+                "entry; skipping it (a database definition of the same alias, "
+                "if any, stays in force)",
+                alias,
+                alias,
+            )
+            continue
         entry_base_url = _resolve_env_vars(entry.get("base_url", base_url))
+        if "base_url" in entry and not entry_base_url:
+            # Same hazard through the back door: an empty value or an unset
+            # ${VAR} would resolve to the provider's public endpoint.
+            log.warning(
+                "Model '%s' has an empty base_url (or its ${VAR} is unset) — set it "
+                "on the [models.%s] entry; skipping it (a database definition of "
+                "the same alias, if any, stays in force)",
+                alias,
+                alias,
+            )
+            continue
         # Per-model sampling overrides from config.toml — invalid values
         # are logged and treated as None (inherit global default).
         entry_temp: float | None = None
@@ -1178,6 +1466,53 @@ def load_model_registry(
         entry_server_compat = entry_caps.pop("server_compat", {})
         if not isinstance(entry_server_compat, dict):
             entry_server_compat = {}
+        entry_provider = _resolve_openai_provider(entry.get("provider", "openai"), entry_base_url)
+        if entry_provider in LOCAL_PROVIDERS and not entry_base_url:
+            log.warning(
+                "Model '%s' is a %s entry without a base_url — set it on the "
+                "[models.%s] entry; skipping",
+                alias,
+                entry_provider,
+                alias,
+            )
+            continue
+        if (
+            not base_url
+            and entry_provider == "openai"
+            and "base_url" not in entry
+            and api_base_url_present
+        ):
+            # provider = "openai" with no base_url is the commercial API. A
+            # file that still carries [api] base_url was written when such an
+            # entry inherited that endpoint; sending its prompts to the
+            # commercial API instead is the one outcome to refuse.
+            log.warning(
+                "Model '%s' names provider \"openai\" without a base_url while "
+                "config.toml still carries [api] base_url, which the server no "
+                "longer applies — set base_url on the [models.%s] entry (or drop "
+                "[api] if the commercial API is intended); skipping",
+                alias,
+                alias,
+            )
+            continue
+        if (
+            not base_url
+            and entry_provider not in LOCAL_PROVIDERS
+            and entry_provider != "openai"
+            and "base_url" not in entry
+            and api_base_url_present
+        ):
+            # Empty base_url is the normal shape for these providers (the
+            # SDK default), so the entry loads — but say where it now goes.
+            log.warning(
+                "Model '%s' (provider %s) has no base_url and config.toml still carries "
+                "[api] base_url, which the server no longer applies — the entry targets "
+                "the provider's public endpoint; set base_url on [models.%s] if a local "
+                "server was intended",
+                alias,
+                entry_provider,
+                alias,
+            )
         entry_auth_mode, entry_obo_audience, entry_obo_scopes = _normalize_auth_mode(
             alias,
             entry.get("auth_mode", "static"),
@@ -1189,13 +1524,9 @@ def load_model_registry(
             base_url=entry_base_url,
             api_key=_resolve_env_vars(entry.get("api_key", api_key)),
             model=model_name,
-            # 0 = auto-detect: inherit the CLI-detected context_window, matching
-            # the DB loader above.  ``.get(k, 0) or context_window`` (NOT
-            # ``.get(k, default)``) is load-bearing — an explicit
-            # ``context_window = 0`` must normalize to the inherited window, not
-            # stay a literal 0 that zeroes every downstream budget.
-            context_window=entry.get("context_window", 0) or context_window,
-            provider=_resolve_openai_provider(entry.get("provider", "openai"), entry_base_url),
+            # 0 = auto-detect, resolved per definition below
+            context_window=_coerce_context_window(entry.get("context_window"), alias),
+            provider=entry_provider,
             capabilities=entry_caps,
             source="config",
             temperature=entry_temp,
@@ -1214,7 +1545,7 @@ def load_model_registry(
     # into the public list — the LLM picks it in task_agent
     # ``model=`` and silently bypasses the operator's per-role
     # task_alias override (the "default" alias points at
-    # whatever LLM_BASE_URL was at boot, not at the configured default).
+    # whatever --base-url was at boot, not at the configured default).
     if not configs and model:
         configs["default"] = ModelConfig(
             alias="default",
@@ -1241,6 +1572,10 @@ def load_model_registry(
             "Add models in the admin panel; they load without a restart."
         )
         return ModelRegistry(models={}, default="")
+
+    configs = _resolve_context_windows(
+        configs, detect=detect_context_windows, inherited=context_window, prior=prior
+    )
 
     # Determine default alias
     default_alias = model_section.get("default", "default")
@@ -1387,12 +1722,23 @@ def _version_tuple(version_str: str) -> tuple[int, ...]:
     return tuple(int(p) for p in version_str.split("."))
 
 
+def _positive_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
 def _extract_context_window(model_obj: Any, provider: str) -> int | None:
     """Extract context window from a model object returned by ``/v1/models``.
 
-    Handles Anthropic and xAI (static capability tables), vLLM
-    (``max_model_len``), and llama.cpp (``meta.n_ctx_train``).
-    Returns ``None`` when not available.
+    Handles Anthropic and xAI (static capability tables) and the keys the
+    OpenAI-compatible servers and gateways put on a model card: vLLM, NIM
+    and SGLang (``max_model_len``); OpenRouter, Together and Fireworks
+    (``context_length``, OpenRouter also under ``top_provider``); Groq
+    (``context_window``); Mistral (``max_context_length``); llama.cpp
+    (``meta.n_ctx_train``). Ollama, LM Studio, LiteLLM and DeepSeek put
+    nothing on the OpenAI path, and neither do the cloud-hosted paths —
+    Azure OpenAI deployments, Bedrock's and Vertex AI's OpenAI-compatible
+    endpoints, OCI Generative AI, Databricks serving — so those definitions
+    need an explicit window. Returns ``None`` when not available.
     """
     if provider == "anthropic":
         from turnstone.core.providers._anthropic import AnthropicProvider
@@ -1403,14 +1749,20 @@ def _extract_context_window(model_obj: Any, provider: str) -> int | None:
 
         return lookup_grok_capabilities(model_obj.id).context_window
     model_data = model_obj.model_dump()
-    max_len = model_data.get("max_model_len")
-    if isinstance(max_len, int) and max_len > 0:
-        return max_len
+    for key in ("max_model_len", "context_length", "context_window", "max_context_length"):
+        found = _positive_int(model_data.get(key))
+        if found is not None:
+            return found
     meta = model_data.get("meta")
     if isinstance(meta, dict):
-        n_ctx = meta.get("n_ctx_train")
-        if isinstance(n_ctx, int) and n_ctx > 0:
-            return n_ctx
+        found = _positive_int(meta.get("n_ctx_train"))
+        if found is not None:
+            return found
+    top_provider = model_data.get("top_provider")
+    if isinstance(top_provider, dict):
+        found = _positive_int(top_provider.get("context_length"))
+        if found is not None:
+            return found
     return None
 
 
@@ -1433,9 +1785,8 @@ def detect_model(
     Calls ``log_fn`` for informational messages (defaults to ``print``).
 
     When *fatal* is ``True`` (default), raises ``SystemExit`` on failure.
-    When ``False``, returns ``(None, None)`` so the server can start in
-    degraded mode (useful for cluster deployments where the LLM backend
-    may not be available at startup).
+    When ``False``, returns ``(None, None)`` so the caller can carry on
+    without a bootstrap model.
     """
     try:
         # Use a short timeout for startup detection — the default OpenAI client
@@ -1478,13 +1829,22 @@ def probe_model_endpoint(
     base_url: str,
     api_key: str,
     target_model: str = "",
+    *,
+    static_table: bool = True,
+    timeout: float = 10.0,
 ) -> dict[str, Any]:
     """Stateless probe of a model endpoint.
 
     Creates a temporary SDK client, calls ``/v1/models``, and returns
     reachability status, available model IDs, detected context window,
-    and server type.  Used by the admin *Detect* button — never persists
-    state or stores the API key.
+    and server type.  Used by the admin *Detect* button and by the
+    registry's ``context_window = 0`` resolution — never persists state
+    or stores the API key.
+
+    *static_table* lets an OpenAI-compatible endpoint that reports no
+    window fall back to the commercial OpenAI table by model id; the
+    Detect button shows that number to a human, the registry loader
+    passes ``False`` so it is never applied to a local server unseen.
     """
     from turnstone.core.providers import create_client
 
@@ -1499,7 +1859,7 @@ def probe_model_endpoint(
     client = None
     try:
         client = create_client(provider, base_url=base_url, api_key=api_key)
-        fast = client.with_options(timeout=10.0, max_retries=0)
+        fast = client.with_options(timeout=timeout, max_retries=0)
         models = fast.models.list()
         if not models.data:
             result["reachable"] = True
@@ -1544,7 +1904,9 @@ def probe_model_endpoint(
             result["server_type"] = "anthropic-compatible"
         else:
             # OpenAI-compatible path
-            _detect_openai_compat(result, inspect_obj, inspect_id, base_url)
+            _detect_openai_compat(
+                result, inspect_obj, inspect_id, base_url, static_table=static_table
+            )
     except Exception as exc:
         err_msg = str(exc)
         if len(err_msg) > 500:
@@ -1561,6 +1923,8 @@ def _detect_openai_compat(
     model_obj: Any,
     model_id: str,
     base_url: str,
+    *,
+    static_table: bool = True,
 ) -> None:
     """Fill context_window and server_type for an OpenAI-compatible endpoint."""
 
@@ -1579,7 +1943,7 @@ def _detect_openai_compat(
         ctx = _extract_context_window(model_obj, "openai")
         if ctx is not None:
             result["context_window"] = ctx
-    if result["context_window"] is None:
+    if result["context_window"] is None and static_table:
         from turnstone.core.providers import lookup_model_capabilities
 
         known = lookup_model_capabilities("openai", model_id)

@@ -32,6 +32,7 @@ from turnstone.console.server import (
     _refresh_coord_registry,
     admin_create_model_definition,
     admin_delete_model_definition,
+    admin_detect_model,
     admin_list_model_definitions,
     admin_model_auth_constraints,
     admin_model_reload,
@@ -978,6 +979,11 @@ def _make_client(
             Route(
                 "/v1/api/admin/model-definitions",
                 admin_create_model_definition,
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/admin/model-definitions/detect",
+                admin_detect_model,
                 methods=["POST"],
             ),
             Route(
@@ -3987,3 +3993,154 @@ def test_every_mutable_column_probes_its_classification(
     )
     assert resp.status_code == 200, resp.text
     assert not storage.get_model_definition("probe-enabled-disarm")["enabled"]
+
+
+def test_create_without_context_window_stores_auto_detect(storage: SQLiteBackend) -> None:
+    """An API create that omits ``context_window`` must store the auto-detect
+    sentinel — a literal 32768 would be taken as an explicit choice and the
+    resolver would never look at the endpoint."""
+    _seed_model_def(storage, definition_id="m1", alias="seed", model="m")
+    client = _make_client(storage, _make_registry(alias="seed", model="m"))
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": "local",
+            "model": "qwen3-32b",
+            "provider": "openai-compatible",
+            "base_url": "http://vllm.example:8000/v1",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    rows = {r["alias"]: r for r in storage.list_model_definitions()}
+    assert rows["local"]["context_window"] == 0
+
+
+def test_create_refuses_local_provider_without_base_url(storage: SQLiteBackend) -> None:
+    """A local-server definition without a base_url is fully knowable as
+    broken at save time — refuse it here rather than on a user's first turn."""
+    _seed_model_def(storage, definition_id="m1", alias="seed", model="m")
+    client = _make_client(storage, _make_registry(alias="seed", model="m"))
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={"alias": "local", "model": "qwen3-32b", "provider": "openai-compatible"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "base_url" in resp.json()["error"]
+    assert storage.get_model_definition_by_alias("local") is None
+
+
+def test_update_refuses_clearing_base_url_on_local_provider(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.put("/v1/api/admin/model-definitions/m1", json={"base_url": ""})
+
+    assert resp.status_code == 400, resp.text
+    assert "base_url" in resp.json()["error"]
+    assert storage.get_model_definition("m1")["base_url"] == "http://localhost:8000/v1"
+
+
+def test_update_unrelated_field_on_legacy_row_without_base_url(storage: SQLiteBackend) -> None:
+    """A row that predates the save-time check can still be disabled or
+    renamed; only a request that chooses the endpoint is refused for it."""
+    _seed_model_def(storage, definition_id="m1", alias="legacy", model="m", base_url="")
+    client = _make_client(storage, _make_registry(alias="legacy", model="m"))
+
+    resp = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": False})
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_model_definition("m1")["enabled"] is False
+
+
+def test_update_refuses_blanking_local_host_stored_as_openai(storage: SQLiteBackend) -> None:
+    """provider "openai" with a non-OpenAI host is a local server the loader
+    reclassifies at load time; blanking the host would retarget the row to
+    the commercial API."""
+    storage.create_model_definition(
+        "m2",
+        "vllm",
+        "qwen3-32b",
+        provider="openai",
+        base_url="http://vllm.example:8000/v1",
+        api_key="",
+        context_window=8192,
+        enabled=True,
+    )
+    client = _make_client(storage, _make_registry(alias="vllm", model="qwen3-32b"))
+
+    resp = client.put("/v1/api/admin/model-definitions/m2", json={"base_url": ""})
+
+    assert resp.status_code == 400, resp.text
+    assert storage.get_model_definition("m2")["base_url"] == "http://vllm.example:8000/v1"
+
+
+def test_detect_is_endpoint_only_for_local_providers(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Detect button must not offer a commercial model's window for a
+    local server that happens to serve that model id — the registry loader
+    applies the same rule, so the form and the runtime agree."""
+    _seed_model_def(storage, definition_id="m1", alias="seed", model="m")
+    client = _make_client(storage, _make_registry(alias="seed", model="m"))
+    seen: dict[str, object] = {}
+
+    def fake_probe(*args: object, **kwargs: object) -> dict[str, object]:
+        seen["args"] = args
+        seen.update(kwargs)
+        return {"reachable": True, "model_found": True, "context_window": None}
+
+    monkeypatch.setattr("turnstone.core.model_registry.probe_model_endpoint", fake_probe)
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions/detect",
+        json={
+            "provider": "openai-compatible",
+            "base_url": "http://vllm.example:8000/v1",
+            "model": "gpt-5.4",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen.get("static_table") is False
+    # No window reported: the form is told what the node would run with,
+    # so the operator corrects it before the first call.
+    assert resp.json()["fallback_context_window"] == 32768
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions/detect",
+        json={"provider": "openai", "base_url": "https://api.openai.com/v1", "api_key": "k"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen.get("static_table") is True
+
+
+def test_detect_reports_fallback_only_when_reachable_and_silent(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="seed", model="m")
+    client = _make_client(storage, _make_registry(alias="seed", model="m"))
+    outcomes = iter(
+        [
+            {"reachable": True, "model_found": True, "context_window": 262144},
+            {"reachable": False, "context_window": None, "error": "connection refused"},
+        ]
+    )
+    monkeypatch.setattr(
+        "turnstone.core.model_registry.probe_model_endpoint",
+        lambda *a, **kw: dict(next(outcomes)),
+    )
+    body = {
+        "provider": "openai-compatible",
+        "base_url": "http://vllm.example:8000/v1",
+        "model": "qwen3-32b",
+    }
+
+    detected = client.post("/v1/api/admin/model-definitions/detect", json=body).json()
+    assert detected["context_window"] == 262144
+    assert "fallback_context_window" not in detected
+
+    down = client.post("/v1/api/admin/model-definitions/detect", json=body).json()
+    assert "fallback_context_window" not in down  # transient; nothing to correct yet

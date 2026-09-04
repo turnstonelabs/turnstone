@@ -1173,11 +1173,11 @@ provider = "anthropic-compatible"
 base_url = "http://localhost:8000"   # no /v1 — the SDK appends /v1/messages
 api_key = "dummy"
 model = "deepseek-ai/DeepSeek-V4-Flash"
+context_window = 131072              # or 0 to ask the server at startup
 
 [models.vllm-claude.capabilities]
 supports_vision = true                    # multimodal checkpoints only
 supports_mid_conversation_system = true   # template-dependent
-context_window = 131072
 thinking_mode = "manual"                  # session effort knob drives the template toggle
 thinking_param = "enable_thinking"        # Qwen/Gemma key; "thinking" for Granite/DeepSeek
 ```
@@ -1301,8 +1301,14 @@ rows are never modified).
 
 **Lifecycle:**
 1. `load_model_registry()` loads DB model definitions (if storage available),
-   then overlays `[models.*]` from config.toml, then builds a `"default"` entry
-   from CLI `--base-url`/`--model`/`--api-key` args
+   then overlays `[models.*]` from config.toml. The CLI additionally builds a
+   `"default"` entry from its `--base-url`/`--model`/`--api-key` args when
+   nothing else defines a model; the server has no bootstrap endpoint. A
+   definition whose `context_window` is `0` is auto-detected per definition:
+   from the provider's capability table, or by asking the definition's own
+   endpoint (vLLM `max_model_len`, llama.cpp `n_ctx_train`, a gateway's
+   `context_length`), with `32768` and
+   a startup warning as the last resort
 2. The registry is passed to the session factory closure in both `cli.py` and
    `server.py`; each workstream resolves its model on creation
 3. `ModelRegistry.get_client()` lazily creates SDK client instances via

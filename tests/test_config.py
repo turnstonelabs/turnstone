@@ -422,3 +422,27 @@ def test_set_config_path_overrides_env_var(tmp_path, monkeypatch):
     set_config_path(str(explicit_cfg))
 
     assert load_config("api") == {"base_url": "http://explicit"}
+
+
+def test_warn_migrated_settings_flags_api_section(tmp_path, caplog):
+    """The server no longer reads [api]; a file that still carries it gets a
+    warning naming the replacement (per-definition base_url / api_key)."""
+    import logging
+
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        """[api]
+base_url = "http://localhost:8000/v1"
+api_key = "k"
+"""
+    )
+    set_config_path(str(cfg))
+    with caplog.at_level(logging.WARNING):
+        config_mod.warn_migrated_settings()
+    # structlog renders the console line (template + positional_args repr)
+    # before the record reaches caplog, so match on pieces present either way.
+    text = " | ".join(f"{r.getMessage()} {r.args!r}" for r in caplog.records)
+    assert "has been removed and will be ignored" in text
+    assert "base_url" in text and "Models tab" in text
+    assert "api_key" in text and "OPENAI_API_KEY" in text

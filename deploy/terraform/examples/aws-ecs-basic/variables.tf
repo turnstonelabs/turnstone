@@ -31,13 +31,8 @@ variable "image_tag" {
   default     = "latest"
 }
 
-variable "llm_base_url" {
-  description = "Base URL for the LLM provider API."
-  type        = string
-}
-
 variable "openai_api_key" {
-  description = "API key for the LLM provider."
+  description = "API key used by model definitions that leave api_key empty."
   type        = string
   sensitive   = true
 }

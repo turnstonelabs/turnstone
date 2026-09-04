@@ -396,7 +396,7 @@ def test_calibrate_no_base_url_graceful(
 def _stub_probe(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> None:
     monkeypatch.setattr(
         "turnstone.core.model_registry.probe_model_endpoint",
-        lambda provider, base_url, api_key, target_model="": dict(result),
+        lambda provider, base_url, api_key, target_model="", **_kw: dict(result),
     )
 
 

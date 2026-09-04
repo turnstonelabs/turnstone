@@ -296,13 +296,6 @@ def test_model_reload_endpoint_rewrites_models_metadata(monkeypatch, tmp_path):
     app_state = SimpleNamespace(
         registry=old_reg,
         health_registry=health_reg,
-        cli_model_args={
-            "base_url": "",
-            "api_key": "",
-            "model": "",
-            "context_window": 0,
-            "provider": "openai",
-        },
         config_store=None,
         node_id="node-a",
     )
@@ -360,13 +353,6 @@ def test_model_reload_cap_only_change_resizes_the_stable_gate(monkeypatch):
     original_gate = old_reg.get_admission("a")
     app_state = SimpleNamespace(
         registry=old_reg,
-        cli_model_args={
-            "base_url": "",
-            "api_key": "",
-            "model": "",
-            "context_window": 0,
-            "provider": "openai",
-        },
         config_store=None,
         node_id="",
     )
@@ -415,13 +401,6 @@ def test_model_reload_refuses_dynamic_auth_without_key(monkeypatch, tmp_path, ca
     app_state = SimpleNamespace(
         registry=old_reg,
         health_registry=HealthTrackerRegistry(),
-        cli_model_args={
-            "base_url": "",
-            "api_key": "",
-            "model": "",
-            "context_window": 0,
-            "provider": "openai",
-        },
         config_store=None,
         node_id="node-a",
         mcp_token_store=None,
@@ -455,13 +434,6 @@ def test_model_reload_maps_auth_config_error_to_422(monkeypatch, tmp_path):
     app_state = SimpleNamespace(
         registry=old_reg,
         health_registry=HealthTrackerRegistry(),
-        cli_model_args={
-            "base_url": "",
-            "api_key": "",
-            "model": "",
-            "context_window": 0,
-            "provider": "openai",
-        },
         config_store=None,
         node_id="node-a",
     )
@@ -490,13 +462,6 @@ def test_model_reload_maps_concurrency_config_error_to_422(monkeypatch, tmp_path
     old_reg = _registry(("a", "http://x"))
     app_state = SimpleNamespace(
         registry=old_reg,
-        cli_model_args={
-            "base_url": "",
-            "api_key": "",
-            "model": "",
-            "context_window": 0,
-            "provider": "openai",
-        },
         config_store=None,
         node_id="node-a",
     )
@@ -603,3 +568,67 @@ def test_heartbeat_write_awaits_before_shutdown_delete():
         "BEFORE delete_node_metadata_by_source(..., 'auto') so an in-flight "
         "set_node_metadata_bulk lands before the delete."
     )
+
+
+def test_model_reload_tolerates_the_last_definition_going_away(monkeypatch, tmp_path):
+    """Deleting the last enabled definition and syncing must reload to an
+    empty registry, not 500 and leave the stale one serving. The endpoint
+    passes ``allow_empty=True`` — the same posture as boot."""
+    from turnstone.core.storage._sqlite import SQLiteBackend
+    from turnstone.server import internal_model_reload
+
+    storage = SQLiteBackend(str(tmp_path / "reload-empty.db"))
+    old_reg = _registry(("a", "http://x"))
+    seen: dict[str, object] = {}
+
+    def fake_loader(**kw):
+        seen.update(kw)
+        return ModelRegistry({}, default="")
+
+    app_state = SimpleNamespace(
+        registry=old_reg,
+        health_registry=HealthTrackerRegistry(),
+        config_store=None,
+        node_id="node-a",
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+    monkeypatch.setattr("turnstone.core.model_registry.load_model_registry", fake_loader)
+    monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
+    monkeypatch.setattr("turnstone.server._broadcast_agent_tool_schema_refresh", lambda _s: None)
+
+    response = internal_model_reload(request)  # type: ignore[arg-type]
+    assert response.status_code == 200
+    assert seen.get("allow_empty") is True
+    assert seen.get("strict") is True
+    assert seen.get("detect_context_windows") is True
+    assert old_reg.list_aliases() == []
+
+
+def test_model_reload_keeps_running_registry_when_the_load_fails(monkeypatch, tmp_path):
+    """A storage read failure during a hot-reload (strict load) must answer
+    503 and leave the running registry untouched — never swap in an empty
+    or config-only registry over live aliases."""
+    from turnstone.core.storage._sqlite import SQLiteBackend
+    from turnstone.server import internal_model_reload
+
+    storage = SQLiteBackend(str(tmp_path / "reload-fail.db"))
+    old_reg = _registry(("a", "http://x"))
+
+    def failing_loader(**_kw):
+        raise RuntimeError("connection reset by pgbouncer")
+
+    app_state = SimpleNamespace(
+        registry=old_reg,
+        health_registry=HealthTrackerRegistry(),
+        config_store=None,
+        node_id="node-a",
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+    monkeypatch.setattr("turnstone.core.model_registry.load_model_registry", failing_loader)
+    monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
+
+    response = internal_model_reload(request)  # type: ignore[arg-type]
+    assert response.status_code == 503
+    assert b"registry load failed: RuntimeError" in response.body
+    assert b"pgbouncer" not in response.body  # detail stays in the node log
+    assert old_reg.list_aliases() == ["a"]

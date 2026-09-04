@@ -23,7 +23,6 @@ module "turnstone" {
   image_repository = var.image_repository
   image_tag        = var.image_tag
 
-  llm_base_url   = var.llm_base_url
   openai_api_key = var.openai_api_key
 
   environment = var.environment

@@ -9,19 +9,20 @@
 #   2. $TURNSTONE_CONFIG env var
 #   3. ~/.config/turnstone/config.toml
 
-# --- LLM API (turnstone, node, eval) ---
+# --- LLM API (turnstone CLI, eval) ---
+# The server (node) does not read this section: its models come from the
+# console Models tab and the [models.*] entries below, each with its own
+# base_url and api_key.
 
 [api]
 # base_url = ""                # API endpoint; empty = binary default
 # api_key = ""                 # env: OPENAI_API_KEY or ANTHROPIC_API_KEY
 
-# --- Default Model (turnstone, node, eval) ---
+# --- Model routing and sampling (turnstone, node, eval) ---
 
 [model]
-# name = ""                    # Model ID; empty = provider default (gpt-5 / claude-sonnet-4)
 # temperature = 0.0            # 0 = provider default
 # reasoning_effort = ""        # "none", "minimal", "low", "medium", "high", "xhigh", "max"
-# context_window = 0           # 0 = auto-detect from provider capabilities
 # max_tokens = 0               # 0 = provider default
 #
 # Sub-agent routing (task_agent tool).  Falls back to agent_model when
@@ -37,13 +38,16 @@
 
 # --- Named Models (turnstone, node, eval) ---
 # Define model aliases with per-model overrides. Useful for local model
-# servers or mixing providers. Reference by name with --model flag.
+# servers or mixing providers. Route with [model].default / fallback above,
+# or per call through task_agent's model= argument.
 #
 # [models.local]
-# name = "llama-3-70b"
+# model = "llama-3-70b"
 # provider = "openai"
 # base_url = "http://localhost:8000/v1"
-# context_window = 8192
+# context_window = 0           # 0 = node asks the server at startup (vLLM,
+#                              # llama.cpp); set it when the server does not
+#                              # report one. The CLI applies its own window.
 # max_concurrency = 1          # Per-process generation cap for this alias; 0 = unlimited.
 #                              # For llama.cpp, start with its usable -np slot count.
 #
@@ -52,8 +56,9 @@
 # supports_web_search = false
 #
 # [models.claude]
-# name = "claude-opus-4-8"
-# provider = "anthropic"
+# model = "claude-opus-4-8"
+# provider = "anthropic"       # context_window omitted = provider capability table
+#                              # (Anthropic, OpenAI, xAI; Google needs a value)
 
 # --- Database (turnstone, node, console) ---
 

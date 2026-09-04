@@ -15,7 +15,3 @@ data:
   TURNSTONE_CONSOLE_HOST: "0.0.0.0"
   TURNSTONE_CONSOLE_PORT: {{ .Values.console.service.port | quote }}
   TURNSTONE_POLL_INTERVAL: "5"
-  {{- if .Values.llm.baseUrl }}
-  TURNSTONE_LLM_BASE_URL: {{ .Values.llm.baseUrl | quote }}
-  {{- end }}
-  TURNSTONE_LLM_PROVIDER: {{ .Values.llm.provider | quote }}

@@ -380,25 +380,41 @@ class TestCompatFactory:
         assert create_provider("anthropic-compatible") is provider
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_create_client_anthropic_compatible(self, mock_ensure: MagicMock) -> None:
-        """base_url forwards verbatim; empty api_key is omitted entirely."""
-        from turnstone.core.providers import create_client
+    def test_create_client_anthropic_compatible(
+        self, mock_ensure: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """base_url forwards verbatim. An empty api_key is omitted so the SDK
+        reads ANTHROPIC_API_KEY; when that is unset too, the local placeholder
+        is passed so the client still constructs (a local server needs no
+        bearer, and the SDK refuses to run with neither)."""
+        from turnstone.core.providers import LOCAL_PLACEHOLDER_API_KEY, create_client
 
         mock_anthropic_cls = MagicMock()
         mock_mod = MagicMock()
         mock_mod.Anthropic = mock_anthropic_cls
         mock_ensure.return_value = mock_mod
 
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
         create_client("anthropic-compatible", base_url="http://vllm-host:8000", api_key="")
         mock_anthropic_cls.assert_called_once_with(base_url="http://vllm-host:8000")
 
+        mock_anthropic_cls.reset_mock()
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        create_client("anthropic-compatible", base_url="http://vllm-host:8000", api_key="")
+        mock_anthropic_cls.assert_called_once_with(
+            api_key=LOCAL_PLACEHOLDER_API_KEY, base_url="http://vllm-host:8000"
+        )
+
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_create_client_strips_v1_suffix(self, mock_ensure: MagicMock) -> None:
+    def test_create_client_strips_v1_suffix(
+        self, mock_ensure: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A /v1-suffixed base_url (openai-compatible muscle memory) is
         normalized for the compat lane — the SDK appends /v1/... itself,
         so the verbatim URL would request /v1/v1/messages and 404."""
         from turnstone.core.providers import create_client
 
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
         mock_anthropic_cls = MagicMock()
         mock_mod = MagicMock()
         mock_mod.Anthropic = mock_anthropic_cls

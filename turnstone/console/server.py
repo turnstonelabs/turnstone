@@ -5477,7 +5477,7 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
     coord_registry: Any | None = None
     try:
         try:
-            coord_registry = load_model_registry(storage=storage)
+            coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
         except ValueError as exc:
             # No model rows configured.  Endpoint returns 503 with the
             # error text so admin sees remediation in the UI; the
@@ -12857,7 +12857,12 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         # Without it, the loader degrades to a config.toml-only registry
         # and ``existing.reload()`` would silently drop every DB-sourced
         # alias.
-        new_registry = load_model_registry(storage=storage, strict=True)
+        new_registry = load_model_registry(
+            storage=storage,
+            strict=True,
+            detect_context_windows=True,
+            prior=existing.models,
+        )
     except ValueError as exc:
         # ModelRegistry.__init__ raises ValueError for several distinct
         # config issues — empty models, default/fallback/agent/task
@@ -12953,7 +12958,7 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
         if getattr(app.state, "coord_mgr", None) is not None:
             return
         try:
-            coord_registry = load_model_registry(storage=storage)
+            coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
         except ValueError as exc:
             # Still no usable rows (e.g. all disabled).  Surface the
             # reason via the same channel the lifespan path uses so
@@ -13214,9 +13219,18 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": f"Unknown provider: {provider!r}"},
             status_code=400,
         )
+    from turnstone.core.providers import LOCAL_PROVIDERS
+
     base_url = str(body.get("base_url", "")).strip()
+    if provider in LOCAL_PROVIDERS and not base_url:
+        # Fully knowable at save time; without it the SDK client would target
+        # the provider's public endpoint (create_client refuses, but only on
+        # the first turn, as a per-user construction error).
+        return JSONResponse(
+            {"error": f"base_url is required for provider {provider!r}"}, status_code=400
+        )
     api_key = str(body.get("api_key", "")).strip()
-    ctx_raw = body.get("context_window", 32768)
+    ctx_raw = body.get("context_window", 0)  # omitted = auto-detect
     # json admits NaN/Infinity literals, which pass the isinstance check but
     # crash int(); refuse non-finite floats as invalid values instead.
     if isinstance(ctx_raw, float) and not math.isfinite(ctx_raw):
@@ -13457,6 +13471,25 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         updates["provider"] = prov
     if "base_url" in body:
         updates["base_url"] = str(body["base_url"]).strip()
+    if "provider" in body or "base_url" in body:
+        # Only a request that chooses the endpoint is refused for it; an
+        # unrelated update (enabled, alias) to an older row still goes through.
+        from turnstone.core.providers import LOCAL_PROVIDERS
+
+        effective_provider = updates.get("provider", existing.get("provider", "openai"))
+        effective_base_url = updates.get("base_url", existing.get("base_url", ""))
+        stored_url = str(existing.get("base_url") or "")
+        # provider "openai" with a non-OpenAI host is a local server too — the
+        # loader reclassifies it at load time — so blanking that host would
+        # retarget the row to the commercial API.
+        was_local = bool(stored_url) and "api.openai.com" not in stored_url
+        if not effective_base_url and (
+            effective_provider in LOCAL_PROVIDERS or (effective_provider == "openai" and was_local)
+        ):
+            return JSONResponse(
+                {"error": f"base_url is required for provider {effective_provider!r}"},
+                status_code=400,
+            )
     if "api_key" in body:
         api_key = str(body["api_key"]).strip()
         # Sentinel "***" or empty string means "keep existing"
@@ -13888,10 +13921,29 @@ async def admin_detect_model(request: Request) -> JSONResponse:
     ):
         return JSONResponse({"error": "api_key is required"}, status_code=400)
 
+    from turnstone.core.providers import LOCAL_PROVIDERS
+
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
-        None, probe_model_endpoint, provider, base_url, api_key, model
+        None,
+        functools.partial(
+            probe_model_endpoint,
+            provider,
+            base_url,
+            api_key,
+            model,
+            # A local server serving a commercial model id must not be shown
+            # (and then saved with) that model's commercial window; the
+            # registry loader applies the same rule.
+            static_table=provider not in LOCAL_PROVIDERS,
+        ),
     )
+    if result.get("reachable") and result.get("context_window") is None:
+        # Tell the form what the node would run with, so the operator sees
+        # the number before the first call instead of in the node log.
+        from turnstone.core.model_registry import FALLBACK_CONTEXT_WINDOW
+
+        result["fallback_context_window"] = FALLBACK_CONTEXT_WINDOW
     return JSONResponse(result)
 
 

@@ -31,13 +31,8 @@ variable "image_tag" {
 
 # --- LLM Provider ---
 
-variable "llm_base_url" {
-  description = "Base URL for the LLM provider API (e.g. https://api.openai.com/v1)."
-  type        = string
-}
-
 variable "openai_api_key" {
-  description = "API key for the LLM provider. Stored in AWS Secrets Manager."
+  description = "API key used by model definitions that leave api_key empty. Stored in AWS Secrets Manager."
   type        = string
   sensitive   = true
 }

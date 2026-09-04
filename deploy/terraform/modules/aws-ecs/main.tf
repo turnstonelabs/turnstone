@@ -26,7 +26,6 @@ locals {
   common_env = [
     { name = "TURNSTONE_ENV", value = var.environment },
     { name = "TURNSTONE_DB_BACKEND", value = "postgresql" },
-    { name = "TURNSTONE_LLM_BASE_URL", value = var.llm_base_url },
   ]
 
   # Secrets pulled from Secrets Manager at container start.

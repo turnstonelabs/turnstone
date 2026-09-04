@@ -29,8 +29,69 @@ frozen.
   addresses, and the `https://` requirement for per-user bearers is
   unchanged. A refusal names the remedy that actually applies to it.
 
+### Changed
+
+- **A model definition that leaves `api_key` empty on a local server**
+  (`openai-compatible` / `anthropic-compatible`) resolves its bearer the way
+  the server's own `--api-key` default used to: the SDK's environment
+  variable when set, otherwise a placeholder, so vLLM and llama.cpp
+  definitions keep working without an exported `OPENAI_API_KEY`. Commercial
+  providers keep the SDK environment-variable rule unchanged.
+- **`turnstone-doctor` resolves its own model the way a node does** — from
+  the database definitions and `[models.*]` — instead of seeding one from
+  `[api]` / `LLM_BASE_URL`, which a node no longer reads.
+- **A `[models.*]` entry that names neither `base_url` nor `provider`** is
+  skipped with a startup warning. It used to inherit the server's bootstrap
+  endpoint; without one, the default provider would send its prompts to the
+  commercial OpenAI API.
+
+### Removed
+
+- **`turnstone-server` no longer takes `--base-url`, `--api-key`,
+  `--provider`, or `--model`, and no longer reads `[api]` from
+  `config.toml`.** Model endpoints live in the console Models tab and in
+  `[models.*]` entries, each with its own `base_url` and `api_key`; a server
+  started with nothing configured boots with an empty registry and picks
+  models up live from the console. `compose.yaml` drops the `LLM_BASE_URL`
+  and `MODEL` variables, the Helm chart drops `llm.baseUrl` / `llm.provider`
+  (their environment variables were read by nothing), and the Terraform
+  module drops `llm_base_url`. A `config.toml` that still carries `[api]`
+  gets a startup warning naming the replacement. The `turnstone` CLI keeps
+  its flags.
+
 ### Fixed
 
+- **Context window auto-detection (#1052).** A model definition whose
+  `context_window` is `0` is now resolved per definition: from the
+  provider's capability table for Anthropic, OpenAI and xAI, and by asking
+  the definition's own endpoint for local servers and gateways (vLLM
+  `max_model_len`, llama.cpp `n_ctx_train`, and the `context_length`,
+  `context_window` or `max_context_length` that OpenRouter, Together,
+  Fireworks, Groq and Mistral report) — at startup and on every
+  hot-reload, identical
+  definitions sharing one probe; when a reload's probe fails, a definition
+  the running registry had detected on the same endpoint and model keeps
+  that window, so a backend mid-restart never shrinks live sessions. The
+  server, the console and the doctor resolve the same way. Previously every
+  such definition inherited the window the server had detected on its
+  bootstrap endpoint at boot — 32768 whenever `--model` was passed or that
+  endpoint was unreachable, and the wrong endpoint's number otherwise. A
+  definition that cannot be resolved — a model id the capability table does
+  not list (every Google model, which has no table), an unreachable or
+  silent endpoint — falls back to 32768 with a startup warning naming the
+  alias and the reason. Probes run concurrently under a five-second budget.
+  A definition created through the admin API without a `context_window` is
+  stored as auto-detect rather than a literal 32768. A local-server
+  definition without a `base_url` is refused at save time and skipped at
+  load time, and a `[models.*]` entry with `provider = "openai"` and no
+  `base_url` is skipped while the file still carries `[api] base_url`,
+  since it was written to inherit that endpoint. The console Detect button
+  no longer offers a commercial model's window for a local server, and when
+  the endpoint reports no window it fills the field with the 32768 the node
+  would otherwise use, and says so, so the operator corrects it before the
+  first call rather than finding it in the node log. Node
+  hot-reloads are serialised and keep the running registry when the load
+  fails.
 - **MCP OAuth discovery for servers and issuers with paths (#1061, #1063).**
   Protected-resource metadata is fetched from the RFC 9728 path-specific
   location first and the origin-level location second, in one candidate loop

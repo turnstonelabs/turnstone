@@ -30,9 +30,3 @@ Components deployed:
   - PostgreSQL (bitnami subchart)
 {{- end }}
 
-{{- if not .Values.llm.apiKey }}
-{{- if not .Values.llm.existingSecret }}
-
-WARNING: No LLM API key configured. Set llm.apiKey or llm.existingSecret in your values.
-{{- end }}
-{{- end }}
