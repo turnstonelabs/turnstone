@@ -56,7 +56,12 @@ frozen.
   budget.
   User-scoped MCP server rows store the canonical URL, a spelling-only
   change no longer purges user tokens, and a Server URL or Authorization
-  Server URL change clears the cached issuer. Every MCP OAuth HTTP client
+  Server URL change clears the cached issuer. Changing the Authorization
+  Server URL on a user-scoped row now also purges that server's per-user
+  grants and pending consents, since the stored refresh tokens were issued
+  by the previous authorization server, and clears a dynamically registered
+  client id, which the previous server issued and the new one will not
+  honour. Every MCP OAuth HTTP client
   sends `Accept: application/json` by default, so token endpoints that
   content-negotiate return JSON on every grant leg.
 

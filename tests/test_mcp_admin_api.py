@@ -1730,7 +1730,10 @@ class TestOAuthUrlCanonicalization:
         assert row["oauth_as_issuer_cached"] is None
         purge.assert_called_once_with("canon-move")
 
-    def test_as_override_change_clears_cached_issuer_without_purge(self, client, storage):
+    def test_as_override_change_purges_and_clears_cached_issuer(self, client, storage):
+        # Pointing a row at a different authorization server is a
+        # token-binding change: the stored refresh tokens were issued by the
+        # old one, and the next refresh would present them to the new one.
         from unittest.mock import patch
 
         r = self._create(client, "canon-as", "https://orig.example.com/sse")
@@ -1751,7 +1754,68 @@ class TestOAuthUrlCanonicalization:
         row = storage.get_mcp_server(sid)
         assert row["oauth_authorization_server_url"] == "https://as2.example.com"
         assert row["oauth_as_issuer_cached"] is None
+        purge.assert_called_once_with("canon-as")
+
+    def test_as_override_resent_unchanged_does_not_purge(self, client, storage):
+        # The admin form re-sends every pre-filled field, so an unrelated
+        # save must not read as an authorization-server change.
+        from unittest.mock import patch
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "canon-as-noop",
+                "transport": "streamable-http",
+                "url": "https://orig.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_seed",
+                "oauth_authorization_server_url": "https://as.example.com",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        with patch.object(
+            storage,
+            "delete_mcp_oauth_rows_by_server_name",
+            wraps=storage.delete_mcp_oauth_rows_by_server_name,
+        ) as purge:
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={
+                    "oauth_authorization_server_url": "https://as.example.com",
+                    "enabled": False,
+                },
+            )
+        assert r2.status_code == 200, r2.text
         purge.assert_not_called()
+
+    def test_as_override_change_clears_a_dynamic_client_id(self, client, storage):
+        # A dynamically registered client_id was issued BY the old
+        # authorization server and means nothing at the new one; clearing it
+        # lets registration run again. A pre-registered id is the operator's
+        # own value and is left alone.
+        for mode, expected in (("dynamic", None), ("preregistered", "cli_seed")):
+            r = client.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": f"canon-dcr-{mode}",
+                    "transport": "streamable-http",
+                    "url": "https://orig.example.com/sse",
+                    "auth_type": "oauth_user",
+                    "oauth_client_id": "cli_seed",
+                    "oauth_registration_mode": mode,
+                    "oauth_authorization_server_url": "https://as.example.com",
+                },
+            )
+            assert r.status_code == 200, r.text
+            sid = r.json()["server_id"]
+            r2 = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}",
+                json={"oauth_authorization_server_url": "https://as2.example.com"},
+            )
+            assert r2.status_code == 200, r2.text
+            assert storage.get_mcp_server(sid)["oauth_client_id"] == expected, mode
 
     def test_update_rejects_fragment(self, client, storage):
         r = self._create(client, "canon-upd-reject", "https://orig.example.com/sse")

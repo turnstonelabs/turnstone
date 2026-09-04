@@ -11394,6 +11394,20 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     ) != (existing.get("oauth_authorization_server_url") or None)
     if url_changing or as_url_changing:
         updates["oauth_as_issuer_cached"] = None
+    # Pointing a row at a different authorization server is a token-binding
+    # change like a URL change: the stored refresh tokens were issued by the
+    # OLD authorization server, and the next refresh would present them to the
+    # new one. A dynamically registered client_id has the same problem — it
+    # was issued by the old server and means nothing at the new one — so it is
+    # cleared too, letting registration run again. A pre-registered client_id
+    # is the operator's own value and is left alone.
+    as_url_purge = as_url_changing and is_user_scoped_auth(old_auth)
+    if as_url_purge:
+        registration_mode = str(
+            updates.get("oauth_registration_mode", existing.get("oauth_registration_mode")) or ""
+        )
+        if registration_mode == "dynamic":
+            updates["oauth_client_id"] = None
     # Changing oauth_audience on a pool-backed row is a token-binding change too:
     # minted obo bearers (and oauth_user tokens) are audience-scoped, so cached
     # rows for the OLD audience must be purged or a privilege reduction silently
@@ -11472,7 +11486,14 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # URL/audience/scope set (the OAuth tables key on the mutable
     # ``server_name`` and tokens are bound to the URL + audience + scopes
     # active at mint/consent time).
-    if name_changing or auth_type_purge or url_changing or audience_changing or scopes_changing:
+    if (
+        name_changing
+        or auth_type_purge
+        or url_changing
+        or as_url_purge
+        or audience_changing
+        or scopes_changing
+    ):
         purge_target = existing.get("name", "")
         if purge_target:
             try:
