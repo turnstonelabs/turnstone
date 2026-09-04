@@ -9,6 +9,12 @@ mocks, not the unit suite. Two grant legs:
 - **Keycloak / RFC 8693** (`keycloak_e2e.py` + `.sh`) — ephemeral docker, fully
   headless.
 
+The sibling per-user flow (`auth_type=oauth_user`, OAuth 2.1 + PKCE against the
+MCP server's own authorization server) has its own harness in the same idiom:
+
+- **Keycloak / per-user consent** (`oauth_user_e2e.py` + `.sh`) — ephemeral
+  docker, fully headless (the harness submits Keycloak's login form itself).
+
 There is also `entra_spike.py` (raw-OAuth **wire** probe, pre-implementation
 reference) and `entra_setup.sh` (creates the Entra app registrations + writes a
 populated `.env`).
@@ -79,6 +85,86 @@ discovery rework — resolved in 3 probes to the realm's own token endpoint
 with S256 advertised and the issuer confirmed. D1 calls `_fetch_as_metadata`
 directly, so it also catches signature drift no unit test covers: it caught
 the added `deadline` argument on the first run after that change.
+
+## `oauth_user_e2e.py` + `oauth_user_e2e.sh` — per-user OAuth (`auth_type=oauth_user`), headless
+
+The `oauth_user` sibling of `keycloak_e2e.py`. `oauth_user_e2e.sh` spins up
+ephemeral Keycloak, configures the realm (a public PKCE-required client whose
+tokens carry the resource identifier in `aud` through an audience mapper, a
+second client without that mapper, a test user, anonymous dynamic client
+registration), runs the harness, then tears down. The harness drives the REAL
+console OAuth surface — `handle_mcp_oauth_authorize` →
+`handle_mcp_oauth_callback` → `get_user_access_token_classified` →
+`handle_mcp_oauth_revoke_connection`, mounted on the console's own routes with
+the client `initialize_mcp_oauth_state` installs — so RFC 9728
+protected-resource metadata, RFC 8414 authorization-server metadata for a
+path-bearing realm issuer, the PKCE code exchange, the refresh grant and RFC
+7009 revocation all happen on the wire. The "MCP server" is a local stub that
+serves only the protected-resource metadata documents and records which
+well-known location was read. No browser: the harness carries Keycloak's
+cookies and submits its login (and, for a registered client, consent) form
+itself. Ports: Keycloak 8092, resource-server stubs 8093 (path-specific) and
+8094 (origin-level only), redirect base 8095 (8090 = the dev console, 8091 =
+the obo harness).
+
+```bash
+./scripts/obo-e2e/oauth_user_e2e.sh
+```
+
+Results — RUN 2026-09-03, 13 VERIFIED / 2 FAILED (exit 1), reproduced on
+`main` after the discovery rework merged; both failures are
+product findings, not harness defects, and are listed below. VERIFIED: D1
+discovery through the authorize handler — PRM read at the path-specific
+location only, the realm issuer resolved in 3 probes to its
+`openid-configuration`, issuer persisted on the row; C1 authorize URL (S256,
+`resource=` the canonical row URL, callback derived from `redirect_base`); C2
+consent — headless login, callback 302 to `return_url`, token row persisted as
+ciphertext, `aud` carries the resource; C3 the stored token is live at Keycloak
+(userinfo) and the callback made exactly one request, the code exchange; C4
+cache hit (0 requests); C5 callback replay refused (state single-use, 0
+requests); C6 refresh after a REAL clock expiry (the realm issues 90s tokens;
+the harness waits ~30s for the product's 60s refresh-ahead window) — one token
+POST, no re-discovery, refresh token rotated and written back, new token live;
+C7 force_refresh (one more POST); C8 connections list without secret fields;
+C9 revoke — 204, row gone, lookup `missing`, one POST to the realm's revocation
+endpoint, and a refresh grant with the revoked token then fails
+`invalid_grant` AT KEYCLOAK; N1 a PRM document declaring a sibling resource
+refused (`PRM resource identifier does not match the server URL`), the origin
+fallback probed and 404'd, no authorization-server traffic; N2 a real token
+whose `aud` omits the resource refused at the callback with nothing persisted;
+D2 the origin-level fallback accepted for a server that serves only there.
+
+FAILED — product findings:
+
+- **D4 issuer not persisted on a warm metadata cache** (#1081).
+  `discover_authorization_server` returns from the in-process metadata-cache hit
+  before reaching the block that writes `oauth_as_issuer_cached`, so any row
+  whose authorization server is already cached (a second server on the same
+  realm) never gets its issuer persisted: its callback, every refresh and the
+  revoke re-read the resource server's PRM document for as long as the cache
+  entry lives (24h), and a refresh then depends on the resource server being up
+  to serve metadata the product already knows. Visible in N2's callback wire
+  (a PRM GET before the token POST) as well. Predates this branch.
+- **D3 dynamic client registration against Keycloak** (#1082). `register_dynamic_client`
+  sends a `resource` member in the RFC 7591 body; Keycloak's OIDC registration
+  endpoint rejects unknown members (`HTTP 400: Invalid json representation for
+  OIDCClientRepresentation. Unrecognized field "resource"`), so
+  `registration_mode=dcr` cannot work against Keycloak at all. With the member
+  removed the same body registers (201, public client) and the consent flow
+  completes on the registered client — verified by hand while building the
+  harness. RFC 7591 §2 says the server MUST ignore metadata it does not
+  understand, but `resource` is not registered client metadata either.
+
+Gotchas: Keycloak marks its cookies `Secure` and a real browser still sends
+them to a loopback origin over http (loopback is a secure context), but
+`http.cookiejar` does not — the harness keeps the jar by hand. Keycloak ignores
+RFC 8707 `resource=`, so the resource identifier reaches `aud` through an
+audience mapper (the realm config does this). For anonymous DCR, Keycloak's
+Trusted Hosts policy sees the docker gateway address, not loopback, as the
+requester, so trust is judged on the registered redirect URI's host instead;
+and its Allowed Client Scopes policy rejects a registration whose `scope`
+names anything that is not a realm client scope (`openid` included), so the
+DCR row is seeded with no scopes.
 
 ## Leg 1 — Entra (`entra_spike.py`) — NEEDS TENANT ACCESS
 
