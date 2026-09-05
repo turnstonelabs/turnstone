@@ -26,6 +26,17 @@ frozen.
   run in the browser's local zone, and the shelf's NEXT RUN column now
   converts the server's UTC time to local time instead of relabelling it.
 
+### Changed
+
+- **Darker amber, cyan and blue in the light theme (#1092).** The launcher's
+  active kind label is drawn in its kind's hue over a tint of the same hue,
+  and in the light theme that sat just under the 4.5:1 text-contrast
+  threshold; the skill shelf's origin badge had the same pairing in cyan.
+  The light-theme amber, cyan and blue tokens now run one step darker,
+  which clears the threshold with room to spare and deepens every other
+  light-theme chip, badge and button that uses those hues by the same
+  step. The dark theme is unchanged.
+
 ## [1.8.2]
 
 Turnstone 1.8.2 moves model endpoints entirely into model definitions and

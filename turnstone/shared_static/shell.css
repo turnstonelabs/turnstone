@@ -47,7 +47,7 @@
   width: 18px;
   height: 18px;
   border-radius: 5px;
-  background: linear-gradient(135deg, var(--accent), #b9762a);
+  background: linear-gradient(135deg, var(--accent), var(--brand-mark-end));
   box-shadow: 0 0 10px var(--accent-glow-strong);
   flex: none;
 }
@@ -962,8 +962,8 @@
   bottom: 2px;
   height: 2px;
   border-radius: 2px;
-  /* 80%: 55% composited to 2.34:1 on the light --panel (sub-3:1 for a
-     load-bearing state mark); 80% = ~3.7:1 light / ~5:1 dark */
+  /* 80%: 55% composited to ~2.5:1 on the light --panel (sub-3:1 for a
+     load-bearing state mark); 80% = ~4.3:1 light / ~5.5:1 dark */
   background: color-mix(in srgb, var(--accent) 80%, transparent);
 }
 .pane-head {
@@ -1062,7 +1062,9 @@
    system-operation hue: the scheduler starts it; magenta is reserved for
    the MCP surface), so "which kind am I starting" reads at a glance.  Tints
    are 15% (sub-0.10 washes out at chip size) and colour is never alone: the
-   kind LED + label weight carry the state too. */
+   kind LED + label weight carry the state too.  The light-theme --accent /
+   --cyan / --blue (base.css) are cut dark enough that the label clears
+   4.5:1 on its tint; measure again before lightening them. */
 .launcher-kinds {
   display: inline-flex;
   flex-wrap: wrap; /* three kinds outgrow a narrow split pane — wrap, not clip */
