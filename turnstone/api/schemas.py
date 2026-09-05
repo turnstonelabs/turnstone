@@ -182,13 +182,21 @@ class AuthWhoamiResponse(BaseModel):
 
 
 class CreateScheduleRequest(BaseModel):
-    """POST /v1/api/admin/schedules request body."""
+    """POST /v1/api/admin/schedules request body.
+
+    A field sent as null is rejected with a 400 naming the field; omit a
+    field to take its default.
+    """
 
     name: str = Field(description="Human-readable schedule name")
     description: str = Field(default="", description="Optional description")
     schedule_type: str = Field(description="'cron' or 'at'")
     cron_expr: str = Field(default="", description="Cron expression (when schedule_type='cron')")
     at_time: str = Field(default="", description="ISO8601 timestamp (when schedule_type='at')")
+    timezone: str = Field(
+        default="UTC",
+        description="IANA zone the cron is evaluated in (e.g. America/New_York); 'at' ignores it",
+    )
     target_mode: str = Field(default="auto", description="auto, pool, all, or specific node_id")
     model: str = Field(default="", description="Model alias for the workstream")
     initial_message: str = Field(description="Message sent to the new workstream")
@@ -205,13 +213,19 @@ class CreateScheduleRequest(BaseModel):
 
 
 class UpdateScheduleRequest(BaseModel):
-    """PUT /v1/api/admin/schedules/{task_id} request body (partial update)."""
+    """PUT /v1/api/admin/schedules/{task_id} request body (partial update).
+
+    Omit a field to leave it unchanged; a field sent as null is rejected with
+    a 400 naming the field, and a timing field resent with its stored value
+    is not a change.
+    """
 
     name: str | None = None
     description: str | None = None
     schedule_type: str | None = None
     cron_expr: str | None = None
     at_time: str | None = None
+    timezone: str | None = None
     target_mode: str | None = None
     model: str | None = None
     initial_message: str | None = None
@@ -233,6 +247,7 @@ class ScheduleInfo(BaseModel):
     schedule_type: str
     cron_expr: str = ""
     at_time: str = ""
+    timezone: str = "UTC"
     target_mode: str = "auto"
     model: str = ""
     initial_message: str

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.8.0a7",
+    "version": "1.8.2",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -9795,7 +9795,7 @@
         "type": "object"
       },
       "CreateScheduleRequest": {
-        "description": "POST /v1/api/admin/schedules request body.",
+        "description": "POST /v1/api/admin/schedules request body.\n\nA field sent as null is rejected with a 400 naming the field; omit a\nfield to take its default.",
         "properties": {
           "name": {
             "description": "Human-readable schedule name",
@@ -9823,6 +9823,12 @@
             "default": "",
             "description": "ISO8601 timestamp (when schedule_type='at')",
             "title": "At Time",
+            "type": "string"
+          },
+          "timezone": {
+            "default": "UTC",
+            "description": "IANA zone the cron is evaluated in (e.g. America/New_York); 'at' ignores it",
+            "title": "Timezone",
             "type": "string"
           },
           "target_mode": {
@@ -9898,7 +9904,7 @@
         "type": "object"
       },
       "UpdateScheduleRequest": {
-        "description": "PUT /v1/api/admin/schedules/{task_id} request body (partial update).",
+        "description": "PUT /v1/api/admin/schedules/{task_id} request body (partial update).\n\nOmit a field to leave it unchanged; a field sent as null is rejected with\na 400 naming the field, and a timing field resent with its stored value\nis not a change.",
         "properties": {
           "name": {
             "anyOf": [
@@ -9959,6 +9965,18 @@
             ],
             "default": null,
             "title": "At Time"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Timezone"
           },
           "target_mode": {
             "anyOf": [
@@ -10121,6 +10139,11 @@
           "at_time": {
             "default": "",
             "title": "At Time",
+            "type": "string"
+          },
+          "timezone": {
+            "default": "UTC",
+            "title": "Timezone",
             "type": "string"
           },
           "target_mode": {

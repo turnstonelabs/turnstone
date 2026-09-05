@@ -2238,6 +2238,7 @@ function _createSchedule(opts) {
     schedule_type: when.schedule_type,
     cron_expr: when.cron_expr,
     at_time: when.at_time,
+    timezone: when.timezone,
     target_mode: target,
     initial_message: task,
     model: (opts.model || "").trim(),

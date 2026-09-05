@@ -1596,11 +1596,13 @@ class StorageBackend(Protocol):
         notify_targets: str = "[]",
         persona: str = "",
         project_id: str = "",
+        timezone: str = "UTC",
     ) -> None:
         """Create a scheduled task. No-op if task_id already exists.
 
         ``persona`` (slug) and ``project_id`` are stamped onto the workstream
         each firing creates; empty = kind-default persona / no project.
+        ``timezone`` is the IANA zone a cron schedule is evaluated in.
         """
         ...
 

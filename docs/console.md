@@ -432,14 +432,17 @@ scheduler later dispatches the task as an interactive workstream (see
 [Scheduled Tasks](#scheduled-tasks)). The kind carries the interactive field
 set, including node placement, and reveals a **When** builder between the
 kind toggle and the composer with Daily / Weekly / Monthly / Interval / Once /
-Cron modes and a live "next runs" read-out. Recurring times are entered in
-UTC (the cron has no zone); a one-shot takes local time; the read-out and the
-confirmation show each run in the browser's local zone. The task text becomes the
-schedule's initial message and is required; the Name option, when empty, is
-derived from the task's first line. Judge model and attachments do not apply,
-so the kind hides them. Submitting uses `POST /v1/api/admin/schedules`; a
-confirmation beneath the composer names the first run, and the schedule is
-then managed under Admin › Schedules.
+Cron modes and a live "next runs" read-out. Recurring times are entered in the
+browser's time zone, which is stored with the schedule and is the zone the
+scheduler evaluates the cron in, so a wall-clock time keeps its meaning across
+daylight-saving changes; the time inputs are labelled with the zone. A one-shot
+takes local time. The read-out and the confirmation show each run in the
+browser's local zone. The task text becomes the schedule's initial message and
+is required; the Name option, when empty, is derived from the task's first
+line. Judge model and attachments do not apply, so the kind hides them.
+Submitting uses `POST /v1/api/admin/schedules`; a confirmation beneath the
+composer names the first run, and the schedule is then managed under Admin ›
+Schedules.
 
 Files require a non-empty initial task so the first turn consumes the staged
 attachments. The console shell does not currently expose a fork action; use the
@@ -567,8 +570,12 @@ The console includes a background **TaskScheduler** daemon that creates workstre
 Schedules are created and managed under Admin › Schedules, and can also be
 created from the dashboard launcher's Scheduled kind (see
 [Workstream launcher](#workstream-launcher)). Both surfaces share one timing
-builder; the admin shelf additionally offers a description, auto-approve,
-notification targets and the pool / all target modes.
+builder, which labels the recurring-time inputs with the zone they are read in:
+the browser's for a new schedule, the saved zone when editing (an edit never
+re-zones a schedule to the editor's browser). The admin shelf additionally
+offers a description, auto-approve, notification targets and the pool / all
+target modes; its list names a schedule's zone beside the cron when it is not
+UTC.
 
 ### Architecture
 
@@ -577,7 +584,7 @@ The scheduler runs as a daemon thread inside the console process. Every `check_i
 1. Acquires a distributed lock via the `system_settings` table (prevents duplicate dispatch in multi-console deployments)
 2. Queries the storage backend for tasks whose `next_run <= now` and `enabled = true`
 3. Dispatches each due task as one or more workstream creation requests via HTTP proxy
-4. Updates `last_run` and computes the next `next_run` (or disables one-shot `at` tasks)
+4. Updates `last_run` and computes the next `next_run` (or disables one-shot `at` tasks). A recurring schedule whose zone the host can no longer resolve, or whose expression has no future firing, is disabled with the reason recorded in its run history; re-enabling it re-validates the stored timing.
 5. Releases the lock
 
 Run history is automatically pruned (runs older than 90 days) approximately once per hour.
@@ -586,8 +593,21 @@ Run history is automatically pruned (runs older than 90 days) approximately once
 
 | Type | Field | Behavior |
 |------|-------|----------|
-| `cron` | `cron_expr` | Recurring schedule using standard 5-field cron syntax. Requires `croniter`. |
+| `cron` | `cron_expr`, `timezone` | Recurring schedule using standard 5-field cron syntax, evaluated in `timezone` (an IANA name such as `America/New_York`; default `UTC`). Requires `croniter`. |
 | `at` | `at_time` | One-shot: fires once at the given ISO 8601 timestamp (must include timezone), then auto-disables. |
+
+A cron's fields are wall-clock in its `timezone`: `30 2 * * *` in
+`America/New_York` fires at 02:30 local on either side of a daylight-saving
+change, and a weekly day is the local day. A time the spring-forward gap
+removes fires at the first instant after it. On the fall-back day an
+expression that names times of day (literal minute and hour fields or
+ranges without a step, such as `0 1-2 * * *`, or a shorthand such as
+`@daily`) fires each of them once, while a cadence (a step or wildcard in
+either field) keeps firing through the repeated hour, which is real time.
+`next_run` and `last_run` are always stored in UTC, whatever the zone; for a
+one-shot the offset in `at_time` is folded into `next_run` while `at_time`
+itself is kept as submitted. Schedules created before the zone was stored
+carry `UTC`, the zone they were always evaluated in.
 
 ### Target Modes
 
@@ -626,6 +646,7 @@ List all scheduled tasks.
       "schedule_type": "cron",
       "cron_expr": "0 2 * * *",
       "at_time": "",
+      "timezone": "America/New_York",
       "target_mode": "auto",
       "model": "",
       "initial_message": "Run the nightly health check suite.",
@@ -654,6 +675,7 @@ Request:
   "description": "Run nightly health checks",
   "schedule_type": "cron",
   "cron_expr": "0 2 * * *",
+  "timezone": "America/New_York",
   "target_mode": "auto",
   "initial_message": "Run the nightly health check suite.",
   "auto_approve": false,
@@ -661,9 +683,9 @@ Request:
 }
 ```
 
-Required fields: `name`, `schedule_type`, `initial_message`. For `cron` schedules provide `cron_expr`; for `at` schedules provide `at_time` (ISO 8601 with timezone, must be in the future).
+Required fields: `name`, `schedule_type`, `initial_message`. For `cron` schedules provide `cron_expr` and, optionally, `timezone` (an IANA zone name; absent or blank means `UTC`); for `at` schedules provide `at_time` (ISO 8601 with timezone, must be in the future). A field sent as `null` is rejected with `400` naming the field.
 
-Response: `ScheduleInfo` (same shape as list items above). Returns `400` for invalid cron syntax, naive timestamps, or past `at_time`. Returns `409` if the 200-schedule cap is reached.
+Response: `ScheduleInfo` (same shape as list items above). Returns `400` for invalid cron syntax, a cron that never matches a real calendar date, an unknown `timezone`, naive timestamps, or past `at_time`. Returns `409` if the 200-schedule cap is reached.
 
 #### `GET /v1/api/admin/schedules/{task_id}`
 
@@ -671,7 +693,7 @@ Get a single scheduled task. Returns `ScheduleInfo` or `404`.
 
 #### `PUT /v1/api/admin/schedules/{task_id}`
 
-Partial update — only include fields to change. If `schedule_type`, `cron_expr`, or `at_time` change, `next_run` is recomputed automatically.
+Partial update — only include fields to change; a field sent as `null` is rejected with `400` naming the field, as is a blank `timezone` (name a zone to change it). A timing field resent with its stored value is not a change. If `schedule_type`, `cron_expr`, `at_time`, or `timezone` change, `next_run` is recomputed automatically.
 
 ```json
 {
@@ -706,7 +728,7 @@ List execution history for a task (most recent first). `limit` defaults to 50, m
 }
 ```
 
-Status is `dispatched` on success or `failed` with an `error` message (e.g. no reachable nodes). Failed runs do not advance `next_run`.
+Status is `dispatched` on success, `failed` with an `error` message (e.g. no reachable nodes), or `disabled` when the schedule was disabled at dispatch because no next firing could be computed, with the reason in `error`. Failed runs do not advance `next_run`.
 
 ---
 

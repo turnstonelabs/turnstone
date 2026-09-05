@@ -1437,3 +1437,40 @@ def test_proxy_shim_selectors_still_exist_in_shell_js() -> None:
             "would silently disable back-to-console.  Update the shim's "
             "querySelector calls in the same change."
         )
+
+
+def test_schedule_when_template_names_the_zone_per_pane() -> None:
+    """#1091: the builder fills every ``data-when-zone`` span with the
+    schedule's zone (setState), and the template's own text is the literal
+    "UTC" fallback — so a renamed attribute on either side would silently
+    label every time input UTC while the schedule runs elsewhere.  Pinned as
+    an exact partition: the wall-clock panes (daily, weekly, monthly, cron)
+    carry the span; interval and once do not — an interval's read-out names
+    the zone only for an hours cadence, and a one-shot is entered in the
+    browser's local time and says so in its own hint."""
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    start = index.index('<template id="schedule-when-template">')
+    template = index[start : index.index("</template>", start)]
+    panes = re.findall(r'<div data-when-pane="(\w+)"', template)
+    assert set(panes) == {"daily", "weekly", "monthly", "interval", "once", "cron"}
+    zoned: dict[str, bool] = {}
+    for i, name in enumerate(panes):
+        block_start = template.index(f'<div data-when-pane="{name}"')
+        block_end = (
+            template.index(f'<div data-when-pane="{panes[i + 1]}"')
+            if i + 1 < len(panes)
+            else template.index('<div class="readout">')
+        )
+        zoned[name] = "data-when-zone" in template[block_start:block_end]
+    assert zoned == {
+        "daily": True,
+        "weekly": True,
+        "monthly": True,
+        "interval": False,
+        "once": False,
+        "cron": True,
+    }
+    builder = (_CONSOLE_INDEX.parent / "schedule_builder.js").read_text(encoding="utf-8")
+    assert 'querySelectorAll("[data-when-zone]")' in builder, (
+        "setState must sweep the template's zone spans by the same attribute"
+    )

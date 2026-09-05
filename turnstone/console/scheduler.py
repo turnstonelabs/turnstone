@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from turnstone.console.schedule_timing import compute_next_run, no_next_run_reason
 from turnstone.sdk.server import TurnstoneServer
 
 if TYPE_CHECKING:
@@ -171,7 +172,13 @@ class TaskScheduler:
         try:
             due_tasks = self._storage.list_due_tasks(now)
             for task in due_tasks:
-                self._dispatch_task(task, now)
+                try:
+                    self._dispatch_task(task, now)
+                except Exception:
+                    # One bad row must not starve the rest of the tick: an
+                    # unadvanced next_run would make it the earliest due
+                    # task again next tick, and every tick after.
+                    log.exception("scheduler.dispatch_error", task_id=task.get("task_id", ""))
 
             # Periodic run history pruning (~once per hour)
             self._tick_count += 1
@@ -247,6 +254,19 @@ class TaskScheduler:
         next_run = self._compute_next_run(task)
         if task["schedule_type"] == "at":
             self._storage.update_scheduled_task(task_id, last_run=now, next_run="", enabled=False)
+        elif not next_run:
+            # The cron walk found no next firing — a zone this host can no
+            # longer resolve, or an expression with no future date.  Disable
+            # the schedule so the shelf shows it stopped, and say why in its
+            # run history; re-enabling it re-validates the stored timing.
+            # The state change comes first: it is what stops the re-dispatch,
+            # so it must not wait on the history write.  A transient fault in
+            # reading the zone database disables too: leaving next_run alone
+            # would re-create the workstream every tick for as long as the
+            # fault lasts, and no other advance is computable without the
+            # zone.  Re-enabling is one click once the host is right.
+            self._storage.update_scheduled_task(task_id, last_run=now, next_run="", enabled=False)
+            self._record_disabled(task, now)
         else:
             self._storage.update_scheduled_task(task_id, last_run=now, next_run=next_run)
 
@@ -334,8 +354,7 @@ class TaskScheduler:
             log.warning("scheduler.sdk_dispatch_failed", node_id=node_id, exc_info=True)
             return
 
-        self._storage.record_task_run(
-            run_id=uuid.uuid4().hex,
+        self._write_run(
             task_id=task["task_id"],
             node_id=node_id,
             ws_id=ws_id,
@@ -353,10 +372,39 @@ class TaskScheduler:
             return
         self._dispatch_to_node(task, node_id, now)
 
+    def _write_run(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        ws_id: str,
+        correlation_id: str,
+        started: str,
+        status: str,
+        error: str,
+    ) -> None:
+        """Append a run-history row.  A row that fails to write is logged,
+        never raised: the schedule's advance must not wait on history, or a
+        dispatched workstream would be re-created on every tick."""
+        try:
+            self._storage.record_task_run(
+                run_id=uuid.uuid4().hex,
+                task_id=task_id,
+                node_id=node_id,
+                ws_id=ws_id,
+                correlation_id=correlation_id,
+                started=started,
+                status=status,
+                error=error,
+            )
+        except Exception:
+            log.warning(
+                "scheduler.record_run_failed", task_id=task_id, status=status, exc_info=True
+            )
+
     def _record_failure(self, task: dict[str, Any], now: str, error: str) -> None:
         """Record a failed dispatch attempt."""
-        self._storage.record_task_run(
-            run_id=uuid.uuid4().hex,
+        self._write_run(
             task_id=task["task_id"],
             node_id="",
             ws_id="",
@@ -367,11 +415,28 @@ class TaskScheduler:
         )
         log.warning("scheduler.dispatch_failed", task_id=task["task_id"], error=error)
 
+    def _record_disabled(self, task: dict[str, Any], now: str) -> None:
+        """Record in the run history that a schedule was disabled at
+        dispatch, and why.  Its own status: the firing itself succeeded, so
+        it is neither a dispatch nor a failure."""
+        reason = no_next_run_reason(task.get("cron_expr", ""), task.get("timezone") or "UTC")
+        log.warning("scheduler.schedule_disabled", task_id=task["task_id"], reason=reason)
+        self._write_run(
+            task_id=task["task_id"],
+            node_id="",
+            ws_id="",
+            correlation_id="",
+            started=now,
+            status="disabled",
+            error=reason,
+        )
+
     @staticmethod
     def _compute_next_run(task: dict[str, Any]) -> str:
         """Compute the next run time. Returns empty string for one-shot tasks."""
-        from turnstone.console.server import _compute_next_run
-
-        return _compute_next_run(
-            task["schedule_type"], task.get("cron_expr", ""), task.get("at_time", "")
+        return compute_next_run(
+            task["schedule_type"],
+            task.get("cron_expr", ""),
+            task.get("at_time", ""),
+            task.get("timezone") or "UTC",
         )

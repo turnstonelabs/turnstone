@@ -53,6 +53,7 @@ def _make_task(**overrides):
         "schedule_type": "cron",
         "cron_expr": "0 9 * * *",
         "at_time": "",
+        "timezone": "UTC",
         "target_mode": "auto",
         "model": "gpt-5",
         "initial_message": "Run the tests",
@@ -312,6 +313,184 @@ class TestSchedulerTick:
         _, kwargs = update_calls[0]
         assert kwargs["next_run"] != ""
         assert "enabled" not in kwargs  # cron tasks stay enabled
+
+    @pytest.mark.parametrize(
+        ("row", "utc_time"),
+        [
+            # 06:30 in Asia/Kolkata (+05:30, no daylight saving) is 01:00 UTC.
+            ({"timezone": "Asia/Kolkata"}, "T01:00:00"),
+            # A row from before the zone was stored evaluates in UTC.
+            ({"timezone": None}, "T06:30:00"),
+        ],
+    )
+    def test_cron_next_run_is_evaluated_in_the_task_zone(self, mocks, row, utc_time):
+        collector, storage = mocks
+
+        task = _make_task(cron_expr="30 6 * * *", **row)
+        if row["timezone"] is None:
+            del task["timezone"]
+        storage.list_due_tasks.return_value = [task]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ):
+            scheduler._tick()
+
+        _, kwargs = storage.update_scheduled_task.call_args_list[0]
+        assert kwargs["next_run"].endswith(utc_time)
+
+    @pytest.mark.parametrize(
+        ("row", "reason"),
+        [
+            ({"timezone": "Nowhere/Land"}, "time zone Nowhere/Land could not be resolved"),
+            ({"cron_expr": "0 0 30 2 *"}, "never matches a real calendar date"),
+            ({"cron_expr": "not a cron"}, "is not a valid cron"),
+        ],
+    )
+    def test_no_next_run_disables_the_task_with_the_reason(self, mocks, row, reason):
+        # A zone this host cannot resolve, or an expression with no future
+        # date, must not abort the tick: the task still dispatches, is then
+        # disabled with the reason in its run history (the shelf shows it
+        # stopped, not active with no next run), and the task behind it in
+        # the same tick still runs.
+        collector, storage = mocks
+
+        bad = _make_task(task_id="bad", **row)
+        good = _make_task(task_id="good")
+        storage.list_due_tasks.return_value = [bad, good]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as create:
+            scheduler._tick()
+
+        assert create.call_count == 2
+        updates = {c.args[0]: c.kwargs for c in storage.update_scheduled_task.call_args_list}
+        assert updates["bad"]["next_run"] == ""
+        assert updates["bad"]["enabled"] is False
+        assert updates["good"]["next_run"] != ""
+        by_status: dict[str, list[str]] = {}
+        for c in storage.record_task_run.call_args_list:
+            by_status.setdefault(c.kwargs["status"], []).append(c.kwargs["task_id"])
+        # The firing itself succeeded for both, and only the bad one was
+        # disabled — recorded as such, not as a failed dispatch.
+        assert by_status == {"dispatched": ["bad", "good"], "disabled": ["bad"]}
+        disabled = [
+            c.kwargs
+            for c in storage.record_task_run.call_args_list
+            if c.kwargs["status"] == "disabled"
+        ]
+        assert reason in disabled[0]["error"]
+
+    def test_disabling_survives_a_failed_history_write(self, mocks):
+        # The state change is what stops the re-dispatch, so it must not
+        # wait on the run-history insert: with that insert failing, the
+        # schedule is still disabled and the tick still completes.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task(timezone="Nowhere/Land")]
+
+        def record(**kwargs):
+            if kwargs["status"] == "disabled":
+                raise RuntimeError("db")
+
+        storage.record_task_run.side_effect = record
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ):
+            scheduler._tick()
+
+        _, kwargs = storage.update_scheduled_task.call_args_list[0]
+        assert kwargs["next_run"] == "" and kwargs["enabled"] is False
+        assert storage.delete_system_setting.called, "the lock is released after the tick"
+
+    def test_a_lost_failure_record_does_not_block_the_advance(self, mocks):
+        # Fan-out: one node dispatched, one without a URL (a failed row), and
+        # the history insert failing for the failed row — the schedule still
+        # advances, or the fan-out would re-create its workstreams each tick.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task(target_mode="all")]
+        collector.get_nodes.return_value = ([_make_node("node-001"), _make_node("node-002")], 2)
+        collector.get_node_detail.side_effect = lambda node_id: (
+            {"server_url": "http://node-001:8080"} if node_id == "node-001" else {}
+        )
+
+        def record(**kwargs):
+            if kwargs["status"] == "failed":
+                raise RuntimeError("db")
+
+        storage.record_task_run.side_effect = record
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as create:
+            scheduler._tick()
+
+        assert create.call_count == 1
+        _, kwargs = storage.update_scheduled_task.call_args_list[0]
+        assert kwargs["next_run"] != ""
+
+    def test_a_lost_run_record_does_not_redispatch(self, mocks):
+        # record_task_run failing after the workstream exists is logged and
+        # the schedule still advances; left unadvanced it would re-create
+        # the workstream on every tick.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task()]
+        storage.record_task_run.side_effect = RuntimeError("db")
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as create:
+            scheduler._tick()
+
+        assert create.call_count == 1
+        _, kwargs = storage.update_scheduled_task.call_args_list[0]
+        assert kwargs["next_run"] != ""
+
+    def test_one_failing_dispatch_does_not_starve_the_next(self, mocks):
+        # An exception out of one row's dispatch is logged and the loop moves
+        # on; otherwise that row, its next_run never advanced, would be the
+        # earliest due task again every tick and nothing behind it would run.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [
+            _make_task(task_id="first"),
+            _make_task(task_id="second"),
+        ]
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(
+            scheduler, "_dispatch_task", side_effect=[RuntimeError("boom"), None]
+        ) as dispatch:
+            scheduler._tick()
+
+        assert [c.args[0]["task_id"] for c in dispatch.call_args_list] == ["first", "second"]
+        # The lock is still released after the guarded loop.
+        assert storage.delete_system_setting.called
 
     def test_no_reachable_nodes_records_failure(self, mocks):
         collector, storage = mocks

@@ -580,6 +580,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         description: str = "",
         cron_expr: str = "",
         at_time: str = "",
+        timezone: str = "",
         target_mode: str = "auto",
         model: str = "",
         auto_approve: bool = False,
@@ -602,6 +603,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["cron_expr"] = cron_expr
         if at_time:
             body["at_time"] = at_time
+        if timezone:
+            body["timezone"] = timezone
         if model:
             body["model"] = model
         if auto_approve_tools:
@@ -628,6 +631,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         schedule_type: Any = _UNSET,
         cron_expr: Any = _UNSET,
         at_time: Any = _UNSET,
+        timezone: Any = _UNSET,
         target_mode: Any = _UNSET,
         model: Any = _UNSET,
         initial_message: Any = _UNSET,
@@ -644,6 +648,7 @@ class AsyncTurnstoneConsole(_BaseClient):
             ("schedule_type", schedule_type),
             ("cron_expr", cron_expr),
             ("at_time", at_time),
+            ("timezone", timezone),
             ("target_mode", target_mode),
             ("model", model),
             ("initial_message", initial_message),
@@ -1511,6 +1516,7 @@ class TurnstoneConsole:
         description: str = "",
         cron_expr: str = "",
         at_time: str = "",
+        timezone: str = "",
         target_mode: str = "auto",
         model: str = "",
         auto_approve: bool = False,
@@ -1525,6 +1531,7 @@ class TurnstoneConsole:
                 description=description,
                 cron_expr=cron_expr,
                 at_time=at_time,
+                timezone=timezone,
                 target_mode=target_mode,
                 model=model,
                 auto_approve=auto_approve,
@@ -1545,6 +1552,7 @@ class TurnstoneConsole:
         schedule_type: Any = _UNSET,
         cron_expr: Any = _UNSET,
         at_time: Any = _UNSET,
+        timezone: Any = _UNSET,
         target_mode: Any = _UNSET,
         model: Any = _UNSET,
         initial_message: Any = _UNSET,
@@ -1560,6 +1568,7 @@ class TurnstoneConsole:
                 schedule_type=schedule_type,
                 cron_expr=cron_expr,
                 at_time=at_time,
+                timezone=timezone,
                 target_mode=target_mode,
                 model=model,
                 initial_message=initial_message,

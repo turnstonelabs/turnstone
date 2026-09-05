@@ -2503,6 +2503,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         notify_targets: str = "[]",
         persona: str = "",
         project_id: str = "",
+        timezone: str = "UTC",
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -2517,6 +2518,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     schedule_type=schedule_type,
                     cron_expr=cron_expr,
                     at_time=at_time,
+                    timezone=timezone,
                     target_mode=target_mode,
                     model=model,
                     initial_message=initial_message,
@@ -2561,6 +2563,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             "schedule_type",
             "cron_expr",
             "at_time",
+            "timezone",
             "target_mode",
             "model",
             "initial_message",
