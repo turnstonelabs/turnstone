@@ -53,7 +53,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("TURNSTONE_CONSOLE_URL", ""),
         help="Console URL for multi-node routing (default: $TURNSTONE_CONSOLE_URL). "
         "When set, control-plane POSTs route through the console; "
-        "SSE connects to node_url from the create response.",
+        "SSE resolves the node through the console on each connection.",
     )
 
     # -- Discord -------------------------------------------------------------

@@ -2143,6 +2143,16 @@ async def route_create(request: Request) -> Response:
                 )
 
         resume_ws = body.get("resume_ws", "")
+        resume_ws_exact = body.get("resume_ws_exact", False)
+        if not isinstance(resume_ws_exact, bool) or (resume_ws_exact and not resume_ws):
+            message = (
+                "resume_ws_exact must be a boolean"
+                if not isinstance(resume_ws_exact, bool)
+                else "resume_ws_exact requires resume_ws"
+            )
+            return _record_route(
+                request, "create", 400, t0, JSONResponse({"error": message}, status_code=400)
+            )
         target_node = body.get("target_node", "")
         requested_ws_id = body.get("ws_id", "")
         if resume_ws and len(resume_ws) > _MAX_ROUTE_RESUME_LEN:
@@ -2196,14 +2206,14 @@ async def route_create(request: Request) -> Response:
                 # id can redirect the routed fork before it reaches the node.
                 exact_row = (
                     await asyncio.to_thread(storage.get_workstream, resume_ws)
-                    if _VALID_CREATE_WS_ID_RE.fullmatch(resume_ws)
+                    if resume_ws_exact or _VALID_CREATE_WS_ID_RE.fullmatch(resume_ws)
                     else None
                 )
-                canonical_resume = (
-                    resume_ws
-                    if exact_row is not None
-                    else await asyncio.to_thread(storage.resolve_workstream, resume_ws)
-                )
+                canonical_resume = resume_ws if exact_row is not None else None
+                if canonical_resume is None and not resume_ws_exact:
+                    canonical_resume = await asyncio.to_thread(
+                        storage.resolve_workstream, resume_ws
+                    )
             except Exception:
                 log.warning(
                     "route_create.resume_lookup_failed source=%s",
@@ -2226,6 +2236,9 @@ async def route_create(request: Request) -> Response:
                     JSONResponse({"error": "Workstream not found"}, status_code=404),
                 )
             body["resume_ws"] = canonical_resume
+            # Preserve the resolved identity even if it disappears before the
+            # node's preflight; another row's alias cannot replace this source.
+            body["resume_ws_exact"] = True
             resume_ws = canonical_resume
 
         fixed_ws_id = bool(requested_ws_id)

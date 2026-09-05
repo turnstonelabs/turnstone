@@ -18,8 +18,9 @@ def mock_storage() -> MagicMock:
     storage.get_channel_user = MagicMock(return_value=None)
     storage.get_channel_route = MagicMock(return_value=None)
     storage.get_channel_route_by_ws = MagicMock(return_value=None)
-    storage.resolve_workstream = MagicMock(side_effect=lambda ws_id: ws_id)
-    storage.create_channel_route = MagicMock()
+    storage.get_workstream = MagicMock(side_effect=lambda ws_id: {"ws_id": ws_id})
+    storage.create_channel_route = MagicMock(return_value=True)
+    storage.replace_channel_route = MagicMock(return_value=True)
     storage.delete_channel_route = MagicMock(return_value=True)
     return storage
 
@@ -123,7 +124,9 @@ class TestDeleteRoute:
         self, router: ChannelRouter, mock_storage: MagicMock
     ) -> None:
         await router.delete_route("discord", "ch-123")
-        mock_storage.delete_channel_route.assert_called_once_with("discord", "ch-123")
+        mock_storage.delete_channel_route.assert_called_once_with(
+            "discord", "ch-123", expected_ws_id=None
+        )
 
 
 class TestWorkstreamLiveness:
@@ -180,7 +183,9 @@ class TestGetOrCreateWorkstream:
         ws_id, is_new = await router.get_or_create_workstream("discord", "ch-1", name="test")
         assert ws_id == "ws-new"
         assert is_new is True
-        mock_storage.create_channel_route.assert_called_once_with("discord", "ch-1", "ws-new")
+        mock_storage.create_channel_route.assert_called_once_with(
+            "discord", "ch-1", "ws-new", channel_user_id=""
+        )
         mock_create.assert_awaited_once()
 
     @pytest.mark.anyio
@@ -206,9 +211,9 @@ class TestGetOrCreateWorkstream:
         )
         assert ws_id == "ws-new"
         assert is_new is True
-        mock_storage.create_channel_route.assert_called_once_with("discord", "ch-1", "ws-new")
-        # Node URL should be cached.
-        assert console_router._node_urls["ws-new"] == "http://node1:8080/v1"
+        mock_storage.create_channel_route.assert_called_once_with(
+            "discord", "ch-1", "ws-new", channel_user_id=""
+        )
 
     @pytest.mark.anyio
     async def test_returns_existing_alive_workstream(
@@ -250,9 +255,10 @@ class TestGetOrCreateWorkstream:
         ws_id, is_new = await router.get_or_create_workstream("discord", "ch-1", name="test")
         assert ws_id == "ws-resumed"
         assert is_new is True
-        # Should have deleted the stale route and created a new one.
-        mock_storage.delete_channel_route.assert_called_once_with("discord", "ch-1")
-        mock_storage.create_channel_route.assert_called_once_with("discord", "ch-1", "ws-resumed")
+        mock_storage.delete_channel_route.assert_not_called()
+        mock_storage.replace_channel_route.assert_called_once_with(
+            "discord", "ch-1", "ws-stale", "ws-resumed"
+        )
         # The create call should include resume_ws pointing at the old ws.
         mock_create.assert_awaited_once()
         call_kwargs = mock_create.call_args[1]
@@ -270,8 +276,8 @@ class TestGetOrCreateWorkstream:
             "channel_type": "discord",
             "channel_id": "ch-1",
         }
-        mock_storage.resolve_workstream.side_effect = None
-        mock_storage.resolve_workstream.return_value = None
+        mock_storage.get_workstream.side_effect = None
+        mock_storage.get_workstream.return_value = None
         assert router._server is not None
         mock_create = AsyncMock(
             side_effect=[
@@ -296,7 +302,9 @@ class TestGetOrCreateWorkstream:
             "",
         ]
         mock_send.assert_awaited_once_with("hello", "ws-fresh")
-        mock_storage.create_channel_route.assert_called_once_with("discord", "ch-1", "ws-fresh")
+        mock_storage.replace_channel_route.assert_called_once_with(
+            "discord", "ch-1", "ws-pruned", "ws-fresh"
+        )
 
     @pytest.mark.anyio
     async def test_missing_stale_source_retries_fresh_via_console(
@@ -310,8 +318,8 @@ class TestGetOrCreateWorkstream:
             "channel_type": "slack",
             "channel_id": "ch-1",
         }
-        mock_storage.resolve_workstream.side_effect = None
-        mock_storage.resolve_workstream.return_value = None
+        mock_storage.get_workstream.side_effect = None
+        mock_storage.get_workstream.return_value = None
         assert console_router._console is not None
         mock_create = AsyncMock(
             side_effect=[
@@ -342,8 +350,9 @@ class TestGetOrCreateWorkstream:
             "",
         ]
         mock_send.assert_awaited_once_with("hello", "ws-fresh")
-        assert console_router._node_urls["ws-fresh"] == "http://node2:8080/v1"
-        mock_storage.create_channel_route.assert_called_once_with("slack", "ch-1", "ws-fresh")
+        mock_storage.replace_channel_route.assert_called_once_with(
+            "slack", "ch-1", "ws-pruned", "ws-fresh"
+        )
 
     @pytest.mark.anyio
     @pytest.mark.parametrize(
@@ -403,8 +412,8 @@ class TestGetOrCreateWorkstream:
             "channel_type": "discord",
             "channel_id": "ch-1",
         }
-        mock_storage.resolve_workstream.side_effect = None
-        mock_storage.resolve_workstream.return_value = None
+        mock_storage.get_workstream.side_effect = None
+        mock_storage.get_workstream.return_value = None
         assert router._server is not None
         error = TurnstoneAPIError(404, "Workstream not found")
         mock_create = AsyncMock(side_effect=[error, error])
@@ -431,7 +440,7 @@ class TestGetOrCreateWorkstream:
             "channel_type": "discord",
             "channel_id": "ch-1",
         }
-        mock_storage.resolve_workstream.side_effect = RuntimeError("storage offline")
+        mock_storage.get_workstream.side_effect = RuntimeError("storage offline")
         assert router._server is not None
         mock_create = AsyncMock()
         monkeypatch.setattr(router._server, "create_workstream", mock_create)
@@ -493,6 +502,17 @@ class TestGetOrCreateWorkstream:
 
 class TestCloseWorkstream:
     @pytest.mark.anyio
+    @pytest.mark.parametrize("status", [403, 409, 503])
+    async def test_close_refusal_propagates(self, router, monkeypatch, status):
+        monkeypatch.setattr(
+            router._server,
+            "close_workstream",
+            AsyncMock(side_effect=TurnstoneAPIError(status, "not closed")),
+        )
+        with pytest.raises(TurnstoneAPIError, match="not closed"):
+            await router.close_workstream("ws-1")
+
+    @pytest.mark.anyio
     async def test_calls_server_close(
         self, router: ChannelRouter, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -547,10 +567,24 @@ class TestAclose:
 
 class TestGetNodeUrl:
     @pytest.mark.anyio
-    async def test_returns_cached_url(self, router: ChannelRouter) -> None:
-        router._node_urls["ws-1"] = "http://node1:8080/v1"
-        url = await router.get_node_url("ws-1")
-        assert url == "http://node1:8080/v1"
+    async def test_reconnect_refreshes_address_and_propagates_failures(
+        self, console_router, monkeypatch
+    ):
+        lookup = AsyncMock(
+            side_effect=[
+                {"node_url": "http://old.example/"},
+                {"node_url": "http://new.example/"},
+                TurnstoneAPIError(503, "unavailable"),
+                {},
+            ]
+        )
+        monkeypatch.setattr(console_router._console, "route_lookup", lookup)
+        assert await console_router.get_node_url("ws-1") == "http://old.example"
+        assert await console_router.get_node_url("ws-1") == "http://new.example"
+        with pytest.raises(TurnstoneAPIError, match="unavailable"):
+            await console_router.get_node_url("ws-1")
+        with pytest.raises(RuntimeError, match="no node URL"):
+            await console_router.get_node_url("ws-1")
 
     @pytest.mark.anyio
     async def test_falls_back_to_server_url(self, router: ChannelRouter) -> None:
@@ -567,5 +601,3 @@ class TestGetNodeUrl:
         url = await console_router.get_node_url("ws-1")
         assert url == "http://node2:8080/v1"
         mock_lookup.assert_awaited_once_with("ws-1")
-        # Should be cached now.
-        assert console_router._node_urls["ws-1"] == "http://node2:8080/v1"

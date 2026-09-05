@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.8.0a7",
+    "version": "1.8.2",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -2967,6 +2967,12 @@
             "description": "Source workstream ID or alias to fork atomically into the new workstream (empty = fresh start)",
             "title": "Resume Ws",
             "type": "string"
+          },
+          "resume_ws_exact": {
+            "default": false,
+            "description": "Require an exact source ID in resume_ws; disable alias and prefix resolution",
+            "title": "Resume Ws Exact",
+            "type": "boolean"
           },
           "skill": {
             "default": "",

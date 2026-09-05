@@ -245,6 +245,10 @@ class CreateWorkstreamRequest(BaseModel):
             "workstream (empty = fresh start)"
         ),
     )
+    resume_ws_exact: bool = Field(
+        default=False,
+        description="Require an exact source ID in resume_ws; disable alias and prefix resolution",
+    )
     skill: str = Field(default="", description="Skill name (replaces default skills)")
     persona: str = Field(
         default="",

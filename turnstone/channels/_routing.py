@@ -45,7 +45,7 @@ class PolicyVerdict:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, MutableMapping
+    from collections.abc import Callable, Iterable, Mapping, MutableMapping
 
     from turnstone.core.storage import StorageBackend
 
@@ -54,9 +54,9 @@ log = get_logger(__name__)
 _WS_CREATE_TIMEOUT = 30.0  # seconds
 _CHANNEL_DEFAULT_TTL = 300.0  # cache channel default alias for 5 minutes
 _MODELS_CACHE_TTL = 30.0  # cache model list for autocomplete
-_ROUTE_CACHE_TTL = 30.0  # cache (channel_type, channel_id) → ws_id lookups
-_ROUTE_CACHE_CAP = 4096  # LRU bound on the lookup cache
 _FORK_SOURCE_NOT_FOUND = "Workstream not found"
+_STARTUP_PROBE_CONCURRENCY = 8
+_STARTUP_PROBE_TIMEOUT = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -145,11 +145,6 @@ class ChannelRouter:
         self._auto_approve_tools: list[str] = auto_approve_tools or []
         self._skill = skill
         self._create_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
-        # Per-workstream node URLs from console routing responses.
-        # Populated when console_url is set and the create response
-        # includes node_url.
-        self._node_urls: dict[str, str] = {}
-
         # SDK clients: use console for multi-node, server for single-node.
         self._console: AsyncTurnstoneConsole | None = None
         self._server: AsyncTurnstoneServer | None = None
@@ -174,9 +169,6 @@ class ChannelRouter:
         # Cached model list for autocomplete (shorter TTL).
         self._models_cache: dict[str, Any] = {}
         self._models_cache_ts: float = 0.0
-        # TTL cache for (channel_type, channel_id) → ws_id so hot inbound
-        # paths don't hit storage on every message. Bounded LRU.
-        self._route_cache: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -253,9 +245,45 @@ class ChannelRouter:
             result = await self._console.route_workstream_live(ws_id)
             return result.live
 
+        return ws_id in await self._direct_live_workstream_ids()
+
+    async def _direct_live_workstream_ids(self) -> set[str]:
         assert self._server is not None
         response = await self._server.list_workstreams()
-        return any(ws.ws_id == ws_id and ws.state != "creating" for ws in response.workstreams)
+        return {ws.ws_id for ws in response.workstreams if ws.state != "creating"}
+
+    async def get_live_workstream_ids(self, ws_ids: Iterable[str]) -> set[str]:
+        """Best-effort, bounded discovery for eager startup subscriptions only.
+
+        Direct mode needs one manager list for all routes. Console mode uses
+        the authoritative routed probes with a fixed worker pool and a total
+        time budget. Errors skip eager subscription; inbound messages retain
+        their strict liveness checks and can recover the saved routes later.
+        """
+        candidates = dict.fromkeys(ws_ids)
+        live: set[str] = set()
+        if not candidates:
+            return live
+        pending = iter(candidates)
+
+        async def probe() -> None:
+            for ws_id in pending:
+                try:
+                    if await self._is_ws_live(ws_id):
+                        live.add(ws_id)
+                except Exception:
+                    log.warning("channel_router.startup_probe_failed", ws_id=ws_id, exc_info=True)
+
+        try:
+            async with asyncio.timeout(_STARTUP_PROBE_TIMEOUT):
+                if self._console is None:
+                    return (await self._direct_live_workstream_ids()).intersection(candidates)
+                async with asyncio.TaskGroup() as tasks:
+                    for _ in range(min(len(candidates), _STARTUP_PROBE_CONCURRENCY)):
+                        tasks.create_task(probe())
+        except Exception:
+            log.warning("channel_router.startup_discovery_incomplete", exc_info=True)
+        return live
 
     # -- workstream management -----------------------------------------------
 
@@ -267,6 +295,8 @@ class ChannelRouter:
         model: str = "",
         initial_message: str = "",
         client_type: str = "",
+        channel_user_id: str = "",
+        require_existing: bool = False,
     ) -> tuple[str, bool]:
         """Look up or create a workstream for a channel.
 
@@ -308,13 +338,16 @@ class ChannelRouter:
             route = await asyncio.to_thread(
                 self._storage.get_channel_route, channel_type, channel_id
             )
+            if require_existing and route is None:
+                raise RuntimeError("Channel conversation was closed; start a new conversation")
             if route:
-                # Resolve storage first so failures are fail-closed and aliases
-                # are compared to the canonical ids returned by the live seam.
-                source_ws_id = await asyncio.to_thread(
-                    self._storage.resolve_workstream, route["ws_id"]
-                )
-                if source_ws_id is not None and await self._is_ws_live(source_ws_id):
+                owner = route.get("channel_user_id", "")
+                if owner and owner != channel_user_id:
+                    raise RuntimeError("Channel conversation belongs to another user")
+                # Persisted routes contain exact IDs. An alias matching a
+                # deleted ID must never substitute another conversation.
+                source = await asyncio.to_thread(self._storage.get_workstream, route["ws_id"])
+                if source is not None and await self._is_ws_live(route["ws_id"]):
                     return route["ws_id"], False
                 # The route is not currently usable. Keep it persisted until
                 # its replacement has been created successfully so ACL,
@@ -337,33 +370,35 @@ class ChannelRouter:
                 resume_ws=resume_ws or None,
             )
 
-            async def _create(resume_from: str) -> tuple[dict[str, Any], str]:
+            async def _create(resume_from: str) -> str:
                 if self._console:
                     result = await self._console.route_create_workstream(
                         name=name,
                         model=model,
                         resume_ws=resume_from,
+                        resume_ws_exact=bool(resume_from),
                         skill=self._skill,
                         auto_approve=self._auto_approve,
                         auto_approve_tools=_tools_csv,
                         client_type=client_type,
                     )
-                    return result.model_dump(), result.ws_id
+                    return result.ws_id
 
                 assert self._server is not None
                 response = await self._server.create_workstream(
                     name=name,
                     model=model,
                     resume_ws=resume_from,
+                    resume_ws_exact=bool(resume_from),
                     skill=self._skill,
                     auto_approve=self._auto_approve,
                     auto_approve_tools=_tools_csv,
                     client_type=client_type,
                 )
-                return {"ws_id": response.ws_id, "name": response.name}, response.ws_id
+                return response.ws_id
 
             try:
-                data, ws_id = await _create(resume_ws)
+                ws_id = await _create(resume_ws)
             except TurnstoneAPIError as exc:
                 # Retry fresh only when BOTH the API response and a new
                 # authoritative storage lookup confirm the fork source is gone.
@@ -372,8 +407,8 @@ class ChannelRouter:
                 # authorization failure into an empty replacement conversation.
                 if not resume_ws or exc.status_code != 404 or exc.message != _FORK_SOURCE_NOT_FOUND:
                     raise
-                source_ws_id = await asyncio.to_thread(self._storage.resolve_workstream, resume_ws)
-                if source_ws_id is not None:
+                source = await asyncio.to_thread(self._storage.get_workstream, resume_ws)
+                if source is not None:
                     raise
                 log.info(
                     "channel_router.fork_source_missing",
@@ -382,43 +417,40 @@ class ChannelRouter:
                     channel_id=channel_id,
                 )
                 resume_ws = ""
-                data, ws_id = await _create(resume_ws)
+                ws_id = await _create(resume_ws)
 
             if not ws_id:
                 msg_err = "workstream creation returned empty ws_id"
                 raise RuntimeError(msg_err)
 
-            # 3. Send the initial message if this is a brand-new workstream.
-            if initial_message and not resume_ws:
-                if self._console:
-                    await self._console.route_send(initial_message, ws_id)
-                else:
-                    assert self._server is not None
-                    await self._server.send(initial_message, ws_id)
-
-            # 4. Replace the stale route only after the destination (and any
-            # initial message) succeeded. ``create_channel_route`` is
-            # first-write-wins, so the old mapping must be removed first.
+            # Claim the route before dispatching anything. Other gateway
+            # processes and explicit closes can race this local lock; a
+            # conditional write must not resurrect or overwrite their route.
             if old_ws_id:
-                await asyncio.to_thread(
-                    self._storage.delete_channel_route, channel_type, channel_id
+                claimed = await asyncio.to_thread(
+                    self._storage.replace_channel_route,
+                    channel_type,
+                    channel_id,
+                    old_ws_id,
+                    ws_id,
                 )
-                self._route_cache.pop((channel_type, channel_id), None)
-                log.info(
-                    "channel_router.stale_route_cleared",
-                    ws_id=old_ws_id,
-                    channel_type=channel_type,
-                    channel_id=channel_id,
+            else:
+                claimed = await asyncio.to_thread(
+                    self._storage.create_channel_route,
+                    channel_type,
+                    channel_id,
+                    ws_id,
+                    channel_user_id=channel_user_id,
                 )
-            await asyncio.to_thread(
-                self._storage.create_channel_route, channel_type, channel_id, ws_id
-            )
+            if not claimed:
+                try:
+                    await self.close_workstream(ws_id)
+                except Exception:
+                    log.warning("channel_router.unclaimed_close_failed", ws_id=ws_id, exc_info=True)
+                raise RuntimeError("Channel route changed; retry your message")
 
-            # When routed through the console, capture the node URL for
-            # direct SSE connections after route persistence succeeds.
-            node_url = data.get("node_url", "")
-            if node_url:
-                self._node_urls[ws_id] = node_url.rstrip("/")
+            if initial_message and not resume_ws:
+                await self.send_message(ws_id, initial_message)
 
             log.info(
                 "channel_router.route_created",
@@ -432,23 +464,16 @@ class ChannelRouter:
     async def get_node_url(self, ws_id: str) -> str:
         """Return the direct server URL for SSE connections to *ws_id*.
 
-        When routing through a console, this is the ``node_url`` from the
-        create response.  If the ws_id is not cached (e.g. after a bot
-        restart), queries the console's route lookup endpoint before
-        falling back to the configured server_url.
+        Resolve through the console on every connection attempt so a node's
+        changed address is picked up after restart. Lookup failures propagate
+        to the SSE retry loop; they do not authorize a different destination.
         """
-        url = self._node_urls.get(ws_id)
-        if url:
-            return url
         if self._console:
-            try:
-                data = await self._console.route_lookup(ws_id)
-                node_url = data.get("node_url", "")
-                if node_url:
-                    self._node_urls[ws_id] = node_url.rstrip("/")
-                    return self._node_urls[ws_id]
-            except Exception:
-                log.debug("Console route lookup failed for ws %s", ws_id, exc_info=True)
+            data = await self._console.route_lookup(ws_id)
+            node_url = data.get("node_url", "")
+            if not node_url:
+                raise RuntimeError("Console route lookup returned no node URL")
+            return str(node_url).rstrip("/")
         return self._server_url
 
     # -- user resolution -----------------------------------------------------
@@ -562,38 +587,15 @@ class ChannelRouter:
 
     # -- route management ----------------------------------------------------
 
-    async def lookup_ws_id(self, channel_type: str, channel_id: str) -> str | None:
-        """Return the ws_id bound to (channel_type, channel_id), or None.
-
-        TTL-cached so the hot inbound-message path (thread replies,
-        DM replies) doesn't hit storage on every token.
-        """
-        key = (channel_type, channel_id)
-        now = time.monotonic()
-        cached = self._route_cache.get(key)
-        if cached is not None:
-            ws_id, expires_at = cached
-            if now < expires_at:
-                self._route_cache.move_to_end(key)
-                return ws_id
-            # Expired — fall through to a fresh lookup.
-            del self._route_cache[key]
-
-        route = await asyncio.to_thread(self._storage.get_channel_route, channel_type, channel_id)
-        if route is None:
-            return None
-
-        ws_id = route["ws_id"]
-        self._route_cache[key] = (ws_id, now + _ROUTE_CACHE_TTL)
-        if len(self._route_cache) > _ROUTE_CACHE_CAP:
-            self._route_cache.popitem(last=False)
-        return ws_id
-
-    async def delete_route(self, channel_type: str, channel_id: str) -> None:
+    async def delete_route(
+        self, channel_type: str, channel_id: str, *, expected_ws_id: str | None = None
+    ) -> bool:
         """Remove a channel-to-workstream mapping."""
-        self._route_cache.pop((channel_type, channel_id), None)
         deleted = await asyncio.to_thread(
-            self._storage.delete_channel_route, channel_type, channel_id
+            self._storage.delete_channel_route,
+            channel_type,
+            channel_id,
+            expected_ws_id=expected_ws_id,
         )
         log.info(
             "channel_router.delete_route",
@@ -601,10 +603,10 @@ class ChannelRouter:
             channel_id=channel_id,
             deleted=deleted,
         )
+        return deleted
 
     async def close_workstream(self, ws_id: str) -> None:
         """Close a workstream via the server API."""
-        self._node_urls.pop(ws_id, None)
         try:
             if self._console:
                 await self._console.route_close(ws_id)
@@ -613,6 +615,8 @@ class ChannelRouter:
                 await self._server.close_workstream(ws_id)
             log.info("channel_router.close_workstream", ws_id=ws_id)
         except TurnstoneAPIError as exc:
+            if exc.status_code != 404:
+                raise
             log.warning(
                 "channel_router.close_workstream_failed",
                 ws_id=ws_id,

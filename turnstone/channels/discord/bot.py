@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -50,9 +49,6 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = get_logger(__name__)
-
-
-_THREAD_INVOKER_CAP: int = 4096
 
 
 def _thread_owner_id(thread: discord.abc.Messageable) -> str:
@@ -226,6 +222,7 @@ class TurnstoneBot:
         )
 
         self._commands_synced: bool = False
+        self._recovering_routes = False
         self._subscribed_ws: set[str] = set()
         self._sse_tasks: dict[str, asyncio.Task[None]] = {}
         self._streaming: dict[str, StreamingMessage] = {}
@@ -254,14 +251,6 @@ class TurnstoneBot:
         # notification reply DM.  The target_user_id is carried so the
         # response message can be re-tracked for multi-turn DM conversations.
         self._notify_reply_channels: dict[str, tuple[discord.abc.Messageable, str]] = {}
-        # Explicit thread-invoker map so the sec-3 owner check can admit
-        # `/ask` follow-ups (Discord sets `thread.owner_id = bot` when the
-        # thread is created via `channel.create_thread(...)` without a
-        # starter message, so `channel.owner_id` alone would reject every
-        # legitimate follow-up from the human who ran the slash command).
-        # Bounded LRU to prevent unbounded growth across long bot uptime.
-        self._thread_invokers: OrderedDict[int, int] = OrderedDict()
-
         # Shared HTTP client for SSE connections.
         # Read timeout detects half-open connections (server sends ping=5s
         # keepalives, so 90s is very conservative).
@@ -371,18 +360,55 @@ class TurnstoneBot:
             log.info("discord.purged_dead_tasks", trigger=trigger, count=len(dead), ws_ids=dead)
 
     async def _recover_routes(self) -> None:
+        """Coalesce overlapping gateway lifecycle events into one recovery pass."""
+        if self._recovering_routes:
+            return
+        self._recovering_routes = True
+        try:
+            await self._restore_saved_routes()
+        finally:
+            self._recovering_routes = False
+
+    async def _restore_saved_routes(self) -> None:
         """Re-subscribe to event channels for existing discord routes.
 
         Queries the storage backend for all channel routes of type ``discord``
-        and opens SSE connections for each workstream.
+        and opens SSE connections only for workstreams that are already live.
         """
+        import aiohttp
+        import discord
+
         routes = await asyncio.to_thread(self.storage.list_channel_routes_by_type, "discord")
+        # Restore cached threads before any platform lookup can block on I/O.
+        routes.sort(key=lambda route: self._bot.get_channel(int(route["channel_id"])) is None)
+        live_ids = await self.router.get_live_workstream_ids(
+            route["ws_id"]
+            for route in routes
+            if route["ws_id"] not in self._sse_tasks or self._sse_tasks[route["ws_id"]].done()
+        )
         for route in routes:
             ws_id = route["ws_id"]
+            if ws_id not in live_ids:
+                continue
+            task = self._sse_tasks.get(ws_id)
+            if task is not None and not task.done():
+                continue
             channel_id = int(route["channel_id"])
             channel = self._bot.get_channel(channel_id)
-            if channel is not None:
-                await self.subscribe_ws(ws_id, channel)  # type: ignore[arg-type]
+            if channel is None:
+                try:
+                    channel = await self._bot.fetch_channel(channel_id)
+                except (discord.HTTPException, aiohttp.ClientError, TimeoutError):
+                    # Missing/inaccessible threads and platform outages do not
+                    # revoke the durable association or its owner metadata.
+                    log.warning(
+                        "discord.route_recovery_fetch_failed", channel_id=channel_id, exc_info=True
+                    )
+                    continue
+            if isinstance(channel, discord.Thread) and self._is_allowed_channel(
+                channel.parent_id or 0
+            ):
+                await self.subscribe_ws(ws_id, channel)
                 log.info("discord.route_recovered", ws_id=ws_id, channel_id=channel_id)
             else:
                 log.warning(
@@ -399,6 +425,9 @@ class TurnstoneBot:
         thread: discord.abc.Messageable,
     ) -> None:
         """Subscribe to workstream events via SSE and dispatch them to *thread*."""
+        prior = self._sse_tasks.get(ws_id)
+        if prior is not None and prior.done():
+            self._purge_dead_sse_tasks("subscribe")
         if ws_id in self._subscribed_ws:
             return
 
@@ -415,14 +444,11 @@ class TurnstoneBot:
 
         Does not cancel or await the SSE task — callers handle task
         lifecycle differently (``unsubscribe_ws`` cancels and awaits;
-        ``_cleanup_stale_route`` is itself invoked from inside the task).
+        ``_stop_unavailable_stream`` is itself invoked from inside the task).
         """
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
         thinking_msg = self._thinking_msgs.pop(ws_id, None)
-        if thinking_msg is not None:
-            with contextlib.suppress(Exception):
-                await thinking_msg.delete()
         self._tool_info_msgs.pop(ws_id, None)
         self._pop_ws_approvals(ws_id)
         self._notify_reply_channels.pop(ws_id, None)
@@ -430,6 +456,9 @@ class TurnstoneBot:
         stale = [mid for mid, entry in self._notify_ws_map.items() if entry[0] == ws_id]
         for mid in stale:
             del self._notify_ws_map[mid]
+        if thinking_msg is not None:
+            with contextlib.suppress(Exception):
+                await thinking_msg.delete()
 
     def _pop_ws_approvals(self, ws_id: str) -> None:
         """Drop every tracked approval embed for *ws_id* (all cycles)."""
@@ -449,15 +478,11 @@ class TurnstoneBot:
         await self._clear_ws_state(ws_id)
         log.info("discord.unsubscribed", ws_id=ws_id)
 
-    async def _cleanup_stale_route(self, ws_id: str) -> None:
-        """Remove a channel route whose workstream no longer exists."""
-        route = await asyncio.to_thread(self.storage.get_channel_route_by_ws, ws_id)
-        if route:
-            # Route deletion must go through the router so the TTL cache
-            # of (channel_type, channel_id) → ws_id is also invalidated.
-            await self.router.delete_route(route["channel_type"], route["channel_id"])
-            log.info("discord.stale_route_removed", ws_id=ws_id)
-        # Called from inside the SSE task itself — don't await the task here.
+    async def _stop_unavailable_stream(self, ws_id: str) -> None:
+        """Retire this listener while retaining the route for inbound recovery."""
+        task = self._sse_tasks.get(ws_id)
+        if task is not None and task is not asyncio.current_task():
+            return
         self._sse_tasks.pop(ws_id, None)
         await self._clear_ws_state(ws_id)
 
@@ -468,14 +493,14 @@ class TurnstoneBot:
 
         Delegates the reconnect/backoff loop to :func:`run_sse_stream`;
         this wrapper just translates events to ``_on_ws_event`` calls and
-        handles the 404 stale-route case.
+        stops an unavailable subscription without deleting its route.
         """
 
         async def _on_event(event: ServerEvent) -> None:
             await self._on_ws_event(ws_id, thread, event)
 
-        async def _on_stale() -> None:
-            await self._cleanup_stale_route(ws_id)
+        async def _on_unavailable() -> None:
+            await self._stop_unavailable_stream(ws_id)
 
         await run_sse_stream(
             http_client=self._http_client,
@@ -484,7 +509,7 @@ class TurnstoneBot:
             node_url_fn=self.router.get_node_url,
             token_factory=self._token_factory,
             on_event=_on_event,
-            on_stale=_on_stale,
+            on_unavailable=_on_unavailable,
         )
 
     # -- event dispatch ------------------------------------------------------
@@ -740,7 +765,11 @@ class TurnstoneBot:
             # Footer format ws_id|cycle_id|owner — the persistent view
             # parses it back on click and routes the decision to exactly
             # this cycle.
-            embed.set_footer(text=f"{ws_id}|{cycle_id}|{_thread_owner_id(thread)}")
+            route = await asyncio.to_thread(self.storage.get_channel_route_by_ws, ws_id)
+            owner_id = (
+                route.get("channel_user_id", "") if route is not None else _thread_owner_id(thread)
+            )
+            embed.set_footer(text=f"{ws_id}|{cycle_id}|{owner_id}")
             msg = await thread.send(embed=embed, view=ApprovalView(self)._view)
             call_ids = frozenset(
                 str(it.get("call_id", "")) for it in event.items if it.get("call_id")
@@ -916,27 +945,6 @@ class TurnstoneBot:
             msg = await target.send(chunk)  # type: ignore[union-attr]
 
         return str(msg.id) if msg else ""
-
-    def register_thread_invoker(self, thread_id: int, discord_user_id: int) -> None:
-        """Record the Discord user who caused *thread_id* to be created.
-
-        Sec-3 gates inbound messages on thread ownership.  When the bot
-        itself creates the thread via ``channel.create_thread(...)``
-        Discord sets ``thread.owner_id`` to the bot, so ``channel.owner_id``
-        alone would silently drop every legitimate follow-up from the
-        human who triggered the session.
-        """
-        self._thread_invokers[thread_id] = discord_user_id
-        self._thread_invokers.move_to_end(thread_id)
-        while len(self._thread_invokers) > _THREAD_INVOKER_CAP:
-            self._thread_invokers.popitem(last=False)
-
-    def get_thread_invoker(self, thread_id: int) -> int | None:
-        """Return the recorded invoker for *thread_id*, or ``None``."""
-        invoker = self._thread_invokers.get(thread_id)
-        if invoker is not None:
-            self._thread_invokers.move_to_end(thread_id)
-        return invoker
 
     async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str:
         """Send a notification and track the message for reply routing (DMs only).

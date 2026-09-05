@@ -1,9 +1,9 @@
 """Shared SSE listener loop for channel adapters.
 
 Both the Discord and Slack adapters subscribe to per-workstream SSE event
-streams with identical reconnect / 404-stale-route / backoff behaviour.
+streams with identical reconnect / unavailable-session / backoff behaviour.
 :func:`run_sse_stream` extracts that loop so each adapter supplies only
-its platform-specific ``on_event`` and ``on_stale`` callbacks.
+its platform-specific ``on_event`` and ``on_unavailable`` callbacks.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ async def run_sse_stream(
     node_url_fn: Callable[[str], Awaitable[str]],
     token_factory: Callable[[], str] | None,
     on_event: Callable[[ServerEvent], Awaitable[None]],
-    on_stale: Callable[[], Awaitable[None]],
+    on_unavailable: Callable[[], Awaitable[None]],
 ) -> None:
     """Run an SSE subscription loop with reconnect/backoff for one workstream.
 
@@ -54,10 +54,11 @@ async def run_sse_stream(
     on_event:
         Async callback invoked once per parsed :class:`ServerEvent`.
         Exceptions are logged and do not kill the stream.
-    on_stale:
+    on_unavailable:
         Async callback invoked when the server returns 404 for *ws_id*,
-        indicating the workstream was evicted/closed. After ``on_stale``
-        returns, the loop exits (does not reconnect).
+        indicating no usable session on that node. Only transient subscription
+        state should be cleared: saved history and the channel route may still
+        exist. The loop then exits; an inbound message can recover the session.
     """
     delay = SSE_RECONNECT_DELAY
     url = ""
@@ -67,7 +68,7 @@ async def run_sse_stream(
             node_base = await node_url_fn(ws_id)
             url = f"{node_base}/v1/api/workstreams/{ws_id}/events"
 
-            sse_headers: dict[str, str] | None = None
+            sse_headers: dict[str, str] = {}
             if token_factory is not None:
                 sse_headers = {"Authorization": f"Bearer {token_factory()}"}
 
@@ -80,14 +81,14 @@ async def run_sse_stream(
             ) as event_source:
                 status = event_source.response.status_code
                 if status == 404:
-                    log.info(f"{log_prefix}.sse_ws_gone", ws_id=ws_id)
+                    log.info(f"{log_prefix}.sse_ws_unavailable", ws_id=ws_id)
                     # The 404-stops-reconnect invariant belongs to this loop,
-                    # not to the caller — if on_stale raises we still exit.
+                    # not to the caller — if cleanup raises we still exit.
                     try:
-                        await on_stale()
+                        await on_unavailable()
                     except Exception:
                         log.warning(
-                            f"{log_prefix}.sse_on_stale_failed",
+                            f"{log_prefix}.sse_on_unavailable_failed",
                             ws_id=ws_id,
                             exc_info=True,
                         )

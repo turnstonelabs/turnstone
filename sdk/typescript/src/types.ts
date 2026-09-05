@@ -169,6 +169,8 @@ export interface CreateWorkstreamRequest {
    */
   user_id?: string;
   resume_ws?: string;
+  /** Require an exact source ID; disable alias and prefix resolution. */
+  resume_ws_exact?: boolean;
   /** Completion-notification targets as JSON text or structured target objects. */
   notify_targets?: string | Array<Record<string, string>>;
   /** Client surface label such as web, cli, chat, or scheduled. */
