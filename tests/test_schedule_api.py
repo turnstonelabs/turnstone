@@ -457,29 +457,6 @@ class TestScheduleAPI:
         assert resp.status_code == 400
         assert "time zone" in resp.json()["error"]
 
-    def test_re_enabling_a_one_shot_clears_its_last_run(self, client, storage):
-        # The shelf reads a disabled one-shot with a last_run as completed.
-        # Re-armed with a new time, the earlier firing no longer counts: if
-        # the new one is given up (no node took it) the shelf must show it
-        # disabled, not completed.
-        self._stored(
-            storage,
-            "again",
-            schedule_type="at",
-            cron_expr="",
-            at_time="2020-01-01T12:00:00+00:00",
-            next_run="",
-        )
-        storage.update_scheduled_task("again", enabled=False, last_run="2020-01-01T12:00:00")
-        resp = client.put(
-            "/v1/api/admin/schedules/again",
-            json={"at_time": "2099-01-01T12:00:00+00:00", "enabled": True},
-        )
-        assert resp.status_code == 200, resp.text
-        task = storage.get_scheduled_task("again")
-        assert task["enabled"] and task["last_run"] == ""
-        assert task["next_run"] == "2099-01-01T12:00:00"
-
     def test_update_renaming_a_missed_one_shot_is_allowed(self, client, storage):
         # A one-shot whose time passed without dispatching (no reachable
         # node, say) is still enabled; renaming it from the shelf resends its

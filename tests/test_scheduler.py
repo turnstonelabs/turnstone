@@ -721,10 +721,9 @@ class TestSchedulerTick:
 
         assert storage.record_task_run.call_count == 1
 
-    def test_a_console_fault_leaves_the_firing_due_and_unrecorded(self, mocks):
-        # A token that will not mint is the console's fault, not an outcome
-        # of the firing: no row is written and the schedule is left as it
-        # was, for the tick's guard to log.
+    def test_a_client_that_cannot_be_built_is_a_certain_non_creation(self, mocks):
+        # A token that will not mint sent nothing: a failed row, and the
+        # firing is held for the bounded retry like any other.
         collector, storage = mocks
         storage.list_due_tasks.return_value = [_make_task()]
         collector.get_nodes.return_value = ([_make_node()], 1)
@@ -735,8 +734,38 @@ class TestSchedulerTick:
         scheduler = TaskScheduler(collector, storage, token_manager=token_manager)
         scheduler._tick()
 
-        storage.record_task_run.assert_not_called()
+        assert storage.record_task_run.call_args.kwargs["error"] == (
+            "node-001: no client (RuntimeError)"
+        )
         storage.update_scheduled_task.assert_not_called()
+        assert "task_001" in scheduler._holds
+
+    def test_a_fan_out_keeps_an_earlier_success_when_a_later_client_fails(self, mocks):
+        # A client fault on the second node must not escape past the first
+        # node's created workstream: the firing is created, the schedule
+        # advances, and the next tick does not create a second on node-001.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task(target_mode="all")]
+        collector.get_nodes.return_value = ([_make_node("node-001"), _make_node("node-002")], 2)
+        collector.get_node_detail.side_effect = lambda nid: {"server_url": f"http://{nid}:8080"}
+        good = MagicMock()
+        good.create_workstream.return_value = _mock_create_response()
+
+        def client_for(url):
+            if url.startswith("http://node-001"):
+                return good
+            raise ValueError("bad url")
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler, "_get_sdk_client", side_effect=client_for):
+            scheduler._tick()
+
+        assert good.create_workstream.call_count == 1
+        rows = [
+            (c.kwargs["status"], c.kwargs["error"]) for c in storage.record_task_run.call_args_list
+        ]
+        assert rows == [("dispatched", ""), ("failed", "node-002: no client (ValueError)")]
+        assert storage.update_scheduled_task.call_args.kwargs["last_run"]
 
     @pytest.mark.parametrize(
         ("row", "kept"),

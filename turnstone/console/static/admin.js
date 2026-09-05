@@ -1184,7 +1184,7 @@ function _renderSchedules(schedules) {
     let statusCls = enabled ? "sched-active" : "sched-disabled";
     let statusLabel = enabled ? "active" : "disabled";
     let statusDot = enabled ? "\u25cf " : "\u25cb ";
-    if (s.schedule_type === "at" && !enabled && s.last_run) {
+    if (s.schedule_type === "at" && !enabled && _schCompleted(s)) {
       statusCls = "sched-expired";
       statusLabel = "completed";
       statusDot = "\u25c9 ";
@@ -1532,6 +1532,17 @@ function _populateNotifyRows(prefix, targets) {
 }
 
 // Browser-local "YYYY-MM-DD HH:MM" for a server UTC timestamp (list cells).
+// A one-shot has completed when its last run is at or after its scheduled
+// instant.  Re-armed to a later time, converted from a cron that had run, or
+// given up without running, it has not.  last_run is naive UTC; at_time
+// carries its own offset.
+function _schCompleted(s) {
+  if (!s.last_run || !s.at_time) return false;
+  const ran = Date.parse(s.last_run + "Z");
+  const due = Date.parse(s.at_time);
+  return !isNaN(ran) && !isNaN(due) && ran >= due;
+}
+
 function _schLocal(utcStr) {
   return window.TurnstoneScheduleBuilder.utcToLocalDatetime(utcStr).replace(
     "T",

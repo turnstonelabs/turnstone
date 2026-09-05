@@ -78,8 +78,10 @@ frozen.
   retry writes one `failed` row per attempt naming each node, not one per
   node. Held firings live in a `system_settings` row beside the scheduler
   lock, so consoles share the pacing and a restart does not restart the
-  window. Re-enabling a one-shot now clears its `last_run`, so one that
-  never runs again shows as disabled rather than completed.
+  window. The schedule shelf reads a one-shot as completed only when its
+  last run is at or after its scheduled time, so one re-armed to a later
+  time, or converted from a cron that had run, that then never runs shows
+  as disabled.
 
 ### Changed
 

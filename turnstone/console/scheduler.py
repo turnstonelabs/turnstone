@@ -513,10 +513,15 @@ class TaskScheduler:
         if not server_url:
             return _Outcome.NOT_CREATED, f"No URL for node {node_id}"
 
-        # Outside the try: a fault of the console's own (a token that will
-        # not mint) is neither outcome, and the tick's guard logs it and
-        # leaves the firing due.
-        client = self._get_sdk_client(server_url)
+        try:
+            client = self._get_sdk_client(server_url)
+        except Exception as exc:
+            # A URL httpx will not take, or a token that will not mint:
+            # nothing was sent.  Classified rather than raised, so a fan-out
+            # keeps the nodes that already created their workstream.
+            log.warning("scheduler.sdk_client_failed", node_id=node_id, exc_info=True)
+            return _Outcome.NOT_CREATED, f"{node_id}: no client ({type(exc).__name__})"
+
         correlation_id = uuid.uuid4().hex
         try:
             resp = client.create_workstream(
