@@ -12,6 +12,20 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
+## [Unreleased]
+
+### Added
+
+- **Scheduled tasks from the dashboard (#1090).** The console launcher's kind
+  toggle gains **Scheduled** next to Coordinator and Interactive, shown to
+  callers with `admin.schedules`. It takes the interactive field set plus a
+  When builder (Daily / Weekly / Monthly / Interval / Once / Cron with a live
+  next-runs read-out) and stores the schedule for the scheduler to dispatch;
+  a confirmation names the first run. The admin schedule shelf and the
+  launcher now share one timing builder; its "next runs" read-out shows each
+  run in the browser's local zone, and the shelf's NEXT RUN column now
+  converts the server's UTC time to local time instead of relabelling it.
+
 ## [1.8.2]
 
 Turnstone 1.8.2 moves model endpoints entirely into model definitions and

@@ -395,8 +395,11 @@
   border-radius: 3px;
 }
 
-/* form cadence — the .admin-modal label/input language, carried verbatim */
-.sh-body label {
+/* form cadence — the .admin-modal label/input language, carried verbatim.
+   .when-builder (the schedule "When" template) carries the same cadence
+   wherever it is mounted, so the launcher host renders it like a shelf. */
+.sh-body label,
+.when-builder label {
   display: block;
   font-family: var(--font-ui);
   font-size: 10px;
@@ -406,7 +409,8 @@
   color: var(--fg-dim);
   margin: 14px 0 5px;
 }
-.sh-body label:first-child {
+.sh-body label:first-child,
+.when-builder label:first-child {
   margin-top: 0;
 }
 /* The console's label.toggle-switch (style.css) ties with .sh-body label at
@@ -423,7 +427,10 @@
   font-weight: 500;
   color: var(--fg);
 }
+/* Monospace field: the input cadence below sets font from --field-font so
+   the class wins without a specificity contest against `font: inherit`. */
 .sh-mono {
+  --field-font: var(--font-mono);
   font-family: var(--font-mono);
 }
 .label-hint {
@@ -438,7 +445,9 @@
 }
 .sh-body input:not([type="checkbox"]):not([type="radio"]),
 .sh-body select,
-.sh-body textarea {
+.sh-body textarea,
+.when-builder input:not([type="checkbox"]):not([type="radio"]),
+.when-builder select {
   width: 100%;
   padding: 9px 12px;
   background: var(--bg);
@@ -446,21 +455,29 @@
   border-radius: var(--r-sm);
   color: var(--fg);
   font: inherit;
+  font-family: var(--field-font, inherit);
   font-size: 13px;
   transition:
     border-color 0.15s,
     box-shadow 0.15s;
 }
+/* Focus rings stay on the system --accent in every host on purpose: a focus
+   ring is a system-wide affordance, not host chrome (the launcher's builder
+   retints its pressed states through --hatch-accent, not its rings). */
 .sh-body input:focus-visible,
 .sh-body select:focus-visible,
-.sh-body textarea:focus-visible {
+.sh-body textarea:focus-visible,
+.when-builder input:focus-visible,
+.when-builder select:focus-visible {
   border-color: var(--accent);
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
 .sh-body input:disabled,
 .sh-body select:disabled,
-.sh-body textarea:disabled {
+.sh-body textarea:disabled,
+.when-builder input:disabled,
+.when-builder select:disabled {
   opacity: 0.55;
   cursor: not-allowed;
   background: var(--bg-highlight);
@@ -468,7 +485,8 @@
   color: var(--fg-dim);
 }
 .sh-body input::placeholder,
-.sh-body textarea::placeholder {
+.sh-body textarea::placeholder,
+.when-builder input::placeholder {
   color: var(--fg-dim);
   opacity: 0.6;
 }
@@ -476,7 +494,8 @@
   resize: vertical;
   min-height: 64px;
 }
-.sh-body select {
+.sh-body select,
+.when-builder select {
   appearance: none;
   -webkit-appearance: none;
   cursor: pointer;
@@ -704,9 +723,13 @@
    Smart-input primitives — "the system already knows"
    ========================================================================== */
 
-/* segmented mode picker (compiles to the raw field) */
+/* segmented mode picker (compiles to the raw field).  Wraps rather than
+   overflowing its track in a narrow pane.  Pressed / selected states below
+   follow the host's --hatch-accent (a shelf's kind colour, the launcher's
+   blue) and tint at 15% with a same-hue ring so they read in light too. */
 .seg {
   display: flex;
+  flex-wrap: wrap;
   background: var(--bg);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
@@ -734,8 +757,14 @@
   color: var(--fg);
 }
 .seg button[aria-pressed="true"] {
-  background: var(--accent-dim);
-  color: var(--accent);
+  background: color-mix(
+    in srgb,
+    var(--hatch-accent, var(--accent)) 15%,
+    transparent
+  );
+  color: var(--hatch-accent, var(--accent));
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--hatch-accent, var(--accent)) 45%, transparent);
   font-weight: 600;
 }
 .seg button:focus-visible {
@@ -767,9 +796,13 @@
     color 0.12s;
 }
 .chips button[aria-pressed="true"] {
-  background: var(--accent-dim);
-  border-color: var(--accent);
-  color: var(--accent);
+  background: color-mix(
+    in srgb,
+    var(--hatch-accent, var(--accent)) 15%,
+    transparent
+  );
+  border-color: var(--hatch-accent, var(--accent));
+  color: var(--hatch-accent, var(--accent));
 }
 .chips button:focus-visible {
   outline: 2px solid var(--accent);
@@ -814,7 +847,7 @@
   flex: 1;
   text-align: right;
   font-size: 11.5px;
-  color: var(--accent);
+  color: var(--hatch-accent, var(--accent));
   font-weight: 600;
 }
 .readout-rows {
@@ -832,11 +865,16 @@
 .readout-row .rel {
   color: var(--ink-4);
 }
-.readout-rows .err {
+.readout-rows .err,
+.readout-rows .hint {
   color: var(--red);
   font-family: var(--font-ui);
   font-size: 11.5px;
   padding: 4px 0;
+}
+/* an untouched mode that still needs input — a prompt, not a failure */
+.readout-rows .hint {
+  color: var(--fg-dim);
 }
 [data-theme="light"] .readout-label,
 [data-theme="light"] .readout-row .rel {

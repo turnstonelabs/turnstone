@@ -19,6 +19,8 @@
  *   value           — current textarea value (getter / setter)
  *   focus()         — focus the textarea
  *   clear()         — empty the textarea + reset auto-resize
+ *   setSendLabel(label, busyLabel?) — swap the send button's labels
+ *   setAttachVisible(visible) — show / hide the attach button
  *   setBusy(b)      — toggle send/queue label, show/hide stop button,
  *                     swap placeholder if `busyPlaceholder` was set
  *   destroy()       — detach event listeners and remove DOM
@@ -306,20 +308,49 @@ Composer.prototype._buildInput = function (row, opts) {
   row.appendChild(this.inputEl);
 };
 
+// Swap the send button's idle / busy labels after construction (a launcher
+// whose kind changes what "send" means).  Mirrors the constructor's
+// busyLabel fallback and setBusy's rotation, so the label shown matches the
+// current busy state and the aria-label tracks it; a glyph send button keeps
+// its glyph (only the aria-label follows).
+// The busy label's fallback rule, shared by construction and setSendLabel:
+// "Queue" only makes sense when queueWhileBusy=true (the send button stays
+// clickable during busy to accept queued messages); non-queue consumers that
+// omit busyLabel get no label rotation, so the disabled button doesn't
+// misleadingly read "Queue" when queueing isn't supported by the caller.
+function resolveBusyLabel(idle, busyLabel, queueWhileBusy) {
+  if (busyLabel != null) return busyLabel;
+  return queueWhileBusy ? "Queue" : idle;
+}
+
+Composer.prototype.setSendLabel = function (label, busyLabel) {
+  var idle = label || "Send";
+  var busy = resolveBusyLabel(idle, busyLabel, this._opts.queueWhileBusy);
+  // Callers repeat this on every option change; skip the DOM writes when
+  // nothing moved (compare the resolved labels, not the raw arguments).
+  if (idle === this._sendLabel && busy === this._busyLabel) return;
+  this._sendLabel = idle;
+  this._busyLabel = busy;
+  var shown = this._busy ? this._busyLabel : this._sendLabel;
+  if (!this._sendGlyph) this.sendBtn.textContent = shown;
+  if (!this._opts.queueWhileBusy)
+    this.sendBtn.setAttribute("aria-label", shown + " message");
+};
+
+// Show / hide the attach button (a launcher kind that cannot carry files).
+// The button keeps its busy-managed disabled / title state while hidden;
+// no-op when attachments are disabled.
+Composer.prototype.setAttachVisible = function (visible) {
+  if (this.attachBtn) this.attachBtn.hidden = !visible;
+};
+
 Composer.prototype._buildSendButton = function (row, opts) {
   this._sendLabel = opts.sendLabel || "Send";
-  // busyLabel default is context-sensitive: "Queue" only makes sense
-  // when queueWhileBusy=true (the send button stays clickable during
-  // busy to accept queued messages).  Non-queue consumers that omit
-  // busyLabel fall back to sendLabel — no label rotation on busy —
-  // so the disabled button doesn't misleadingly read "Queue" when
-  // queueing isn't actually supported by the caller.
-  this._busyLabel =
-    opts.busyLabel != null
-      ? opts.busyLabel
-      : opts.queueWhileBusy
-        ? "Queue"
-        : this._sendLabel;
+  this._busyLabel = resolveBusyLabel(
+    this._sendLabel,
+    opts.busyLabel,
+    opts.queueWhileBusy,
+  );
   // Glyph mode (chat composers): show a send GLYPH instead of a word.  The
   // textual sendLabel stays the aria-label and drives setBusy's a11y
   // rotation, but the visible glyph is constant (setBusy never overwrites it).
@@ -822,15 +853,24 @@ Composer.prototype.setOptionChoices = function (id, choices) {
   this._refreshOptionsSummary();
 };
 
-// Update just the placeholder (first) option's text without disturbing
-// the rest of the choice list.  Callers that resolve the effective
-// default asynchronously use this to annotate the empty option with the
-// concrete alias — e.g. "Default model" → "Default model (gpt-5)".
+// Update a field's placeholder: for a select, just the placeholder (first)
+// option's text without disturbing the rest of the choice list — callers
+// that resolve the effective default asynchronously use this to annotate
+// the empty option with the concrete alias, e.g. "Default model" → "Default
+// model (gpt-5)"; for a text input, its placeholder attribute (a launcher
+// whose kind changes what an empty field means).
 Composer.prototype.setOptionPlaceholder = function (id, text) {
   var ctrl = this._optionFields && this._optionFields[id];
-  if (!ctrl || ctrl.tagName !== "SELECT") return;
-  if (ctrl.options.length === 0) return;
-  ctrl.options[0].textContent = text == null ? "" : String(text);
+  if (!ctrl) return;
+  var isSelect = ctrl.tagName === "SELECT";
+  if (isSelect && ctrl.options.length === 0) return;
+  var value = text == null ? "" : String(text);
+  // Callers repeat this on every repaint / option change; skip the write
+  // and the summary refresh when the text is already in place.
+  var current = isSelect ? ctrl.options[0].textContent : ctrl.placeholder;
+  if (current === value) return;
+  if (isSelect) ctrl.options[0].textContent = value;
+  else ctrl.placeholder = value;
   this._refreshOptionsSummary();
 };
 

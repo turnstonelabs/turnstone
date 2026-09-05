@@ -1052,16 +1052,20 @@
   outline-offset: -2px;
 }
 
-/* ===== Dashboard session launcher — kind toggle (coordinator | interactive).
-   A console-dashboard control; lives here because the L-shell loads shell.css.
+/* ===== Dashboard session launcher — kind toggle
+   (coordinator | interactive | scheduled).  A console-dashboard control;
+   lives here because the L-shell loads shell.css.
 
    The active option wears its KIND, not a neutral highlight: amber for
    coordinator, cyan for interactive — the same vocabulary as the pane-head
-   .ptag chips and the rail's session rows, so "which kind am I starting"
-   reads at a glance.  Tints are 15% (sub-0.10 washes out at chip size) and
-   colour is never alone: the kind LED + label weight carry the state too. */
+   .ptag chips and the rail's session rows — and blue for scheduled (the
+   system-operation hue: the scheduler starts it; magenta is reserved for
+   the MCP surface), so "which kind am I starting" reads at a glance.  Tints
+   are 15% (sub-0.10 washes out at chip size) and colour is never alone: the
+   kind LED + label weight carry the state too. */
 .launcher-kinds {
   display: inline-flex;
+  flex-wrap: wrap; /* three kinds outgrow a narrow split pane — wrap, not clip */
   gap: 2px;
   margin-bottom: 10px;
   padding: 3px;
@@ -1072,6 +1076,7 @@
 .kind-btn {
   display: inline-flex;
   align-items: center;
+  min-width: 0;
   gap: 7px;
   padding: 5px 14px;
   border: 0;
@@ -1123,6 +1128,15 @@
   background: var(--cyan);
   opacity: 1;
   box-shadow: 0 0 6px var(--cyan-glow);
+}
+.kind-btn--sched.active {
+  background: color-mix(in srgb, var(--blue) 15%, transparent);
+  color: var(--blue);
+}
+.kind-btn--sched.active .kind-led {
+  background: var(--blue);
+  opacity: 1;
+  box-shadow: 0 0 6px var(--blue-glow);
 }
 /* kind tag in the saved-sessions table — shares the rail chip base
    (.row .tag above); only no-wrap + the INT colour differ. */

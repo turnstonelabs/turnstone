@@ -1171,13 +1171,9 @@ function _renderSchedules(schedules) {
     const typeCls =
       s.schedule_type === "cron" ? "scope-write" : "scope-approve";
     const schedule =
-      s.schedule_type === "cron"
-        ? s.cron_expr
-        : _utcToLocalDatetime(s.at_time).replace("T", " ");
+      s.schedule_type === "cron" ? s.cron_expr : _schLocal(s.at_time);
     const target = s.target_mode;
-    const nextRun = s.next_run
-      ? _utcToLocalDatetime(s.next_run).replace("T", " ")
-      : "\u2014";
+    const nextRun = s.next_run ? _schLocal(s.next_run) : "\u2014";
     const enabled = s.enabled;
     let statusCls = enabled ? "sched-active" : "sched-disabled";
     let statusLabel = enabled ? "active" : "disabled";
@@ -1204,7 +1200,7 @@ function _renderSchedules(schedules) {
       escapeHtml(target) +
       "</span>" +
       '<span class="admin-col admin-col-snext">' +
-      nextRun +
+      escapeHtml(nextRun) +
       "</span>" +
       '<span class="admin-col admin-col-sstatus"><span class="' +
       statusCls +
@@ -1527,300 +1523,24 @@ function _populateNotifyRows(prefix, targets) {
   });
 }
 
-function _localToUtcIso(localDatetimeStr) {
-  // datetime-local gives "YYYY-MM-DDTHH:MM" in browser local time
-  // Convert to UTC ISO string for the server
-  const d = new Date(localDatetimeStr);
-  if (isNaN(d.getTime())) return "";
-  return d.toISOString().replace(/\.\d{3}Z$/, "+00:00");
-}
-
-function _utcToLocalDatetime(utcStr) {
-  // Convert UTC ISO string to datetime-local format in browser local time
-  if (!utcStr) return "";
-  const d = new Date(utcStr);
-  if (isNaN(d.getTime())) return utcStr.slice(0, 16);
-  const pad = function (n) {
-    return n < 10 ? "0" + n : "" + n;
-  };
-  return (
-    d.getFullYear() +
-    "-" +
-    pad(d.getMonth() + 1) +
-    "-" +
-    pad(d.getDate()) +
-    "T" +
-    pad(d.getHours()) +
-    ":" +
-    pad(d.getMinutes())
+// Browser-local "YYYY-MM-DD HH:MM" for a server UTC timestamp (list cells).
+function _schLocal(utcStr) {
+  return window.TurnstoneScheduleBuilder.utcToLocalDatetime(utcStr).replace(
+    "T",
+    " ",
   );
 }
 
 // --- Schedule shelf (create + edit) ---
-// The cron DSL is compiled, not typed: the segmented Runs control builds
-// schedule_type/cron_expr/at_time, and the NEXT RUNS read-out previews the
-// result through the server's croniter (POST /v1/api/admin/schedules/preview)
-// as the user edits.  Cron mode is the raw escape hatch with the same live
-// read-out.  Storage is unchanged: on edit the saved expression is
-// reverse-parsed back into the friendly mode when its shape matches
-// (_cronToScheduleMode), else the editor opens in Cron mode.
+// Timing comes from the shared Runs builder (schedule_builder.js): the
+// segmented control compiles to schedule_type / cron_expr / at_time and the
+// NEXT RUNS read-out previews the result through the server's croniter as
+// the user edits.  The shelf owns the rest of the form plus the footer
+// "compiles to" read-out.
 
 let _schWired = false;
-let _schPreviewTimer = null;
-let _schPreviewSeq = 0;
 let _schShelfHandle = null;
-
-function _schMode() {
-  const seg = document.getElementById("sch-seg");
-  const on = seg.querySelector('[aria-pressed="true"]');
-  return on ? on.getAttribute("data-mode") : "daily";
-}
-
-function _schSetMode(mode) {
-  const seg = document.getElementById("sch-seg");
-  seg.querySelectorAll("button[data-mode]").forEach(function (b) {
-    b.setAttribute(
-      "aria-pressed",
-      b.getAttribute("data-mode") === mode ? "true" : "false",
-    );
-  });
-  document
-    .querySelectorAll("#schedule-shelf [data-sch-pane]")
-    .forEach(function (pane) {
-      pane.hidden = pane.getAttribute("data-sch-pane") !== mode;
-    });
-}
-
-function _schSelectedDays() {
-  const out = [];
-  document
-    .querySelectorAll('#sch-days button[aria-pressed="true"]')
-    .forEach(function (b) {
-      out.push(parseInt(b.getAttribute("data-day"), 10));
-    });
-  return out.sort();
-}
-
-function _schSetDays(days) {
-  document.querySelectorAll("#sch-days button").forEach(function (b) {
-    const d = parseInt(b.getAttribute("data-day"), 10);
-    b.setAttribute("aria-pressed", days.indexOf(d) >= 0 ? "true" : "false");
-  });
-}
-
-function _schTimeParts(id) {
-  const v = document.getElementById(id).value || "06:00";
-  const parts = v.split(":");
-  return [parseInt(parts[0], 10) || 0, parseInt(parts[1], 10) || 0];
-}
-
-// Compile the builder state down to the wire fields.  Returns
-// {schedule_type, cron_expr, at_time} or {error}.
-function _schCompile() {
-  const mode = _schMode();
-  if (mode === "once") {
-    const local = document.getElementById("sch-at").value || "";
-    if (!local) return { error: "Pick a date and time" };
-    return {
-      schedule_type: "at",
-      cron_expr: "",
-      at_time: _localToUtcIso(local),
-    };
-  }
-  if (mode === "cron") {
-    const expr = (document.getElementById("sch-cron").value || "").trim();
-    if (!expr) return { error: "Cron expression is required" };
-    return { schedule_type: "cron", cron_expr: expr, at_time: "" };
-  }
-  let h, m;
-  if (mode === "daily") {
-    [h, m] = _schTimeParts("sch-time-daily");
-    return {
-      schedule_type: "cron",
-      cron_expr: m + " " + h + " * * *",
-      at_time: "",
-    };
-  }
-  if (mode === "weekly") {
-    const days = _schSelectedDays();
-    if (!days.length) return { error: "Select at least one day" };
-    [h, m] = _schTimeParts("sch-time-weekly");
-    return {
-      schedule_type: "cron",
-      cron_expr: m + " " + h + " * * " + days.join(","),
-      at_time: "",
-    };
-  }
-  if (mode === "monthly") {
-    const dom = parseInt(document.getElementById("sch-dom").value, 10);
-    if (!dom || dom < 1 || dom > 31)
-      return { error: "Day of month must be 1-31" };
-    [h, m] = _schTimeParts("sch-time-monthly");
-    return {
-      schedule_type: "cron",
-      cron_expr: m + " " + h + " " + dom + " * *",
-      at_time: "",
-    };
-  }
-  // interval
-  const n = parseInt(document.getElementById("sch-every").value, 10);
-  if (!n || n < 1) return { error: "Interval must be at least 1" };
-  const unit = document.getElementById("sch-unit").value;
-  const expr = unit === "hours" ? "0 */" + n + " * * *" : "*/" + n + " * * * *";
-  return { schedule_type: "cron", cron_expr: expr, at_time: "" };
-}
-
-const _SCH_DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-function _schDescribe() {
-  const mode = _schMode();
-  const t = function (id) {
-    const parts = _schTimeParts(id);
-    const pad = function (n) {
-      return n < 10 ? "0" + n : "" + n;
-    };
-    return pad(parts[0]) + ":" + pad(parts[1]);
-  };
-  if (mode === "daily") return "every day at " + t("sch-time-daily") + " UTC";
-  if (mode === "weekly") {
-    const names = _schSelectedDays().map(function (d) {
-      return _SCH_DAY_NAMES[d];
-    });
-    return names.length
-      ? "every " + names.join(", ") + " at " + t("sch-time-weekly") + " UTC"
-      : "no days selected";
-  }
-  if (mode === "monthly")
-    return (
-      "monthly on day " +
-      (document.getElementById("sch-dom").value || "?") +
-      " at " +
-      t("sch-time-monthly") +
-      " UTC"
-    );
-  if (mode === "interval")
-    return (
-      "every " +
-      (document.getElementById("sch-every").value || "?") +
-      " " +
-      document.getElementById("sch-unit").value
-    );
-  if (mode === "once") return "one time";
-  return "custom cron";
-}
-
-// Reverse-parse a saved expression into builder state.  Only the exact
-// shapes the builder emits round-trip; anything else opens in Cron mode.
-function _cronToScheduleMode(expr) {
-  let m = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(expr);
-  if (m) return { mode: "daily", h: +m[2], min: +m[1] };
-  m = /^(\d{1,2}) (\d{1,2}) \* \* ([0-7](?:,[0-7])*)$/.exec(expr);
-  if (m)
-    return {
-      mode: "weekly",
-      h: +m[2],
-      min: +m[1],
-      days: m[3].split(",").map(function (d) {
-        return +d % 7; // cron allows 7 for Sunday
-      }),
-    };
-  m = /^(\d{1,2}) (\d{1,2}) (\d{1,2}) \* \*$/.exec(expr);
-  if (m) return { mode: "monthly", h: +m[2], min: +m[1], dom: +m[3] };
-  m = /^0 \*\/(\d+) \* \* \*$/.exec(expr);
-  if (m) return { mode: "interval", every: +m[1], unit: "hours" };
-  m = /^\*\/(\d+) \* \* \* \*$/.exec(expr);
-  if (m) return { mode: "interval", every: +m[1], unit: "minutes" };
-  return { mode: "cron" };
-}
-
-function _schSetTime(id, h, min) {
-  const pad = function (n) {
-    return n < 10 ? "0" + n : "" + n;
-  };
-  document.getElementById(id).value = pad(h) + ":" + pad(min);
-}
-
-// Apply a saved schedule's timing to the builder (edit mode).
-function _schApplyTiming(scheduleType, cronExpr, atTime) {
-  if (scheduleType === "at") {
-    document.getElementById("sch-at").value = _utcToLocalDatetime(atTime);
-    _schSetMode("once");
-    return;
-  }
-  const parsed = _cronToScheduleMode(cronExpr || "");
-  if (parsed.mode === "daily")
-    _schSetTime("sch-time-daily", parsed.h, parsed.min);
-  else if (parsed.mode === "weekly") {
-    _schSetTime("sch-time-weekly", parsed.h, parsed.min);
-    _schSetDays(parsed.days);
-  } else if (parsed.mode === "monthly") {
-    _schSetTime("sch-time-monthly", parsed.h, parsed.min);
-    document.getElementById("sch-dom").value = parsed.dom;
-  } else if (parsed.mode === "interval") {
-    document.getElementById("sch-every").value = parsed.every;
-    document.getElementById("sch-unit").value = parsed.unit;
-  } else {
-    document.getElementById("sch-cron").value = cronExpr || "";
-  }
-  _schSetMode(parsed.mode);
-}
-
-function _schFmtUtc(iso) {
-  // Server emits "YYYY-MM-DDTHH:MM:SS" (UTC, no suffix) or "+00:00" ISO.
-  const d = new Date(/[Z+]/.test(iso) ? iso : iso + "Z");
-  if (isNaN(d.getTime())) return iso;
-  const pad = function (n) {
-    return n < 10 ? "0" + n : "" + n;
-  };
-  return (
-    _SCH_DAY_NAMES[d.getUTCDay()] +
-    " " +
-    d.getUTCFullYear() +
-    "-" +
-    pad(d.getUTCMonth() + 1) +
-    "-" +
-    pad(d.getUTCDate()) +
-    " " +
-    pad(d.getUTCHours()) +
-    ":" +
-    pad(d.getUTCMinutes()) +
-    " UTC"
-  );
-}
-
-function _schRel(iso) {
-  const d = new Date(/[Z+]/.test(iso) ? iso : iso + "Z");
-  if (isNaN(d.getTime())) return "";
-  const mins = Math.round((d.getTime() - Date.now()) / 60000);
-  if (mins < 1) return "now";
-  if (mins < 60) return "in " + mins + "m";
-  if (mins < 48 * 60) return "in " + Math.round(mins / 60) + "h";
-  return "in " + Math.round(mins / (24 * 60)) + "d";
-}
-
-function _schRenderRuns(runs, errText) {
-  const rows = document.getElementById("sch-runs-out");
-  while (rows.firstChild) rows.removeChild(rows.firstChild);
-  if (errText) {
-    const err = document.createElement("div");
-    err.className = "err";
-    err.textContent = errText;
-    rows.appendChild(err);
-    return;
-  }
-  runs.forEach(function (iso) {
-    const row = document.createElement("div");
-    row.className = "readout-row";
-    const when = document.createElement("span");
-    when.textContent = _schFmtUtc(iso);
-    const rel = document.createElement("span");
-    rel.className = "rel";
-    rel.textContent = _schRel(iso);
-    row.appendChild(when);
-    row.appendChild(rel);
-    rows.appendChild(row);
-  });
-}
+let _schWhen = null; // ScheduleBuilder mounted in #sch-when-mount
 
 function _schRenderCompiled(compiled) {
   const meta = document.getElementById("sch-compiled-out");
@@ -1841,70 +1561,12 @@ function _schRenderCompiled(compiled) {
   }
 }
 
-// Debounced read-out refresh: description + compiled text render instantly,
-// the next-runs list arrives from the croniter preview endpoint.
-function _schPreview() {
-  document.getElementById("sch-desc-out").textContent = _schDescribe();
-  const compiled = _schCompile();
-  _schRenderCompiled(compiled);
-  if (compiled.error) {
-    _schRenderRuns([], compiled.error);
-    return;
-  }
-  if (_schPreviewTimer) clearTimeout(_schPreviewTimer);
-  const seq = ++_schPreviewSeq;
-  _schPreviewTimer = setTimeout(function () {
-    authFetch("/v1/api/admin/schedules/preview", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(compiled),
-    })
-      .then(function (r) {
-        return r.json();
-      })
-      .then(function (data) {
-        if (seq !== _schPreviewSeq) return; // a newer edit superseded us
-        if (!data.valid) _schRenderRuns([], data.error || "Invalid schedule");
-        else _schRenderRuns(data.next || []);
-      })
-      .catch(function () {
-        if (seq === _schPreviewSeq) _schRenderRuns([], "Preview unavailable");
-      });
-  }, 250);
-}
-
 function _schWire() {
   if (_schWired) return;
-  _schWired = true;
-  document.getElementById("sch-seg").addEventListener("click", function (e) {
-    const b = e.target.closest("button[data-mode]");
-    if (!b) return;
-    _schSetMode(b.getAttribute("data-mode"));
-    _schPreview();
-  });
-  document.getElementById("sch-days").addEventListener("click", function (e) {
-    const b = e.target.closest("button[data-day]");
-    if (!b) return;
-    b.setAttribute(
-      "aria-pressed",
-      b.getAttribute("aria-pressed") === "true" ? "false" : "true",
-    );
-    _schPreview();
-  });
-  [
-    "sch-time-daily",
-    "sch-time-weekly",
-    "sch-time-monthly",
-    "sch-dom",
-    "sch-every",
-    "sch-unit",
-    "sch-at",
-    "sch-cron",
-  ].forEach(function (id) {
-    const el = document.getElementById(id);
-    el.addEventListener("input", _schPreview);
-    el.addEventListener("change", _schPreview);
-  });
+  _schWhen = new window.TurnstoneScheduleBuilder.ScheduleBuilder(
+    document.getElementById("sch-when-mount"),
+    { onChange: _schRenderCompiled },
+  );
   document.getElementById("sch-target").addEventListener("change", function () {
     const isNode = this.value === "node";
     document.getElementById("sch-node-group").hidden = !isNode;
@@ -1918,6 +1580,9 @@ function _schWire() {
   document
     .getElementById("sch-submit")
     .addEventListener("click", _submitScheduleShelf);
+  // Latched only once everything above succeeded: a failed mount is retried
+  // on the next open instead of dying on a null builder.
+  _schWired = true;
 }
 
 // Shared open path: reset to a clean create state, then edit overwrites.
@@ -1928,15 +1593,7 @@ function _schResetForm() {
   document.getElementById("sch-id").value = "";
   document.getElementById("sch-name").value = "";
   document.getElementById("sch-desc").value = "";
-  document.getElementById("sch-time-daily").value = "06:00";
-  document.getElementById("sch-time-weekly").value = "06:00";
-  document.getElementById("sch-time-monthly").value = "06:00";
-  _schSetDays([]);
-  document.getElementById("sch-dom").value = "1";
-  document.getElementById("sch-every").value = "4";
-  document.getElementById("sch-unit").value = "hours";
-  document.getElementById("sch-at").value = "";
-  document.getElementById("sch-cron").value = "";
+  _schWhen.reset();
   document.getElementById("sch-target").value = "auto";
   document.getElementById("sch-node").value = "";
   document.getElementById("sch-node-group").hidden = true;
@@ -1944,7 +1601,6 @@ function _schResetForm() {
   document.getElementById("sch-autoapprove").checked = false;
   document.getElementById("sch-enabled").checked = true;
   _populateNotifyRows("sch", []);
-  _schSetMode("daily");
 }
 
 function _schPopulateSelects(
@@ -2010,7 +1666,7 @@ function _schOpen(title, tag, kind, submitLabel) {
   document.getElementById("sch-submit").textContent = submitLabel;
   _schShelfHandle = window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("sch-name").focus();
-  _schPreview();
+  _schWhen.preview();
 }
 
 function showCreateScheduleModal() {
@@ -2033,7 +1689,7 @@ function showEditScheduleModal(taskId) {
       document.getElementById("sch-id").value = s.task_id;
       document.getElementById("sch-name").value = s.name || "";
       document.getElementById("sch-desc").value = s.description || "";
-      _schApplyTiming(s.schedule_type, s.cron_expr, s.at_time);
+      _schWhen.apply(s.schedule_type, s.cron_expr, s.at_time);
       const isSpecificNode =
         s.target_mode &&
         s.target_mode !== "auto" &&
@@ -2078,8 +1734,11 @@ function _submitScheduleShelf() {
 
   if (!name) return _showModalError(errEl, "Name is required");
   if (!message) return _showModalError(errEl, "Initial message is required");
-  const compiled = _schCompile();
-  if (compiled.error) return _showModalError(errEl, compiled.error);
+  const compiled = _schWhen.compile();
+  if (compiled.error) {
+    _schWhen.showErrors();
+    return _showModalError(errEl, compiled.error);
+  }
 
   let targetMode = document.getElementById("sch-target").value;
   if (targetMode === "node") {
@@ -8848,7 +8507,8 @@ function _modelCapsRefreshBaseline() {
     return;
   }
   // Two type-then-pause cycles can have both fetches in flight; a reordered
-  // older response must not clobber the tiles (the _schPreviewSeq pattern).
+  // older response must not clobber the tiles (the same sequence guard the
+  // schedule builder's preview uses).
   authFetch(
     "/v1/api/admin/model-capabilities?provider=" +
       encodeURIComponent(provider) +

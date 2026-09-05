@@ -407,8 +407,10 @@ workstream rows, and tab state glyphs synchronized.
 ### Workstream launcher
 
 The landing-page composer starts a workstream with an optional initial task and
-attachments. When the caller can create both kinds, a Coordinator / Interactive
-toggle selects the target kind. Its options include:
+attachments. A Coordinator / Interactive / Scheduled toggle selects the target
+kind; each option appears only when the caller holds its permission
+(`admin.coordinator`, `workstreams.create`, `admin.schedules`), and the toggle
+is hidden when only one kind is available. Its options include:
 
 - **Node placement** — "Least loaded" picks the reachable node with the most
   headroom, or "Specific node" pins the create to a node from the live list.
@@ -424,6 +426,20 @@ Interactive launches additionally expose node strategy / node selection.
 Submitting uses `POST /v1/api/cluster/workstreams/new`; coordinator launches use
 the console's coordinator create surface. A toast confirms the committed
 create, while SSE updates the dashboard and opens the resulting pane.
+
+**Scheduled** launches store a schedule instead of starting anything: the
+scheduler later dispatches the task as an interactive workstream (see
+[Scheduled Tasks](#scheduled-tasks)). The kind carries the interactive field
+set, including node placement, and reveals a **When** builder between the
+kind toggle and the composer with Daily / Weekly / Monthly / Interval / Once /
+Cron modes and a live "next runs" read-out. Recurring times are entered in
+UTC (the cron has no zone); a one-shot takes local time; the read-out and the
+confirmation show each run in the browser's local zone. The task text becomes the
+schedule's initial message and is required; the Name option, when empty, is
+derived from the task's first line. Judge model and attachments do not apply,
+so the kind hides them. Submitting uses `POST /v1/api/admin/schedules`; a
+confirmation beneath the composer names the first run, and the schedule is
+then managed under Admin › Schedules.
 
 Files require a non-empty initial task so the first turn consumes the staged
 attachments. The console shell does not currently expose a fork action; use the
@@ -547,6 +563,12 @@ to create the initial admin user and receive a JWT in one step. See
 ## Scheduled Tasks
 
 The console includes a background **TaskScheduler** daemon that creates workstreams on a timed basis via HTTP proxy to target nodes. It supports cron-based recurring schedules and one-shot `at` schedules.
+
+Schedules are created and managed under Admin › Schedules, and can also be
+created from the dashboard launcher's Scheduled kind (see
+[Workstream launcher](#workstream-launcher)). Both surfaces share one timing
+builder; the admin shelf additionally offers a description, auto-approve,
+notification targets and the pool / all target modes.
 
 ### Architecture
 
