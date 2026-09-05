@@ -703,7 +703,7 @@ class SessionUIBase:
         self._ws_activity_state: str = ""
         # Compaction pill window: while True, on_thinking_start leaves the
         # activity alone (the impl's own thinking wrap would otherwise
-        # clobber "Compacting context…" with "Thinking…" milliseconds after
+        # clobber "Compacting context…" with "Reasoning…" milliseconds after
         # the start event set it, for the whole summarize phase).  The end
         # event restores the pre-compaction pair, so a bail can't strand a
         # stale "Compacting context…" on an idle workstream either.
@@ -3991,7 +3991,7 @@ class SessionUIBase:
                 self._ws_turn_content_size,
             )
             if not self._compaction_activity_live:
-                self._ws_current_activity = "Thinking…"
+                self._ws_current_activity = "Reasoning…"
                 self._ws_activity_state = "thinking"
         self._broadcast_activity()
         self._enqueue({"type": "thinking_start"})
@@ -4466,7 +4466,7 @@ class SessionUIBase:
         if phase == "start" and not superseded:
             # The activity pill mirrors on_thinking_start's mechanics but
             # names the actual work — the summarize calls can run for a
-            # while and "Thinking…" undersells what the session is doing.
+            # while and "Reasoning…" undersells what the session is doing.
             # Save the prior pair for the end-side restore, and latch the
             # window so the impl's own on_thinking_start can't clobber it.
             with self._ws_lock:

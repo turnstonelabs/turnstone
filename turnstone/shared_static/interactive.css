@@ -72,20 +72,6 @@
   letter-spacing: 0.02em;
 }
 
-/* Streaming content — .msg.reasoning (chat.css) styles reasoning
-   bubbles; .reasoning is never emitted on its own, only paired with
-   the .msg base class. */
-.thinking-indicator {
-  color: var(--fg-dim);
-  font-size: 12px;
-  padding: 6px 14px;
-}
-
-.thinking-indicator::after {
-  content: "...";
-  animation: dots 1.5s steps(3, end) infinite;
-}
-
 /* Historical-message attachment pills — beneath the user bubble */
 .msg-user-attach {
   display: flex;

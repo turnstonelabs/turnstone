@@ -47,7 +47,7 @@ import {
   indexLabel,
   isConvVerdictCompactBlocker,
   markConvRowResultSettled,
-  setReasoningActivity,
+  createReasoningActivity,
   setConvBatchExpanded,
   setToolOutputReviewState,
 } from "/shared/conversation.js";
@@ -1943,7 +1943,10 @@ function createCoordinatorPane(root, wsId, opts) {
       const prevBadge = row.querySelector(".conv-verdict");
       if (prevBadge) {
         const prevDetail = prevBadge.nextElementSibling;
-        if (prevDetail && prevDetail.classList.contains("conv-verdict-detail")) {
+        if (
+          prevDetail &&
+          prevDetail.classList.contains("conv-verdict-detail")
+        ) {
           prevDetail.remove();
         }
         prevBadge.remove();
@@ -2518,9 +2521,10 @@ function createCoordinatorPane(root, wsId, opts) {
   let currentAssistantBuf = "";
   let currentReasoningEl = null;
   let currentReasoningBuf = "";
+  const reasoningActivity = createReasoningActivity();
 
   function appendContentToken(text) {
-    setReasoningActivity(currentReasoningEl, false);
+    reasoningActivity.finish();
     if (!currentAssistantEl) {
       currentAssistantEl = appendMsg("assistant", "", { label: "assistant" });
       currentAssistantBuf = "";
@@ -2559,7 +2563,7 @@ function createCoordinatorPane(root, wsId, opts) {
       currentReasoningBuf = "";
       messagesEl.setAttribute("aria-live", "off");
     }
-    setReasoningActivity(currentReasoningEl, true);
+    reasoningActivity.attach(currentReasoningEl);
     currentReasoningBuf += text;
     const body = currentReasoningEl.querySelector(".msg-body");
     if (body) body.textContent = currentReasoningBuf;
@@ -2584,7 +2588,7 @@ function createCoordinatorPane(root, wsId, opts) {
     }
     currentAssistantEl = null;
     currentAssistantBuf = "";
-    setReasoningActivity(currentReasoningEl, false);
+    reasoningActivity.finish();
     currentReasoningEl = null;
     currentReasoningBuf = "";
     messagesEl.setAttribute("aria-live", "polite");
@@ -2657,7 +2661,7 @@ function createCoordinatorPane(root, wsId, opts) {
   function setBusy(b, source) {
     const next = !!b;
     if (!next) {
-      setReasoningActivity(currentReasoningEl, false);
+      reasoningActivity.finish();
       currentReasoningEl = null;
       currentReasoningBuf = "";
     }
@@ -3617,7 +3621,7 @@ function createCoordinatorPane(root, wsId, opts) {
     suspendStream();
     currentAssistantEl = null;
     currentAssistantBuf = "";
-    setReasoningActivity(currentReasoningEl, false);
+    reasoningActivity.finish();
     currentReasoningEl = null;
     currentReasoningBuf = "";
     // Drop the live cursor for the reconnect: the full render below
@@ -3782,6 +3786,15 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function handleEvent(ev) {
     switch (ev.type) {
+      case "thinking_start":
+        if (!compactionHolder.card) {
+          reasoningActivity.start(messagesEl);
+          _scheduleScroll();
+        }
+        break;
+      case "thinking_stop":
+        reasoningActivity.hideWaiting();
+        break;
       case "content":
         appendContentToken(ev.text || "");
         break;
@@ -3802,14 +3815,14 @@ function createCoordinatorPane(root, wsId, opts) {
             });
             messagesEl.setAttribute("aria-live", "off");
           }
-          setReasoningActivity(currentReasoningEl, true);
+          reasoningActivity.attach(currentReasoningEl);
           currentReasoningBuf = ev.reasoning;
           var rbody = currentReasoningEl.querySelector(".msg-body");
           if (rbody) rbody.textContent = currentReasoningBuf;
           _scheduleScroll();
         }
         if (ev.content && ev.content.length > currentAssistantBuf.length) {
-          setReasoningActivity(currentReasoningEl, false);
+          reasoningActivity.finish();
           if (!currentAssistantEl) {
             currentAssistantEl = appendMsg("assistant", "", {
               label: "assistant",
@@ -4061,6 +4074,8 @@ function createCoordinatorPane(root, wsId, opts) {
           onNotice: (msg) => appendText("info", msg, { label: "info" }),
           scroll: () => _scheduleScroll(),
         });
+        // Manual compaction's busy state can start reasoning before this card.
+        if (compactionHolder.card) reasoningActivity.finish();
         break;
       case "connected":
         // First yield from _coord_events_replay — populates the
@@ -4096,7 +4111,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // transitions we didn't initiate (cross-tab cancel, judge
         // reset, idle-after-error). Mirrors the interactive pane.
         if (ev.state === "idle" || ev.state === "error") {
-          setReasoningActivity(currentReasoningEl, false);
+          reasoningActivity.finish();
           setBusy(false);
           // Deferred replay_truncated re-sync: the truncation arrived while a
           // turn was mid-stream (refetching then would have detached the live
@@ -4202,6 +4217,17 @@ function createCoordinatorPane(root, wsId, opts) {
           ev.state === "attention"
         ) {
           setBusy(true);
+          // Fresh state snapshots may precede the first reasoning token and
+          // carry no thinking_start event to recreate the waiting indicator.
+          if (
+            ev.state === "thinking" &&
+            !currentAssistantEl &&
+            !currentReasoningEl &&
+            !compactionHolder.card
+          ) {
+            reasoningActivity.start(messagesEl);
+            _scheduleScroll();
+          }
         }
         break;
       case "rename":
@@ -4246,7 +4272,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // Force Stop after 2s. state_change → idle is what actually
         // clears busy; the 10s safety timer covers the connection-drop
         // case.
-        setReasoningActivity(currentReasoningEl, false);
+        reasoningActivity.finish();
         if (!busy) break;
         clearTimeout(cancelTimeoutId);
         clearTimeout(forceTimeoutId);
@@ -7041,6 +7067,7 @@ function createCoordinatorPane(root, wsId, opts) {
   // per-instance pane must release the stream + every timer/observer or a
   // backgrounded pane keeps an SSE open and fires renders into detached DOM.
   function destroy() {
+    reasoningActivity.finish();
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
     // truncated resync).
     closeStreamTransport();

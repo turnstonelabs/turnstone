@@ -150,7 +150,7 @@ def test_coord_on_thinking_start_sets_activity() -> None:
     ``activity_state`` to ``"thinking"`` when the model starts."""
     ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
     ui.on_thinking_start()
-    assert ui._ws_current_activity == "Thinking…"
+    assert ui._ws_current_activity == "Reasoning…"
     assert ui._ws_activity_state == "thinking"
 
 
@@ -220,11 +220,11 @@ def test_snapshot_carries_token_and_activity_snapshot() -> None:
             context_window=400,
             effort="medium",
         )
-    ui.on_thinking_start()  # sets activity = "Thinking…"
+    ui.on_thinking_start()  # sets activity = "Reasoning…"
     payload = ui.snapshot_and_consume_state_payload("running")
     assert payload["tokens"] == 100
     assert payload["context_ratio"] == pytest.approx(0.25)
-    assert payload["activity"] == "Thinking…"
+    assert payload["activity"] == "Reasoning…"
     assert payload["activity_state"] == "thinking"
 
 
@@ -325,7 +325,7 @@ def test_coord_adapter_emit_state_passes_rich_payload_to_collector() -> None:
     assert call["state"] == "running"
     assert call["tokens"] == 100
     assert call["context_ratio"] == pytest.approx(0.25)
-    assert call["activity"] == "Thinking…"
+    assert call["activity"] == "Reasoning…"
     assert call["activity_state"] == "thinking"
     # Mid-turn (RUNNING) — content stays accumulated for the eventual IDLE drain.
     assert call["content"] == ""
@@ -380,7 +380,7 @@ def test_coord_ui_broadcast_activity_calls_collector() -> None:
         assert len(recorder.activity_calls) == 1
         call = recorder.activity_calls[0]
         assert call["ws_id"] == "coord-ws"
-        assert call["activity"] == "Thinking…"
+        assert call["activity"] == "Reasoning…"
         assert call["activity_state"] == "thinking"
     finally:
         ConsoleCoordinatorUI._collector = None
@@ -462,13 +462,13 @@ def test_coord_ui_broadcast_activity_failure_does_not_strand_dedup() -> None:
             "next identical tick would be silently suppressed"
         )
         # Tick #2 — same activity tuple. Pre-fix this would no-op
-        # (because dedup state was already (Thinking…, thinking)).
+        # (because dedup state was already (Reasoning…, thinking)).
         # Post-fix it retries; collector succeeds; dedup state lands.
         ui.on_thinking_start()
         assert recorder.update_console_ws_activity.call_count == 2, (
             "second tick was deduped despite the first call failing"
         )
-        assert ui._last_broadcast_activity == ("Thinking…", "thinking")
+        assert ui._last_broadcast_activity == ("Reasoning…", "thinking")
     finally:
         ConsoleCoordinatorUI._collector = None
 
@@ -487,7 +487,7 @@ def test_coord_ui_broadcast_activity_dedup_skips_identical_after_success() -> No
         ui.on_thinking_start()  # tick 2 — same tuple, deduped
         ui.on_thinking_start()  # tick 3 — same tuple, deduped
         assert recorder.update_console_ws_activity.call_count == 1
-        assert ui._last_broadcast_activity == ("Thinking…", "thinking")
+        assert ui._last_broadcast_activity == ("Reasoning…", "thinking")
     finally:
         ConsoleCoordinatorUI._collector = None
 
@@ -613,13 +613,13 @@ def test_snapshot_under_concurrent_writes_does_not_crash() -> None:
 def test_coord_on_stream_end_clears_activity() -> None:
     """Lifted ``on_stream_end`` body clears ``_ws_current_activity``
     and ``_ws_activity_state`` so the dashboard's coord row stops
-    showing the stale 'Thinking…' indicator after the stream
+    showing the stale 'Reasoning…' indicator after the stream
     finishes. Pre-lift coord just enqueued ``stream_end`` without
     touching activity — this test pins the new clear path so a
     future re-stub doesn't silently re-introduce a stuck activity
     indicator."""
     ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
-    ui._ws_current_activity = "Thinking…"
+    ui._ws_current_activity = "Reasoning…"
     ui._ws_activity_state = "thinking"
     ui.on_stream_end()
     assert ui._ws_current_activity == ""

@@ -3251,7 +3251,7 @@ class TestCompactionActivityPill:
         assert ui._ws_activity_state == ""
         # Outside a compaction window, thinking writes normally again.
         ui.on_thinking_start()
-        assert ui._ws_current_activity == "Thinking…"
+        assert ui._ws_current_activity == "Reasoning…"
 
     def test_stale_end_leaves_successor_latch_alone(self, session):
         """A force-abandoned compaction's late end must not unlatch — or
@@ -3313,7 +3313,7 @@ class TestCompactionActivityPill:
         assert not ui._compaction_activity_live
         assert ui._ws_current_activity == "Compacting context…"  # no stale restore
         ui.on_thinking_start()  # the live turn recovers the pill
-        assert ui._ws_current_activity == "Thinking…"
+        assert ui._ws_current_activity == "Reasoning…"
 
     def test_superseded_progress_is_swallowed(self, session):
         """An abandoned compaction's progress chatter is dropped at the base
@@ -3403,7 +3403,7 @@ class TestCompactionActivityPill:
         assert ui._ws_activity_state == "tool"
         # And thinking writes work again for the live turn.
         ui.on_thinking_start()
-        assert ui._ws_current_activity == "Thinking…"
+        assert ui._ws_current_activity == "Reasoning…"
         # No live latch: a claim is a no-op (no restore of stale pairs).
         ui._ws_current_activity = "Custom"
         session._claim_generation()

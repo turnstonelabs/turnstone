@@ -43,7 +43,7 @@ import {
   convBatchSummaryText,
   isConvVerdictCompactBlocker,
   markConvRowResultSettled,
-  setReasoningActivity,
+  createReasoningActivity,
   setConvBatchExpanded,
   setToolOutputReviewState,
   batchKicker,
@@ -246,7 +246,6 @@ class Pane {
     // Provenance of the current busy=true (see setBusy): "server" |
     // "optimistic" | null when idle.
     this.busySource = null;
-    this.isThinking = false;
     // Acting user (turn initiator) of the in-flight turn, from state_change
     // events; drives the shared-workstream cross-user send gate. Carries the
     // owner id even single-user (the gate just no-ops — it equals this viewer);
@@ -397,7 +396,7 @@ class Pane {
     this._nearBottom = true;
     this._scrollPinPending = false;
     this._scrollPinForce = false;
-    this._thinkingEl = null;
+    this._reasoningActivity = createReasoningActivity();
     // Compaction lifecycle holder for the shared reducer
     // (conversation.applyCompactionEvent); `card` is the in-progress card
     // between start and end, nulled wherever the transcript DOM is wiped.
@@ -520,7 +519,7 @@ class Pane {
 
   reset() {
     this.currentAssistantEl = null;
-    setReasoningActivity(this.currentReasoningEl, false);
+    this._reasoningActivity.finish();
     this.currentReasoningEl = null;
     this.contentBuffer = "";
     this.setBusy(false);
@@ -600,6 +599,7 @@ class Pane {
   // timer cleanup wired via the queue's onIdle hook).
   setBusy(b, source) {
     const next = !!b;
+    if (!next) this._reasoningActivity.finish();
     // Who asserted busy: "server" (default — state events, thinking_start,
     // every existing/future writer) or "optimistic" (ONLY the send flow's
     // pre-POST flip). The deferred/queue_full settle arms may clear busy
@@ -688,23 +688,9 @@ class Pane {
   }
 
   addThinkingIndicator() {
-    // Instance ref, not a container query: removeThinkingIndicator runs on
-    // EVERY content/reasoning delta, and a class-selector miss walks the
-    // whole transcript subtree — O(N) per streamed token at 5000 messages.
     if (this._compaction.card) return; // the compaction card owns the affordance
-    if (this._thinkingEl) return;
-    const el = document.createElement("div");
-    el.className = "thinking-indicator";
-    el.textContent = "Thinking";
-    this._thinkingEl = el;
-    this.messagesEl.appendChild(el);
+    this._reasoningActivity.start(this.messagesEl);
     this.scrollToBottom();
-  }
-
-  removeThinkingIndicator() {
-    if (!this._thinkingEl) return;
-    this._thinkingEl.remove();
-    this._thinkingEl = null;
   }
 
   addSystemNudgeMarker() {
@@ -795,6 +781,8 @@ class Pane {
       onNotice: (msg) => this.addInfoMessage(msg),
       scroll: (force) => this.scrollToBottom(force),
     });
+    // Manual compaction's busy state can start reasoning before this card.
+    if (this._compaction.card) this._reasoningActivity.finish();
   }
 
   addCommandEcho(text) {
@@ -2335,19 +2323,16 @@ class Pane {
     }
     switch (evt.type) {
       case "thinking_start":
-        this.isThinking = true;
         this.setBusy(true);
         this.removeEmptyState();
         this.addThinkingIndicator();
         break;
 
       case "thinking_stop":
-        this.isThinking = false;
-        this.removeThinkingIndicator();
+        this._reasoningActivity.hideWaiting();
         break;
 
       case "reasoning":
-        this.removeThinkingIndicator();
         let reasoningBody = null;
         if (!this.currentReasoningEl) {
           this.currentReasoningEl = document.createElement("div");
@@ -2359,17 +2344,14 @@ class Pane {
         } else {
           reasoningBody = this.currentReasoningEl.querySelector(".msg-body");
         }
-        setReasoningActivity(this.currentReasoningEl, true);
+        this._reasoningActivity.attach(this.currentReasoningEl);
         if (reasoningBody) reasoningBody.textContent += evt.text;
         this.scrollToBottom();
         break;
 
       case "content":
-        this.removeThinkingIndicator();
-        if (this.currentReasoningEl) {
-          setReasoningActivity(this.currentReasoningEl, false);
-          this.currentReasoningEl = null;
-        }
+        this._reasoningActivity.finish();
+        this.currentReasoningEl = null;
         if (!this.currentAssistantEl) {
           this._newAssistantBubble();
         }
@@ -2404,7 +2386,7 @@ class Pane {
         const doneBuffer = this.contentBuffer;
         this.currentAssistantBodyEl = null;
         this.currentAssistantEl = null;
-        setReasoningActivity(this.currentReasoningEl, false);
+        this._reasoningActivity.finish();
         this.currentReasoningEl = null;
         this.contentBuffer = "";
         // Finalize the completed streaming segment's markdown.  This fires
@@ -2436,7 +2418,7 @@ class Pane {
         // skip overwrite when the current buffer is already at-or-past
         // the snapshot length, so a stale replay can't reset the live-
         // streamed view back to a shorter prefix.
-        this.removeThinkingIndicator();
+        if (evt.reasoning || evt.content) this._reasoningActivity.hideWaiting();
         if (evt.reasoning) {
           let snapshotReasoningBody = null;
           if (!this.currentReasoningEl) {
@@ -2450,7 +2432,7 @@ class Pane {
             snapshotReasoningBody =
               this.currentReasoningEl.querySelector(".msg-body");
           }
-          setReasoningActivity(this.currentReasoningEl, true);
+          this._reasoningActivity.attach(this.currentReasoningEl);
           const curReason = snapshotReasoningBody
             ? snapshotReasoningBody.textContent || ""
             : "";
@@ -2462,13 +2444,11 @@ class Pane {
           }
         }
         if (evt.content) {
+          this._reasoningActivity.finish();
           // Content snapshot supersedes any reasoning bubble — matches
           // the "case content" invariant of clearing currentReasoningEl
           // when content begins.
-          if (this.currentReasoningEl) {
-            setReasoningActivity(this.currentReasoningEl, false);
-            this.currentReasoningEl = null;
-          }
+          this.currentReasoningEl = null;
           if (!this.currentAssistantEl) {
             this._newAssistantBubble();
           }
@@ -2491,7 +2471,7 @@ class Pane {
           this._actingUserId = evt.acting_user_id;
         }
         if (evt.state === "idle" || evt.state === "error") {
-          setReasoningActivity(this.currentReasoningEl, false);
+          this._reasoningActivity.finish();
           this.setBusy(false);
           // A context event received while its call id still resolved to a
           // prior terminal row is retained briefly for a possible successor
@@ -2572,6 +2552,15 @@ class Pane {
           evt.state === "attention"
         ) {
           this.setBusy(true);
+          // A reconnect before the first token has only the current state,
+          // not the earlier thinking_start. Restore its waiting affordance.
+          if (
+            evt.state === "thinking" &&
+            !this.currentAssistantEl &&
+            !this.currentReasoningEl
+          ) {
+            this.addThinkingIndicator();
+          }
         }
         break;
 
@@ -2771,7 +2760,7 @@ class Pane {
         clearTimeout(this._cancelTimeout);
         clearTimeout(this._forceTimeout);
         this.currentAssistantEl = null;
-        setReasoningActivity(this.currentReasoningEl, false);
+        this._reasoningActivity.finish();
         this.currentReasoningEl = null;
         this.contentBuffer = "";
         this.stopBtn.disabled = true;
@@ -3706,7 +3695,7 @@ class Pane {
     // preserves the pane, and preserved DOM keeps valid refs.
     this.currentAssistantEl = null;
     this.currentAssistantBodyEl = null;
-    setReasoningActivity(this.currentReasoningEl, false);
+    this._reasoningActivity.finish();
     this.currentReasoningEl = null;
     this.contentBuffer = "";
     // In-progress compaction card: the transcript wipe orphaned it; live
@@ -3717,7 +3706,6 @@ class Pane {
     this.approvalCycles = new Map();
     this.announcedBlocks = new Map();
     this._syncApprovalState();
-    this._thinkingEl = null;
     this._retryHolderEl = null;
   }
 
@@ -4741,7 +4729,10 @@ class Pane {
     const context = card.context || wrap.querySelector(".conv-agent-context");
     const issue = card.issue || wrap.querySelector(".conv-agent-step-issue");
     if (!toggle || !label) return;
-    const parts = ["Show or hide sub-agent steps", label.textContent || "0 steps"];
+    const parts = [
+      "Show or hide sub-agent steps",
+      label.textContent || "0 steps",
+    ];
     const state = wrap.dataset.state;
     if (state === "running") parts.push("running");
     else if (state === "done") parts.push("done");
@@ -5979,6 +5970,7 @@ function createInteractivePane(root, wsId, opts) {
       clearTimeout(pane._staleRetryTimer);
       pane._staleRetryTimer = null;
     }
+    pane._reasoningActivity.finish();
     pane.disconnectSSE();
     // Detach the visibility handler and clear the hide-close marker: a dead
     // controller must NOT be resurrected by a tab-visibility change.  Without
@@ -6156,6 +6148,7 @@ function createInteractivePane(root, wsId, opts) {
         clearTimeout(pane._staleRetryTimer);
         pane._staleRetryTimer = null;
       }
+      pane._reasoningActivity.finish();
       pane.disconnectSSE();
       // The document-level visibilitychange listener holds a strong ref
       // to the pane — leaving it registered would both leak the pane and

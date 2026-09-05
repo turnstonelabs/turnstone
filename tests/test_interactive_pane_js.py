@@ -607,17 +607,17 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
 
 def test_per_token_hot_path_avoids_container_scans() -> None:
     """P1 (perf audit): per-token work must stay O(1) in transcript length.
-    The thinking indicator is an instance ref (the class-selector miss walked
-    the whole transcript on EVERY content/reasoning delta); near-bottom state
+    The reasoning activity controller owns its DOM references, so token deltas
+    never search the whole transcript for an indicator; near-bottom state
     comes from the passive scroll listener instead of a forced-layout
     geometry read per event; the scroll pin is rAF-coalesced; per-tool
     row/stream lookups resolve through the self-healing caches."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     stripped = _strip_comments(body)
-    assert 'querySelector(".thinking-indicator")' not in stripped, (
-        "thinking indicator must use the instance ref, not a container scan"
+    assert 'querySelector(".reasoning-activity-status")' not in stripped, (
+        "reasoning indicator must use owned references, not a container scan"
     )
-    assert "this._thinkingEl" in body
+    assert "this._reasoningActivity" in body
     near = body.index("isNearBottom() {")
     assert "return this._nearBottom;" in body[near : near + 700]
     assert "passive: true" in body
@@ -1452,7 +1452,7 @@ def test_compact_presentation_live_replay_and_lifecycle_wiring() -> None:
         "preserveTranscriptBottomPin",
         "registerTranscriptScroller",
         "markConvRowResultSettled",
-        "setReasoningActivity",
+        "createReasoningActivity",
         "setConvBatchExpanded",
     ):
         assert symbol in body
@@ -1530,14 +1530,14 @@ def test_compact_presentation_live_replay_and_lifecycle_wiring() -> None:
     assert cleanup < body.index("pane._unregisterTranscriptScroller();", cleanup)
 
     reasoning_case = body[body.index('case "reasoning"') : body.index('case "content"')]
-    assert "setReasoningActivity(this.currentReasoningEl, true)" in reasoning_case
+    assert "this._reasoningActivity.attach(this.currentReasoningEl)" in reasoning_case
     assert 'reasoningBody.className = "msg-body"' in reasoning_case
     assert "reasoningBody.textContent += evt.text" in reasoning_case
     assert "this.currentReasoningEl.textContent += evt.text" not in reasoning_case
     content_case = body[body.index('case "content"') : body.index('case "stream_end"')]
-    assert "setReasoningActivity(this.currentReasoningEl, false)" in content_case
+    assert "this._reasoningActivity.finish()" in content_case
     stream_case = body[body.index('case "stream_end"') : body.index('case "in_progress_snapshot"')]
-    assert "setReasoningActivity(this.currentReasoningEl, false)" in stream_case
+    assert "this._reasoningActivity.finish()" in stream_case
 
 
 def test_task_agent_context_badge_is_keyed_idempotent_and_terminal_safe() -> None:

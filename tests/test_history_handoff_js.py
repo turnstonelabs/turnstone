@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._js_harness_helpers import FAKE_DOM
 from tests._js_harness_helpers import extract_braced as _extract_braced
 from tests._js_harness_helpers import strip_js_comments as _strip_comments
 
@@ -55,6 +56,95 @@ def _as_function(source: str, signature: str) -> str:
     return "function " + extracted
 
 
+@pytest.mark.parametrize("kind", ["interactive", "coordinator"])
+def test_reasoning_indicator_recovers_from_current_state_snapshot(
+    tmp_path: Path, kind: str
+) -> None:
+    """State hints restore initial wait, then yield to a compaction card."""
+    source = (_INTERACTIVE if kind == "interactive" else _COORDINATOR).read_text()
+    signature = "  handleEvent(evt) {" if kind == "interactive" else "  function handleEvent(ev) {"
+    handler = _as_function(source, signature)
+    waiting = _as_function(source, "  addThinkingIndicator() {") if kind == "interactive" else ""
+    compaction = (
+        _as_function(source, "  handleCompactionEvent(evt) {") if kind == "interactive" else ""
+    )
+    module = (_ROOT / "turnstone/shared_static/conversation.js").as_uri()
+    script = FAKE_DOM + "\n" + handler + "\n" + waiting + "\n" + compaction
+    script += (
+        "\nconst { createReasoningActivity, applyCompactionEvent, resetCompactionHolder }"
+        " = await import(%s);\n" % json.dumps(module)
+    )
+    script += r"""
+globalThis.setInterval = () => 1;
+globalThis.clearInterval = () => {};
+const messagesEl = new FakeElement("div");
+html.appendChild(messagesEl);
+const reasoningActivity = createReasoningActivity();
+const compactionHolder = { card: null };
+const renderedSystemEventIds = new Set();
+const statusEl = null;
+let actingUserId = null;
+let currentAssistantEl = null, currentReasoningEl = null;
+let currentAssistantBuf = "", currentReasoningBuf = "";
+function setBusy() {}
+function _scheduleScroll() {}
+const pane = {
+  _reasoningActivity: reasoningActivity,
+  _compaction: compactionHolder,
+  _renderedSystemEventIds: renderedSystemEventIds,
+  messagesEl,
+  currentAssistantEl: null,
+  currentReasoningEl: null,
+  setBusy,
+  scrollToBottom() {},
+  removeEmptyState() {},
+  _handleAgentCompaction() {},
+};
+"""
+    if kind == "interactive":
+        script += "pane.addThinkingIndicator = addThinkingIndicator;\n"
+        script += "pane.handleCompactionEvent = handleCompactionEvent;\n"
+    script += r"""
+const receive = (event) => handleEvent.call(pane, event);
+const status = () => messagesEl.querySelector(".reasoning-activity-status");
+receive({ type: "state_change", state: "thinking" });
+const first = status();
+if (!first) throw new Error("state-only reconnect left the waiting phase invisible");
+receive({ type: "in_progress_snapshot", reasoning: "", content: "" });
+receive({ type: "state_change", state: "thinking" });
+if (status() !== first) throw new Error("empty snapshot or repeated state replaced the clock");
+reasoningActivity.finish();
+
+// Busy tools and compaction have their own activity; neither is reasoning.
+for (const state of ["running", "attention"]) {
+  receive({ type: "state_change", state });
+  if (status()) throw new Error(state + " incorrectly started reasoning");
+}
+// Manual /compact publishes thinking state before its compaction start.
+// Reconnect can instead introduce that card through a progress event.
+for (const phase of ["start", "progress"]) {
+  receive({ type: "state_change", state: "thinking" });
+  const waiting = status();
+  receive({ type: "compaction", target: "task_agent", phase });
+  if (status() !== waiting) throw new Error("nested compaction stopped pane reasoning");
+  receive({ type: "compaction", phase, compaction_id: "manual" });
+  if (!compactionHolder.card) throw new Error("compaction card missing");
+  if (status()) throw new Error("reasoning overlaps the compaction card");
+  receive({ type: "thinking_start" });
+  receive({ type: "state_change", state: "thinking" });
+  if (status()) throw new Error("thinking restarted during compaction");
+  resetCompactionHolder(compactionHolder);
+}
+
+// Replayed busy state during visible answer streaming must not add a clock.
+currentAssistantEl = pane.currentAssistantEl = new FakeElement("div");
+receive({ type: "state_change", state: "thinking" });
+if (status()) throw new Error("answer streaming acquired a reasoning indicator");
+reasoningActivity.finish();
+"""
+    _run_module(tmp_path, script)
+
+
 def test_interactive_stale_backstop_waits_for_replay_tail_runtime(
     tmp_path: Path,
 ) -> None:
@@ -87,7 +177,6 @@ def test_interactive_stale_backstop_waits_for_replay_tail_runtime(
 
     script = """
 function resetCompactionHolder() {}
-function setReasoningActivity() {}
 function streamingRender(body, text) { body.textContent = text; }
 function streamingRenderFinalize(body, text) { body.textContent = text; }
 """
@@ -130,7 +219,7 @@ const pane = {
   setBusy(value) { this.busy = value; },
   _attachRetryToLastAssistant() {},
   _acceptUserTurn(evt) { this.userRows.push(evt.content); },
-  removeThinkingIndicator() {},
+  _reasoningActivity: { finish() {}, hideWaiting() {}, attach() {} },
   removeEmptyState() {},
   scrollToBottom() {},
   _newAssistantBubble() {

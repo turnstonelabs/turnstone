@@ -40,7 +40,7 @@ def test_exports_the_shared_helpers() -> None:
         "isConvBatchCompactEligible",
         "isConvVerdictCompactBlocker",
         "markConvRowResultSettled",
-        "setReasoningActivity",
+        "createReasoningActivity",
         "setConvBatchExpanded",
         "setToolOutputReviewState",
     ):
@@ -97,6 +97,119 @@ def test_agent_card_exposes_hidden_context_badge() -> None:
 
 
 @node_skip
+def test_reasoning_activity_clock_handoff_and_cleanup() -> None:
+    script = (
+        FAKE_DOM
+        + f"""
+const conv = await import({json.dumps(_CONVERSATION_JS.as_uri())});
+const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};
+let now = 0;
+let nextTimer = 0;
+const timers = new Map();
+Object.defineProperty(globalThis, "performance", {{ value: {{ now: () => now }} }});
+globalThis.setInterval = (callback, delay) => {{
+  assert(delay === 1000, "clock polls more than once per second");
+  timers.set(++nextTimer, callback);
+  return nextTimer;
+}};
+globalThis.clearInterval = (id) => timers.delete(id);
+const advance = (ms) => {{ now += ms; [...timers.values()].forEach((tick) => tick()); }};
+const container = new FakeElement("div");
+html.appendChild(container);
+const activity = conv.createReasoningActivity();
+activity.start(container);
+const status = container.querySelector(".reasoning-activity-status");
+const label = status.querySelector(".reasoning-activity-label");
+const elapsed = status.querySelector(".reasoning-activity-elapsed");
+assert(label.textContent === "Reasoning", "waiting label differs from reasoning");
+assert(label.getAttribute("role") === "status", "announcement role missing");
+assert(label.getAttribute("aria-live") === "polite", "announcement is not polite");
+assert(label.getAttribute("aria-atomic") === "true", "announcement is not atomic");
+assert(label.getAttribute("aria-label") === "Model reasoning in progress", "announcement missing");
+assert(status.getAttribute("aria-live") === null, "clock is inside a live region");
+assert(elapsed.getAttribute("role") === "timer", "clock is not accessible as a timer");
+assert(elapsed.getAttribute("aria-live") === "off", "clock ticks would be announced");
+assert(elapsed.textContent === "0s", "initial time is not zero");
+advance(2500);
+activity.start(container);
+assert(elapsed.textContent === "2s", "duplicate start reset the clock");
+assert(timers.size === 1, "duplicate start allocated another timer");
+
+// thinking_stop arrives before the first reasoning token. It removes the
+// waiting affordance but must preserve the same clock for the handoff.
+activity.hideWaiting();
+assert(status.parentNode === null && timers.size === 0, "waiting timer survived stop");
+advance(1500);
+const reasoning = new FakeElement("div");
+reasoning.setAttribute("role", "article");
+reasoning.setAttribute("aria-label", "reasoning");
+const trace = new FakeElement("div");
+trace.className = "msg-body";
+trace.setAttribute("aria-hidden", "false");
+reasoning.appendChild(trace);
+container.appendChild(reasoning);
+activity.attach(reasoning);
+assert(reasoning.querySelector(".reasoning-activity-status") === status, "handoff replaced status");
+assert(elapsed.textContent === "4s", "handoff lost pre-token time");
+assert(reasoning.dataset.reasoningActive === "true", "active marker missing");
+assert(reasoning.getAttribute("role") === "article", "row role changed");
+assert(reasoning.getAttribute("aria-label") === "reasoning", "row label changed");
+assert(trace.getAttribute("aria-hidden") === "true", "streamed trace is exposed to AT");
+assert(reasoning.children[0] === status, "indicator is below the streamed trace");
+trace.textContent = "first token";
+activity.attach(reasoning);
+activity.hideWaiting();
+assert(timers.size === 1 && status.parentNode === reasoning, "token stopped live reasoning");
+document.documentElement.setAttribute("data-transcript-presentation", "compact");
+advance(2000);
+document.documentElement.removeAttribute("data-transcript-presentation");
+assert(elapsed.textContent === "6s", "mode switch or token reset elapsed time");
+assert(label.textContent === "Reasoning", "clock mutated the live announcement");
+
+// Every pane owns its clock. Finishing one must not cancel its neighbor.
+const other = conv.createReasoningActivity();
+other.start(container);
+const secondStatus = container.querySelectorAll(".reasoning-activity-status")[1];
+assert(timers.size === 2, "second pane did not get an independent clock");
+activity.finish();
+activity.finish();
+assert(timers.size === 1, "finish affected the other pane");
+assert(!Object.hasOwn(reasoning.dataset, "reasoningActive"), "active marker survived finish");
+assert(trace.getAttribute("aria-hidden") === "false", "trace visibility was not restored");
+assert(!reasoning.querySelector(".reasoning-activity-status"), "finished clock survived");
+advance(62000);
+assert(secondStatus.querySelector(".reasoning-activity-elapsed").textContent === "62s", "long duration wrong");
+other.finish();
+assert(timers.size === 0, "finish leaked a timer");
+
+// A snapshot with no observed start begins at zero. Replacing/removing its
+// row must release the old trace and never retain a detached ticking pane.
+const snapshot = new FakeElement("div");
+snapshot.textContent = "snapshot reasoning";
+container.appendChild(snapshot);
+activity.attach(snapshot);
+assert(snapshot.querySelector(".reasoning-activity-elapsed").textContent === "0s", "snapshot invented prior time");
+assert(snapshot.querySelector(".msg-body").textContent === "snapshot reasoning", "legacy text lost");
+advance(1000);
+activity.attach(reasoning);
+assert(snapshot.querySelector(".msg-body").getAttribute("aria-hidden") === null, "old row stayed hidden");
+assert(reasoning.querySelector(".reasoning-activity-elapsed").textContent === "1s", "row replacement reset clock");
+container.remove();
+advance(1000);
+assert(timers.size === 0, "detached pane leaked a clock");
+assert(trace.getAttribute("aria-hidden") === "false", "detached trace was not restored");
+"""
+    )
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+@node_skip
 def test_compact_batch_settlement_disclosure_and_fail_open_behavior() -> None:
     script = (
         FAKE_DOM
@@ -119,42 +232,6 @@ for (const [verdict, expected] of [
     "verdict blocker classification drifted",
   );
 }}
-
-const reasoning = new FakeElement("div");
-reasoning.setAttribute("role", "article");
-reasoning.setAttribute("aria-label", "reasoning");
-const reasoningTrace = new FakeElement("div");
-reasoningTrace.className = "msg-body";
-reasoningTrace.setAttribute("aria-hidden", "false");
-reasoning.appendChild(reasoningTrace);
-assert(conv.setReasoningActivity(reasoning, true), "reasoning did not activate");
-assert(reasoning.dataset.reasoningActive === "true", "activity marker missing");
-assert(reasoning.getAttribute("role") === "article", "row role was replaced");
-assert(
-  reasoning.getAttribute("aria-label") === "reasoning",
-  "row label was replaced",
-);
-assert(reasoning.getAttribute("aria-live") === null, "row became a live region");
-assert(reasoningTrace.getAttribute("aria-hidden") === "true", "streamed trace stayed exposed");
-const reasoningStatus = reasoning.querySelector(".reasoning-activity-status");
-assert(reasoningStatus, "dedicated activity status missing");
-assert(reasoningStatus.parentNode === reasoning, "activity status is not a trace sibling");
-assert(reasoningStatus.getAttribute("role") === "status", "activity role missing");
-assert(reasoningStatus.getAttribute("aria-live") === "polite", "activity live mode missing");
-assert(reasoningStatus.getAttribute("aria-atomic") === "true", "activity status is not atomic");
-assert(
-  reasoningStatus.getAttribute("aria-label") === "Model reasoning in progress",
-  "activity label missing",
-);
-const stableStatusText = reasoningStatus.textContent;
-reasoningTrace.textContent += "first token";
-reasoningTrace.textContent += " second token";
-assert(reasoningStatus.textContent === stableStatusText, "token stream mutated live status");
-assert(!conv.setReasoningActivity(reasoning, true), "duplicate activation transitioned");
-assert(conv.setReasoningActivity(reasoning, false), "reasoning did not settle");
-assert(!Object.hasOwn(reasoning.dataset, "reasoningActive"), "activity marker survived");
-assert(reasoningTrace.getAttribute("aria-hidden") === "false", "trace visibility was not restored");
-assert(!reasoning.querySelector(".reasoning-activity-status"), "activity status survived");
 
 function batchWithRows(count, state = "conv-batch--approved") {{
   const batch = conv.buildConvBatchShell({{

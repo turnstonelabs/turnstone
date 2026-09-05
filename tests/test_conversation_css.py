@@ -168,10 +168,7 @@ def test_compact_message_density_cannot_match_shell_status_messages() -> None:
     assert prefix + " .msg.reasoning {" in css
     assert prefix + ' .msg.reasoning[data-reasoning-active="true"] {' in css
     assert prefix + ' .msg.reasoning[data-reasoning-active="true"] > .msg-body {' in css
-    assert (
-        prefix + ' .msg.reasoning[data-reasoning-active="true"] > .reasoning-activity-status {'
-        in css
-    )
+    assert ".msg.reasoning > .reasoning-activity-status {" in css
     assert prefix + ' .msg.reasoning[data-reasoning-active="true"] > * {' not in css
     assert ".reasoning-activity-status {" in css
     assert "@keyframes transcript-reasoning-spin" in css

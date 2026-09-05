@@ -415,7 +415,6 @@ export function indexLabel(idx, n) {
 // left indent (a real bug if a caller passes pre-indented text).
 // ===========================================================================
 
-const activeReasoningState = new WeakMap();
 const OUTPUT_REVIEW_INCOMPLETE_TEXT = "Output review did not complete";
 
 function _reasoningTrace(row) {
@@ -433,44 +432,105 @@ function _reasoningTrace(row) {
   return trace;
 }
 
-// The streamed trace and the model-activity announcement must be separate
-// accessibility subtrees.  Tokens mutate only the aria-hidden trace while a
-// static sibling status announces once; settlement restores the completed
-// trace for ordinary, non-live navigation.
-export function setReasoningActivity(row, active) {
-  if (!row) return false;
-  if (active) {
-    if (row.dataset.reasoningActive === "true") return false;
-    const trace = _reasoningTrace(row);
-    const status = document.createElement("span");
-    status.className = "reasoning-activity-status";
-    status.setAttribute("role", "status");
-    status.setAttribute("aria-live", "polite");
-    status.setAttribute("aria-atomic", "true");
-    status.setAttribute("aria-label", "Model reasoning in progress");
-    status.textContent = "Reasoning";
-    activeReasoningState.set(row, {
-      trace,
-      traceHidden: trace.getAttribute("aria-hidden"),
-      status,
-    });
-    trace.setAttribute("aria-hidden", "true");
-    row.dataset.reasoningActive = "true";
-    row.appendChild(status);
-    return true;
+// One per pane: the pre-token indicator moves into the reasoning row without
+// restarting its clock. The elapsed time describes this browser's observed
+// phase, not provider compute time; cold history has no invented duration.
+export function createReasoningActivity() {
+  let status = null;
+  let elapsed = null;
+  let startedAt = null;
+  let timer = null;
+  let row = null;
+  let trace = null;
+  let traceHidden = null;
+
+  function stopTimer() {
+    if (timer !== null) clearInterval(timer);
+    timer = null;
   }
-  if (row.dataset.reasoningActive !== "true") return false;
-  delete row.dataset.reasoningActive;
-  const prior = activeReasoningState.get(row) || {};
-  const trace = prior.trace || row.querySelector(".msg-body");
-  if (trace) {
-    if (prior.traceHidden == null) trace.removeAttribute("aria-hidden");
-    else trace.setAttribute("aria-hidden", prior.traceHidden);
+
+  function releaseTrace() {
+    if (!row) return;
+    delete row.dataset.reasoningActive;
+    if (traceHidden === null) trace.removeAttribute("aria-hidden");
+    else trace.setAttribute("aria-hidden", traceHidden);
+    row = trace = null;
+    traceHidden = null;
   }
-  const status = prior.status || row.querySelector(".reasoning-activity-status");
-  if (status) status.remove();
-  activeReasoningState.delete(row);
-  return true;
+
+  function finish() {
+    stopTimer();
+    releaseTrace();
+    if (status) status.remove();
+    status = elapsed = startedAt = null;
+  }
+
+  function tick() {
+    if (!status.isConnected) {
+      finish();
+      return;
+    }
+    const seconds = Math.max(
+      0,
+      Math.floor((performance.now() - startedAt) / 1000),
+    );
+    const text = seconds + "s";
+    if (elapsed.textContent !== text) elapsed.textContent = text;
+  }
+
+  function mount(parent) {
+    if (!status) {
+      startedAt = performance.now();
+      status = document.createElement("span");
+      status.className = "reasoning-activity-status";
+      const label = document.createElement("span");
+      label.className = "reasoning-activity-label";
+      label.setAttribute("role", "status");
+      label.setAttribute("aria-live", "polite");
+      label.setAttribute("aria-atomic", "true");
+      label.setAttribute("aria-label", "Model reasoning in progress");
+      label.textContent = "Reasoning";
+      elapsed = document.createElement("span");
+      elapsed.className = "reasoning-activity-elapsed";
+      // The clock and streamed trace are outside the live announcement.
+      // Neither tokens nor timer ticks should repeatedly interrupt a reader.
+      elapsed.setAttribute("role", "timer");
+      elapsed.setAttribute("aria-live", "off");
+      elapsed.setAttribute("aria-label", "Elapsed reasoning time");
+      elapsed.textContent = "0s";
+      status.append(label, elapsed);
+    }
+    parent.appendChild(status);
+    if (status.isConnected) tick();
+    if (timer === null) timer = setInterval(tick, 1000);
+  }
+
+  return {
+    start(container) {
+      if (status && status.isConnected) return;
+      finish();
+      mount(container);
+    },
+    hideWaiting() {
+      if (row) return;
+      stopTimer();
+      if (status) status.remove();
+      // thinking_stop precedes the first token. Keep the clock origin for
+      // the reasoning handoff; content/terminal events call finish instead.
+    },
+    attach(nextRow) {
+      if (!nextRow || row === nextRow) return;
+      releaseTrace();
+      row = nextRow;
+      trace = _reasoningTrace(row);
+      traceHidden = trace.getAttribute("aria-hidden");
+      trace.setAttribute("aria-hidden", "true");
+      row.dataset.reasoningActive = "true";
+      mount(row);
+      row.appendChild(trace);
+    },
+    finish,
+  };
 }
 
 const COMPACT_BLOCKER_SELECTOR = [
@@ -565,11 +625,7 @@ export function isConvVerdictCompactBlocker(verdict) {
   if (!verdict) return false;
   const risk = normalizeRiskLevel(verdict.risk_level);
   const recommendation = verdict.recommendation || "review";
-  return (
-    risk === "high" ||
-    risk === "critical" ||
-    recommendation !== "approve"
-  );
+  return risk === "high" || risk === "critical" || recommendation !== "approve";
 }
 
 function _playingBatchMedia(batch) {

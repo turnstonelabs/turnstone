@@ -69,6 +69,13 @@ Turnstone gives LLMs tools — shell, files, search, web, planning — and orche
 - **MCP support** — external tool servers with native deferred loading (Anthropic/OpenAI) or BM25 fallback
 - **Team controls when you need them** — optional RBAC, SSO, tool policies, and audit logs, all stored in your own database
 
+The browser's **Default / Compact** control saves your transcript preference in that browser.
+Compact hides reasoning text and folds completed successful tool details. Both views show a
+**Reasoning** indicator with elapsed seconds while the model prepares its answer. The clock starts
+when the browser observes that phase and continues as reasoning tokens arrive; reconnecting to an
+existing phase starts a new clock if its start was not observed. Completed history has no estimated
+reasoning duration.
+
 <p align="center">
   <img src="docs/diagrams/architecture-overview.svg" alt="Turnstone system architecture" width="960"/>
 </p>

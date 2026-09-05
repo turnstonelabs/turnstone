@@ -1268,7 +1268,7 @@ def test_compact_presentation_coordinator_wiring_and_ordering():
         "registerTranscriptScroller",
         "isConvVerdictCompactBlocker",
         "markConvRowResultSettled",
-        "setReasoningActivity",
+        "createReasoningActivity",
         "setConvBatchExpanded",
     ):
         assert symbol in body
@@ -1343,20 +1343,18 @@ def test_compact_presentation_coordinator_wiring_and_ordering():
     assert "unmountTranscriptPresentation();" in destroy
 
     reasoning = _extract_braced(body, "  function appendReasoningToken(text) {")
-    assert "setReasoningActivity(currentReasoningEl, true)" in reasoning
+    assert "reasoningActivity.attach(currentReasoningEl)" in reasoning
     content = _extract_braced(body, "  function appendContentToken(text) {")
-    assert "setReasoningActivity(currentReasoningEl, false)" in content
+    assert "reasoningActivity.finish()" in content
     finish = _extract_braced(body, "  function finishAssistantStream() {")
-    assert "setReasoningActivity(currentReasoningEl, false)" in finish
+    assert "reasoningActivity.finish()" in finish
     busy = _extract_braced(body, "  function setBusy(b, source) {")
     assert "if (!next) {" in busy
-    assert "setReasoningActivity(currentReasoningEl, false);" in busy
+    assert "reasoningActivity.finish();" in busy
     assert "currentReasoningEl = null;" in busy
     assert 'currentReasoningBuf = "";' in busy
     cancelled = body[body.index('case "cancelled"') : body.index('case "clear_ui"')]
-    assert cancelled.index("setReasoningActivity(currentReasoningEl, false)") < cancelled.index(
-        "if (!busy) break"
-    )
+    assert cancelled.index("reasoningActivity.finish()") < cancelled.index("if (!busy) break")
 
 
 def test_coordinator_close_409_uses_plain_retry_copy():
