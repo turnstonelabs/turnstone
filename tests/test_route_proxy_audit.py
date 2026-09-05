@@ -196,6 +196,8 @@ class TestRouteCreateAudit:
     def test_503_retry_records_final_node_id(self):
         """Audit row must reflect the node that actually served 200, not the failed first node."""
         router = _make_mock_router()
+        router.node_count.return_value = 2
+        router.rendezvous_node.return_value = NodeRef("node-b-retry", "http://b:8080")
 
         call_count = 0
 
