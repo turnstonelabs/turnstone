@@ -8,7 +8,7 @@ FROM python:3.14-slim
 LABEL org.opencontainers.image.title="turnstone" \
       org.opencontainers.image.description="Multi-node AI orchestration platform"
 
-COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /uvs /usr/local/bin
+COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /uvx /usr/local/bin/
 
 # Remove the slim image's man page exclusion so man-db has actual content
 RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
