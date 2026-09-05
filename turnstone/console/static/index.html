@@ -4187,6 +4187,36 @@
     <script src="/shared/hljs-11.12.0/highlight.min.js"></script>
     <script type="module" src="/shared/renderer.js"></script>
 
+    <dialog
+      class="hatch hatch--dialog"
+      id="continue-session-dialog"
+      aria-labelledby="continue-session-title"
+      aria-describedby="continue-session-description"
+    >
+      <header class="sh-head">
+        <span class="sh-led" aria-hidden="true"></span>
+        <h2 class="sh-title" id="continue-session-title">Continue elsewhere</h2>
+        <button class="sh-x" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="sh-body">
+        <p class="sh-prose" id="continue-session-description">
+          Start a separate conversation from the saved history on another node.
+          The original conversation stays saved. Files on its node and running
+          tools are not transferred.
+        </p>
+        <label for="continue-session-node">Destination node</label>
+        <select id="continue-session-node" autofocus></select>
+        <p id="continue-session-error" class="sh-alert" role="alert"></p>
+      </div>
+      <footer class="sh-foot">
+        <div class="sh-foot-meta"></div>
+        <button class="sh-btn" data-close>Cancel</button>
+        <button id="continue-session-submit" class="sh-btn sh-btn--primary">
+          Create continuation
+        </button>
+      </footer>
+    </dialog>
+
     <!-- Token Created (show-once) Modal -->
     <dialog
       class="hatch hatch--dialog"

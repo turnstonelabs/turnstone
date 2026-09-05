@@ -852,11 +852,12 @@ async function mountShell() {
     // offer a one-click retry — re-clicking the tab won't re-fire onActivate
     // (PaneManager fires it only on a pane CHANGE), so without this a transient
     // failure would strand the pane until the user closed + reopened it.
-    const showResolveError = (msg, forceResolve) => {
+    const showResolveError = (result, forceResolve) => {
       const el = pane._statusEl;
       if (!el) return;
       el.className = "pane-status pane-status--retry msg error";
-      el.textContent = msg || "Could not connect to this session.";
+      el.textContent =
+        (result && result.error) || "Could not connect to this session.";
       el.title = "Click to retry";
       el.onclick = () => {
         if (pane._ctl || pane._resolving) return;
@@ -866,6 +867,21 @@ async function mountShell() {
         el.textContent = "Connecting…";
         beginConnect(forceResolve);
       };
+      const app = window.TS_APP;
+      if (
+        result &&
+        result.canContinue &&
+        app &&
+        app.continueInteractiveElsewhere
+      ) {
+        const button = make("button", "sh-btn", "Continue elsewhere…");
+        button.type = "button";
+        button.onclick = (event) => {
+          event.stopPropagation();
+          app.continueInteractiveElsewhere(id, result.requiredNodeId);
+        };
+        el.append(button);
+      }
     };
     // First-activate connect.  A LIVE session (Tier-1 already names its node, so
     // it is loaded there) connects DIRECTLY — no /open round-trip; this is the
@@ -891,7 +907,7 @@ async function mountShell() {
         pane._resolving = false;
         if (pane._closed) return; // closed mid-resolve — don't build into a detached body
         if (!res || res.error) {
-          showResolveError(res && res.error, forceResolve);
+          showResolveError(res, forceResolve);
           return;
         }
         buildController(res.nodeId);

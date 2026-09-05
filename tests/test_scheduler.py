@@ -545,6 +545,10 @@ class TestSchedulerTick:
             scheduler._tick()
 
         assert create.call_count == 2
+        expected_required = None if target_mode in {"auto", "pool"} else "node-001"
+        assert all(
+            call.kwargs["required_node_id"] == expected_required for call in create.call_args_list
+        )
         storage.update_scheduled_task.assert_not_called()
         rows = [
             (c.kwargs["status"], c.kwargs["error"]) for c in storage.record_task_run.call_args_list

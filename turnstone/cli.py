@@ -1485,11 +1485,21 @@ def main() -> None:
 
     # Handle --resume
     if resume_target:
+        from turnstone.core.node_affinity import NodeAffinityError
+
         if ws.session is None:
             print(red("No session available."))
+            manager.close(ws.id)
             sys.exit(1)
-        if not ws.session.resume(resume_target):
+        try:
+            resumed = ws.session.resume(resume_target)
+        except NodeAffinityError as exc:
+            manager.close(ws.id)
+            print(red(f"Cannot resume {resume_target}: {exc}"))
+            sys.exit(1)
+        if not resumed:
             print(red(f"Workstream '{args.resume}' has no messages."))
+            manager.close(ws.id)
             sys.exit(1)
         print(f"Resumed workstream {bold(resume_target)} ({len(ws.session.messages)} messages)")
 

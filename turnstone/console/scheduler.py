@@ -526,6 +526,9 @@ class TaskScheduler:
         try:
             resp = client.create_workstream(
                 name=task["name"],
+                required_node_id=(
+                    node_id if task.get("target_mode", "auto") not in {"auto", "pool"} else None
+                ),
                 model=task.get("model", ""),
                 initial_message=task["initial_message"],
                 auto_approve=bool(task.get("auto_approve", 0)),

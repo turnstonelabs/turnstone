@@ -8,6 +8,7 @@ import threading
 import pytest
 
 from turnstone.console.router import ConsoleRouter, NodeRef
+from turnstone.core.node_affinity import NodeAffinityError
 from turnstone.core.rendezvous import NoAvailableNodeError
 
 
@@ -17,6 +18,10 @@ class FakeStorage:
     def __init__(self) -> None:
         self.services: list[dict[str, str]] = []
         self.overrides: list[dict[str, str]] = []
+        self.workstreams: dict[str, dict[str, str]] = {}
+
+    def get_workstream(self, ws_id: str) -> dict[str, str] | None:
+        return self.workstreams.get(ws_id)
 
     def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
         return list(self.services)
@@ -303,24 +308,6 @@ class TestRefreshLifecycle:
         assert router.version > v2
 
 
-class TestGenerateWsId:
-    def test_generates_routable_id(self) -> None:
-        router, storage = _make_router()
-        storage.services = [NODE_A, NODE_B, NODE_C]
-        router.refresh_cache()
-
-        ws_id = router.generate_ws_id_for_node("node-b")
-        assert len(ws_id) == 32
-        assert router.route(ws_id).node_id == "node-b"
-
-    def test_unknown_node_raises(self) -> None:
-        router, storage = _make_router()
-        storage.services = [NODE_A]
-        router.refresh_cache()
-        with pytest.raises(NoAvailableNodeError, match="node-z"):
-            router.generate_ws_id_for_node("node-z")
-
-
 class TestIsReady:
     def test_false_when_empty(self) -> None:
         router, _ = _make_router()
@@ -339,3 +326,56 @@ class TestNodeCount:
         storage.services = [NODE_A, NODE_B, NODE_C]
         router.refresh_cache()
         assert router.node_count() == 3
+
+
+class TestDurableRequirement:
+    def test_requirement_precedes_overrides_and_survives_membership_loss(self):
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B]
+        storage.workstreams["pinned"] = {"required_node_id": "node-a"}
+        storage.overrides = [{"ws_id": "pinned", "node_id": "node-b"}]
+        router.refresh_cache()
+        assert router.route("pinned").node_id == "node-a"
+        for services in ([NODE_B], []):
+            storage.services = services
+            router.refresh_cache()
+            with pytest.raises(NodeAffinityError) as error:
+                router.route("pinned")
+            assert error.value.status_code == 503
+            assert error.value.required_node_id == "node-a"
+        storage.services = [{**NODE_A, "url": "http://returned:8080"}, NODE_B]
+        router.refresh_cache()
+        assert router.route("pinned") == NodeRef("node-a", "http://returned:8080")
+
+    def test_policy_is_read_after_creation_and_after_authorized_policy_change(self):
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B]
+        router.refresh_cache()
+        router.route("new-id")  # A cached miss must not release a later requirement.
+        storage.workstreams["new-id"] = {"required_node_id": "node-a"}
+        assert router.route("new-id").node_id == "node-a"
+        # Future fenced migration can change the row without invalidating a
+        # separate, indefinitely cached affinity map.
+        storage.workstreams["new-id"]["required_node_id"] = "node-b"
+        assert router.route("new-id").node_id == "node-b"
+
+    def test_private_requirement_does_not_disclose_missing_node(self):
+        router, storage = _make_router()
+        storage.services = [NODE_B]
+        storage.workstreams["private"] = {"required_node_id": "secret-node"}
+        router.refresh_cache()
+        assert router.route("private", can_read=lambda row: False) == router.route("unknown")
+        with pytest.raises(NodeAffinityError):
+            router.route("private", can_read=lambda row: True)
+
+    def test_storage_failure_never_means_flexible_placement(self, monkeypatch):
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B]
+        router.refresh_cache()
+
+        def broken(ws_id):
+            raise RuntimeError("storage unavailable")
+
+        monkeypatch.setattr(storage, "get_workstream", broken)
+        with pytest.raises(NoAvailableNodeError):
+            router.route("pinned")

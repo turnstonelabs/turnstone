@@ -6799,6 +6799,7 @@ class ChatSession:
         *,
         principal_id: str,
         source_reservation_token: str,
+        source_required_node_id: str | None = None,
         trusted_internal: bool = False,
     ) -> ForkCloneSnapshot:
         """Atomically clone, then adopt, one authorized source snapshot."""
@@ -6816,6 +6817,8 @@ class ChatSession:
             project_writable=project_access.project_writable,
             destination_reservation_token=self._fork_reservation_token,
             source_reservation_token=source_reservation_token,
+            source_required_node_id=source_required_node_id,
+            node_id=self._node_id,
         )
         snapshot = storage.clone_workstream(
             source_ws_id,
@@ -6854,6 +6857,18 @@ class ChatSession:
         """
         if _fork_snapshot is not None and not fork:
             raise ValueError("a fork snapshot requires fork=True")
+        from turnstone.core.node_affinity import require_execution_node
+
+        if _fork_snapshot is not None:
+            require_execution_node(_fork_snapshot.required_node_id, self._node_id)
+        elif fork:
+            source_row = get_storage().get_workstream(ws_id)
+            if source_row and source_row.get("required_node_id"):
+                raise ValueError("Use atomic workstream creation to fork a node-bound session")
+        else:
+            target_row = get_storage().get_workstream(ws_id)
+            if target_row is not None:
+                require_execution_node(target_row.get("required_node_id"), self._node_id)
         turns = (
             list(_fork_snapshot.turns)
             if _fork_snapshot is not None
@@ -6879,8 +6894,12 @@ class ChatSession:
         resumed_attached_project_id = ""
         resumed_incarnation_token = ""
         if not fork:
+            # History loading can overlap a same-ID replacement. Keep this
+            # authoritative check after loading as well as the cheap preflight.
             storage = get_storage()
             target_row = storage.ensure_workstream_incarnation_snapshot(ws_id)
+            if target_row is not None:
+                require_execution_node(target_row.get("required_node_id"), self._node_id)
             raw_project_id = target_row.get("project_id") if target_row is not None else None
             target_project_id = (
                 raw_project_id.strip()
@@ -28028,6 +28047,8 @@ class ChatSession:
                 self.ui.on_info("\n".join(lines))
 
         elif cmd == "/resume":
+            from turnstone.core.node_affinity import NodeAffinityError
+
             if not arg:
                 self.ui.on_info(
                     "Usage: /resume <alias_or_ws_id>\nUse /workstreams to list available workstreams."
@@ -28045,7 +28066,7 @@ class ChatSession:
                     self._drain_queue_for_identity_swap()
                     try:
                         resumed: bool | None = self.resume(target_id)
-                    except ValueError as exc:
+                    except (ValueError, NodeAffinityError) as exc:
                         # Corrupt stamp or MCP-lever refusal: resume parses
                         # before mutating, so this session is untouched —
                         # report and stay on the current workstream.

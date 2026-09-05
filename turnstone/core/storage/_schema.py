@@ -143,6 +143,7 @@ workstreams = sa.Table(
     metadata,
     sa.Column("ws_id", sa.Text, primary_key=True),
     sa.Column("node_id", sa.Text),
+    sa.Column("required_node_id", sa.Text, nullable=True),
     sa.Column("user_id", sa.Text),
     sa.Column("alias", sa.Text, unique=True),
     sa.Column("title", sa.Text),

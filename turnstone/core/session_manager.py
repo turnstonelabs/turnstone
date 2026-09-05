@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from turnstone.core.adapters._ui_cleanup import _broadcast_ws_closed_to_listeners
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import ModelClientConstructionError, UnknownModelAliasError
+from turnstone.core.node_affinity import parse_required_node_id, require_execution_node
 from turnstone.core.personas import snapshot_from_config
 from turnstone.core.workstream import (
     Workstream,
@@ -514,6 +515,7 @@ class SessionManager:
         parent_ws_id: str | None = None,
         project_id: str | None = None,
         persona: str = "",
+        required_node_id: str | None = None,
         defer_emit_created: bool = False,
         **extra_session_kwargs: Any,
     ) -> Workstream:
@@ -530,6 +532,7 @@ class SessionManager:
             parent_ws_id=parent_ws_id,
             project_id=project_id,
             persona=persona,
+            required_node_id=required_node_id,
             defer_emit_created=defer_emit_created,
             **extra_session_kwargs,
         )
@@ -548,6 +551,7 @@ class SessionManager:
         parent_ws_id: str | None = None,
         project_id: str | None = None,
         persona: str = "",
+        required_node_id: str | None = None,
         defer_emit_created: bool = False,
         **extra_session_kwargs: Any,
     ) -> Workstream:
@@ -582,6 +586,8 @@ class SessionManager:
         slot is held forever (capacity leak). The HTTP handler bracket
         runs both terminations within a single request lifecycle.
         """
+        required_node_id = parse_required_node_id(required_node_id)
+        require_execution_node(required_node_id, self._node_id)
         requested_ws_id = ws_id
         while True:
             # Caller-chosen ids are contractual and collide loudly. Generated
@@ -651,6 +657,7 @@ class SessionManager:
                     skill_id=skill_id,
                     skill_version=skill_version,
                     fork_reservation_token=fork_reservation_token,
+                    required_node_id=required_node_id,
                 )
                 if inserted is False:
                     raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} already exists")
@@ -1125,6 +1132,8 @@ class SessionManager:
                 # max_active (evicting an idle peer or raising).
                 if row.get("state") in {"creating", "deleted"}:
                     return None
+
+                require_execution_node(row.get("required_node_id"), self._node_id)
 
                 # Re-check + capacity admission happen inside the helper. The
                 # per-id open lane prevents another opener for this id, while

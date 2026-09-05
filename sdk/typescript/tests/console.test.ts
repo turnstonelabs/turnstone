@@ -169,27 +169,39 @@ describe("TurnstoneConsole", () => {
     });
   });
 
-  it("routeCreateWorkstream rejects attachments + target_node", async () => {
-    const fetchFn = vi.fn().mockResolvedValue(
-      new Response("{}", {
-        status: 500,
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    const client = new TurnstoneConsole({
-      baseUrl: "http://test",
-      fetch: fetchFn,
-    });
-    const data = new TextEncoder().encode("hi");
-    await expect(
-      client.routeCreateWorkstream({
+  it.each([undefined, "1".repeat(32)])(
+    "routeCreateWorkstream preserves targeted multipart metadata (ws_id: %s)",
+    async (wsId) => {
+      const fetchFn = mockFetch({ ws_id: "new-id", node_id: "n1" });
+      const client = new TurnstoneConsole({
+        baseUrl: "http://test",
+        fetch: fetchFn,
+      });
+      const data = new TextEncoder().encode("hi");
+      await client.routeCreateWorkstream({
         name: "x",
+        ws_id: wsId,
         target_node: "n1",
+        required_node_id: "n1",
         attachments: [{ filename: "a.txt", data }],
-      }),
-    ).rejects.toThrow(/target_node/);
-    expect(fetchFn).not.toHaveBeenCalled();
-  });
+      });
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+      const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+      const queryId = new URL(url).searchParams.get("ws_id");
+      expect(queryId).toMatch(/^[a-f0-9]{32}$/);
+      if (wsId) expect(queryId).toBe(wsId);
+      const form = init.body as FormData;
+      expect(JSON.parse(form.get("meta") as string)).toEqual({
+        name: "x",
+        ws_id: queryId,
+        target_node: "n1",
+        required_node_id: "n1",
+      });
+      const file = form.get("file") as File;
+      expect(file.name).toBe("a.txt");
+      expect(await file.text()).toBe("hi");
+    },
+  );
 
   it("routeWorkstreamLive returns the non-mutating liveness probe", async () => {
     const fetchFn = mockFetch({ ws_id: "saved/ws", live: true });

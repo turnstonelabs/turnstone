@@ -3011,7 +3011,9 @@ class TestSendGenerationInitializationPublication:
     ) -> None:
         """A resume during the user save cannot retarget deferred title work."""
         session = _make_session(ws_id="opening-ws", user_id="opening-principal")
-        _bind_storage_mock()
+        storage = _bind_storage_mock()
+        storage.get_workstream.return_value = None
+        storage.ensure_workstream_incarnation_snapshot.return_value = None
         generation = session._claim_generation()
         successor_turn = turn_from_dict(
             {"role": "user", "content": "successor workstream history"},

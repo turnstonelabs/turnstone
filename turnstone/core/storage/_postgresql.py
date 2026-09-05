@@ -1414,6 +1414,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         project_id: str | None = None,
         persona: str | None = None,
         fork_reservation_token: str = "",
+        required_node_id: str | None = None,
     ) -> bool:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -1431,6 +1432,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         values = {
             "ws_id": ws_id,
             "node_id": node_id,
+            "required_node_id": required_node_id,
             "user_id": user_id,
             "name": name,
             "state": state,
@@ -4487,6 +4489,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     workstreams.c.updated,
                     workstreams.c.project_id,
                     workstreams.c.persona,
+                    workstreams.c.required_node_id,
                 ).where(workstreams.c.ws_id.in_(clean))
             ).fetchall()
         for r in rows:
@@ -4506,6 +4509,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 "updated": r[12],
                 "project_id": r[13],
                 "persona": r[14],
+                "required_node_id": r[15],
             }
             out[r[0]] = item
         return out

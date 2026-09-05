@@ -73,7 +73,6 @@ def _make_mock_router(node_id: str = "node-a", url: str = "http://a:8080") -> Ma
     router = MagicMock(spec=ConsoleRouter)
     router.is_ready.return_value = True
     router.route.return_value = NodeRef(node_id, url)
-    router.generate_ws_id_for_node.return_value = "00ff" + "0" * 28
     return router
 
 
@@ -197,10 +196,12 @@ class TestRouteCreateAudit:
     def test_503_retry_records_final_node_id(self):
         """Audit row must reflect the node that actually served 200, not the failed first node."""
         router = _make_mock_router()
+        router.node_count.return_value = 2
+        router.rendezvous_node.return_value = NodeRef("node-b-retry", "http://b:8080")
 
         call_count = 0
 
-        def _route(_ws_id: str) -> NodeRef:
+        def _route(_ws_id: str, **kwargs: Any) -> NodeRef:
             nonlocal call_count
             call_count += 1
             if call_count <= 1:

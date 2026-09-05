@@ -95,6 +95,23 @@ TURNSTONE_NODE_ID=host-1 \
   turnstone-server --host 0.0.0.0 --port 8080
 ```
 
+Keep `TURNSTONE_NODE_ID` stable across restarts when conversations require this
+host. Without it, the server generates a new identity on each start. Give each
+execution environment a unique ID: a host server and a container with different
+files or devices should not share one. A returning identity may advertise a
+new URL; the console resolves that URL from service registration.
+
+Selecting **Specific node** in the launcher persists an execution requirement.
+If that node is unavailable, the conversation waits for it. **Continue
+elsewhere** creates a separate conversation from saved history on the chosen
+node; local files and running tools are not transferred. Automatic placement
+remains flexible. Existing conversations are left unbound during migration
+because historical placement does not establish explicit intent; fork one to
+a specific node to create a bound continuation.
+
+Deploy the updated console and server code with migration 076 before relying
+on node requirements. Older server versions do not enforce the new field.
+
 The host server registers itself in PostgreSQL; the console reaches it back via
 `host.docker.internal`. `TURNSTONE_CONSOLE_URL` points the node at the console's
 published ACME endpoint so it can enroll its mTLS certificate (needed only when

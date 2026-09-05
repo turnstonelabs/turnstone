@@ -213,6 +213,17 @@ class RewindRequest(BaseModel):
 
 
 class CreateWorkstreamRequest(BaseModel):
+    required_node_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+        description=(
+            "Required execution node. Omission permits automatic placement for a fresh "
+            "workstream and inherits the source requirement for a fork. An explicit "
+            "destination applies only to the new workstream ID."
+        ),
+    )
     name: str = Field(default="", description="Workstream display name (auto-generated if empty)")
     model: str = Field(default="", description="Model alias from registry")
     judge_model: str = Field(

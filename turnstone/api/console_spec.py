@@ -1213,16 +1213,20 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         "/v1/api/route/workstreams/new",
         "POST",
-        "Create workstream via rendezvous routing proxy",
+        "Create workstream via console routing proxy",
         description=(
             "The documented JSON form accepts RouteCreateRequest. The endpoint also "
             "accepts multipart/form-data with a JSON `meta` field and file parts; "
             "multipart callers must supply `ws_id` as a query parameter; the console "
-            "requires the cached `meta.ws_id` to match before forwarding the original "
-            "body. A JSON body may instead carry "
-            "an explicit `ws_id`; the console preserves it and uses it as the "
-            "rendezvous placement key. `resume_ws` accepts an id or saved alias and "
-            "is resolved to the canonical source id before an atomic fork is routed."
+            "requires `meta.ws_id` to match before forwarding the original upload "
+            "body. A JSON body may instead carry an explicit destination `ws_id`. "
+            "Explicit or inherited node requirements take precedence over rendezvous "
+            "placement while preserving the destination ID. `resume_ws` accepts an "
+            "id or saved alias and is authorized and resolved to its canonical source "
+            "before routing an atomic fork. A fork inherits the source requirement "
+            "unless an explicit destination node is selected for the new ID. "
+            "Metadata-only multipart forks use the same JSON fork path; uploads "
+            "cannot be combined with a fork."
         ),
         request_model=RouteCreateRequest,
         response_model=RouteCreateResponse,
@@ -1231,7 +1235,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             QueryParam(
                 "ws_id",
                 (
-                    "32-hex rendezvous key required for multipart creates. JSON "
+                    "32-hex destination ID required for multipart creates. JSON "
                     "callers put an optional destination ws_id in the request body."
                 ),
             )
@@ -1243,12 +1247,12 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "GET",
         "Probe whether a routed workstream is loaded without rehydrating it",
         description=(
-            "Routes to the workstream's rendezvous owner and checks its "
+            "Resolves the workstream's required node or flexible placement and checks its "
             "manager-authoritative active list. The response does not expose "
             "workstream metadata; missing, unloaded, creating, and "
             "caller-invisible rows all report ``live=false``. Routing and "
-            "upstream uncertainty fail with an error rather than reporting a "
-            "false miss."
+            "upstream uncertainty, including an unavailable required node, fail "
+            "with an error rather than reporting a false miss."
         ),
         response_model=RouteLiveResponse,
         error_codes=[400, 502, 503],

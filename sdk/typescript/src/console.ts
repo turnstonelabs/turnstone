@@ -150,28 +150,18 @@ export class TurnstoneConsole extends BaseClient {
   // -- Routing proxy --------------------------------------------------------
 
   /**
-   * Create a workstream via the console rendezvous router.
+   * Create a workstream through console routing.
    *
    * When `attachments` is non-empty the request is sent as
-   * multipart/form-data and the console routes via `?ws_id=<hex>`
-   * (auto-generated when not supplied) so the body lands on the
-   * owning node directly.
+   * multipart/form-data with the same destination ID in `?ws_id=<hex>`
+   * and the metadata (auto-generated when not supplied). An explicit
+   * node requirement takes precedence over rendezvous placement.
    */
   async routeCreateWorkstream(
     opts?: RouteCreateRequest,
   ): Promise<RouteCreateResponse> {
     const attachments = opts?.attachments;
     if (attachments && attachments.length > 0) {
-      // The console's multipart route_create routes by `?ws_id=` only —
-      // it does not parse the body to honor `target_node`. Refuse the
-      // combination at the SDK boundary so callers don't silently get
-      // routed to the wrong node.
-      if (opts?.target_node) {
-        throw new Error(
-          "target_node is not supported with attachments; " +
-            "use ws_id (caller-generated to hash to the desired node) instead",
-        );
-      }
       const meta: Record<string, unknown> = { ...opts };
       delete (meta as { attachments?: unknown }).attachments;
       let wsId = (meta.ws_id as string | undefined) ?? "";
