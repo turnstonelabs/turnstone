@@ -584,7 +584,7 @@ The scheduler runs as a daemon thread inside the console process. Every `check_i
 1. Acquires a distributed lock via the `system_settings` table (prevents duplicate dispatch in multi-console deployments)
 2. Queries the storage backend for tasks whose `next_run <= now` and `enabled = true`
 3. Dispatches each due task as one or more workstream creation requests via HTTP proxy
-4. Updates `last_run` and computes the next `next_run` (or disables one-shot `at` tasks). A recurring schedule whose zone the host can no longer resolve, or whose expression has no future firing, is disabled with the reason recorded in its run history; re-enabling it re-validates the stored timing.
+4. Updates `last_run` and computes the next `next_run` (or disables one-shot `at` tasks). A recurring schedule whose zone the host can no longer resolve, or whose expression has no future firing, is disabled with the reason recorded in its run history; re-enabling it re-validates the stored timing. A firing on which no node created the workstream is held when that is certain (no reachable node, a connection that never opened, a node's 4xx answer): its `next_run` stays at the due time and the firing is attempted again about once a minute (`retry_interval`) for five minutes after its first failed attempt (`retry_window`), then given up. When the answer does not say whether the workstream was created (a lost reply, a connection dropped mid-request, a 5xx) the firing is not retried, since another attempt could create a second workstream; its `failed` row says so. A given-up or unretried firing advances the schedule from the clock with `last_run` untouched; a one-shot is disabled with the reason in its run history and needs a new time to run again. Held firings are kept in a `system_settings` row beside the scheduler lock, so every console paces them alike and a restart does not restart the window.
 5. Releases the lock
 
 Run history is automatically pruned (runs older than 90 days) approximately once per hour.
@@ -625,6 +625,8 @@ carry `UTC`, the zone they were always evaluated in.
 | `check_interval` | `15.0` | Seconds between scheduler ticks |
 | `lock_ttl` | `60` | Distributed lock TTL in seconds |
 | `max_fan_out` | `20` | Maximum nodes for `all` target mode |
+| `retry_window` | `300.0` | Seconds after a firing's first failed attempt during which it is retried |
+| `retry_interval` | `60.0` | Seconds between attempts of a held firing |
 
 Dependency: `croniter` (installed with turnstone).
 
@@ -728,7 +730,7 @@ List execution history for a task (most recent first). `limit` defaults to 50, m
 }
 ```
 
-Status is `dispatched` on success, `failed` with an `error` message (e.g. no reachable nodes), or `disabled` when the schedule was disabled at dispatch because no next firing could be computed, with the reason in `error`. Failed runs do not advance `next_run`.
+Status is `dispatched` on success, `failed` with an `error` message (e.g. no reachable nodes) for each attempt that created no workstream, or `disabled` when the schedule was disabled at dispatch, with the reason in `error`: no next firing could be computed, or a one-shot's firing was given up. When a failed firing is retried, and when it is not, is described under the scheduler's architecture above.
 
 ---
 

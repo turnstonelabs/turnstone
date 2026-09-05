@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
+import httpx
 import pytest
 
 from turnstone.console.scheduler import TaskScheduler
@@ -524,6 +525,341 @@ class TestSchedulerTick:
 
         # update_scheduled_task should NOT be called (no last_run/next_run advance)
         storage.update_scheduled_task.assert_not_called()
+
+    @pytest.mark.parametrize("target_mode", ["auto", "pool", "node-001", "all"])
+    def test_a_firing_no_node_took_is_held_and_retried(self, mocks, target_mode):
+        # A node that cannot be reached is a failed firing in every target
+        # mode, not only the no-node paths: the schedule keeps its
+        # next_run, records the failure, and the next tick tries again.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task(target_mode=target_mode)]
+        collector.get_nodes.return_value = ([_make_node("node-001")], 1)
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+
+        scheduler = TaskScheduler(collector, storage, retry_interval=0)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            side_effect=httpx.ConnectError("refused"),
+        ) as create:
+            scheduler._tick()
+            scheduler._tick()
+
+        assert create.call_count == 2
+        storage.update_scheduled_task.assert_not_called()
+        rows = [
+            (c.kwargs["status"], c.kwargs["error"]) for c in storage.record_task_run.call_args_list
+        ]
+        assert rows == [("failed", "node-001 could not be reached (ConnectError)")] * 2
+
+    def test_a_node_without_a_url_is_a_failed_firing(self, mocks):
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task(target_mode="node-gone")]
+        collector.get_node_detail.return_value = {}
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch("turnstone.console.scheduler.TurnstoneServer.create_workstream") as create:
+            scheduler._tick()
+
+        create.assert_not_called()
+        storage.update_scheduled_task.assert_not_called()
+        assert storage.record_task_run.call_args.kwargs["error"] == "No URL for node node-gone"
+
+    def test_a_fan_out_records_one_row_per_attempt_naming_each_node(self, mocks):
+        # The fan-out reached its nodes, so the history names each failure
+        # rather than claiming no node was reachable — in one row per
+        # attempt, so a held fan-out does not write a page of rows a tick.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task(target_mode="all")]
+        collector.get_nodes.return_value = ([_make_node("node-001"), _make_node("node-002")], 2)
+        collector.get_node_detail.side_effect = lambda nid: {"server_url": f"http://{nid}:8080"}
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            side_effect=TurnstoneAPIError(400, "unknown persona"),
+        ):
+            scheduler._tick()
+
+        storage.update_scheduled_task.assert_not_called()
+        rows = [
+            (c.kwargs["status"], c.kwargs["error"]) for c in storage.record_task_run.call_args_list
+        ]
+        assert rows == [
+            (
+                "failed",
+                "node-001 answered HTTP 400: unknown persona; "
+                "node-002 answered HTTP 400: unknown persona",
+            )
+        ]
+
+    def test_a_cron_firing_is_given_up_after_the_retry_window(self, mocks):
+        # The window runs from the first failed attempt, not the due time:
+        # a firing first seen late (the console was down) gets its full five
+        # minutes.  It is judged after an attempt, so a console back from a
+        # long gap still tries the node once; then the schedule moves on
+        # from the clock, and nothing ran, so last_run is left alone.
+        collector, storage = mocks
+        collector.get_nodes.return_value = ([], 0)
+        task = _make_task(next_run="2030-01-01T00:00:00")
+
+        scheduler = TaskScheduler(collector, storage, retry_interval=0)
+        scheduler._dispatch_task(task, "2030-01-01T00:10:00")
+        storage.update_scheduled_task.assert_not_called()
+        scheduler._dispatch_task(task, "2030-01-01T00:14:59")
+        storage.update_scheduled_task.assert_not_called()
+        scheduler._dispatch_task(task, "2030-01-01T00:15:00")
+
+        _, kwargs = storage.update_scheduled_task.call_args
+        assert set(kwargs) == {"next_run"} and kwargs["next_run"].endswith("T09:00:00")
+        assert storage.record_task_run.call_count == 3
+        assert scheduler._holds == {}
+
+    def test_a_console_behind_the_clock_attempts_rather_than_waits(self, mocks):
+        # Holds are shared, and a console whose clock is behind the writer's
+        # sees a negative wait; it attempts, so pacing cannot wedge it.
+        collector, storage = mocks
+        collector.get_nodes.return_value = ([], 0)
+        task = _make_task(next_run="2030-01-01T00:00:00")
+
+        scheduler = TaskScheduler(collector, storage, retry_interval=60)
+        scheduler._dispatch_task(task, "2030-01-01T00:00:00")
+        scheduler._dispatch_task(task, "2029-12-31T23:00:00")
+
+        assert storage.record_task_run.call_count == 2
+
+    def test_a_one_shot_given_up_is_disabled_with_the_reason(self, mocks):
+        # A one-shot has no next firing to move on to: it is disabled, the
+        # run history says why and what to do, and last_run stays empty so
+        # the shelf shows it disabled rather than completed.
+        collector, storage = mocks
+        collector.get_nodes.return_value = ([], 0)
+        task = _make_task(
+            schedule_type="at", cron_expr="", at_time="", next_run="2030-01-01T00:00:00"
+        )
+
+        scheduler = TaskScheduler(collector, storage)
+        scheduler._dispatch_task(task, "2030-01-01T00:00:00")
+        scheduler._dispatch_task(task, "2030-01-01T00:05:00")
+
+        _, kwargs = storage.update_scheduled_task.call_args
+        assert kwargs == {"next_run": "", "enabled": False}
+        rows = [
+            (c.kwargs["status"], c.kwargs["error"]) for c in storage.record_task_run.call_args_list
+        ]
+        assert rows == [
+            ("failed", "No reachable nodes"),
+            ("failed", "No reachable nodes"),
+            ("disabled", "the firing was given up; set a new time to run it again"),
+        ]
+
+    def test_a_held_firing_is_attempted_at_the_retry_interval(self, mocks):
+        # Between attempts the firing is due on every tick and skipped
+        # cheaply: one attempt, and one failed row, per interval.
+        collector, storage = mocks
+        collector.get_nodes.return_value = ([], 0)
+        task = _make_task(next_run="2030-01-01T00:00:00")
+
+        scheduler = TaskScheduler(collector, storage, retry_interval=60)
+        for now in ("00:00:00", "00:00:15", "00:00:45", "00:01:00", "00:01:15"):
+            scheduler._dispatch_task(task, "2030-01-01T" + now)
+
+        assert storage.record_task_run.call_count == 2
+        storage.update_scheduled_task.assert_not_called()
+
+    def test_a_hold_is_shared_through_storage(self, mocks):
+        # Consoles take turns at the lock, and one may restart mid-hold:
+        # the hold lives in storage, so a second console paces against the
+        # first's attempt, and a restarted one gives up on the first's
+        # window rather than starting its own.
+        collector, storage = mocks
+        collector.get_nodes.return_value = ([], 0)
+        storage.list_due_tasks.return_value = [_make_task()]
+
+        TaskScheduler(collector, storage, retry_interval=3600)._tick()
+        assert storage.record_task_run.call_count == 1
+        TaskScheduler(collector, storage, retry_interval=3600)._tick()
+        assert storage.record_task_run.call_count == 1, "the other console holds off"
+        storage.update_scheduled_task.assert_not_called()
+
+        TaskScheduler(collector, storage, retry_window=0, retry_interval=0)._tick()
+        assert storage.record_task_run.call_count == 2, "one more attempt, then given up"
+        assert set(storage.update_scheduled_task.call_args.kwargs) == {"next_run"}
+        assert storage.get_system_setting("scheduler_holds") is None
+
+    def test_holds_are_not_written_by_a_tick_that_lost_its_lock(self, mocks):
+        # A tick that outlived the lock TTL must not overwrite the holds a
+        # console that took the lock since has been advancing.
+        collector, storage = mocks
+        collector.get_nodes.return_value = ([], 0)
+        storage.list_due_tasks.return_value = [_make_task()]
+        scheduler = TaskScheduler(collector, storage)
+
+        def dispatch(task, now):
+            TaskScheduler._dispatch_task(scheduler, task, now)
+            storage.upsert_system_setting(
+                "scheduler_lock", json.dumps({"owner": "other", "acquired": now})
+            )
+
+        with patch.object(scheduler, "_dispatch_task", side_effect=dispatch):
+            scheduler._tick()
+
+        assert storage.record_task_run.call_count == 1
+        assert storage.get_system_setting("scheduler_holds") is None
+        assert scheduler._holds, "kept in memory for the next tick"
+
+    def test_an_unreadable_holds_row_keeps_the_holds_in_memory(self, mocks):
+        # A row this version cannot read costs the console its shared view,
+        # not the bound on its own attempts: pacing continues from memory.
+        collector, storage = mocks
+        collector.get_nodes.return_value = ([], 0)
+        storage.list_due_tasks.return_value = [_make_task()]
+        scheduler = TaskScheduler(collector, storage, retry_interval=3600)
+
+        scheduler._tick()
+        storage.upsert_system_setting("scheduler_holds", "not json")
+        scheduler._tick()
+
+        assert storage.record_task_run.call_count == 1
+
+    def test_a_console_fault_leaves_the_firing_due_and_unrecorded(self, mocks):
+        # A token that will not mint is the console's fault, not an outcome
+        # of the firing: no row is written and the schedule is left as it
+        # was, for the tick's guard to log.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task()]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+        token_manager = MagicMock()
+        type(token_manager).token = PropertyMock(side_effect=RuntimeError("no signing key"))
+
+        scheduler = TaskScheduler(collector, storage, token_manager=token_manager)
+        scheduler._tick()
+
+        storage.record_task_run.assert_not_called()
+        storage.update_scheduled_task.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("row", "kept"),
+        [
+            (None, False),
+            ({"enabled": 0}, False),
+            ({"next_run": "2021-01-01T09:00:00"}, False),
+            ({}, True),
+        ],
+    )
+    def test_a_hold_outlives_the_due_page_but_not_its_firing(self, mocks, row, kept):
+        # A held task absent from the due page is still held if its row
+        # says the same firing is pending (the page is capped); deleted,
+        # disabled or re-timed, its hold goes, and it starts afresh when
+        # next due.
+        collector, storage = mocks
+        collector.get_nodes.return_value = ([], 0)
+        task = _make_task()
+        storage.list_due_tasks.return_value = [task]
+        storage.get_scheduled_task.return_value = None if row is None else {**task, **row}
+
+        scheduler = TaskScheduler(collector, storage, retry_interval=3600)
+        scheduler._tick()
+        storage.list_due_tasks.return_value = []
+        scheduler._tick()
+        assert (storage.get_system_setting("scheduler_holds") is not None) is kept
+        storage.list_due_tasks.return_value = [task]
+        scheduler._tick()
+
+        assert storage.record_task_run.call_count == (1 if kept else 2)
+
+    @pytest.mark.parametrize(
+        ("failure", "held"),
+        [
+            (httpx.ConnectError("refused"), True),
+            (httpx.ConnectTimeout("no route"), True),
+            (httpx.PoolTimeout("busy"), True),
+            (httpx.ProxyError("refused"), True),
+            (httpx.UnsupportedProtocol("no scheme"), True),
+            (TurnstoneAPIError(429, "manager at capacity"), True),
+            (TurnstoneAPIError(400, "unknown persona"), True),
+            (TurnstoneAPIError(401, "token not yet valid"), True),
+            (TurnstoneAPIError(503, "Unknown model alias"), False),
+            (httpx.ReadTimeout("slow node"), False),
+            (RuntimeError("unexpected"), False),
+        ],
+    )
+    def test_only_a_certain_non_creation_is_retried(self, mocks, failure, held):
+        # A connection that never opened, or a node's 4xx, made nothing:
+        # worth another attempt.  A lost reply or a 5xx may have made the
+        # workstream, so the firing is not retried but recorded as
+        # unresolved and the schedule moves on without a last_run.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task()]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream", side_effect=failure
+        ):
+            scheduler._tick()
+
+        row = storage.record_task_run.call_args.kwargs
+        assert row["status"] == "failed"
+        assert row["error"].endswith("so the firing was not retried") is not held
+        assert storage.update_scheduled_task.called is not held
+        if not held:
+            assert "last_run" not in storage.update_scheduled_task.call_args.kwargs
+
+    def test_an_unresolved_one_shot_is_disabled_without_a_last_run(self, mocks):
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [
+            _make_task(schedule_type="at", cron_expr="", at_time="")
+        ]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            side_effect=httpx.ReadTimeout("slow node"),
+        ):
+            scheduler._tick()
+
+        assert storage.update_scheduled_task.call_args.kwargs == {"next_run": "", "enabled": False}
+        rows = [
+            (c.kwargs["status"], c.kwargs["error"]) for c in storage.record_task_run.call_args_list
+        ]
+        assert rows == [
+            (
+                "failed",
+                "node-001 gave no answer (ReadTimeout); whether the workstream was "
+                "created is not known, so the firing was not retried",
+            ),
+            (
+                "disabled",
+                "whether the firing ran is not known; check the node before setting a new time",
+            ),
+        ]
+
+    def test_a_fan_out_with_one_unresolved_node_is_not_retried(self, mocks):
+        # One node whose answer was lost makes the firing unresolved even
+        # when the others certainly made nothing: a retry could hand that
+        # node a second workstream.
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task(target_mode="all")]
+        collector.get_nodes.return_value = ([_make_node("node-001"), _make_node("node-002")], 2)
+        collector.get_node_detail.side_effect = lambda nid: {"server_url": f"http://{nid}:8080"}
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            side_effect=[httpx.ConnectError("refused"), httpx.ReadTimeout("slow node")],
+        ):
+            scheduler._tick()
+
+        assert set(storage.update_scheduled_task.call_args.kwargs) == {"next_run"}
+        error = storage.record_task_run.call_args.kwargs["error"]
+        assert error.startswith(
+            "node-001 could not be reached (ConnectError); node-002 gave no answer"
+        )
+        assert error.endswith("so the firing was not retried")
 
     def test_fan_out_capped(self, mocks):
         """Fan-out 'all' mode should respect max_fan_out limit."""
