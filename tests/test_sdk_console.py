@@ -406,6 +406,29 @@ async def test_create_schedule():
         # Optional fields with defaults should not appear when not set
         assert "description" not in body
         assert "model" not in body
+        assert "timezone" not in body
+
+
+@pytest.mark.anyio
+async def test_create_schedule_sends_timezone():
+    captured_body: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.append(json.loads(request.content))
+        return _json_response({**_SCHEDULE_FIXTURE, "timezone": "America/New_York"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.create_schedule(
+            name="nightly",
+            schedule_type="cron",
+            initial_message="Run nightly checks",
+            cron_expr="0 2 * * *",
+            timezone="America/New_York",
+        )
+        assert resp.timezone == "America/New_York"
+        assert captured_body[0]["timezone"] == "America/New_York"
 
 
 @pytest.mark.anyio
@@ -436,6 +459,23 @@ async def test_update_schedule_partial():
         assert resp.enabled is False
         body = captured_body[0]
         assert body == {"enabled": False}
+
+
+@pytest.mark.anyio
+async def test_update_schedule_timezone():
+    """The zone rides the same unset-sentinel path as every other field."""
+    captured_body: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.append(json.loads(request.content))
+        return _json_response({**_SCHEDULE_FIXTURE, "timezone": "Europe/Berlin"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        resp = await client.update_schedule("t1", timezone="Europe/Berlin")
+        assert resp.timezone == "Europe/Berlin"
+        assert captured_body[0] == {"timezone": "Europe/Berlin"}
 
 
 @pytest.mark.anyio

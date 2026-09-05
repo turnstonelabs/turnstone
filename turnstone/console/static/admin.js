@@ -1172,6 +1172,12 @@ function _renderSchedules(schedules) {
       s.schedule_type === "cron" ? "scope-write" : "scope-approve";
     const schedule =
       s.schedule_type === "cron" ? s.cron_expr : _schLocal(s.at_time);
+    // A cron reads in its zone.  UTC goes unsaid: it is what every schedule
+    // meant before the zone was stored, and the common case.
+    const zone =
+      s.schedule_type === "cron" && s.timezone && s.timezone !== "UTC"
+        ? s.timezone
+        : "";
     const target = s.target_mode;
     const nextRun = s.next_run ? _schLocal(s.next_run) : "\u2014";
     const enabled = s.enabled;
@@ -1195,7 +1201,9 @@ function _renderSchedules(schedules) {
       "</span></span>" +
       '<span class="admin-col admin-col-sschedule"><code>' +
       escapeHtml(schedule) +
-      "</code></span>" +
+      "</code>" +
+      (zone ? " " + escapeHtml(zone) : "") +
+      "</span>" +
       '<span class="admin-col admin-col-starget">' +
       escapeHtml(target) +
       "</span>" +
@@ -1533,10 +1541,10 @@ function _schLocal(utcStr) {
 
 // --- Schedule shelf (create + edit) ---
 // Timing comes from the shared Runs builder (schedule_builder.js): the
-// segmented control compiles to schedule_type / cron_expr / at_time and the
-// NEXT RUNS read-out previews the result through the server's croniter as
-// the user edits.  The shelf owns the rest of the form plus the footer
-// "compiles to" read-out.
+// segmented control compiles to schedule_type / cron_expr / at_time /
+// timezone and the NEXT RUNS read-out previews the result through the
+// server's croniter as the user edits.  The shelf owns the rest of the form
+// plus the footer "compiles to" read-out.
 
 let _schWired = false;
 let _schShelfHandle = null;
@@ -1558,6 +1566,7 @@ function _schRenderCompiled(compiled) {
     span.className = "mono";
     span.textContent = compiled.cron_expr;
     meta.appendChild(span);
+    meta.appendChild(document.createTextNode(" in " + compiled.timezone));
   }
 }
 
@@ -1689,7 +1698,7 @@ function showEditScheduleModal(taskId) {
       document.getElementById("sch-id").value = s.task_id;
       document.getElementById("sch-name").value = s.name || "";
       document.getElementById("sch-desc").value = s.description || "";
-      _schWhen.apply(s.schedule_type, s.cron_expr, s.at_time);
+      _schWhen.apply(s.schedule_type, s.cron_expr, s.at_time, s.timezone);
       const isSpecificNode =
         s.target_mode &&
         s.target_mode !== "auto" &&
@@ -1752,6 +1761,7 @@ function _submitScheduleShelf() {
     schedule_type: compiled.schedule_type,
     cron_expr: compiled.cron_expr,
     at_time: compiled.at_time,
+    timezone: compiled.timezone,
     target_mode: targetMode,
     model: (document.getElementById("sch-model").value || "").trim(),
     skill: (document.getElementById("sch-template").value || "").trim(),
@@ -1828,7 +1838,9 @@ function showScheduleRuns(taskId) {
               ? "sched-active"
               : r.status === "failed"
                 ? "sched-expired"
-                : "";
+                : r.status === "disabled"
+                  ? "sched-disabled"
+                  : "";
           html +=
             '<div class="admin-row sched-runs-grid">' +
             '<span class="admin-col">' +

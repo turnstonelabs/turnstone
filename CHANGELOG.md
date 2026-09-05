@@ -25,6 +25,41 @@ frozen.
   launcher now share one timing builder; its "next runs" read-out shows each
   run in the browser's local zone, and the shelf's NEXT RUN column now
   converts the server's UTC time to local time instead of relabelling it.
+- **Schedules run in the operator's time zone (#1091).** A recurring schedule
+  now stores the IANA zone its cron is evaluated in (`timezone` on
+  `scheduled_tasks`, migration 073; `POST`/`PUT /v1/api/admin/schedules`, the
+  preview endpoint and the SDK accept it; an unknown zone, or a cron that
+  never matches a real calendar date, is refused). The timing builder detects the
+  browser's zone, labels the recurring-time inputs with it and sends it with
+  the schedule, so "02:30 daily" keeps firing at 02:30 local across
+  daylight-saving changes and a weekly day is the local day; a fixed time of
+  day fires once on the fall-back day while a cadence keeps its real-time
+  rhythm through the repeated hour (#1097); editing keeps a schedule's saved
+  zone. Existing schedules carry `UTC`, the zone they were
+  always evaluated in, and `next_run` stays stored in UTC. `tzdata` becomes
+  a direct dependency so legacy zone keys browsers still report
+  (`Asia/Calcutta`) resolve on hosts whose system database omits them, and
+  the `croniter` floor rises to 6.1, the first release whose zone-aware walk
+  handles daylight-saving changes correctly. A schedule whose zone the host
+  can no longer resolve is disabled with the reason recorded in its run
+  history.
+
+### Fixed
+
+- **One-shot schedules with a non-UTC offset fired at the wrong time
+  (#1096).** A one-shot's `at_time` was stored verbatim as its `next_run`,
+  which the due query compares as a string against a UTC clock, so an
+  `at_time` such as `2030-01-01T12:00:00+05:30` fired at 12:00 UTC rather
+  than 06:30 UTC. The offset is now folded into `next_run`, and migration
+  074 rewrites the one-shots already stored; `at_time` is kept as submitted.
+- **Schedule requests read an explicit null as a value (#1098).**
+  `PUT /v1/api/admin/schedules/{id}` gated each field on key presence and
+  `POST` read defaults only for absent keys, so a null, which the update
+  schema advertises for every field and the SDK forwards for a caller's
+  `None`, disabled the schedule (`enabled`), stored the string `"None"`
+  (`name`, `description`), or failed validation (`cron_expr`). A null is
+  now refused with a `400` naming the field on create, update and preview:
+  neither a value nor a silent no-op.
 
 ### Changed
 

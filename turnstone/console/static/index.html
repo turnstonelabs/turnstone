@@ -305,7 +305,10 @@
         </div>
         <div data-when-pane="daily">
           <label for="when-time-daily"
-            >At time <span class="label-hint">— UTC</span></label
+            >At time
+            <span class="label-hint"
+              >— <span data-when-zone>UTC</span></span
+            ></label
           >
           <input id="when-time-daily" type="time" />
         </div>
@@ -340,7 +343,10 @@
             </button>
           </div>
           <label for="when-time-weekly"
-            >At time <span class="label-hint">— UTC</span></label
+            >At time
+            <span class="label-hint"
+              >— <span data-when-zone>UTC</span></span
+            ></label
           >
           <input id="when-time-weekly" type="time" />
         </div>
@@ -352,7 +358,10 @@
             </div>
             <div>
               <label for="when-time-monthly"
-                >At time <span class="label-hint">— UTC</span></label
+                >At time
+                <span class="label-hint"
+                  >— <span data-when-zone>UTC</span></span
+                ></label
               >
               <input id="when-time-monthly" type="time" />
             </div>
@@ -384,7 +393,8 @@
           <label for="when-cron"
             >Cron expression
             <span class="label-hint"
-              >min hour day month weekday</span
+              >min hour day month weekday —
+              <span data-when-zone>UTC</span></span
             ></label
           >
           <input

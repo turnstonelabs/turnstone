@@ -307,6 +307,11 @@ scheduled_tasks = sa.Table(
     sa.Column("schedule_type", sa.Text, nullable=False),  # "cron" or "at"
     sa.Column("cron_expr", sa.Text, nullable=False, server_default=""),
     sa.Column("at_time", sa.Text, nullable=False, server_default=""),  # ISO8601
+    # timezone: the IANA zone the cron's wall-clock fields are evaluated in
+    # (console/schedule_timing.py::next_cron_runs).  "UTC" is the pre-073 meaning of
+    # every row; next_run stays UTC.  An ``at`` schedule's at_time carries its
+    # own offset and ignores it.  Added in migration 073.
+    sa.Column("timezone", sa.Text, nullable=False, server_default="UTC"),
     sa.Column("target_mode", sa.Text, nullable=False, server_default="auto"),
     sa.Column("model", sa.Text, nullable=False, server_default=""),
     sa.Column("initial_message", sa.Text, nullable=False),

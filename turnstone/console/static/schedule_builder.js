@@ -6,9 +6,15 @@
    cron_expr / at_time, and the NEXT RUNS read-out previews the result
    through the server's croniter (POST /v1/api/admin/schedules/preview) as
    the user edits.  Cron mode is the raw escape hatch with the same live
-   read-out.  Storage is unchanged: a saved expression is reverse-parsed
-   back into the friendly mode when its shape matches (cronToScheduleMode),
-   else the editor opens in Cron mode.
+   read-out.  A saved expression is reverse-parsed back into the friendly
+   mode when its shape matches (cronToScheduleMode), else the editor opens
+   in Cron mode.
+
+   A recurring time is wall-clock in a zone: the builder detects the
+   browser's IANA zone (browserZone) and sends it as `timezone` beside the
+   cron, and the scheduler evaluates the cron in that zone.  The zone is
+   part of the state, so editing a schedule saved from another zone keeps
+   its zone (the time labels name it) rather than silently re-zoning it.
 
    Markup comes from <template id="schedule-when-template"> — one source for
    every consumer.  Each instance clones it and prefixes every id (plus the
@@ -98,10 +104,31 @@
     }
   }
 
+  // The browser's IANA zone ("America/New_York"); "UTC" when the platform
+  // cannot say.  This is the zone a new schedule's cron is evaluated in.
+  // The platform can report a placeholder the server cannot resolve — an
+  // unmappable host zone reads as "Etc/Unknown", a POSIX offset zone as a
+  // bare "+03:00" — and sending one would fail every schedule from this
+  // browser, so a detected zone is vouched for here: it must be one the
+  // formatter itself accepts (which rejects the placeholders) and not an
+  // offset (which newer engines accept but the server does not).  The
+  // fallback is visible, not silent: the time labels then say UTC.
+  function browserZone() {
+    try {
+      const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (!zone || /^[+-]/.test(zone)) return "UTC";
+      new Intl.DateTimeFormat(undefined, { timeZone: zone });
+      return zone;
+    } catch (_e) {
+      return "UTC";
+    }
+  }
+
   // A server instant in the operator's local time: "Tue 2026-09-08 02:00
-  // EDT".  The raw input when it does not parse.  The cron itself stays in
-  // UTC (the scheduler has no zone), so the read-out is where an operator
-  // sees when a run actually lands for them.
+  // EDT".  The raw input when it does not parse.  The read-out is where an
+  // operator sees when a run actually lands for them — the schedule's own
+  // zone unless it was saved from another one, when the short zone name
+  // here says so.
   function formatLocal(iso) {
     const d = parseServerTime(iso);
     if (isNaN(d.getTime())) return iso;
@@ -167,10 +194,13 @@
   // mode keeps its own fields so switching modes never loses an edit.
   // monthlyDom and intervalEvery are numbers from defaultState() /
   // stateFromSaved() and the raw input strings from state(); consumers
-  // parse them (compileSchedule does).
+  // parse them (compileSchedule does).  timezone is the IANA zone the
+  // recurring modes' times are read in — the browser's for a new schedule,
+  // the saved one when editing.
   function defaultState() {
     return {
       mode: "daily",
+      timezone: browserZone(),
       dailyTime: "06:00",
       weeklyTime: "06:00",
       weeklyDays: [],
@@ -183,42 +213,58 @@
     };
   }
 
-  function cronResult(expr) {
-    return { schedule_type: "cron", cron_expr: expr, at_time: "" };
+  function zoneOf(state) {
+    return state.timezone || "UTC";
+  }
+
+  function cronResult(expr, zone) {
+    return {
+      schedule_type: "cron",
+      cron_expr: expr,
+      at_time: "",
+      timezone: zone,
+    };
   }
 
   // Compile builder state down to the wire fields.  Returns
-  // {schedule_type, cron_expr, at_time} or {error}.
+  // {schedule_type, cron_expr, at_time, timezone} or {error}.  A one-shot's
+  // at_time carries its own offset; its zone is carried for a uniform shape.
   function compileSchedule(state) {
     const mode = state.mode;
+    const zone = zoneOf(state);
     let h, m;
     if (mode === "once") {
       if (!state.atLocal) return { error: "Pick a date and time" };
       const at = localToUtcIso(state.atLocal);
       if (!at) return { error: "Pick a date and time" };
-      return { schedule_type: "at", cron_expr: "", at_time: at };
+      return {
+        schedule_type: "at",
+        cron_expr: "",
+        at_time: at,
+        timezone: zone,
+      };
     }
     if (mode === "cron") {
       const expr = (state.cron || "").trim();
       if (!expr) return { error: "Cron expression is required" };
-      return cronResult(expr);
+      return cronResult(expr, zone);
     }
     if (mode === "daily") {
       [h, m] = timeParts(state.dailyTime);
-      return cronResult(m + " " + h + " * * *");
+      return cronResult(m + " " + h + " * * *", zone);
     }
     if (mode === "weekly") {
       const days = (state.weeklyDays || []).slice().sort(byNumber);
       if (!days.length) return { error: "Select at least one day" };
       [h, m] = timeParts(state.weeklyTime);
-      return cronResult(m + " " + h + " * * " + days.join(","));
+      return cronResult(m + " " + h + " * * " + days.join(","), zone);
     }
     if (mode === "monthly") {
       const dom = wholeNumber(state.monthlyDom);
       if (!dom || dom < 1 || dom > 31)
         return { error: "Day of month must be 1-31" };
       [h, m] = timeParts(state.monthlyTime);
-      return cronResult(m + " " + h + " " + dom + " * *");
+      return cronResult(m + " " + h + " " + dom + " * *", zone);
     }
     if (mode === "interval") {
       const n = wholeNumber(state.intervalEvery);
@@ -235,16 +281,19 @@
         };
       return cronResult(
         unit === "hours" ? "0 */" + n + " * * *" : "*/" + n + " * * * *",
+        zone,
       );
     }
     return { error: "Unknown schedule mode" };
   }
 
-  // Plain-words summary of the state for the read-out header.
+  // Plain-words summary of the state for the read-out header.  A time is
+  // named with its zone, the one the cron is evaluated in.
   function describeSchedule(state) {
+    const zone = zoneOf(state);
     switch (state.mode) {
       case "daily":
-        return "every day at " + hhmm(state.dailyTime) + " UTC";
+        return "every day at " + hhmm(state.dailyTime) + " " + zone;
       case "weekly": {
         const names = (state.weeklyDays || [])
           .slice()
@@ -257,7 +306,8 @@
               names.join(", ") +
               " at " +
               hhmm(state.weeklyTime) +
-              " UTC"
+              " " +
+              zone
           : "no days selected";
       }
       case "monthly":
@@ -268,22 +318,28 @@
             : "?") +
           " at " +
           hhmm(state.monthlyTime) +
-          " UTC"
+          " " +
+          zone
         );
       case "interval": {
         const n = wholeNumber(state.intervalEvery);
         const unit = state.intervalUnit === "hours" ? "hours" : "minutes";
         // The phrase names the step compile will use — never the raw text.
         const base = "every " + (n >= 1 ? n : "?") + " " + unit;
+        if (!intervalStepOk(n, unit)) return base;
         // A step that does not divide its field restarts at the field
         // boundary ("*/7" hours fires 00, 07, 14, 21, then 00): say so.
-        if (!intervalStepOk(n, unit) || INTERVAL_FIELD[unit] % n === 0)
-          return base;
+        // Minutes keep their cadence in any zone (a repeated fall-back
+        // hour is one real hour with the same firings); hours are anchored
+        // to the zone's midnight, so name the zone the way the wall-clock
+        // modes do.
+        const divides = INTERVAL_FIELD[unit] % n === 0;
+        if (unit === "minutes")
+          return divides ? base : base + ", restarting each hour";
         return (
           base +
-          (unit === "hours"
-            ? ", restarting at midnight"
-            : ", restarting each hour")
+          (divides ? " from midnight " : ", restarting at midnight ") +
+          zone
         );
       }
       case "once": {
@@ -291,7 +347,7 @@
         return at ? "once at " + formatLocal(at) : "one time";
       }
       default:
-        return "custom cron";
+        return "custom cron in " + zone;
     }
   }
 
@@ -321,9 +377,12 @@
     return { mode: "cron" };
   }
 
-  // Saved timing -> the state a builder shows for it (edit mode).
-  function stateFromSaved(scheduleType, cronExpr, atTime) {
+  // Saved timing -> the state a builder shows for it (edit mode).  The
+  // saved zone is kept (a schedule without one predates the zone and is
+  // UTC), so an edit never re-zones a schedule to the editor's browser.
+  function stateFromSaved(scheduleType, cronExpr, atTime, timezone) {
     const s = defaultState();
+    s.timezone = timezone || "UTC";
     if (scheduleType === "at") {
       s.mode = "once";
       s.atLocal = utcToLocalDatetime(atTime);
@@ -371,7 +430,8 @@
 
   /**
    * Mount a builder into `mount`.  `opts.onChange(compiled)` fires with the
-   * compiled wire fields ({schedule_type, cron_expr, at_time} or {error})
+   * compiled wire fields ({schedule_type, cron_expr, at_time, timezone} or
+   * {error})
    * on every edit and on preview().
    */
   function ScheduleBuilder(mount, opts) {
@@ -475,6 +535,7 @@
       });
     return {
       mode: on ? on.getAttribute("data-mode") : "daily",
+      timezone: this._zone,
       dailyTime: els["when-time-daily"].value,
       weeklyTime: els["when-time-weekly"].value,
       weeklyDays: days,
@@ -490,6 +551,13 @@
   /** Write a plain state object into the controls (no preview). */
   ScheduleBuilder.prototype.setState = function (state) {
     const els = this._els;
+    // The zone is not a control: it is held here (state() reads it back)
+    // and the time labels name it, the zone their input is read in.
+    this._zone = zoneOf(state);
+    const zone = this._zone;
+    this.root.querySelectorAll("[data-when-zone]").forEach(function (el) {
+      el.textContent = zone;
+    });
     els["when-time-daily"].value = state.dailyTime;
     els["when-time-weekly"].value = state.weeklyTime;
     const days = state.weeklyDays || [];
@@ -532,8 +600,13 @@
   };
 
   /** Show a saved schedule's timing (edit mode). */
-  ScheduleBuilder.prototype.apply = function (scheduleType, cronExpr, atTime) {
-    this.setState(stateFromSaved(scheduleType, cronExpr, atTime));
+  ScheduleBuilder.prototype.apply = function (
+    scheduleType,
+    cronExpr,
+    atTime,
+    timezone,
+  ) {
+    this.setState(stateFromSaved(scheduleType, cronExpr, atTime, timezone));
   };
 
   ScheduleBuilder.prototype.compile = function () {
@@ -652,6 +725,7 @@
     cronToScheduleMode: cronToScheduleMode,
     stateFromSaved: stateFromSaved,
     defaultState: defaultState,
+    browserZone: browserZone,
     scopedId: scopedId,
     runsMessageKind: runsMessageKind,
     utcToLocalDatetime: utcToLocalDatetime,

@@ -29,6 +29,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,12 @@ from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.console.coordinator_client import _serialize_messages, load_task_envelope
 from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
+from turnstone.console.schedule_timing import (
+    compute_next_run,
+    next_cron_runs,
+    no_next_run_reason,
+    resolve_zone,
+)
 from turnstone.core.audit import record_audit
 from turnstone.core.auth import (
     AUTH_COOKIE_CONSOLE,
@@ -6565,38 +6572,20 @@ def _normalize_task_dict(task: dict[str, Any]) -> dict[str, Any]:
     return task
 
 
-def _next_cron_runs(cron_expr: str, count: int) -> list[str] | None:
-    """Next *count* firings of *cron_expr* as naive-UTC ISO strings.
+def _validate_schedule_fields(
+    schedule_type: str, cron_expr: str, at_time: str, timezone: str = "UTC"
+) -> str | None:
+    """Validate schedule type/expression/zone. Returns error string or None.
 
-    Returns None for expressions that pass croniter.is_valid but can never
-    match a real calendar date (``0 0 30 2 *`` — get_next raises
-    CroniterBadDateError after exhausting its search window).
+    The zone arrives normalized (``_schedule_timezone`` reads a blank one as
+    UTC) and is checked for both types: an ``at`` schedule ignores it, but
+    the row's invariant is one valid IANA name, so a later switch to ``cron``
+    that keeps the stored zone cannot inherit a bad one.
     """
-    from datetime import UTC, datetime
-
-    from croniter import CroniterBadDateError, croniter
-
-    cron = croniter(cron_expr, datetime.now(UTC))
-    try:
-        return [cron.get_next(datetime).strftime("%Y-%m-%dT%H:%M:%S") for _ in range(count)]
-    except CroniterBadDateError:
-        return None
-
-
-def _compute_next_run(schedule_type: str, cron_expr: str, at_time: str) -> str:
-    """Compute the next run time for a schedule. Empty string if invalid."""
-    if schedule_type == "at":
-        return at_time
-    if schedule_type == "cron" and cron_expr:
-        runs = _next_cron_runs(cron_expr, 1)
-        return runs[0] if runs else ""
-    return ""
-
-
-def _validate_schedule_fields(schedule_type: str, cron_expr: str, at_time: str) -> str | None:
-    """Validate schedule type/expression. Returns error string or None."""
     if schedule_type not in ("cron", "at"):
         return "schedule_type must be 'cron' or 'at'"
+    if resolve_zone(timezone) is None:
+        return f"Unknown time zone: {timezone}"
     if schedule_type == "cron":
         if not cron_expr:
             return "cron_expr is required when schedule_type is 'cron'"
@@ -6607,8 +6596,6 @@ def _validate_schedule_fields(schedule_type: str, cron_expr: str, at_time: str) 
     if schedule_type == "at":
         if not at_time:
             return "at_time is required when schedule_type is 'at'"
-        from datetime import UTC, datetime
-
         try:
             dt = datetime.fromisoformat(at_time)
             if dt.tzinfo is None:
@@ -6659,6 +6646,53 @@ def _validate_schedule_project(
     return ensure_project_attachable(user_id, project_id, storage=storage)
 
 
+# The fields that decide when a schedule fires: a change to any recomputes
+# next_run, and a value resent unchanged is not a change.
+_TIMING_FIELDS = ("schedule_type", "cron_expr", "at_time", "timezone")
+
+
+def _same_timing_value(field: str, value: str, existing: dict[str, Any]) -> bool:
+    """Whether *value* resends the stored timing *field* unchanged.
+
+    ``at_time`` is compared as an instant: the shelf re-emits it in its own
+    spelling (UTC offset, minute precision), so a one-shot stored with a
+    ``Z`` suffix, another offset or seconds would otherwise read as a
+    change on every edit and be rewritten in passing.
+    """
+    stored = str(existing.get(field) or "")
+    if value == stored:
+        return True
+    if field != "at_time":
+        return False
+    try:
+        return datetime.fromisoformat(value) == datetime.fromisoformat(stored)
+    except ValueError:
+        return False
+
+
+def _null_field(body: dict[str, Any]) -> str | None:
+    """The first field sent as null, or None when there is none.
+
+    The update schema advertises every field as nullable and the SDK
+    forwards a caller's None, but a null has no meaning here.  Read as a
+    value it became bool(None) (a schedule disabled), the string "None" (a
+    schedule named None) or a zone reset to UTC; read as "not sent" it made
+    a caller's intent to clear a privilege-bearing field such as
+    auto_approve a silent no-op.  Refusing it keeps both directions loud,
+    under one rule for every field on every schedule endpoint.
+    """
+    for key, value in body.items():
+        if value is None:
+            return str(key)
+    return None
+
+
+def _schedule_timezone(raw: Any) -> str:
+    """The zone a schedule request names; absent or blank is UTC — the
+    meaning every schedule had before the zone was stored."""
+    return str(raw if raw is not None else "").strip()[:64] or "UTC"
+
+
 async def admin_preview_schedule(request: Request) -> JSONResponse:
     """POST /v1/api/admin/schedules/preview — validate timing, return next runs.
 
@@ -6677,19 +6711,23 @@ async def admin_preview_schedule(request: Request) -> JSONResponse:
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
+    null_field = _null_field(body)
+    if null_field:
+        return JSONResponse({"valid": False, "error": f"{null_field} must not be null", "next": []})
 
     schedule_type = str(body.get("schedule_type", "")).strip()
     cron_expr = str(body.get("cron_expr", "")).strip()[:256]
     at_time = str(body.get("at_time", "")).strip()[:64]
+    timezone = _schedule_timezone(body.get("timezone"))
 
-    verr = _validate_schedule_fields(schedule_type, cron_expr, at_time)
+    verr = _validate_schedule_fields(schedule_type, cron_expr, at_time, timezone)
     if verr:
         return JSONResponse({"valid": False, "error": verr, "next": []})
 
     if schedule_type == "at":
         return JSONResponse({"valid": True, "error": "", "next": [at_time]})
 
-    runs = _next_cron_runs(cron_expr, 3)
+    runs = next_cron_runs(cron_expr, 3, timezone)
     if runs is None:
         # croniter.is_valid passes these, but the date never exists
         # (e.g. ``0 0 30 2 *``) — a preview outcome, not a server error.
@@ -6739,12 +6777,16 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
+    null_field = _null_field(body)
+    if null_field:
+        return JSONResponse({"error": f"{null_field} must not be null"}, status_code=400)
 
     name = str(body.get("name", "")).strip()[:SCHEDULE_NAME_MAX_CHARS]
     description = str(body.get("description", "")).strip()[:1024]
     schedule_type = str(body.get("schedule_type", "")).strip()
     cron_expr = str(body.get("cron_expr", "")).strip()[:256]
     at_time = str(body.get("at_time", "")).strip()[:64]
+    timezone = _schedule_timezone(body.get("timezone"))
     target_mode = str(body.get("target_mode", "auto")).strip()[:256]
     model = str(body.get("model", "")).strip()[:128]
     initial_message = str(body.get("initial_message", "")).strip()[:SCHEDULE_MESSAGE_MAX_CHARS]
@@ -6790,7 +6832,7 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         status_code, message = project_denied
         return JSONResponse({"error": message}, status_code=status_code)
 
-    validation_err = _validate_schedule_fields(schedule_type, cron_expr, at_time)
+    validation_err = _validate_schedule_fields(schedule_type, cron_expr, at_time, timezone)
     if validation_err:
         return JSONResponse({"error": validation_err}, status_code=400)
 
@@ -6805,7 +6847,14 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
             {"error": f"Maximum of {max_schedules} schedules reached"}, status_code=409
         )
 
-    next_run = _compute_next_run(schedule_type, cron_expr, at_time)
+    next_run = compute_next_run(schedule_type, cron_expr, at_time, timezone)
+    if schedule_type == "cron" and not next_run:
+        # croniter.is_valid passes an expression no calendar date matches;
+        # a schedule that can never fire is refused rather than stored.
+        return JSONResponse(
+            {"error": "Schedule has no next run: " + no_next_run_reason(cron_expr, timezone)},
+            status_code=400,
+        )
     task_id = uuid.uuid4().hex
 
     storage.create_scheduled_task(
@@ -6822,6 +6871,7 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         auto_approve_tools=auto_approve_tools,
         created_by=created_by,
         next_run=next_run if enabled else "",
+        timezone=timezone,
         skill=skill_name,
         notify_targets=notify_targets,
         persona=persona,
@@ -6877,6 +6927,9 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
+    null_field = _null_field(body)
+    if null_field:
+        return JSONResponse({"error": f"{null_field} must not be null"}, status_code=400)
 
     updates: dict[str, Any] = {}
     if "name" in body:
@@ -6889,6 +6942,16 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
         updates["cron_expr"] = str(body["cron_expr"]).strip()[:256]
     if "at_time" in body:
         updates["at_time"] = str(body["at_time"]).strip()[:64]
+    if "timezone" in body:
+        # On create a blank zone is UTC, since there is no prior meaning to
+        # lose; on update it would silently re-zone the schedule, so a change
+        # has to name a zone.
+        if not str(body["timezone"]).strip():
+            return JSONResponse(
+                {"error": "timezone must not be blank; name a zone to change it"},
+                status_code=400,
+            )
+        updates["timezone"] = _schedule_timezone(body["timezone"])
     if "target_mode" in body:
         updates["target_mode"] = str(body["target_mode"]).strip()[:256]
     if "model" in body:
@@ -6963,28 +7026,44 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
             return JSONResponse({"error": nt_err}, status_code=400)
         updates["notify_targets"] = nt_str
 
-    # Validate schedule fields if changed
+    # Only a value that differs from the stored one is a change: the edit
+    # shelf resends every timing field on any edit, and a schedule whose
+    # zone this host can no longer resolve must stay editable for its other
+    # fields rather than fail re-validation of timing it did not touch.
+    for field in _TIMING_FIELDS:
+        if field in updates and _same_timing_value(field, updates[field], existing):
+            del updates[field]
+    # The shelf resends the enabled flag on every edit as well: only a
+    # transition is a toggle, so a name edit neither re-validates timing an
+    # enabled schedule already has nor advances a pending next_run.
+    was_enabled = bool(existing.get("enabled", 1))
+    if "enabled" in updates and updates["enabled"] == was_enabled:
+        del updates["enabled"]
+
     stype = updates.get("schedule_type", existing["schedule_type"])
     cexpr = updates.get("cron_expr", existing["cron_expr"])
     atime = updates.get("at_time", existing["at_time"])
-    schedule_fields_changed = (
-        "schedule_type" in updates or "cron_expr" in updates or "at_time" in updates
-    )
-    if schedule_fields_changed:
-        validation_err = _validate_schedule_fields(stype, cexpr, atime)
+    tzone = updates.get("timezone", existing.get("timezone") or "UTC")
+    timing_changed = any(field in updates for field in _TIMING_FIELDS)
+    enabled = updates.get("enabled", was_enabled)
+    # Validate the timing when it changes, and again on re-enable: a
+    # one-shot's time may have passed, and a zone may no longer resolve on
+    # this host — refused here rather than re-enabled with no next run.
+    if timing_changed or ("enabled" in updates and enabled):
+        validation_err = _validate_schedule_fields(stype, cexpr, atime, tzone)
         if validation_err:
             return JSONResponse({"error": validation_err}, status_code=400)
 
-    # Recompute next_run if schedule changed or enabled toggled
-    if schedule_fields_changed or "enabled" in updates:
-        enabled = updates.get("enabled", bool(existing.get("enabled", 1)))
+    # Recompute next_run if the timing changed or enabled toggled
+    if timing_changed or "enabled" in updates:
         if enabled:
-            # Re-validate at_time when re-enabling a one-shot task
-            if stype == "at" and not schedule_fields_changed:
-                validation_err = _validate_schedule_fields(stype, cexpr, atime)
-                if validation_err:
-                    return JSONResponse({"error": validation_err}, status_code=400)
-            updates["next_run"] = _compute_next_run(stype, cexpr, atime)
+            next_run = compute_next_run(stype, cexpr, atime, tzone)
+            if stype == "cron" and not next_run:
+                return JSONResponse(
+                    {"error": "Schedule has no next run: " + no_next_run_reason(cexpr, tzone)},
+                    status_code=400,
+                )
+            updates["next_run"] = next_run
         else:
             updates["next_run"] = ""
 

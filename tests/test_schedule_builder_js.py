@@ -72,7 +72,12 @@ def _describe(tz: str = "UTC", **state: Any) -> str:
 
 
 def test_default_state_compiles_to_daily_0600() -> None:
-    assert _compile() == {"schedule_type": "cron", "cron_expr": "0 6 * * *", "at_time": ""}
+    assert _compile() == {
+        "schedule_type": "cron",
+        "cron_expr": "0 6 * * *",
+        "at_time": "",
+        "timezone": "UTC",
+    }
 
 
 def test_daily_uses_the_chosen_time() -> None:
@@ -128,7 +133,7 @@ def test_interval_accepts_an_exponent_form_as_the_whole_number_it_is() -> None:
         "0 */10 * * *"
     )
     assert _describe(mode="interval", intervalEvery="1e1", intervalUnit="hours") == (
-        "every 10 hours, restarting at midnight"
+        "every 10 hours, restarting at midnight UTC"
     )
 
 
@@ -157,7 +162,12 @@ def test_interval_step_is_bounded_by_the_cron_field() -> None:
 
 def test_once_compiles_local_time_to_an_offset_bearing_at_time() -> None:
     out = _compile(mode="once", atLocal="2026-09-08T10:00")
-    assert out == {"schedule_type": "at", "cron_expr": "", "at_time": "2026-09-08T10:00:00+00:00"}
+    assert out == {
+        "schedule_type": "at",
+        "cron_expr": "",
+        "at_time": "2026-09-08T10:00:00+00:00",
+        "timezone": "UTC",
+    }
 
 
 @pytest.mark.parametrize("at", ["", "not-a-date"])
@@ -178,6 +188,61 @@ def test_unknown_mode_is_an_error_not_an_interval() -> None:
 
 
 # ---------------------------------------------------------------------------
+# timezone — the zone the recurring modes' times are read in
+# ---------------------------------------------------------------------------
+
+
+def test_default_zone_is_the_browsers() -> None:
+    """A new schedule is evaluated in the browser's IANA zone: the wall-clock
+    time the operator typed keeps its meaning across daylight-saving changes,
+    which a client-side conversion to a UTC cron could not give."""
+    assert _eval("SB.defaultState().timezone", "America/New_York") == "America/New_York"
+    assert _eval("SB.browserZone()", "Europe/Berlin") == "Europe/Berlin"
+
+
+def test_browser_zone_screens_placeholders_the_server_cannot_resolve() -> None:
+    """An empty TZ makes the platform report "Etc/Unknown" and a POSIX
+    "GMT+3" a bare "+03:00"; neither is a zone the server resolves, so the
+    builder reads both as UTC (the labels then say so) rather than failing
+    every schedule from that browser."""
+    assert _eval("SB.browserZone()", "") == "UTC"
+    assert _eval("SB.browserZone()", "GMT+3") == "UTC"
+    assert _eval("SB.defaultState().timezone", "") == "UTC"
+
+
+def test_compile_carries_the_state_zone() -> None:
+    out = _eval(
+        'SB.compileSchedule(Object.assign(SB.defaultState(), {timezone: "Europe/Berlin"}))',
+        "America/New_York",
+    )
+    assert out["cron_expr"] == "0 6 * * *" and out["timezone"] == "Europe/Berlin"
+
+
+def test_blank_zone_compiles_as_utc() -> None:
+    assert _compile(timezone="")["timezone"] == "UTC"
+
+
+def test_saved_zone_is_kept_over_the_browsers() -> None:
+    """Editing a schedule saved from another zone keeps that zone — the
+    time inputs read in it — rather than silently re-zoning the schedule
+    to whoever opened it."""
+    state = _eval('SB.stateFromSaved("cron", "0 9 * * *", "", "Europe/Berlin")', "America/New_York")
+    assert state["mode"] == "daily" and state["timezone"] == "Europe/Berlin"
+    out = _eval(
+        'SB.compileSchedule(SB.stateFromSaved("cron", "0 9 * * *", "", "Europe/Berlin"))',
+        "America/New_York",
+    )
+    assert out["timezone"] == "Europe/Berlin"
+
+
+def test_saved_schedule_without_a_zone_is_utc() -> None:
+    """A schedule from before the zone was stored was evaluated in UTC, and
+    opens that way — never in the editor's browser zone."""
+    state = _eval('SB.stateFromSaved("cron", "0 9 * * *", "")', "America/New_York")
+    assert state["timezone"] == "UTC"
+
+
+# ---------------------------------------------------------------------------
 # describeSchedule — the read-out header
 # ---------------------------------------------------------------------------
 
@@ -188,8 +253,44 @@ def test_descriptions() -> None:
     assert _describe(mode="weekly", weeklyDays=[5, 1]) == "every Mon, Fri at 06:00 UTC"
     assert _describe(mode="weekly", weeklyDays=[]) == "no days selected"
     assert _describe(mode="monthly", monthlyDom=12) == "monthly on day 12 at 06:00 UTC"
-    assert _describe(mode="interval") == "every 4 hours"
+    assert _describe(mode="interval") == "every 4 hours from midnight UTC"
+    assert _describe(mode="interval", intervalEvery=15, intervalUnit="minutes") == (
+        "every 15 minutes"
+    )
     assert _describe(mode="once") == "one time"
+    assert _describe(mode="cron", cron="0 9 * * MON-FRI") == "custom cron in UTC"
+
+
+def test_descriptions_name_the_schedule_zone() -> None:
+    """The header names the zone a time is read in — the state's, not the
+    browser's, so an edit of a schedule saved elsewhere reads right."""
+    tz = "America/New_York"
+    assert _describe(tz, timezone="Europe/Berlin") == "every day at 06:00 Europe/Berlin"
+    assert (
+        _describe(tz, mode="weekly", weeklyDays=[1], timezone="Europe/Berlin")
+        == "every Mon at 06:00 Europe/Berlin"
+    )
+    assert (
+        _describe(tz, mode="monthly", monthlyDom=3, timezone="Europe/Berlin")
+        == "monthly on day 3 at 06:00 Europe/Berlin"
+    )
+    assert _describe(tz, mode="cron", timezone="Europe/Berlin") == "custom cron in Europe/Berlin"
+    # An hours interval is anchored to the zone's midnight; a minutes one
+    # keeps its cadence in any zone and stays unlabelled.
+    assert (
+        _describe(tz, mode="interval", timezone="Europe/Berlin")
+        == "every 4 hours from midnight Europe/Berlin"
+    )
+    assert (
+        _describe(tz, mode="interval", intervalEvery=7, intervalUnit="hours")
+        == "every 7 hours, restarting at midnight America/New_York"
+    )
+    assert (
+        _describe(tz, mode="interval", intervalEvery=15, intervalUnit="minutes")
+        == "every 15 minutes"
+    )
+    # The browser's zone is the default for a new schedule.
+    assert _describe(tz) == "every day at 06:00 America/New_York"
 
 
 def test_interval_description_says_how_an_uneven_step_restarts() -> None:
@@ -197,18 +298,21 @@ def test_interval_description_says_how_an_uneven_step_restarts() -> None:
     restarts at the field boundary ("*/7" hours fires 00, 07, 14, 21, then
     00) and the read-out says so.  A blank or out-of-range step (which
     compile refuses) gets the plain phrase, never a claim."""
-    even = [(15, "minutes"), (30, "minutes"), (1, "minutes"), (4, "hours"), (12, "hours")]
-    for n, unit in even:
-        assert _describe(mode="interval", intervalEvery=n, intervalUnit=unit) == (
-            f"every {n} {unit}"
+    for n in (15, 30, 1):
+        assert _describe(mode="interval", intervalEvery=n, intervalUnit="minutes") == (
+            f"every {n} minutes"
         )
-    for n, unit in [(7, "minutes"), (45, "minutes")]:
-        assert _describe(mode="interval", intervalEvery=n, intervalUnit=unit) == (
-            f"every {n} {unit}, restarting each hour"
+    for n in (4, 12):
+        assert _describe(mode="interval", intervalEvery=n, intervalUnit="hours") == (
+            f"every {n} hours from midnight UTC"
         )
-    for n, unit in [(5, "hours"), (7, "hours")]:
-        assert _describe(mode="interval", intervalEvery=n, intervalUnit=unit) == (
-            f"every {n} {unit}, restarting at midnight"
+    for n in (7, 45):
+        assert _describe(mode="interval", intervalEvery=n, intervalUnit="minutes") == (
+            f"every {n} minutes, restarting each hour"
+        )
+    for n in (5, 7):
+        assert _describe(mode="interval", intervalEvery=n, intervalUnit="hours") == (
+            f"every {n} hours, restarting at midnight UTC"
         )
     assert _describe(mode="interval", intervalEvery="", intervalUnit="hours") == "every ? hours"
     # The read-out names the step compile will use, never the raw text.
@@ -223,7 +327,7 @@ def test_interval_description_says_how_an_uneven_step_restarts() -> None:
     assert _describe(mode="once", atLocal="2026-09-08T10:00", tz="America/New_York") == (
         "once at Tue 2026-09-08 10:00 EDT"
     )
-    assert _describe(mode="cron") == "custom cron"
+    assert _describe(mode="cron") == "custom cron in UTC"
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +384,7 @@ def test_saved_out_of_range_step_opens_in_cron_mode_unchanged(expr: str) -> None
     state = _eval(f'SB.stateFromSaved("cron", {json.dumps(expr)}, "")')
     assert state["mode"] == "cron" and state["cron"] == expr
     out = _eval(f'SB.compileSchedule(SB.stateFromSaved("cron", {json.dumps(expr)}, ""))')
-    assert out == {"schedule_type": "cron", "cron_expr": expr, "at_time": ""}
+    assert out == {"schedule_type": "cron", "cron_expr": expr, "at_time": "", "timezone": "UTC"}
 
 
 def test_unrecognised_cron_opens_in_cron_mode_with_the_raw_text() -> None:
@@ -290,6 +394,7 @@ def test_unrecognised_cron_opens_in_cron_mode_with_the_raw_text() -> None:
         "schedule_type": "cron",
         "cron_expr": "0 9 * * MON-FRI",
         "at_time": "",
+        "timezone": "UTC",
     }
 
 

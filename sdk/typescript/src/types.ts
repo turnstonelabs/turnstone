@@ -659,6 +659,8 @@ export interface CreateScheduleRequest {
   description?: string;
   cron_expr?: string;
   at_time?: string;
+  /** IANA zone the cron is evaluated in (e.g. America/New_York); default UTC. */
+  timezone?: string;
   target_mode?: string;
   model?: string;
   auto_approve?: boolean;
@@ -672,6 +674,7 @@ export interface UpdateScheduleRequest {
   schedule_type?: string;
   cron_expr?: string;
   at_time?: string;
+  timezone?: string;
   target_mode?: string;
   model?: string;
   initial_message?: string;
@@ -687,6 +690,7 @@ export interface ScheduleInfo {
   schedule_type: string;
   cron_expr: string;
   at_time: string;
+  timezone: string;
   target_mode: string;
   model: string;
   initial_message: string;

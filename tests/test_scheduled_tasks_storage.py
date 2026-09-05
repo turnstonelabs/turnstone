@@ -51,8 +51,24 @@ class TestScheduledTaskCRUD:
         # project", resolved late at dispatch (mirrors empty model/skill).
         assert result["persona"] == ""
         assert result["project_id"] == ""
+        # timezone defaults to UTC — the zone every cron was evaluated in
+        # before it was stored, so a caller that names none keeps its times.
+        assert result["timezone"] == "UTC"
         assert "created" in result
         assert "updated" in result
+
+    def test_create_with_timezone(self, db):
+        db.create_scheduled_task(**_make_task_kwargs(timezone="America/New_York"))
+        result = db.get_scheduled_task("task_001")
+        assert result is not None
+        assert result["timezone"] == "America/New_York"
+
+    def test_update_timezone(self, db):
+        db.create_scheduled_task(**_make_task_kwargs())
+        assert db.update_scheduled_task("task_001", timezone="Europe/Berlin")
+        updated = db.get_scheduled_task("task_001")
+        assert updated is not None
+        assert updated["timezone"] == "Europe/Berlin"
 
     def test_create_with_persona_and_project(self, db):
         db.create_scheduled_task(**_make_task_kwargs(persona="researcher", project_id="proj_42"))

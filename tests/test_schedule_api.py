@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+from turnstone.console.schedule_timing import cron_names_a_time, next_cron_runs
 from turnstone.console.server import (
     SCHEDULE_MESSAGE_MAX_CHARS,
     SCHEDULE_NAME_MAX_CHARS,
@@ -138,13 +139,86 @@ class TestScheduleAPI:
         assert "next_run" in task
         assert task["next_run"] != ""
 
+    @pytest.mark.parametrize("field", ["model", "enabled", "auto_approve", "timezone", "name"])
+    def test_create_rejects_a_null_field(self, client, field):
+        # A null has no meaning here: read as a value it became bool(None)
+        # or the string "None"; read as "not sent" it would hide a caller's
+        # intent.  It is refused naming the field, and nothing is created.
+        resp = client.post("/v1/api/admin/schedules", json=_cron_payload(**{field: None}))
+        assert resp.status_code == 400
+        assert resp.json()["error"] == f"{field} must not be null"
+        assert client.get("/v1/api/admin/schedules").json()["schedules"] == []
+
+    def test_create_defaults_the_zone_to_utc(self, client):
+        # No zone named = UTC, the meaning every schedule had before the zone
+        # was stored, so an older API client keeps its firing times.
+        resp = client.post("/v1/api/admin/schedules", json=_cron_payload(cron_expr="30 6 * * *"))
+        assert resp.status_code == 200
+        task = resp.json()
+        assert task["timezone"] == "UTC"
+        assert task["next_run"].endswith("T06:30:00")
+
+    def test_create_stores_the_zone_and_computes_next_run_in_it(self, client):
+        # 06:30 in Asia/Kolkata (UTC+05:30, no daylight saving) is 01:00 UTC;
+        # next_run itself stays UTC — the scheduler's due query compares it.
+        resp = client.post(
+            "/v1/api/admin/schedules",
+            json=_cron_payload(cron_expr="30 6 * * *", timezone="Asia/Kolkata"),
+        )
+        assert resp.status_code == 200
+        task = resp.json()
+        assert task["timezone"] == "Asia/Kolkata"
+        assert task["cron_expr"] == "30 6 * * *", "the expression is stored as written"
+        assert task["next_run"].endswith("T01:00:00")
+
+    def test_create_rejects_an_unknown_zone(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules",
+            json=_cron_payload(timezone="Mars/Olympus_Mons"),
+        )
+        assert resp.status_code == 400
+        assert "time zone" in resp.json()["error"]
+
+    def test_create_at_validates_the_zone_too(self, client):
+        # A one-shot ignores the zone, but the row's invariant is one valid
+        # name: a later switch to cron must not inherit a bad zone.
+        resp = client.post("/v1/api/admin/schedules", json=_at_payload(timezone="Not/A_Zone"))
+        assert resp.status_code == 400
+        assert "time zone" in resp.json()["error"]
+
     def test_create_at(self, client):
         resp = client.post("/v1/api/admin/schedules", json=_at_payload())
         assert resp.status_code == 200
         task = resp.json()
         assert task["schedule_type"] == "at"
         assert task["at_time"] == "2099-01-01T00:00:00+00:00"
-        assert task["next_run"] == "2099-01-01T00:00:00+00:00"
+        # next_run is naive UTC for both schedule types.
+        assert task["next_run"] == "2099-01-01T00:00:00"
+
+    def test_create_at_folds_the_offset_into_next_run(self, client, storage):
+        # The due query compares next_run as a string against a naive-UTC
+        # clock, so an offset-bearing at_time kept verbatim would fire hours
+        # late (a "+05:30" sorts as if it were UTC).  at_time stays as sent.
+        resp = client.post(
+            "/v1/api/admin/schedules", json=_at_payload(at_time="2099-01-01T00:00:00+05:30")
+        )
+        assert resp.status_code == 200
+        task = resp.json()
+        assert task["at_time"] == "2099-01-01T00:00:00+05:30"
+        assert task["next_run"] == "2098-12-31T18:30:00"
+        due_ids = [t["task_id"] for t in storage.list_due_tasks("2098-12-31T18:30:00")]
+        assert task["task_id"] in due_ids
+        assert storage.list_due_tasks("2098-12-31T18:29:59") == []
+
+    def test_reenabling_an_at_task_folds_the_offset_too(self, client):
+        created = client.post(
+            "/v1/api/admin/schedules",
+            json=_at_payload(at_time="2099-01-01T00:00:00-05:00", enabled=False),
+        ).json()
+        assert created["next_run"] == ""
+        resp = client.put("/v1/api/admin/schedules/" + created["task_id"], json={"enabled": True})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["next_run"] == "2099-01-01T05:00:00"
 
     def test_create_missing_name(self, client):
         payload = _cron_payload()
@@ -270,6 +344,240 @@ class TestScheduleAPI:
             created_by="",
             next_run="2099-01-01T09:00:00",
         )
+
+    def test_update_keeps_a_schedule_with_an_unresolvable_zone_editable(self, client, storage):
+        # The shelf resends the stored zone, so a zone this host can no
+        # longer resolve must not block edits to other fields; re-enabling or
+        # changing the timing is refused loudly rather than re-enabled with
+        # no next run, and naming a zone the host resolves repairs it.
+        storage.create_scheduled_task(
+            task_id="lost",
+            name="Lost",
+            description="",
+            schedule_type="cron",
+            cron_expr="0 9 * * *",
+            at_time="",
+            target_mode="auto",
+            model="",
+            initial_message="go",
+            auto_approve=False,
+            auto_approve_tools=[],
+            created_by="test-admin",
+            next_run="",
+            timezone="Nowhere/Land",
+        )
+        storage.update_scheduled_task("lost", enabled=False)
+        # The shelf resends every timing field on any edit.
+        resp = client.put(
+            "/v1/api/admin/schedules/lost",
+            json={
+                "schedule_type": "cron",
+                "cron_expr": "0 9 * * *",
+                "at_time": "",
+                "timezone": "Nowhere/Land",
+                "description": "still editable",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] == "still editable"
+        assert resp.json()["enabled"] is False
+        for body in ({"enabled": True}, {"cron_expr": "0 7 * * *"}):
+            resp = client.put("/v1/api/admin/schedules/lost", json=body)
+            assert resp.status_code == 400, body
+            assert "time zone" in resp.json()["error"]
+        resp = client.put(
+            "/v1/api/admin/schedules/lost",
+            json={"timezone": "Asia/Kolkata", "enabled": True},
+        )
+        assert resp.status_code == 200, resp.text
+        task = resp.json()
+        assert task["enabled"] is True
+        assert task["next_run"].endswith("T03:30:00"), "09:00 in Kolkata is 03:30 UTC"
+
+    def test_reenabling_a_cron_that_can_never_fire_is_refused(self, client, storage):
+        # A row from before the create-time refusal: re-enabling it would
+        # show it enabled with no next run, so it is refused with the reason.
+        storage.create_scheduled_task(
+            task_id="feb30",
+            name="Never",
+            description="",
+            schedule_type="cron",
+            cron_expr="0 0 30 2 *",
+            at_time="",
+            target_mode="auto",
+            model="",
+            initial_message="go",
+            auto_approve=False,
+            auto_approve_tools=[],
+            created_by="test-admin",
+            next_run="",
+        )
+        storage.update_scheduled_task("feb30", enabled=False)
+        resp = client.put("/v1/api/admin/schedules/feb30", json={"enabled": True})
+        assert resp.status_code == 400
+        assert "calendar" in resp.json()["error"]
+        assert client.get("/v1/api/admin/schedules/feb30").json()["enabled"] is False
+
+    @staticmethod
+    def _stored(storage, task_id, **fields):
+        row = {
+            "task_id": task_id,
+            "name": task_id,
+            "description": "",
+            "schedule_type": "cron",
+            "cron_expr": "0 9 * * *",
+            "at_time": "",
+            "target_mode": "auto",
+            "model": "",
+            "initial_message": "go",
+            "auto_approve": False,
+            "auto_approve_tools": [],
+            "created_by": "test-admin",
+            "next_run": "2099-01-01T09:00:00",
+        }
+        row.update(fields)
+        storage.create_scheduled_task(**row)
+
+    def test_update_resent_enabled_flag_is_not_a_toggle(self, client, storage):
+        # The shelf resends enabled on every edit.  An ENABLED schedule whose
+        # zone this host can no longer resolve must still take a description
+        # edit carrying enabled: true; disabling it needs no validation; a
+        # real re-enable is the transition that re-validates, and is refused.
+        self._stored(storage, "live", timezone="Nowhere/Land", next_run="")
+        resp = client.put(
+            "/v1/api/admin/schedules/live",
+            json={"enabled": True, "description": "edited while enabled"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] == "edited while enabled"
+        assert (
+            client.put("/v1/api/admin/schedules/live", json={"enabled": False}).status_code == 200
+        )
+        resp = client.put("/v1/api/admin/schedules/live", json={"enabled": True})
+        assert resp.status_code == 400
+        assert "time zone" in resp.json()["error"]
+
+    def test_update_renaming_a_missed_one_shot_is_allowed(self, client, storage):
+        # A one-shot whose time passed without dispatching (no reachable
+        # node, say) is still enabled; renaming it from the shelf resends its
+        # timing and enabled flag unchanged, which is not a re-enable.
+        self._stored(
+            storage,
+            "missed",
+            schedule_type="at",
+            cron_expr="",
+            at_time="2020-01-01T12:00:00+00:00",
+            next_run="2020-01-01T12:00:00",
+        )
+        resp = client.put(
+            "/v1/api/admin/schedules/missed",
+            json={
+                "name": "renamed",
+                "schedule_type": "at",
+                "cron_expr": "",
+                "at_time": "2020-01-01T12:00:00+00:00",
+                "enabled": True,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["name"] == "renamed"
+        assert resp.json()["next_run"] == "2020-01-01T12:00:00", "still pending, not advanced"
+
+    def test_update_resent_at_time_is_compared_as_an_instant(self, client, storage):
+        # The shelf re-emits at_time as "+00:00" at minute precision; a
+        # one-shot stored with another spelling of the same instant is not
+        # changed by that, and keeps its spelling.
+        self._stored(
+            storage,
+            "offset",
+            schedule_type="at",
+            cron_expr="",
+            at_time="2020-01-01T12:00:00+05:30",
+            next_run="2020-01-01T06:30:00",
+        )
+        resp = client.put(
+            "/v1/api/admin/schedules/offset",
+            json={
+                "name": "renamed",
+                "schedule_type": "at",
+                "cron_expr": "",
+                "at_time": "2020-01-01T06:30:00+00:00",
+                "enabled": True,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task = resp.json()
+        assert task["at_time"] == "2020-01-01T12:00:00+05:30", "kept as submitted"
+        assert task["next_run"] == "2020-01-01T06:30:00"
+
+    def test_update_name_only_leaves_an_overdue_next_run_pending(self, client, storage):
+        # An overdue next_run is a firing the scheduler still owes; a name
+        # edit (with the shelf's resent flag) must not advance past it.
+        self._stored(storage, "overdue", cron_expr="0 2 * * *", next_run="2020-01-01T02:00:00")
+        resp = client.put(
+            "/v1/api/admin/schedules/overdue", json={"name": "renamed", "enabled": True}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["next_run"] == "2020-01-01T02:00:00"
+
+    def test_update_zone_recomputes_next_run(self, client):
+        created = client.post(
+            "/v1/api/admin/schedules", json=_cron_payload(cron_expr="30 6 * * *")
+        ).json()
+        assert created["next_run"].endswith("T06:30:00")
+        resp = client.put(
+            "/v1/api/admin/schedules/" + created["task_id"],
+            json={"timezone": "Asia/Kolkata"},
+        )
+        assert resp.status_code == 200, resp.text
+        task = resp.json()
+        assert task["timezone"] == "Asia/Kolkata"
+        assert task["next_run"].endswith("T01:00:00"), "the same wall-clock time, in the zone"
+
+    def test_update_rejects_an_unknown_zone_and_keeps_the_row(self, client):
+        created = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()
+        resp = client.put(
+            "/v1/api/admin/schedules/" + created["task_id"],
+            json={"timezone": "Nowhere/Land"},
+        )
+        assert resp.status_code == 400
+        assert "time zone" in resp.json()["error"]
+        row = client.get("/v1/api/admin/schedules/" + created["task_id"]).json()
+        assert row["timezone"] == "UTC"
+        assert row["next_run"] == created["next_run"]
+
+    @pytest.mark.parametrize(
+        "field", ["name", "enabled", "auto_approve", "cron_expr", "timezone", "notify_targets"]
+    )
+    def test_update_rejects_a_null_field_and_changes_nothing(self, client, field):
+        # The request schema advertises every field as nullable and the SDK
+        # forwards a caller's None, but a null has no meaning: as a value it
+        # disabled the schedule or stored "None"; as "not sent" it would make
+        # an intent to clear auto-approval a silent no-op.  Refused, whole.
+        created = client.post(
+            "/v1/api/admin/schedules",
+            json=_cron_payload(cron_expr="30 6 * * *", timezone="Asia/Kolkata"),
+        ).json()
+        resp = client.put(
+            "/v1/api/admin/schedules/" + created["task_id"],
+            json={field: None, "description": "not applied either"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == f"{field} must not be null"
+        row = client.get("/v1/api/admin/schedules/" + created["task_id"]).json()
+        assert row == created
+
+    def test_update_blank_zone_is_refused(self, client):
+        # A blank zone means UTC on create, where nothing is lost; on update
+        # it would silently re-zone the schedule, so it is refused.
+        created = client.post(
+            "/v1/api/admin/schedules",
+            json=_cron_payload(cron_expr="30 6 * * *", timezone="Asia/Kolkata"),
+        ).json()
+        resp = client.put("/v1/api/admin/schedules/" + created["task_id"], json={"timezone": ""})
+        assert resp.status_code == 400
+        assert "blank" in resp.json()["error"]
+        assert client.get("/v1/api/admin/schedules/" + created["task_id"]).json() == created
 
     def test_update_assign_project_heals_empty_created_by(self, client, storage):
         # Assigning a project to an orphaned schedule adopts the editing admin
@@ -582,15 +890,57 @@ class TestPreviewSchedule:
         assert "calendar" in data["error"]
         assert data["next"] == []
 
-    def test_create_with_impossible_date_cron_does_not_500(self, client):
-        """_compute_next_run shares the guard: creating such a schedule must
-        not crash (next_run computes as empty)."""
+    def test_create_with_impossible_date_cron_is_refused(self, client):
+        """croniter.is_valid passes '0 0 31 4 *' but no date ever matches:
+        a schedule that can never fire is refused, not stored dormant."""
         resp = client.post(
             "/v1/api/admin/schedules",
             json=_cron_payload(cron_expr="0 0 31 4 *"),
         )
+        assert resp.status_code == 400
+        assert "calendar" in resp.json()["error"]
+        assert client.get("/v1/api/admin/schedules").json()["schedules"] == []
+
+    def test_cron_is_evaluated_in_the_named_zone(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "cron", "cron_expr": "30 6 * * *", "timezone": "Asia/Kolkata"},
+        )
+        data = resp.json()
+        assert data["valid"] is True
+        # 06:30 IST every day is 01:00 UTC; the read-out still gets UTC
+        # instants and converts to the browser's zone itself.
+        assert all(t.endswith("T01:00:00+00:00") for t in data["next"])
+
+    def test_unknown_zone_is_a_preview_outcome(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "cron", "cron_expr": "0 6 * * *", "timezone": "Nowhere/Land"},
+        )
         assert resp.status_code == 200
-        assert resp.json()["next_run"] == ""
+        data = resp.json()
+        assert data["valid"] is False
+        assert "time zone" in data["error"]
+        assert data["next"] == []
+
+    def test_null_field_is_a_preview_outcome(self, client):
+        # The same rule as create and update, in the preview's own shape.
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "cron", "cron_expr": "0 6 * * *", "timezone": None},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["valid"] is False
+        assert data["error"] == "timezone must not be null"
+        assert data["next"] == []
+
+    def test_blank_zone_previews_in_utc(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "cron", "cron_expr": "0 6 * * *", "timezone": ""},
+        )
+        assert all(t.endswith("T06:00:00+00:00") for t in resp.json()["next"])
 
     def test_cron_next_runs_carry_a_utc_offset(self, client):
         """next[] must be one shape: the 'at' branch echoes offset-bearing
@@ -600,6 +950,192 @@ class TestPreviewSchedule:
             json={"schedule_type": "cron", "cron_expr": "0 6 * * *"},
         )
         assert all(t.endswith("+00:00") for t in resp.json()["next"])
+
+
+class TestNextCronRunsInZone:
+    """next_cron_runs walks the cron in the schedule's zone and reports UTC.
+
+    These pin the three failures a client-side local-to-UTC conversion has
+    (the reason the zone is stored instead): an hour's drift across a
+    daylight-saving change, and a weekly day that shifts near midnight.
+    """
+
+    @staticmethod
+    def _start(iso: str):
+        from datetime import datetime
+
+        return datetime.fromisoformat(iso)
+
+    def test_utc_is_the_default_and_the_old_behaviour(self) -> None:
+        runs = next_cron_runs("0 6 * * *", 2, start=self._start("2026-01-01T00:00:00+00:00"))
+        assert runs == ["2026-01-01T06:00:00", "2026-01-02T06:00:00"]
+
+    def test_wall_clock_time_holds_across_spring_forward(self) -> None:
+        # New York moves to daylight time on 2026-03-08 at 02:00, so 02:30
+        # local is 07:30 UTC before and 06:30 UTC after; the removed 02:30 on
+        # the change day fires at the first instant after the gap (03:00
+        # EDT).  A UTC cron fixed at either offset would be an hour off for
+        # half the year.
+        runs = next_cron_runs(
+            "30 2 * * *",
+            3,
+            "America/New_York",
+            start=self._start("2026-03-06T12:00:00+00:00"),
+        )
+        assert runs == ["2026-03-07T07:30:00", "2026-03-08T07:00:00", "2026-03-09T06:30:00"]
+
+    def test_wall_clock_time_holds_across_fall_back(self) -> None:
+        # Daylight time ends 2026-11-01 at 02:00: 04:00 local is 08:00 UTC
+        # before and 09:00 UTC after.
+        runs = next_cron_runs(
+            "0 4 * * *",
+            2,
+            "America/New_York",
+            start=self._start("2026-10-30T12:00:00+00:00"),
+        )
+        assert runs == ["2026-10-31T08:00:00", "2026-11-01T09:00:00"]
+
+    def test_a_fixed_time_fires_once_on_the_fall_back_day(self) -> None:
+        # 01:30 exists twice on 2026-11-01 (EDT, then EST an hour later);
+        # croniter visits both, and a time of day is de-duplicated to one.
+        runs = next_cron_runs(
+            "30 1 * * *",
+            3,
+            "America/New_York",
+            start=self._start("2026-10-31T12:00:00+00:00"),
+        )
+        assert runs == ["2026-11-01T05:30:00", "2026-11-02T06:30:00", "2026-11-03T06:30:00"]
+
+    def test_interleaved_minute_values_each_fire_once(self) -> None:
+        # 01:00 and 01:30 alternate across the two offsets (01:00 EDT, 01:30
+        # EDT, 01:00 EST, 01:30 EST): the second pass of each is skipped, so
+        # neither adjacency nor memory of the last firing decides it.
+        runs = next_cron_runs(
+            "0,30 1 * * *",
+            4,
+            "America/New_York",
+            start=self._start("2026-11-01T04:00:00+00:00"),
+        )
+        assert runs == [
+            "2026-11-01T05:00:00",
+            "2026-11-01T05:30:00",
+            "2026-11-02T06:00:00",
+            "2026-11-02T06:30:00",
+        ]
+
+    def test_a_range_names_times_too(self) -> None:
+        # "0 1-2" is 01:00 and 02:00; on the fall-back day the repeated
+        # 01:00 fires once and 02:00 (which exists only in standard time)
+        # once.
+        runs = next_cron_runs(
+            "0 1-2 * * *",
+            3,
+            "America/New_York",
+            start=self._start("2026-11-01T03:00:00+00:00"),
+        )
+        assert runs == ["2026-11-01T05:00:00", "2026-11-01T07:00:00", "2026-11-02T06:00:00"]
+
+    def test_shorthand_names_a_time_too(self) -> None:
+        # Havana's daylight time ends 2026-11-01 at 01:00, so midnight
+        # repeats; "@daily" is the same time of day as "0 0 * * *".
+        runs = next_cron_runs(
+            "@daily",
+            3,
+            "America/Havana",
+            start=self._start("2026-11-01T02:00:00+00:00"),
+        )
+        assert runs == ["2026-11-01T04:00:00", "2026-11-02T05:00:00", "2026-11-03T05:00:00"]
+
+    def test_the_scheduler_advance_skips_the_repeated_hour(self) -> None:
+        # The scheduler computes the next run seconds after a firing: from
+        # 01:30 EDT the next 01:30 is tomorrow's, not the EST one an hour on.
+        runs = next_cron_runs(
+            "30 1 * * *",
+            1,
+            "America/New_York",
+            start=self._start("2026-11-01T05:30:07+00:00"),
+        )
+        assert runs == ["2026-11-02T06:30:00"]
+
+    def test_a_cadence_keeps_firing_through_the_repeated_hour(self) -> None:
+        # The repeated hour is real time: every thirty minutes stays every
+        # thirty minutes, so the local 01:00-02:00 hour fires four times.
+        runs = next_cron_runs(
+            "*/30 * * * *",
+            5,
+            "America/New_York",
+            start=self._start("2026-11-01T04:50:00+00:00"),
+        )
+        assert runs == [
+            "2026-11-01T05:00:00",
+            "2026-11-01T05:30:00",
+            "2026-11-01T06:00:00",
+            "2026-11-01T06:30:00",
+            "2026-11-01T07:00:00",
+        ]
+
+    def test_two_fixed_times_stay_distinct_across_spring_forward(self) -> None:
+        # The removed 02:30 fires at 03:00 EDT and the real 03:30 follows:
+        # different wall-clock times, so nothing is mistaken for a repeat.
+        runs = next_cron_runs(
+            "30 2,3 * * *",
+            3,
+            "America/New_York",
+            start=self._start("2026-03-08T05:00:00+00:00"),
+        )
+        assert runs == ["2026-03-08T07:00:00", "2026-03-08T07:30:00", "2026-03-09T06:30:00"]
+
+    @pytest.mark.parametrize(
+        ("expr", "names_a_time"),
+        [
+            ("30 1 * * *", True),
+            ("0 9,17 * * 1-5", True),
+            ("*/15 * * * *", False),
+            ("0 */4 * * *", False),
+            ("0-59/15 1 * * *", False),
+            ("30 * * * *", False),
+            ("@daily", True),
+            ("@MIDNIGHT", True),
+            ("@weekly", True),
+            ("@hourly", False),
+            ("0 1-2 * * *", True),
+            ("0-30 1 * * *", True),
+            ("0 1-5/2 * * *", False),
+        ],
+    )
+    def test_cron_names_a_time(self, expr: str, names_a_time: bool) -> None:
+        assert cron_names_a_time(expr) is names_a_time
+
+    def test_weekly_day_is_the_local_day(self) -> None:
+        # Monday 00:30 in Auckland is Sunday in UTC — 12:30 under standard
+        # time (+12) and 11:30 once daylight time starts on 2026-09-27 (+13).
+        # A UTC cron would have to name Sunday and pick one of the two hours.
+        runs = next_cron_runs(
+            "30 0 * * 1",
+            4,
+            "Pacific/Auckland",
+            start=self._start("2026-09-04T00:00:00+00:00"),
+        )
+        assert runs == [
+            "2026-09-06T12:30:00",
+            "2026-09-13T12:30:00",
+            "2026-09-20T12:30:00",
+            "2026-09-27T11:30:00",
+        ]
+
+    def test_impossible_date_is_none_in_any_zone(self) -> None:
+        assert next_cron_runs("0 0 30 2 *", 1, "Europe/Berlin") is None
+
+    def test_unparsable_expression_is_none_not_an_exception(self) -> None:
+        # A stored expression this croniter no longer parses is the
+        # scheduler's case too: disabled with the reason, not raised.
+        assert next_cron_runs("not a cron", 1) is None
+
+    def test_unresolvable_zone_is_none_not_an_exception(self) -> None:
+        # A stored zone the host can no longer resolve is the scheduler's
+        # case (requests validate first): the walk must retire the schedule,
+        # not raise through the tick.
+        assert next_cron_runs("0 6 * * *", 1, "Nowhere/Land") is None
 
 
 def test_message_cap_is_mirrored_by_the_console_ui() -> None:
