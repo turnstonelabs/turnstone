@@ -15099,6 +15099,12 @@
             "title": "Resume Ws",
             "type": "string"
           },
+          "resume_ws_exact": {
+            "default": false,
+            "description": "Require an exact source ID in resume_ws; disable alias and prefix resolution",
+            "title": "Resume Ws Exact",
+            "type": "boolean"
+          },
           "skill": {
             "default": "",
             "description": "Skill name (replaces default skills)",

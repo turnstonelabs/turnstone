@@ -66,6 +66,7 @@ def _make_bot() -> tuple[object, MagicMock, MagicMock]:
 
     router = MagicMock()
     router.get_or_create_workstream = AsyncMock(return_value=("ws-1", True))
+    router.get_live_workstream_ids = AsyncMock(side_effect=lambda ws_ids: set(ws_ids))
     router.send_message = AsyncMock()
     router.send_approval = AsyncMock()
     router.get_node_url = AsyncMock(return_value="http://localhost:8080")
@@ -99,6 +100,7 @@ def _make_bot() -> tuple[object, MagicMock, MagicMock]:
             storage=storage,
         )
 
+    bot._sse_listener = AsyncMock()  # Subscription behavior is tested separately.
     bot.router = router  # type: ignore[attr-defined]
     bot._client = client  # type: ignore[attr-defined]
 
@@ -277,7 +279,7 @@ class TestArchiveSession:
         _run(bot._archive_session("C1", "U1", "ws-old", "1000000.000001"))  # type: ignore[attr-defined]
 
         router.delete_route.assert_awaited_once_with(  # type: ignore[attr-defined]
-            "slack", "C1:U1:1000000.000001"
+            "slack", "C1:U1:1000000.000001", expected_ws_id="ws-old"
         )
         router.close_workstream.assert_awaited_once_with("ws-old")  # type: ignore[attr-defined]
         assert ("C1", "U1") not in bot._channel_sessions  # type: ignore[attr-defined]
@@ -836,6 +838,7 @@ class TestWsEventDispatch:
                 server_url="http://localhost:8080",
                 storage=storage,
             )
+        bot._sse_listener = AsyncMock()  # Subscription behavior is tested separately.
         bot.router = router  # type: ignore[attr-defined]
         bot._client = client  # type: ignore[attr-defined]
         bot.storage = None  # type: ignore[attr-defined]
@@ -914,6 +917,7 @@ class TestWsEventDispatch:
             ),
         ):
             bot = TurnstoneSlackBot(config, server_url="http://localhost:8080", storage=storage)
+        bot._sse_listener = AsyncMock()  # Subscription behavior is tested separately.
         bot.router = router  # type: ignore[attr-defined]
         bot._client = client  # type: ignore[attr-defined]
         bot.storage = None  # type: ignore[attr-defined]

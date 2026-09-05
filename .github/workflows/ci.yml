@@ -55,7 +55,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
-      - run: pip install -e ".[test]"
+      - run: pip install -e ".[test,discord]"
       # -v lists each test id as it starts (pytest prints the nodeid at
       # logstart), so a hang names the culprit on the last line instead of
       # riding the job timeout with only a trail of "..." dots.
@@ -91,7 +91,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
-      - run: pip install -e ".[test]"
+      - run: pip install -e ".[test,discord]"
       - run: pytest tests/ -m "not live and not e2e_recovery" --storage-backend=postgresql -v
         env:
           TURNSTONE_TEST_PG_URL: postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test

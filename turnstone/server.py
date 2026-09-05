@@ -2552,6 +2552,11 @@ async def _interactive_create_validate_request(
     if requested_ws_id and not _VALID_WS_ID.match(requested_ws_id):
         return JSONResponse({"error": "invalid ws_id format"}, status_code=400)
     resume_ws_id = body.get("resume_ws", "") or ""
+    resume_ws_exact = body.get("resume_ws_exact", False)
+    if not isinstance(resume_ws_exact, bool):
+        return JSONResponse({"error": "resume_ws_exact must be a boolean"}, status_code=400)
+    if resume_ws_exact and (not isinstance(resume_ws_id, str) or not resume_ws_id):
+        return JSONResponse({"error": "resume_ws_exact requires resume_ws"}, status_code=400)
     if uploaded_files and resume_ws_id:
         return JSONResponse(
             {"error": "attachments cannot be combined with resume_ws"},
@@ -2629,15 +2634,16 @@ async def _interactive_create_validate_request(
         # through alias-first resolution: an unrelated row may legally carry
         # that 32-hex string as its alias, and a routing proxy has already
         # canonicalized saved aliases before forwarding the request.  Retain
-        # support for 32-hex aliases only when no exact row exists.
+        # support for 32-hex aliases only when no exact row exists and the
+        # caller has not required an exact identity (as channel recovery does).
         _exact_source = (
-            _rstorage.get_workstream(resume_ws_id) if _VALID_WS_ID.fullmatch(resume_ws_id) else None
+            _rstorage.get_workstream(resume_ws_id)
+            if resume_ws_exact or _VALID_WS_ID.fullmatch(resume_ws_id)
+            else None
         )
-        _canonical = (
-            resume_ws_id
-            if _exact_source is not None
-            else _rstorage.resolve_workstream(resume_ws_id)
-        )
+        _canonical = resume_ws_id if _exact_source is not None else None
+        if _canonical is None and not resume_ws_exact:
+            _canonical = _rstorage.resolve_workstream(resume_ws_id)
         _src_row = (
             _rstorage.ensure_workstream_incarnation_snapshot(_canonical) if _canonical else None
         )

@@ -1080,7 +1080,9 @@ class StorageBackend(Protocol):
         reservation. An existing row returns ``False``; generated-ID callers
         may draw another ID while caller-selected IDs surface the collision.
         Hard deletion releases the ID for later reuse after removing the
-        workstream and its owned state in the same transaction.
+        workstream and its owned state in the same transaction, unless a
+        retained channel route still references it. Such references also
+        return ``False`` to prevent redirecting a channel into a new incarnation.
 
         ``kind`` accepts a ``WorkstreamKind`` member or its raw string value
         (``"interactive"`` / ``"coordinator"``); the storage edge validates
@@ -1554,9 +1556,21 @@ class StorageBackend(Protocol):
     # -- Channel routing -------------------------------------------------------
 
     def create_channel_route(
-        self, channel_type: str, channel_id: str, ws_id: str, node_id: str = ""
-    ) -> None:
-        """Map a channel/thread to a workstream. No-op if exists."""
+        self,
+        channel_type: str,
+        channel_id: str,
+        ws_id: str,
+        node_id: str = "",
+        *,
+        channel_user_id: str = "",
+    ) -> bool:
+        """Map a channel/thread and its external owner. Return whether inserted."""
+        ...
+
+    def replace_channel_route(
+        self, channel_type: str, channel_id: str, expected_ws_id: str, ws_id: str
+    ) -> bool:
+        """Atomically replace the expected workstream, preserving owner and creation time."""
         ...
 
     def get_channel_route(self, channel_type: str, channel_id: str) -> dict[str, str] | None:
@@ -1571,8 +1585,10 @@ class StorageBackend(Protocol):
         """List all routes for a channel type, ordered by created DESC."""
         ...
 
-    def delete_channel_route(self, channel_type: str, channel_id: str) -> bool:
-        """Remove a channel route. Returns True if existed."""
+    def delete_channel_route(
+        self, channel_type: str, channel_id: str, *, expected_ws_id: str | None = None
+    ) -> bool:
+        """Remove a route, optionally only if its workstream still matches. Return whether removed."""
         ...
 
     # -- Scheduled tasks -------------------------------------------------------

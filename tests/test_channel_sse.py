@@ -96,19 +96,19 @@ def _valid_event_data(ws_id: str = "ws-1") -> str:
 
 
 # ---------------------------------------------------------------------------
-# 404 → on_stale + exit
+# 404 → on_unavailable + exit
 # ---------------------------------------------------------------------------
 
 
-class TestStaleRoute:
-    def test_404_calls_on_stale_and_returns(self, monkeypatch, _fast_sleep):
+class TestUnavailableStream:
+    def test_404_calls_on_unavailable_and_returns(self, monkeypatch, _fast_sleep):
         from turnstone.channels import _sse
 
         queue = [_FakeEventSource(status_code=404, events=[])]
         fake_connect = _FakeConnect(queue)
         monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
 
-        on_stale = AsyncMock()
+        on_unavailable = AsyncMock()
         on_event = AsyncMock()
 
         async def node_url_fn(ws_id: str) -> str:
@@ -122,26 +122,26 @@ class TestStaleRoute:
                 node_url_fn=node_url_fn,
                 token_factory=None,
                 on_event=on_event,
-                on_stale=on_stale,
+                on_unavailable=on_unavailable,
             )
         )
 
-        on_stale.assert_awaited_once()
+        on_unavailable.assert_awaited_once()
         on_event.assert_not_awaited()
         # No reconnect after 404.
         assert fake_connect.call_count == 1
         assert fake_connect.calls[0][1]["params"] == {"user_turn": 1}
         assert _fast_sleep == []
 
-    def test_on_stale_exception_still_exits(self, monkeypatch, _fast_sleep):
-        """If on_stale raises, the loop must not reconnect."""
+    def test_on_unavailable_exception_still_exits(self, monkeypatch, _fast_sleep):
+        """If on_unavailable raises, the loop must not reconnect."""
         from turnstone.channels import _sse
 
         queue = [_FakeEventSource(status_code=404, events=[])]
         fake_connect = _FakeConnect(queue)
         monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
 
-        on_stale = AsyncMock(side_effect=RuntimeError("storage down"))
+        on_unavailable = AsyncMock(side_effect=RuntimeError("storage down"))
 
         async def node_url_fn(ws_id: str) -> str:
             return "http://node"
@@ -154,11 +154,11 @@ class TestStaleRoute:
                 node_url_fn=node_url_fn,
                 token_factory=None,
                 on_event=AsyncMock(),
-                on_stale=on_stale,
+                on_unavailable=on_unavailable,
             )
         )
 
-        on_stale.assert_awaited_once()
+        on_unavailable.assert_awaited_once()
         # Still a single connect — no livelock.
         assert fake_connect.call_count == 1
 
@@ -192,7 +192,7 @@ class TestBackoff:
                     node_url_fn=node_url_fn,
                     token_factory=None,
                     on_event=AsyncMock(),
-                    on_stale=AsyncMock(),
+                    on_unavailable=AsyncMock(),
                 )
             )
 
@@ -232,7 +232,7 @@ class TestBackoff:
                     node_url_fn=node_url_fn,
                     token_factory=None,
                     on_event=on_event,
-                    on_stale=AsyncMock(),
+                    on_unavailable=AsyncMock(),
                 )
             )
 
@@ -274,7 +274,7 @@ class TestEventDispatch:
                     node_url_fn=node_url_fn,
                     token_factory=None,
                     on_event=on_event,
-                    on_stale=AsyncMock(),
+                    on_unavailable=AsyncMock(),
                 )
             )
 
@@ -304,7 +304,7 @@ class TestEventDispatch:
                     node_url_fn=node_url_fn,
                     token_factory=None,
                     on_event=on_event,
-                    on_stale=AsyncMock(),
+                    on_unavailable=AsyncMock(),
                 )
             )
 
@@ -318,6 +318,40 @@ class TestEventDispatch:
 
 
 class TestTokenFactory:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("rotating", [False, True])
+    async def test_real_sdk_preserves_auth_headers(self, rotating):
+        from turnstone.channels._sse import run_sse_stream
+
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(404)
+
+        on_unavailable = AsyncMock()
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(respond),
+            headers={"Authorization": "Bearer static-token"},
+        ) as client:
+            await asyncio.wait_for(
+                run_sse_stream(
+                    http_client=client,
+                    log_prefix="test",
+                    ws_id="ws-1",
+                    node_url_fn=AsyncMock(return_value="http://node.example"),
+                    token_factory=(lambda: "rotating-token") if rotating else None,
+                    on_event=AsyncMock(),
+                    on_unavailable=on_unavailable,
+                ),
+                timeout=2,
+            )
+        assert len(requests) == 1
+        expected = "rotating-token" if rotating else "static-token"
+        assert requests[0].headers["Authorization"] == f"Bearer {expected}"
+        assert requests[0].headers["Accept"] == "text/event-stream"
+        on_unavailable.assert_awaited_once()
+
     def test_header_refreshed_per_connection(self, monkeypatch, _fast_sleep):
         """token_factory is called once per reconnect so rotating service
         JWTs stay fresh."""
@@ -350,7 +384,7 @@ class TestTokenFactory:
                     node_url_fn=node_url_fn,
                     token_factory=factory,
                     on_event=AsyncMock(),
-                    on_stale=AsyncMock(),
+                    on_unavailable=AsyncMock(),
                 )
             )
 
@@ -391,7 +425,7 @@ class TestTransportErrors:
                     node_url_fn=node_url_fn,
                     token_factory=None,
                     on_event=AsyncMock(),
-                    on_stale=AsyncMock(),
+                    on_unavailable=AsyncMock(),
                 )
             )
 

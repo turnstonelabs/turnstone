@@ -365,7 +365,7 @@ class TurnstoneSlackBot:
         log.info("slack.stopped")
 
     async def _recover_routes(self) -> None:
-        """Re-subscribe to SSE streams for existing slack routes."""
+        """Restore all associations, then subscribe only to already-live sessions."""
         routes = await asyncio.to_thread(
             self.storage.list_channel_routes_by_type,
             "slack",
@@ -377,8 +377,6 @@ class TurnstoneSlackBot:
             ws_id = route["ws_id"]
             channel_id = route["channel_id"]
 
-            await self.subscribe_ws(ws_id, channel_id)
-
             slack_route = SlackRoute.parse(channel_id)
             if slack_route.channel and slack_route.user_id and slack_route.thread_ts:
                 key = (slack_route.channel, slack_route.user_id)
@@ -387,9 +385,15 @@ class TurnstoneSlackBot:
                 if existing is None or _parse_ts(slack_route.thread_ts) > _parse_ts(existing[1]):
                     latest_sessions[key] = (ws_id, slack_route.thread_ts)
 
-            log.info("slack.route_recovered", ws_id=ws_id, channel_id=channel_id)
-
         self._channel_sessions = latest_sessions
+
+        live_ids = await self.router.get_live_workstream_ids(route["ws_id"] for route in routes)
+        for route in routes:
+            if route["ws_id"] in live_ids:
+                await self.subscribe_ws(route["ws_id"], route["channel_id"])
+                log.info(
+                    "slack.route_recovered", ws_id=route["ws_id"], channel_id=route["channel_id"]
+                )
 
         for (slack_channel, user_id), (ws_id, thread_ts) in self._channel_sessions.items():
             log.info(
@@ -448,12 +452,16 @@ class TurnstoneSlackBot:
         existing = self._channel_sessions.get((slack_channel, user_id))
         if existing is not None:
             old_ws_id, old_thread_ts = existing
-            await self._archive_session(
-                slack_channel,
-                user_id,
-                old_ws_id,
-                old_thread_ts,
-            )
+            try:
+                await self._archive_session(slack_channel, user_id, old_ws_id, old_thread_ts)
+            except Exception:
+                log.warning("slack.session_archive_failed", exc_info=True)
+                await self._client.chat_postEphemeral(
+                    channel=slack_channel,
+                    user=user_id,
+                    text="I couldn't close the previous session. Please try again.",
+                )
+                return
 
         opener = await self._client.chat_postMessage(
             channel=slack_channel,
@@ -690,48 +698,32 @@ class TurnstoneSlackBot:
         ws_id: str,
         thread_ts: str,
     ) -> None:
-        """Mark the old session as archived and unsubscribe."""
+        """Close the selected session without removing a concurrent replacement."""
+        route = SlackRoute(channel=slack_channel, user_id=user_id, thread_ts=thread_ts)
+        await self.router.close_workstream(ws_id)
+        if not await self.router.delete_route("slack", route.to_channel_id(), expected_ws_id=ws_id):
+            current = await asyncio.to_thread(
+                self.storage.get_channel_route, "slack", route.to_channel_id()
+            )
+            key = (slack_channel, user_id)
+            if self._channel_sessions.get(key) == (ws_id, thread_ts):
+                if current is None:
+                    self._channel_sessions.pop(key, None)
+                else:
+                    self._channel_sessions[key] = (current["ws_id"], thread_ts)
+            raise RuntimeError("Slack session changed; retry closing it")
+        if self._channel_sessions.get((slack_channel, user_id)) == (ws_id, thread_ts):
+            self._channel_sessions.pop((slack_channel, user_id), None)
+        await self.unsubscribe_ws(ws_id)
         try:
             await self._client.chat_postMessage(
                 channel=slack_channel,
                 thread_ts=thread_ts,
-                text="_This session has been archived. A new one has started._",
+                text="_This session has been archived._",
             )
         except Exception:
             log.debug("slack.archive_session.notify_failed", ws_id=ws_id, exc_info=True)
-
-        route = SlackRoute(
-            channel=slack_channel,
-            user_id=user_id,
-            thread_ts=thread_ts,
-        )
-
-        try:
-            await self.router.delete_route("slack", route.to_channel_id())
-            log.info(
-                "slack.archived_route_deleted",
-                ws_id=ws_id,
-                channel_id=route.to_channel_id(),
-            )
-        except Exception:
-            log.exception(
-                "slack.archived_route_delete_failed",
-                ws_id=ws_id,
-                channel_id=route.to_channel_id(),
-            )
-
-        await self.unsubscribe_ws(ws_id)
-        # close_workstream is the only path that drops the ws_id from
-        # ChannelRouter._node_urls; skipping it leaks one cache entry per
-        # archived session over long bot uptime.
-        await self.router.close_workstream(ws_id)
-        self._channel_sessions.pop((slack_channel, user_id), None)
-        log.info(
-            "slack.session_archived",
-            ws_id=ws_id,
-            channel=slack_channel,
-            user=user_id,
-        )
+        log.info("slack.session_archived", ws_id=ws_id, channel=slack_channel, user=user_id)
 
     async def _on_message(self, event: dict[str, Any], say: Any) -> None:
         """Route messages — thread-only in channels, free in DMs."""
@@ -831,6 +823,22 @@ class TurnstoneSlackBot:
             return
 
         try:
+            route = SlackRoute(channel=channel_id, user_id=user_id, thread_ts=thread_ts)
+            recovered_ws_id, _is_new = await self.router.get_or_create_workstream(
+                channel_type="slack",
+                channel_id=route.to_channel_id(),
+                name=f"slack-{user_id[:8]}",
+                client_type="chat",
+                require_existing=True,
+            )
+            if recovered_ws_id != ws_id:
+                await self.unsubscribe_ws(ws_id)
+            current = self._channel_sessions.get((channel_id, user_id))
+            if current is None or current[1] != thread_ts:
+                raise RuntimeError("Slack session changed; retry your message")
+            ws_id = recovered_ws_id
+            self._channel_sessions[(channel_id, user_id)] = (ws_id, thread_ts)
+            await self.subscribe_ws(ws_id, route.to_channel_id())
             await self.router.send_message(ws_id, text)
             log.info("slack.message_dispatched", ws_id=ws_id, channel=channel_id)
         except Exception:
@@ -866,14 +874,13 @@ class TurnstoneSlackBot:
         )
 
         try:
-            ws_id, is_new = await self.router.get_or_create_workstream(
+            ws_id, _is_new = await self.router.get_or_create_workstream(
                 channel_type="slack",
                 channel_id=route.to_channel_id(),
                 name=f"slack-dm-{user_id[:8]}",
                 client_type="chat",
             )
-            if is_new:
-                await self.subscribe_ws(ws_id, route.to_channel_id())
+            await self.subscribe_ws(ws_id, route.to_channel_id())
 
             await self.router.send_message(ws_id, text)
             log.info("slack.dm_dispatched", ws_id=ws_id, user=user_id)
@@ -985,7 +992,7 @@ class TurnstoneSlackBot:
 
         Does not cancel or await the SSE task — callers handle task
         lifecycle differently (``unsubscribe_ws`` cancels and awaits;
-        ``_cleanup_stale_route`` is itself invoked from inside the task).
+        ``_stop_unavailable_stream`` is itself invoked from inside the task).
         """
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
@@ -1020,8 +1027,8 @@ class TurnstoneSlackBot:
             )
             await self._on_ws_event(ws_id, effective_route, event)
 
-        async def _on_stale() -> None:
-            await self._cleanup_stale_route(ws_id, channel_id)
+        async def _on_unavailable() -> None:
+            await self._stop_unavailable_stream(ws_id)
 
         await run_sse_stream(
             http_client=self._http_client,
@@ -1030,21 +1037,16 @@ class TurnstoneSlackBot:
             node_url_fn=self.router.get_node_url,
             token_factory=self._token_factory,
             on_event=_on_event,
-            on_stale=_on_stale,
+            on_unavailable=_on_unavailable,
         )
 
-    async def _cleanup_stale_route(self, ws_id: str, channel_id: str) -> None:
-        """Remove a channel route whose workstream no longer exists."""
-        route = SlackRoute.parse(channel_id)
-        if route.channel and route.user_id and route.thread_ts:
-            self._channel_sessions.pop((route.channel, route.user_id), None)
-
-        await self.router.delete_route("slack", channel_id)
-        # Called from inside the SSE task itself — don't await the task here.
+    async def _stop_unavailable_stream(self, ws_id: str) -> None:
+        """Retire this listener while retaining the route and session association."""
+        task = self._sse_tasks.get(ws_id)
+        if task is not None and task is not asyncio.current_task():
+            return
         self._sse_tasks.pop(ws_id, None)
         self._clear_ws_state(ws_id)
-
-        log.info("slack.stale_route_removed", ws_id=ws_id)
 
     async def _on_ws_event(
         self,

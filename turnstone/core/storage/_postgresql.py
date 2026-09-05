@@ -1428,23 +1428,29 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         # Use ON CONFLICT DO NOTHING to match SQLite's OR IGNORE semantics
         # and close the SELECT-then-INSERT TOCTOU window under concurrent
         # register_workstream calls for the same ws_id.
-        stmt = pg_insert(workstreams).values(
-            ws_id=ws_id,
-            node_id=node_id,
-            user_id=user_id,
-            name=name,
-            state=state,
-            alias=alias,
-            title=title,
-            skill_id=skill_id,
-            skill_version=skill_version,
-            kind=norm_kind,
-            parent_ws_id=norm_parent,
-            project_id=norm_project,
-            persona=norm_persona,
-            created=now,
-            updated=now,
+        values = {
+            "ws_id": ws_id,
+            "node_id": node_id,
+            "user_id": user_id,
+            "name": name,
+            "state": state,
+            "alias": alias,
+            "title": title,
+            "skill_id": skill_id,
+            "skill_version": skill_version,
+            "kind": norm_kind,
+            "parent_ws_id": norm_parent,
+            "project_id": norm_project,
+            "persona": norm_persona,
+            "created": now,
+            "updated": now,
+        }
+        # Keep the reference check in the INSERT statement, matching SQLite:
+        # a channel's deleted source ID cannot be claimed by a new incarnation.
+        source = sa.select(*(sa.literal(value) for value in values.values())).where(
+            ~sa.exists().where(channel_routes.c.ws_id == ws_id)
         )
+        stmt = pg_insert(workstreams).from_select(list(values), source)
         insert_stmt = stmt.on_conflict_do_nothing(index_elements=["ws_id"]).returning(
             workstreams.c.ws_id
         )
@@ -2379,24 +2385,50 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
     # -- Channel routing -------------------------------------------------------
 
     def create_channel_route(
-        self, channel_type: str, channel_id: str, ws_id: str, node_id: str = ""
-    ) -> None:
+        self,
+        channel_type: str,
+        channel_id: str,
+        ws_id: str,
+        node_id: str = "",
+        *,
+        channel_user_id: str = "",
+    ) -> bool:
         from sqlalchemy.dialects import postgresql
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            conn.execute(
+            result = conn.execute(
                 postgresql.insert(channel_routes)
                 .values(
                     channel_type=channel_type,
                     channel_id=channel_id,
                     ws_id=ws_id,
                     node_id=node_id,
+                    channel_user_id=channel_user_id,
                     created=now,
                 )
                 .on_conflict_do_nothing()
+                .returning(channel_routes.c.ws_id)
+            )
+            inserted = result.scalar_one_or_none() is not None
+            conn.commit()
+            return inserted
+
+    def replace_channel_route(
+        self, channel_type: str, channel_id: str, expected_ws_id: str, ws_id: str
+    ) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(channel_routes)
+                .where(
+                    (channel_routes.c.channel_type == channel_type)
+                    & (channel_routes.c.channel_id == channel_id)
+                    & (channel_routes.c.ws_id == expected_ws_id)
+                )
+                .values(ws_id=ws_id, node_id="")
             )
             conn.commit()
+            return result.rowcount > 0
 
     def get_channel_route(self, channel_type: str, channel_id: str) -> dict[str, str] | None:
 
@@ -2408,6 +2440,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     channel_routes.c.ws_id,
                     channel_routes.c.node_id,
                     channel_routes.c.created,
+                    channel_routes.c.channel_user_id,
                 ).where(
                     (channel_routes.c.channel_type == channel_type)
                     & (channel_routes.c.channel_id == channel_id)
@@ -2420,6 +2453,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     "ws_id": row[2],
                     "node_id": row[3],
                     "created": row[4],
+                    "channel_user_id": row[5],
                 }
             return None
 
@@ -2433,6 +2467,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     channel_routes.c.ws_id,
                     channel_routes.c.node_id,
                     channel_routes.c.created,
+                    channel_routes.c.channel_user_id,
                 ).where(channel_routes.c.ws_id == ws_id)
             ).fetchone()
             if row:
@@ -2442,6 +2477,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     "ws_id": row[2],
                     "node_id": row[3],
                     "created": row[4],
+                    "channel_user_id": row[5],
                 }
             return None
 
@@ -2455,6 +2491,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     channel_routes.c.ws_id,
                     channel_routes.c.node_id,
                     channel_routes.c.created,
+                    channel_routes.c.channel_user_id,
                 )
                 .where(channel_routes.c.channel_type == channel_type)
                 .order_by(channel_routes.c.created.desc())
@@ -2466,19 +2503,22 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     "ws_id": r[2],
                     "node_id": r[3],
                     "created": r[4],
+                    "channel_user_id": r[5],
                 }
                 for r in rows
             ]
 
-    def delete_channel_route(self, channel_type: str, channel_id: str) -> bool:
-
+    def delete_channel_route(
+        self, channel_type: str, channel_id: str, *, expected_ws_id: str | None = None
+    ) -> bool:
+        statement = sa.delete(channel_routes).where(
+            (channel_routes.c.channel_type == channel_type)
+            & (channel_routes.c.channel_id == channel_id)
+        )
+        if expected_ws_id is not None:
+            statement = statement.where(channel_routes.c.ws_id == expected_ws_id)
         with self._conn() as conn:
-            result = conn.execute(
-                sa.delete(channel_routes).where(
-                    (channel_routes.c.channel_type == channel_type)
-                    & (channel_routes.c.channel_id == channel_id)
-                )
-            )
+            result = conn.execute(statement)
             conn.commit()
             return result.rowcount > 0
 

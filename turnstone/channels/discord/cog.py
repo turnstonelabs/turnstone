@@ -10,6 +10,7 @@ import asyncio
 import time
 from collections import OrderedDict, deque
 from typing import TYPE_CHECKING
+from weakref import WeakValueDictionary
 
 from turnstone.core.log import get_logger
 
@@ -24,6 +25,10 @@ log = get_logger(__name__)
 
 _THREAD_NAME_MAX = 100
 _DM_REPLY_MAX_LENGTH = 4096  # Discord's own message limit
+_LEGACY_THREAD_MESSAGE = (
+    "I can't verify who started this older thread. Use `/ask` in the parent channel "
+    "to start a new conversation."
+)
 
 # /link is the only flow that reads Turnstone API tokens out of user
 # input; throttle aggressively so an attacker with throw-away Discord
@@ -50,6 +55,7 @@ class MessageCog:
         # Per-Discord-user sliding-window rate limit on /link, to block
         # online enumeration of Turnstone API tokens.
         self._link_buckets: OrderedDict[str, deque[float]] = OrderedDict()
+        self._thread_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
 
         # -- Cog wiring (manual since we can't use decorators with guarded imports) --
 
@@ -141,73 +147,9 @@ class MessageCog:
 
         # --- Message in a Discord Thread ---
         if isinstance(channel, discord.Thread):
-            parent_id = channel.parent_id or 0
-            if not self.ts._is_allowed_channel(parent_id):
-                return
-
-            # Check if this thread has an existing route (TTL-cached).
-            existing_ws_id = await self.ts.router.lookup_ws_id("discord", str(channel.id))
-            if existing_ws_id is None:
-                # Not our thread — ignore.
-                return
-
-            # Owner check: only the thread creator (who initiated the
-            # workstream) can inject messages. Without this gate, any
-            # linked user in a public / multi-member thread could
-            # redirect someone else's assistant and bill their quota,
-            # because the gateway forwards with its service-scoped JWT
-            # and the server bypasses ownership on service scope.
-            #
-            # We prefer the explicitly-recorded invoker over
-            # `thread.owner_id`: `/ask` creates threads via
-            # `channel.create_thread(...)` which reports the bot as
-            # owner, so the Discord-reported value alone would reject
-            # every legitimate follow-up.
-            effective_owner_id = self.ts.get_thread_invoker(channel.id)
-            if effective_owner_id is None:
-                effective_owner_id = channel.owner_id
-            if effective_owner_id is None or message.author.id != effective_owner_id:
-                log.debug(
-                    "discord.thread_message_rejected_non_owner",
-                    thread_id=channel.id,
-                    author_id=message.author.id,
-                    owner_id=effective_owner_id,
-                )
-                return
-
-            # Resolve user.
-            user_id = await self.ts.router.resolve_user("discord", str(message.author.id))
-            if user_id is None:
-                return
-
-            # Use get_or_create_workstream so stale routes (evicted ws) are
-            # auto-refreshed with a new workstream.
-            try:
-                ws_id, is_new = await self.ts.router.get_or_create_workstream(
-                    "discord",
-                    str(channel.id),
-                    name=channel.name or "",
-                    initial_message="",
-                    client_type="chat",
-                )
-            except (TimeoutError, RuntimeError):
-                log.warning("discord.ws_reactivation_failed", thread_id=channel.id)
-                return
-
-            if is_new:
-                await channel.send("*Workstream reactivated.*")
-
-            # Ensure subscription is active (handles bot restart recovery).
-            if ws_id not in self.ts._subscribed_ws:
-                await self.ts.subscribe_ws(ws_id, channel)
-
-            await self.ts.router.send_message(ws_id, message.content)
-            log.debug(
-                "discord.message_routed",
-                ws_id=ws_id,
-                thread_id=channel.id,
-                author=str(message.author),
-            )
+            lock = self._thread_lock(channel.id)
+            async with lock:
+                await self._handle_thread_message(message, channel)
             return
 
         # --- @mention in a non-thread channel ---
@@ -234,10 +176,6 @@ class MessageCog:
                 name=thread_name,
                 auto_archive_duration=self.ts.config.thread_auto_archive,  # type: ignore[arg-type]
             )
-            # Record invoker so the sec-3 gate admits follow-ups even if
-            # Discord's reported thread.owner_id diverges.
-            self.ts.register_thread_invoker(thread.id, message.author.id)
-
             # Create workstream WITHOUT initial_message — subscribe to events
             # first, then send the message.  With SSE the event stream is
             # reliable once connected, but we still subscribe first for
@@ -252,6 +190,7 @@ class MessageCog:
                 model=mention_model,
                 initial_message="",
                 client_type="chat",
+                channel_user_id=str(message.author.id),
             )
 
             await self.ts.subscribe_ws(ws_id, thread)
@@ -262,6 +201,92 @@ class MessageCog:
                 thread_id=thread.id,
                 author=str(message.author),
             )
+
+    def _thread_lock(self, thread_id: int) -> asyncio.Lock:
+        """Serialize local reply/close operations; idle locks are not retained."""
+        lock = self._thread_locks.get(thread_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._thread_locks[thread_id] = lock
+        return lock
+
+    async def _handle_thread_message(
+        self, message: discord.Message, channel: discord.Thread
+    ) -> None:
+        parent_id = channel.parent_id or 0
+        if not self.ts._is_allowed_channel(parent_id):
+            return
+
+        # Read the association and its durable owner together. A bot-owned
+        # /ask thread cannot prove the human invoker through owner_id alone.
+        route = await asyncio.to_thread(
+            self.ts.storage.get_channel_route, "discord", str(channel.id)
+        )
+        if route is None:
+            # Not our thread — ignore.
+            return
+
+        # Owner check: only the thread creator (who initiated the
+        # workstream) can inject messages. Without this gate, any
+        # linked user in a public / multi-member thread could
+        # redirect someone else's assistant and bill their quota,
+        # because the gateway forwards with its service-scoped JWT
+        # and the server bypasses ownership on service scope.
+        #
+        effective_owner_id = route.get("channel_user_id", "")
+        if not effective_owner_id:
+            if await self.ts.router.resolve_user("discord", str(message.author.id)):
+                await channel.send(_LEGACY_THREAD_MESSAGE)
+            return
+        if str(message.author.id) != effective_owner_id:
+            log.debug(
+                "discord.thread_message_rejected_non_owner",
+                thread_id=channel.id,
+                author_id=message.author.id,
+                owner_id=effective_owner_id,
+            )
+            return
+
+        # Resolve user.
+        user_id = await self.ts.router.resolve_user("discord", str(message.author.id))
+        if user_id is None:
+            return
+
+        # Use get_or_create_workstream so stale routes (evicted ws) are
+        # auto-refreshed with a new workstream.
+        try:
+            ws_id, is_new = await self.ts.router.get_or_create_workstream(
+                "discord",
+                str(channel.id),
+                name=channel.name or "",
+                initial_message="",
+                client_type="chat",
+                channel_user_id=str(message.author.id),
+                require_existing=True,
+            )
+        except Exception:
+            log.warning("discord.ws_reactivation_failed", thread_id=channel.id, exc_info=True)
+            await channel.send(
+                "I couldn't recover this conversation. Please try your message again."
+            )
+            return
+
+        if is_new:
+            await channel.send("*Workstream reactivated.*")
+
+        # Ensure subscription is active (handles bot restart recovery).
+        if ws_id != route["ws_id"]:
+            await self.ts.unsubscribe_ws(route["ws_id"])
+        await self.ts.subscribe_ws(ws_id, channel)
+
+        await self.ts.router.send_message(ws_id, message.content)
+        log.debug(
+            "discord.message_routed",
+            ws_id=ws_id,
+            thread_id=channel.id,
+            author=str(message.author),
+        )
+        return
 
     # -- DM reply handling ---------------------------------------------------
 
@@ -447,6 +472,11 @@ class MessageCog:
         if channel is None:
             await interaction.followup.send("Cannot determine channel.", ephemeral=True)
             return
+        if not self.ts._is_allowed_channel(channel.id):
+            await interaction.followup.send(
+                "This channel is not enabled for Turnstone.", ephemeral=True
+            )
+            return
 
         thread_name = message[:_THREAD_NAME_MAX] if len(message) > _THREAD_NAME_MAX else message
 
@@ -457,10 +487,6 @@ class MessageCog:
                 auto_archive_duration=self.ts.config.thread_auto_archive,  # type: ignore[arg-type]
                 type=discord.ChannelType.public_thread,
             )
-            # `channel.create_thread` without a starter message makes the
-            # bot the thread owner, so the sec-3 gate needs to see the
-            # real invoker here — otherwise `/ask` follow-ups get dropped.
-            self.ts.register_thread_invoker(thread.id, interaction.user.id)
         else:
             await interaction.followup.send(
                 "Cannot create a thread in this channel type.",
@@ -482,6 +508,7 @@ class MessageCog:
             model=effective_model,
             initial_message="",
             client_type="chat",
+            channel_user_id=str(interaction.user.id),
         )
 
         await self.ts.subscribe_ws(ws_id, thread)
@@ -570,13 +597,41 @@ class MessageCog:
             )
             return
 
+        await interaction.response.defer(ephemeral=True)
+        lock = self._thread_lock(channel.id)
+        async with lock:
+            try:
+                await self._close_thread(interaction, channel)
+            except Exception:
+                log.warning("discord.workstream_close_failed", thread_id=channel.id, exc_info=True)
+                await interaction.followup.send(
+                    "I couldn't close this conversation. Please try again.", ephemeral=True
+                )
+
+    async def _close_thread(
+        self, interaction: discord.Interaction, channel: discord.Thread
+    ) -> None:
+        import discord
+
         route = await asyncio.to_thread(
             self.ts.storage.get_channel_route, "discord", str(channel.id)
         )
         if route is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "No workstream is associated with this thread.",
                 ephemeral=True,
+            )
+            return
+
+        owner_id = route.get("channel_user_id", "")
+        if not owner_id:
+            await interaction.followup.send(_LEGACY_THREAD_MESSAGE, ephemeral=True)
+            return
+        if str(interaction.user.id) != owner_id or not await self.ts.router.resolve_user(
+            "discord", str(interaction.user.id)
+        ):
+            await interaction.followup.send(
+                "Only the linked conversation owner can close this workstream.", ephemeral=True
             )
             return
 
@@ -586,10 +641,14 @@ class MessageCog:
         await self.ts.router.close_workstream(ws_id)
 
         # Delete route and unsubscribe.
-        await self.ts.router.delete_route("discord", str(channel.id))
+        if not await self.ts.router.delete_route("discord", str(channel.id), expected_ws_id=ws_id):
+            await interaction.followup.send(
+                "The conversation changed while closing. Please try `/close` again.", ephemeral=True
+            )
+            return
         await self.ts.unsubscribe_ws(ws_id)
 
-        await interaction.response.send_message("Workstream closed.")
+        await interaction.followup.send("Workstream closed.")
         log.info("discord.workstream_closed", ws_id=ws_id, thread_id=channel.id)
 
         # Archive the thread.

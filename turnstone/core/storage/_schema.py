@@ -288,6 +288,7 @@ channel_routes = sa.Table(
     sa.Column("channel_id", sa.Text, nullable=False),
     sa.Column("ws_id", sa.Text, nullable=False),
     sa.Column("node_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("channel_user_id", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
     sa.PrimaryKeyConstraint("channel_type", "channel_id"),
 )

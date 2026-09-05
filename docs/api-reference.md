@@ -1332,6 +1332,7 @@ An absent or malformed JSON body returns `400`.
 | `auto_approve_tools` | string/array | `""` | Tool names to auto-approve even when `auto_approve` is false; accepts comma-separated text or an array |
 | `user_id`         | string        | `""`  | Owner override honored only for a trusted `console` service identity carrying the `service` scope; ordinary callers remain bound to their authenticated identity |
 | `resume_ws`       | string        | `""`    | Source workstream ID or alias to fork atomically into this new ID |
+| `resume_ws_exact` | bool          | false   | Require `resume_ws` to match an exact source ID; never resolve an alias or prefix |
 | `skill`           | string        | `""`    | Skill name. Applies its system prompt and session configuration. Returns 400 if missing/disabled; ignored for a fork because the source configuration is cloned. |
 | `persona`         | string        | `""`    | Persona slug; empty selects the kind's default. A fork keeps the source persona. |
 | `judge_model`     | string        | `""`    | Optional judge model alias                                     |
@@ -1341,6 +1342,10 @@ An absent or malformed JSON body returns `400`.
 | `notify_targets`  | string/array  | `[]`    | Completion-notification targets                                |
 | `client_type`     | string        | `web`   | Client surface label (`web`, `cli`, `chat`, or `scheduled`)    |
 | `parent_ws_id`    | string/null   | none    | Owning coordinator ID for a coordinator-spawned child          |
+
+A deleted workstream ID remains reserved while a channel route references it.
+Creating a new workstream with that ID returns `409`; channel recovery forks or
+starts a conversation under a new ID before updating the association.
 
 > **Skill behavior:** When `skill` is specified, the skill's content is injected as a system message and its session config fields (model, temperature, auto-approve, token budget, etc.) override system defaults for the new workstream.
 
@@ -1352,6 +1357,11 @@ the source's checkpoint-bounded conversation, saved session configuration,
 persona, effective project, and attachment references. The source remains
 unchanged. Use `POST .../{ws_id}/open` when you want to rehydrate the original
 ID instead.
+
+Set `resume_ws_exact: true` when recovering a stored canonical ID. A missing
+exact source returns `404` even if another workstream has that ID as its alias.
+The console preserves this requirement after resolving an ordinary alias, so
+the node cannot substitute another source if the original disappears in transit.
 
 The clone transaction rechecks source visibility, private-project membership
 and attachability, persona/project construction context, destination ownership
@@ -2821,6 +2831,7 @@ the ordinary create fields plus `target_node`:
 |-------|------------------|
 | `ws_id` | Optional 32-hex destination. When present, it is preserved and used as the rendezvous key, including on a fork. A 503 never replaces a caller-selected ID. |
 | `resume_ws` | Optional source ID or saved alias for an atomic fork. The console resolves aliases to the canonical source ID before routing and forwards that canonical value. When no destination `ws_id` is supplied, the source is the placement key. |
+| `resume_ws_exact` | Optional boolean, default false. Requires an exact source ID in `resume_ws`; disables alias and prefix resolution. |
 | `target_node` | Optional node ID hint. When neither `ws_id` nor `resume_ws` selects placement, the console generates a destination whose rendezvous owner is this live node. |
 
 Without any placement field, the console generates a destination ID and routes

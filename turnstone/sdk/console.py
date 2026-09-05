@@ -220,6 +220,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         persona: str = "",
         project_id: str = "",
         resume_ws: str = "",
+        resume_ws_exact: bool = False,
         judge_model: str = "",
         target_node: str = "",
         user_id: str = "",
@@ -229,6 +230,9 @@ class AsyncTurnstoneConsole(_BaseClient):
         attachments: list[AttachmentUpload] | None = None,
     ) -> RouteCreateResponse:
         """Create a workstream via the console's routing proxy.
+
+        *resume_ws_exact* requires the exact source ID, preventing alias or
+        prefix substitution when recovering a persisted association.
 
         Posts to /v1/api/route/workstreams/new.  When *attachments* is
         non-empty, the request is sent as multipart and the console
@@ -255,6 +259,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["project_id"] = project_id
         if resume_ws:
             body["resume_ws"] = resume_ws
+        if resume_ws_exact:
+            body["resume_ws_exact"] = True
         if judge_model:
             body["judge_model"] = judge_model
         if target_node:
@@ -1337,6 +1343,7 @@ class TurnstoneConsole:
         persona: str = "",
         project_id: str = "",
         resume_ws: str = "",
+        resume_ws_exact: bool = False,
         judge_model: str = "",
         target_node: str = "",
         user_id: str = "",
@@ -1356,6 +1363,7 @@ class TurnstoneConsole:
                 persona=persona,
                 project_id=project_id,
                 resume_ws=resume_ws,
+                resume_ws_exact=resume_ws_exact,
                 judge_model=judge_model,
                 target_node=target_node,
                 user_id=user_id,

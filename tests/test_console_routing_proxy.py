@@ -200,6 +200,7 @@ class TestRouteCreate:
             NodeRef("node-b", "http://b:8080"),
         )
         assert app.state.proxy_client.post.call_args.kwargs["json"]["resume_ws"] == "d" * 32
+        assert app.state.proxy_client.post.call_args.kwargs["json"]["resume_ws_exact"] is True
         client.close()
 
     def test_route_create_target_node(self):
@@ -318,6 +319,8 @@ class TestRouteCreate:
         ("field", "value", "error"),
         [
             ("resume_ws", 3, "resume_ws must be a string"),
+            ("resume_ws_exact", "true", "resume_ws_exact must be a boolean"),
+            ("resume_ws_exact", True, "resume_ws_exact requires resume_ws"),
             ("resume_ws", "x" * 257, "resume_ws must be at most 256 characters"),
             ("target_node", ["node-a"], "target_node must be a string"),
             ("target_node", "bad/node", "invalid target_node format"),
@@ -404,6 +407,29 @@ class TestRouteCreate:
         storage.resolve_workstream.assert_not_called()
         router.route.assert_called_once_with(source_id)
         assert post.call_args.kwargs["json"]["resume_ws"] == source_id
+
+    @pytest.mark.anyio
+    async def test_sdk_exact_resume_does_not_resolve_a_missing_id_as_an_alias(self):
+        from turnstone.sdk._types import TurnstoneAPIError
+        from turnstone.sdk.console import AsyncTurnstoneConsole
+
+        storage = MagicMock()
+        storage.get_workstream.return_value = None
+        storage.resolve_workstream.return_value = "e" * 32
+        app = _make_app(router=_make_mock_router(), auth_storage=storage)
+        post = _make_proxy_post(json_data={"ws_id": _FORK_DEST_WS_ID})
+        _wire_proxy(app, post)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers=_TEST_AUTH_HEADERS,
+        ) as http_client:
+            sdk = AsyncTurnstoneConsole(httpx_client=http_client)
+            with pytest.raises(TurnstoneAPIError) as error:
+                await sdk.route_create_workstream(resume_ws="d" * 32, resume_ws_exact=True)
+        assert error.value.status_code == 404
+        storage.resolve_workstream.assert_not_called()
+        post.assert_not_called()
 
     @pytest.mark.parametrize(
         "upstream",

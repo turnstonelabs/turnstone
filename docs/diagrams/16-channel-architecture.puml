@@ -86,13 +86,13 @@ class "ChannelRouter" as Router <<service>> {
     +_is_ws_live(ws_id)
     +send_message(ws_id, message)
     +send_approval(ws_id, ...)
-    +lookup_ws_id(channel_type, channel_id)
     +resolve_user(channel_type, channel_user_id)
         -> user_id | None
     --
     Maps channels -> workstreams
     Maps platform users -> turnstone users
-    Caches routes in memory
+    Conditionally replaces durable routes
+    Resolves SSE destination on reconnect
 }
 
 class "turnstone-console router" as ConsoleRouter <<server>> {
@@ -136,6 +136,7 @@ class "channel_routes" as CR <<storage>> {
     channel_id (PK)
     ws_id
     node_id
+    channel_user_id: external owner
     created
     --
     Maps platform channels

@@ -76,6 +76,8 @@ def _make_interaction(*, footer_text=None, has_embeds=True):
     interaction.user.id = 67890
     interaction.response = MagicMock()
     interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
 
     if has_embeds and footer_text is not None:
         embed = MagicMock()
@@ -400,6 +402,14 @@ class TestAskModelSelection:
 
         _, kwargs = ts.router.get_or_create_workstream.call_args
         assert kwargs["model"] == "explicit-model"
+        assert kwargs["channel_user_id"] == "67890"
+
+    def test_disallowed_channel_cannot_start_conversation(self):
+        cog, ts, interaction = self._make_cog_and_interaction()
+        ts._is_allowed_channel.return_value = False
+        _run(cog._cmd_ask(interaction, "hello"))
+        interaction.channel.create_thread.assert_not_awaited()
+        ts.router.get_or_create_workstream.assert_not_awaited()
 
     def test_channel_default_used_when_no_explicit_model(self):
         cog, ts, interaction = self._make_cog_and_interaction()
@@ -574,7 +584,8 @@ class TestApprovalVerdictDisplay:
         bot.config.streaming_edit_interval = 1.5
         bot.config.auto_approve = False
         bot.config.auto_approve_tools = []
-        bot.storage = None
+        bot.storage = MagicMock()
+        bot.storage.get_channel_route_by_ws.return_value = None
         bot._streaming = {}
         bot._thinking_msgs = {}
         bot._tool_info_msgs = {}
@@ -644,6 +655,21 @@ class TestApprovalVerdictDisplay:
         embed = call_kwargs["embed"]
         # No verdict field added
         assert len(embed.fields) == 0
+
+    def test_approval_uses_persisted_invoker_for_bot_owned_thread(self):
+        from turnstone.sdk.events import ApproveRequestEvent
+
+        bot = self._make_bot()
+        bot.storage.get_channel_route_by_ws.return_value = {"channel_user_id": "111"}
+        thread = AsyncMock()
+        thread.owner_id = 99999
+        event = ApproveRequestEvent(
+            ws_id="ws-1",
+            cycle_id="cycle",
+            items=[{"func_name": "bash", "needs_approval": True, "preview": "pwd"}],
+        )
+        _run(bot._on_ws_event("ws-1", thread, event))
+        assert thread.send.call_args.kwargs["embed"].footer.text == "ws-1|cycle|111"
 
     def test_intent_verdict_event_updates_embed(self):
         """IntentVerdictEvent should update the pending approval embed."""
@@ -1368,7 +1394,8 @@ class TestThinkingIndicator:
         bot.config.streaming_edit_interval = 1.5
         bot.config.auto_approve = False
         bot.config.auto_approve_tools = []
-        bot.storage = None
+        bot.storage = MagicMock()
+        bot.storage.get_channel_route_by_ws.return_value = None
         bot._streaming = {}
         bot._thinking_msgs = {}
         bot._tool_info_msgs = {}
@@ -1468,7 +1495,8 @@ class TestToolInfoEvent:
         bot.config.streaming_edit_interval = 1.5
         bot.config.auto_approve = False
         bot.config.auto_approve_tools = []
-        bot.storage = None
+        bot.storage = MagicMock()
+        bot.storage.get_channel_route_by_ws.return_value = None
         bot._streaming = {}
         bot._thinking_msgs = {}
         bot._tool_info_msgs = {}
@@ -1562,7 +1590,8 @@ class TestToolResultEvent:
         bot.config.streaming_edit_interval = 1.5
         bot.config.auto_approve = False
         bot.config.auto_approve_tools = []
-        bot.storage = None
+        bot.storage = MagicMock()
+        bot.storage.get_channel_route_by_ws.return_value = None
         bot._streaming = {}
         bot._thinking_msgs = {}
         bot._tool_info_msgs = {}
@@ -1718,7 +1747,8 @@ class TestApprovalResolved:
         bot.config.streaming_edit_interval = 1.5
         bot.config.auto_approve = False
         bot.config.auto_approve_tools = []
-        bot.storage = None
+        bot.storage = MagicMock()
+        bot.storage.get_channel_route_by_ws.return_value = None
         bot._streaming = {}
         bot._thinking_msgs = {}
         bot._tool_info_msgs = {}
@@ -1915,7 +1945,6 @@ class TestDiscordThreadOwnerCheck:
         ts._is_allowed_channel = MagicMock(return_value=True)
         ts.storage = MagicMock()
         ts.router = MagicMock()
-        ts.router.lookup_ws_id = AsyncMock(return_value="ws-1")
         ts.router.resolve_user = AsyncMock(return_value="turnstone-user-1")
         ts.router.send_message = AsyncMock()
         ts.router.get_or_create_workstream = AsyncMock(return_value=("ws-1", False))
@@ -1924,7 +1953,7 @@ class TestDiscordThreadOwnerCheck:
         ts._subscribed_ws = {"ws-1"}
         ts._notify_ws_map = {}
         ts._notify_reply_channels = {}
-        ts.get_thread_invoker = MagicMock(return_value=None)
+        ts.storage.get_channel_route.return_value = {"ws_id": "ws-1", "channel_user_id": "111"}
         ts.subscribe_ws = AsyncMock()
         bot.turnstone = ts
 
@@ -1950,12 +1979,71 @@ class TestDiscordThreadOwnerCheck:
         ts.router.send_message.assert_not_awaited()
         ts.router.get_or_create_workstream.assert_not_awaited()
 
+    @pytest.mark.parametrize("owner_id", [111, 99999, None])
+    def test_legacy_route_requires_starting_a_new_conversation(self, owner_id):
+        cog, ts = self._make_cog_and_ts()
+        ts.storage.get_channel_route.return_value["channel_user_id"] = ""
+        thread = MagicMock(spec=discord.Thread)
+        thread.id, thread.parent_id, thread.name = 555, 222, "legacy"
+        thread.owner_id = owner_id
+        thread.send = AsyncMock()
+        msg = _make_message(guild=True, channel=thread)
+        msg.author.id = 111
+        _run(cog._on_message(msg))
+        ts.router.get_or_create_workstream.assert_not_awaited()
+        ts.router.send_message.assert_not_awaited()
+        assert "`/ask` in the parent channel" in thread.send.call_args.args[0]
+
+    @pytest.mark.parametrize(
+        ("actor", "linked", "allowed"),
+        [
+            (111, True, True),
+            (222, True, False),
+            (111, False, False),
+        ],
+    )
+    def test_close_uses_saved_owner_and_current_link(self, actor, linked, allowed):
+        cog, ts = self._make_cog_and_ts()
+        ts.storage.get_channel_route.return_value = {"ws_id": "ws-1", "channel_user_id": "111"}
+        ts.router.resolve_user.return_value = "user" if linked else None
+        ts.router.close_workstream = AsyncMock()
+        ts.router.delete_route = AsyncMock()
+        ts.unsubscribe_ws = AsyncMock()
+        interaction = _make_interaction()
+        interaction.user.id = actor
+        thread = MagicMock(spec=discord.Thread)
+        thread.id, thread.owner_id = 555, 99999
+        thread.edit = AsyncMock()
+        interaction.channel = thread
+        _run(cog._cmd_close(interaction))
+        if allowed:
+            ts.router.close_workstream.assert_awaited_once_with("ws-1")
+            ts.router.delete_route.assert_awaited_once_with("discord", "555", expected_ws_id="ws-1")
+        else:
+            ts.router.close_workstream.assert_not_awaited()
+            ts.router.delete_route.assert_not_awaited()
+
+    def test_unavailable_recovery_keeps_route_and_reports_failure(self):
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        cog, ts = self._make_cog_and_ts()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id, thread.parent_id, thread.owner_id = 555, 222, 111
+        thread.send = AsyncMock()
+        ts.router.get_or_create_workstream.side_effect = TurnstoneAPIError(503, "offline")
+        msg = _make_message(guild=True, channel=thread)
+        msg.author.id = 111
+        _run(cog._on_message(msg))
+        ts.storage.delete_channel_route.assert_not_called()
+        ts.router.send_message.assert_not_awaited()
+        assert "try your message again" in thread.send.call_args.args[0]
+
     def test_ask_thread_followup_allowed_when_invoker_registered(self):
         """/ask creates threads with owner_id=bot; follow-ups from the
         registered invoker must still reach the workstream."""
         cog, ts = self._make_cog_and_ts()
         # Simulate what _cmd_ask does after channel.create_thread().
-        ts.get_thread_invoker = MagicMock(return_value=111)
+        ts.storage.get_channel_route.return_value = {"ws_id": "ws-1", "channel_user_id": "111"}
 
         thread = MagicMock(spec=discord.Thread)
         thread.id = 555
@@ -1973,7 +2061,7 @@ class TestDiscordThreadOwnerCheck:
     def test_ask_thread_rejects_other_user_even_when_invoker_registered(self):
         """Registered invoker lock: only that user's follow-ups pass."""
         cog, ts = self._make_cog_and_ts()
-        ts.get_thread_invoker = MagicMock(return_value=111)
+        ts.storage.get_channel_route.return_value = {"ws_id": "ws-1", "channel_user_id": "111"}
 
         thread = MagicMock(spec=discord.Thread)
         thread.id = 555
