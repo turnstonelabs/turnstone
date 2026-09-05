@@ -1,4 +1,4 @@
-# MCP OAuth — per-user authorization for MCP servers
+# MCP authentication and OAuth setup
 
 Turnstone supports **per-(user, MCP server) OAuth 2.1 + PKCE** delegation so each Turnstone user authorizes a remote MCP server with their own identity, rather than sharing a single bearer token across the deployment. This is the right shape for MCP servers that expose user-specific data (a personal CRM, an email inbox, a calendar) and for MCP servers that want per-user audit attribution.
 
@@ -6,18 +6,27 @@ Per-user OAuth is opt-in per `mcp_servers` row. Local-auth Turnstone installs wi
 
 > **Note**: This is a separate authorization layer from Turnstone's own user authentication. A user who logs into Turnstone with a local username + password can still authorize a per-server OAuth MCP server. OIDC SSO and per-server OAuth are orthogonal.
 
+Docker deployments use one [shared authentication config](docker.md#shared-bootstrap-config)
+for MCP OAuth, SSO, and model delegation. Enable the features you need in that
+file; each server's authorization mode is selected separately in the admin UI.
+
 ---
 
 ## When to use which `auth_type`
 
-The MCP server admin form exposes three authorization modes ("Multitenant Authorization"):
+The MCP server admin form exposes four authorization modes ("Multitenant Authorization"). Choose the transport first:
 
-| `auth_type` | What it means | When to use |
+| Choice | Transport | Identity and setup |
 |---|---|---|
-| `none` | No headers attached. Open MCP server (or one gated by network policy only). | Internal MCP servers on a trusted network. |
-| `static` | One static bearer token, configured per server, sent on every request from every user. | Service-to-service MCP servers where per-user attribution doesn't matter, or single-tenant deployments. |
-| `oauth_user` *(recommended for user-data servers)* | Each user authorizes separately via OAuth 2.1 + PKCE; Turnstone stores per-user tokens encrypted at rest. | MCP servers that expose user-specific data or that want per-user audit attribution. |
-| `oauth_obo` *(sign-in passthrough)* | Each user's Turnstone **org sign-in** (OIDC) mints a per-server access token on demand — no separate per-server consent. One captured credential per user covers every `oauth_obo` server. | Enterprise deployments where the identity provider governs access (Entra, Keycloak) and you want zero per-user connect clicks. See the dedicated section below. |
+| `none` — no authorization | Streamable HTTP or stdio | An open server or one protected by the deployment's network/process access controls. |
+| `static` — static headers | Streamable HTTP | One shared identity for everyone using the server. Configure its headers, such as `Authorization: Bearer <token>`. No per-user consent or OAuth bootstrap is needed. |
+| `oauth_user` — per-user OAuth | Streamable HTTP | Each user connects their own account in the browser. Requires the shared encryption key, HTTPS callback origin, and provider client registration below. Local Turnstone login is sufficient. |
+| `oauth_obo` — sign-in passthrough | Streamable HTTP | Uses each user's organization sign-in and delegated permissions. Requires OIDC credential capture and an Entra/RFC 8693 grant profile; see the dedicated section below. |
+| Server-owned authentication | stdio | Run the server's own login flow or supply its documented credentials/configuration to the child process. Use `none` in Turnstone; HTTP OAuth settings do not authenticate a stdio subprocess. |
+
+For stdio, credentials and any persisted login state must be available on every
+node that launches the process. A shared process login does not become a
+separate identity for each Turnstone user.
 
 Switching `auth_type` away from `oauth_user` / `oauth_obo` **deletes** that server's per-user rows (consents / minted cache) — see the transition table below. Switching back later starts clean: users re-consent (or re-mint) on next use. The admin **bulk-revoke** / **flush cache** affordance clears rows without an auth-type change.
 
@@ -33,7 +42,98 @@ Switching `auth_type` away from `oauth_user` / `oauth_obo` **deletes** that serv
    - **Pre-registered** (most common): you create an OAuth client at the authorization server (manually, via admin console, or via Terraform), then paste the `client_id` / `client_secret` into the Turnstone admin form.
    - **Dynamic client registration** (RFC 7591): if the AS supports it and you select that mode in the admin form, Turnstone registers a client at first use and persists the `client_id` automatically.
 
-4. **Redirect URI** registered at the authorization server: `https://your-turnstone-host/v1/api/mcp/oauth/callback`.
+4. **Public callback origin**. Set `[oidc] redirect_base` to the dashboard's
+   HTTPS origin, even when users log in with local usernames and passwords.
+   Register exactly `https://your-turnstone-host/v1/api/mcp/oauth/callback` at
+   the authorization server. Setting only `redirect_base` does not enable SSO.
+
+## Remote Docker setup
+
+1. Make the dashboard reachable at its final HTTPS address, for example
+   `https://turnstone.example.com`. Configure DNS and a trusted certificate at
+   Caddy or your reverse proxy; proxy the callback path to the **console** along
+   with the rest of the dashboard. Verify that users can open that address and
+   sign in. An internal name such as `http://console:8090` is not the callback
+   origin. See [Docker deployment](docker.md) and [TLS](tls.md).
+2. Enable the [shared bootstrap config](docker.md#shared-bootstrap-config),
+   either through `run.sh`'s optional prompt or the shipped Compose overlay.
+   Its minimal contents are:
+
+   ```toml
+   [security]
+   mcp_token_encryption_key = "<one generated Fernet key, shared by console and all nodes>"
+
+   [oidc]
+   redirect_base = "https://turnstone.example.com"
+   ```
+
+   Keep the key in this file only. Use the generator in the Docker guide rather
+   than copying the placeholder. Recreate the console and every active node
+   when adding the mount; later TOML edits need a restart of those services.
+   The admin Settings tab cannot distribute this key.
+3. Register an OAuth client with the MCP provider. Set its callback URL to
+   **`https://turnstone.example.com/v1/api/mcp/oauth/callback`** (including any
+   explicit port in your origin). This is different from Turnstone's OIDC
+   sign-in callback. The GitHub example below gives the provider fields.
+4. In **MCP Servers → Add Server**, choose **Streamable HTTP** and **Per-user
+   OAuth2.1**. Enter the server URL and provider client details, then save.
+5. Each user connects their own account. An admin can choose **connect** in
+   that server row's action menu; users also receive an inline **Connect** card
+   when a tool needs authorization. Complete the provider's browser consent,
+   then retry the tool. An admin's consent authorizes only that admin.
+
+Scheduled work and Discord/Slack conversations cannot complete browser consent
+inside the run. The user whose Turnstone identity owns the run must connect
+through the web UI first; channel users need their linked Turnstone identity.
+See [headless OAuth operation](operations/mcp-oauth-headless.md).
+
+### GitHub remote MCP example
+
+Use **`https://api.githubcopilot.com/mcp/`** as the Server URL. Register a
+dedicated GitHub App or OAuth App for this Turnstone deployment and select
+**Pre-registered** in Turnstone. GitHub's remote MCP server does not support
+dynamic client registration. Both app types use a client ID and client secret;
+use the app's **Client ID**, not a GitHub App's numeric App ID.
+See GitHub's [host integration guide](https://github.com/github/github-mcp-server/blob/main/docs/host-integration.md).
+
+| Turnstone field | Value |
+|---|---|
+| Transport | Streamable HTTP |
+| Server URL | `https://api.githubcopilot.com/mcp/` |
+| Multitenant Authorization | Per-user OAuth2.1 (`oauth_user`) |
+| Client Registration | Pre-registered |
+| Client ID / Client Secret | From your dedicated GitHub App or OAuth App |
+| Authorization Server URL | Leave blank for metadata discovery |
+| Scopes | Choose for your app type and required tools, as described below |
+
+Set the app's callback to
+`https://turnstone.example.com/v1/api/mcp/oauth/callback`. The client secret
+belongs in Turnstone's encrypted, write-only **Client Secret** field, not in
+static headers. Current discovery handles GitHub's path-bearing metadata;
+the old manual Authorization Server URL workaround is not required. Older
+installations should upgrade the console and nodes to include
+[#1083](https://github.com/turnstonelabs/turnstone/pull/1083), which also requests
+JSON from GitHub's token endpoint.
+
+For a **GitHub App**, configure the app's repository/organization permissions
+and installation access for the tools you intend to use. Leave Turnstone's
+Scopes field empty: GitHub App user tokens use the intersection of app and
+user permissions, rather than OAuth App scopes. Organization installation or
+approval may be required. See [GitHub App user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app).
+
+For an **OAuth App**, enter space-separated scopes appropriate to the tools:
+for example, `read:org` for organization membership, or `repo` for private
+repository operations. `repo` includes write access; it is not a read-only
+scope. Do not copy a broad scope list for a read-only use case. Consult
+[GitHub's scope reference](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps)
+and your organization's app-access policy.
+
+**PAT fallback:** select **Static headers** with the same remote Server URL
+and set `Authorization: Bearer <your PAT>`. Choose the PAT's repository access
+and permissions for the intended tools. This avoids OAuth setup, but every
+Turnstone user who can use that MCP server acts as the PAT's owner; it is a
+shared credential. GitHub documents PAT support in its
+[host integration guide](https://github.com/github/github-mcp-server/blob/main/docs/host-integration.md).
 
 ---
 
@@ -44,7 +144,7 @@ Switching `auth_type` away from `oauth_user` / `oauth_obo` **deletes** that serv
 | Field | Required | Description |
 |---|---|---|
 | Server URL | Yes | The MCP server's `streamable-http` base URL. For `oauth_user` and `oauth_obo` rows it is stored in canonical form (lower-case scheme and host, default port dropped, a root-only trailing slash dropped, the path otherwise kept exactly as typed) and that value is the RFC 8707 `resource=` sent on every authorize and token request. A fragment or embedded credentials is rejected at save; a row stored before that check keeps working, with both stripped from the identifier at use. |
-| Multitenant Authorization | Yes | `none` / `static` / `oauth_user` (recommended). |
+| Multitenant Authorization | Yes | `none` / `static` / `oauth_user` / `oauth_obo`; choose according to transport and identity needs above. |
 | Authorization Server URL | No | Override for RFC 9728 PRM discovery. Set when your AS endpoint differs from the MCP server URL (e.g., corporate AS protecting a third-party MCP). When unset, Turnstone fetches the server's protected-resource metadata from the RFC 9728 path-specific location first and the origin-level location second, and follows one `WWW-Authenticate` `resource_metadata` challenge per location. Each document must declare the identifier its own URL was derived from — the canonical Server URL at the path-specific location, the bare origin at the origin-level one — so a server that publishes only at the origin while declaring its path-bearing URL needs this override instead. Authorization-server metadata is then tried at the locations MCP lists (RFC 8414 inserted, OpenID Connect inserted, OpenID Connect appended) followed by an appended-form RFC 8414 compatibility probe, and a location wins only after its whole document validates. A document whose `issuer` is not identical to the one requested is skipped — a trailing slash makes it a different identifier, so set this field to the exact spelling the AS publishes; a templated issuer (`{tenantid}`) is accepted and logged. An issuer with a query string or fragment is refused. The resolved issuer is cached on the row and cleared whenever this field or the Server URL changes. Changing this field also purges the server's per-user grants and pending consents — the stored refresh tokens were issued by the previous authorization server — and clears a dynamically registered client id. |
 | Client Registration | Yes (oauth_user) | `preregistered` or `dynamic`. |
 | Client ID | Yes (preregistered) | OAuth 2.0 client ID. Stored unencrypted. |
@@ -96,7 +196,16 @@ mcp_token_encryption_key = "base64-fernet-key"
 # mcp_token_encryption_keys = ["new-key", "old-key"]
 ```
 
-Keep this in `config.toml` rather than environment variables. An in-process LLM with shell-tool access can read the server's environment via `env` / `os.environ` and exfiltrate any secret stored there; secrets in `config.toml` are only loaded into the server at startup and never re-read on a tool-driven path, so a prompt-injection attack against the agent cannot reach them.
+This key is accepted only from `config.toml`, not environment variables or
+DB-backed runtime settings. Use the same keyring on the console and all nodes
+sharing the database, and retain a private backup. Losing it makes stored
+tokens and client secrets undecryptable.
+
+File-backed storage avoids putting the key in inherited process environments.
+It does not isolate the key from a shell running as the same OS user: that
+shell can read the file too. A read-only Docker mount prevents changes, not
+reads. Keep the file outside the mounted workspace and use process/filesystem
+isolation when tools must not be able to access service credentials.
 
 ---
 
@@ -116,6 +225,14 @@ Access is governed **downstream** by the IdP: a user can only mint a token for a
 capture_user_credential = true          # persist the IdP refresh token at login
 obo_grant_profile = "entra"             # "entra" | "rfc8693" — how tokens are minted
 ```
+
+For Docker, edit the existing `[oidc]` section in the
+[shared config](docker.md#shared-bootstrap-config), retaining its encryption
+key. Complete [OIDC provider setup](oidc.md), grant the downstream permissions
+below, then restart the console and active nodes. Users must sign in again
+after capture is enabled to store a refresh credential. OIDC login and
+per-server MCP OAuth have separate callback URLs; OBO uses the OIDC login
+callback and has no per-server browser consent step.
 
 - **`capture_user_credential`** (default `false`): when enabled, Turnstone appends `offline_access` to the login scopes and stores the returned refresh token, encrypted with the same `[security] mcp_token_encryption_key` as `oauth_user` tokens. **The encryption key is required** — Turnstone refuses to start with an `oauth_obo` row (or capture enabled) and no key.
 - **`obo_grant_profile`** picks the mint mechanism (the IdP determines which one is valid; this is deployment-wide, not per-server):
@@ -199,6 +316,8 @@ Every transition that changes what a stored row *means* deletes the rows outrigh
 
 | Symptom | Likely cause | Action |
 |---|---|---|
+| `MCP OAuth is not configured on this node.` / encryption-key configuration hint | Console or node did not load the shared TOML file | Check the read-only mount, `TURNSTONE_CONFIG`, file ownership, and the same key on every consumer; restart after TOML edits or recreate after changing Compose mounts/environment. |
+| OAuth start says the redirect base is not configured | Missing or invalid `[oidc] redirect_base` | Set the public HTTPS origin, with no path/query/fragment, even for local-auth installs; restart the console and nodes. |
 | `mcp_consent_required` even after consenting | Token persistence failed, or refresh-token rejected by AS | Check audit log for `mcp_server.oauth.persist_failed` or `mcp_server.oauth.token_revoked`. Re-consent via settings modal. |
 | `mcp_token_undecryptable_key_unknown` | Encryption key rotated without keeping the previous key in the keyring | Add the previous key back to `mcp_token_encryption_keys` until all rows have been re-encrypted, then drop. |
 | `mcp_oauth_url_insecure` | MCP server URL is `http://` (not `https://`) on a non-loopback host | Use `https://`. Per-user bearers must not transit cleartext. |
@@ -213,4 +332,4 @@ Every transition that changes what a stored row *means* deletes the rows outrigh
 | **`oauth_obo`**: "Sign in to Turnstone again" on one server | Captured credential missing/rejected, or a Conditional Access challenge | User re-logs into Turnstone (re-captures the credential). If it persists, check the IdP grant / CA policy. |
 | **`oauth_obo`**: tools don't appear at all for a user | User has not signed in since `capture_user_credential` was enabled (no credential captured) | User logs out and back in via OIDC so the refresh credential is captured. |
 
-See also: `docs/operations/mcp-oauth-headless.md` for the cron / channel-driven run caveat.
+See also: [headless OAuth operation](operations/mcp-oauth-headless.md) for the cron / channel-driven run caveat.

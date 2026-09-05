@@ -2,6 +2,11 @@
 
 Turnstone integrates with the [official MCP Registry](https://registry.modelcontextprotocol.io) to let administrators discover and install MCP servers directly from the console admin panel.
 
+For static headers, per-user OAuth, sign-in passthrough, and stdio credentials,
+see [MCP authentication and OAuth setup](mcp-oauth.md), including a remote
+Docker/GitHub walkthrough. Installing a registry entry does not authorize each
+user's account.
+
 ## Overview
 
 The MCP Registry is maintained by the [Agentic AI Foundation](https://www.linuxfoundation.org/press/linux-foundation-announces-the-formation-of-the-agentic-ai-foundation) (Linux Foundation) and serves as the canonical discovery layer for MCP servers. Turnstone queries its REST API (v0.1) for server metadata and provides a one-click install flow.

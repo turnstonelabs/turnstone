@@ -13,10 +13,11 @@
 #   4. builds the image
 #   5. picks free host ports for Caddy (prefers 443) and PostgreSQL
 #   6. writes a .env with a generated JWT secret + Postgres password
-#   7. pins the node count and runs `docker compose up -d`, then prints how to
+#   7. optionally creates shared config.toml for OAuth/SSO and delegation
+#   8. pins the choices and runs `docker compose up -d`, then prints how to
 #      finish setup in the UI
 #
-# Re-running is safe: it updates the checkout and keeps an existing .env.
+# Re-running is safe: it updates the checkout and keeps existing .env/config.toml.
 #
 # Env overrides:
 #   TURNSTONE_DIR     where to clone (default: $HOME/turnstone)
@@ -56,7 +57,7 @@ trap on_error ERR
 ask() {
     local prompt="$1" default="${2:-y}" ans hint
     [ "$default" = y ] && hint="Y/n" || hint="y/N"
-    if [ ! -r /dev/tty ]; then
+    if ! ( : </dev/tty ) 2>/dev/null; then
         warn "non-interactive shell; assuming '$default' for: $prompt"
         [ "$default" = y ]; return
     fi
@@ -285,7 +286,7 @@ ensure_compose() {
 NODE_COUNT=10
 
 pick_node_count() {
-    if [ ! -r /dev/tty ]; then
+    if ! ( : </dev/tty ) 2>/dev/null; then
         info "Non-interactive shell — starting the recommended 10-node cluster."
         return
     fi
@@ -310,34 +311,70 @@ EOF
     info "Will start ${NODE_COUNT} server node(s)."
 }
 
-# Pin the chosen count: park nodes above NODE_COUNT behind the "extra" profile in
-# an auto-loaded compose.override.yaml, so a later *plain* `docker compose up -d`
-# keeps the same count (Compose merges compose.override.yaml automatically). A
-# full (10) choice removes the file. Never clobbers an override we didn't write.
-OVERRIDE_MARKER="# turnstone run.sh — node-count limiter (safe to delete)"
-write_node_override() {
-    local f="$INSTALL_DIR/compose.override.yaml" k
-    if [ -f "$f" ] && ! head -1 "$f" 2>/dev/null | grep -qF "$OVERRIDE_MARKER"; then
-        warn "$f exists and isn't managed by this installer — leaving it as-is."
+# Save choices in the auto-loaded override so plain `docker compose up -d`
+# retains both the node count and optional config. Accept the old marker on
+# upgrades, but never replace an override written by the operator.
+OVERRIDE_MARKER="# turnstone run.sh — saved deployment choices"
+LEGACY_OVERRIDE_MARKER="# turnstone run.sh — node-count limiter (safe to delete)"
+CONFIG_MARKER="# Shared bootstrap config enabled."
+CONFIG_ENABLED=0
+managed_override() {
+    local first
+    first="$(head -1 "$INSTALL_DIR/compose.override.yaml" 2>/dev/null || true)"
+    [ "$first" = "$OVERRIDE_MARKER" ] || [ "$first" = "$LEGACY_OVERRIDE_MARKER" ]
+}
+
+find_custom_override() {
+    local f
+    for f in "$INSTALL_DIR"/{compose,docker-compose}.override.{yaml,yml}; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        if [ "$f" = "$INSTALL_DIR/compose.override.yaml" ] && [ ! -L "$f" ] && managed_override; then
+            continue
+        fi
+        printf '%s' "$f"
+        return 0
+    done
+    return 1
+}
+
+write_compose_override() {
+    local f="$INSTALL_DIR/compose.override.yaml" k custom
+    if custom="$(find_custom_override)"; then
+        warn "$custom exists and isn't managed by this installer — leaving it as-is."
         warn "A plain 'docker compose up -d' may not match your ${NODE_COUNT}-node choice."
         return
     fi
-    if [ "$NODE_COUNT" -ge 10 ]; then
+    if [ "$NODE_COUNT" -ge 10 ] && [ "$CONFIG_ENABLED" -eq 0 ]; then
         rm -f "$f"
         return
     fi
     {
         echo "$OVERRIDE_MARKER"
-        echo "# Keeps 'docker compose up -d' at ${NODE_COUNT} node(s). Nodes above"
-        echo "# node-${NODE_COUNT} are parked behind the 'extra' profile:"
-        echo "#   docker compose --profile extra up -d        # start all 10"
-        echo "#   docker compose up -d node-$((NODE_COUNT + 1))                 # start one more"
+        [ "$CONFIG_ENABLED" -eq 0 ] || echo "$CONFIG_MARKER"
+        if [ "$NODE_COUNT" -lt 10 ]; then
+            echo "# Nodes above node-${NODE_COUNT} use the 'extra' profile."
+            echo "# docker compose --profile extra up -d  # start all 10"
+        else
+            echo "# All 10 nodes are enabled."
+        fi
         echo "services:"
-        for k in $(seq $((NODE_COUNT + 1)) 10); do
-            printf '  node-%s: { profiles: ["extra"] }\n' "$k"
+        if [ "$CONFIG_ENABLED" -eq 1 ]; then
+            echo "  console:"
+            echo "    extends: { file: compose.config.yaml, service: console }"
+        fi
+        for k in $(seq 1 10); do
+            if [ "$CONFIG_ENABLED" -eq 1 ] || [ "$k" -gt "$NODE_COUNT" ]; then
+                printf '  node-%s:\n' "$k"
+                if [ "$CONFIG_ENABLED" -eq 1 ]; then
+                    printf '    extends: { file: compose.config.yaml, service: node-%s }\n' "$k"
+                fi
+                if [ "$k" -gt "$NODE_COUNT" ]; then
+                    echo '    profiles: ["extra"]'
+                fi
+            fi
         done
     } >"$f"
-    info "Pinned ${NODE_COUNT} node(s) in $f (a later 'docker compose up -d' honors it)."
+    info "Saved deployment choices in $f (a later 'docker compose up -d' honors them)."
 }
 
 # -- ports --------------------------------------------------------------------
@@ -430,6 +467,74 @@ EOF
     info "Wrote $INSTALL_DIR/.env (generated JWT secret + Postgres password, mode 600)."
 }
 
+# -- optional shared bootstrap config -----------------------------------------
+create_shared_config() {
+    local f="$INSTALL_DIR/config.toml" origin="$1" scratch
+    scratch="$(mktemp -d "$INSTALL_DIR/.turnstone-bootstrap.XXXXXX")"
+    # Only the inner directory is mounted. Its writable mode permits remapped
+    # container root to create the file; the outer 0700 directory prevents
+    # other host users from reaching it.
+    mkdir -m 0777 -- "$scratch/output"
+    # Generate inside the image so ownership matches its non-root user,
+    # including Docker user namespace remapping.
+    if ! $DOCKER run --rm --network none --user root --entrypoint python \
+        -v "$scratch/output:/bootstrap:rw,z" turnstone:local \
+        -m turnstone.deploy.bootstrap_config /bootstrap/config.toml "$origin" --owner turnstone; then
+        rm -rf -- "$scratch"
+        die "Could not create shared config. Check the HTTPS origin and Docker's write access to the install directory."
+    fi
+    # Rename within the same filesystem: hard links can be refused when the
+    # image's UID differs from the installing user's UID.
+    if ! mv -nT -- "$scratch/output/config.toml" "$f" || [ -e "$scratch/output/config.toml" ]; then
+        rm -rf -- "$scratch"
+        die "Could not install $f. Check directory permissions and whether the destination already exists."
+    fi
+    rm -rf -- "$scratch"
+    info "Created $f (mode 600, owned by the container's turnstone user). Back it up privately."
+    info "You may need sudo to edit or back up this file on the host."
+}
+
+prepare_shared_config() {
+    local f="$INSTALL_DIR/config.toml" origin custom
+    if custom="$(find_custom_override)"; then
+        warn "Shared-config setup skipped: $custom is managed by you. See docs/docker.md#shared-bootstrap-config."
+        return
+    fi
+    if managed_override && grep -qxF "$CONFIG_MARKER" "$INSTALL_DIR/compose.override.yaml"; then
+        CONFIG_ENABLED=1
+        # Losing the key must never silently generate a replacement on re-run.
+        [ -f "$f" ] || die "Saved config is missing: $f. Restore it from backup before restarting."
+        info "Keeping shared $f (including its encryption key)."
+    elif ask "Prepare shared config.toml for OAuth/SSO (MCP, login, model gateways)?" n; then
+        CONFIG_ENABLED=1
+        if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+            printf 'Dashboard HTTPS origin (e.g. https://turnstone.example.com): ' >/dev/tty
+            read -r origin </dev/tty || die "A dashboard HTTPS origin is required."
+            create_shared_config "$origin"
+        else
+            info "Keeping existing $f without changing its contents or permissions."
+        fi
+    else
+        return 0
+    fi
+    [ -f "$f" ] || die "Shared config must be a regular file: $f."
+    # Check the actual service user's access before saving the mount or starting
+    # services. Suppress parser details because the document contains secrets.
+    if ! $DOCKER run --rm -i --network none --entrypoint python \
+        -v "$f:/run/turnstone/config.toml:ro,z" turnstone:local - <<'PY'
+import sys
+import tomllib
+try:
+    with open("/run/turnstone/config.toml", "rb") as stream:
+        tomllib.load(stream)
+except (OSError, ValueError):
+    sys.exit("Shared config must be valid TOML readable by the container's turnstone user.")
+PY
+    then
+        die "Cannot load $f. Fix its permissions or TOML before re-running; see docs/docker.md."
+    fi
+}
+
 # -- summary ------------------------------------------------------------------
 print_done() {
     local url scale
@@ -473,6 +578,10 @@ ${GREEN}${BOLD}Turnstone is running${RESET} (${NODE_COUNT} node$([ "$NODE_COUNT"
   Troubleshoot  ${DIM}pipx run --spec turnstone turnstone-doctor --dir $INSTALL_DIR${RESET}
                 LLM-backed diagnostics for this install (read-only; needs Python)
 EOF
+    if [ "$CONFIG_ENABLED" -eq 1 ]; then
+        info "Shared config: $INSTALL_DIR/config.toml (read-only in the console and all nodes)."
+        info "Configure OAuth/SSO and delegation: https://github.com/turnstonelabs/turnstone/blob/main/docs/docker.md#shared-bootstrap-config"
+    fi
 }
 
 # -- main ---------------------------------------------------------------------
@@ -497,7 +606,8 @@ main() {
 
     prepare_env
     info "Ports — dashboard (Caddy): ${CADDY_PORT}, PostgreSQL: 127.0.0.1:${PG_PORT}"
-    write_node_override
+    prepare_shared_config
+    write_compose_override
 
     info "Starting the stack…"
     # Plain `up -d` (honoring compose.override.yaml) + --remove-orphans so a
@@ -509,4 +619,6 @@ main() {
     print_done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    main "$@"
+fi

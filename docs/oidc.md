@@ -25,9 +25,43 @@ Auth0, OneLogin, and others that publish a
 
 ## Configuration
 
-OIDC is configured via environment variables (preferred) or the `[oidc]`
-section of `config.toml`. Environment variables take precedence when both
-are set.
+Configure OIDC in the `[oidc]` section of the shared `config.toml` used by the
+console and server nodes. Docker deployments can prepare and mount this file
+through the installer's optional OAuth/SSO step or the
+[shared config overlay](docker.md#shared-bootstrap-config). For other
+deployments, select the file with `TURNSTONE_CONFIG` on each process.
+
+### Shared config example
+
+Edit the existing `[oidc]` section in place, preserving other sections and
+the token encryption key. Replace the provider placeholders before enabling
+SSO; create a local admin first.
+
+```toml
+[oidc]
+issuer = "https://identity.example.com"
+client_id = "your-client-id"
+client_secret = "your-client-secret"
+redirect_base = "https://app.example.com"
+provider_name = "SSO"
+password_enabled = true
+capture_user_credential = false
+```
+
+SSO login alone does not need refresh-credential capture. For delegation,
+follow [MCP sign-in passthrough](mcp-oauth.md#auth_typeoauth_obo--single-credential-sign-in-passthrough)
+or [model gateway credentials](#model-gateway-credentials). Both reuse this
+file and the shared token encryption key. After changing bootstrap config,
+restart every consumer. For Docker, restart after TOML edits and recreate
+services after changing Compose mounts or environment variables; see the
+[shared config instructions](docker.md#shared-bootstrap-config).
+
+### Environment variable reference
+
+Environment variables remain supported and take precedence over TOML when
+both are set. Keep the client secret in the private TOML file rather than
+inherited process environments. Setting `TURNSTONE_CONFIG` selects that file;
+the installer does not copy OIDC variables from `.env` into the services.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -42,6 +76,8 @@ are set.
 | `TURNSTONE_OIDC_REDIRECT_BASE` | Yes | — | Externally-reachable origin for the OIDC redirect URI (e.g. `https://app.example.com`). Without this, OIDC will refuse to start. The previous Host-header fallback was unsafe under permissive reverse proxies. |
 | `TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS` | No | — | Comma-separated list of additional hostnames whose endpoints the IdP discovery document is allowed to reference. See [Cross-host endpoints](#cross-host-endpoints). |
 | `TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK` | No | `false` | Allow the issuer (and its discovered endpoints) to resolve to private/internal addresses — needed for a self-hosted IdP on an internal network. See [Self-hosted and internal IdPs](#self-hosted-and-internal-idps). |
+| `TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL` | No | `false` | Capture an encrypted refresh credential at SSO login for delegated MCP/model access; requires the shared token encryption key. |
+| `TURNSTONE_OIDC_OBO_GRANT_PROFILE` | No | `entra` | Token minting profile supported by the IdP: `entra` or `rfc8693`. See [MCP delegation](mcp-oauth.md#deployment-configuration-oidc-in-configtoml). |
 
 All four required fields — issuer, client ID, client secret, and
 `TURNSTONE_OIDC_REDIRECT_BASE` — must be set. If any are missing OIDC
@@ -50,19 +86,24 @@ is missing) and the login screen shows only the password form.
 
 ### Redirect base (required)
 
-`TURNSTONE_OIDC_REDIRECT_BASE` pins the redirect URI sent to the identity
-provider to a known externally-visible origin. Set it to the public origin
-of your Turnstone deployment:
+`[oidc] redirect_base` (or `TURNSTONE_OIDC_REDIRECT_BASE`) pins the redirect
+URI sent to the identity provider to a known externally-visible origin. Set
+it to the public origin of your Turnstone deployment:
 
-```bash
-TURNSTONE_OIDC_REDIRECT_BASE=https://app.example.com
+```toml
+[oidc]
+redirect_base = "https://app.example.com"
 ```
 
 The resulting callback URL will be
 `https://app.example.com/v1/api/auth/oidc/callback` — register this as the
 authorized redirect URI in your identity provider.
 
-OIDC will refuse to start when this variable is unset. There is no
+Per-user MCP authorization uses the same origin with a different path,
+`/v1/api/mcp/oauth/callback`, registered with the MCP provider. Setting only
+`redirect_base` supports that flow without enabling SSO.
+
+OIDC will refuse to start when this setting is unset. There is no
 Host-header fallback: a permissive reverse proxy or direct backend access
 would otherwise let an attacker spoof `Host` and steer the IdP redirect
 to a callback origin they control.
@@ -92,8 +133,9 @@ on `graph.microsoft.com`, distinct from the issuer host.)
 For other IdPs whose discovery document references a non-issuer host,
 extend the allow-list explicitly:
 
-```bash
-TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS=token.example.com,keys.example.com
+```toml
+[oidc]
+trusted_endpoint_hosts = ["token.example.com", "keys.example.com"]
 ```
 
 The same scheme / no-userinfo / SSRF rules apply to allow-listed hosts —
@@ -133,11 +175,19 @@ reaches, so an IPv6 transition address (NAT64, 6to4, Teredo) wrapping
 an internal IPv4 is treated exactly as that IPv4 would be. The HTTPS
 requirement and the same-origin endpoint checks are unaffected.
 
-This knob only affects the login-flow IdP configured here. OAuth
-endpoints advertised by remote MCP servers are untrusted input and are
-always held to the strict public-address rule.
+This knob only affects the login-flow IdP configured here. OAuth endpoints
+advertised by remote MCP servers use the separate runtime setting
+[`mcp.oauth_allow_private_network`](mcp-oauth.md#mcp-servers-on-a-private-network),
+which also defaults to the strict public-address rule.
 
 ### Model gateway credentials
+
+For Docker, use the same [shared config](docker.md#shared-bootstrap-config)
+for the console and every node. Enable credential capture for users who
+will use delegated models, and have them sign in again. Application identity
+(`entra_app`) uses the registration's own permissions and needs no user
+credential capture. Configure model auth modes and audiences in the admin
+Models tab, following the runtime settings linked below.
 
 The same OIDC registration can authenticate model gateways. A model definition
 with `auth_mode = "entra_obo"` (Entra grant profile) or `auth_mode =
@@ -196,29 +246,14 @@ start; the console starts but withholds its coordinator subsystem and shows
 the key requirement as the remediation error instead of failing silently at
 call time.
 
-### config.toml alternative
-
-```toml
-[oidc]
-issuer = "https://accounts.google.com"
-client_id = "your-client-id"
-client_secret = "your-client-secret"
-scopes = "openid email profile"
-provider_name = "Google"
-role_claim = "groups"
-password_enabled = true
-redirect_base = "https://app.example.com"
-# Self-hosted IdP on an internal network (see "Self-hosted and internal IdPs")
-allow_private_network = false
-
-[oidc.role_map]
-admin = "builtin-admin"
-engineering = "builtin-operator"
-```
-
 ---
 
 ## Provider-Specific Setup
+
+Merge these fields into your existing `[oidc]` section, retaining its
+`redirect_base` and any delegation settings. Role mappings below are examples;
+choose the group/role claims and Turnstone permissions appropriate to your
+organization.
 
 ### Google
 
@@ -230,11 +265,12 @@ engineering = "builtin-operator"
    `https://your-turnstone-host/v1/api/auth/oidc/callback`
 5. Copy the **Client ID** and **Client secret**
 
-```bash
-TURNSTONE_OIDC_ISSUER=https://accounts.google.com
-TURNSTONE_OIDC_CLIENT_ID=123456789.apps.googleusercontent.com
-TURNSTONE_OIDC_CLIENT_SECRET=GOCSPX-...
-TURNSTONE_OIDC_PROVIDER_NAME=Google
+```toml
+[oidc]
+issuer = "https://accounts.google.com"
+client_id = "123456789.apps.googleusercontent.com"
+client_secret = "GOCSPX-..."
+provider_name = "Google"
 ```
 
 ### Okta
@@ -248,13 +284,14 @@ TURNSTONE_OIDC_PROVIDER_NAME=Google
 5. Note the **Issuer** (your Okta domain, e.g.
    `https://dev-123456.okta.com`)
 
-```bash
-TURNSTONE_OIDC_ISSUER=https://dev-123456.okta.com
-TURNSTONE_OIDC_CLIENT_ID=0oaXXXXXXXXXXXXX
-TURNSTONE_OIDC_CLIENT_SECRET=...
-TURNSTONE_OIDC_PROVIDER_NAME=Okta
-TURNSTONE_OIDC_ROLE_CLAIM=groups
-TURNSTONE_OIDC_ROLE_MAP="admin:builtin-admin,everyone:builtin-operator"
+```toml
+[oidc]
+issuer = "https://dev-123456.okta.com"
+client_id = "0oaXXXXXXXXXXXXX"
+client_secret = "..."
+provider_name = "Okta"
+role_claim = "groups"
+role_map = {admin = "builtin-admin", everyone = "builtin-operator"}
 ```
 
 ### Azure AD (Entra ID)
@@ -267,13 +304,14 @@ TURNSTONE_OIDC_ROLE_MAP="admin:builtin-admin,everyone:builtin-operator"
 4. The issuer URL is
    `https://login.microsoftonline.com/{tenant-id}/v2.0`
 
-```bash
-TURNSTONE_OIDC_ISSUER=https://login.microsoftonline.com/YOUR_TENANT_ID/v2.0
-TURNSTONE_OIDC_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-TURNSTONE_OIDC_CLIENT_SECRET=...
-TURNSTONE_OIDC_PROVIDER_NAME="Azure AD"
-TURNSTONE_OIDC_ROLE_CLAIM=roles
-TURNSTONE_OIDC_ROLE_MAP="Admin:builtin-admin,User:builtin-operator"
+```toml
+[oidc]
+issuer = "https://login.microsoftonline.com/YOUR_TENANT_ID/v2.0"
+client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+client_secret = "..."
+provider_name = "Azure AD"
+role_claim = "roles"
+role_map = {Admin = "builtin-admin", User = "builtin-operator"}
 ```
 
 ### Keycloak
@@ -287,13 +325,14 @@ TURNSTONE_OIDC_ROLE_MAP="Admin:builtin-admin,User:builtin-operator"
 6. The issuer URL is
    `https://keycloak.example.com/realms/your-realm`
 
-```bash
-TURNSTONE_OIDC_ISSUER=https://keycloak.example.com/realms/your-realm
-TURNSTONE_OIDC_CLIENT_ID=turnstone
-TURNSTONE_OIDC_CLIENT_SECRET=...
-TURNSTONE_OIDC_PROVIDER_NAME=Keycloak
-TURNSTONE_OIDC_ROLE_CLAIM=realm_access.roles
-TURNSTONE_OIDC_ROLE_MAP="admin:builtin-admin,operator:builtin-operator"
+```toml
+[oidc]
+issuer = "https://keycloak.example.com/realms/your-realm"
+client_id = "turnstone"
+client_secret = "..."
+provider_name = "Keycloak"
+role_claim = "realm_access.roles"
+role_map = {admin = "builtin-admin", operator = "builtin-operator"}
 ```
 
 ---
@@ -306,17 +345,23 @@ the `builtin-viewer` role (read-only access) by default.
 
 ### Configuration
 
-Set `TURNSTONE_OIDC_ROLE_CLAIM` to the name of the claim in the ID token
-that contains the user's group or role memberships. Then set
-`TURNSTONE_OIDC_ROLE_MAP` to map claim values to Turnstone role IDs.
+Set `[oidc] role_claim` to the name of the claim in the ID token that
+contains the user's group or role memberships. Then map claim values to
+Turnstone role IDs in `role_map`:
 
-The role map is a comma-separated list of `claim_value:turnstone_role`
-pairs:
+```toml
+[oidc]
+role_claim = "groups"
 
-```bash
-TURNSTONE_OIDC_ROLE_CLAIM=groups
-TURNSTONE_OIDC_ROLE_MAP="admin:builtin-admin,engineering:builtin-operator,viewer:builtin-viewer"
+[oidc.role_map]
+admin = "builtin-admin"
+engineering = "builtin-operator"
+viewer = "builtin-viewer"
 ```
+
+The environment equivalent uses `TURNSTONE_OIDC_ROLE_CLAIM=groups` and a
+comma-separated `TURNSTONE_OIDC_ROLE_MAP` such as
+`admin:builtin-admin,engineering:builtin-operator,viewer:builtin-viewer`.
 
 ### Behavior
 
@@ -383,8 +428,9 @@ every login.
 
 To enforce OIDC for all logins and hide the password form, set:
 
-```bash
-TURNSTONE_OIDC_PASSWORD_ENABLED=false
+```toml
+[oidc]
+password_enabled = false
 ```
 
 In this mode the login screen shows only the "Continue with SSO" button.
@@ -526,18 +572,18 @@ callback validation. Entries are automatically cleaned up after 5 minutes.
 
 ### "OIDC not configured"
 
-All four required environment variables must be set:
-`TURNSTONE_OIDC_ISSUER`, `TURNSTONE_OIDC_CLIENT_ID`,
-`TURNSTONE_OIDC_CLIENT_SECRET`, and `TURNSTONE_OIDC_REDIRECT_BASE`.
-Check that none are empty or whitespace-only.
+All four required `[oidc]` fields must be set: `issuer`, `client_id`,
+`client_secret`, and `redirect_base`. Check that none are empty or
+whitespace-only, that `TURNSTONE_CONFIG` selects the intended file, and that
+no environment overrides replace its values.
 
 ### "OIDC enabled but TURNSTONE_OIDC_REDIRECT_BASE is unset"
 
-This error is logged when the three credential variables are set but
-`TURNSTONE_OIDC_REDIRECT_BASE` is missing. OIDC is disabled at startup
-to prevent Host-header-derived redirect URI spoofing. Set the variable
-to your service's externally-visible origin (e.g.
-`https://app.example.com`) and restart the server. See
+This error is logged when the three credential fields are set but
+`redirect_base` is missing from both TOML and the environment. OIDC is
+disabled at startup to prevent Host-header-derived redirect URI spoofing.
+Set `[oidc] redirect_base` to your service's externally-visible origin
+(e.g. `https://app.example.com`) and restart the consumers. See
 [Redirect base](#redirect-base-required) for the rationale.
 
 ### Discovery silently disables OIDC with "host does not match issuer"
@@ -545,7 +591,7 @@ to your service's externally-visible origin (e.g.
 The IdP discovery document points `token_endpoint`, `jwks_uri`, or
 `userinfo_endpoint` at a hostname that doesn't share the issuer's
 origin. If the IdP is legitimate, add the additional hostname(s) to
-`TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS`. Google is allow-listed
+`[oidc] trusted_endpoint_hosts`. Google and Entra endpoints are allow-listed
 automatically; see [Cross-host endpoints](#cross-host-endpoints).
 
 ### "Login session expired"
@@ -587,9 +633,9 @@ The redirect URI configured at the identity provider must exactly match
 
 Check that:
 
-1. `TURNSTONE_OIDC_ROLE_CLAIM` matches the exact claim name in the ID
+1. `[oidc] role_claim` matches the exact claim name in the ID
    token (case-sensitive)
-2. `TURNSTONE_OIDC_ROLE_MAP` maps the correct claim values to valid
+2. `[oidc] role_map` maps the correct claim values to valid
    Turnstone role IDs
 3. The roles referenced in the map exist in the database (check the
    admin panel > Roles tab)

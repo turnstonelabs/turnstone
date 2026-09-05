@@ -133,6 +133,10 @@ LLM; add model backends from the console UI.
 For production (released images from ghcr.io, real secrets required), use the
 bundled stack: `docker compose -f turnstone/deploy/compose.yaml up`.
 
+For optional SSO, per-user MCP OAuth, or model gateway authentication, the
+installer and both stacks support one [shared authentication config](docs/docker.md#shared-bootstrap-config).
+The default local-login setup needs no additional configuration.
+
 See [QUICKSTART.md](QUICKSTART.md) for the install + troubleshooting walkthrough and [docs/docker.md](docs/docker.md) for Docker configuration.
 
 ### Programmatic (SDK)
@@ -148,7 +152,7 @@ with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
 
 ## Tools
 
-Built-in tools for shell, files, search, web, memory, notifications, and autonomous sub-agents — plus external tools via [MCP](https://modelcontextprotocol.io/) with native deferred loading. See [docs/tools.md](docs/tools.md) for the full reference and [docs/mcp-registry.md](docs/mcp-registry.md) for MCP configuration.
+Built-in tools for shell, files, search, web, memory, notifications, and autonomous sub-agents — plus external tools via [MCP](https://modelcontextprotocol.io/) with native deferred loading. See [docs/tools.md](docs/tools.md) for the full reference, [docs/mcp-registry.md](docs/mcp-registry.md) for MCP configuration, and [MCP authentication](docs/mcp-oauth.md) for auth choices and remote Docker/GitHub OAuth setup.
 
 ## Architecture
 
@@ -202,6 +206,7 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 | Eval harness | [docs/eval.md](docs/eval.md) |
 | Tools reference | [docs/tools.md](docs/tools.md) |
 | MCP integration | [docs/mcp-registry.md](docs/mcp-registry.md) |
+| MCP authentication / OAuth | [docs/mcp-oauth.md](docs/mcp-oauth.md) |
 
 ## Requirements
 

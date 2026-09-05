@@ -83,6 +83,15 @@ base_url = "http://localhost:8000/v1"   # your local model endpoint
 model = "qwen3-32b"
 ```
 
+If the cluster uses OAuth, SSO, or model gateway authentication, also copy
+the applicable `[security]` and `[oidc]` sections from its
+[shared bootstrap config](#shared-bootstrap-config) into this host's file.
+Keep the same encryption key and authentication settings as the console and
+containerized nodes, while retaining this host's database/model settings.
+The Compose overlay only mounts the file into the Compose services; joined
+hosts need their own private copy, updated whenever those shared settings
+change.
+
 Then start the server. The node identity isn't a secret, so it stays on the
 command line:
 
@@ -188,9 +197,148 @@ See [tls.md](tls.md) for details.
 
 ## Configuration
 
-Everything is configured with environment variables in `.env` (copy from
-[`.env.example`](../.env.example)). The dev stack needs none of them — they're
-overrides.
+Container wiring and ports are configured in `.env` (copy from
+[`.env.example`](../.env.example)). The dev stack needs none of them. Bootstrap
+settings such as SSO client credentials and token encryption keys use the
+shared TOML file below.
+
+### Shared bootstrap config
+
+Both stacks ship an optional `compose.config.yaml` overlay. It mounts one
+`config.toml`, beside that stack's `compose.yaml`, read-only at
+`/run/turnstone/config.toml` in the console and **every server node**. Each
+consumer selects that file with `TURNSTONE_CONFIG`. The channel gateway and
+supporting services do not receive it. The default stack needs no TOML file.
+The bind mount refuses a missing source instead of creating a directory.
+
+Use the same file for the authentication features your deployment needs:
+
+| Feature | Shared config and next step |
+|---|---|
+| Local login, API-key models, static MCP credentials | The default install needs no shared authentication config. |
+| Personal MCP accounts (`oauth_user`) | Set the encryption key and HTTPS `redirect_base`; follow [MCP authorization](mcp-oauth.md#remote-docker-setup). Local login is sufficient. |
+| SSO login | Set the `[oidc]` issuer, client ID, client secret, and `redirect_base`; follow [OIDC setup](oidc.md). SSO alone does not capture refresh credentials. |
+| SSO delegation to MCP/model backends | Add the encryption key, opt into `capture_user_credential`, and choose the IdP's `obo_grant_profile`; configure [MCP passthrough](mcp-oauth.md#auth_typeoauth_obo--single-credential-sign-in-passthrough) or [delegated models](oidc.md#model-gateway-credentials). |
+| Application identity for model gateways (`entra_app`) | Use the encryption key and Entra OIDC registration with the `entra` grant profile; configure [model gateway credentials](oidc.md#model-gateway-credentials). User credential capture is unnecessary. |
+
+Each feature also needs its provider registration and permissions. Configure
+MCP servers and model definitions in their admin tabs; model audiences are
+permitted through the runtime setting `model.auth_audience_allowlist`.
+
+**Using `run.sh`:** accept the optional OAuth/SSO shared-config prompt. If no
+`config.toml` exists, the installer asks for the dashboard's HTTPS origin and
+generates one Fernet key, with commented SSO and delegation fields. A new file
+keeps local password login available; SSO and credential capture remain off.
+Create your local admin before filling in SSO credentials, then follow the
+applicable guide above and restart the services after editing the file.
+
+The installer saves the mount alongside the node count in
+`compose.override.yaml`, so later plain `docker compose up -d` commands retain
+both choices. Reruns preserve the file and key; a missing previously enabled
+file requires restoring the backup. An override written by you is left
+intact; use the manual overlay flow below to incorporate it.
+This includes `compose.override.yml` and `docker-compose.override.*` files.
+To disable the installer-managed mount, remove its generated
+`compose.override.yaml`, rerun `run.sh` to reselect your node count, and
+decline shared config; retain the TOML/key backup.
+
+**Manual setup:** work in the directory containing your stack's `compose.yaml`.
+For the dev stack, build the image with `docker compose build` and set:
+
+```bash
+turnstone_image=turnstone:local
+```
+
+For production, work in `turnstone/deploy/` (or the directory where you copied
+the bundled deployment files), provide its required `.env`, and select the
+same image tag as the stack:
+
+```bash
+turnstone_image="$(docker compose config --images | grep -m 1 '^ghcr.io/turnstonelabs/turnstone:')"
+docker pull "$turnstone_image"
+```
+
+Use deployment files and an image from the same Turnstone release. The
+generator below requires the `turnstone.deploy.bootstrap_config` module.
+If an older pinned tag reports that the module is missing, upgrade the image
+or prepare `config.toml` using the fields and key-generation command in
+[`turnstone.example.toml`](../turnstone.example.toml), then follow the
+existing-file ownership instructions below. Preserve any existing key.
+
+This recipe uses GNU `mv` for its `-nT` options. On macOS, use `gmv` from
+[GNU coreutils](https://formulae.brew.sh/formula/coreutils) for the move step;
+the system `mv` does not support `-T`.
+
+To create a **new** config, replace the HTTPS origin in this command with the
+address users actually open. The helper writes privately as the image's
+`turnstone` account, including when Docker maps container UIDs on the host:
+
+```bash
+bootstrap_dir="$(mktemp -d "$PWD/.turnstone-bootstrap.XXXXXX")"
+mkdir -m 0777 -- "$bootstrap_dir/output"
+docker run --rm --network none --user root --entrypoint python \
+  -v "$bootstrap_dir/output:/bootstrap:rw,z" "$turnstone_image" \
+  -m turnstone.deploy.bootstrap_config /bootstrap/config.toml \
+  https://turnstone.example.com --owner turnstone
+mv -nT -- "$bootstrap_dir/output/config.toml" ./config.toml
+rm -rf -- "$bootstrap_dir"
+```
+
+The outer directory stays private (`0700`); only its writable inner directory
+is exposed to the bootstrap container. Other host users cannot traverse the
+outer directory, and the generated key file is `0600` throughout.
+
+The final move uses GNU `mv`'s no-clobber mode and keeps an existing file. To
+reuse an existing configuration, place it at `./config.toml` instead; keep its
+encryption key.
+[`turnstone.example.toml`](../turnstone.example.toml) lists the bootstrap fields.
+The file must be readable by the image's `turnstone` user, with mode `0600`.
+For an existing file with different ownership on ordinary or rootless
+Docker, adjust it through the container:
+
+```bash
+docker run --rm --network none --user root --entrypoint sh \
+  -v "$PWD/config.toml:/run/turnstone/config.toml:rw,z" "$turnstone_image" \
+  -c 'chown turnstone:turnstone /run/turnstone/config.toml && chmod 600 /run/turnstone/config.toml'
+```
+
+With rootful `userns-remap`, an existing host-owned file can lie outside the
+container's UID/GID mapping, so the container cannot change its owner. Use
+host root to assign the service user's mapped UID/GID and mode `0600` instead;
+derive those IDs from your daemon's mapping and the image's `turnstone`
+account. See [Docker's bind-mount ownership requirements](https://docs.docker.com/engine/security/userns-remap/#user-namespace-known-limitations).
+
+Enable the overlay when starting the stack:
+
+```bash
+docker compose -f compose.yaml -f compose.config.yaml up -d
+```
+
+Keep those `-f` arguments on subsequent commands. If you have an existing
+`compose.override.yaml`, include it too: explicit `-f` arguments disable the
+automatic override selection. Do not replace an override containing other
+deployment choices.
+
+Back up `config.toml` privately with the database. Its host owner may be a
+mapped container UID, so host-side edits and backups may require `sudo`.
+After editing only this file, **restart the console and all active server
+nodes** using `docker compose restart` with those service names and the same
+Compose files. A running container can retain the old file after an editor's
+atomic save; restarting the container remounts it and reloads the settings.
+When adding or changing Compose mounts or environment variables, recreate
+the affected services with `up -d --force-recreate` instead; a restart does
+not apply changes to the Compose configuration. Do not generate a new key
+on each node or on each restart.
+
+The key stays out of `.env`, runtime settings, source control, and image build
+contexts. A read-only mount protects against writes, but a shell running as
+the service user can still read it; file-backed secrets are not a sandbox.
+Use the dashboard's HTTPS origin for `redirect_base`. Register the appropriate
+callback with each provider: `/v1/api/auth/oidc/callback` for SSO login and
+`/v1/api/mcp/oauth/callback` for per-user MCP authorization. Both belong on the
+console's public origin, but they serve different registrations. See
+[OIDC setup](oidc.md) and [MCP authorization](mcp-oauth.md) for the remaining
+provider and consent steps.
 
 ### LLM backend
 

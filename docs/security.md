@@ -211,25 +211,18 @@ so the browser is immediately authenticated after setup completes.
 
 Turnstone supports OIDC Authorization Code Flow with PKCE for
 single sign-on with external identity providers (Okta, Azure AD,
-Google, etc.). SSO is opt-in — enabled when the three required
-environment variables are set. Users are auto-provisioned on first
-login.
+Google, etc.). SSO is opt-in. Users are auto-provisioned on first login;
+create a local admin before enabling SSO.
 
 #### Configuration
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TURNSTONE_OIDC_ISSUER` | Yes | OIDC issuer URL (e.g., `https://accounts.google.com`) |
-| `TURNSTONE_OIDC_CLIENT_ID` | Yes | Client ID from the identity provider |
-| `TURNSTONE_OIDC_CLIENT_SECRET` | Yes | Client secret (confidential client) |
-| `TURNSTONE_OIDC_SCOPES` | No | OIDC scopes (default: `openid email profile`) |
-| `TURNSTONE_OIDC_PROVIDER_NAME` | No | Display name for the SSO button (default: `SSO`) |
-| `TURNSTONE_OIDC_ROLE_CLAIM` | No | Claim name in the ID token for role mapping (e.g., `groups`) |
-| `TURNSTONE_OIDC_ROLE_MAP` | No | Comma-separated `claim_value:role_id` pairs (e.g., `admin:builtin-admin,eng:builtin-operator`) |
-| `TURNSTONE_OIDC_PASSWORD_ENABLED` | No | Set to `false` to hide password login and force SSO-only |
-
-OIDC is enabled when all three required variables (`ISSUER`,
-`CLIENT_ID`, `CLIENT_SECRET`) are set.
+Set `issuer`, `client_id`, `client_secret`, and `redirect_base` in the
+`[oidc]` section of the private TOML config shared by the console and nodes.
+Environment variables remain supported and take precedence over TOML.
+See [OIDC configuration](oidc.md#configuration) for the complete reference,
+provider registration, role mapping, and optional credential delegation.
+Docker deployments use the
+[shared config overlay](docker.md#shared-bootstrap-config).
 
 #### Login flow
 

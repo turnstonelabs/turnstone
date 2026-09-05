@@ -6,6 +6,10 @@ build/
 .venv/
 venv/
 .env
+/config.toml
+/turnstone/deploy/config.toml
+/.turnstone-bootstrap.*/
+/turnstone/deploy/.turnstone-bootstrap.*/
 *.db
 .git/
 .pytest_cache/

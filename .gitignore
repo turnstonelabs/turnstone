@@ -9,7 +9,12 @@ build/
 .venv/
 venv/
 .env
-# Local compose overrides (e.g. run.sh's node-count limiter, bootstrap output)
+# Private shared bootstrap configuration (dev and production stacks).
+/config.toml
+/turnstone/deploy/config.toml
+/.turnstone-bootstrap.*/
+/turnstone/deploy/.turnstone-bootstrap.*/
+# Local compose overrides (e.g. run.sh's saved choices, bootstrap output)
 compose.override.yaml
 compose.override.yml
 docker-compose.override.yaml

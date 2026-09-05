@@ -155,6 +155,36 @@
 [mcp]
 # config_path = ""             # Path to MCP servers config file (JSON)
 
+# --- Shared authentication (console and every server node) ---
+# See docs/docker.md#shared-bootstrap-config for OAuth, SSO, and delegation.
+# Keep the same key on every process sharing the database. This key is
+# config-file-only: never put it in .env or the admin Settings table.
+
+[security]
+# Encrypts per-user MCP tokens, captured SSO credentials, and model auth tokens.
+# mcp_token_encryption_key = "" # Generate once; keep a private backup
+# python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+
+[oidc]
+# Shared origin for SSO login and per-user MCP OAuth; setting it alone enables neither.
+# redirect_base = "https://turnstone.example.com" # Origin only, no path/query/fragment
+# MCP callback: https://turnstone.example.com/v1/api/mcp/oauth/callback
+# SSO callback: https://turnstone.example.com/v1/api/auth/oidc/callback
+
+# Optional SSO: configure all three fields after creating a local admin.
+# See docs/oidc.md for provider registration and role mapping.
+# issuer = "https://identity.example.com"
+# client_id = "your-client-id"
+# client_secret = "your-client-secret"
+# provider_name = "SSO"
+# password_enabled = true      # Keep local password login available
+
+# Optional SSO delegation to MCP/model backends. Requires the encryption key
+# above, provider permissions, and the grant profile supported by your IdP.
+# See docs/mcp-oauth.md and docs/oidc.md#model-gateway-credentials.
+# capture_user_credential = false # Set true to capture refresh tokens at login
+# obo_grant_profile = "entra"     # "entra" or "rfc8693"
+
 # --- Server (node, console) ---
 
 [server]

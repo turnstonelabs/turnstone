@@ -539,6 +539,9 @@ live; edits apply without restart.
 
 **MCP Servers tab:**
 
+Choose authentication using the [MCP authentication guide](mcp-oauth.md), which
+covers shared tokens, per-user consent, org sign-in, and remote Docker setup.
+
 The tab has two views toggled via a pill control: **Servers** and
 **Registry**.
 

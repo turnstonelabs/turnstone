@@ -1,0 +1,15 @@
+# Optional shared bootstrap config. See docs/docker.md#shared-bootstrap-config.
+# docker compose -f compose.yaml -f compose.config.yaml up -d
+services:
+  console: &shared-config
+    environment:
+      TURNSTONE_CONFIG: /run/turnstone/config.toml
+    volumes:
+      - type: bind
+        source: ./config.toml
+        target: /run/turnstone/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+  server: *shared-config
