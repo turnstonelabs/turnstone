@@ -73,7 +73,6 @@ def _make_mock_router(node_id: str = "node-a", url: str = "http://a:8080") -> Ma
     router = MagicMock(spec=ConsoleRouter)
     router.is_ready.return_value = True
     router.route.return_value = NodeRef(node_id, url)
-    router.generate_ws_id_for_node.return_value = "00ff" + "0" * 28
     return router
 
 

@@ -57,10 +57,11 @@ def _make_mock_router(ready: bool = True) -> MagicMock:
     if not ready:
         router.route.side_effect = NoAvailableNodeError("no live nodes")
     router.route.return_value = NodeRef("node-a", "http://a:8080")
+    router.node_count.return_value = 2
+    router.rendezvous_node.return_value = NodeRef("node-b", "http://b:8080")
     router.required_node.side_effect = lambda node_id: NodeRef(
         node_id, f"http://{node_id.removeprefix('node-')}:8080"
     )
-    router.generate_ws_id_for_node.return_value = "00ff" + "0" * 28
     return router
 
 
@@ -212,7 +213,6 @@ class TestRouteCreate:
     def test_route_create_target_node(self):
         """An explicit target is persisted without constraining the ID hash."""
         router = _make_mock_router()
-        router.generate_ws_id_for_node.return_value = "00ff" + "0" * 28
         router.route.return_value = NodeRef("node-c", "http://c:8080")
         app = _make_app(router=router)
         _wire_proxy(
@@ -247,7 +247,6 @@ class TestRouteCreate:
 
     def test_route_create_routing_strategy_target_node(self):
         router = _make_mock_router()
-        router.generate_ws_id_for_node.return_value = "00ff" + "0" * 28
         router.route.return_value = NodeRef("node-c", "http://c:8080")
         app = _make_app(router=router)
         _wire_proxy(app, _make_proxy_post(json_data={"ws_id": "00ff" + "0" * 28, "name": "pinned"}))
@@ -363,7 +362,6 @@ class TestRouteCreate:
         assert resp.json()["routing_strategy"] == "target_node"
         router.required_node.assert_called_once_with("node-a")
         router.route.assert_not_called()
-        router.generate_ws_id_for_node.assert_not_called()
         assert post.call_args.kwargs["json"]["ws_id"] == _DEST_WS_ID
 
     def test_resume_alias_missing_and_storage_uncertainty_are_bounded(self):

@@ -6865,6 +6865,10 @@ class ChatSession:
             source_row = get_storage().get_workstream(ws_id)
             if source_row and source_row.get("required_node_id"):
                 raise ValueError("Use atomic workstream creation to fork a node-bound session")
+        else:
+            target_row = get_storage().get_workstream(ws_id)
+            if target_row is not None:
+                require_execution_node(target_row.get("required_node_id"), self._node_id)
         turns = (
             list(_fork_snapshot.turns)
             if _fork_snapshot is not None
@@ -6890,6 +6894,8 @@ class ChatSession:
         resumed_attached_project_id = ""
         resumed_incarnation_token = ""
         if not fork:
+            # History loading can overlap a same-ID replacement. Keep this
+            # authoritative check after loading as well as the cheap preflight.
             storage = get_storage()
             target_row = storage.ensure_workstream_incarnation_snapshot(ws_id)
             if target_row is not None:

@@ -1861,14 +1861,8 @@ async def create_workstream(request: Request) -> JSONResponse:
     if effective_required:
         node_id = effective_required
 
-    # Pool — pick any available node
-    if node_id == "pool":
-        node_id = _pick_best_node(collector)
-        if not node_id:
-            return JSONResponse({"error": "No reachable nodes available"}, status_code=503)
-
-    # Auto-select node by most available capacity
-    if not node_id or node_id == "auto":
+    # Automatic placement is a mode only when no node identity is required.
+    if not effective_required and node_id in {"", "auto", "pool"}:
         node_id = _pick_best_node(collector)
         if not node_id:
             return JSONResponse({"error": "No reachable nodes available"}, status_code=503)
@@ -2392,6 +2386,7 @@ async def route_create(request: Request) -> Response:
                 and not pin
                 and not resume_ws
                 and not fixed_ws_id
+                and router.node_count() > 1
             ):
                 capacity_retried = True
                 failed_node = ref.node_id
@@ -2399,6 +2394,8 @@ async def route_create(request: Request) -> Response:
                 for _ in range(10):
                     ws_id = secrets.token_hex(16)
                     try:
+                        if router.rendezvous_node(ws_id).node_id == failed_node:
+                            continue
                         ref = await _request_route(request, router, ws_id)
                     except NodeAffinityError as exc:
                         return _record_route(

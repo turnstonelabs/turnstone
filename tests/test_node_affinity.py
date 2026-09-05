@@ -98,7 +98,10 @@ def test_node_create_and_fork_requirements(app_client, multipart):
     assert storage.get_workstream(source)["required_node_id"] == "host-1"
 
 
-def test_core_resume_checks_node_before_adopting_identity(app_client):
+@pytest.mark.parametrize("replace_during_load", [False, True])
+def test_core_resume_checks_node_before_adopting_identity(app_client, replace_during_load):
+    from unittest.mock import Mock
+
     from turnstone.core.session import ChatSession
 
     client, manager = app_client
@@ -107,12 +110,25 @@ def test_core_resume_checks_node_before_adopting_identity(app_client):
         "/v1/api/workstreams/new", json={"required_node_id": "host-1"}, headers=_auth("owner")
     ).json()["ws_id"]
     session = ChatSession.__new__(ChatSession)
-    session._node_id, session._ws_id = "node-1", "original"
-    session._load_message_turns = lambda _: [object()]
-    session._load_workstream_config = lambda _: {}
+    session._node_id = "host-1" if replace_during_load else "node-1"
+    session._ws_id = "original"
+    session._load_message_turns = Mock(return_value=[object()])
+    session._load_workstream_config = Mock(return_value={})
+    if replace_during_load:
+        storage = get_storage()
+
+        def replace_source(_ws_id):
+            storage.delete_workstream(source)
+            storage.register_workstream(source, required_node_id="node-1")
+            return [object()]
+
+        session._load_message_turns.side_effect = replace_source
     with pytest.raises(NodeAffinityError):
         session.resume(source)
     assert session._ws_id == "original"
+    if not replace_during_load:
+        session._load_message_turns.assert_not_called()
+        session._load_workstream_config.assert_not_called()
 
 
 def test_cli_resume_refuses_requirement_without_exiting_repl(monkeypatch):
@@ -131,6 +147,9 @@ def test_cli_resume_refuses_requirement_without_exiting_repl(monkeypatch):
         "required_node_id": "host-1",
         "fork_reservation_token": "token",
     }
+    storage.get_workstream.return_value = (
+        storage.ensure_workstream_incarnation_snapshot.return_value
+    )
     monkeypatch.setattr("turnstone.core.session.current_worker_claim", lambda _: None)
     monkeypatch.setattr("turnstone.core.session.resolve_workstream", lambda _: "target")
     monkeypatch.setattr("turnstone.core.session.get_storage", lambda: storage)

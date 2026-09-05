@@ -532,6 +532,7 @@ def test_resume_resets_shared_state():
     s._shared_workstream = True
     turns = [turn_from_dict({"role": "user", "content": "x", "_sender": "owner"})]
     storage = MagicMock()
+    storage.get_workstream.return_value = None
     storage.ensure_workstream_incarnation_snapshot.return_value = None
     with (
         patch("turnstone.core.session.load_message_turns", return_value=turns),

@@ -308,24 +308,6 @@ class TestRefreshLifecycle:
         assert router.version > v2
 
 
-class TestGenerateWsId:
-    def test_generates_routable_id(self) -> None:
-        router, storage = _make_router()
-        storage.services = [NODE_A, NODE_B, NODE_C]
-        router.refresh_cache()
-
-        ws_id = router.generate_ws_id_for_node("node-b")
-        assert len(ws_id) == 32
-        assert router.route(ws_id).node_id == "node-b"
-
-    def test_unknown_node_raises(self) -> None:
-        router, storage = _make_router()
-        storage.services = [NODE_A]
-        router.refresh_cache()
-        with pytest.raises(NoAvailableNodeError, match="node-z"):
-            router.generate_ws_id_for_node("node-z")
-
-
 class TestIsReady:
     def test_false_when_empty(self) -> None:
         router, _ = _make_router()

@@ -20,7 +20,6 @@ O(N) hash computes. Node membership and placement overrides remain cached.
 from __future__ import annotations
 
 import json
-import secrets
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -31,14 +30,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.storage._protocol import StorageBackend
-
-# Brute-force attempt cap for ``generate_ws_id_for_node``.  Expected
-# attempts for a weight-w_t target in a cluster with total weight W is
-# W/w_t (the target wins w_t/W of keys).  At typical scale (N≤50,
-# weights ∈ {1..4}) the worst case is ~200 attempts; the cap is well
-# above that to absorb pathologically-skewed configurations without
-# spurious failures.
-_GENERATE_ATTEMPT_CAP = 65_536
 
 
 def _parse_weight(metadata_json: str) -> int:
@@ -179,6 +170,17 @@ class ConsoleRouter:
             ref = self._overrides.get(ws_id) if visible else None
             if ref is not None:
                 return ref
+            nodes = self._nodes
+        if not nodes:
+            raise NoAvailableNodeError("no live nodes")
+        return select(ws_id, nodes)
+
+    def rendezvous_node(self, ws_id: str) -> NodeRef:
+        """Compute cached HRW placement before admitting a fresh candidate.
+
+        This does not resolve durable policy; existing IDs must use route().
+        """
+        with self._lock:
             nodes = self._nodes  # snapshot — list is replaced wholesale on refresh
         if not nodes:
             raise NoAvailableNodeError("no live nodes")
@@ -238,31 +240,3 @@ class ConsoleRouter:
         """
         with self._lock:
             return self._refresh_counter
-
-    # ------------------------------------------------------------------
-    # Workstream ID generation
-    # ------------------------------------------------------------------
-
-    def generate_ws_id_for_node(self, node_id: str) -> str:
-        """Generate a 32-hex-char ws_id where rendezvous selects *node_id*.
-
-        Brute-force loop: pick a random candidate, check whether HRW
-        picks the target.  Expected attempts ≈ ``W/w_t`` where ``W`` is
-        total cluster weight and ``w_t`` is the target's weight.  Cap
-        at ``_GENERATE_ATTEMPT_CAP`` to bound worst case for skewed
-        configurations.
-        """
-        with self._lock:
-            nodes = list(self._nodes)
-        if not nodes:
-            raise NoAvailableNodeError(f"no live node {node_id!r}")
-        if not any(n.node_id == node_id for n in nodes):
-            raise NoAvailableNodeError(f"no live node {node_id!r}")
-
-        for _ in range(_GENERATE_ATTEMPT_CAP):
-            candidate = secrets.token_hex(16)
-            if select(candidate, nodes).node_id == node_id:
-                return candidate
-        raise NoAvailableNodeError(
-            f"could not generate ws_id targeting {node_id!r} after {_GENERATE_ATTEMPT_CAP} attempts"
-        )

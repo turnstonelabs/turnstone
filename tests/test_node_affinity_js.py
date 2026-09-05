@@ -109,9 +109,18 @@ submit.onclick();
 submit.onclick(); // Busy guard prevents a duplicate continuation.
 await new Promise(resolve=>setTimeout(resolve,0));
 assert.equal(posted.length,1);
-assert.deepEqual(posted[0],{url:'/v1/api/cluster/workstreams/new',body:{node_id:'node-1',resume_ws:'saved-id',resume_ws_exact:true}});
+assert.deepEqual(posted[0],{url:'/v1/api/cluster/workstreams/new',body:{node_id:'node-1',required_node_id:'node-1',resume_ws:'saved-id',resume_ws_exact:true}});
 assert.deepEqual(opened,[['interactive','new-id',{nodeId:'node-1'}]]);
 assert.equal(dlg.open,false);
+for(const nodeId of ['auto','pool']) {
+  clusterState.nodes[nodeId]={};
+  window.TS_APP.continueInteractiveElsewhere('saved-id','host-1');
+  select.value=nodeId;
+  submit.onclick();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(posted.at(-1).body.node_id,nodeId);
+  assert.equal(posted.at(-1).body.required_node_id,nodeId);
+}
 """
     )
     assert result.returncode == 0, result.stderr

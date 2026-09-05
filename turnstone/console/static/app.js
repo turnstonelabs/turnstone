@@ -1356,14 +1356,14 @@ function _wireLauncherToggle() {
 // Node placement from the launcher's node-strategy picker, shared by every
 // kind that runs on a compute node: "node" pins to the chosen node, anything
 // else is "auto" (the console or the scheduler picks the least-loaded node).
-// Pure — returns { placement } or { error } and never touches the DOM or the
-// busy flag, so callers validate BEFORE flipping busy and a missing pick
-// surfaces inline without a stuck spinner.
+// Pure — returns { placement, requiredNodeId? } or { error } without touching
+// the DOM or the busy flag, so callers validate BEFORE flipping busy and a
+// missing pick surfaces inline without a stuck spinner.
 function _resolveNodePlacement(opts) {
   if (opts.node_strategy !== "node") return { placement: "auto" };
   const placement = (opts.node_id || "").trim();
   if (!placement) return { error: "Choose a node, or switch to Least loaded." };
-  return { placement: placement };
+  return { placement: placement, requiredNodeId: placement };
 }
 
 // POST /v1/api/cluster/workstreams/new — the console picks a node and PROXIES
@@ -1392,6 +1392,7 @@ function _createInteractive(opts) {
   setBusy(true);
 
   const body = { node_id: placement };
+  if (placed.requiredNodeId) body.required_node_id = placed.requiredNodeId;
   if (opts.resume_ws) {
     body.resume_ws = opts.resume_ws;
     body.resume_ws_exact = true;

@@ -93,6 +93,93 @@ async def test_create_intent_crosses_console_and_node(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("reserved_node", ["auto", "pool"])
+@pytest.mark.parametrize("fork", [False, True])
+async def test_required_node_identity_is_not_an_automatic_placement_mode(
+    app_client, reserved_node, fork
+):
+    client, manager = app_client
+    client.app.state.node_id = manager._node_id = reserved_node
+    storage = get_storage()
+    body = {"required_node_id": reserved_node}
+    if fork:
+        source = client.post(
+            "/v1/api/workstreams/new", json=body, headers=_auth("test-routing")
+        ).json()["ws_id"]
+        manager.close(source)
+        body = {"resume_ws": source, "resume_ws_exact": True}
+    console, _router = _console(storage)
+    collector = console.state.collector
+    collector.get_node_detail.side_effect = lambda node_id: {
+        "server_url": f"http://{node_id}.example:8080"
+    }
+    collector.get_all_nodes.return_value = [
+        dict(node_id=reserved_node, reachable=True, max_ws=5, ws_total=4),
+        dict(node_id="node-1", reachable=True, max_ws=10, ws_total=0),
+    ]
+    dispatched = []
+
+    async def capture(request):
+        dispatched.append(request.url.host)
+        client.app.state.node_id = manager._node_id = request.url.host.split(".")[0]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=client.app),
+        event_hooks={"request": [capture]},
+    ) as node:
+        console.state.proxy_client = node
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=console), base_url="http://console"
+        ) as proxy:
+            response = await proxy.post(
+                "/v1/api/cluster/workstreams/new", json=body, headers=_TEST_AUTH_HEADERS
+            )
+    assert response.status_code == 200, response.text
+    assert dispatched == [f"{reserved_node}.example"]
+    destination = response.json()["correlation_id"]
+    assert storage.get_workstream(destination)["required_node_id"] == reserved_node
+    if fork:
+        assert destination != source
+        assert storage.get_workstream(source)["required_node_id"] == reserved_node
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("node_count", [1, 2])
+async def test_failed_create_skips_policy_reads_for_unsuitable_candidates(
+    app_client, monkeypatch, node_count
+):
+    from unittest.mock import Mock
+
+    storage = get_storage()
+    console, router = _console(storage)
+    if node_count == 2:
+        storage.register_service("server", "node-1", "http://other.example:8080")
+        router.refresh_cache()
+    # Every candidate hashes back to the failed node. A single-node cluster
+    # skips the search; a larger cluster rejects these candidates from cache.
+    monkeypatch.setattr("turnstone.console.server.secrets.token_hex", lambda _: "a" * 32)
+    lookup = Mock(wraps=storage.get_workstream)
+    monkeypatch.setattr(storage, "get_workstream", lookup)
+    dispatched = []
+
+    def fail(request):
+        dispatched.append(request)
+        return httpx.Response(503, json={"error": "Node unavailable"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as node:
+        console.state.proxy_client = node
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=console), base_url="http://console"
+        ) as proxy:
+            response = await proxy.post(
+                "/v1/api/route/workstreams/new", json={}, headers=_TEST_AUTH_HEADERS
+            )
+    assert response.status_code == 503
+    assert len(dispatched) == 1
+    assert lookup.call_count == 1
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "endpoint,multipart", [("route", False), ("cluster", False), ("route", True)]
 )
