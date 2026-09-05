@@ -1474,3 +1474,15 @@ def test_schedule_when_template_names_the_zone_per_pane() -> None:
     assert 'querySelectorAll("[data-when-zone]")' in builder, (
         "setState must sweep the template's zone spans by the same attribute"
     )
+
+
+def test_schedule_shelf_reads_completed_from_the_scheduled_instant() -> None:
+    """A disabled one-shot is "completed" only when its last run is at or
+    after its scheduled instant, so a one-shot re-armed to a later time or
+    converted from a cron that had run, then given up, shows as disabled."""
+    admin = _CONSOLE_ADMIN.read_text(encoding="utf-8")
+    assert "function _schCompleted(" in admin
+    assert 'Date.parse(s.last_run + "Z")' in admin and "Date.parse(s.at_time)" in admin
+    assert "ran >= due" in admin
+    assert "!enabled && _schCompleted(s)" in admin, "the status badge must use the comparison"
+    assert "!enabled && s.last_run" not in admin, "a bare last_run no longer means completed"
