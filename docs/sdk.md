@@ -94,6 +94,23 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 
 ### Console Client API
 
+Use `required_node_id="host-1"` with direct or routed creation to preserve an
+execution requirement across close/reopen and restart. Console `node_id` and
+routed `target_node` selections express the same requirement; automatic
+placement leaves fresh conversations flexible. A fork (`resume_ws`) inherits
+the source requirement unless an explicit destination is supplied. For example:
+
+```python
+copy = console.route_create_workstream(
+    resume_ws=saved_ws_id,
+    resume_ws_exact=True,
+    target_node="node-1",
+)
+```
+
+This creates a new conversation and leaves the original saved. It does not
+move a running session or transfer node-local files.
+
 Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 
 | Category | Method | Returns |

@@ -1469,7 +1469,9 @@ class TestConsoleWorkstreamCreation:
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "nonexistent"},
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 503
+        assert resp.json()["code"] == "required_node_unavailable"
+        mock_post.assert_not_called()
 
     def test_create_invalid_json(self, client_and_mock):
         client, mock_post = client_and_mock
@@ -1516,6 +1518,10 @@ class TestConsoleWorkstreamCreation:
     def test_create_with_resume_ws_directed(self, client_and_mock, mock_collector):
         """resume_ws is forwarded in directed dispatch."""
         client, mock_post = client_and_mock
+        storage = MagicMock()
+        storage.resolve_workstream.return_value = "old-ws-id-123"
+        storage.get_workstream.return_value = {"ws_id": "old-ws-id-123", "state": "idle"}
+        client.app.state.auth_storage = storage
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "node-a", "resume_ws": "old-ws-id-123"},
@@ -1527,6 +1533,10 @@ class TestConsoleWorkstreamCreation:
     def test_create_with_resume_ws_auto(self, client_and_mock, mock_collector):
         """resume_ws is forwarded in auto-select dispatch."""
         client, mock_post = client_and_mock
+        storage = MagicMock()
+        storage.resolve_workstream.return_value = "old-ws-id-789"
+        storage.get_workstream.return_value = {"ws_id": "old-ws-id-789", "state": "idle"}
+        client.app.state.auth_storage = storage
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"resume_ws": "old-ws-id-789"},

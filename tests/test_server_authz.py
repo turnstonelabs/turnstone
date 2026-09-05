@@ -305,6 +305,7 @@ class _FakeSession:
         *,
         principal_id: str,
         source_reservation_token: str,
+        source_required_node_id: str | None = None,
         trusted_internal: bool = False,
     ) -> Any:
         from turnstone.core.storage import get_storage
@@ -3108,6 +3109,7 @@ class TestCreateForkRollback:
             *,
             principal_id: str,
             source_reservation_token: str,
+            source_required_node_id: str | None = None,
             trusted_internal: bool = False,
         ) -> Any:
             assert fork_source_id == source_id
@@ -3117,6 +3119,7 @@ class TestCreateForkRollback:
                 fork_source_id,
                 principal_id=principal_id,
                 source_reservation_token=source_reservation_token,
+                source_required_node_id=source_required_node_id,
                 trusted_internal=trusted_internal,
             )
 
@@ -3166,6 +3169,7 @@ class TestCreateForkRollback:
             *,
             principal_id: str,
             source_reservation_token: str,
+            source_required_node_id: str | None = None,
             trusted_internal: bool = False,
         ) -> Any:
             assert fork_source_id == source_id
@@ -3246,6 +3250,7 @@ class TestCreateForkRollback:
             *,
             principal_id: str,
             source_reservation_token: str,
+            source_required_node_id: str | None = None,
             trusted_internal: bool = False,
         ) -> Any:
             fork_calls.append((fork_source_id, principal_id, trusted_internal))
@@ -3372,6 +3377,7 @@ class TestCreateForkRollback:
             *,
             principal_id: str,
             source_reservation_token: str,
+            source_required_node_id: str | None = None,
             trusted_internal: bool = False,
         ) -> Any:
             entered_clone.set()
@@ -3381,6 +3387,7 @@ class TestCreateForkRollback:
                 fork_source_id,
                 principal_id=principal_id,
                 source_reservation_token=source_reservation_token,
+                source_required_node_id=source_required_node_id,
                 trusted_internal=trusted_internal,
             )
 
@@ -3495,6 +3502,7 @@ class TestCreateForkRollback:
             *,
             principal_id: str,
             source_reservation_token: str,
+            source_required_node_id: str | None = None,
             trusted_internal: bool = False,
         ) -> Any:
             entered_clone.set()
@@ -3505,6 +3513,7 @@ class TestCreateForkRollback:
                     fork_source_id,
                     principal_id=principal_id,
                     source_reservation_token=source_reservation_token,
+                    source_required_node_id=source_required_node_id,
                     trusted_internal=trusted_internal,
                 )
             finally:
@@ -3578,6 +3587,7 @@ class TestCreateForkRollback:
             *,
             principal_id: str,
             source_reservation_token: str,
+            source_required_node_id: str | None = None,
             trusted_internal: bool = False,
         ) -> Any:
             assert storage.delete_project("fork-project") is True
@@ -3586,6 +3596,7 @@ class TestCreateForkRollback:
                 fork_source_id,
                 principal_id=principal_id,
                 source_reservation_token=source_reservation_token,
+                source_required_node_id=source_required_node_id,
                 trusted_internal=trusted_internal,
             )
 

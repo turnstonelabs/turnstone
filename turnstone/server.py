@@ -2547,6 +2547,19 @@ async def _interactive_create_validate_request(
       canonicalized before the workstream reservation is created.
     """
     requested_ws_id = body.get("ws_id", "") or ""
+    from turnstone.core.node_affinity import (
+        NodeAffinityError,
+        requested_node_requirement,
+        require_execution_node,
+    )
+
+    try:
+        body["required_node_id"] = requested_node_requirement(
+            body.get("required_node_id"), body.get("target_node")
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    body.pop("_resume_required_node_id", None)
     if not isinstance(requested_ws_id, str):
         requested_ws_id = ""
     if requested_ws_id and not _VALID_WS_ID.match(requested_ws_id):
@@ -2672,6 +2685,9 @@ async def _interactive_create_validate_request(
         # incarnation inside its transaction, so delete/recreate under the same
         # canonical id cannot inherit the earlier authorization decision.
         body["_resume_incarnation_token"] = str(_src_row.get("fork_reservation_token") or "")
+        body["_resume_required_node_id"] = _src_row.get("required_node_id")
+        if body["required_node_id"] is None:
+            body["required_node_id"] = _src_row.get("required_node_id")
         body["project_id"] = source_project
         resume_inherited_pid = bool(source_project)
     # Project attach gate (explicit or parent-inherited): a project requires
@@ -2718,6 +2734,10 @@ async def _interactive_create_validate_request(
     if tools_err:
         return JSONResponse({"error": tools_err}, status_code=400)
     body["auto_approve_tools"] = auto_approve_tools
+    try:
+        require_execution_node(body["required_node_id"], getattr(request.app.state, "node_id", ""))
+    except NodeAffinityError as exc:
+        return JSONResponse(exc.as_dict(), status_code=exc.status_code)
     return None
 
 
@@ -2762,6 +2782,7 @@ def _interactive_create_build_kwargs(
         "judge_model": body.get("judge_model", "") or None,
         "parent_ws_id": body.get("parent_ws_id") or None,
         "project_id": body.get("project_id") or None,
+        "required_node_id": body.get("required_node_id"),
     }
 
 
@@ -2797,6 +2818,7 @@ async def _interactive_create_pre_commit(
             source_ws_id,
             principal_id=uid,
             source_reservation_token=source_reservation_token,
+            source_required_node_id=body.get("_resume_required_node_id"),
             trusted_internal=False,
         )
         message_count = len(snapshot.turns)
@@ -6547,6 +6569,7 @@ def main() -> None:
     # on demand via POST /v1/api/workstreams.
     if args.resume:
         from turnstone.core.memory import resolve_workstream
+        from turnstone.core.node_affinity import NodeAffinityError
 
         target_id = resolve_workstream(args.resume)
         if not target_id:
@@ -6569,9 +6592,19 @@ def main() -> None:
             raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
         if args.skip_permissions or config_store.get("tools.skip_permissions"):
             ws.ui.auto_approve = True
-        assert ws.session is not None
-        if not ws.session.resume(target_id):
+        if ws.session is None:
+            manager.close(ws.id)
+            log.error("No session available for resume: %s", target_id)
+            sys.exit(1)
+        try:
+            resumed = ws.session.resume(target_id)
+        except NodeAffinityError as exc:
+            manager.close(ws.id)
+            log.error("Cannot resume %s: %s", target_id, exc)
+            sys.exit(1)
+        if not resumed:
             log.error("Workstream '%s' has no messages.", args.resume)
+            manager.close(ws.id)
             sys.exit(1)
         # AFTER the successful resume (mirroring the restore fn's order),
         # so the registration keys on the adopted ``target_id`` — the id

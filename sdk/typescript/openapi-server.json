@@ -2916,6 +2916,22 @@
       },
       "CreateWorkstreamRequest": {
         "properties": {
+          "required_node_id": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Required execution node. Omission permits automatic placement for a fresh workstream and inherits the source requirement for a fork. An explicit destination applies only to the new workstream ID.",
+            "title": "Required Node Id"
+          },
           "name": {
             "default": "",
             "description": "Workstream display name (auto-generated if empty)",

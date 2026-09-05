@@ -184,7 +184,7 @@ All fields are optional:
 - `node_id` — targeting mode:
   - **omitted or `"auto"`** — console picks the reachable node with the most available capacity (max_ws - ws_total) and proxies the request to it.
   - **`"pool"`** — compatibility alias for automatic placement on the reachable node with the most headroom.
-  - **specific node ID** — proxies the request to that node directly.
+  - **specific node ID** — requires execution on that node, including after restart or close.
 - `name` — workstream display name. Auto-generated if omitted.
 - `model` — model alias from the target node's registry. Uses the node's default model if omitted.
 - `judge_model` — optional judge-model alias for this workstream.
@@ -195,6 +195,11 @@ All fields are optional:
 - `resume_ws` — source ID to **fork** atomically into a new workstream. The
   source remains unchanged; its checkpoint-bounded history, configuration,
   persona, project, and attachment references are copied transactionally.
+  Omission of a destination node inherits the source's execution requirement;
+  an explicit destination pins the new conversation there.
+- `resume_ws_exact` — require the exact source ID without alias resolution.
+- `required_node_id` — optional explicit execution requirement; must agree with
+  a specific `node_id` when both are supplied.
 
 The endpoint also accepts the same multipart create shape as a node: one
 JSON-encoded `meta` field plus up to ten `file` parts. Files require an
@@ -220,9 +225,9 @@ rather than treating them as two creates.
 
 For safety, the console masks most target-node failures as the opaque `502`
 shape `{"error":"Dispatch to node <node_id> failed"}` instead of reflecting
-arbitrary node text or retry-triggering 401/429 responses. The coded
-`server.require_project` refusal is the exception and remains a `400` with
-actionable wording. Consult the target node's logs for the underlying create
+arbitrary node text or retry-triggering 401/429 responses. Coded
+`server.require_project` (`400`) and wrong-execution-node (`409`) refusals retain
+their actionable wording. Consult the target node's logs for the underlying create
 correlation when a reachable node returns a masked 502.
 
 ### `GET /v1/api/cluster/events`

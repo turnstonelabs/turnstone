@@ -1656,8 +1656,21 @@ and size its server pool for expected concurrent fork traffic.
 `ws_id` is the persistent conversation/lifecycle identity. There is no
 separate `session_id`: `workstreams` holds lifecycle, owner, kind, hierarchy,
 project, and display metadata, while `conversations` stores the append-only
-trajectory. `node_id` is an owning-service hint; rendezvous/service liveness,
-not that historical field alone, determines cluster routing and orphan safety.
+trajectory. `node_id` records creation origin and remains a maintenance hint.
+The nullable `required_node_id` column independently records execution
+eligibility. Console routing checks that requirement before cached placement
+overrides or rendezvous; manager create/open and core resume enforce it at the
+executor. The requirement survives residency changes and close. Ordinary
+operations cannot alter it in place; an explicitly targeted fork creates a new
+identity with its own requirement. Legacy rows remain unbound.
+
+Affinity does not establish exclusive live ownership. A future same-ID
+migration still needs a fenced ownership handoff; neither a registry heartbeat
+nor an affinity check supplies that lease. The router reads requirements from
+storage on every resolution, so future authorized changes need no permanent
+policy-cache invalidation. A handoff must report temporary unavailability to
+channel recovery, rather than a clean absent-workstream result that starts a
+new fork.
 
 `ChatSession.messages` is `list[Turn]`. Persistence serializes the neutral
 fields, opaque provider-native lane, attachment references, SSE cursor, and

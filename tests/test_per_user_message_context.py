@@ -554,10 +554,12 @@ def test_fork_persists_sender_meta():
         turn_from_dict({"role": "user", "content": "wake", "_source": "wake"}),
         turn_from_dict({"role": "assistant", "content": "yo"}),
     ]
+    storage = MagicMock()
+    storage.get_workstream.return_value = None
     with (
         patch("turnstone.core.session.load_message_turns", return_value=turns),
         patch("turnstone.core.session.save_messages_bulk") as bulk,
-        patch("turnstone.core.session.get_storage", return_value=None),
+        patch("turnstone.core.session.get_storage", return_value=storage),
         patch.object(s, "_save_config"),
         patch.object(s, "_init_system_messages"),
     ):

@@ -54,7 +54,12 @@ def _make_mock_collector() -> MagicMock:
 def _make_mock_router(ready: bool = True) -> MagicMock:
     router = MagicMock(spec=ConsoleRouter)
     router.is_ready.return_value = ready
+    if not ready:
+        router.route.side_effect = NoAvailableNodeError("no live nodes")
     router.route.return_value = NodeRef("node-a", "http://a:8080")
+    router.required_node.side_effect = lambda node_id: NodeRef(
+        node_id, f"http://{node_id.removeprefix('node-')}:8080"
+    )
     router.generate_ws_id_for_node.return_value = "00ff" + "0" * 28
     return router
 
@@ -177,6 +182,7 @@ class TestRouteCreate:
         router.route.return_value = NodeRef("node-b", "http://b:8080")
         storage = MagicMock()
         storage.resolve_workstream.return_value = "d" * 32
+        storage.get_workstream.return_value = {"ws_id": "d" * 32, "state": "idle"}
         app = _make_app(router=router, auth_storage=storage)
         _wire_proxy(
             app,
@@ -194,7 +200,7 @@ class TestRouteCreate:
         assert data["node_url"] == "http://b:8080"
         assert data["node_id"] == "node-b"
         storage.resolve_workstream.assert_called_once_with("saved-alias")
-        router.route.assert_called_with("d" * 32)
+        assert router.route.call_args.args == ("d" * 32,)
         router.remember_override.assert_called_once_with(
             _FORK_DEST_WS_ID,
             NodeRef("node-b", "http://b:8080"),
@@ -204,7 +210,7 @@ class TestRouteCreate:
         client.close()
 
     def test_route_create_target_node(self):
-        """target_node should generate a ws_id that hashes to that node."""
+        """An explicit target is persisted without constraining the ID hash."""
         router = _make_mock_router()
         router.generate_ws_id_for_node.return_value = "00ff" + "0" * 28
         router.route.return_value = NodeRef("node-c", "http://c:8080")
@@ -223,7 +229,8 @@ class TestRouteCreate:
         assert resp.status_code == 200
         data = resp.json()
         assert data["node_id"] == "node-c"
-        router.generate_ws_id_for_node.assert_called_with("node-c")
+        router.required_node.assert_called_with("node-c")
+        assert app.state.proxy_client.post.call_args.kwargs["json"]["required_node_id"] == "node-c"
         client.close()
 
     def test_route_create_routing_strategy_rendezvous(self, client):
@@ -259,6 +266,7 @@ class TestRouteCreate:
         router.route.return_value = NodeRef("node-b", "http://b:8080")
         storage = MagicMock()
         storage.resolve_workstream.return_value = "d" * 32
+        storage.get_workstream.return_value = {"ws_id": "d" * 32, "state": "idle"}
         app = _make_app(router=router, auth_storage=storage)
         _wire_proxy(
             app,
@@ -337,7 +345,7 @@ class TestRouteCreate:
         assert resp.status_code == 400
         assert resp.json() == {"error": error}
 
-    def test_explicit_json_ws_id_is_preserved_and_routed_by_rendezvous(self):
+    def test_explicit_json_ws_id_is_preserved_with_required_node(self):
         router = _make_mock_router()
         app = _make_app(router=router)
         post = _make_proxy_post(json_data={"ws_id": _DEST_WS_ID, "name": "fixed"})
@@ -352,8 +360,9 @@ class TestRouteCreate:
         client.close()
 
         assert resp.status_code == 200
-        assert resp.json()["routing_strategy"] == "rendezvous"
-        router.route.assert_called_once_with(_DEST_WS_ID)
+        assert resp.json()["routing_strategy"] == "target_node"
+        router.required_node.assert_called_once_with("node-a")
+        router.route.assert_not_called()
         router.generate_ws_id_for_node.assert_not_called()
         assert post.call_args.kwargs["json"]["ws_id"] == _DEST_WS_ID
 
@@ -405,7 +414,8 @@ class TestRouteCreate:
         assert resp.status_code == 200, resp.text
         storage.get_workstream.assert_any_call(source_id)
         storage.resolve_workstream.assert_not_called()
-        router.route.assert_called_once_with(source_id)
+        assert router.route.call_count == 1
+        assert router.route.call_args.args == (source_id,)
         assert post.call_args.kwargs["json"]["resume_ws"] == source_id
 
     @pytest.mark.anyio
@@ -468,7 +478,12 @@ class TestRouteCreate:
         router = _make_mock_router()
         storage = MagicMock()
         storage.resolve_workstream.return_value = "d" * 32
-        storage.get_workstream.return_value = {"node_id": "stored-node"}
+        storage.get_workstream.return_value = {"ws_id": "d" * 32, "state": "idle"}
+        storage.get_workstream.side_effect = lambda ws_id: {
+            "ws_id": ws_id,
+            "state": "idle",
+            "node_id": "stored-node",
+        }
         app = _make_app(router=router, auth_storage=storage)
         _wire_proxy(
             app,
@@ -486,7 +501,7 @@ class TestRouteCreate:
 
         assert resp.status_code == 200
         assert resp.json()["node_id"] == "stored-node"
-        storage.get_workstream.assert_called_once_with(_FORK_DEST_WS_ID)
+        storage.get_workstream.assert_any_call(_FORK_DEST_WS_ID)
         audit.assert_called_once()
         assert audit.call_args.args[2] == _FORK_DEST_WS_ID
 
@@ -505,7 +520,8 @@ class TestRouteCreate:
 
         assert resp.status_code == 200
         assert resp.json()["routing_strategy"] == "rendezvous"
-        router.route.assert_called_once_with(_DEST_WS_ID)
+        assert router.route.call_count == 1
+        assert router.route.call_args.args == (_DEST_WS_ID,)
 
 
 class TestRouteCreate503Retry:
@@ -516,7 +532,7 @@ class TestRouteCreate503Retry:
         router = _make_mock_router()
         call_count = 0
 
-        def side_effect_route(ws_id: str) -> NodeRef:
+        def side_effect_route(ws_id: str, **kwargs: Any) -> NodeRef:
             nonlocal call_count
             call_count += 1
             if call_count <= 1:
@@ -579,11 +595,35 @@ class TestRouteCreate503Retry:
         assert resp.status_code == 503
         assert post.call_count == 1
         assert post.call_args.kwargs["json"]["ws_id"] == _DEST_WS_ID
-        router.route.assert_called_once_with(_DEST_WS_ID)
+        assert router.route.call_count == 1
+        assert router.route.call_args.args == (_DEST_WS_ID,)
 
 
 class TestRouteCreate409Retry:
     """Generated destination ids retry live collisions at the router."""
+
+    def test_wrong_executor_conflict_is_not_an_id_collision(self):
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        post = _make_proxy_post(
+            status_code=409,
+            json_data={
+                "error": "This workstream must run on node 'host-1'.",
+                "code": "wrong_execution_node",
+                "required_node_id": "host-1",
+            },
+        )
+        _wire_proxy(app, post)
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            response = client.post(
+                "/v1/api/route/workstreams/new", json={}, headers=_TEST_AUTH_HEADERS
+            )
+        finally:
+            client.close()
+        assert response.status_code == 409
+        assert response.json()["code"] == "wrong_execution_node"
+        assert post.call_count == 1
 
     def test_generated_ws_id_collision_draws_another_id(self, monkeypatch):
         first_id = "1" * 32
@@ -622,11 +662,12 @@ class TestRouteCreate409Retry:
         assert posted_ids == [first_id, second_id]
         assert generated.call_count == 2
 
-    def test_target_node_collision_retries_with_targeted_generator(self):
+    def test_target_node_collision_keeps_required_node(self, monkeypatch):
         first_id = "1" * 32
         second_id = "2" * 32
         router = _make_mock_router()
-        router.generate_ws_id_for_node.side_effect = [first_id, second_id]
+        generated = MagicMock(side_effect=[first_id, second_id])
+        monkeypatch.setattr("turnstone.console.server.secrets.token_hex", generated)
         router.route.return_value = NodeRef("node-c", "http://c:8080")
         app = _make_app(router=router)
         posted_ids: list[str] = []
@@ -657,9 +698,9 @@ class TestRouteCreate409Retry:
         assert resp.status_code == 200
         assert resp.json()["node_id"] == "node-c"
         assert posted_ids == [first_id, second_id]
-        assert router.generate_ws_id_for_node.call_count == 2
-        assert router.generate_ws_id_for_node.call_args_list[0].args == ("node-c",)
-        assert router.generate_ws_id_for_node.call_args_list[1].args == ("node-c",)
+        assert generated.call_count == 2
+        assert router.required_node.call_count == 2
+        assert all(call.args == ("node-c",) for call in router.required_node.call_args_list)
 
     def test_explicit_ws_id_collision_is_not_retried(self):
         router = _make_mock_router()
@@ -1068,7 +1109,8 @@ class TestRouteWorkstreamLive:
 
         assert resp.status_code == 200
         assert resp.json() == {"ws_id": "ws-live", "live": True}
-        router.route.assert_called_once_with("ws-live")
+        assert router.route.call_count == 1
+        assert router.route.call_args.args == ("ws-live",)
         assert mock_get.call_args.args[0] == "http://a:8080/v1/api/workstreams"
 
     def test_false_miss_refreshes_stale_override_and_reprobes_new_owner(self):
@@ -1282,3 +1324,40 @@ class TestRouteNoNode:
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
+
+
+def test_route_proxy_refresh_retries_new_url_for_same_node_identity():
+    router = _make_mock_router()
+    router.route.side_effect = [
+        NodeRef("host-1", "http://old:8080"),
+        NodeRef("host-1", "http://new:8080"),
+    ]
+    app = _make_app(router=router)
+    requests = []
+
+    async def upstream(method, url, **kwargs):
+        requests.append(url)
+        return httpx.Response(
+            404 if len(requests) == 1 else 200,
+            json={"status": "ok"},
+            request=httpx.Request(method, url),
+        )
+
+    proxy = MagicMock(spec=httpx.AsyncClient)
+    proxy.request = MagicMock(side_effect=upstream)
+    app.state.proxy_client = proxy
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        response = client.post(
+            "/v1/api/route/workstreams/saved/send",
+            json={"message": "continue"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+    finally:
+        client.close()
+    assert response.status_code == 200
+    assert requests == [
+        "http://old:8080/v1/api/workstreams/saved/send",
+        "http://new:8080/v1/api/workstreams/saved/send",
+    ]
+    router.force_refresh.assert_called_once()

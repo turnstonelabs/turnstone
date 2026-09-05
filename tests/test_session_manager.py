@@ -213,6 +213,7 @@ class _Row:
     parent_ws_id: str | None = None
     updated: str = ""
     node_id: str | None = None
+    required_node_id: str | None = None
     project_id: str | None = None
     persona: str | None = None
 
@@ -262,6 +263,7 @@ class FakeStorage:
         state: str = "idle",
         updated: str | None = None,
         fork_reservation_token: str = "",
+        required_node_id: str | None = None,
     ) -> None:
         if self.register_raises:
             raise RuntimeError("register forced failure")
@@ -276,6 +278,7 @@ class FakeStorage:
                 parent_ws_id=parent_ws_id,
                 updated=updated if updated is not None else self._now_iso(),
                 node_id=node_id,
+                required_node_id=required_node_id,
                 project_id=project_id,
                 persona=persona if persona else None,
             )
@@ -386,6 +389,7 @@ class FakeStorage:
                 "state": row.state,
                 "parent_ws_id": row.parent_ws_id,
                 "persona": row.persona,
+                "required_node_id": row.required_node_id,
             }
 
     def ensure_workstream_incarnation_snapshot(self, ws_id: str) -> dict[str, Any] | None:
@@ -406,6 +410,7 @@ class FakeStorage:
                 "parent_ws_id": row.parent_ws_id,
                 "project_id": row.project_id,
                 "persona": row.persona,
+                "required_node_id": row.required_node_id,
                 "fork_reservation_token": token,
             }
 

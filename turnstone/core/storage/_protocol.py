@@ -113,6 +113,8 @@ class ForkCloneExpectation:
     project_writable: bool
     destination_reservation_token: str
     source_reservation_token: str
+    source_required_node_id: str | None = None
+    node_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +129,7 @@ class ForkCloneSnapshot:
     turns: tuple[Turn, ...]
     config: dict[str, str]
     project_id: str | None
+    required_node_id: str | None = None
 
 
 class OIDCIdentity(TypedDict):
@@ -1073,6 +1076,7 @@ class StorageBackend(Protocol):
         project_id: str | None = None,
         persona: str | None = None,
         fork_reservation_token: str = "",
+        required_node_id: str | None = None,
     ) -> bool:
         """Create a workstreams row and report whether it was inserted.
 

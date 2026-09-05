@@ -81,6 +81,7 @@ from turnstone.core.model_registry import (
     strip_control_characters,
 )
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
+from turnstone.core.node_affinity import NodeAffinityError, requested_node_requirement
 from turnstone.core.project_access import fold_role_permissions
 from turnstone.core.rendezvous import NoAvailableNodeError, NodeRef
 from turnstone.core.rerank_calibrate import canonical_caps_value
@@ -1843,6 +1844,23 @@ async def create_workstream(request: Request) -> JSONResponse:
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
 
+    try:
+        explicit_required = requested_node_requirement(
+            body.get("required_node_id"), node_id if node_id not in {"", "auto", "pool"} else None
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    source_row = await _resolve_fork_source(request, body)
+    if isinstance(source_row, JSONResponse):
+        return source_row
+    if source_row is not None:
+        resume_ws = body["resume_ws"]
+    effective_required = explicit_required or (
+        source_row.get("required_node_id") if source_row else None
+    )
+    if effective_required:
+        node_id = effective_required
+
     # Pool — pick any available node
     if node_id == "pool":
         node_id = _pick_best_node(collector)
@@ -1858,6 +1876,9 @@ async def create_workstream(request: Request) -> JSONResponse:
     # Validate node exists and get its URL
     detail = collector.get_node_detail(node_id)
     if not detail:
+        if effective_required:
+            error = NodeAffinityError(effective_required, unavailable=True)
+            return JSONResponse(error.as_dict(), status_code=error.status_code)
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
     server_url = detail.get("server_url", "")
@@ -1872,6 +1893,8 @@ async def create_workstream(request: Request) -> JSONResponse:
         "skill": skill,
         "persona": persona,
         "resume_ws": resume_ws,
+        "resume_ws_exact": bool(resume_ws),
+        "required_node_id": explicit_required,
         "user_id": uid,
         "project_id": project_id,
     }
@@ -1899,9 +1922,8 @@ async def create_workstream(request: Request) -> JSONResponse:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
         return _dispatch_failed(node_id)
 
-    # The node is the authoritative require_project gate. Surface ONLY its
-    # coded require_project 400 to the operator; mask every OTHER node outcome
-    # as an opaque 502. Rationale (do not "simplify" by re-emitting the node
+    # Preserve the coded project-required and wrong-executor refusals. Mask
+    # other node failures as an opaque 502. Rationale (do not "simplify" by re-emitting the node
     # status/body generically):
     #   * a node 401 re-emitted here trips authFetch's reactive refresh +
     #     force-logout, dumping a VALID operator to the login overlay and
@@ -1948,6 +1970,17 @@ async def create_workstream(request: Request) -> JSONResponse:
         )
 
     from turnstone.core.auth import REQUIRE_PROJECT_CODE, REQUIRE_PROJECT_ERROR
+
+    if node_body and node_body.get("code") == "wrong_execution_node" and resp.status_code == 409:
+        # Use validated canonical fields, keeping the node's arbitrary error
+        # text behind the existing dispatch boundary.
+        try:
+            required = requested_node_requirement(node_body.get("required_node_id"))
+        except ValueError:
+            required = None
+        if required:
+            error = NodeAffinityError(required)
+            return JSONResponse(error.as_dict(), status_code=error.status_code)
 
     if (
         resp.status_code == 400
@@ -2008,26 +2041,19 @@ async def route_create(request: Request) -> Response:
     if err is not None:
         return _record_route(request, "create", 403, t0, err)
     router: ConsoleRouter | None = request.app.state.router
-    ring_ready = router is not None and router.is_ready()
-    if not ring_ready:
-        # Router cache empty — the collector hasn't published a
-        # services list yet.  One-shot refresh off the event loop
-        # before giving up.
-        if router is not None:
-            await asyncio.to_thread(router.refresh_cache)
-            ring_ready = router.is_ready()
-        if not ring_ready:
-            return _record_route(
-                request,
-                "create",
-                503,
-                t0,
-                JSONResponse(
-                    {"error": "Cluster routing not initialized"},
-                    status_code=503,
-                ),
-            )
-    assert router is not None
+    if router is None:
+        return _record_route(
+            request,
+            "create",
+            503,
+            t0,
+            JSONResponse(
+                {"error": "Cluster routing not initialized"},
+                status_code=503,
+            ),
+        )
+    if not router.is_ready():
+        await asyncio.to_thread(router.refresh_cache)
 
     raw_content_type = request.headers.get("content-type") or ""
     is_multipart = raw_content_type.lower().startswith("multipart/form-data")
@@ -2039,6 +2065,8 @@ async def route_create(request: Request) -> Response:
     # coordinator's spawn_workstream tool especially) can explain why a
     # given node was chosen.  Set on every branch below.
     routing_strategy = "rendezvous"
+    multipart_fork: dict[str, Any] | None = None
+    meta: dict[str, Any] = {}
 
     if is_multipart:
         # Multipart: caller must pass ws_id as a query param. Parse only the
@@ -2072,13 +2100,14 @@ async def route_create(request: Request) -> Response:
         try:
             form = await request.form()
             meta_raw = form.get("meta")
-            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else None
+            parsed_meta = json.loads(meta_raw) if isinstance(meta_raw, str) else None
+            has_files = any(not isinstance(value, str) for value in form.values())
         except Exception:
-            meta = None
+            parsed_meta = None
         finally:
             if form is not None:
                 await form.close()
-        if not isinstance(meta, dict) or meta.get("ws_id") != ws_id:
+        if not isinstance(parsed_meta, dict) or parsed_meta.get("ws_id") != ws_id:
             return _record_route(
                 request,
                 "create",
@@ -2089,8 +2118,50 @@ async def route_create(request: Request) -> Response:
                     status_code=400,
                 ),
             )
+        meta = parsed_meta
+        if meta.get("resume_ws"):
+            if has_files:
+                return _record_route(
+                    request,
+                    "create",
+                    400,
+                    t0,
+                    JSONResponse(
+                        {
+                            "error": "Attachments cannot be combined with resume_ws; fork first, then upload"
+                        },
+                        status_code=400,
+                    ),
+                )
+            # With no uploads there is no binary framing to preserve. Route
+            # metadata-only forks through the common JSON path, which resolves
+            # the exact source and inherits its execution requirement.
+            multipart_fork = meta
+            is_multipart = False
+
+    if is_multipart:
         try:
-            ref = router.route(ws_id)
+            required = requested_node_requirement(
+                meta.get("required_node_id"), meta.get("target_node")
+            )
+        except ValueError as exc:
+            return _record_route(
+                request, "create", 400, t0, JSONResponse({"error": str(exc)}, status_code=400)
+            )
+        try:
+            ref = (
+                router.required_node(required)
+                if required
+                else await _request_route(request, router, ws_id)
+            )
+        except NodeAffinityError as exc:
+            return _record_route(
+                request,
+                "create",
+                exc.status_code,
+                t0,
+                JSONResponse(exc.as_dict(), status_code=exc.status_code),
+            )
         except NoAvailableNodeError:
             return _record_route(
                 request,
@@ -2105,7 +2176,7 @@ async def route_create(request: Request) -> Response:
         # Multipart callers pre-allocate a fresh destination id. Placement is
         # ordinary rendezvous over that id; ``resume`` is reserved for the JSON
         # atomic-fork path keyed by its source workstream.
-        routing_strategy = "rendezvous"
+        routing_strategy = "target_node" if required else "rendezvous"
         # Forward the raw header verbatim — the multipart `boundary=` parameter
         # is case-sensitive and must match the bytes in the body exactly.
         upstream_headers = {**headers, "Content-Type": raw_content_type}
@@ -2127,7 +2198,9 @@ async def route_create(request: Request) -> Response:
                 ),
             )
     else:
-        parsed_body = await read_json_or_400(request)
+        parsed_body = (
+            multipart_fork if multipart_fork is not None else await read_json_or_400(request)
+        )
         if isinstance(parsed_body, JSONResponse):
             return _record_route(request, "create", parsed_body.status_code, t0, parsed_body)
         body = parsed_body
@@ -2185,85 +2258,53 @@ async def route_create(request: Request) -> Response:
                 JSONResponse({"error": "invalid ws_id format"}, status_code=400),
             )
 
-        # ``resume_ws`` supports saved aliases, but rendezvous placement needs
-        # the canonical source id. Resolve before choosing a node and forward
-        # the canonical value so the router and node operate on one identity.
-        if resume_ws:
-            storage, storage_err = require_storage_or_503(request)
-            if storage_err is not None:
-                return _record_route(
-                    request,
-                    "create",
-                    storage_err.status_code,
-                    t0,
-                    storage_err,
-                )
-            try:
-                # Keep the node and console on one precedence rule. A full
-                # workstream id is already canonical when that exact row
-                # exists; only fall back to alias-first resolution when it
-                # does not. Otherwise an alias equal to another row's 32-hex
-                # id can redirect the routed fork before it reaches the node.
-                exact_row = (
-                    await asyncio.to_thread(storage.get_workstream, resume_ws)
-                    if resume_ws_exact or _VALID_CREATE_WS_ID_RE.fullmatch(resume_ws)
-                    else None
-                )
-                canonical_resume = resume_ws if exact_row is not None else None
-                if canonical_resume is None and not resume_ws_exact:
-                    canonical_resume = await asyncio.to_thread(
-                        storage.resolve_workstream, resume_ws
-                    )
-            except Exception:
-                log.warning(
-                    "route_create.resume_lookup_failed source=%s",
-                    resume_ws[:32],
-                    exc_info=True,
-                )
-                return _record_route(
-                    request,
-                    "create",
-                    503,
-                    t0,
-                    JSONResponse({"error": "Storage not available"}, status_code=503),
-                )
-            if not canonical_resume:
-                return _record_route(
-                    request,
-                    "create",
-                    404,
-                    t0,
-                    JSONResponse({"error": "Workstream not found"}, status_code=404),
-                )
-            body["resume_ws"] = canonical_resume
-            # Preserve the resolved identity even if it disappears before the
-            # node's preflight; another row's alias cannot replace this source.
-            body["resume_ws_exact"] = True
-            resume_ws = canonical_resume
+        source_row = await _resolve_fork_source(request, body)
+        if isinstance(source_row, JSONResponse):
+            return _record_route(request, "create", source_row.status_code, t0, source_row)
+        resume_ws = body.get("resume_ws", "")
+        try:
+            explicit_required = requested_node_requirement(
+                body.get("required_node_id"), target_node
+            )
+        except ValueError as exc:
+            return _record_route(
+                request, "create", 400, t0, JSONResponse({"error": str(exc)}, status_code=400)
+            )
+        # Inheritance is resolved again at the node's authorized source read.
+        # Forward only explicit intent, so a stale console snapshot cannot
+        # turn an inherited requirement into an explicit policy override.
+        body["required_node_id"] = explicit_required
+        effective_required = explicit_required or (
+            source_row.get("required_node_id") if source_row else None
+        )
 
         fixed_ws_id = bool(requested_ws_id)
         try:
-            if requested_ws_id:
-                # A caller-selected destination is authoritative. Do not
-                # overwrite it for a target hint or a fork; place it through
-                # the same rendezvous path used for generated destinations.
-                ref = router.route(requested_ws_id)
+            if effective_required:
+                ref = router.required_node(effective_required)
+                if not requested_ws_id and not resume_ws:
+                    ws_id = secrets.token_hex(16)
+                    body["ws_id"] = ws_id
+                pin = bool(explicit_required)
+                routing_strategy = "target_node" if explicit_required else "resume"
+            elif requested_ws_id:
+                ref = await _request_route(request, router, requested_ws_id)
                 routing_strategy = "rendezvous"
             elif resume_ws:
-                ref = router.route(resume_ws)
+                ref = await _request_route(request, router, resume_ws)
                 routing_strategy = "resume"
-            elif target_node:
-                # Brute-force HRW search can take up to _GENERATE_ATTEMPT_CAP
-                # iterations for skewed weights; off the event loop.
-                ws_id = await asyncio.to_thread(router.generate_ws_id_for_node, target_node)
-                body["ws_id"] = ws_id
-                ref = router.route(ws_id)
-                pin = True
-                routing_strategy = "target_node"
             else:
                 ws_id = secrets.token_hex(16)
                 body["ws_id"] = ws_id
-                ref = router.route(ws_id)
+                ref = await _request_route(request, router, ws_id)
+        except NodeAffinityError as exc:
+            return _record_route(
+                request,
+                "create",
+                exc.status_code,
+                t0,
+                JSONResponse(exc.as_dict(), status_code=exc.status_code),
+            )
         except NoAvailableNodeError:
             return _record_route(
                 request,
@@ -2300,19 +2341,34 @@ async def route_create(request: Request) -> Response:
             # ordinary generated-id contract here: an atomic registration
             # collision draws another id, while a caller-selected id remains
             # authoritative and returns the node's 409 unchanged.
+            try:
+                collision = resp.status_code == 409 and resp.json() == {
+                    "error": "Workstream already exists"
+                }
+            except ValueError:
+                collision = False
             if (
-                resp.status_code == 409
+                collision
                 and not resume_ws
                 and not fixed_ws_id
                 and collision_retries < _GENERATED_WS_ID_COLLISION_RETRY_CAP
             ):
                 collision_retries += 1
                 try:
-                    if target_node:
-                        ws_id = await asyncio.to_thread(router.generate_ws_id_for_node, target_node)
-                    else:
-                        ws_id = secrets.token_hex(16)
-                    ref = router.route(ws_id)
+                    ws_id = secrets.token_hex(16)
+                    ref = (
+                        router.required_node(effective_required)
+                        if effective_required
+                        else await _request_route(request, router, ws_id)
+                    )
+                except NodeAffinityError as exc:
+                    return _record_route(
+                        request,
+                        "create",
+                        exc.status_code,
+                        t0,
+                        JSONResponse(exc.as_dict(), status_code=exc.status_code),
+                    )
                 except NoAvailableNodeError:
                     return _record_route(
                         request,
@@ -2343,7 +2399,15 @@ async def route_create(request: Request) -> Response:
                 for _ in range(10):
                     ws_id = secrets.token_hex(16)
                     try:
-                        ref = router.route(ws_id)
+                        ref = await _request_route(request, router, ws_id)
+                    except NodeAffinityError as exc:
+                        return _record_route(
+                            request,
+                            "create",
+                            exc.status_code,
+                            t0,
+                            JSONResponse(exc.as_dict(), status_code=exc.status_code),
+                        )
                     except NoAvailableNodeError:
                         break
                     if ref.node_id != failed_node:
@@ -2464,23 +2528,19 @@ async def route_attachment_proxy(request: Request) -> Response:
     method = "attach"
     t0 = time.monotonic()
     router: ConsoleRouter | None = request.app.state.router
-    ring_ready = router is not None and router.is_ready()
-    if not ring_ready:
-        if router is not None:
-            await asyncio.to_thread(router.refresh_cache)
-            ring_ready = router.is_ready()
-        if not ring_ready:
-            return _record_route(
-                request,
-                method,
-                503,
-                t0,
-                JSONResponse(
-                    {"error": "Cluster routing not initialized"},
-                    status_code=503,
-                ),
-            )
-    assert router is not None
+    if router is None:
+        return _record_route(
+            request,
+            method,
+            503,
+            t0,
+            JSONResponse(
+                {"error": "Cluster routing not initialized"},
+                status_code=503,
+            ),
+        )
+    if not router.is_ready():
+        await asyncio.to_thread(router.refresh_cache)
 
     ws_id = request.path_params.get("ws_id", "").strip()
     if not ws_id:
@@ -2492,7 +2552,15 @@ async def route_attachment_proxy(request: Request) -> Response:
             JSONResponse({"error": "ws_id required"}, status_code=400),
         )
     try:
-        ref = router.route(ws_id)
+        ref = await _request_route(request, router, ws_id)
+    except NodeAffinityError as exc:
+        return _record_route(
+            request,
+            method,
+            exc.status_code,
+            t0,
+            JSONResponse(exc.as_dict(), status_code=exc.status_code),
+        )
     except (NoAvailableNodeError, ValueError):
         return _record_route(
             request,
@@ -2606,23 +2674,19 @@ async def route_proxy(request: Request) -> Response:
         if err is not None:
             return _record_route(request, verb, 403, t0, err)
     router: ConsoleRouter | None = request.app.state.router
-    ring_ready = router is not None and router.is_ready()
-    if not ring_ready:
-        if router is not None:
-            await asyncio.to_thread(router.refresh_cache)
-            ring_ready = router.is_ready()
-        if not ring_ready:
-            return _record_route(
-                request,
-                verb,
-                503,
-                t0,
-                JSONResponse(
-                    {"error": "Cluster routing not initialized"},
-                    status_code=503,
-                ),
-            )
-    assert router is not None
+    if router is None:
+        return _record_route(
+            request,
+            verb,
+            503,
+            t0,
+            JSONResponse(
+                {"error": "Cluster routing not initialized"},
+                status_code=503,
+            ),
+        )
+    if not router.is_ready():
+        await asyncio.to_thread(router.refresh_cache)
 
     try:
         body = await request.json()
@@ -2673,7 +2737,15 @@ async def route_proxy(request: Request) -> Response:
             ),
         )
     try:
-        ref = router.route(ws_id)
+        ref = await _request_route(request, router, ws_id)
+    except NodeAffinityError as exc:
+        return _record_route(
+            request,
+            verb,
+            exc.status_code,
+            t0,
+            JSONResponse(exc.as_dict(), status_code=exc.status_code),
+        )
     except (NoAvailableNodeError, ValueError):
         return _record_route(
             request,
@@ -2722,10 +2794,18 @@ async def route_proxy(request: Request) -> Response:
         # stampede after a node churn doesn't N×-multiply DB reads.
         await asyncio.to_thread(router.force_refresh)
         try:
-            new_ref = router.route(ws_id)
+            new_ref = await _request_route(request, router, ws_id)
+        except NodeAffinityError as exc:
+            return _record_route(
+                request,
+                verb,
+                exc.status_code,
+                t0,
+                JSONResponse(exc.as_dict(), status_code=exc.status_code),
+            )
         except (NoAvailableNodeError, ValueError):
             new_ref = ref
-        if new_ref.node_id != ref.node_id:
+        if (new_ref.node_id, new_ref.url) != (ref.node_id, ref.url):
             try:
                 resp = await client.request(
                     http_method,
@@ -2774,23 +2854,19 @@ async def route_workstream_delete(request: Request) -> Response:
     """
     t0 = time.monotonic()
     router: ConsoleRouter | None = request.app.state.router
-    ring_ready = router is not None and router.is_ready()
-    if not ring_ready:
-        if router is not None:
-            await asyncio.to_thread(router.refresh_cache)
-            ring_ready = router.is_ready()
-        if not ring_ready:
-            return _record_route(
-                request,
-                "delete",
-                503,
-                t0,
-                JSONResponse(
-                    {"error": "Cluster routing not initialized"},
-                    status_code=503,
-                ),
-            )
-    assert router is not None
+    if router is None:
+        return _record_route(
+            request,
+            "delete",
+            503,
+            t0,
+            JSONResponse(
+                {"error": "Cluster routing not initialized"},
+                status_code=503,
+            ),
+        )
+    if not router.is_ready():
+        await asyncio.to_thread(router.refresh_cache)
 
     try:
         body = await request.json()
@@ -2813,7 +2889,15 @@ async def route_workstream_delete(request: Request) -> Response:
             JSONResponse({"error": "ws_id required"}, status_code=400),
         )
     try:
-        ref = router.route(ws_id)
+        ref = await _request_route(request, router, ws_id)
+    except NodeAffinityError as exc:
+        return _record_route(
+            request,
+            "delete",
+            exc.status_code,
+            t0,
+            JSONResponse(exc.as_dict(), status_code=exc.status_code),
+        )
     except (NoAvailableNodeError, ValueError):
         return _record_route(
             request,
@@ -2855,27 +2939,88 @@ async def route_workstream_delete(request: Request) -> Response:
     )
 
 
+async def _resolve_fork_source(
+    request: Request, body: dict[str, Any]
+) -> dict[str, Any] | JSONResponse | None:
+    """Resolve and authorize saved history before exposing its node requirement."""
+    from turnstone.core.auth import WorkstreamProjectVisibility
+
+    source = body.get("resume_ws")
+    exact = body.get("resume_ws_exact", False)
+    if not isinstance(exact, bool):
+        return JSONResponse({"error": "resume_ws_exact must be a boolean"}, status_code=400)
+    if exact and not source:
+        return JSONResponse({"error": "resume_ws_exact requires resume_ws"}, status_code=400)
+    if not source:
+        return None
+    if not isinstance(source, str) or len(source) > 256:
+        return JSONResponse(
+            {"error": "resume_ws must be a string of at most 256 characters"}, status_code=400
+        )
+    storage, error = require_storage_or_503(request)
+    if error is not None:
+        return error
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    try:
+        row: dict[str, Any] | None = None
+        if body.get("resume_ws_exact") or _VALID_CREATE_WS_ID_RE.fullmatch(source):
+            row = await asyncio.to_thread(storage.get_workstream, source)
+        if row is None and not body.get("resume_ws_exact"):
+            canonical = await asyncio.to_thread(storage.resolve_workstream, source)
+            row = await asyncio.to_thread(storage.get_workstream, canonical) if canonical else None
+        visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
+        if (
+            row is None
+            or row.get("state") in {"creating", "deleted"}
+            or not await asyncio.to_thread(
+                visibility.ws_visible,
+                row.get("project_id") or "",
+                ws_owner=row.get("user_id") or "",
+            )
+        ):
+            return JSONResponse({"error": "Workstream not found"}, status_code=404)
+    except Exception:
+        log.warning("route_create.resume_lookup_failed", exc_info=True)
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    body["resume_ws"] = row["ws_id"]
+    body["resume_ws_exact"] = True
+    return row
+
+
+async def _request_route(request: Request, router: ConsoleRouter, ws_id: str) -> NodeRef:
+    """Resolve durable policy off-loop, with the request's history visibility."""
+    from turnstone.core.auth import WorkstreamProjectVisibility
+
+    visibility = WorkstreamProjectVisibility.for_request(
+        request, storage=getattr(request.app.state, "auth_storage", None)
+    )
+    return await asyncio.to_thread(
+        router.route,
+        ws_id,
+        can_read=lambda row: visibility.ws_visible(
+            row.get("project_id") or "", ws_owner=row.get("user_id") or ""
+        ),
+    )
+
+
 async def route_lookup(request: Request) -> JSONResponse:
     """GET /v1/api/route — look up which node owns a workstream."""
     t0 = time.monotonic()
     router: ConsoleRouter | None = request.app.state.router
-    ring_ready = router is not None and router.is_ready()
-    if not ring_ready:
-        if router is not None:
-            await asyncio.to_thread(router.refresh_cache)
-            ring_ready = router.is_ready()
-        if not ring_ready:
-            return _record_route(
-                request,
-                "route",
-                503,
-                t0,
-                JSONResponse(
-                    {"error": "Cluster routing not initialized"},
-                    status_code=503,
-                ),
-            )  # type: ignore[return-value]
-    assert router is not None
+    if router is None:
+        return _record_route(
+            request,
+            "route",
+            503,
+            t0,
+            JSONResponse(
+                {"error": "Cluster routing not initialized"},
+                status_code=503,
+            ),
+        )  # type: ignore[return-value]
+    if not router.is_ready():
+        await asyncio.to_thread(router.refresh_cache)
 
     ws_id = request.query_params.get("ws_id", "")
     if not ws_id:
@@ -2891,7 +3036,15 @@ async def route_lookup(request: Request) -> JSONResponse:
         )  # type: ignore[return-value]
 
     try:
-        ref = router.route(ws_id)
+        ref = await _request_route(request, router, ws_id)
+    except NodeAffinityError as exc:
+        return _record_route(
+            request,
+            "route",
+            exc.status_code,
+            t0,
+            JSONResponse(exc.as_dict(), status_code=exc.status_code),
+        )  # type: ignore[return-value]
     except NoAvailableNodeError:
         return _record_route(
             request,
@@ -2926,23 +3079,19 @@ async def route_workstream_live(request: Request) -> Response:
     """
     t0 = time.monotonic()
     router: ConsoleRouter | None = request.app.state.router
-    ring_ready = router is not None and router.is_ready()
-    if not ring_ready:
-        if router is not None:
-            await asyncio.to_thread(router.refresh_cache)
-            ring_ready = router.is_ready()
-        if not ring_ready:
-            return _record_route(
-                request,
-                "live",
-                503,
-                t0,
-                JSONResponse(
-                    {"error": "Cluster routing not initialized"},
-                    status_code=503,
-                ),
-            )
-    assert router is not None
+    if router is None:
+        return _record_route(
+            request,
+            "live",
+            503,
+            t0,
+            JSONResponse(
+                {"error": "Cluster routing not initialized"},
+                status_code=503,
+            ),
+        )
+    if not router.is_ready():
+        await asyncio.to_thread(router.refresh_cache)
 
     ws_id = request.path_params.get("ws_id", "").strip()
     if not ws_id:
@@ -2955,7 +3104,15 @@ async def route_workstream_live(request: Request) -> Response:
         )
 
     try:
-        ref = router.route(ws_id)
+        ref = await _request_route(request, router, ws_id)
+    except NodeAffinityError as exc:
+        return _record_route(
+            request,
+            "live",
+            exc.status_code,
+            t0,
+            JSONResponse(exc.as_dict(), status_code=exc.status_code),
+        )
     except (NoAvailableNodeError, ValueError):
         return _record_route(
             request,
@@ -3016,7 +3173,7 @@ async def route_workstream_live(request: Request) -> Response:
         # the original miss without another round trip.
         try:
             await asyncio.to_thread(router.force_refresh)
-            refreshed_ref = router.route(ws_id)
+            refreshed_ref = await _request_route(request, router, ws_id)
         except Exception:
             log.warning("route_workstream_live.refresh_failed ws=%s", ws_id[:8], exc_info=True)
             return _record_route(

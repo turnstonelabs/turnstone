@@ -28,7 +28,7 @@
             },
             "target_node": {
               "type": "string",
-              "description": "Optional node_id hint. Pinning is hard — if the named node has dropped the 120s registry heartbeat between list_nodes and this spawn, the item lands in denied[] with a `No available node for routing` reason. Omit unless the workload truly requires that node."
+              "description": "Optional required node_id, retained after close or restart. An unavailable target puts this item in denied[] without fallback. Omit for flexible placement."
             },
             "persona": {
               "type": "string",

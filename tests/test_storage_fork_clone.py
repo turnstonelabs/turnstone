@@ -749,3 +749,103 @@ def test_compacted_clone_rewrites_marker_to_destination_id_space(storage_backend
     assert marker_id != source_watermark
     assert backend.get_compaction_checkpoint("destination") == marker_id
     assert backend.count_messages("destination") == 3  # marker + two live tail rows
+
+
+@pytest.mark.parametrize(
+    "destination_required,executor,changed",
+    [
+        (None, "host-1", False),
+        ("node-1", "node-1", False),
+        (None, "node-1", False),
+        ("node-1", "node-1", True),
+    ],
+)
+def test_clone_requirement_inheritance_override_and_atomic_recheck(
+    storage_backend,
+    destination_required,
+    executor,
+    changed,
+):
+    from turnstone.core.node_affinity import NodeAffinityError
+
+    backend = storage_backend
+    backend.register_workstream(
+        "source",
+        user_id="alice",
+        state="idle",
+        kind="interactive",
+        required_node_id="host-1",
+        fork_reservation_token="source-token",
+    )
+    backend.register_workstream(
+        "destination",
+        user_id="alice",
+        state="creating",
+        kind="interactive",
+        required_node_id=destination_required,
+        fork_reservation_token="destination-token",
+    )
+    backend.save_message("source", "user", "saved history")
+    if changed:
+        with backend._conn() as conn:
+            conn.execute(
+                sa.update(workstreams)
+                .where(workstreams.c.ws_id == "source")
+                .values(required_node_id="new-host")
+            )
+            conn.commit()
+    expectation = ForkCloneExpectation(
+        persona_config=(),
+        project_id="",
+        project_name="",
+        project_writable=False,
+        destination_reservation_token="destination-token",
+        source_reservation_token="source-token",
+        source_required_node_id="host-1",
+        node_id=executor,
+    )
+
+    def clone():
+        return backend.clone_workstream(
+            "source", "destination", principal_id="alice", expected_session=expectation
+        )
+
+    if changed or (destination_required is None and executor != "host-1"):
+        with pytest.raises(ForkSourceUnavailableError if changed else NodeAffinityError):
+            clone()
+        assert backend.load_message_turns("destination") == []
+        assert backend.get_workstream("destination")["required_node_id"] == destination_required
+    else:
+        result = clone()
+        assert [turn.text for turn in result.turns] == ["saved history"]
+        assert result.required_node_id == (destination_required or "host-1")
+        assert backend.get_workstream("destination")["required_node_id"] == result.required_node_id
+        assert backend.get_workstream("source")["required_node_id"] == "host-1"
+
+
+def test_foreign_destination_hides_its_execution_requirement(storage_backend):
+    backend = storage_backend
+    _register(backend, "source", "alice", fork_reservation_token="source-token", state="idle")
+    backend.register_workstream(
+        "destination",
+        user_id="bob",
+        state="creating",
+        required_node_id="private-host",
+        fork_reservation_token="destination-token",
+    )
+    with pytest.raises(ForkDestinationConflictError, match="destination is not available"):
+        backend.clone_workstream(
+            "source",
+            "destination",
+            principal_id="alice",
+            expected_session=ForkCloneExpectation(
+                persona_config=(),
+                project_id="",
+                project_name="",
+                project_writable=False,
+                source_reservation_token="source-token",
+                destination_reservation_token="destination-token",
+                node_id="node-1",
+            ),
+        )
+    assert backend.get_workstream("destination")["required_node_id"] == "private-host"

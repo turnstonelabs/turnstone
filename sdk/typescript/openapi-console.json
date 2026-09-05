@@ -8783,7 +8783,7 @@
         "properties": {
           "node_id": {
             "default": "",
-            "description": "Target node: specific ID, 'auto', 'pool', or empty for auto",
+            "description": "Required node: a specific ID pins execution; 'auto', 'pool', or empty select initial placement only",
             "title": "Node Id",
             "type": "string"
           },
@@ -8828,6 +8828,28 @@
             "description": "Source workstream ID or alias to fork atomically into the new workstream",
             "title": "Resume Ws",
             "type": "string"
+          },
+          "resume_ws_exact": {
+            "default": false,
+            "description": "Require an exact fork source ID",
+            "title": "Resume Ws Exact",
+            "type": "boolean"
+          },
+          "required_node_id": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Durable execution requirement; omission inherits the fork source requirement",
+            "title": "Required Node Id"
           },
           "judge_model": {
             "default": "",
@@ -15047,6 +15069,22 @@
       "RouteCreateRequest": {
         "description": "JSON workstream creation through the routing proxy.",
         "properties": {
+          "required_node_id": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Required execution node. Omission permits automatic placement for a fresh workstream and inherits the source requirement for a fork. An explicit destination applies only to the new workstream ID.",
+            "title": "Required Node Id"
+          },
           "name": {
             "default": "",
             "description": "Workstream display name (auto-generated if empty)",
@@ -15187,7 +15225,7 @@
           },
           "target_node": {
             "default": "",
-            "description": "Optional node id to pin placement to. The console generates a workstream id whose rendezvous owner is that node.",
+            "description": "Optional required execution node. Applies even with a supplied destination ID or fork source. Must match required_node_id when both are supplied.",
             "title": "Target Node",
             "type": "string"
           }
@@ -15255,7 +15293,7 @@
             "type": "string"
           },
           "routing_strategy": {
-            "description": "Placement reason: rendezvous for a destination id, target_node for a generated pinned id, or resume when an atomic fork is routed by its canonical source id",
+            "description": "Placement reason: rendezvous for a destination id, target_node for an explicit execution requirement, or resume when an atomic fork inherits its source requirement or placement",
             "enum": [
               "rendezvous",
               "target_node",

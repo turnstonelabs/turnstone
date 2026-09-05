@@ -1440,6 +1440,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         project_id: str | None = None,
         persona: str | None = None,
         fork_reservation_token: str = "",
+        required_node_id: str | None = None,
     ) -> bool:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         # Kind validation at the storage edge — third of three layers
@@ -1457,6 +1458,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         values = {
             "ws_id": ws_id,
             "node_id": node_id,
+            "required_node_id": required_node_id,
             "user_id": user_id,
             "alias": alias,
             "title": title,
@@ -4541,6 +4543,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     workstreams.c.updated,
                     workstreams.c.project_id,
                     workstreams.c.persona,
+                    workstreams.c.required_node_id,
                 ).where(workstreams.c.ws_id.in_(clean))
             ).fetchall()
         for r in rows:
@@ -4560,6 +4563,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 "updated": r[12],
                 "project_id": r[13],
                 "persona": r[14],
+                "required_node_id": r[15],
             }
             out[r[0]] = item
         return out

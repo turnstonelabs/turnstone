@@ -1333,6 +1333,7 @@ An absent or malformed JSON body returns `400`.
 | `user_id`         | string        | `""`  | Owner override honored only for a trusted `console` service identity carrying the `service` scope; ordinary callers remain bound to their authenticated identity |
 | `resume_ws`       | string        | `""`    | Source workstream ID or alias to fork atomically into this new ID |
 | `resume_ws_exact` | bool          | false   | Require `resume_ws` to match an exact source ID; never resolve an alias or prefix |
+| `required_node_id` | string/null | none | Require execution on this node. Omission inherits the fork source's requirement; a fresh direct create without it stays flexible. |
 | `skill`           | string        | `""`    | Skill name. Applies its system prompt and session configuration. Returns 400 if missing/disabled; ignored for a fork because the source configuration is cloned. |
 | `persona`         | string        | `""`    | Persona slug; empty selects the kind's default. A fork keeps the source persona. |
 | `judge_model`     | string        | `""`    | Optional judge model alias                                     |
@@ -1357,6 +1358,14 @@ the source's checkpoint-bounded conversation, saved session configuration,
 persona, effective project, and attachment references. The source remains
 unchanged. Use `POST .../{ws_id}/open` when you want to rehydrate the original
 ID instead.
+
+An explicit `required_node_id` applies to the new destination and can differ
+from the source requirement. Omission (including `null`) inherits it. A
+same-ID reopen never changes the requirement. The receiving node returns
+`409` with `code: "wrong_execution_node"` and `required_node_id` before
+constructing executable state if it is not the required node. Node IDs accept
+1–256 letters, digits, dots, underscores, and hyphens; empty requirements are
+invalid. Requirements survive restart, soft close, idle timeout, and eviction.
 
 Set `resume_ws_exact: true` when recovering a stored canonical ID. A missing
 exact source returns `404` even if another workstream has that ID as its alias.
@@ -2818,8 +2827,8 @@ turnstone_tool_calls_total{tool="read_file"} 3
 ## Console Routing Proxy Endpoints
 
 These endpoints are served by the console (`turnstone-console`) and proxy
-requests to the correct server node via rendezvous (HRW) hashing over the
-live service registry. In multi-node deployments, clients (SDK, channel
+requests to the required execution node, or use placement overrides and
+rendezvous (HRW) hashing for flexible workstreams. In multi-node deployments, clients (SDK, channel
 gateway) talk to the console instead of individual server nodes.
 
 ### `POST /v1/api/route/workstreams/new`
@@ -2829,25 +2838,27 @@ the ordinary create fields plus `target_node`:
 
 | Field | Routing behavior |
 |-------|------------------|
-| `ws_id` | Optional 32-hex destination. When present, it is preserved and used as the rendezvous key, including on a fork. A 503 never replaces a caller-selected ID. |
-| `resume_ws` | Optional source ID or saved alias for an atomic fork. The console resolves aliases to the canonical source ID before routing and forwards that canonical value. When no destination `ws_id` is supplied, the source is the placement key. |
+| `ws_id` | Optional 32-hex destination. It is preserved; without an explicit or inherited requirement it is the rendezvous key. A 503 never replaces a caller-selected ID. |
+| `resume_ws` | Optional source ID or saved alias for an atomic fork. The console authorizes and canonicalizes the source before routing. Its node requirement is inherited unless explicitly replaced on the new ID. For flexible forks without a destination ID, the source is the placement key. |
 | `resume_ws_exact` | Optional boolean, default false. Requires an exact source ID in `resume_ws`; disables alias and prefix resolution. |
-| `target_node` | Optional node ID hint. When neither `ws_id` nor `resume_ws` selects placement, the console generates a destination whose rendezvous owner is this live node. |
+| `target_node` | Optional required execution node, including when `ws_id` or `resume_ws` is supplied. |
+| `required_node_id` | Same durable requirement as direct create. Must match `target_node` when both are supplied. |
 
 Without any placement field, the console generates a destination ID and routes
 it by rendezvous. Multipart callers must pre-allocate the destination and put
 the **same** 32-hex value in both `?ws_id=<32-hex>` and the multipart
-`meta.ws_id` field. The query value selects the target node; the console
+`meta.ws_id` field. An explicit requirement takes precedence over hashing; the console
 buffers the body, parses only `meta` to require the same destination ID, then
 forwards the original bytes and boundary unchanged. The node uses `meta.ws_id`
-as the destination identity.
+as the destination identity. Metadata-only multipart forks use the common JSON
+fork path after parsing, including canonicalization and inherited requirements.
+Uploads cannot be combined with a fork; fork first, then upload.
 
 The response extends the node create response with three required fields:
 `node_url`, authoritative `node_id`, and `routing_strategy`.
-`routing_strategy` is `rendezvous` for generated, explicit JSON, and multipart
-destination IDs; `target_node` when the console generated an ID for a requested
-node; or `resume` only when an atomic fork was placed by its canonical source
-ID. The node-returned destination `ws_id` is authoritative for the response,
+`routing_strategy` is `target_node` for an explicit requirement, `resume` for
+inherited affinity or source placement, and `rendezvous` for destination-ID
+placement. The node-returned destination `ws_id` is authoritative for the response,
 storage binding lookup, and audit record; the fork source is never reported as
 the created destination.
 
@@ -2858,9 +2869,16 @@ returns `200` without an object containing a valid destination `ws_id`, the
 console returns a bounded `502` instead of exposing or trusting the malformed
 payload.
 
+A required node missing from live membership returns `503` with
+`code: "required_node_unavailable"` and `required_node_id`. An unreachable
+registered node can return an upstream `502`. Neither condition permits a
+fallback to another node. Ordinary route resolution reads the durable
+requirement before cached placement, including after the node disappears.
+Private-project requirements follow the same visibility rules as history.
+
 ### `GET /v1/api/route/workstreams/{ws_id}/live`
 
-Probe the rendezvous-selected owner without opening or rehydrating the
+Probe the routed node without opening or rehydrating the
 workstream. The console asks that node's manager-authoritative active list and
 returns only:
 
@@ -2871,6 +2889,8 @@ returns only:
 Missing, unloaded, still-`creating`, and caller-invisible workstreams all
 produce `live: false`. Routing, upstream, and authorization uncertainty returns
 an error instead of a false miss, so callers can preserve an existing route.
+This includes an unavailable required node: channel recovery retains its
+saved association and retries when that node returns.
 
 ### `POST /v1/api/route/workstreams/{ws_id}/send`
 

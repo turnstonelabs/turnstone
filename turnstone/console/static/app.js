@@ -103,7 +103,8 @@ const STATE_DISPLAY = {
 const PERSISTENCE_DISPLAY = {
   pending: {
     label: "History save pending",
-    tooltip: "An accepted conversation turn has not reached durable history yet.",
+    tooltip:
+      "An accepted conversation turn has not reached durable history yet.",
   },
   retrying: {
     label: "History save retrying",
@@ -1391,6 +1392,10 @@ function _createInteractive(opts) {
   setBusy(true);
 
   const body = { node_id: placement };
+  if (opts.resume_ws) {
+    body.resume_ws = opts.resume_ws;
+    body.resume_ws_exact = true;
+  }
   if (name) body.name = name;
   if (skill) body.skill = skill;
   if (persona) body.persona = persona;
@@ -2638,16 +2643,42 @@ window.TS_APP.buildNodeInfo = function (node) {
 // The shell's interactive pane factory calls this on first activate (fresh open,
 // saved-row resume, AND reload-rehydrate all funnel through here).
 //
-// Origin-FIRST: POST /open on the hint node (the live / origin / just-created
-// node) — this REUSES a session already loaded there instead of loading a
-// duplicate copy elsewhere, and keeps node affinity (the pane talks directly to
-// /node/{id} for every verb, so load-node == pane-node).  Only when the hint
-// node is gone (404 = not in the registry / 502 = unreachable) or there is no
-// hint do we re-home onto a live rendezvous node via GET /v1/api/route (the
-// router skips dead nodes; persistence is shared ws_id-keyed Postgres, so any
-// live node is state-safe).  Capacity (429) / permission (403) surface as an
-// error — NOT a silent re-home.  Resolves to {nodeId} on success, else {error}.
+// Try the live/origin hint first to reuse an already loaded session. A missing,
+// unreachable, or wrong-node hint requires a fresh route lookup. The router
+// preserves durable node requirements; flexible sessions retain HRW recovery.
+// Both the router and the executing node enforce the requirement.
 window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
+  const readFailure = function (r) {
+    return Promise.resolve()
+      .then(function () {
+        return r.json();
+      })
+      .catch(function () {
+        return {};
+      })
+      .then(function (data) {
+        const required = data && data.required_node_id;
+        if (
+          data &&
+          ((r.status === 503 && data.code === "required_node_unavailable") ||
+            (r.status === 409 && data.code === "wrong_execution_node")) &&
+          typeof required === "string" &&
+          /^[A-Za-z0-9_.-]{1,256}$/.test(required)
+        ) {
+          return {
+            status: r.status,
+            code: data.code,
+            requiredNodeId: required,
+            error:
+              "This session requires node '" +
+              required +
+              "'. Retry when it returns, or continue elsewhere from saved history.",
+            canContinue: true,
+          };
+        }
+        return { status: r.status };
+      });
+  };
   const openOn = function (nodeId) {
     return authFetch(
       "/node/" +
@@ -2657,29 +2688,29 @@ window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
         "/open",
       { method: "POST" },
     ).then(function (r) {
-      return r.ok ? { nodeId: nodeId } : { status: r.status };
+      return r.ok ? { nodeId: nodeId } : readFailure(r);
     });
   };
   // Single error surface: the failure is returned as {error} and the interactive
   // pane writes it into its .pane-status line (the pane is always the active tab
   // when it resolves).  No toast — one source of truth, no wording drift.
-  const failResult = function (status) {
+  const failResult = function (res) {
+    if (res.error) return res;
+    const status = res.status;
     if (status === 429)
       return { error: "Node at capacity — close a session and retry." };
     if (status === 403)
       return { error: "You don’t have permission to open this session." };
-    return { error: "Could not open this session (" + status + ")." };
+    return {
+      error: "Could not open this session (" + status + ").",
+      canContinue: status === 502 || status === 503,
+    };
   };
   const routeFallback = function () {
     return authFetch("/v1/api/route?ws_id=" + encodeURIComponent(wsId))
       .then(function (r) {
         if (!r.ok) {
-          return {
-            error:
-              r.status === 503
-                ? "No nodes available to open this session."
-                : "Could not locate the session node (" + r.status + ").",
-          };
+          return readFailure(r).then(failResult);
         }
         return r.json();
       })
@@ -2689,21 +2720,66 @@ window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
         if (!route.node_id)
           return { error: "Could not locate the session node." };
         return openOn(route.node_id).then(function (res) {
-          return res.nodeId ? res : failResult(res.status);
+          return res.nodeId ? res : failResult(res);
         });
       });
   };
   const flow = hintNodeId
     ? openOn(hintNodeId).then(function (res) {
         if (res.nodeId) return res;
-        // Origin gone -> rendezvous re-home; capacity/permission surface as-is.
-        if (res.status === 404 || res.status === 502) return routeFallback();
-        return failResult(res.status);
+        if (
+          res.status === 404 ||
+          res.status === 502 ||
+          res.code === "wrong_execution_node"
+        )
+          return routeFallback();
+        return failResult(res);
       })
     : routeFallback();
   return flow.catch(function () {
     return { error: "Failed to open this session." };
   });
+};
+
+window.TS_APP.continueInteractiveElsewhere = function (wsId, requiredNodeId) {
+  const dlg = document.getElementById("continue-session-dialog");
+  if (!dlg || dlg.open) return;
+  const select = document.getElementById("continue-session-node");
+  const error = document.getElementById("continue-session-error");
+  const submit = document.getElementById("continue-session-submit");
+  select.replaceChildren(new Option("Choose a destination node", ""));
+  Object.keys((clusterState && clusterState.nodes) || {})
+    .sort()
+    .forEach(function (nodeId) {
+      const node = clusterState.nodes[nodeId];
+      if (
+        nodeId !== "console" &&
+        nodeId !== requiredNodeId &&
+        node.reachable !== false
+      )
+        select.add(new Option(nodeId, nodeId));
+    });
+  error.textContent =
+    select.options.length === 1
+      ? "No other nodes are available. Retry when a node returns."
+      : "";
+  submit.disabled = select.options.length === 1;
+  submit.onclick = function () {
+    if (dlg.hasAttribute("data-busy")) return;
+    _createInteractive({
+      resume_ws: wsId,
+      node_strategy: "node",
+      node_id: select.value,
+      errEl: error,
+      setBusy: function (busy) {
+        window.TurnstoneHatch.setBusy(dlg, busy);
+      },
+      onSuccess: function () {
+        dlg.close();
+      },
+    });
+  };
+  window.TurnstoneHatch.openDialog(dlg);
 };
 // === MCP consent badge (console L-shell) ====================================
 // Mirror of the node dashboard's pending-consent subsystem (ui/static/app.js

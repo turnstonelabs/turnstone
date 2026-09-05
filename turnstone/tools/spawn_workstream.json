@@ -1,6 +1,6 @@
 {
   "name": "spawn_workstream",
-  "description": "Create a new child workstream, optionally dispatching an initial message. Kick off a focused sub-task on a different skill / model / node while the coordinator stays in charge. The child runs independently — drive it with send_to_workstream / inspect_workstream / close_workstream. Returns `{child_ws_id, name, node_id, routing_strategy}` — pass `child_ws_id` into `wait_for_workstream(ws_ids=[...])` and the other `ws_id`-taking tools. For this tool, `routing_strategy` is `rendezvous` (default placement on the live-node set) or `target_node` (your hint was honored). The returned `node_id` is the spawn-time binding; subsequent ops re-route via rendezvous over the live-node set, so a node join or drop after spawn can shift the active owner. Conversation state lives in storage (the new owner rehydrates lazily). Don't cache `node_id` for long-running callbacks — re-read with inspect_workstream. Lifecycle state (idle / running / etc.) is not in this response — read it via inspect_workstream.",
+  "description": "Create a new child workstream, optionally dispatching an initial message. Kick off a focused sub-task on a different skill / model / node while the coordinator stays in charge. The child runs independently — drive it with send_to_workstream / inspect_workstream / close_workstream. Returns `{child_ws_id, name, node_id, routing_strategy}` — pass `child_ws_id` into `wait_for_workstream(ws_ids=[...])` and the other `ws_id`-taking tools. For this tool, `routing_strategy` is `rendezvous` (default placement on the live-node set) or `target_node` (an explicit execution requirement). An explicit target remains required after close or restart; unavailable targets do not fall back. Automatic placement remains flexible. The returned `node_id` describes placement at creation, not an exclusive ownership lease. Don't cache `node_id` for long-running callbacks — re-read with inspect_workstream. Lifecycle state (idle / running / etc.) is not in this response — read it via inspect_workstream.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -22,7 +22,7 @@
       },
       "target_node": {
         "type": "string",
-        "description": "Optional node_id hint. When provided, the routing proxy pins the workstream to that node by generating a ws_id that rendezvous-hashes onto it. Otherwise rendezvous picks deterministically from the live-node set. CAVEAT: pinning is a hard constraint — if the named node has dropped out of the 120s service-registry heartbeat window between your `list_nodes` call and this spawn, the spawn fails with \"No available node for routing\" rather than falling back. Omit `target_node` if you can tolerate landing on any node; pin only when the workload truly requires that specific node's capabilities/region/tenancy."
+        "description": "Optional required node_id. Execution stays bound to this identity after close, timeout, or restart. An unavailable node fails without fallback. Omit for flexible placement; select a node when its local files, devices, or environment are required."
       },
       "project": {
         "type": "string",

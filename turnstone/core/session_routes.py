@@ -42,6 +42,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from turnstone.core.log import get_logger
+from turnstone.core.node_affinity import NodeAffinityError
 from turnstone.core.session_manager import CloseOutcome, WorkstreamAlreadyExistsError
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_ui_base import CrossPrincipalApprovalError
@@ -2128,6 +2129,8 @@ def make_open_handler(
 
         try:
             ws = mgr.open(ws_id)
+        except NodeAffinityError as exc:
+            return JSONResponse(exc.as_dict(), status_code=exc.status_code)
         except ValueError as exc:
             # Session factory misconfig (e.g., a model alias that
             # no longer exists). Surface the factory's remediation
@@ -3458,6 +3461,8 @@ def make_create_handler(
                 raise
         except WorkstreamAlreadyExistsError:
             return JSONResponse({"error": "Workstream already exists"}, status_code=409)
+        except NodeAffinityError as exc:
+            return JSONResponse(exc.as_dict(), status_code=exc.status_code)
         except RuntimeError as exc:
             # ``SessionManager.create`` documents RuntimeError as
             # "manager at capacity" — translate to 429 (rate-limit /
@@ -4923,6 +4928,8 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
         if ws is None:
             try:
                 ws = mgr.open(ws_id)
+            except NodeAffinityError as exc:
+                return JSONResponse(exc.as_dict(), status_code=exc.status_code)
             except ValueError as exc:
                 # Session factory misconfig (e.g. a model alias that no
                 # longer resolves). Surface remediation text as 503

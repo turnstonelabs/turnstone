@@ -200,7 +200,7 @@ class TestRouteCreateAudit:
 
         call_count = 0
 
-        def _route(_ws_id: str) -> NodeRef:
+        def _route(_ws_id: str, **kwargs: Any) -> NodeRef:
             nonlocal call_count
             call_count += 1
             if call_count <= 1:

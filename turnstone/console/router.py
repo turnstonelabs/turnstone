@@ -1,22 +1,20 @@
 """Console routing layer — routes workstream requests to server nodes.
 
-Uses rendezvous (HRW) hashing over the live ``services`` table.  The
-routing function is a pure function of ``(ws_id, live_nodes)``: every
-reader given the same membership list produces the same answer, and
-``services.last_heartbeat`` is the single source of truth for both
-liveness and routing.
+Uses durable execution requirements before placement overrides and rendezvous
+(HRW) hashing over the live ``services`` table. Requirements are read from the
+saved row on each resolution, so a missing cache entry never releases a pin.
 
 **Cache ownership**: the router's cache is push-driven by the
-collector's background discovery thread.  ``route()`` and ``is_ready()``
-are pure in-memory lookups — they do not touch storage on the hot path.
+collector's background discovery thread. ``route()`` also reads the saved
+workstream row; async callers must run it in a worker thread.
 The collector calls ``refresh_cache()`` on every discovery tick and
 again immediately on observed membership changes (node_joined /
 node_lost).  ``force_refresh()`` exists for the 404-retry path;
 callers must wrap it in ``asyncio.to_thread`` when invoking from an
 async handler so its DB read doesn't stall the event loop.
 
-Per-route cost is O(N) hash computes — microseconds at typical cluster
-sizes, dwarfed by every downstream HTTP round-trip.
+Each resolution costs one indexed workstream read and, for flexible placement,
+O(N) hash computes. Node membership and placement overrides remain cached.
 """
 
 from __future__ import annotations
@@ -24,11 +22,14 @@ from __future__ import annotations
 import json
 import secrets
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from turnstone.core.node_affinity import NodeAffinityError, parse_required_node_id
 from turnstone.core.rendezvous import NoAvailableNodeError, NodeRef, select
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turnstone.core.storage._protocol import StorageBackend
 
 # Brute-force attempt cap for ``generate_ws_id_for_node``.  Expected
@@ -151,26 +152,45 @@ class ConsoleRouter:
     # Routing
     # ------------------------------------------------------------------
 
-    def route(self, ws_id: str) -> NodeRef:
+    def route(
+        self, ws_id: str, *, can_read: Callable[[dict[str, Any]], bool] | None = None
+    ) -> NodeRef:
         """Route a workstream to its assigned node.
 
         Priority:
-        1. Per-workstream override (pinned to a specific node)
-        2. Rendezvous (HRW) selection over the live-node list
-
-        Pure in-memory lookup — does not touch storage.  Cache freshness
-        is the collector's responsibility (see module docstring).
+        A durable requirement wins over location overrides and HRW. Invisible
+        rows use the same placement as unknown IDs, avoiding a private-source
+        oracle through unavailable-node responses. Callers without a filter
+        are trusted internal consumers.
         """
+        if not ws_id:
+            raise NoAvailableNodeError("invalid ws_id: empty")
+        try:
+            row = self._storage.get_workstream(ws_id)
+            visible = row is None or can_read is None or can_read(row)
+            required = (
+                parse_required_node_id(row.get("required_node_id")) if row and visible else None
+            )
+        except Exception as exc:
+            raise NoAvailableNodeError("Cannot resolve workstream execution requirement") from exc
+        if required:
+            return self.required_node(required)
         with self._lock:
-            ref = self._overrides.get(ws_id)
+            ref = self._overrides.get(ws_id) if visible else None
             if ref is not None:
                 return ref
             nodes = self._nodes  # snapshot — list is replaced wholesale on refresh
         if not nodes:
             raise NoAvailableNodeError("no live nodes")
-        if not ws_id:
-            raise NoAvailableNodeError("invalid ws_id: empty")
         return select(ws_id, nodes)
+
+    def required_node(self, node_id: str) -> NodeRef:
+        """Resolve one required identity without permitting placement fallback."""
+        with self._lock:
+            for ref in self._nodes:
+                if ref.node_id == node_id:
+                    return ref
+        raise NodeAffinityError(node_id, unavailable=True)
 
     def remember_override(self, ws_id: str, ref: NodeRef) -> None:
         """Publish one just-confirmed durable placement into this cache.

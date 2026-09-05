@@ -156,7 +156,7 @@ class ClusterSnapshotResponse(BaseModel):
 class ConsoleCreateWsRequest(BaseModel):
     node_id: str = Field(
         default="",
-        description="Target node: specific ID, 'auto', 'pool', or empty for auto",
+        description="Required node: a specific ID pins execution; 'auto', 'pool', or empty select initial placement only",
     )
     name: str = Field(default="", description="Workstream name (auto-generated if empty)")
     model: str = Field(default="", description="Model alias from node registry")
@@ -175,6 +175,14 @@ class ConsoleCreateWsRequest(BaseModel):
     resume_ws: str = Field(
         default="",
         description=("Source workstream ID or alias to fork atomically into the new workstream"),
+    )
+    resume_ws_exact: bool = Field(default=False, description="Require an exact fork source ID")
+    required_node_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+        description="Durable execution requirement; omission inherits the fork source requirement",
     )
     judge_model: str = Field(
         default="", description="Override judge model alias for this workstream"
@@ -1450,8 +1458,8 @@ class RouteCreateRequest(CreateWorkstreamRequest):
     target_node: str = Field(
         default="",
         description=(
-            "Optional node id to pin placement to. The console generates a "
-            "workstream id whose rendezvous owner is that node."
+            "Optional required execution node. Applies even with a supplied destination ID "
+            "or fork source. Must match required_node_id when both are supplied."
         ),
     )
 
@@ -1464,8 +1472,8 @@ class RouteCreateResponse(CreateWorkstreamResponse):
     routing_strategy: Literal["rendezvous", "target_node", "resume"] = Field(
         description=(
             "Placement reason: rendezvous for a destination id, target_node for "
-            "a generated pinned id, or resume when an atomic fork is routed by "
-            "its canonical source id"
+            "an explicit execution requirement, or resume when an atomic fork inherits "
+            "its source requirement or placement"
         ),
     )
 

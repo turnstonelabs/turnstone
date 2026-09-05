@@ -15,6 +15,7 @@ from starlette.testclient import TestClient
 
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.router import ConsoleRouter, NodeRef
+from turnstone.core.rendezvous import NoAvailableNodeError
 
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
 
@@ -112,7 +113,7 @@ class TestRouteCreateMultipart:
             # Body bytes were forwarded raw
             assert isinstance(captured["content"], (bytes, bytearray))
             assert b"hello" in bytes(captured["content"])
-            router.route.assert_called_with(ws_id)
+            assert router.route.call_args.args == (ws_id,)
         finally:
             client.close()
 
@@ -362,6 +363,7 @@ class TestRoutingFailures:
     def test_router_not_ready_returns_503(self):
         router = MagicMock(spec=ConsoleRouter)
         router.is_ready.return_value = False
+        router.route.side_effect = NoAvailableNodeError("no live nodes")
         router.refresh_cache.return_value = None
         app = _make_app(router=router)
         app.state.proxy_client = MagicMock(spec=httpx.AsyncClient)

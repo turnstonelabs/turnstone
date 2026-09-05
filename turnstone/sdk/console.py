@@ -170,6 +170,8 @@ class AsyncTurnstoneConsole(_BaseClient):
         persona: str = "",
         project_id: str = "",
         resume_ws: str = "",
+        resume_ws_exact: bool = False,
+        required_node_id: str | None = None,
         judge_model: str = "",
     ) -> ConsoleCreateWsResponse:
         body: dict[str, Any] = {}
@@ -189,6 +191,10 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["project_id"] = project_id
         if resume_ws:
             body["resume_ws"] = resume_ws
+        if resume_ws_exact:
+            body["resume_ws_exact"] = True
+        if required_node_id is not None:
+            body["required_node_id"] = required_node_id
         if judge_model:
             body["judge_model"] = judge_model
         return await self._request(
@@ -221,6 +227,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         project_id: str = "",
         resume_ws: str = "",
         resume_ws_exact: bool = False,
+        required_node_id: str | None = None,
         judge_model: str = "",
         target_node: str = "",
         user_id: str = "",
@@ -261,6 +268,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["resume_ws"] = resume_ws
         if resume_ws_exact:
             body["resume_ws_exact"] = True
+        if required_node_id is not None:
+            body["required_node_id"] = required_node_id
         if judge_model:
             body["judge_model"] = judge_model
         if target_node:
@@ -273,15 +282,6 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["notify_targets"] = notify_targets
 
         if attachments:
-            # The console's multipart route_create routes by `?ws_id=` only —
-            # it does not parse the body to honor `target_node`.  Refuse the
-            # combination at the SDK boundary so callers don't silently get
-            # routed to the wrong node.
-            if target_node:
-                raise ValueError(
-                    "target_node is not supported with attachments; "
-                    "use ws_id (caller-generated to hash to the desired node) instead"
-                )
             if not ws_id:
                 ws_id = secrets.token_hex(16)
             body["ws_id"] = ws_id
@@ -1308,6 +1308,8 @@ class TurnstoneConsole:
         persona: str = "",
         project_id: str = "",
         resume_ws: str = "",
+        resume_ws_exact: bool = False,
+        required_node_id: str | None = None,
         judge_model: str = "",
     ) -> ConsoleCreateWsResponse:
         return self._runner.run(
@@ -1320,6 +1322,8 @@ class TurnstoneConsole:
                 persona=persona,
                 project_id=project_id,
                 resume_ws=resume_ws,
+                resume_ws_exact=resume_ws_exact,
+                required_node_id=required_node_id,
                 judge_model=judge_model,
             )
         )
@@ -1344,6 +1348,7 @@ class TurnstoneConsole:
         project_id: str = "",
         resume_ws: str = "",
         resume_ws_exact: bool = False,
+        required_node_id: str | None = None,
         judge_model: str = "",
         target_node: str = "",
         user_id: str = "",
@@ -1364,6 +1369,7 @@ class TurnstoneConsole:
                 project_id=project_id,
                 resume_ws=resume_ws,
                 resume_ws_exact=resume_ws_exact,
+                required_node_id=required_node_id,
                 judge_model=judge_model,
                 target_node=target_node,
                 user_id=user_id,
