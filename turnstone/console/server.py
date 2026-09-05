@@ -7064,6 +7064,11 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
                     status_code=400,
                 )
             updates["next_run"] = next_run
+            if stype == "at" and "enabled" in updates:
+                # Re-arming a one-shot: the firing it had before no longer
+                # counts as its completion (the shelf reads a disabled
+                # one-shot with a last_run as completed).
+                updates["last_run"] = ""
         else:
             updates["next_run"] = ""
 

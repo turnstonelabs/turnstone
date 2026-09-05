@@ -16,6 +16,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import CroniterError, croniter
 
+# The stored shape of a schedule's times: naive UTC to the second, the
+# shape the due query compares as a string against the clock.
+TS_FMT = "%Y-%m-%dT%H:%M:%S"
+
 
 def resolve_zone(name: str) -> ZoneInfo | None:
     """The zone *name* names, or None when this host cannot resolve it.
@@ -133,7 +137,7 @@ def next_cron_runs(
             fire = cron.get_next(datetime)
             if names_a_time and is_second_occurrence(fire):
                 continue
-            runs.append(fire.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"))
+            runs.append(fire.astimezone(UTC).strftime(TS_FMT))
     except CroniterError:
         return None
     return runs
@@ -157,7 +161,7 @@ def compute_next_run(
             return ""
         if at.tzinfo is None:
             return ""
-        return at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        return at.astimezone(UTC).strftime(TS_FMT)
     if schedule_type == "cron" and cron_expr:
         runs = next_cron_runs(cron_expr, 1, timezone)
         return runs[0] if runs else ""

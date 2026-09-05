@@ -60,6 +60,26 @@ frozen.
   (`name`, `description`), or failed validation (`cron_expr`). A null is
   now refused with a `400` naming the field on create, update and preview:
   neither a value nor a silent no-op.
+- **A failed dispatch advanced the schedule in the auto, pool and node
+  target modes (#1099).** The scheduler counted a firing as dispatched once
+  a node was chosen, so a node without a server URL, or one that refused the
+  workstream, skipped the firing while the run history showed it `failed`;
+  only the no-reachable-node paths held the schedule, and those retried it
+  on every pass for ever. The schedule now advances only when a node created
+  the workstream. A firing that certainly made nothing (no reachable node, a
+  connection that never opened, a node's 4xx answer) is held and attempted
+  again about once a minute for five minutes after its first failure
+  (`retry_interval`, `retry_window` on the scheduler), then given up. A
+  firing whose answer does not say whether the workstream was created (a
+  lost reply, a 5xx) is not retried, since a retry could run the job twice;
+  its `failed` row says so. A given-up or unretried firing moves the
+  schedule on from the clock with `last_run` untouched, and disables a
+  one-shot with a `disabled` run-history row saying why. A fan-out under
+  retry writes one `failed` row per attempt naming each node, not one per
+  node. Held firings live in a `system_settings` row beside the scheduler
+  lock, so consoles share the pacing and a restart does not restart the
+  window. Re-enabling a one-shot now clears its `last_run`, so one that
+  never runs again shows as disabled rather than completed.
 
 ### Changed
 
