@@ -993,7 +993,9 @@
    cyan tool surface, the yellow operator bubbles, and the amber user turns.
    NOT magenta: that accent is reserved for the MCP surface (.scope-mcp and
    the admin scope chips); blue's other uses are admin-surface only (model
-   status dots, provider chips) and never co-render with transcript cards. */
+   status dots, provider chips) plus the dashboard launcher's Scheduled kind
+   (a scheduler-started session), and never co-render with transcript
+   cards. */
 .msg.compaction-card {
   border-left-color: var(--blue);
   background: var(--panel);

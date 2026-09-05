@@ -10,14 +10,13 @@ manual testing.
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests._js_harness_helpers import slice_braced_block
+from tests._js_harness_helpers import run_node_source, slice_braced_block
 from tests._js_harness_helpers import strip_js_comments as _strip_js_comments
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
@@ -756,6 +755,9 @@ _CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/
 _CONSOLE_GOVERNANCE_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/console/static/governance.js"
 )
+_CONSOLE_SCHEDULE_BUILDER_JS = (
+    Path(__file__).resolve().parent.parent / "turnstone/console/static/schedule_builder.js"
+)
 
 
 _UNSAFE_CODE_SINK_LINT_TARGETS = [
@@ -768,6 +770,7 @@ _UNSAFE_CODE_SINK_LINT_TARGETS = [
     ("turnstone/console/static/admin.js", _CONSOLE_ADMIN_JS),
     ("turnstone/console/static/governance.js", _CONSOLE_GOVERNANCE_JS),
     ("turnstone/console/static/app.js", _CONSOLE_APP_JS),
+    ("turnstone/console/static/schedule_builder.js", _CONSOLE_SCHEDULE_BUILDER_JS),
 ]
 
 
@@ -906,7 +909,6 @@ def test_capability_bool_lift_agrees_with_the_backend_coercion() -> None:
     Cases are generated FROM the Python table, so a spelling added on one
     side and not the other fails here rather than in the field.
     """
-    import tempfile
 
     from turnstone.core.model_turn import _CAPABILITY_BOOL_STRINGS
 
@@ -938,15 +940,7 @@ def test_capability_bool_lift_agrees_with_the_backend_coercion() -> None:
     ]
     harness = table.group(0) + chr(10) + fn.group(0) + chr(10) + chr(10).join(checks)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
-        f.write(harness)
-        tmp = f.name
-    try:
-        proc = subprocess.run(["node", tmp], capture_output=True, text=True, timeout=15)
-    except FileNotFoundError:
-        pytest.skip("node binary not available on PATH")
-    finally:
-        os.unlink(tmp)
+    proc = run_node_source(harness)
     assert proc.returncode == 0, (
         f"_capBool disagrees with the backend coercion.  stderr={proc.stderr!r}"
     )
@@ -1380,6 +1374,7 @@ _SWEPT_BUNDLES = [
     _REPO_ROOT / "turnstone/console/static/admin.js",
     _REPO_ROOT / "turnstone/console/static/governance.js",
     _REPO_ROOT / "turnstone/console/static/app.js",
+    _REPO_ROOT / "turnstone/console/static/schedule_builder.js",
 ]
 
 # The const-reassign analysis below is pure text — module vs script semantics
@@ -1719,7 +1714,6 @@ def test_redact_credentials_runtime_smoke() -> None:
     directories.  The ``redact_credentials.js`` source file is imported
     by absolute path so resolution is unambiguous.
     """
-    import tempfile
 
     mod_path = _REDACT_CREDENTIALS_JS.resolve()
     harness = (
@@ -1788,20 +1782,7 @@ def test_redact_credentials_runtime_smoke() -> None:
         + "if (up !== 'POSTGRESQL+PSYCOPG2://user:[REDACTED:password]@db/app') "
         + "throw new Error('uppercase scheme conn redact failed: ' + up);\n"
     )
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
-        f.write(harness)
-        tmp = f.name
-    try:
-        proc = subprocess.run(
-            ["node", tmp],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except FileNotFoundError:
-        pytest.skip("node binary not available on PATH")
-    finally:
-        os.unlink(tmp)
+    proc = run_node_source(harness)
     assert proc.returncode == 0, (
         f"redactCredentials runtime smoke failed.  stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
@@ -3079,6 +3060,87 @@ def test_dashboard_paints_project_and_persona_from_cache_synchronously() -> None
     # The hint is seeded synchronously inside _paintProjectPicker (asserted there).
 
 
+def test_console_schedule_name_from_task() -> None:
+    """The Scheduled kind names a schedule from the task when the Name option
+    is empty: first line, whitespace collapsed, cut at 60 code points with an
+    ellipsis.  Driven through node like the builder helpers, because an
+    off-by-one or a surrogate split here mislabels every launcher-made
+    schedule (a lone surrogate would 500 the create)."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    cut = re.search(r"const _SCHEDULE_NAME_CUT_CHARS = \d+;", body)
+    assert cut, "the derived-name cut must be a named constant"
+    fn = cut.group(0) + chr(10) + _slice_top_level_fn(body, "function _scheduleNameFromTask(")
+    cases = [
+        ("Check disk usage", "Check disk usage"),
+        ("First line\nsecond line", "First line"),
+        ("a   b\t c", "a b c"),
+        ("x" * 60, "x" * 60),
+        ("x" * 61, "x" * 59 + "\u2026"),
+        # A space landing at the cut is trimmed before the ellipsis.
+        ("x" * 58 + " " + "y" * 10, "x" * 58 + "\u2026"),
+        # An astral character spanning the cut stays whole (code points, not
+        # UTF-16 units).
+        ("x" * 58 + "\U0001f600" + "y" * 5, "x" * 58 + "\U0001f600" + "\u2026"),
+    ]
+    checks = [
+        f"if (_scheduleNameFromTask({json.dumps(task)}) !== {json.dumps(want)}) "
+        f"throw new Error('case ' + {json.dumps(task[:20])});"
+        for task, want in cases
+    ]
+    proc = run_node_source(fn + chr(10) + chr(10).join(checks))
+    assert proc.returncode == 0, f"_scheduleNameFromTask disagrees: stderr={proc.stderr!r}"
+
+
+def test_console_over_cap_counts_code_points_with_a_cheap_short_circuit() -> None:
+    """The launcher's caps count code points like the server, but only box a
+    string into an array once its UTF-16 length is already over the cap — a
+    UTF-16 length under the cap can never exceed it in code points."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _overCap(")
+    astral = "\U0001f600"
+    cases = [
+        ("x" * 10, 10, False),
+        ("x" * 11, 10, True),
+        (astral * 10, 10, False),  # 20 UTF-16 units, 10 code points: under
+        (astral * 11, 10, True),
+        ("x" * 9 + astral, 10, False),
+        ("", 10, False),
+    ]
+    checks = [
+        f"if (_overCap({json.dumps(text)}, {cap}) !== {json.dumps(want)}) "
+        f"throw new Error('case ' + {json.dumps(text[:8])} + ' cap ' + {cap});"
+        for text, cap, want in cases
+    ]
+    proc = run_node_source(fn + chr(10) + chr(10).join(checks))
+    assert proc.returncode == 0, f"_overCap disagrees: stderr={proc.stderr!r}"
+
+
+def test_console_next_launcher_kind() -> None:
+    """The kind toggle's arrow-key step: the neighbour in the available list,
+    wrapping at either end, and an end of the list when the active kind is no
+    longer offered (a permission refresh mid-session)."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _nextLauncherKind(")
+    three = ["coordinator", "interactive", "scheduled"]
+    cases = [
+        (("coordinator", three, False), "interactive"),
+        (("scheduled", three, False), "coordinator"),
+        (("coordinator", three, True), "scheduled"),
+        (("interactive", three, True), "coordinator"),
+        (("interactive", ["interactive"], False), "interactive"),
+        (("coordinator", ["interactive", "scheduled"], False), "interactive"),
+        (("coordinator", ["interactive", "scheduled"], True), "scheduled"),
+        (("coordinator", [], False), "coordinator"),
+    ]
+    checks = [
+        f"if (_nextLauncherKind({json.dumps(cur)}, {json.dumps(avail)}, {json.dumps(back)}) "
+        f"!== {json.dumps(want)}) throw new Error({json.dumps(f'{cur} {avail} {back}')});"
+        for (cur, avail, back), want in cases
+    ]
+    proc = run_node_source(fn + chr(10) + chr(10).join(checks))
+    assert proc.returncode == 0, f"_nextLauncherKind disagrees: stderr={proc.stderr!r}"
+
+
 def test_console_launcher_paints_project_and_persona_from_cache_synchronously() -> None:
     """FOUC fix (console launcher composer): the project + persona wrappers route
     through the _paintHomeFromCache chokepoint — sync paint from the warm cache,
@@ -3088,7 +3150,9 @@ def test_console_launcher_paints_project_and_persona_from_cache_synchronously() 
     kind-default revert: _populateHomePersonaDropdown must fall back to
     defaultPersona(kind) when the previous pick is no longer a valid choice (the
     interactive/coordinator persona shelves are disjoint), or a kind toggle
-    silently degrades the picker to a bare placeholder."""
+    silently degrades the picker to a bare placeholder.  The kind goes through
+    _launcherPersonaKind: a schedule dispatches an interactive workstream, so the
+    Scheduled kind draws from the interactive shelf."""
     body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
     proj_fn = _slice_top_level_fn(body, "function _refreshAndPopulateProjects(")
     assert re.search(
@@ -3104,8 +3168,11 @@ def test_console_launcher_paints_project_and_persona_from_cache_synchronously() 
     assert '_restorePick("persona"' in pop, (
         "the persona populate must restore a still-valid pick via _restorePick"
     )
-    assert "defaultPersona(_launcherKind)" in pop, (
+    assert "defaultPersona(_launcherPersonaKind())" in pop, (
         "the persona populate must revert to the kind default when the pick is gone"
+    )
+    assert "personaChoices(_launcherPersonaKind())" in pop, (
+        "the persona choices must come from the kind's persona shelf"
     )
     proj_pop = _slice_top_level_fn(body, "function _populateHomeProjectDropdown(")
     assert '_restorePick("project"' in proj_pop, (
@@ -3709,7 +3776,6 @@ def test_memory_description_editor_defers_normalization_to_server() -> None:
 
 
 def test_memory_health_refresh_lifecycle() -> None:
-    import tempfile
 
     governance = _CONSOLE_GOVERNANCE_JS.read_text(encoding="utf-8")
     admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
@@ -3799,15 +3865,7 @@ function loadMemoryIndexHealth(force) {load_health}
   process.exitCode = 1;
 }});
 """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as handle:
-        handle.write(script)
-        path = handle.name
-    try:
-        proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=15)
-    except FileNotFoundError:
-        pytest.skip("node binary not available on PATH")
-    finally:
-        os.unlink(path)
+    proc = run_node_source(script)
     assert proc.returncode == 0, proc.stderr
 
 

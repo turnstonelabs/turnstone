@@ -109,9 +109,11 @@
           style="display: none"
           aria-label="Start a new session"
         >
-          <!-- Persona toggle — start a coordinator (console-local) or an
-           interactive session (proxied to a node).  app.js gates each option
-           by scope and hides the toggle when only one is available. -->
+          <!-- Kind toggle — start a coordinator (console-local), an
+           interactive session (proxied to a node), or a scheduled task (an
+           interactive session the scheduler starts later, on a timer).
+           app.js gates each option by scope and hides the toggle when only
+           one is available. -->
           <div
             id="launcher-kinds"
             class="launcher-kinds"
@@ -140,11 +142,37 @@
               <span class="kind-led" aria-hidden="true"></span>
               Interactive
             </button>
+            <button
+              type="button"
+              id="kind-scheduled"
+              class="kind-btn kind-btn--sched"
+              role="radio"
+              aria-checked="false"
+              aria-controls="launcher-when"
+              tabindex="-1"
+            >
+              <span class="kind-led" aria-hidden="true"></span>
+              Scheduled
+            </button>
           </div>
           <!-- Composer DOM is built by shared_static/composer.js into this
            mount — stacked layout (textarea above, options toggle +
            Start button below) with Name + Skill in an Options
            dropdown to match the webui dashboard composer's shape. -->
+          <!-- Scheduled kind only: the Runs builder (same template as the
+           admin shelf) sits between the kind toggle and the composer — it is
+           required input for this kind, so it precedes the task text and the
+           Schedule button rather than trailing them or hiding among the
+           options.  app.js reveals it per kind. -->
+          <section
+            id="launcher-when"
+            class="launcher-when"
+            aria-label="When to run"
+            hidden
+          >
+            <h3 class="launcher-when-title">When</h3>
+            <div id="launcher-when-mount"></div>
+          </section>
           <div id="home-coord-composer-mount"></div>
           <div
             id="home-coord-error"
@@ -240,6 +268,148 @@
           </div>
         </section>
       </div>
+
+      <!-- Schedule "When" builder — the timing control shared by the admin
+           schedule shelf and the dashboard launcher's Scheduled kind.  One
+           markup source: schedule_builder.js clones this template per
+           instance and prefixes every id, so both consumers can coexist
+           on the page.  Never rendered directly.  Carries no defaults: the
+           builder's reset() on mount writes defaultState() into every
+           control, so a value here would never be seen. -->
+      <template id="schedule-when-template">
+        <label id="when-runs-label">Runs</label>
+        <div
+          class="seg"
+          role="group"
+          aria-labelledby="when-runs-label"
+          id="when-seg"
+        >
+          <button type="button" data-mode="daily" aria-pressed="false">
+            Daily
+          </button>
+          <button type="button" data-mode="weekly" aria-pressed="false">
+            Weekly
+          </button>
+          <button type="button" data-mode="monthly" aria-pressed="false">
+            Monthly
+          </button>
+          <button type="button" data-mode="interval" aria-pressed="false">
+            Interval
+          </button>
+          <button type="button" data-mode="once" aria-pressed="false">
+            Once
+          </button>
+          <button type="button" data-mode="cron" aria-pressed="false">
+            Cron
+          </button>
+        </div>
+        <div data-when-pane="daily">
+          <label for="when-time-daily"
+            >At time <span class="label-hint">— UTC</span></label
+          >
+          <input id="when-time-daily" type="time" />
+        </div>
+        <div data-when-pane="weekly" hidden>
+          <label id="when-days-label">On days</label>
+          <div
+            class="chips"
+            id="when-days"
+            role="group"
+            aria-labelledby="when-days-label"
+          >
+            <button type="button" data-day="1" aria-pressed="false">
+              Mon
+            </button>
+            <button type="button" data-day="2" aria-pressed="false">
+              Tue
+            </button>
+            <button type="button" data-day="3" aria-pressed="false">
+              Wed
+            </button>
+            <button type="button" data-day="4" aria-pressed="false">
+              Thu
+            </button>
+            <button type="button" data-day="5" aria-pressed="false">
+              Fri
+            </button>
+            <button type="button" data-day="6" aria-pressed="false">
+              Sat
+            </button>
+            <button type="button" data-day="0" aria-pressed="false">
+              Sun
+            </button>
+          </div>
+          <label for="when-time-weekly"
+            >At time <span class="label-hint">— UTC</span></label
+          >
+          <input id="when-time-weekly" type="time" />
+        </div>
+        <div data-when-pane="monthly" hidden>
+          <div class="field-pair">
+            <div>
+              <label for="when-dom">On day</label>
+              <input id="when-dom" type="number" min="1" max="31" step="1" />
+            </div>
+            <div>
+              <label for="when-time-monthly"
+                >At time <span class="label-hint">— UTC</span></label
+              >
+              <input id="when-time-monthly" type="time" />
+            </div>
+          </div>
+        </div>
+        <div data-when-pane="interval" hidden>
+          <div class="field-pair">
+            <div>
+              <label for="when-every">Every</label>
+              <input id="when-every" type="number" min="1" step="1" />
+            </div>
+            <div>
+              <label for="when-unit">Unit</label>
+              <select id="when-unit">
+                <option value="hours">hours</option>
+                <option value="minutes">minutes</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div data-when-pane="once" hidden>
+          <label for="when-at"
+            >Run at
+            <span class="label-hint">— your local time</span></label
+          >
+          <input id="when-at" type="datetime-local" />
+        </div>
+        <div data-when-pane="cron" hidden>
+          <label for="when-cron"
+            >Cron expression
+            <span class="label-hint"
+              >min hour day month weekday</span
+            ></label
+          >
+          <input
+            id="when-cron"
+            type="text"
+            class="sh-mono"
+            placeholder="0 9 * * MON-FRI"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </div>
+        <div class="readout">
+          <div class="readout-head">
+            <span class="readout-label">Next runs</span>
+            <span class="readout-desc" id="when-desc-out"></span>
+          </div>
+          <div
+            class="readout-rows"
+            id="when-runs-out"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          ></div>
+        </div>
+      </template>
 
       <!-- FILTERED WORKSTREAMS -->
       <div id="view-filtered" style="display: none">
@@ -1367,6 +1537,7 @@
               <input
                 id="sch-name"
                 type="text"
+                maxlength="256"
                 placeholder="Daily health check"
                 autocomplete="off"
               />
@@ -1376,138 +1547,9 @@
               <input id="sch-desc" type="text" autocomplete="off" />
 
               <div class="sh-section">When</div>
-              <label id="sch-runs-label">Runs</label>
-              <div
-                class="seg"
-                role="group"
-                aria-labelledby="sch-runs-label"
-                id="sch-seg"
-              >
-                <button type="button" data-mode="daily" aria-pressed="true">
-                  Daily
-                </button>
-                <button type="button" data-mode="weekly" aria-pressed="false">
-                  Weekly
-                </button>
-                <button type="button" data-mode="monthly" aria-pressed="false">
-                  Monthly
-                </button>
-                <button type="button" data-mode="interval" aria-pressed="false">
-                  Interval
-                </button>
-                <button type="button" data-mode="once" aria-pressed="false">
-                  Once
-                </button>
-                <button type="button" data-mode="cron" aria-pressed="false">
-                  Cron
-                </button>
-              </div>
-              <div data-sch-pane="daily">
-                <label for="sch-time-daily"
-                  >At time <span class="label-hint">— UTC</span></label
-                >
-                <input id="sch-time-daily" type="time" value="06:00" />
-              </div>
-              <div data-sch-pane="weekly" hidden>
-                <label id="sch-days-label">On days</label>
-                <div
-                  class="chips"
-                  id="sch-days"
-                  role="group"
-                  aria-labelledby="sch-days-label"
-                >
-                  <button type="button" data-day="1" aria-pressed="false">
-                    Mon
-                  </button>
-                  <button type="button" data-day="2" aria-pressed="false">
-                    Tue
-                  </button>
-                  <button type="button" data-day="3" aria-pressed="false">
-                    Wed
-                  </button>
-                  <button type="button" data-day="4" aria-pressed="false">
-                    Thu
-                  </button>
-                  <button type="button" data-day="5" aria-pressed="false">
-                    Fri
-                  </button>
-                  <button type="button" data-day="6" aria-pressed="false">
-                    Sat
-                  </button>
-                  <button type="button" data-day="0" aria-pressed="false">
-                    Sun
-                  </button>
-                </div>
-                <label for="sch-time-weekly"
-                  >At time <span class="label-hint">— UTC</span></label
-                >
-                <input id="sch-time-weekly" type="time" value="06:00" />
-              </div>
-              <div data-sch-pane="monthly" hidden>
-                <div class="field-pair">
-                  <div>
-                    <label for="sch-dom">On day</label>
-                    <input
-                      id="sch-dom"
-                      type="number"
-                      min="1"
-                      max="31"
-                      value="1"
-                    />
-                  </div>
-                  <div>
-                    <label for="sch-time-monthly"
-                      >At time <span class="label-hint">— UTC</span></label
-                    >
-                    <input id="sch-time-monthly" type="time" value="06:00" />
-                  </div>
-                </div>
-              </div>
-              <div data-sch-pane="interval" hidden>
-                <div class="field-pair">
-                  <div>
-                    <label for="sch-every">Every</label>
-                    <input id="sch-every" type="number" min="1" value="4" />
-                  </div>
-                  <div>
-                    <label for="sch-unit">Unit</label>
-                    <select id="sch-unit">
-                      <option value="hours">hours</option>
-                      <option value="minutes">minutes</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
-              <div data-sch-pane="once" hidden>
-                <label for="sch-at"
-                  >Run at
-                  <span class="label-hint">— your local time</span></label
-                >
-                <input id="sch-at" type="datetime-local" />
-              </div>
-              <div data-sch-pane="cron" hidden>
-                <label for="sch-cron"
-                  >Cron expression
-                  <span class="label-hint"
-                    >min hour day month weekday</span
-                  ></label
-                >
-                <input
-                  id="sch-cron"
-                  type="text"
-                  class="sh-mono"
-                  placeholder="0 9 * * MON-FRI"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-              </div>
-              <div class="readout" role="status" aria-live="polite">
-                <div class="readout-head">
-                  <span class="readout-label">Next runs</span>
-                  <span class="readout-desc" id="sch-desc-out"></span>
-                </div>
-                <div class="readout-rows" id="sch-runs-out"></div>
-              </div>
+              <!-- Runs builder: mounted by admin.js from
+                   #schedule-when-template (schedule_builder.js). -->
+              <div id="sch-when-mount"></div>
 
               <div class="sh-section">Target</div>
               <label for="sch-target">Target</label>
@@ -1557,6 +1599,7 @@
               <textarea
                 id="sch-message"
                 rows="3"
+                maxlength="4096"
                 placeholder="What should the workstream do?"
               ></textarea>
               <div class="toggle-stack">
@@ -4269,6 +4312,7 @@
       </footer>
     </dialog>
 
+    <script src="/static/schedule_builder.js"></script>
     <script src="/static/admin.js"></script>
     <script src="/static/governance.js"></script>
     <script src="/static/app.js"></script>

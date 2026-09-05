@@ -99,6 +99,41 @@
   padding: 4px 2px 0;
 }
 
+/* Scheduled kind: the When builder between the kind toggle and the
+   composer.  Required input for this kind, so it is NOT the options tier
+   (--bg-highlight): it sits on the surface tier and wears the kind's blue
+   (the system-operation hue; magenta is the MCP surface's) — border and left
+   rule here, and the pressed segments / chips / read-out inside follow
+   through --hatch-accent (hatch.css).  The builder's
+   labels and fields take the shelf cadence from hatch.css (.when-builder);
+   only the panel and its heading live here. */
+.launcher-when {
+  --hatch-accent: var(--blue);
+  padding: 10px 12px 12px;
+  background: var(--bg-surface);
+  border: 1px solid color-mix(in srgb, var(--blue) 35%, var(--border-strong));
+  border-left: 2px solid var(--blue);
+  border-radius: var(--r-sm);
+}
+/* A heading, not another field label: the shelf's .sh-section treatment
+   (hairline rule) at the panel's own ink. */
+.launcher-when-title {
+  margin: 0 0 4px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--hair);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+/* The message row doubles as the Scheduled kind's post-submit confirmation
+   (app.js _homeShowMessage toggles the class). */
+.home-composer-error.is-ok {
+  color: var(--green);
+}
+
 /* Drag-over feedback for the home coord composer — wired by Composer's
    dragDrop option (dropClass: home-coord-drop) on the composer mount.
    Mirrors the dashed-outline affordance on coord-main so users see the

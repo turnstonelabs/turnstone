@@ -41,6 +41,13 @@ export function pasteTextToFile(text) {
   return file;
 }
 
+// True for a File this module synthesized from a paste (a consumer that
+// cannot take files returns false for it silently, keeping the text inline;
+// a real drop or picked file still deserves its refusal message).
+export function isPastedTextFile(file) {
+  return pastedTextSources.has(file);
+}
+
 export function isDuplicatePastedTextFile(file, existingFiles) {
   const source = pastedTextSources.get(file);
   if (source === undefined) return false;
@@ -54,6 +61,7 @@ export function isDuplicatePastedTextFile(file, existingFiles) {
 if (typeof window !== "undefined") {
   window.TurnstonePasteText = {
     isDuplicatePastedTextFile,
+    isPastedTextFile,
     pasteTextToFile,
   };
 }

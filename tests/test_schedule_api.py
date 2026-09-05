@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
 from turnstone.console.server import (
+    SCHEDULE_MESSAGE_MAX_CHARS,
+    SCHEDULE_NAME_MAX_CHARS,
     admin_create_schedule,
     admin_delete_schedule,
     admin_get_schedule,
@@ -598,3 +600,47 @@ class TestPreviewSchedule:
             json={"schedule_type": "cron", "cron_expr": "0 6 * * *"},
         )
         assert all(t.endswith("+00:00") for t in resp.json()["next"])
+
+
+def test_message_cap_is_mirrored_by_the_console_ui() -> None:
+    """The launcher's client-side cap and the admin shelf's textarea maxlength
+    carry the server's number.  The number only: the launcher counts code
+    points like the server, while an HTML maxlength can only count UTF-16
+    units, so the semantics are allowed to differ at the edge."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    app = (root / "turnstone/console/static/app.js").read_text(encoding="utf-8")
+    index = (root / "turnstone/console/static/index.html").read_text(encoding="utf-8")
+    assert f"const _SCHEDULE_TASK_MAX_CHARS = {SCHEDULE_MESSAGE_MAX_CHARS};" in app
+    assert f'maxlength="{SCHEDULE_MESSAGE_MAX_CHARS}"' in index
+    assert f"const _SCHEDULE_NAME_MAX_CHARS = {SCHEDULE_NAME_MAX_CHARS};" in app
+    assert f'maxlength="{SCHEDULE_NAME_MAX_CHARS}"' in index
+
+
+def test_create_keeps_the_capped_message_length(client) -> None:
+    resp = client.post(
+        "/v1/api/admin/schedules",
+        json={
+            "name": "long",
+            "schedule_type": "cron",
+            "cron_expr": "0 6 * * *",
+            "initial_message": "x" * (SCHEDULE_MESSAGE_MAX_CHARS + 10),
+        },
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["initial_message"]) == SCHEDULE_MESSAGE_MAX_CHARS
+
+
+def test_create_keeps_the_capped_name_length(client) -> None:
+    resp = client.post(
+        "/v1/api/admin/schedules",
+        json={
+            "name": "n" * (SCHEDULE_NAME_MAX_CHARS + 10),
+            "schedule_type": "cron",
+            "cron_expr": "0 6 * * *",
+            "initial_message": "task",
+        },
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["name"]) == SCHEDULE_NAME_MAX_CHARS

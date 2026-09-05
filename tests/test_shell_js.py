@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from tests._js_harness_helpers import strip_js_comments
+from tests._js_harness_helpers import slice_braced_block, strip_js_comments
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SHARED = _ROOT / "turnstone/shared_static"
@@ -246,9 +246,7 @@ def test_console_launcher_routes_by_kind() -> None:
     (the rail covers it).  Pins the console-JS convention for the new logic."""
     app = _CONSOLE_APP.read_text(encoding="utf-8")
     assert "function _setLauncherKind" in app and "_launcherKind" in app
-    assert "function _hasInteractivePermission" in app, (
-        "launcher must scope-gate the interactive kind"
-    )
+    assert 'perm: "workstreams.create"' in app, "launcher must scope-gate the interactive kind"
     assert 'kind === "interactive"' in app, "submitHomeCoord must branch by kind"
     assert "function _createInteractive" in app, "the interactive create path must exist"
     assert '"/v1/api/cluster/workstreams/new"' in app, (
@@ -320,8 +318,9 @@ def test_console_launcher_node_strategy() -> None:
     assert "function _populateLauncherNodes" in app, (
         "the specific-node picker must populate from the live cluster snapshot"
     )
-    assert 'opts.node_strategy === "node"' in app, (
-        "interactive create must pin to the chosen node only under the Specific strategy"
+    resolver = slice_braced_block(app, app.index("function _resolveNodePlacement("))
+    assert resolver and 'opts.node_strategy !== "node"' in resolver, (
+        "creates must pin to the chosen node only under the Specific strategy"
     )
     composer = (_SHARED / "composer.js").read_text(encoding="utf-8")
     assert "Composer.prototype.setPlaceholder" in composer, (
@@ -367,6 +366,202 @@ def test_console_launcher_interactive_create_carries_attachments() -> None:
     assert "_createWorkstreamFetchOpts(body, files)" in interactive, (
         "_createInteractive must build its create body via the shared helper"
     )
+
+
+def test_console_launcher_scheduled_kind() -> None:
+    """#1090: the dashboard launcher carries a third kind, Scheduled — a
+    schedule the console's scheduler later dispatches as an interactive
+    workstream.  Pins the radio + its scope gate, the kind list the toggle
+    walks (no two-kind ternary cycle), the interactive field set minus judge
+    model + attachments, the When builder mounted from the shared template,
+    and the submit branch posting the schedule create."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert 'id="kind-scheduled"' in index, "the third kind radio must be in the toggle"
+    assert 'id="launcher-when"' in index and 'id="launcher-when-mount"' in index, (
+        "the When builder needs its section + mount under the composer"
+    )
+    assert 'id="schedule-when-template"' in index, "the builder markup must be a template"
+    assert '<script src="/static/schedule_builder.js"></script>' in index
+    assert index.index("/static/schedule_builder.js") < index.index('src="/static/admin.js"'), (
+        "the builder script must load before its classic consumers"
+    )
+    for fragment in ('kind: "scheduled"', 'id: "kind-scheduled"', 'perm: "admin.schedules"'):
+        assert fragment in app, f"the kind list must carry the Scheduled entry ({fragment})"
+    # The registry is the one place a kind's permission is named: the gate is
+    # derived from `perm`, and the named helpers read the registry.
+    assert "return _consoleHasPermission(k.perm);" in app, (
+        "each kind's gate must be derived from its registry perm"
+    )
+    assert '_consoleHasPermission(_launcherPerm("coordinator"))' in app, (
+        "_hasCoordPermission must read the registry, not restate the string"
+    )
+    assert "function _hasSchedulePermission" not in app, (
+        "no per-kind permission helper beside the registry (the gate is derived)"
+    )
+    # One permission gate for every kind, driven by the registry.
+    submit = slice_braced_block(app, app.index("function submitHomeCoord("))
+    assert submit and 'showToast((entry ? entry.perm : kind) + " permission required")' in submit
+    assert "_consoleHasPermission(" not in submit, (
+        "submit must not hardcode a per-kind permission check beside the registry"
+    )
+    # Success bookkeeping: the typed name belongs to the schedule just made,
+    # and a composer the user has moved on from is left alone.
+    create = slice_braced_block(app, app.index("function _createSchedule("))
+    assert create and '_homeCoordComposer.setOptionValue("name", "")' in create
+    assert "const submittedKind = _launcherKind;" in create
+    assert "_launcherKind !== submittedKind" in create
+    # Ctrl/Cmd+Enter submits from anywhere in the panel — the When block too.
+    assert 'const panel = document.getElementById("coord-composer-panel");' in app, (
+        "the keyboard submit must cover the whole launcher panel, not just the composer"
+    )
+    for gone in (
+        '? _launcherKind === "interactive"',
+        'const map = {\n    "kind-coordinator": "coordinator",',
+    ):
+        assert gone not in app, f"two-kind hardcoding {gone!r} must be gone (the list walks)"
+    assert "function _launcherPersonaKind" in app, (
+        "Scheduled must draw personas from the interactive shelf"
+    )
+    assert "function _createSchedule" in app and 'kind === "scheduled"' in app, (
+        "submitHomeCoord must branch to the schedule create"
+    )
+    assert 'authFetch("/v1/api/admin/schedules", {' in app
+    assert "_launcherWhen.compile()" in app, "the create must compile timing via the builder"
+    for creator in ("function _createInteractive(", "function _createSchedule("):
+        body = slice_braced_block(app, app.index(creator))
+        assert body and "_resolveNodePlacement(opts)" in body, (
+            f"{creator} must resolve node placement through the shared resolver"
+        )
+        assert 'opts.node_strategy === "node"' not in body, (
+            f"{creator} must not restate the placement rule beside the resolver"
+        )
+    assert "function _scheduleNameFromTask" in app, "an empty Name derives from the task"
+    assert 'setOptionFieldVisible("judge_model", !scheduled)' in app
+    fields = slice_braced_block(app, app.index("function _applyLauncherFields("))
+    assert fields and "setAttachVisible(!scheduled)" in fields, (
+        "the paperclip must be hidden through the composer's API"
+    )
+    assert "attachBtn.hidden" not in fields, (
+        "the kind switch must not poke the composer's attach button directly"
+    )
+    stage = slice_braced_block(app, app.index("function _homeStageFile("))
+    assert stage and 'if (_launcherKind === "scheduled") {' in stage, (
+        "_homeStageFile must refuse attachments in the Scheduled kind"
+    )
+    # A large paste is synthesized into a File by the composer; refusing it
+    # keeps the text inline, which is right for a schedule's task — so that
+    # case must stay silent while a real drop still gets the message.
+    assert "paste.isPastedTextFile(file)" in stage, (
+        "the Scheduled refusal must recognise a pasted-text file and stay silent for it"
+    )
+    paste_mod = (_SHARED / "composer_paste_text.js").read_text(encoding="utf-8")
+    assert "export function isPastedTextFile(file)" in paste_mod
+    assert "isPastedTextFile,\n" in paste_mod, "the window bridge must expose isPastedTextFile"
+    assert 'if (v.judge_model && _launcherKind !== "scheduled")' in app, (
+        "the options summary must not claim a judge model the Scheduled kind drops"
+    )
+    assert 'aria-controls="launcher-when"' in index, (
+        "the Scheduled radio must name the When region it reveals"
+    )
+    assert index.index('id="launcher-when"') < index.index('id="home-coord-composer-mount"'), (
+        "the When block must precede the composer (required input before the action)"
+    )
+    # One owner for the message row: kind switch and submit clear it, the
+    # schedule create confirms through it, and the confirmation is inline
+    # (nothing opens, so a toast would evaporate before the time is read).
+    assert "function _homeShowMessage" in app
+    create = slice_braced_block(app, app.index("function _createSchedule("))
+    assert create and 'Manage it under Admin › Schedules.", true)' in create
+    # The confirmation is the inline row; a toast only stands in when the
+    # user has already switched kinds while the create was in flight.
+    assert create.count("showToast(") == 1 and create.index(
+        "_launcherKind !== submittedKind"
+    ) < create.index("showToast("), (
+        "the schedule confirmation is the inline message row; a toast only for a moved-on user"
+    )
+    assert "_launcherWhen.showErrors()" in create, (
+        "a refused compile must flag the builder's untouched-mode hint as an error"
+    )
+    # Files staged before the switch are refused at submit, ahead of the
+    # files-need-a-task guard whose advice could never resolve the refusal.
+    assert submit and submit.index('kind === "scheduled" && files.length > 0') < submit.index(
+        "Add a message to send with this attachment."
+    ), "the Scheduled attachment refusal must precede the files-need-a-task guard"
+    composer = (_SHARED / "composer.js").read_text(encoding="utf-8")
+    for api in ("Composer.prototype.setSendLabel", "Composer.prototype.setAttachVisible"):
+        assert api in composer, f"the composer must expose {api} for the launcher"
+    assert re.search(r'setSendLabel\(\s*scheduled \? "Schedule" : "Start"', app), (
+        "the send button must read Schedule in the Scheduled kind"
+    )
+
+
+def test_admin_schedule_shelf_uses_shared_builder() -> None:
+    """#1090: the admin shelf's Runs builder moved to schedule_builder.js so the
+    launcher can share it.  The shelf keeps a mount + the footer read-out; the
+    in-file compile / reverse-parse / preview copies are gone."""
+    admin = _CONSOLE_ADMIN.read_text(encoding="utf-8")
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    builder = (_ROOT / "turnstone/console/static/schedule_builder.js").read_text(encoding="utf-8")
+    assert 'id="sch-when-mount"' in index, "the shelf mounts the builder"
+    assert 'id="sch-seg"' not in index and "data-sch-pane" not in index, (
+        "the shelf's inline builder markup must be gone (it lives in the template)"
+    )
+    assert "new window.TurnstoneScheduleBuilder.ScheduleBuilder(" in admin
+    for method in (
+        "_schWhen.reset()",
+        "_schWhen.preview()",
+        "_schWhen.apply(",
+        "_schWhen.compile()",
+    ):
+        assert method in admin, f"the shelf must route {method} through the builder"
+    for gone in (
+        "function _schCompile",
+        "function _cronToScheduleMode",
+        "function _schApplyTiming",
+        "function _schPreview(",
+        "function _schFmtUtc",
+        "function _localToUtcIso",
+        "function _utcToLocalDatetime",
+    ):
+        assert gone not in admin, f"{gone!r} must not survive in admin.js"
+    assert "window.TurnstoneScheduleBuilder = {" in builder
+    assert 'const TEMPLATE_ID = "schedule-when-template"' in builder
+    assert '"/v1/api/admin/schedules/preview"' in builder
+    assert "seq !== self._previewSeq" in builder, "a superseded preview must be dropped"
+    # Every id-bearing attribute of the cloned template goes through scopedId
+    # (the pure transform test_schedule_builder_js.py pins), so two instances
+    # can share a page with their labels still pointing at their own inputs.
+    for wiring in (
+        "el.id = scopedId(el.id, prefix)",
+        'el.setAttribute("for", scopedId(el.getAttribute("for"), prefix))',
+        'scopedId(el.getAttribute("aria-labelledby"), prefix)',
+    ):
+        assert wiring in builder, f"instance scoping must route {wiring!r} through scopedId"
+    assert "_schWhen.showErrors()" in admin, (
+        "a refused shelf submit must flag the builder's untouched-mode hint as an error"
+    )
+
+
+def test_schedule_when_template_ids_carry_the_instance_prefix() -> None:
+    """scopedId rewrites only ids beginning with ``when-``; an id (or a
+    ``for`` / ``aria-labelledby`` reference) added to the template without
+    it would collide between the shelf's and the launcher's instances with no
+    runtime signal, so the contract is pinned here.  The template element's
+    own id is outside the cloned content and exempt."""
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    start = index.index('<template id="schedule-when-template">') + len(
+        '<template id="schedule-when-template">'
+    )
+    block = index[start : index.index("</template>", start)]
+    refs = re.findall(r'(?:\bid|\bfor|aria-labelledby)="([^"]+)"', block)
+    assert len(refs) >= 14, "the template lost its ids"
+    bad = [r for r in refs if not r.startswith("when-")]
+    assert not bad, f"template ids / references must carry the when- prefix: {bad}"
+    # No defaults in the markup: reset() on mount writes defaultState() into
+    # every control, so a value here would be a second, dead source of truth.
+    assert 'aria-pressed="true"' not in block, "the template must not pre-press a segment"
+    assert not re.search(r'<input[^>]*\svalue="', block), "template inputs carry no default value"
 
 
 def test_pane_persists_meta_for_rehydrate() -> None:

@@ -55,6 +55,12 @@ check(converted instanceof File, "above-threshold text did not convert");
 check(converted.name === "pasted-text.txt", "filename drifted");
 check(converted.type === "text/plain", "MIME drifted");
 check(converted.size === 2001, "byte size drifted");
+check(paste.isPastedTextFile(converted) === true, "synthesized file not recognised");
+check(
+  paste.isPastedTextFile(new File(["x"], "real.txt", { type: "text/plain" })) === false,
+  "a real file mistaken for a paste",
+);
+check(paste.isPastedTextFile(null) === false, "null mistaken for a paste");
 check(
   (await converted.text()) === convertedText,
   "file content did not round-trip",

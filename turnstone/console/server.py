@@ -247,6 +247,11 @@ _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
 _VALID_CREATE_WS_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _MAX_ROUTE_RESUME_LEN = 256
+# The schedule API keeps this many characters (code points) of a task's
+# initial message and of its name.  The console launcher and the admin shelf
+# mirror the values; tests/test_schedule_api.py keeps them in step.
+SCHEDULE_MESSAGE_MAX_CHARS = 4096
+SCHEDULE_NAME_MAX_CHARS = 256
 _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 
 # Client timeout for the REST proxy pool (BOTH constructions: startup and
@@ -6735,14 +6740,14 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
     if isinstance(body, JSONResponse):
         return body
 
-    name = str(body.get("name", "")).strip()[:256]
+    name = str(body.get("name", "")).strip()[:SCHEDULE_NAME_MAX_CHARS]
     description = str(body.get("description", "")).strip()[:1024]
     schedule_type = str(body.get("schedule_type", "")).strip()
     cron_expr = str(body.get("cron_expr", "")).strip()[:256]
     at_time = str(body.get("at_time", "")).strip()[:64]
     target_mode = str(body.get("target_mode", "auto")).strip()[:256]
     model = str(body.get("model", "")).strip()[:128]
-    initial_message = str(body.get("initial_message", "")).strip()[:4096]
+    initial_message = str(body.get("initial_message", "")).strip()[:SCHEDULE_MESSAGE_MAX_CHARS]
     auto_approve = bool(body.get("auto_approve", False))
     raw_tools = body.get("auto_approve_tools", [])
     auto_approve_tools = raw_tools if isinstance(raw_tools, list) else []
@@ -6875,7 +6880,7 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
 
     updates: dict[str, Any] = {}
     if "name" in body:
-        updates["name"] = str(body["name"]).strip()[:256]
+        updates["name"] = str(body["name"]).strip()[:SCHEDULE_NAME_MAX_CHARS]
     if "description" in body:
         updates["description"] = str(body["description"]).strip()[:1024]
     if "schedule_type" in body:
@@ -6889,7 +6894,9 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
     if "model" in body:
         updates["model"] = str(body["model"]).strip()[:128]
     if "initial_message" in body:
-        updates["initial_message"] = str(body["initial_message"]).strip()[:4096]
+        updates["initial_message"] = str(body["initial_message"]).strip()[
+            :SCHEDULE_MESSAGE_MAX_CHARS
+        ]
     if "auto_approve" in body:
         updates["auto_approve"] = bool(body["auto_approve"])
     if "auto_approve_tools" in body:
