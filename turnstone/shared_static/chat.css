@@ -1527,10 +1527,10 @@
   border-left: 2px solid var(--green);
 }
 [data-theme="light"] .hljs-addition {
-  background: rgba(4, 120, 87, 0.06);
+  background: color-mix(in srgb, var(--green) 6%, transparent);
 }
 [data-theme="light"] .hljs-deletion {
-  background: rgba(220, 38, 38, 0.06);
+  background: color-mix(in srgb, var(--red) 6%, transparent);
 }
 
 /* KaTeX math wrappers — shared for the same reason as the hljs theme above:

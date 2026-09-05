@@ -112,8 +112,8 @@
   /* Dark-theme --red (#f87171) on #fff is only 3.0:1 — below WCAG AA
      for normal text on a destructive button.  Use the deeper red
      (#dc2626 → 4.85:1) on the filled state so the button label clears
-     AA in the default theme. Light theme already uses --red (#b91c1c,
-     5.9:1) and stays put — the override below pins it. */
+     AA in the default theme. Light theme uses --red (#991b1b,
+     8.3:1) and stays put — the override below pins it. */
   background: #dc2626;
   color: #fff;
   border: none;
@@ -438,5 +438,5 @@
   background: rgba(248, 113, 113, 0.08);
 }
 [data-theme="light"] .dash-row.ws-selected {
-  background: rgba(220, 38, 38, 0.08);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
 }

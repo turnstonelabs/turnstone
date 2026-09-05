@@ -28,14 +28,15 @@ frozen.
 
 ### Changed
 
-- **Darker amber, cyan and blue in the light theme (#1092).** The launcher's
-  active kind label is drawn in its kind's hue over a tint of the same hue,
-  and in the light theme that sat just under the 4.5:1 text-contrast
-  threshold; the skill shelf's origin badge had the same pairing in cyan.
-  The light-theme amber, cyan and blue tokens now run one step darker,
-  which clears the threshold with room to spare and deepens every other
-  light-theme chip, badge and button that uses those hues by the same
-  step. The dark theme is unchanged.
+- **Darker indicator hues in the light theme (#1092, #1094).** The
+  launcher's active kind label is drawn in its kind's hue over a tint of
+  the same hue, and in the light theme that sat just under the 4.5:1
+  text-contrast threshold; the skill shelf's origin badge had the same
+  pairing in cyan. The light theme's amber, cyan, blue, green, red,
+  yellow, magenta and two channel accents now run one step darker, which
+  clears the threshold with room to spare, keeps that family at one tier,
+  and deepens every light-theme chip, badge and button that uses those
+  hues by the same step. The dark theme is unchanged.
 
 ## [1.8.2]
 
