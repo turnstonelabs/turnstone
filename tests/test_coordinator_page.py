@@ -1640,3 +1640,371 @@ def test_idle_tasks_card_uses_the_shared_status_label():
     assert "taskStatusLabel(" in body[idx : idx + 1400]
     idx_row = body.index("function renderTaskRow(")
     assert "taskStatusLabel(" in body[idx_row : idx_row + 1400]
+
+
+def test_coordinator_js_status_bar_approval_chip():
+    """The coord status bar carries the same pending-approval chip as the
+    interactive pane.  The coord keeps no cycle map — pending state IS the
+    DOM — so the count is re-derived from ``.conv-batch--pending`` under the
+    transcript at every place that state can change: a pending batch paint
+    (either return path, gated on ``opts.pending`` so a history render's
+    per-batch calls never scan the transcript), the resolve morph, and the
+    history wipe.  The click targets ``_currentPendingBatch`` — the SAME
+    batch the keyboard shortcuts act on — and focuses its head, never an
+    action button.  Asserts string presence only (no JS framework for
+    coord.js)."""
+    from pathlib import Path
+
+    from tests._js_harness_helpers import extract_braced
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert 'id: "coord-sb-approval",' in body
+    assert 'class: "warn-chip ws-sb-approval",' in body
+    assert "_revealPendingApproval();" in body, "the chip click must route to the reveal"
+    # The chip is a button INSIDE root, which carries the approval keydown
+    # handler: without a guard, Enter on the focused chip approves the batch.
+    assert "if (ae && ae === sbApprovalEl) return;" in body, (
+        "the approval keydown handler must ignore keys originating on the chip"
+    )
+    sync = extract_braced(body, "function _syncApprovalChip() {")
+    assert '".conv-batch.conv-batch--pending"' in sync, (
+        "the count must derive from the transcript's pending batches"
+    )
+    assert "StatusBar.paintApprovalChip(" in sync
+    assert "focusFallbackEl: composer && composer.inputEl" in sync
+    # Every pending-state transition recounts — and only those.
+    append = extract_braced(body, "function appendToolBatch(items, opts) {")
+    upgrade_return = append.index("return existing;")
+    fresh_return = append.index("return batch;")
+    upgrade_recount = append.index("if (opts.pending) _syncApprovalChip();")
+    fresh_recount = append.index("if (opts.pending) _syncApprovalChip();", upgrade_recount + 1)
+    assert upgrade_recount < upgrade_return < fresh_recount < fresh_return, (
+        "each appendToolBatch return path must recount when it can add a pending batch"
+    )
+    assert (
+        "\n    _syncApprovalChip();" not in append and "\n      _syncApprovalChip();" not in append
+    ), (
+        "an unconditional recount in appendToolBatch scans the transcript once per "
+        "replayed batch — quadratic on a long history render"
+    )
+    morph = extract_braced(body, "function _morphBatchResolved(batch, opts) {")
+    assert "_syncApprovalChip();" in morph
+    refetch = extract_braced(body, "async function refetchHistory(seedCursor = false) {")
+    wipe = refetch.index("messagesEl.replaceChildren();")
+    assert wipe < refetch.index("_syncApprovalChip();", wipe), (
+        "the history wipe must recount (a history render never paints a pending batch)"
+    )
+    # Click target == keyboard target, and that target must really be pending.
+    current = extract_braced(body, "function _currentPendingBatch() {")
+    assert 'if (!b.classList.contains("conv-batch--pending")) continue;' in current, (
+        "a resolved batch keeps data-needs-approval on its rows and has no button, "
+        "so without the class check it outranks an older still-pending batch"
+    )
+    reveal = extract_braced(body, "function _revealPendingApproval() {")
+    assert "_currentPendingBatch()" in reveal, "click target must equal the keyboard target"
+    assert "setConvBatchExpanded(batch, true, { blocker: true });" in reveal
+    assert "StatusBar.scrollToApprovalTarget(batch);" in reveal
+    assert "focusConvBatchHead(batch);" in reveal, (
+        "a reveal must land focus on the batch head, never on Approve (Space would fire it)"
+    )
+    assert "_focusBatchPrimary" not in reveal
+    shared = (
+        Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
+    ).read_text(encoding="utf-8")
+    assert "export function focusConvBatchHead(batch) {" in shared
+
+
+def test_coordinator_js_children_pending_count_is_a_reveal_chip():
+    """The "x pending" half of the Children heading's "(N · x pending)" count
+    is now a warn chip (the status-bar approval chip's sibling): coloured,
+    clickable, hidden at zero, reading "x approvals".  Its click scrolls the
+    tree to the first child whose approval is pending, flashes the row, and
+    lands temporary focus on the row's approval region or the row — never
+    the child's link or an Approve button.  The count repaints from the
+    live-badge cache helpers, the one place the pending set changes (the
+    bulk live fetch that first discovers a pending approval reaches no
+    render otherwise), and the bulk fetch's row swap goes through the
+    single-row update so it keeps focus, the flash and the visibility
+    observer.  Structural pins; the behavior runs under node below."""
+    from pathlib import Path
+
+    from tests._js_harness_helpers import extract_braced, strip_js_comments
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert '"coord-children-pending",' in body, "the children section must request the chip"
+    assert 'class: "warn-chip side-count-pending",' in body
+    assert "_revealPendingChild();" in body, "the chip click must route to the reveal"
+    count = extract_braced(body, "function _refreshChildrenCount() {")
+    assert "StatusBar.paintWarnChip(" in count
+    assert 'label: pending + " approval" + (pending === 1 ? "" : "s"),' in count
+    assert "focusFallbackEl: composer && composer.inputEl" in count
+    for helper in (
+        "function _liveBadgeCacheSet(id, entry) {",
+        "function _liveBadgeCacheDelete(id) {",
+        "function _liveBadgeCacheClear() {",
+    ):
+        assert "_refreshChildrenCount();" in extract_braced(body, helper), (
+            f"{helper} mutates the pending set and must repaint the count"
+        )
+    flush = strip_js_comments(extract_braced(body, "async function flushLiveFetches() {"))
+    assert "_updateChildRow(id);" in flush and ".replaceWith(" not in flush, (
+        "the bulk fetch's row swap must go through _updateChildRow (focus, observer, count)"
+    )
+    capture = extract_braced(body, "function _captureRowFocusKey(scopeEl) {")
+    assert 'role: "row"' in capture and 'role: "approval"' in capture
+    restore = extract_braced(body, "function _restoreRowFocus(scopeEl, focusKey) {")
+    assert "focusTemporarily(target);" in restore, (
+        "a role target is a plain div on the fresh row; a raw focus() is a no-op there"
+    )
+    approve = extract_braced(body, "function handleChildApproveRequest(ev) {")
+    assert 'childrenState.set(childId, { ws_id: childId, name: "" });' in approve, (
+        "an approve_request ahead of the first state tick must still have a row to reveal"
+    )
+    assert (
+        'if (child.ws_id && child.ws_id === _flashWsId) row.classList.add("highlight");' in body
+    ), "renderChildRow must re-apply the flash across a row swap"
+    reveal = extract_braced(body, "function _revealPendingChild() {")
+    assert "pendingApprovalIds.has(" in reveal, "the target must come from the pending set"
+    assert "_setSidebarExpanded" not in body, (
+        "a collapsed sidebar hides the chip too, so a reveal never needs to expand it"
+    )
+    assert "StatusBar.scrollToApprovalTarget(row);" in reveal
+    assert "_flashChildRow(row.dataset.wsId);" in reveal
+    assert 'focusTemporarily(row.querySelector(".approval-block") || row);' in reveal
+    assert ".ws-link" not in reveal
+    shared = (
+        Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
+    ).read_text(encoding="utf-8")
+    assert "export function focusTemporarily(el) {" in shared
+
+
+def test_coordinator_children_pending_chip_behavior(tmp_path):
+    """Run ``_refreshChildrenCount`` and ``_revealPendingChild`` under node
+    against the fake DOM: the count paints "(N)" plus a chip with the
+    pending count; the reveal targets the FIRST pending row in tree order,
+    expands the sidebar, scrolls, highlights, and focuses the approval
+    region when painted (else the row); zero pending is a no-op."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import pytest
+
+    from tests._js_harness_helpers import FAKE_DOM, extract_braced
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    count_fn = extract_braced(body, "function _refreshChildrenCount() {")
+    reveal_fn = extract_braced(body, "function _revealPendingChild() {")
+    flash_fn = extract_braced(body, "function _flashChildRow(wsId) {")
+    unflash_fn = extract_braced(body, "function _unflashChildRow(wsId) {")
+    script = tmp_path / "children_chip.mjs"
+    script.write_text(
+        FAKE_DOM
+        + f"""
+const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};
+const painted = [];
+const scrolled = [];
+const focused = [];
+const timers = [];
+globalThis.StatusBar = {{
+  paintWarnChip: (els, n, text) => painted.push({{ els, n, text }}),
+  scrollToApprovalTarget: (el) => scrolled.push(el),
+}};
+globalThis.focusTemporarily = (el) => focused.push(el);
+globalThis.setTimeout = (fn) => {{ timers.push(fn); return timers.length; }};
+globalThis.clearTimeout = () => {{}};
+globalThis.cssEscape = (s) => s;
+globalThis._flashWsId = null;
+globalThis._flashTimer = null;
+globalThis.FLASH_MS = 1200;
+globalThis.composer = {{ inputEl: new FakeElement("textarea") }};
+globalThis.childrenCountEl = new FakeElement("span");
+globalThis.childrenPendingEl = new FakeElement("button");
+globalThis.childrenState = new Map([["a", {{}}], ["b", {{}}], ["c", {{}}]]);
+globalThis.pendingApprovalIds = new Set();
+globalThis.childrenTreeEl = new FakeElement("div");
+html.appendChild(childrenTreeEl);
+function row(id, withBlock) {{
+  const r = new FakeElement("div");
+  r.className = "ch-row";
+  r.dataset.wsId = id;
+  if (withBlock) {{
+    const block = new FakeElement("div");
+    block.className = "approval-block";
+    r.appendChild(block);
+  }}
+  childrenTreeEl.appendChild(r);
+  return r;
+}}
+const rowA = row("a", false);
+const rowB = row("b", true);
+const rowC = row("c", false);
+{count_fn}
+{reveal_fn}
+{flash_fn}
+{unflash_fn}
+
+_refreshChildrenCount();
+assert(childrenCountEl.textContent === "(3)", "count must be the total alone: " + childrenCountEl.textContent);
+assert(painted.length === 1 && painted[0].n === 0, "zero pending paints the chip hidden");
+assert(painted[0].els.chipEl === childrenPendingEl, "the chip element must be the heading button");
+assert(painted[0].els.focusFallbackEl === composer.inputEl, "hidden-under-focus falls back to the composer");
+_revealPendingChild();
+assert(scrolled.length === 0 && focused.length === 0, "zero pending: reveal is a no-op");
+
+pendingApprovalIds.add("c");
+pendingApprovalIds.add("b");
+_refreshChildrenCount();
+assert(painted[1].n === 2 && painted[1].text.label === "2 approvals", "chip must carry the pending count with its noun");
+assert(/first child/.test(painted[1].text.title), "plural title names the first child");
+_revealPendingChild();
+assert(scrolled.length === 1 && scrolled[0] === rowB, "must scroll to the FIRST pending row in tree order");
+assert(rowB.classList.contains("highlight"), "the row must flash");
+assert(_flashWsId === "b", "the flash is held by id so a row swap can re-apply it");
+assert(focused.length === 1 && focused[0] === rowB.children[0], "focus lands on the painted approval region");
+// A live fetch swaps the row mid-flash: the timer strips the class from the
+// row that now carries the id, not the detached one.
+const rowB2 = new FakeElement("div");
+rowB2.className = "ch-row";
+rowB2.dataset.wsId = "b";
+if (rowB2.dataset.wsId === _flashWsId) rowB2.classList.add("highlight");
+rowB.remove();
+childrenTreeEl.appendChild(rowB2);
+assert(rowB2.classList.contains("highlight"), "a re-rendered row inside the window re-applies the flash");
+timers.splice(0).forEach((fn) => fn());
+assert(!rowB2.classList.contains("highlight") && _flashWsId === null, "the flash must clear on the live row");
+
+pendingApprovalIds.delete("b");
+_refreshChildrenCount();
+assert(painted[2].n === 1 && painted[2].text.label === "1 approval", "singular label");
+assert(!/first/.test(painted[2].text.title), "singular title does not say first");
+_revealPendingChild();
+assert(scrolled[1] === rowC, "after b resolves, c is next");
+assert(focused[1] === rowC, "no approval block yet: the row itself takes focus");
+
+// A pending id with no rendered row (tree not loaded) is a no-op.
+pendingApprovalIds.clear();
+pendingApprovalIds.add("zz");
+_revealPendingChild();
+assert(scrolled.length === 2, "unknown row: nothing to scroll to");
+console.log("children chip OK");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0, f"children chip harness failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+def test_coordinator_row_focus_restore_handles_reveal_targets(tmp_path):
+    """``_captureRowFocusKey`` / ``_restoreRowFocus`` survive the row swaps
+    a child state tick or live fetch performs while the Children-heading
+    chip's reveal has parked temporary focus on the row or its approval
+    region: those are captured as roles (their classNames are transient)
+    and restored through ``focusTemporarily`` on the fresh row, while a
+    focused button inside the row still restores by className."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import pytest
+
+    from tests._js_harness_helpers import FAKE_DOM, extract_braced
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    capture_fn = extract_braced(body, "function _captureRowFocusKey(scopeEl) {")
+    restore_fn = extract_braced(body, "function _restoreRowFocus(scopeEl, focusKey) {")
+    script = tmp_path / "row_focus.mjs"
+    script.write_text(
+        FAKE_DOM
+        + f"""
+const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};
+FakeElement.prototype.matches = function (sel) {{ return this._matches(sel); }};
+const temporary = [];
+globalThis.focusTemporarily = (el) => {{ temporary.push(el); document.activeElement = el; }};
+globalThis.cssEscape = (s) => s;
+{capture_fn}
+{restore_fn}
+const tree = new FakeElement("div");
+html.appendChild(tree);
+function buildRow() {{
+  const row = new FakeElement("div");
+  row.className = "ch-row";
+  row.dataset.wsId = "b";
+  const block = new FakeElement("div");
+  block.className = "approval-block";
+  const btn = new FakeElement("button");
+  btn.className = "approve-btn";
+  block.appendChild(btn);
+  row.appendChild(block);
+  tree.appendChild(row);
+  return {{ row, block, btn }};
+}}
+let a = buildRow();
+
+// Focus on the row itself (reveal without a painted block): role, not class.
+a.row.classList.add("highlight");
+document.activeElement = a.row;
+let key = _captureRowFocusKey(tree);
+assert(key && key.role === "row" && key.wsId === "b", "row focus captures the row role: " + JSON.stringify(key));
+a.row.remove();
+let b = buildRow();
+_restoreRowFocus(tree, key);
+assert(temporary[0] === b.row, "row role restores onto the fresh row with a temporary tabindex");
+
+// Focus on the approval region.
+document.activeElement = b.block;
+key = _captureRowFocusKey(tree);
+assert(key && key.role === "approval", "region focus captures the approval role");
+b.row.remove();
+let c = buildRow();
+_restoreRowFocus(tree, key);
+assert(temporary[1] === c.block, "approval role restores onto the fresh region");
+
+// The region is gone on the resolution swap: the caret stays on the row.
+document.activeElement = c.block;
+key = _captureRowFocusKey(tree);
+c.row.remove();
+const bare = new FakeElement("div");
+bare.className = "ch-row";
+bare.dataset.wsId = "b";
+tree.appendChild(bare);
+_restoreRowFocus(tree, key);
+assert(temporary[2] === bare, "a resolved row without a region takes the focus itself");
+bare.remove();
+c = buildRow();
+
+// Focus on a button inside the row: the className marker path, raw focus.
+document.activeElement = c.btn;
+key = _captureRowFocusKey(tree);
+assert(key && key.marker === "approve-btn" && !key.role, "button focus keeps the className marker");
+c.row.remove();
+let d = buildRow();
+_restoreRowFocus(tree, key);
+assert(document.activeElement === d.btn && temporary.length === 3, "a focusable restores with a plain focus()");
+
+// Focus outside the tree: nothing captured, restore is a no-op.
+document.activeElement = html;
+assert(_captureRowFocusKey(tree) === null, "focus outside the scope captures nothing");
+_restoreRowFocus(tree, null);
+console.log("row focus OK");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0, f"row focus harness failed:\n{proc.stderr}\n{proc.stdout}"

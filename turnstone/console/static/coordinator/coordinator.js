@@ -49,6 +49,8 @@ import {
   markConvRowResultSettled,
   createReasoningActivity,
   setConvBatchExpanded,
+  focusConvBatchHead,
+  focusTemporarily,
   setToolOutputReviewState,
 } from "/shared/conversation.js";
 import {
@@ -285,6 +287,16 @@ function buildCoordChrome(root, opts) {
         "aria-label": "Tool calls this turn",
         text: "0 tools",
       }),
+      // Pending-approval chip — sticky count of the human gates open in
+      // this transcript, painted by _syncApprovalChip and hidden at zero.
+      // A button: the click brings the batch the keyboard shortcuts act
+      // on into view.  Mirrors the interactive pane's chip.
+      el("button", {
+        id: "coord-sb-approval",
+        class: "warn-chip ws-sb-approval",
+        type: "button",
+        hidden: "",
+      }),
       el("span", {
         id: "coord-sb-turns",
         class: "ws-sb-turns",
@@ -322,11 +334,24 @@ function buildCoordChrome(root, opts) {
     refreshId,
     refreshLabel,
     bodyId,
+    pendingId,
   ) {
     return el("div", { id: wrapId, class: "side-section" }, [
       el("div", { class: "coord-sidebar-head" }, [
         el("h2", { id: headingId, class: "side-label", text: heading }),
         el("span", { id: countId, class: "side-count" }),
+        // Children only: the "N pending" count as a clickable warn chip
+        // (the status-bar approval chip's sibling) that scrolls the tree
+        // to the first child waiting on an approval.  Painted by
+        // _refreshChildrenCount, hidden at zero.
+        pendingId
+          ? el("button", {
+              id: pendingId,
+              class: "warn-chip side-count-pending",
+              type: "button",
+              hidden: "",
+            })
+          : null,
         el("button", {
           type: "button",
           class: "ghost",
@@ -378,6 +403,7 @@ function buildCoordChrome(root, opts) {
         "coord-children-refresh",
         "Refresh children",
         "coord-children-tree",
+        "coord-children-pending",
       ),
       sideSection(
         "coord-tasks-wrap",
@@ -543,6 +569,12 @@ function createCoordinatorPane(root, wsId, opts) {
   const nameEl = root.querySelector("#coord-name");
   const childrenTreeEl = root.querySelector("#coord-children-tree");
   const childrenCountEl = root.querySelector("#coord-children-count");
+  const childrenPendingEl = root.querySelector("#coord-children-pending");
+  if (childrenPendingEl) {
+    childrenPendingEl.addEventListener("click", function () {
+      _revealPendingChild();
+    });
+  }
   const childrenRefreshBtn = root.querySelector("#coord-children-refresh");
   const tasksEl = root.querySelector("#coord-tasks");
   const tasksCountEl = root.querySelector("#coord-tasks-count");
@@ -588,6 +620,10 @@ function createCoordinatorPane(root, wsId, opts) {
         ae.isContentEditable)
     )
       return;
+    // The status-bar chip is a button inside root: Enter on it must reach
+    // its own click (reveal), never the approve arm below — and the
+    // preventDefault there would swallow that click outright.
+    if (ae && ae === sbApprovalEl) return;
     // Ignore browser/OS accelerators (Cmd+D bookmark, Ctrl+D, Alt+D) — only bare
     // keys + Shift+A resolve, else a stray accelerator silently denies the batch.
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -657,6 +693,12 @@ function createCoordinatorPane(root, wsId, opts) {
   const sbTokensEl = root.querySelector("#coord-sb-tokens");
   const sbToolsEl = root.querySelector("#coord-sb-tools");
   const sbTurnsEl = root.querySelector("#coord-sb-turns");
+  const sbApprovalEl = root.querySelector("#coord-sb-approval");
+  if (sbApprovalEl) {
+    sbApprovalEl.addEventListener("click", function () {
+      _revealPendingApproval();
+    });
+  }
   let coordModel = "";
   let coordModelAlias = "";
   let coordEffort = "";
@@ -2164,12 +2206,17 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   // The tool-batch currently awaiting an approval decision (for the keyboard
-  // shortcuts): the last .conv-batch with a still-pending row whose actions
-  // aren't already disabled — i.e. not mid-resolve, so a key never double-fires.
+  // shortcuts and the status-bar chip): the last --pending .conv-batch with a
+  // still-pending row whose actions aren't already disabled — i.e. not
+  // mid-resolve, so a key never double-fires.  The class check matters: a
+  // resolved batch keeps its rows' data-needs-approval (only _refreshRowStatus
+  // clears it) and its status pill has no button, so without it a resolved
+  // batch outranked an older still-pending one and a key 409'd on a stale id.
   function _currentPendingBatch() {
     const batches = messagesEl.querySelectorAll(".conv-batch");
     for (let i = batches.length - 1; i >= 0; i--) {
       const b = batches[i];
+      if (!b.classList.contains("conv-batch--pending")) continue;
       if (!b.querySelector('.conv-row[data-needs-approval="1"][data-call-id]'))
         continue;
       const btn = b.querySelector(".conv-actions button");
@@ -2177,6 +2224,47 @@ function createCoordinatorPane(root, wsId, opts) {
       return b;
     }
     return null;
+  }
+
+  // Status-bar pending-approval chip.  The coord keeps no cycle map (the
+  // interactive pane's approvalCycles); pending state IS the DOM, so the
+  // count is derived from it: every --pending batch in THIS transcript
+  // (child workstreams' gates live in the children tree and the rail, not
+  // here).  Re-derived at the three places pending state changes —
+  // appendToolBatch (paint / replay / upgrade), _morphBatchResolved, and
+  // the refetchHistory wipe (a history render never paints a pending
+  // batch; SSE re-delivers approve_request, which repaints and recounts).
+  // A batch stays counted while its own click is mid-resolve: the server
+  // has not confirmed yet, and approval_resolved morphs it out.
+  function _syncApprovalChip() {
+    if (!sbApprovalEl) return;
+    const n = messagesEl.querySelectorAll(
+      ".conv-batch.conv-batch--pending",
+    ).length;
+    StatusBar.paintApprovalChip(
+      {
+        approvalEl: sbApprovalEl,
+        focusFallbackEl: composer && composer.inputEl,
+      },
+      n,
+    );
+  }
+
+  // Chip click: bring the batch the keyboard shortcuts act on into view and
+  // focus its HEAD, not its primary action — a "show me" click must never
+  // arm Space on Approve.  (The paint-time focus on the primary action stays
+  // where it is; that one follows a judge verdict the reviewer asked for.)
+  // Falls back to any --pending batch (all mid-resolve) so the click never
+  // lands on nothing while the chip is showing.  The head focus uses
+  // preventScroll internally, so the smooth scroll keeps the viewport.
+  function _revealPendingApproval() {
+    const batch =
+      _currentPendingBatch() ||
+      messagesEl.querySelector(".conv-batch.conv-batch--pending");
+    if (!batch) return;
+    setConvBatchExpanded(batch, true, { blocker: true });
+    StatusBar.scrollToApprovalTarget(batch);
+    focusConvBatchHead(batch);
   }
 
   // Build the resolved-state status pill.  Shared between the live
@@ -2238,6 +2326,7 @@ function createCoordinatorPane(root, wsId, opts) {
     const actions = batch.querySelector(".conv-actions");
     if (actions) actions.replaceWith(_buildStatusPill(opts));
     if (activeBatch === batch) activeBatch = null;
+    _syncApprovalChip();
   }
 
   function _focusBatchPrimary(batch, prefer) {
@@ -2408,6 +2497,11 @@ function createCoordinatorPane(root, wsId, opts) {
           _appendJudgePendingLineTo(entry.row);
         }
       });
+      // Only a pending paint can add --pending (the morph is the sole
+      // remover), so the recount is gated on it: a history render calls
+      // this once per tool batch, and an unconditional transcript scan
+      // there is quadratic in a long session.
+      if (opts.pending) _syncApprovalChip();
       return existing;
     }
 
@@ -2510,6 +2604,7 @@ function createCoordinatorPane(root, wsId, opts) {
 
     messagesEl.appendChild(batch);
     _scheduleScroll();
+    if (opts.pending) _syncApprovalChip();
     return batch;
   }
 
@@ -4627,6 +4722,10 @@ function createCoordinatorPane(root, wsId, opts) {
   const _mapSet = Map.prototype.set;
   const _mapDelete = Map.prototype.delete;
   const _mapClear = Map.prototype.clear;
+  // Every mutation repaints the Children-heading count: the pending set
+  // IS that chip's number, and the bulk live fetch (the path that first
+  // discovers a pending approval after load) reaches no render otherwise.
+  // Cheap per call — two sizes, one text write, one two-child lookup.
   function _liveBadgeCacheSet(id, entry) {
     _mapSet.call(liveBadgeCache, id, entry);
     if (entry && entry.live && entry.live.pending_approval) {
@@ -4634,15 +4733,25 @@ function createCoordinatorPane(root, wsId, opts) {
     } else {
       pendingApprovalIds.delete(id);
     }
+    _refreshChildrenCount();
   }
   function _liveBadgeCacheDelete(id) {
     _mapDelete.call(liveBadgeCache, id);
     pendingApprovalIds.delete(id);
+    _refreshChildrenCount();
   }
   function _liveBadgeCacheClear() {
     _mapClear.call(liveBadgeCache);
     pendingApprovalIds.clear();
+    _refreshChildrenCount();
   }
+  // The child row currently flashed by a reveal (the Children-heading
+  // chip).  Held by id, not element: a live-fetch or state tick can
+  // replace the row within the flash window, so renderChildRow re-applies
+  // the class from this and the timer strips it by id.
+  let _flashWsId = null;
+  let _flashTimer = null;
+  const FLASH_MS = 1200;
   // ws_ids currently visible in the viewport — only these trigger
   // live-fetch on SSE state changes.  Populated by an
   // IntersectionObserver attached to each rendered .ch-row so a
@@ -4718,6 +4827,7 @@ function createCoordinatorPane(root, wsId, opts) {
     row.setAttribute("role", "listitem");
     if (state === "closed" || state === "deleted") row.classList.add("closed");
     if (child.ws_id) row.dataset.wsId = child.ws_id;
+    if (child.ws_id && child.ws_id === _flashWsId) row.classList.add("highlight");
 
     const a = document.createElement("a");
     a.className = "ws-link";
@@ -5410,6 +5520,14 @@ function createCoordinatorPane(root, wsId, opts) {
     if (!active || !scopeEl || !scopeEl.contains(active)) return null;
     const row = active.closest(".ch-row");
     if (!row || !row.dataset.wsId) return null;
+    // The row and its approval region take temporary focus from the
+    // Children-heading chip's reveal.  Neither is a stable className
+    // (the row carries a transient flash class, the region a transient
+    // loading class), so they are captured as roles.
+    if (active === row) return { wsId: row.dataset.wsId, role: "row" };
+    if (active.classList && active.classList.contains("approval-block")) {
+      return { wsId: row.dataset.wsId, role: "approval" };
+    }
     return {
       wsId: row.dataset.wsId,
       marker: active.className || active.tagName,
@@ -5422,7 +5540,13 @@ function createCoordinatorPane(root, wsId, opts) {
     const row = scopeEl.matches(sel) ? scopeEl : scopeEl.querySelector(sel);
     if (!row) return;
     let target = null;
-    if (focusKey.marker) {
+    if (focusKey.role === "row") {
+      target = row;
+    } else if (focusKey.role === "approval") {
+      // The block is gone on the resolution swap: keep the caret in the
+      // list on the row rather than dropping it to the document.
+      target = row.querySelector(".approval-block") || row;
+    } else if (focusKey.marker) {
       // CSS.escape can't safely round-trip a class list with spaces,
       // so we walk focusables and string-compare. A future refactor
       // could swap to a stable ``data-focus-key`` attribute on each
@@ -5438,7 +5562,12 @@ function createCoordinatorPane(root, wsId, opts) {
         }
       }
     }
-    if (target) target.focus({ preventScroll: true });
+    if (!target) return;
+    // A role target is a plain div on the fresh row: a raw focus() is a
+    // silent no-op there, so it takes the same temporary tabindex the
+    // reveal gave the original.  Marker targets are natively focusable.
+    if (focusKey.role) focusTemporarily(target);
+    else target.focus({ preventScroll: true });
   }
 
   function _renderChildrenNow() {
@@ -5520,9 +5649,70 @@ function createCoordinatorPane(root, wsId, opts) {
   function _refreshChildrenCount() {
     const total = childrenState.size;
     const pending = pendingApprovalIds.size;
-    childrenCountEl.textContent = total
-      ? "(" + total + (pending > 0 ? " · " + pending + " pending" : "") + ")"
-      : "";
+    childrenCountEl.textContent = total ? "(" + total + ")" : "";
+    // The pending part of the old "(N · x pending)" annotation is now a
+    // warn chip: same words, but coloured and clickable — the click
+    // scrolls the tree to the first child waiting on an approval.
+    StatusBar.paintWarnChip(
+      {
+        chipEl: childrenPendingEl,
+        focusFallbackEl: composer && composer.inputEl,
+      },
+      pending,
+      {
+        label: pending + " approval" + (pending === 1 ? "" : "s"),
+        title:
+          "Show the " +
+          (pending === 1 ? "child" : "first child") +
+          " waiting for approval",
+      },
+    );
+  }
+
+  // Children-heading chip click: the first child row (tree order) whose
+  // approval is pending.  Rows lazy-load their approval block on
+  // visibility, so the row is the reliable target; the block, when
+  // already painted, is the better landing (a labelled region).  Focus is
+  // temporary on the region or the row — never the child's link (Enter
+  // would open it) and never an Approve button (Space would fire it).
+  // No sidebar expand: a collapsed sidebar hides the whole children
+  // section, this chip included, so the click cannot happen there.
+  function _revealPendingChild() {
+    if (!pendingApprovalIds.size) return;
+    const rows = childrenTreeEl.querySelectorAll(".ch-row");
+    let row = null;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.wsId && pendingApprovalIds.has(rows[i].dataset.wsId)) {
+        row = rows[i];
+        break;
+      }
+    }
+    if (!row) return;
+    StatusBar.scrollToApprovalTarget(row);
+    _flashChildRow(row.dataset.wsId);
+    focusTemporarily(row.querySelector(".approval-block") || row);
+  }
+
+  function _flashChildRow(wsId) {
+    if (_flashTimer) clearTimeout(_flashTimer);
+    if (_flashWsId && _flashWsId !== wsId) _unflashChildRow(_flashWsId);
+    _flashWsId = wsId;
+    const row = childrenTreeEl.querySelector(
+      '.ch-row[data-ws-id="' + cssEscape(wsId) + '"]',
+    );
+    if (row) row.classList.add("highlight");
+    _flashTimer = setTimeout(() => {
+      _flashTimer = null;
+      _flashWsId = null;
+      _unflashChildRow(wsId);
+    }, FLASH_MS);
+  }
+
+  function _unflashChildRow(wsId) {
+    const row = childrenTreeEl.querySelector(
+      '.ch-row[data-ws-id="' + cssEscape(wsId) + '"]',
+    );
+    if (row) row.classList.remove("highlight");
   }
 
   function renderTaskRow(task) {
@@ -5758,16 +5948,16 @@ function createCoordinatorPane(root, wsId, opts) {
           permanent: wasDenied,
           sseUpdatedAt: prev ? prev.sseUpdatedAt || 0 : 0,
         });
+        // Through _updateChildRow for its focus capture/restore, observer
+        // rebind and count repaint — the reveal's own scroll brings a row
+        // into view and lands here within the flash window, and a bare
+        // replaceWith dropped the focus it had just placed.  The guard
+        // keeps an absent row a silent skip rather than the full render
+        // _updateChildRow falls back to.
         const row = childrenTreeEl.querySelector(
           '.ch-row[data-ws-id="' + cssEscape(id) + '"]',
         );
-        if (row) {
-          const entry = childrenState.get(id);
-          if (entry) {
-            const replacement = renderChildRow(entry);
-            row.replaceWith(replacement);
-          }
-        }
+        if (row && childrenState.get(id)) _updateChildRow(id);
       });
     } catch (e) {
       // 403 = caller lacks admin.cluster.inspect → mark every pending
@@ -6065,6 +6255,14 @@ function createCoordinatorPane(root, wsId, opts) {
     details.push(detail);
     cachedLive.pending_approval = true;
     cachedLive.pending_approval_details = details;
+    // An approve_request can precede the child's first state tick (and
+    // the /children load).  Seed the entry as handleChildState does so
+    // the Children-heading chip never counts a gate with no row to
+    // reveal; the tick fills in state and node when it lands.
+    if (!childrenState.has(childId)) {
+      childrenState.set(childId, { ws_id: childId, name: "" });
+      _touchChild(childId);
+    }
     _liveBadgeCacheSet(childId, {
       live: cachedLive,
       fetched: cached ? cached.fetched : 0,
@@ -6635,6 +6833,7 @@ function createCoordinatorPane(root, wsId, opts) {
     )
       return;
     messagesEl.replaceChildren();
+    _syncApprovalChip();
     // A full committed-history render repairs any recorded truncation gap —
     // whether this render came from the truncated resync itself or from an
     // unrelated clear_ui rebuild — so it supersedes ALL pending repair

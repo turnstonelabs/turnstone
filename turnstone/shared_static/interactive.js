@@ -910,11 +910,44 @@ class Pane {
     this.approvalBlockEl = active ? active.blockEls[0] : null;
     this.inputEl.disabled = this.pendingApproval;
     this._reconcileSendDisabled();
+    StatusBar.paintApprovalChip(
+      { approvalEl: this._sbApproval, focusFallbackEl: this.inputEl },
+      this.approvalCycles.size,
+    );
   }
 
   _oldestCycleId() {
     const first = this.approvalCycles.keys().next();
     return first.done ? null : first.value;
+  }
+
+  // Status-bar chip click: bring the card the keyboard shortcuts act on
+  // (the OLDEST live cycle — see the keydown handler) into view and hand
+  // focus to its feedback field, exactly as a freshly painted first cycle
+  // does.  The card may have scrolled far away or, for a task-agent
+  // sub-batch, sit inside an agent card the user re-collapsed after the
+  // approve paint forced it open — unfold both layers first, otherwise
+  // scrollIntoView on a display:none row is a no-op.
+  revealPendingApproval() {
+    const id = this._oldestCycleId();
+    const entry = id ? this.approvalCycles.get(id) : null;
+    const block = entry
+      ? entry.blockEls.find((el) => el && el.isConnected)
+      : null;
+    if (!block) return;
+    const agentCard = block.closest(".conv-agent");
+    if (agentCard) {
+      agentCard.dataset.collapsed = "false";
+      const toggle = agentCard.querySelector(".conv-agent-toggle");
+      if (toggle) toggle.setAttribute("aria-expanded", "true");
+    }
+    const batch = block.closest(".conv-batch");
+    if (batch) setConvBatchExpanded(batch, true, { blocker: true });
+    StatusBar.scrollToApprovalTarget(block);
+    const fb = block.querySelector(".conv-feedback");
+    // preventScroll: the smooth scroll above owns the viewport; a focus
+    // jump would cut it short and land the card at the viewport edge.
+    if (fb) fb.focus({ preventScroll: true });
   }
 
   _registerApprovalCycle(cycleId, blockEls, items) {
@@ -1210,6 +1243,10 @@ class Pane {
     // keys type; elsewhere y|Enter approve, n|Esc deny, a = approve-all.
     this.el.addEventListener("keydown", (e) => {
       if (!this.pendingApproval || !this.approvalBlockEl) return;
+      // The status-bar chip is a button inside this.el: Enter on it must
+      // reach its own click (reveal), never the approve arm below — and
+      // preventDefault here would swallow that click outright.
+      if (e.target === this._sbApproval) return;
       // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
       // tracks); sibling cards from parallel task agents resolve by
       // their own buttons or become oldest in turn.  When the feedback
@@ -1373,9 +1410,21 @@ class Pane {
     this._sbTurns.className = "ws-sb-turns";
     this._sbTurns.textContent = "turn 0";
     this._sbTurns.setAttribute("aria-label", "Conversation turn");
+    // Pending-approval chip: sticky count of the live human gates in this
+    // transcript, painted by _syncApprovalState (the one approval-state
+    // chokepoint) and hidden at zero.  A button, so it tabs and clicks:
+    // the click brings the card the keyboard shortcuts act on into view.
+    this._sbApproval = document.createElement("button");
+    this._sbApproval.type = "button";
+    this._sbApproval.className = "warn-chip ws-sb-approval";
+    this._sbApproval.hidden = true;
+    this._sbApproval.addEventListener("click", () =>
+      this.revealPendingApproval(),
+    );
 
     this.statusBarEl.appendChild(this._sbTokens);
     this.statusBarEl.appendChild(this._sbTools);
+    this.statusBarEl.appendChild(this._sbApproval);
     this.statusBarEl.appendChild(this._sbTurns);
     this.el.appendChild(this.statusBarEl);
 

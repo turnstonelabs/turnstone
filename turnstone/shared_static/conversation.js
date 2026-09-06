@@ -641,21 +641,33 @@ function _batchHasProtectedFocus(batch) {
   return !head || !head.contains(active);
 }
 
-function _focusConvBatchHead(batch) {
-  const head = _convBatchHead(batch);
-  if (!head || typeof head.focus !== "function") return;
-  const temporary = !head.hasAttribute("tabindex");
-  if (temporary) head.setAttribute("tabindex", "-1");
-  head.focus({ preventScroll: true });
+// Focus a non-interactive element without pre-selecting an answer: a
+// temporary tabindex, so the element takes focus (and a visible ring)
+// while Space and Enter stay unarmed on any action button or link inside
+// it.  The tabindex leaves with the focus, so the element never joins the
+// Tab order.  preventScroll: callers own the viewport (a smooth scroll is
+// usually already running toward the element).
+export function focusTemporarily(el) {
+  if (!el || typeof el.focus !== "function") return;
+  const temporary = !el.hasAttribute("tabindex");
+  if (temporary) el.setAttribute("tabindex", "-1");
+  el.focus({ preventScroll: true });
   if (temporary) {
-    head.addEventListener(
+    el.addEventListener(
       "blur",
       () => {
-        head.removeAttribute("tabindex");
+        el.removeAttribute("tabindex");
       },
       { once: true },
     );
   }
+}
+
+// Focus a batch's head — used when a blocker expansion steals focus from
+// the disclosure, and by the status-bar approval chip's reveal on the
+// coordinator (which has no feedback field to land on).
+export function focusConvBatchHead(batch) {
+  focusTemporarily(_convBatchHead(batch));
 }
 
 function _syncConvBatchDisclosure(batch, expanded) {
@@ -721,7 +733,7 @@ export function setConvBatchExpanded(batch, expanded, options) {
     disclosure &&
     document.activeElement === disclosure
   ) {
-    _focusConvBatchHead(batch);
+    focusConvBatchHead(batch);
   }
   const playing = _playingBatchMedia(batch);
   if (!expanded && !options.manual) {

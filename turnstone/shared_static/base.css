@@ -117,6 +117,11 @@
   --warn-soft: oklch(0.29 0.07 80);
   --warn-tint: oklch(0.22 0.05 80);
   --warn-tint-border: oklch(0.58 0.15 80);
+  /* Ink for text ON --warn-tint (the rail badge, the status-bar approval
+     chip).  Equals --warn here (6.4:1 on the dark tint) but is a separate
+     token, written out, so a retune of --warn can't drag chip ink with it;
+     in light, --warn itself is only 3.3:1 on the pale tint. */
+  --warn-text: oklch(0.7 0.13 80);
   --err: oklch(0.68 0.17 25);
   --err-soft: oklch(0.29 0.07 25);
   --err-fill: oklch(0.56 0.17 25); /* darker filled red for .risk.crit */
@@ -195,6 +200,7 @@
   --warn-soft: oklch(0.94 0.05 80);
   --warn-tint: oklch(0.92 0.1 80);
   --warn-tint-border: oklch(0.64 0.15 80);
+  --warn-text: oklch(0.44 0.13 80); /* dark amber on pale warn-tint: 6.0:1 */
   --err: oklch(0.5 0.17 25);
   --err-soft: oklch(0.94 0.05 25);
   --err-fill: oklch(0.45 0.17 25);

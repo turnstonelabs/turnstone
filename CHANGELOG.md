@@ -43,6 +43,18 @@ frozen.
   handles daylight-saving changes correctly. A schedule whose zone the host
   can no longer resolve is disabled with the reason recorded in its run
   history.
+- **Pending-approval chip in the status bar.** When a tool call is waiting on
+  you, the workstream status bar (tokens / tools / turn) shows a sticky
+  "1 approval needed" chip, counting up when parallel task agents open several
+  gates at once, so a prompt that scrolled out of view or sits inside a
+  collapsed agent card is no longer easy to miss. Clicking it scrolls to the
+  card the keyboard shortcuts act on and puts the cursor on it. The
+  coordinator status bar shows the same chip for the coordinator's own
+  transcript, and the "x pending" count beside the coordinator's Children
+  heading becomes the same kind of chip, reading "x approvals": clicking it
+  scrolls the children list to the first child waiting on an approval. The chips and the rail's
+  attention badge share a new ink colour that reads clearly on the light
+  theme, where the old one fell short.
 
 ### Fixed
 

@@ -1247,7 +1247,7 @@
   border-radius: var(--r-sm);
   background: var(--warn-tint);
   border: 1px solid var(--warn-tint-border);
-  color: var(--warn);
+  color: var(--warn-text);
   font-size: 10px;
   line-height: 1.5;
   font-variant-numeric: tabular-nums;

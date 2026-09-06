@@ -2065,6 +2065,60 @@
   white-space: nowrap;
   margin-left: auto;
 }
+/* Pending-approval chip — a sticky, clickable count of the human gates open
+   in THIS pane's transcript.  Parallel task agents make several live at
+   once and the card can sit far off-screen; the click scrolls to the one
+   the keyboard shortcuts act on.  Same tint family and ink as the rail's
+   attention badge (shell.css .rail-badge) — one signal, one look — and it
+   stays at full strength in the disconnected state (the cycle is still
+   live client-side).  Hidden at zero via [hidden]: no display here, so the
+   UA rule keeps winning.
+
+   Geometry: the bar is 22px min-height with 4px vertical padding, a 14px
+   inner box.  12px line box + 2 × 1px border = 14px, so the bar does NOT
+   change height when the chip appears — it is the transcript/composer
+   boundary, and a shift there lands at the very moment the card paints.
+   The 2px focus ring at 1px offset spans y=1..21 inside that 22px.
+
+   Placement: between the tools and turn cells, the bar's only free space
+   (the turn cell carries margin-left: auto), so the chip appears and
+   disappears without moving any other cell.  The price is clip order under
+   a very narrow pane (turn, then this chip, before the ambient cells);
+   the bar is already slicing text mid-glyph below ~360px, and there the
+   card, the rail badge and the announcer still carry the signal. */
+/* .warn-chip is the look — shared with the coordinator's Children-heading
+   pending chip (coord-chrome.css .side-count-pending); each surface adds
+   only its geometry (padding, font size and family, line box). */
+.warn-chip {
+  appearance: none;
+  flex: none;
+  margin: 0;
+  border: 1px solid var(--warn-tint-border);
+  border-radius: var(--r-sm);
+  background: var(--warn-tint);
+  color: var(--warn-text);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+/* Hover steps the fill toward the ink — a darkening in both themes.
+   (--warn-soft is not a hover token: it is lighter than the tint in light
+   and darker in dark, so it would fade the chip into a white bar.) */
+.warn-chip:hover {
+  background: color-mix(in srgb, var(--warn-tint) 82%, var(--warn));
+}
+.warn-chip:focus-visible {
+  outline: 2px solid var(--warn);
+  outline-offset: 1px;
+}
+/* Family and size as longhands, not the font shorthand: the shorthand
+   would also reset the weight .warn-chip sets. */
+.ws-sb-approval {
+  padding: 0 6px;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 12px;
+}
 .ws-status-bar.ws-sb-warn .ws-sb-tokens {
   color: var(--yellow);
   font-weight: 600;

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._js_harness_helpers import FAKE_DOM, node_skip, run_node_source
 from tests._js_harness_helpers import extract_braced as _extract_braced
 from tests._js_harness_helpers import strip_js_comments as _strip_comments
 
@@ -1966,3 +1967,132 @@ def test_orphan_tool_result_does_not_mark_a_batch_failed() -> None:
     assert "!isOrphanResult" in body[guard:stamp], (
         "an orphan result can stamp conv-batch--error on a batch whose own calls all succeeded"
     )
+
+
+def test_status_bar_approval_chip_wired_to_the_cycle_chokepoint() -> None:
+    """The pending-approval chip is painted from ``_syncApprovalState`` — the
+    ONE place approval cycles register, resolve, prune and reset — so every
+    path that changes the count (peer-tab resolution, transcript rebuild,
+    orphan prune) repaints it for free.  It is a button (tabs, clicks) built
+    in ``_createDOM`` ahead of the turn cell, and its click reveals the SAME
+    cycle the keyboard shortcuts act on."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert 'this._sbApproval = document.createElement("button");' in body
+    assert 'this._sbApproval.className = "warn-chip ws-sb-approval";' in body, (
+        "the look is the shared .warn-chip; the surface class carries only geometry"
+    )
+    assert "this._sbApproval.hidden = true;" in body
+    assert "this.revealPendingApproval()," in body, (
+        "the chip click must route to revealPendingApproval"
+    )
+    dom = _strip_comments(body)
+    assert dom.index("this.statusBarEl.appendChild(this._sbApproval);") < dom.index(
+        "this.statusBarEl.appendChild(this._sbTurns);"
+    ), "the chip sits before the turn cell so a narrow pane clips the turn first"
+    sync = _extract_braced(body, "_syncApprovalState() {")
+    assert "StatusBar.paintApprovalChip(" in sync, (
+        "the chip must repaint from the approval-state chokepoint"
+    )
+    assert "this.approvalCycles.size," in sync
+    assert "focusFallbackEl: this.inputEl" in sync, (
+        "a chip hidden under keyboard focus must hand focus to the composer"
+    )
+    # The chip is a button INSIDE this.el, which carries the approval keydown
+    # handler: without a target guard, Enter on the focused chip approves the
+    # tool call (and preventDefault swallows the click that would reveal it).
+    assert "if (e.target === this._sbApproval) return;" in body, (
+        "the approval keydown handler must ignore keys originating on the chip"
+    )
+    reveal = _extract_braced(body, "revealPendingApproval() {")
+    assert "this._oldestCycleId()" in reveal, (
+        "click target must equal the keyboard target (the oldest live cycle)"
+    )
+    assert 'agentCard.dataset.collapsed = "false";' in reveal
+    assert "setConvBatchExpanded(batch, true, { blocker: true });" in reveal
+    assert "StatusBar.scrollToApprovalTarget(block);" in reveal
+    assert "fb.focus({ preventScroll: true });" in reveal
+
+
+@node_skip
+def test_reveal_pending_approval_unfolds_and_focuses_the_oldest_cycle() -> None:
+    """Run ``revealPendingApproval`` against the fake DOM: with two live
+    cycles it targets the oldest one whose block is still attached, re-opens
+    the agent card and batch that hold it, scrolls to the row, and focuses
+    its feedback field without a scroll jump."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    reveal = _extract_braced(body, "revealPendingApproval() {")
+    oldest = _extract_braced(body, "_oldestCycleId() {")
+    script = (
+        FAKE_DOM
+        + f"""
+const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};
+const scrolled = [];
+const expanded = [];
+globalThis.StatusBar = {{ scrollToApprovalTarget: (el) => scrolled.push(el) }};
+globalThis.setConvBatchExpanded = (batch, open, opts) => expanded.push([batch, open, opts]);
+const proto = {{
+  {reveal},
+  {oldest},
+}};
+
+// Transcript: a parent batch holding a task-agent card, collapsed by the
+// user, with a nested pending row (oldest cycle) — plus a later top-level
+// pending batch (newer cycle).
+const messages = new FakeElement("div");
+html.appendChild(messages);
+const parentBatch = new FakeElement("div");
+parentBatch.className = "conv-batch";
+messages.appendChild(parentBatch);
+const agentCard = new FakeElement("div");
+agentCard.className = "conv-agent";
+agentCard.dataset.collapsed = "true";
+parentBatch.appendChild(agentCard);
+const toggle = new FakeElement("button");
+toggle.className = "conv-agent-toggle";
+toggle.setAttribute("aria-expanded", "false");
+agentCard.appendChild(toggle);
+const nestedRow = new FakeElement("div");
+nestedRow.className = "conv-row";
+agentCard.appendChild(nestedRow);
+const nestedFeedback = new FakeElement("input");
+nestedFeedback.className = "conv-feedback";
+let focusOpts = null;
+nestedFeedback.focus = (opts) => {{ focusOpts = opts; document.activeElement = nestedFeedback; }};
+nestedRow.appendChild(nestedFeedback);
+const laterBatch = new FakeElement("div");
+laterBatch.className = "conv-batch";
+messages.appendChild(laterBatch);
+
+const pane = Object.assign({{ approvalCycles: new Map() }}, proto);
+pane.approvalCycles.set("cycle-old", {{ blockEls: [nestedRow], callIds: ["c1"] }});
+pane.approvalCycles.set("cycle-new", {{ blockEls: [laterBatch], callIds: ["c2"] }});
+
+pane.revealPendingApproval();
+assert(scrolled.length === 1 && scrolled[0] === nestedRow, "must scroll to the OLDEST cycle's row");
+assert(agentCard.dataset.collapsed === "false", "the collapsed agent card must reopen");
+assert(toggle.getAttribute("aria-expanded") === "true", "toggle aria must follow the reopen");
+assert(expanded.length === 1 && expanded[0][0] === parentBatch && expanded[0][1] === true
+  && expanded[0][2].blocker === true, "the enclosing batch must unfold as a blocker");
+assert(document.activeElement === nestedFeedback, "the feedback field must take focus");
+assert(focusOpts && focusOpts.preventScroll === true, "focus must not cut the scroll short");
+
+// The oldest cycle resolves: the next reveal targets the newer top-level batch.
+pane.approvalCycles.delete("cycle-old");
+pane.revealPendingApproval();
+assert(scrolled.length === 2 && scrolled[1] === laterBatch, "must fall through to the next cycle");
+assert(expanded[1][0] === laterBatch, "a top-level batch unfolds itself");
+
+// A cycle whose only block was detached (wiped transcript) reveals nothing.
+laterBatch.remove();
+pane.revealPendingApproval();
+assert(scrolled.length === 2, "a detached block must not be scrolled to");
+
+// No cycles at all is a no-op.
+pane.approvalCycles.clear();
+pane.revealPendingApproval();
+assert(scrolled.length === 2, "no cycles: nothing to reveal");
+console.log("reveal OK");
+"""
+    )
+    proc = run_node_source(script)
+    assert proc.returncode == 0, f"reveal harness failed:\n{proc.stderr}\n{proc.stdout}"
