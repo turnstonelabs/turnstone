@@ -920,27 +920,49 @@ stale lanes, and close its transport after active calls drain; cap-only reloads
 resize the stable alias admission gate without discarding the pool. Calibration
 remains an isolated one-shot client and always closes it after the probe.
 
-**OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
-already in OpenAI format), including multi-part content blocks (text + images)
-in tool results. Model capability lookup covers GPT-5 through GPT-5.6,
-O-series, and search models (`gpt-5-search-api`) — all with `supports_vision`.
-For search models, injects `web_search_options` and removes the `web_search`
-function tool (the model always searches). Citations from `url_citation`
-annotations are formatted as footnotes. Pre-5.6 GPT-5 models request extended
-prompt-cache retention (`prompt_cache_retention: "24h"`); GPT-5.6 uses
-`prompt_cache_options.ttl: "30m"`. Cache reads and writes are extracted from
-`cached_tokens` and `cache_write_tokens`. Unknown models get permissive
-defaults with `supports_vision=False` and use SearxNG for web search. The
-`openai-compatible` lane never consults this table at all — on either API
-surface (the responses pin is served by a compat-mode
-`OpenAIResponsesProvider`, mirroring `AnthropicProvider(compat=True)`): a
-local server serves whatever the operator named it (vLLM
-`--served-model-name` is a free string), so a prefix collision with a cloud
-model id must not inherit that model's sampling/effort contract — every
-local model gets the plain defaults, commercial prompt-cache controls are not
-injected by model-name prefix, and anything beyond those defaults is declared
-on the model definition (capabilities JSON + `server_compat`), matching the
-`anthropic-compatible` lane.
+**OpenAIResponsesProvider** (`_openai_responses.py`): the commercial `openai` lane always uses
+`/v1/responses`, translating the neutral message projection into Responses input items. The
+capability table covers GPT-5.4, GPT-5.5, GPT-5.6, GPT-6 Astra, search models, and audio roles.
+Captured reasoning items can be replayed when the operator enables reasoning replay. Native
+search replaces a visible client `web_search` tool on search-capable models; citations from
+`url_citation` annotations are formatted as footnotes. Pre-5.6 GPT-5 models request extended
+prompt-cache retention (`prompt_cache_retention: "24h"`); GPT-5.6 and Astra use
+`prompt_cache_options.ttl: "30m"`. Cache reads and writes are extracted from `cached_tokens` and
+`cache_write_tokens`. Unknown models get generic defaults with `supports_vision=False` and use
+client-side web search.
+
+Responses replay preserves native assistant message boundaries, `commentary` / `final_answer`
+phases, and their order among tool calls. Phase preservation does not depend on reasoning replay;
+when reasoning replay is enabled, those items retain their native positions too. The provider
+matches stored message text and call IDs against the lowered canonical history before restoring
+that layout; repaired call arguments come from canonical fields. Generated citation footers remain
+attached once to the last message. If edits make the layout ambiguous, replay uses current text
+without guessing a phase. Explicitly foreign producer metadata is excluded; legacy untagged blocks
+remain readable. See the [Responses input schema][responses-input-schema].
+
+[responses-input-schema]: https://developers.openai.com/api/reference/python/resources/responses/methods/create
+
+GPT-6 Astra (`gpt-6-astra`) has a 1,050,000-token context window, 128,000-token output limit, and
+reasoning levels `low`, `medium`, `high`, `xhigh`, and `max`. Temperature is always omitted.
+An unset effort leaves the server default in charge; the shared effort policy omits unsupported
+`none` and snaps `minimal` to `low`. Vision, native PDF input, tool search, reasoning replay,
+verbosity, and pro mode use the existing Responses paths. Astra also enables
+`supports_mid_conversation_system`: leading system/developer messages become `instructions`, while
+later messages keep their role and position in `input`. The canonical Turn IR is unchanged. Async
+tool execution, WebSocket steering, and `configuration_update` reasoning changes are not enabled.
+See the [OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model) and
+[model card](https://developers.openai.com/api/docs/models/gpt-6-astra).
+
+The `openai-compatible` lane never consults the commercial table on either API surface. Chat
+Completions uses `OpenAIChatCompletionsProvider`; the Responses pin uses
+`OpenAIResponsesProvider(compat=True)`. A local server serves whatever the operator named it, so a
+prefix collision with a cloud model ID must not inherit its sampling/effort contract. Every local
+model gets plain defaults, commercial prompt-cache controls are not injected by model-name prefix,
+and additional capabilities come from the model definition (`capabilities` JSON + `server_compat`),
+matching the `anthropic-compatible` lane.
+Native mid-conversation system messages remain disabled by default for compatible servers: a
+server's chat template may require system messages at the beginning even when it exposes the
+Responses API. These lanes keep using the existing folded operator reminders.
 
 **AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
 Anthropic content blocks, maps `system`/`developer` roles to the `system`
@@ -1109,7 +1131,7 @@ Three reasoning paths are recognised:
 | Path | Provider | Capture | Persist | Replay |
 |------|----------|---------|---------|--------|
 | 1 | Anthropic Messages API | `thinking_delta` | `provider_blocks` (`type="thinking"`) | Verbatim via `_provider_content` |
-| 2 | OpenAI Responses (gpt-5*, o-series) | `response.reasoning_text.delta` events | `provider_blocks` (`type="reasoning"`) — only when `include=["reasoning.encrypted_content"]` | `ResponseReasoningItemParam` input items |
+| 2 | OpenAI Responses (GPT-5+, o-series) | `response.reasoning_text.delta` events | `provider_blocks` (`type="reasoning"`) — only when `include=["reasoning.encrypted_content"]` | `ResponseReasoningItemParam` input items |
 | 3 | OpenAI Chat Completions (vLLM, llama.cpp, Gemini-compat) | `delta.reasoning_content` Pydantic extras | Synthetic `{type: "reasoning_text", text, source}` block stamped at end-of-stream | None — no API surface for replay on Chat Completions |
 
 Cross-provider safety is enforced by `ANTHROPIC_VALID_BLOCK_TYPES` (a

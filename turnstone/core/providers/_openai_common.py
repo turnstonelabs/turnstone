@@ -347,6 +347,22 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_verbosity=True,
         supports_pro_mode=True,
     ),
+    # GPT-6 Astra — Responses is required for tool calling. Reasoning cannot
+    # be disabled, and sampling parameters are rejected at every effort level.
+    # An unspecified effort stays server-selected.
+    "gpt-6-astra": ModelCapabilities(
+        context_window=1050000,
+        max_output_tokens=128000,
+        supports_temperature=False,
+        reasoning_effort_values=("low", "medium", "high", "xhigh", "max"),
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+        supports_verbosity=True,
+        supports_pro_mode=True,
+    ),
     # Search models — always search on every request, no reasoning_effort
     "gpt-5-search-api": ModelCapabilities(
         context_window=400000,
@@ -486,13 +502,13 @@ def apply_temperature_and_effort(
 
 
 def apply_cache_retention(kwargs: dict[str, Any], model: str) -> None:
-    """Configure the prompt-cache lifetime supported by each GPT-5 generation.
+    """Configure the prompt-cache lifetime supported by each known generation.
 
-    GPT-5.6 replaces the deprecated ``prompt_cache_retention`` field with
+    GPT-5.6 and Astra replace the deprecated ``prompt_cache_retention`` field with
     ``prompt_cache_options.ttl``; 30 minutes is currently its only accepted
     minimum lifetime.  Earlier GPT-5 models retain the 24-hour policy.
     """
-    if model.startswith("gpt-5.6"):
+    if model.startswith(("gpt-5.6", "gpt-6-astra")):
         kwargs["prompt_cache_options"] = {"ttl": "30m"}
     elif model.startswith("gpt-5"):
         kwargs["prompt_cache_retention"] = "24h"

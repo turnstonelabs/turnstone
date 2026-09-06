@@ -599,11 +599,11 @@ class ModelCapabilities:
     # Mid-conversation system messages: append ``{"role": "system"}`` to the
     # ``messages`` array (rather than editing the top-level ``system`` field) to
     # add operator-level instructions partway through a session without
-    # invalidating the cached prefix.  When False, ``system``-role messages must
-    # be hoisted into the top-level ``system`` param (the universal fallback).
-    # Available on the Claude API only (NOT Bedrock / Vertex / Foundry), on
-    # every row that sets this flag (validated header-less on claude-opus-4-8;
-    # documented wire surface); no beta header required.
+    # invalidating the cached prefix. When False, lowering folds operator turns
+    # into nonce-fenced reminders on the preceding input turn. Native Anthropic
+    # rows use inline Messages system blocks; native OpenAI Responses rows use
+    # system/developer input messages. Provider converters hoist only leading
+    # instructions on native lanes. No beta header is required.
     supports_mid_conversation_system: bool = False
     # Phase 3 reranker calibration — populated by calibrate-on-detect; read by
     # ChatSession._bm25_rerank_threshold. A non-empty rerank_scale is the

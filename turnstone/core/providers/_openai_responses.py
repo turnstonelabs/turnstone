@@ -1,4 +1,4 @@
-"""Responses API provider — for commercial OpenAI models (GPT-5.x, O-series).
+"""Responses API provider — for commercial OpenAI models.
 
 Uses the OpenAI Responses API (``/v1/responses``) which natively supports
 reasoning, tool use, web search, and tool search without the limitations
@@ -8,6 +8,7 @@ of the Chat Completions endpoint.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
@@ -33,12 +34,14 @@ from turnstone.core.providers._openai_common import (
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
+    TRAILING_INFO_SEPARATOR,
     ModelCapabilities,
     ProviderRequestMetrics,
     StreamChunk,
     ToolCallDelta,
     _join_reasoning_with_cap,
     finish_shim_due,
+    folds_trailing_info,
     refuse_aborted_request,
     request_uses_native_tools,
     resolve_reasoning_effort,
@@ -183,68 +186,36 @@ class OpenAIResponsesProvider:
         messages: list[dict[str, Any]],
         *,
         replay_reasoning_to_model: bool = False,
+        supports_mid_conversation_system: bool = False,
+        native_producer: str = "openai",
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert Chat Completions messages to Responses API input items.
 
         Returns ``(instructions, input_items)`` where *instructions* is the
         concatenated system/developer messages (or ``None``) and *input_items*
-        is the Responses API ``input`` array.
+        is the Responses API ``input`` array. With native mid-conversation
+        system support, only leading instructions are hoisted; later system
+        and developer messages retain their role and position in ``input``.
 
-        When *replay_reasoning_to_model* is True, stored ``_provider_content``
-        reasoning items (``type=="reasoning"``, captured via
-        ``include=["reasoning.encrypted_content"]`` on a prior turn)
-        are emitted as ``ResponseReasoningItemParam`` input items
-        immediately before the assistant message they belong to.  The
-        SDK explicitly documents this round-trip pattern at
-        ``response_reasoning_item_param.py:33-37``: "Be sure to include
-        these items in your ``input`` to the Responses API for
-        subsequent turns of a conversation if you are manually managing
-        context".  Even with ``store=False``, ``encrypted_content``
-        round-trips correctly per ``response_create_params.py:70-74``.
-
-        When *replay_reasoning_to_model* is False, reasoning items are silently
-        dropped (they were stripped from the wire by ``sanitize_messages``
-        anyway, but we also skip the input-item emission step).
-
-        Default ``False`` differs intentionally from
-        ``AnthropicProvider._convert_messages`` (which defaults
-        ``True``).  Anthropic's default exists for back-compat with
-        pre-Phase-2 callers who never threaded the kwarg; OpenAI
-        Responses replay is brand-new in Phase 3 and has no such
-        legacy.  Production callers (``_build_kwargs``) always pass
-        the resolved flag explicitly, so the default only matters in
-        tests.  Conservative-default-False keeps the persist-only
-        capture path live without forcing a downstream cost on every
-        unaware caller.
+        Native assistant message boundaries and ``phase`` survive when they
+        still match canonical text and call order. Reasoning items are replayed
+        only when *replay_reasoning_to_model* is True; phase is independent of
+        that toggle. Explicitly foreign producer metadata is ignored, while
+        untagged legacy native blocks retain shape-based replay.
         """
-        # Capture ``_provider_content`` reasoning items per ASSISTANT
-        # ORDINAL (not raw message index) BEFORE sanitization strips
-        # the underscore-prefixed key.  Position-by-index would be
-        # unsafe: ``sanitize_messages`` drops orphan tool results
-        # (``_openai_common.py:489-498`` / ``:521-535``) and inserts
-        # synthesized error tool messages for orphaned tool_calls
-        # (``:510-517``).  Either operation shifts subsequent message
-        # indices, so a pre-vs-post-sanitize index match would
-        # silently miss reasoning attachments after any tool-message
-        # repair.  Assistant messages themselves are never dropped or
-        # duplicated by sanitize_messages — only tool messages — so
-        # the n-th assistant in the original list is invariably the
-        # n-th assistant in the sanitized list.  Ordinal-keyed lookup
-        # survives any tool-message length change.
-        reasoning_by_assistant_ordinal: dict[int, list[dict[str, Any]]] = {}
-        if replay_reasoning_to_model:
-            ord_pre = 0
-            for raw_msg in messages:
-                if raw_msg.get("role") != "assistant":
-                    continue
-                pc = raw_msg.get("_provider_content")
-                if isinstance(pc, list):
-                    items_to_replay = [
-                        b for b in pc if isinstance(b, dict) and b.get("type") == "reasoning"
-                    ]
-                    if items_to_replay:
-                        reasoning_by_assistant_ordinal[ord_pre] = items_to_replay
-                ord_pre += 1
+        # Save native blocks before sanitization strips private fields. Key by
+        # assistant ordinal: sanitizer repair inserts/drops tool results, so raw
+        # message indices can shift, but assistants are never dropped/duplicated.
+        native_by_assistant_ordinal: dict[int, list[dict[str, Any]]] = {}
+        ord_pre = 0
+        for raw_msg in messages:
+            if raw_msg.get("role") != "assistant":
+                continue
+            pc = raw_msg.get("_provider_content")
+            producer = raw_msg.get("_producer")
+            if isinstance(pc, list) and (not producer or producer == native_producer):
+                native_by_assistant_ordinal[ord_pre] = [b for b in pc if isinstance(b, dict)]
+            ord_pre += 1
 
         # Skip PDF inlining: this lane has a native ``input_file`` block, so the
         # ``application/pdf`` document part must survive to ``convert_content_parts``
@@ -253,10 +224,6 @@ class OpenAIResponsesProvider:
         messages = sanitize_messages(messages, skip_pdf_inline=True)
         instructions_parts: list[str] = []
         items: list[dict[str, Any]] = []
-        # Track assistant ordinal in the SANITIZED list so the lookup
-        # into reasoning_by_assistant_ordinal stays aligned with the
-        # original-list ordinal.  See the long comment above for why
-        # ordinal is invariant under sanitization.
         assistant_ordinal_post = 0
 
         for msg in messages:
@@ -264,13 +231,25 @@ class OpenAIResponsesProvider:
             content = msg.get("content")
 
             if role in ("system", "developer"):
+                instruction_text: list[str] = []
                 if isinstance(content, str) and content:
-                    instructions_parts.append(content)
+                    instruction_text.append(content)
                 elif isinstance(content, list):
                     # Content parts — extract text
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "text":
-                            instructions_parts.append(part["text"])
+                            instruction_text.append(part["text"])
+                if instruction_text:
+                    if supports_mid_conversation_system and items:
+                        items.append(
+                            {
+                                "type": "message",
+                                "role": role,
+                                "content": "\n\n".join(instruction_text),
+                            }
+                        )
+                    else:
+                        instructions_parts.extend(instruction_text)
                 continue
 
             if role == "user":
@@ -285,37 +264,14 @@ class OpenAIResponsesProvider:
                 items.append(item)
 
             elif role == "assistant":
-                # Phase 3 reasoning replay: emit stored reasoning items
-                # BEFORE the assistant message they belong to.  The SDK
-                # expects reasoning items to appear in input order
-                # alongside the assistant turn that produced them.
-                for r_item in reasoning_by_assistant_ordinal.get(assistant_ordinal_post, []):
-                    item_for_input = _reasoning_item_for_input(r_item)
-                    if item_for_input is not None:
-                        items.append(item_for_input)
+                items.extend(
+                    _assistant_items_for_input(
+                        msg,
+                        native_by_assistant_ordinal.get(assistant_ordinal_post, []),
+                        replay_reasoning_to_model=replay_reasoning_to_model,
+                    )
+                )
                 assistant_ordinal_post += 1
-
-                # Text content → assistant message (plain string for input)
-                if content:
-                    items.append(
-                        {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": content,
-                        }
-                    )
-
-                # Tool calls → function_call items
-                for tc in msg.get("tool_calls") or []:
-                    func = tc.get("function", {})
-                    items.append(
-                        {
-                            "type": "function_call",
-                            "call_id": tc.get("id", ""),
-                            "name": func.get("name", ""),
-                            "arguments": func.get("arguments", ""),
-                        }
-                    )
 
             elif role == "tool":
                 # Tool result → function_call_output
@@ -429,7 +385,10 @@ class OpenAIResponsesProvider:
         caps = capabilities or self.get_capabilities(model)
 
         instructions, input_items = self._convert_messages(
-            messages, replay_reasoning_to_model=replay_reasoning_to_model
+            messages,
+            replay_reasoning_to_model=replay_reasoning_to_model,
+            supports_mid_conversation_system=caps.supports_mid_conversation_system,
+            native_producer=self.provider_name,
         )
         tools = apply_tool_search(caps, tools, deferred_names)
         converted_tools = self._convert_tools(tools, caps)
@@ -952,6 +911,96 @@ class OpenAIResponsesProvider:
                     if isinstance(text, str) and text:
                         parts.append(text)
         return _join_reasoning_with_cap(parts)
+
+
+def _assistant_items_for_input(
+    message: dict[str, Any],
+    native: list[dict[str, Any]],
+    *,
+    replay_reasoning_to_model: bool,
+) -> list[dict[str, Any]]:
+    """Recover native message phases/order only while canonical history agrees.
+
+    A Turn joins all output messages into one text field. Native blocks retain
+    their boundaries, but may predate edits, fence neutralization, or call repair.
+    Match the text and call IDs before using that layout, and always construct
+    calls from the lowered canonical fields. An ambiguous layout falls back to
+    canonical text/calls with no guessed phase, plus the existing reasoning replay.
+    """
+    content = message.get("content")
+    calls = [
+        {
+            "type": "function_call",
+            "call_id": tc.get("id", ""),
+            "name": tc.get("function", {}).get("name", ""),
+            "arguments": tc.get("function", {}).get("arguments", ""),
+        }
+        for tc in message.get("tool_calls") or []
+    ]
+    reasoning: list[dict[str, Any]] = []
+    ordered: list[dict[str, Any]] = []
+    text_items: list[dict[str, Any]] = []
+    native_call_ids: list[str] = []
+    annotations: list[Any] = []
+    valid_layout = isinstance(content, str)
+    for block in native:
+        kind = block.get("type")
+        if kind == "reasoning" and replay_reasoning_to_model:
+            item = _reasoning_item_for_input(block)
+            if item is not None:
+                reasoning.append(item)
+                ordered.append(item)
+        elif kind == "function_call":
+            if len(native_call_ids) < len(calls):
+                ordered.append(calls[len(native_call_ids)])
+            native_call_ids.append(block.get("call_id", ""))
+        elif kind == "message":
+            parts = block.get("content")
+            if block.get("role") != "assistant" or not isinstance(parts, list):
+                valid_layout = False
+                continue
+            texts: list[str] = []
+            for part in parts:
+                if not isinstance(part, dict):
+                    valid_layout = False
+                elif part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+                    annotations.extend(
+                        SimpleNamespace(**ann)
+                        for ann in part.get("annotations") or []
+                        if isinstance(ann, dict)
+                    )
+                elif part.get("type") == "refusal" and isinstance(part.get("refusal"), str):
+                    texts.append(format_refusal(part["refusal"]))
+                else:
+                    valid_layout = False
+            text = "".join(texts)
+            if text:
+                projected = {"type": "message", "role": "assistant", "content": text}
+                if block.get("phase") in ("commentary", "final_answer"):
+                    projected["phase"] = block["phase"]
+                text_items.append(projected)
+                ordered.append(projected)
+        # Hosted tool output remains omitted, as on the legacy replay path.
+
+    if valid_layout and text_items and native_call_ids == [call["call_id"] for call in calls]:
+        native_text = "".join(item["content"] for item in text_items)
+        if content == native_text:
+            return ordered
+        # Streaming appends a deduplicated citation footer to the canonical text.
+        # Recognize that exact transform; an arbitrary appended edit is ambiguous.
+        footer = format_citations("", annotations).strip()
+        if (
+            footer
+            and folds_trailing_info(native_text)
+            and content == native_text + TRAILING_INFO_SEPARATOR + footer
+        ):
+            text_items[-1]["content"] += TRAILING_INFO_SEPARATOR + footer
+            return ordered
+
+    if content:
+        reasoning.append({"type": "message", "role": "assistant", "content": content})
+    return reasoning + calls
 
 
 def _reasoning_item_for_input(stored: dict[str, Any]) -> dict[str, Any] | None:

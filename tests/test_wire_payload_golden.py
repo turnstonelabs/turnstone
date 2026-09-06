@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from tests._wire_capture import RecordingClient
-from turnstone.core.lowering import repair_wire_messages
+from turnstone.core.lowering import fold_system_turns, repair_wire_messages
 from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._google import GoogleProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
@@ -359,3 +359,105 @@ def test_wire_payload_openai_verbosity_pro() -> None:
     assert payload["text"] == {"verbosity": "low"}
     assert payload["reasoning"] == {"effort": "high", "mode": "pro"}
     _assert_golden("openai_responses_verbosity_pro__text", payload)
+
+
+def test_wire_payload_openai_astra_operator_system() -> None:
+    """Astra keeps the base prompt stable and operator instructions in place."""
+    provider = OpenAIResponsesProvider()
+    caps = provider.get_capabilities("gpt-6-astra")
+    messages = fold_system_turns(
+        [{"role": "system", "content": "You are a helpful assistant."}, *FIX_OPERATOR_SYSTEM],
+        supports_mid_conversation_system=caps.supports_mid_conversation_system,
+        nonce="testnonce",
+    )
+    payload = _capture(
+        provider,
+        model="gpt-6-astra",
+        messages=messages,
+        caps=caps,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "deploy",
+                    "description": "Deploy the application.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        temperature=0.7,
+        reasoning_effort="max",
+    )
+    assert payload["instructions"] == "You are a helpful assistant."
+    assert payload["input"][3] == {
+        "type": "message",
+        "role": "system",
+        "content": "Output-guard: deploy output looked clean.",
+    }
+    assert "temperature" not in payload
+    _assert_golden("openai_responses_astra__operator_system", payload)
+
+
+def test_wire_payload_openai_astra_phased_replay() -> None:
+    """Native phases/order coexist with tool results and inline instructions."""
+    provider = OpenAIResponsesProvider()
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Check deployment status."},
+        {
+            "role": "assistant",
+            "content": "Checking. The check is running.",
+            "tool_calls": [
+                {"id": "call_status", "function": {"name": "status", "arguments": "{}"}}
+            ],
+            "_producer": "openai",
+            "_provider_content": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "Checking.", "annotations": []}],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_status",
+                    "summary": [],
+                    "encrypted_content": "opaque-status",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_status",
+                    "name": "status",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [
+                        {"type": "output_text", "text": " The check is running.", "annotations": []}
+                    ],
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_status", "content": "Healthy"},
+        {"role": "system", "content": "Output-guard: status output looked clean."},
+        {"role": "user", "content": "Summarize the result."},
+    ]
+    payload = _capture(
+        provider,
+        model="gpt-6-astra",
+        messages=fold_system_turns(
+            messages, supports_mid_conversation_system=True, nonce="testnonce"
+        ),
+        reasoning_effort="max",
+        replay_reasoning_to_model=True,
+        tools=[
+            {"type": "function", "function": {"name": "status", "parameters": {"type": "object"}}}
+        ],
+    )
+    assert [item["phase"] for item in payload["input"] if "phase" in item] == [
+        "commentary",
+        "final_answer",
+    ]
+    _assert_golden("openai_responses_astra__phased_replay", payload)

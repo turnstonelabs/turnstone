@@ -1,0 +1,56 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "Run the deploy.",
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "arguments": "{}",
+      "call_id": "call_1",
+      "name": "deploy",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call_1",
+      "output": "deployed",
+      "type": "function_call_output"
+    },
+    {
+      "content": "Output-guard: deploy output looked clean.",
+      "role": "system",
+      "type": "message"
+    },
+    {
+      "content": "Great, what's next?",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "instructions": "You are a helpful assistant.",
+  "max_output_tokens": 4096,
+  "model": "gpt-6-astra",
+  "prompt_cache_options": {
+    "ttl": "30m"
+  },
+  "reasoning": {
+    "effort": "max"
+  },
+  "store": false,
+  "stream": true,
+  "tools": [
+    {
+      "description": "Deploy the application.",
+      "name": "deploy",
+      "parameters": {
+        "properties": {},
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    }
+  ]
+}

@@ -8810,7 +8810,7 @@ class ChatSession:
         models get each turn wrapped as a nonce-delimited
         ``[start system-reminder]`` block on the preceding turn; native
         mid-conversation-system models (rows with the capability flag)
-        keep them inline for the Anthropic converter to emit as real
+        keep them inline for the provider converter to emit as real
         ``system`` messages.
 
         Messages without a foldable system turn pass through unchanged

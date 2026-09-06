@@ -403,7 +403,7 @@ def fold_system_turns(
     before folding so it can never defang a real fence appended here.
 
     Native models (*supports_mid_conversation_system*) keep the turns inline —
-    the Anthropic converter emits them as real ``system`` messages.  Base-prompt
+    the provider converter emits them as real ``system`` messages.  Base-prompt
     system messages (no ``_source``) pass through.  Consecutive operator turns
     fold onto the shared predecessor in order, so the wire never carries two
     adjacent ``system`` messages.  An operator turn with no predecessor (should

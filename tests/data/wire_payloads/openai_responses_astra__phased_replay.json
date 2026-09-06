@@ -1,0 +1,73 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "Check deployment status.",
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "content": "Checking.",
+      "phase": "commentary",
+      "role": "assistant",
+      "type": "message"
+    },
+    {
+      "encrypted_content": "opaque-status",
+      "id": "rs_status",
+      "summary": [],
+      "type": "reasoning"
+    },
+    {
+      "arguments": "{}",
+      "call_id": "call_status",
+      "name": "status",
+      "type": "function_call"
+    },
+    {
+      "content": " The check is running.",
+      "phase": "final_answer",
+      "role": "assistant",
+      "type": "message"
+    },
+    {
+      "call_id": "call_status",
+      "output": "Healthy",
+      "type": "function_call_output"
+    },
+    {
+      "content": "Output-guard: status output looked clean.",
+      "role": "system",
+      "type": "message"
+    },
+    {
+      "content": "Summarize the result.",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "instructions": "You are a helpful assistant.",
+  "max_output_tokens": 4096,
+  "model": "gpt-6-astra",
+  "prompt_cache_options": {
+    "ttl": "30m"
+  },
+  "reasoning": {
+    "effort": "max"
+  },
+  "store": false,
+  "stream": true,
+  "tools": [
+    {
+      "description": "",
+      "name": "status",
+      "parameters": {
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    }
+  ]
+}

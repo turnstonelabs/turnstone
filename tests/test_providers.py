@@ -4933,7 +4933,9 @@ class TestOpenAIPromptCaching:
     def setup_method(self) -> None:
         self.provider = OpenAIProvider()
 
-    @pytest.mark.parametrize("model", ("gpt-5.5-local-lora", "gpt-5.6-local-lora"))
+    @pytest.mark.parametrize(
+        "model", ("gpt-5.5-local-lora", "gpt-5.6-local-lora", "gpt-6-astra-local-lora")
+    )
     def test_chat_compat_streaming_omits_commercial_cache_params(self, model: str) -> None:
         """A local model name must not activate commercial OpenAI cache controls."""
         client = MagicMock()
@@ -5639,7 +5641,7 @@ class TestResponsesParamBuilding:
 
     def test_compat_responses_omits_commercial_cache_params(self) -> None:
         provider = type(self.provider)(compat=True)
-        for model in ("gpt-5.5-local-lora", "gpt-5.6-local-lora"):
+        for model in ("gpt-5.5-local-lora", "gpt-5.6-local-lora", "gpt-6-astra-local-lora"):
             kwargs = provider._build_kwargs(
                 model=model,
                 messages=[{"role": "user", "content": "Hi"}],
