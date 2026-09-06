@@ -7206,12 +7206,15 @@ class MCPClientManager:
             self._static_session_op(server_name, session.call_tool(original_name, arguments)),
             self._loop,
         )
+        # exception() waits without raising the operation's own TimeoutError.
+        # Only expiry of the caller's wait is neutral for server health.
         try:
-            result = future.result(timeout=timeout)
+            future.exception(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
-            self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP tool call timed out after {timeout}s") from None
+        try:
+            result = future.result()
         except Exception as exc:
             self._record_and_evict_on_dead_transport(server_name, exc)
             raise
@@ -7614,12 +7617,14 @@ class MCPClientManager:
             ),
             self._loop,
         )
+        # Async dispatch accounts for operation failures; local expiry can
+        # mean waiting for the pool lock without ever contacting the server.
         try:
-            return future.result(timeout=timeout)
+            future.exception(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
-            self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP tool call timed out after {original_timeout}s") from None
+        return future.result()
 
     def _dispatch_pool_resource_sync(
         self,
@@ -7706,11 +7711,11 @@ class MCPClientManager:
             self._loop,
         )
         try:
-            return future.result(timeout=timeout)
+            future.exception(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
-            self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP resource read timed out after {original_timeout}s") from None
+        return future.result()
 
     def _dispatch_pool_prompt_sync(
         self,
@@ -7801,13 +7806,13 @@ class MCPClientManager:
             self._loop,
         )
         try:
-            return future.result(timeout=timeout)
+            future.exception(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
-            self._cb_record_failure(server_name)
             raise TimeoutError(
                 f"MCP prompt retrieval timed out after {original_timeout}s"
             ) from None
+        return future.result()
 
     async def _dispatch_pool(
         self,
@@ -7897,6 +7902,10 @@ class MCPClientManager:
                 original_name=original_name,
                 arguments=arguments,
             )
+        except asyncio.CancelledError:
+            # A cancelled lock waiter has not owned this carrier; it may
+            # describe the active caller's auth failure. Never retry or evict.
+            raise
         except BaseException as exc:
             classification = self._classify_failure(exc, capture=capture)
             if classification == "auth_401":
@@ -8035,6 +8044,9 @@ class MCPClientManager:
                 access_token=access_token,
                 sdk_call=lambda s: s.read_resource(uri),
             )
+        except asyncio.CancelledError:
+            # Cancellation precedes shared-carrier auth handling; see _dispatch_pool.
+            raise
         except BaseException as exc:
             classification = self._classify_failure(exc, capture=capture)
             if classification == "auth_401":
@@ -8158,6 +8170,9 @@ class MCPClientManager:
                 access_token=access_token,
                 sdk_call=lambda s: s.get_prompt(original_name, arguments=arguments),
             )
+        except asyncio.CancelledError:
+            # Cancellation precedes shared-carrier auth handling; see _dispatch_pool.
+            raise
         except BaseException as exc:
             classification = self._classify_failure(exc, capture=capture)
             if classification == "auth_401":
@@ -8869,11 +8884,12 @@ class MCPClientManager:
             self._static_session_op(server_name, session.read_resource(uri)), self._loop
         )
         try:
-            result = future.result(timeout=timeout)
+            future.exception(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
-            self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP resource read timed out after {timeout}s") from None
+        try:
+            result = future.result()
         except Exception as exc:
             self._record_and_evict_on_dead_transport(server_name, exc)
             raise
@@ -8966,11 +8982,12 @@ class MCPClientManager:
             self._loop,
         )
         try:
-            result = future.result(timeout=timeout)
+            future.exception(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
-            self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP prompt retrieval timed out after {timeout}s") from None
+        try:
+            result = future.result()
         except Exception as exc:
             self._record_and_evict_on_dead_transport(server_name, exc)
             raise

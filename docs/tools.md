@@ -818,6 +818,15 @@ MCP-compatible service.
    generic approval preview and `_exec_mcp_tool()` calls `MCPClientManager.call_tool_sync()`,
    which dispatches the call to the background asyncio event loop.
 
+   If the caller's timeout expires, turnstone cancels its local wait without changing
+   the server's circuit-breaker failure count. This also applies to resource reads,
+   prompt retrievals, and calls still waiting for a per-user session lock. Observed
+   transport failures still count. Static reconnection precedes the operation timeout;
+   per-user calls include token lookup, connection, and lock waiting in their budget.
+   A timeout does not confirm remote cancellation: the server may continue working,
+   and timed-out tool calls retain an unknown outcome. A connected server that never
+   answers can continue to consume each caller's timeout budget.
+
 ### Approval behavior
 
 MCP tools **require user approval by default** (`needs_approval: True`). turnstone

@@ -2840,7 +2840,7 @@ class TestFutureCancellation:
     def test_call_tool_sync_cancels_future_on_timeout(self):
         mgr = self._make_manager_with_session()
         mock_future = MagicMock()
-        mock_future.result.side_effect = concurrent.futures.TimeoutError()
+        mock_future.exception.side_effect = concurrent.futures.TimeoutError()
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(TimeoutError, match="timed out"),
@@ -2851,7 +2851,7 @@ class TestFutureCancellation:
     def test_read_resource_sync_cancels_future_on_timeout(self):
         mgr = self._make_manager_with_session()
         mock_future = MagicMock()
-        mock_future.result.side_effect = concurrent.futures.TimeoutError()
+        mock_future.exception.side_effect = concurrent.futures.TimeoutError()
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(TimeoutError, match="timed out"),
@@ -2862,7 +2862,7 @@ class TestFutureCancellation:
     def test_get_prompt_sync_cancels_future_on_timeout(self):
         mgr = self._make_manager_with_session()
         mock_future = MagicMock()
-        mock_future.result.side_effect = concurrent.futures.TimeoutError()
+        mock_future.exception.side_effect = concurrent.futures.TimeoutError()
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(TimeoutError, match="timed out"),
@@ -2992,21 +2992,23 @@ class TestCircuitBreaker:
         assert "srv" not in mgr._circuit_open_until
         assert "srv" not in mgr._circuit_trip_count
 
-    def test_call_tool_sync_records_failure_on_timeout(self):
+    def test_call_tool_sync_preserves_failure_count_on_caller_timeout(self):
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
         mock_session.call_tool = MagicMock(return_value="sentinel")
         _seed_static_state(mgr, "test", session=mock_session)
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
+        mgr._consecutive_failures["test"] = 2
         mock_future = MagicMock()
-        mock_future.result.side_effect = concurrent.futures.TimeoutError()
+        mock_future.exception.side_effect = concurrent.futures.TimeoutError()
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(TimeoutError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=1)
-        assert mgr._consecutive_failures.get("test", 0) == 1
+        assert mgr._consecutive_failures["test"] == 2
+        assert "test" not in mgr._circuit_open_until
 
     def test_call_tool_sync_records_success(self):
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})

@@ -1198,7 +1198,7 @@ class TestCrossTaskRetryIsolation:
 
 
 class TestRetryTimeoutBudget:
-    """The retry's ``future.result(timeout=...)`` window MUST be reduced
+    """The retry's synchronous wait window MUST be reduced
     by however long the first attempt consumed before raising
     ``_PoolDispatchRetryRequested``.
 
@@ -1219,7 +1219,7 @@ class TestRetryTimeoutBudget:
         self, running_loop_mgr, storage: SQLiteBackend
     ) -> None:
         """First attempt sleeps ~1s before raising the retry signal; the
-        second attempt's ``future.result(timeout=...)`` MUST receive a
+        second attempt's synchronous wait MUST receive a
         value strictly less than the original ``timeout``.
         """
         from turnstone.core.mcp_client import _PoolDispatchRetryRequested
