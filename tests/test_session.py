@@ -10807,7 +10807,7 @@ class TestUserAdvisoryCancelClear:
 
     def test_unexpected_exception_clears_user_advisory_buffer(self, tmp_db):
         session = _make_session()
-        session._queue_user_advisory("resume", "leftover")
+        session._queue_user_advisory("completion", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
             patch.object(session, "_stream_response", side_effect=RuntimeError("boom")),
@@ -10979,7 +10979,7 @@ class TestDeliverWakeNudge:
     def test_marks_source_tag_on_synthesized_user_msg(self, tmp_db):
         session = _make_session()
         session._title_generated = True
-        session._queue_user_advisory("denial", "leftover")
+        session._nudge_queue.enqueue("idle_children", "leftover", "any")
         with (
             patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
@@ -10996,7 +10996,7 @@ class TestDeliverWakeNudge:
     def test_clears_wake_tag_after_success(self, tmp_db):
         session = _make_session()
         session._title_generated = True
-        session._queue_user_advisory("denial", "x")
+        session._nudge_queue.enqueue("idle_children", "x", "any")
         with (
             patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
@@ -11021,9 +11021,9 @@ class TestDeliverWakeNudge:
         """
         session = _make_session()
         session._title_generated = True
-        # NUDGE_DENIAL contains "don't modify that file" — would match
-        # the strong-correction `\bdon'?t\b` pattern if re-detected.
-        session._queue_user_advisory("denial", "don't do that next time")
+        # The body contains "don't" — would match the strong-correction
+        # `\bdon'?t\b` pattern if re-detected.
+        session._nudge_queue.enqueue("idle_children", "don't do that next time", "any")
         # Force enough memory + message context that should_nudge would
         # otherwise fire a fresh correction nudge.
         session.messages.append(turn_from_dict({"role": "user", "content": "earlier"}))
@@ -11037,8 +11037,8 @@ class TestDeliverWakeNudge:
         ):
             session.deliver_wake_nudge_from_queue()
         # No fresh correction entry was enqueued during the wake send.
-        # (The original `denial` entry was drained as the wake's
-        # _reminders payload, not re-queued.)
+        # (The original entry was drained onto the wake turn, not
+        # re-queued.)
         assert all(t != "correction" for t, _ in _user_pending(session))
 
     def test_flushed_user_msg_during_wake_does_not_inherit_source_tag(self, tmp_db):
@@ -11105,7 +11105,7 @@ class TestDeliverWakeNudge:
         still cleared by the ``finally`` block.
         """
         session = _make_session()
-        session._queue_user_advisory("denial", "leftover")
+        session._nudge_queue.enqueue("idle_children", "leftover", "any")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
             patch.object(session, "_stream_response", side_effect=RuntimeError("boom")),
@@ -11115,7 +11115,9 @@ class TestDeliverWakeNudge:
         # The nudge system turn landed and stays (persistent history).
         msgs = dicts_from_turns(session.messages)
         sys_turns = [m for m in msgs if m.get("role") == "system"]
-        assert any(m["_source"] == "denial" and m["content"] == "leftover" for m in sys_turns)
+        assert any(
+            m["_source"] == "idle_children" and m["content"] == "leftover" for m in sys_turns
+        )
         # No legacy delivered flag anywhere.
         assert all("_reminders_delivered" not in m for m in msgs)
         # Wake tag cleared even on exception (finally block).
@@ -11131,7 +11133,7 @@ class TestDeliverWakeNudge:
 
         session = _make_registered_session()
         session._title_generated = True
-        session._queue_user_advisory("denial", "leftover")
+        session._nudge_queue.enqueue("idle_children", "leftover", "any")
         with (
             patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
@@ -11157,7 +11159,7 @@ class TestDeliverWakeNudge:
 
         session = _make_registered_session()
         session._title_generated = True
-        session._queue_user_advisory("denial", "do not do that")
+        session._nudge_queue.enqueue("idle_children", "do not do that", "any")
         with (
             patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
@@ -11168,7 +11170,9 @@ class TestDeliverWakeNudge:
         ):
             session.deliver_wake_nudge_from_queue()
         rows = get_storage().load_messages(session._ws_id)
-        sys_rows = [r for r in rows if r.get("role") == "system" and r.get("_source") == "denial"]
+        sys_rows = [
+            r for r in rows if r.get("role") == "system" and r.get("_source") == "idle_children"
+        ]
         assert len(sys_rows) == 1
         assert sys_rows[0]["content"] == "do not do that"
 
@@ -13971,3 +13975,69 @@ class TestWhitespaceOnlyBlanknessGates:
             {"call_id": "wf3", "url": "https://example.com/x", "question": "What?"}
         )
         assert answer == "Error: extraction returned no answer"
+
+
+class TestResumeQueuesNoWakeEligibleNudge:
+    """Reopening a workstream must not queue anything the idle wake could
+    deliver on a synthetic empty turn.
+
+    The retired ``resume`` nudge was queued on the ``"user"`` channel from
+    inside :meth:`ChatSession.resume` — outside any send — and ``"user"``
+    was wake-eligible, so the post-reopen IDLE transition spawned a wake
+    whose empty turn held the worker slot while the user's real message
+    arrived, pushing that message into the next tool seam as a mid-turn
+    interjection.  Two pins: ``resume`` leaves the queue empty, and a
+    ``"user"`` entry never arms the wake gate.
+    """
+
+    def test_resume_leaves_nudge_queue_empty(self, tmp_db):
+        from turnstone.core.nudge_queue import WAKE_PENDING
+
+        first = _make_registered_session()
+        first._title_generated = True
+        with (
+            patch.object(first, "_stream_response", return_value=make_result("ok")),
+            patch.object(first, "_visible_memory_count", return_value=0),
+            patch.object(first, "_emit_state"),
+            patch.object(first, "_print_status_line"),
+            patch.object(first, "_update_token_table"),
+        ):
+            first.send("hello")
+
+        second = _make_session()
+        with patch.object(second, "_visible_memory_count", return_value=3):
+            assert second.resume(first._ws_id) is True
+        assert second._nudge_queue.pending() == []
+        assert not second._nudge_queue.has_pending(WAKE_PENDING)
+
+    def test_user_channel_advisory_never_arms_the_wake_gate(self, tmp_db):
+        from turnstone.core.nudge_queue import USER_DRAIN, WAKE_PENDING
+
+        session = _make_session()
+        session._queue_user_advisory("correction", "watch your step")
+        assert not session._nudge_queue.has_pending(WAKE_PENDING)
+        assert [t for t, _x, _m in session._nudge_queue.drain(USER_DRAIN)] == ["correction"]
+
+    def test_wake_leaves_user_channel_entry_for_the_next_real_turn(self, tmp_db):
+        """A wake earned by an external event does not carry a co-queued
+        user-channel advisory along: the wake drains only the wake-eligible
+        channels, and the advisory waits for the user's next real turn."""
+        from turnstone.core.nudge_queue import WAKE_PENDING
+
+        session = _make_registered_session()
+        session._title_generated = True
+        session._queue_user_advisory("correction", "watch your step")
+        session._nudge_queue.enqueue("watch_triggered", "ci went red", "any")
+        with (
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_visible_memory_count", return_value=0),
+        ):
+            session.deliver_wake_nudge_from_queue()
+        sources = [t.source for t in session.messages if t.role is Role.SYSTEM]
+        assert sources == ["watch_triggered"]
+        assert session._nudge_queue.pending(channel="user") == [("correction", "watch your step")]
+        assert not session._nudge_queue.has_pending(WAKE_PENDING)

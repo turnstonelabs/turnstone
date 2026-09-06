@@ -118,7 +118,6 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
         "skill_hint",
         "correction",
         "denial",
-        "resume",
         "completion",
         "tool_error",
         "repeat",

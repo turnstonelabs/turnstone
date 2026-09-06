@@ -95,9 +95,9 @@ def wake_workstream_if_pending(
       retracted).  See the predicate's docstring for the staleness
       argument.
     * nothing gate-eligible under ``WAKE_PENDING`` and no compatible
-      interjection claimed by the worker-exit backstop — tool-only/quiet
-      entries belong to the next tool-result seam, not a synthetic empty user
-      turn (``deliver_wake_nudge_from_queue`` would no-op on them).
+      interjection claimed by the worker-exit backstop — tool-only, user-only
+      and quiet entries belong to their next real seam, not a synthetic empty
+      user turn (``deliver_wake_nudge_from_queue`` would no-op on them).
       ``"wake"``-channel entries (the coordinator idle nudges) ARE
       gate-eligible: the wake is the only seam that can deliver them.  The
       interjection claim is session-owned and lock-safe; it refuses budget,
@@ -216,12 +216,12 @@ class IdleNudgeWatcher:
     :func:`wake_workstream_if_pending` (the shared gate — see its
     docstring for the full gate order).  If the workstream's
     :class:`NudgeQueue` has any drainable entry for the wake's drain
-    gate (``WAKE_PENDING`` — channels ``"user"``, ``"any"`` or
-    ``"wake"``), the gate dispatches via ``session_worker.send`` with a
-    no-op ``enqueue`` callback.  Tool-only entries don't fire the wake —
-    they belong to the next tool-result seam, not a synthetic empty
-    user turn — otherwise every IDLE event with a queued tool advisory
-    would spawn a wake daemon that immediately no-ops at
+    gate (``WAKE_PENDING`` — channels ``"any"`` or ``"wake"``), the gate
+    dispatches via ``session_worker.send`` with a no-op ``enqueue``
+    callback.  Tool-only and user-only entries don't fire the wake —
+    they belong to the next tool-result or user seam, not a synthetic
+    empty user turn — otherwise every IDLE event with a queued tool
+    advisory would spawn a wake daemon that immediately no-ops at
     ``deliver_wake_nudge_from_queue``'s drain guard.
 
     This watcher only covers nudges that are already queued when the

@@ -22,7 +22,6 @@ from turnstone.core.metacognition import (
     NUDGE_IDLE_TASKS_WAIT_SLOT,
     NUDGE_REPEAT,
     NUDGE_REQUIRED_TOOL,
-    NUDGE_RESUME,
     NUDGE_TOOL_ERROR,
     RepeatDetector,
     detect_completion,
@@ -244,14 +243,14 @@ class TestShouldNudge:
         state: dict[str, float] = {}
         assert should_nudge("correction", state, message_count=1, memory_count=0) is False
 
-    def test_resume_requires_memories(self):
-        state: dict[str, float] = {}
-        assert should_nudge("resume", state, message_count=5, memory_count=0) is False
-        assert should_nudge("resume", state, message_count=5, memory_count=3) is True
+    def test_no_type_fires_on_first_message(self):
+        """Every registered type is a live-conversation heuristic: none
+        fires on the first message, memories or not."""
+        from turnstone.core.metacognition import _NUDGE_MAP
 
-    def test_resume_allowed_on_first_message(self):
-        state: dict[str, float] = {}
-        assert should_nudge("resume", state, message_count=1, memory_count=3) is True
+        for nudge_type in _NUDGE_MAP:
+            state: dict[str, float] = {}
+            assert should_nudge(nudge_type, state, message_count=1, memory_count=3) is False
 
     def test_invalid_type(self):
         state: dict[str, float] = {}
@@ -264,9 +263,6 @@ class TestFormatNudge:
 
     def test_denial(self):
         assert format_nudge("denial") == NUDGE_DENIAL
-
-    def test_resume(self):
-        assert format_nudge("resume") == NUDGE_RESUME
 
     def test_completion(self):
         assert format_nudge("completion") == NUDGE_COMPLETION

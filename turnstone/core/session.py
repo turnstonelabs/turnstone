@@ -7137,14 +7137,6 @@ class ChatSession:
                 message_count=len(self.messages),
             )
 
-        if self._nudges_enabled("resume") and should_nudge(
-            "resume",
-            self._metacog_state,
-            message_count=len(self.messages),
-            memory_count=self._visible_memory_count(),
-            cooldown_secs=self._mem_cfg.nudge_cooldown,
-        ):
-            self._queue_user_advisory("resume", format_nudge("resume"))
         if not fork:
             self._follow_watch_registration(old_ws_id)
         self._init_system_messages()
@@ -20504,9 +20496,14 @@ class ChatSession:
         Drains in ``_emit_pending_user_nudges`` and is appended as a
         first-class ``{"role": "system"}`` turn AFTER the user turn.  Used
         for nudges that respond to the user's message: ``correction``,
-        ``resume``, ``completion``. (``denial`` is user
-        behaviour too, but it responds to a specific TOOL BATCH — it
-        rides the tool channel so it lands with the denied results.)
+        ``completion``. (``denial`` is user behaviour too, but it responds
+        to a specific TOOL BATCH — it rides the tool channel so it lands
+        with the denied results.)
+
+        Every caller runs inside the send that drains the entry: the
+        ``"user"`` channel is not wake-eligible (``WAKE_PENDING``), so an
+        entry queued here can never manufacture a synthetic user turn of
+        its own — it waits for the user's real one.
 
         No-ops while the session is inside a wake-driven turn
         (``_wake_source_tag`` set) so model behaviour during the wake
@@ -20536,9 +20533,8 @@ class ChatSession:
         the system turns sit after the user turn they advise (uniform attach
         rule).  Each drained nudge becomes one ``{"role": "system",
         "_source": <nudge_type>, ...}`` turn via :meth:`_append_system_turn`
-        — the source is the nudge type (``correction`` / ``resume`` /
-        ``completion`` / ``idle_children`` /
-        ``watch_triggered``) and any optional metadata (e.g.
+        — the source is the nudge type (``correction`` / ``completion`` /
+        ``idle_children`` / ``watch_triggered``) and any optional metadata (e.g.
         ``watch_triggered``'s ``watch_name``) rides as sibling keys.
         ``_append_system_turn`` persists each row and fires the live
         ``on_system_turn`` SSE hook so reconnecting / multi-tab consumers
@@ -20855,26 +20851,24 @@ class ChatSession:
                 # ``requeue`` keeps seq (a re-queued poll-4 still renders
                 # before poll-5 on the retry) and the ``valid_until``
                 # predicate (a stale notice stays droppable), while quiet
-                # keeps the entry OUT of the wake gate.  A ``"user"``
-                # advisory is deliberately DROPPED instead: re-queueing it
-                # wake-eligible re-arms ``_retry_pending_wake``'s zero-
-                # backoff worker-exit gate — a repeatable pre-consumption
-                # send failure would respawn wake workers in an unbounded
-                # hot loop (persisting an orphan synthetic user turn per
-                # spin).  Losing a generation-scoped metacog hint on a
-                # rare failed wake is the strictly smaller harm.  A
-                # ``"wake"``-channel idle nudge is DROPPED for the union
-                # of both reasons: quiet would deliver it at the user/tool
-                # seams its channel exists to be invisible to, and
-                # re-queueing it wake-eligible is the same hot loop as the
-                # ``"user"`` case.  Dropping a charged entry is this
+                # keeps the entry OUT of the wake gate.  A
+                # ``"wake"``-channel idle nudge is DROPPED instead, for two
+                # reasons: quiet would deliver it at the user/tool seams
+                # its channel exists to be invisible to, and re-queueing it
+                # wake-eligible would re-arm ``_retry_pending_wake``'s
+                # zero-backoff worker-exit gate — a repeatable
+                # pre-consumption send failure would respawn wake workers
+                # in an unbounded hot loop (persisting an orphan synthetic
+                # user turn per spin).  Dropping a charged entry is this
                 # class's standing fail-closed price; the next genuine
-                # idle bracket re-derives it over fresh reads.
+                # idle bracket re-derives it over fresh reads.  (The wake
+                # drains only ``WAKE_PENDING`` and ``QUIET_DRAIN``, so a
+                # ``"user"`` entry never reaches this arm.)
                 for reminder in undelivered:
                     recovered = entry_by_reminder.get(id(reminder))
                     if recovered is None or not recovered.text:
                         continue
-                    if recovered.channel in ("user", WAKE_CHANNEL):
+                    if recovered.channel == WAKE_CHANNEL:
                         log.debug(
                             "wake_nudge.advisory_dropped ws=%s type=%s channel=%s",
                             self._ws_id[:8],

@@ -588,10 +588,12 @@ def test_failed_wake_preserves_chronology_and_stays_wake_quiescent(session, monk
     """Failed-wake recovery invariants: (a) the re-queued external notice
     keeps its seq, so the retry renders it BEFORE a newer event that
     arrived during the failure; (b) NOTHING wake-eligible remains after
-    the failure — external notices demote to quiet and user-channel
-    advisories are dropped outright, because a re-armed WAKE_PENDING gate
-    plus the zero-backoff worker-exit retry would respawn wake workers in
-    an unbounded hot loop against a persistent failure."""
+    the failure — external notices demote to quiet, because a re-armed
+    WAKE_PENDING gate plus the zero-backoff worker-exit retry would
+    respawn wake workers in an unbounded hot loop against a persistent
+    failure.  A user-channel advisory is not the wake's to deliver at
+    all: it is never drained by the wake and stays queued for the user's
+    next real turn."""
     from turnstone.core.nudge_queue import WAKE_PENDING
 
     calls = {"n": 0}
@@ -614,6 +616,9 @@ def test_failed_wake_preserves_chronology_and_stays_wake_quiescent(session, monk
         "a failed wake must not leave wake-eligible entries (respawn hot loop)"
     )
     assert [t for t, _x in session._nudge_queue.pending(channel="quiet")] == ["watch_triggered"]
+    # The user-channel advisory was never the wake's: still queued for the
+    # user seam, untouched by the failure.
+    assert session._nudge_queue.pending(channel="user") == [("correction", "user advisory")]
     # A NEWER event lands after the failure...
     session._nudge_queue.enqueue("watch_triggered", "poll-5", "any")
     session.deliver_wake_nudge_from_queue()

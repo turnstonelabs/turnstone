@@ -537,7 +537,7 @@ def test_retry_walk_skips_operator_context_cards() -> None:
 
 def test_operator_nudge_labels_use_shared_helper() -> None:
     """Operator-context nudge bubbles collapse the metacognition nudge types
-    (including legacy persisted start turns) to one
+    (including legacy persisted start / resume turns) to one
     'metacognition' category via the shared ``utils.js`` ``operatorSourceLabel``
     helper rather than leaking the raw ``_source`` (the 'operator · start'
     regression).  Both panes call the one helper so they can't drift."""

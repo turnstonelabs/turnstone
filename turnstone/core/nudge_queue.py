@@ -11,7 +11,12 @@ the same queue with an explicit ``channel``; consumers
 each drained nudge as a first-class ``{"role": "system"}`` turn.
 
 Channels:
-    * ``"user"`` — only drains at user-turn seams.
+    * ``"user"`` — only drains at user-turn seams, and never justifies
+      one: every producer enqueues inside the send that drains the entry
+      (or a cancel path clears it), so the channel is NOT a member of
+      :data:`WAKE_PENDING`.  A synthetic empty turn manufactured to
+      deliver a user-turn advisory would race the user's own message
+      into the mid-turn interjection seam.
     * ``"tool"`` — only drains at tool-result seams.
     * ``"any"``  — drains at whichever seam fires first (used for
       wake-trigger-driven nudges that should not be pinned to a
@@ -66,10 +71,14 @@ TOOL_DRAIN: frozenset[str] = frozenset({"tool", "any", "quiet"})
 # The idle-wake GATE (``IdleNudgeWatcher``): which pending channels justify
 # waking an idle workstream.  Deliberately excludes ``"quiet"`` — entries a
 # user cancel demoted must ride the next legitimate seam/wake, never cause
-# one, or Stop is followed seconds later by an autonomous resume.
+# one, or Stop is followed seconds later by an autonomous resume.  Likewise
+# excludes ``"user"`` — those entries advise the user's OWN turn and are
+# queued inside the send that drains them; a wake spent delivering one on a
+# synthetic empty turn would race the user's real message into the
+# interjection seam (the retired resume nudge did exactly that on reopen).
 # ``"wake"`` is a member here and NOWHERE else: the wake is both the only
 # seam that may deliver those entries and a seam they justify.
-WAKE_PENDING: frozenset[str] = frozenset({"user", "any", "wake"})
+WAKE_PENDING: frozenset[str] = frozenset({"any", "wake"})
 # The wake-only channel, named once: the idle-nudge producer's enqueue
 # target, the abandoned-generation drop set (dropped, never demoted — see
 # the channel table above), and the interjection handoff's drop set.

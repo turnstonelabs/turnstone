@@ -130,7 +130,7 @@ class TestLenAndClear:
         # Metadata and valid_until ride the demotion; USER_DRAIN delivers.
         from turnstone.core.nudge_queue import USER_DRAIN, WAKE_PENDING
 
-        assert not q.has_pending(WAKE_PENDING - {"user"})  # no 'any' left
+        assert not q.has_pending(WAKE_PENDING)  # no 'any' left; 'user' never arms it
         drained = q.drain(USER_DRAIN)
         assert [(t, x, m) for t, x, m in drained] == [
             ("watch_triggered", "w", {"watch_name": "ci"}),

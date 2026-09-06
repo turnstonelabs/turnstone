@@ -82,13 +82,6 @@ NUDGE_DENIAL = (
     "If so, save it as a feedback memory for future sessions."
 )
 
-NUDGE_RESUME = (
-    "This workstream has prior conversation history. Before proceeding, "
-    "use memory(action='search') to check for relevant context — there "
-    "may be saved preferences, project notes, or prior decisions that "
-    "apply to this work."
-)
-
 NUDGE_COMPLETION = (
     "The task may be wrapping up. Consider whether there are learnings, "
     "decisions, or user preferences from this session worth persisting "
@@ -152,7 +145,6 @@ NUDGE_TASK_COMPACTION_RESUME = (
 _NUDGE_MAP: dict[str, str] = {
     "correction": NUDGE_CORRECTION,
     "denial": NUDGE_DENIAL,
-    "resume": NUDGE_RESUME,
     "completion": NUDGE_COMPLETION,
     "tool_error": NUDGE_TOOL_ERROR,
     "repeat": NUDGE_REPEAT,
@@ -190,9 +182,7 @@ _NUDGE_MAP: dict[str, str] = {
 # the same "I don't have access" apologies the memory-advisory gating
 # fixed — while behavioural nudges (repeat, compaction_pending,
 # idle_children, watch_triggered) keep firing.
-MEMORY_NUDGE_TYPES: frozenset[str] = frozenset(
-    {"correction", "denial", "resume", "completion", "tool_error"}
-)
+MEMORY_NUDGE_TYPES: frozenset[str] = frozenset({"correction", "denial", "completion", "tool_error"})
 
 # Nudge types whose copy names a specific tool the model is told to call,
 # mapped to that tool.  ``ChatSession._nudges_enabled`` suppresses a type
@@ -1243,21 +1233,17 @@ def nudge_allowed(
 
     Note the gates this applies that a bare ``_cooldown_allows`` peek
     does NOT: unknown type, ``message_count <= 1``, and the memory-count
-    requirements. A caller
-    that charges budget before consulting THIS function would charge on
-    every one of those refusals.
+    requirement. A caller that charges budget before consulting THIS
+    function would charge on every one of those refusals.
     """
     if nudge_type not in _NUDGE_MAP:
         return False
-    # Resume is the sole nudge allowed on the first message: it describes
-    # rehydrated conversation state, not a live user-message heuristic.
-    if message_count <= 1 and nudge_type != "resume":
+    # Every nudge is a live-conversation heuristic: none fires on the
+    # first message.
+    if message_count <= 1:
         return False
     # Tool error nudge only if there are memories to search
     if nudge_type == "tool_error" and memory_count == 0:
-        return False
-    # Resume nudge only if there are memories to recall.
-    if nudge_type == "resume" and memory_count == 0:
         return False
     # Rate limit: one nudge per type per cooldown window
     last = state.get(nudge_type)

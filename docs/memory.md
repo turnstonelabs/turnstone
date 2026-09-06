@@ -155,7 +155,7 @@ select a larger-context model, or start a new workstream after memory cleanup.
 ### Nudges
 
 The metacognition layer can nudge the model to save memories at appropriate
-moments (e.g., after a correction or when resuming a workstream). Nudges are
+moments (e.g., after a correction or as a task wraps up). Nudges are
 rate-limited by `nudge_cooldown`. Setting `memory.nudges=false` suppresses both
 live memory pointers and memory-directed nudges; it does not remove the
 immutable initial index or the memory tool.

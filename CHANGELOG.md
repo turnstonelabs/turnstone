@@ -46,6 +46,18 @@ frozen.
 
 ### Fixed
 
+- **Reopening a workstream no longer spends a turn on a memory search, and a
+  message sent while it reopens starts its own turn.** Resuming a workstream
+  with saved memories queued a "check your memories" nudge outside any user
+  turn, and the idle wake delivered it on a synthetic empty turn as soon as
+  the workstream went idle. A message sent while that turn ran was queued and
+  handed to the model at the next tool seam as mid-turn "additional context"
+  instead of starting its own turn; channel sessions hit this on nearly every
+  reopen. The nudge is retired: the immutable memory index and the per-turn
+  memory pointers already put the saved context in front of the model.
+  User-channel advisories no longer arm the idle wake at all, so no advisory
+  can manufacture an empty turn ahead of the user's message. Persisted
+  `resume` turns in existing transcripts still render.
 - **One-shot schedules with a non-UTC offset fired at the wrong time
   (#1096).** A one-shot's `at_time` was stored verbatim as its `next_run`,
   which the due query compares as a string against a UTC clock, so an
