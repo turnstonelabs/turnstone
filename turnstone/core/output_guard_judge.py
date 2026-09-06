@@ -709,6 +709,11 @@ class OutputGuardJudge:
                 verdict_id, call_id, start, f"provider_error: {type(e).__name__}"
             )
 
+        # A refusal, including one cut off by the output limit, may quote valid
+        # verdict JSON without endorsing it. Keep the heuristic disposition.
+        if result.finish_reason in ("content_filter", "length"):
+            return self._error_verdict(verdict_id, call_id, start, result.finish_reason)
+
         content = (result.content or "").strip()
         if not content:
             return self._error_verdict(verdict_id, call_id, start, "empty_response")

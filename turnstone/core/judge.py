@@ -1835,6 +1835,12 @@ class IntentJudge:
                 elapsed=round(turn_elapsed, 1),
             )
 
+            # Refused or truncated responses cannot authorize a tool, even if
+            # their text happens to contain a complete verdict JSON object.
+            if result.finish_reason in ("content_filter", "length"):
+                log.info("judge.turn.stopped", finish_reason=result.finish_reason, turn=turn + 1)
+                return None
+
             # Reset empty-response counter after any non-empty response
             if result.content or result.tool_calls:
                 empty_retries = 0
@@ -1899,13 +1905,6 @@ class IntentJudge:
                 )
                 turn += 1
                 continue
-
-            # Empty response (0 chars, 0 tools).  If the model hit the
-            # output token limit the finish_reason will be "length" — retrying
-            # with the same prompt and max_tokens is pointless.
-            if result.finish_reason == "length":
-                log.info("judge.empty_response.length_stop", turn=turn + 1)
-                return None
 
             # Transient empty response — retry up to 3 times without
             # consuming the turn budget.

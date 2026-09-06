@@ -618,13 +618,11 @@ class TestStreamFlushBeforeToolCalls:
             )
 
         # Two scripted turns: the tool round-trip makes send() loop, and
-        # the follow-up turn must carry a real finish reason — the strict
-        # finish gate (RULED, #832) rejects an exhausted iterator that
-        # used to commit as an empty turn.
+        # the follow-up turn must carry an answer and a real finish reason.
         arm_session(
             session,
             stream_content_then_tool(),
-            iter([StreamChunk(finish_reason="stop")]),
+            iter([StreamChunk(content_delta="Done", finish_reason="stop")]),
         )
         with (
             # Prevent real tool execution (e.g., bash) during this test.
@@ -632,14 +630,14 @@ class TestStreamFlushBeforeToolCalls:
         ):
             session.send("test")
 
-        # All content should have been emitted
-        total = "".join(e[1] for e in events if e[0] == "content")
+        # The first turn's complete content precedes its stream_end, including
+        # the carry flush. The tool follow-up gets a separate answer afterward.
+        stream_end_idx = next(i for i, e in enumerate(events) if e[0] == "stream_end")
+        total = "".join(e[1] for e in events[:stream_end_idx] if e[0] == "content")
         assert total == "Hello world, this is a test message"
 
-        # No content events after stream_end
-        stream_end_idx = next(i for i, e in enumerate(events) if e[0] == "stream_end")
         late_content = [e for e in events[stream_end_idx + 1 :] if e[0] == "content"]
-        assert late_content == [], f"Content after stream_end: {late_content}"
+        assert late_content == [("content", "Done")]
 
 
 class TestStreamAbort:

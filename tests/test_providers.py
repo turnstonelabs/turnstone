@@ -13,6 +13,7 @@ import pytest
 from tests._session_helpers import fake_anthropic_stream, fake_chat_stream
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.lowering import repair_wire_messages
+from turnstone.core.providers import create_provider
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import (
@@ -34,8 +35,87 @@ from turnstone.core.providers._protocol import (
     ToolCallDelta,
     UsageInfo,
     drain_stream,
+    request_uses_native_tools,
     serialized_tool_chars,
 )
+
+# ---------------------------------------------------------------------------
+# Prepared request facts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("family", ["openai-compatible", "openai", "anthropic-compatible"])
+@pytest.mark.parametrize(
+    "mode", ["none", "client", "search", "deferred", "extra_native", "extra_disable", "mcp"]
+)
+def test_prepared_request_reports_native_tool_posture(family, mode):
+    provider = create_provider(family)
+    client = MagicMock()
+    client.chat.completions.create.return_value = iter([])
+    client.responses.create.return_value = iter([])
+    client.messages.stream.return_value.__enter__.return_value = iter([])
+    tool_name = "web_search" if mode in ("search", "extra_disable") else "lookup"
+    tools = (
+        None
+        if mode == "none"
+        else [
+            {
+                "type": "function",
+                "function": {"name": tool_name, "parameters": {}},
+            }
+        ]
+    )
+    extra = None
+    if mode == "extra_native":
+        extra = {"tools": [{"type": "code_interpreter"}]}
+    elif mode == "extra_disable":
+        extra = {"tools": None, "web_search_options": None}
+    elif mode == "mcp":
+        extra = {
+            "mcp_servers": [{"type": "url", "name": "remote", "url": "https://example.com/mcp"}]
+        }
+    metrics = []
+    stream = provider.create_streaming(
+        client=client,
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        capabilities=ModelCapabilities(
+            supports_web_search=True,
+            supports_tool_search=True,
+        ),
+        deferred_names=frozenset({"lookup"}) if mode == "deferred" else None,
+        extra_params=extra,
+        request_metrics_ref=metrics,
+    )
+    list(stream)
+    # The Responses adapter does not forward extra_params. Its metrics must
+    # describe what was actually prepared, not the caller's requested override.
+    native = mode == "search" or (mode == "deferred" and family != "openai-compatible")
+    if family == "openai":
+        native = native or mode == "extra_disable"
+    else:
+        native = native or mode in ("extra_native", "mcp")
+    assert len(metrics) == 1
+    assert metrics[0].native_tools_enabled is native
+
+
+@pytest.mark.parametrize(
+    "body,native",
+    [
+        ({"tools": [{"type": "function"}]}, False),
+        ({"tools": [{"type": "function", "defer_loading": True}]}, False),
+        ({"extra_body": None}, False),
+        ({"tools": [{}]}, True),
+        ({"tools": ["unknown"]}, True),
+        ({"tools": {"type": "function"}}, True),
+        ({"web_search_options": {}}, True),
+        ({"tools": [{"type": "code_exec"}], "extra_body": {"tools": None}}, False),
+    ],
+)
+def test_native_tool_posture_handles_overrides_and_unknown_shapes(body, native):
+    assert request_uses_native_tools(body) is native
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -3474,11 +3554,11 @@ class TestAnthropicWebSearch:
         assert len(info_chunks) == 1
         assert "test query" in info_chunks[0].info_delta
 
-    def test_pause_turn_normalized_to_stop(self) -> None:
-        """pause_turn stop reason should normalize to 'stop'."""
+    def test_pause_turn_preserved(self) -> None:
+        """A server-tool continuation is distinct from an ordinary stop."""
         from turnstone.core.providers._anthropic import _normalize_finish_reason
 
-        assert _normalize_finish_reason("pause_turn") == "stop"
+        assert _normalize_finish_reason("pause_turn") == "pause_turn"
 
     def test_drained_stream_skips_server_blocks(self) -> None:
         """Server-side blocks surface as transient info (dropped by the
@@ -3826,7 +3906,8 @@ class TestOpenAIWebSearch:
         )
         assert request_metrics == [
             ProviderRequestMetrics(
-                serialized_tool_chars=serialized_tool_chars(call_kwargs.get("tools"))
+                serialized_tool_chars=serialized_tool_chars(call_kwargs.get("tools")),
+                native_tools_enabled=True,
             )
         ]
         assert request_metrics[0].serialized_tool_chars == 0
@@ -6181,15 +6262,16 @@ class TestResponsesDrainedStream:
         assert result.usage.prompt_tokens == 10
         assert result.usage.completion_tokens == 5
 
-    def test_refusal_renders_in_content(self) -> None:
+    @pytest.mark.parametrize("refusal", ["cannot help with that", ""])
+    def test_refusal_renders_in_content(self, refusal: str) -> None:
         # The response.refusal.done handler (CHANGELOG "refusals render in
-        # content") — a refused turn must not drain to empty content.
+        # content") — the event identifies a refusal even when its text is empty.
         events = [
-            SimpleNamespace(type="response.refusal.done", refusal="cannot help with that"),
+            SimpleNamespace(type="response.refusal.done", refusal=refusal),
             *self._make_events(),
         ]
         result = self._drain(events)
-        assert result.content == "[Refused: cannot help with that]"
+        assert result.content == f"[Refused: {refusal}]"
 
     def test_truncation_rebuilds_blocks_from_terminal_response_output(self) -> None:
         # The item being generated at max_output_tokens truncation never

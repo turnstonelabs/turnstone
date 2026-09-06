@@ -804,7 +804,7 @@ def test_truncation_counts_only_durable_rows_across_live_only_turns(
 ) -> None:
     """A live-only empty assistant turn must not cost an older durable row.
 
-    The empty completion flows through the real provider path so the
+    An output-limited empty completion flows through the real provider path so the
     admission-site ``no_durable_row`` marker — not test scaffolding — carries
     the live/durable asymmetry into the cut accounting.
     """
@@ -817,7 +817,7 @@ def test_truncation_counts_only_durable_rows_across_live_only_turns(
     arm_session(
         session,
         iter([StreamChunk(content_delta="first answer", finish_reason="stop")]),
-        iter([StreamChunk(finish_reason="stop")]),
+        iter([StreamChunk(finish_reason="length")]),
     )
     session.send("first request")
     session.send("second request")

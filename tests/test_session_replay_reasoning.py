@@ -457,14 +457,18 @@ class TestSessionToOpenAIResponsesBoundaryIntegration:
 
     def _stub_responses_client(self) -> tuple[MagicMock, dict[str, object]]:
         """Mock OpenAI Responses client.  ``client.responses.create``
-        captures kwargs and returns a stream carrying only the terminal
-        event — the fused create+drain needs a finish reason (a
-        finish-less exhaust is an ``IncompleteStreamError`` post-#832)."""
+        captures kwargs and returns a completed answer. Empty completed
+        replies now enter the conversation's recovery path (#1070)."""
         captured: dict[str, object] = {}
 
         def create(**kwargs: object) -> object:
             captured.update(kwargs)
-            return iter([SimpleNamespace(type="response.completed", response=None)])
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="ok"),
+                    SimpleNamespace(type="response.completed", response=None),
+                ]
+            )
 
         client = MagicMock()
         client.responses.create = create

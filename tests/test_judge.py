@@ -380,11 +380,12 @@ class TestErrorHandling:
         )
         assert result is None
 
-    def test_empty_content_length_stop_no_retry(self):
-        """When finish_reason is 'length', don't retry — return None immediately."""
+    @pytest.mark.parametrize("finish", ["length", "content_filter"])
+    def test_empty_content_nonrecoverable_stop_no_retry(self, finish):
+        """Output limits and safety filters stop the empty-response ladder."""
         provider = _make_mock_provider(response_content="")
         result_mock = _mock_result("", None)
-        result_mock.finish_reason = "length"
+        result_mock.finish_reason = finish
         provider.create_streaming.return_value = as_stream(result_mock)
 
         judge = _make_judge(provider)
@@ -396,6 +397,30 @@ class TestErrorHandling:
         )
         assert result is None
         # Should have been called exactly once — no retries
+        assert provider.create_streaming.call_count == 1
+
+    @pytest.mark.parametrize("finish", ["content_filter", "length"])
+    def test_rejected_response_cannot_execute_judge_tools(self, finish):
+        provider = _make_mock_provider()
+        response = _mock_result(
+            "",
+            [{"id": "read", "function": {"name": "read_file", "arguments": '{"path":"x"}'}}],
+        )
+        response.finish_reason = finish
+        provider.create_streaming.return_value = as_stream(response)
+        judge = _make_judge(provider)
+        execute = MagicMock()
+        judge._exec_read_only_tool = execute
+
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+
+        assert result is None
+        execute.assert_not_called()
         assert provider.create_streaming.call_count == 1
 
 

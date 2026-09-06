@@ -27,6 +27,12 @@ from turnstone.core.providers._protocol import (
 
 log = structlog.get_logger(__name__)
 
+
+def format_refusal(text: str) -> str:
+    """Keep refusals visible across OpenAI-family streaming and terminal payloads."""
+    return f"[Refused: {text}]"
+
+
 _UPSTREAM_ERROR_BODY_MAX_BYTES = 4096
 _INVALID_UPSTREAM_ERROR_BODY = "<JSON response did not contain a valid error object>"
 _UPSTREAM_RATE_LIMIT_CODES = frozenset(
@@ -567,10 +573,10 @@ def apply_tool_search(
     tools: list[dict[str, Any]] | None,
     deferred_names: frozenset[str] | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Mark deferred tools with ``defer_loading: true`` for native search.
+    """Mark client tools with ``defer_loading: true`` when search is enabled.
 
-    For GPT-5.4+ models that support tool search, OpenAI's API handles
-    discovery automatically — no explicit search tool is needed.
+    This adds only loading metadata. The Responses adapter adds the hosted
+    search tool separately during conversion to its native tool shape.
     """
     if not caps.supports_tool_search or not deferred_names or not tools:
         return tools

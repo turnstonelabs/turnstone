@@ -1748,6 +1748,19 @@ runs, grace-gated).
 
 Every model call streams (#831); retry lives at two stacked layers:
 
+- **Empty completed responses** — interactive and coordinator conversations
+  share the mid-stream retry budget (at most 2 re-issues) for an ordinary
+  `stop` with no answer or tool call, including reasoning-only output.
+  Each re-issue resends the full context and can repeat its latency and cost;
+  the shared limit bounds attempts, not elapsed time.
+  Automatic recovery requires the prepared request to have no server-side
+  tools; otherwise the conversation enters error immediately. Each completed
+  attempt reports usage, including a same-generation Stop after completion.
+  Rejected usage also updates the existing token-budget checks; exhaustion
+  stops recovery and requires approval on the next send. Discarded reasoning
+  stays out of saved history, and retry exhaustion enters error instead of
+  silently becoming idle. Refusals, output limits, native activity, and
+  continuation signals are excluded.
 - **Caller ladders** — `ChatSession._model_turn_with_retry()` (chat
   loop, one ladder per lane) and the agent `_api_call()` (drained via
   `model_turn`) use the same pattern: 4 total attempts (1 initial + 3 retries,
@@ -1781,7 +1794,11 @@ Every model call streams (#831); retry lives at two stacked layers:
   Any partial tool calls are discarded (their JSON would be malformed),
   causing the `send()` loop to exit cleanly.
 - **`"content_filter"`**: warns via `ui.on_error()` that the response was
-  blocked.
+  blocked. Both intent and output-guard judges reject filtered or truncated
+  responses before parsing a verdict, so JSON quoted in refusal text cannot
+  become an approval. Non-empty Chat refusal text converts an ordinary `stop`
+  to this finish reason. An empty nullable Chat refusal field alone does not;
+  explicit filter finishes and Responses refusal events retain their meaning.
 
 Agent sub-sessions (`_run_agent()`) check `finish_reason` on each
 drained turn and stop the agent early on `"length"` or

@@ -25,7 +25,9 @@ from tests._session_helpers import as_stream
 from turnstone.core.model_turn import (
     ModelAdmissionError,
     ModelLane,
+    ModelTurnResult,
     finalize_provider_blocks,
+    is_empty_completion,
     maybe_attach_vllm_chat_reasoning,
     model_turn,
     resolve_lane,
@@ -42,7 +44,7 @@ from turnstone.core.providers._protocol import (
     serialized_tool_chars,
 )
 from turnstone.core.session import ChatSession
-from turnstone.core.trajectory import AttachmentRef, Role, ToolCall, Turn
+from turnstone.core.trajectory import AttachmentRef, ProviderNative, Role, ToolCall, Turn
 
 
 class _FakeProvider:
@@ -170,6 +172,7 @@ def test_result_carries_exact_serving_tool_definition_size() -> None:
 
     assert result.tool_def_chars == serialized_tool_chars(tools)
     assert result.serving_model == "m"
+    assert result.native_tools_enabled is None
 
 
 def test_result_prefers_final_provider_native_tool_definition_size() -> None:
@@ -178,7 +181,9 @@ def test_result_prefers_final_provider_native_tool_definition_size() -> None:
     class _NativeMetricsProvider(_FakeProvider):
         def create_streaming(self, **kwargs: Any) -> list[StreamChunk]:
             metrics = kwargs["request_metrics_ref"]
-            metrics.append(ProviderRequestMetrics(serialized_tool_chars=1_234))
+            metrics.append(
+                ProviderRequestMetrics(serialized_tool_chars=1_234, native_tools_enabled=True)
+            )
             return super().create_streaming(**kwargs)
 
     provider = _NativeMetricsProvider([CompletionResult(content="ok")])
@@ -189,6 +194,71 @@ def test_result_prefers_final_provider_native_tool_definition_size() -> None:
     )
 
     assert result.tool_def_chars == 1_234
+    assert result.native_tools_enabled is True
+
+
+@pytest.mark.parametrize(
+    "blocks,empty",
+    [
+        ([], True),
+        ([{"type": "thinking", "thinking": "private"}], True),
+        ([{"type": "redacted_thinking", "data": "opaque"}], True),
+        ([{"type": "reasoning", "encrypted_content": "opaque"}], True),
+        ([{"type": "reasoning_text", "text": "private"}], True),
+        ([{"type": "text", "text": " \n"}], True),
+        ([{"type": "text", "text": "<think>private</think>"}], True),
+        ([{"type": "message", "content": []}], True),
+        ([{"type": "message", "content": [{"type": "output_text", "text": " "}]}], True),
+        ([{"type": "message", "content": [{"type": "refusal", "refusal": ""}]}], False),
+        # Known text is a replay mirror; parsed canonical text owns the answer.
+        ([{"type": "message", "content": [{"type": "output_text", "text": "answer"}]}], True),
+        ([{"type": "message", "content": [{"type": "future_output"}]}], False),
+        ([{"type": "message", "content": None}], False),
+        ([{"type": "reasoning"}, {"type": "web_search_call", "id": "search"}], False),
+        ([{"type": "reasoning"}, {"type": "future_output"}], False),
+        ([{"type": "server_tool_use", "name": "code_exec"}], False),
+        ([{"type": "output_text", "text": None}], False),
+        ([{"type": ["malformed"]}], False),
+        (["unknown"], False),
+    ],
+)
+def test_empty_completion_native_output_is_conservative(blocks, empty):
+    result = ModelTurnResult(
+        turn=Turn.assistant(native=ProviderNative("test", tuple(blocks))),
+        finish_reason="stop",
+        usage=None,
+        tool_calls=[],
+    )
+    assert is_empty_completion(result) is empty
+
+
+@pytest.mark.parametrize(
+    "turn,raw_calls",
+    [
+        (Turn.assistant("answer"), []),
+        (
+            Turn.assistant(
+                "<think>literal text</think>",
+                native=ProviderNative(
+                    "anthropic", ({"type": "text", "text": "<think>literal text</think>"},)
+                ),
+            ),
+            [],
+        ),
+        (Turn(Role.ASSISTANT, (AttachmentRef("attachment", "image"),)), []),
+        (Turn.assistant(tool_calls=(ToolCall("call", "lookup", "{}"),)), []),
+        (Turn.assistant(), [{"id": "", "function": {"name": "lookup", "arguments": "{}"}}]),
+    ],
+)
+def test_empty_completion_excludes_answer_attachment_and_either_tool_mirror(turn, raw_calls):
+    result = ModelTurnResult(turn=turn, finish_reason="stop", usage=None, tool_calls=raw_calls)
+    assert not is_empty_completion(result)
+
+
+@pytest.mark.parametrize("finish", ["length", "content_filter", "pause_turn", "unknown"])
+def test_empty_completion_requires_ordinary_stop(finish):
+    result = ModelTurnResult(turn=Turn.assistant(), finish_reason=finish, usage=None, tool_calls=[])
+    assert not is_empty_completion(result)
 
 
 def test_entra_app_lane_resolver_never_issues_placeholder_client() -> None:

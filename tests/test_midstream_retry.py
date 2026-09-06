@@ -704,9 +704,9 @@ class TestMidStreamRetry:
 
 class TestRecreateWindowClassification:
     """Between a mid-stream death and the next attempt's ``begin_attempt``
-    there is NO live attempt — ``end_attempt`` pronounces the dead one
-    dead the moment its partial is captured.  These pins hold the two
-    failure modes of reading the dead attempt's armed state in that
+    there is NO live attempt — ``end_attempt`` disarms the dead one
+    after its partial is captured and stream_end is emitted. These pins
+    hold the two failure modes of reading the dead attempt's armed state in that
     window (a Stop re-finalizing discarded display state; a walk-preamble
     error replacing the stream death), the two error classes the
     re-issue mask must forward verbatim, and the saw-chunk classifier

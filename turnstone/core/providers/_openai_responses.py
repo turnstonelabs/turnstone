@@ -26,6 +26,7 @@ from turnstone.core.providers._openai_common import (
     extract_usage,
     format_citations,
     format_document_wrapper,
+    format_refusal,
     lookup_openai_capabilities,
     reject_non_stream_response,
     resolve_server_side_tools,
@@ -39,6 +40,7 @@ from turnstone.core.providers._protocol import (
     _join_reasoning_with_cap,
     finish_shim_due,
     refuse_aborted_request,
+    request_uses_native_tools,
     resolve_reasoning_effort,
     serialized_tool_chars,
 )
@@ -51,13 +53,6 @@ log = structlog.get_logger(__name__)
 # condition — the only ones worth retrying (the API's other codes are
 # deterministic request rejections).
 _TRANSIENT_FAILURE_CODES = frozenset({"server_error", "rate_limit_exceeded"})
-
-
-def _format_refusal(text: str) -> str:
-    """Render a refusal part as visible content — ONE format for both the
-    streamed ``response.refusal.done`` event and the terminal-payload
-    harvest, so drained text cannot differ by which path carried it."""
-    return f"[Refused: {text}]"
 
 
 def _extend_message_annotations(item: Any, annotations: list[Any]) -> None:
@@ -576,7 +571,8 @@ class OpenAIResponsesProvider:
         if request_metrics_ref is not None:
             request_metrics_ref.append(
                 ProviderRequestMetrics(
-                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools"))
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
+                    native_tools_enabled=request_uses_native_tools(kwargs),
                 )
             )
 
@@ -665,7 +661,7 @@ class OpenAIResponsesProvider:
             # double-emit.
             if event_type == "response.refusal.done":
                 refusal_text = getattr(event, "refusal", "")
-                sc = StreamChunk(content_delta=_format_refusal(refusal_text))
+                sc = StreamChunk(content_delta=format_refusal(refusal_text))
                 content_len += len(sc.content_delta)
                 if first:
                     sc.is_first = True
@@ -795,7 +791,7 @@ class OpenAIResponsesProvider:
                             if part.get("type") == "output_text" and part.get("text"):
                                 parts_text.append(part["text"])
                             elif part.get("type") == "refusal" and part.get("refusal"):
-                                parts_text.append(_format_refusal(part["refusal"]))
+                                parts_text.append(format_refusal(part["refusal"]))
                     harvested = "".join(parts_text)
                     if harvested:
                         content_len = len(harvested)

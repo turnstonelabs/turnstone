@@ -20,6 +20,7 @@ from turnstone.core.providers._openai_common import (
     apply_tool_search,
     extract_usage,
     format_citations,
+    format_refusal,
     reject_non_stream_response,
     sanitize_messages,
 )
@@ -32,6 +33,7 @@ from turnstone.core.providers._protocol import (
     finish_shim_due,
     merge_reasoning_template_kwargs,
     refuse_aborted_request,
+    request_uses_native_tools,
     serialized_tool_chars,
 )
 from turnstone.core.trajectory import materialize_attachments
@@ -334,7 +336,8 @@ class OpenAIChatCompletionsProvider:
         if request_metrics_ref is not None:
             request_metrics_ref.append(
                 ProviderRequestMetrics(
-                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools"))
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
+                    native_tools_enabled=request_uses_native_tools(kwargs),
                 )
             )
 
@@ -375,6 +378,8 @@ class OpenAIChatCompletionsProvider:
         """
         first = True
         annotations: list[Any] = []
+        refusals: list[str] = []
+        refusal_seen = False
         content_len = 0
         reasoning_len = 0
         tool_call_count = 0
@@ -416,6 +421,23 @@ class OpenAIChatCompletionsProvider:
                 sc.content_delta = delta.content
                 content_len += len(delta.content)
 
+            refusal = getattr(delta, "refusal", None)
+            # An empty nullable field alone is not a refusal signal. Explicit
+            # content_filter finishes remain authoritative even without text.
+            if isinstance(refusal, str) and refusal:
+                refusals.append(refusal)
+                refusal_seen = True
+            if sc.finish_reason == "stop" and refusal_seen:
+                # Classify only at a real terminal signal. Inline reasoning
+                # parsing must not turn a refusal into a retryable empty answer.
+                sc.finish_reason = "content_filter"
+                last_finish_reason = sc.finish_reason
+            if sc.finish_reason and refusals:
+                rendered = format_refusal("".join(refusals))
+                sc.content_delta += rendered
+                content_len += len(rendered)
+                refusals.clear()
+
             # Tool calls
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
@@ -449,6 +471,13 @@ class OpenAIChatCompletionsProvider:
             if has_content or sc.finish_reason or sc.usage:
                 yield sc
 
+        # A refusal is content, not a terminal signal. Clean finish-less streams
+        # still need the capability shim below; a transport failure never gets here.
+        if refusals:
+            rendered = format_refusal("".join(refusals))
+            content_len += len(rendered)
+            yield StreamChunk(content_delta=rendered, is_first=first)
+
         # Finish-reason-less lax-server tolerance (the deleted non-streaming
         # path's `finish_reason or "stop"` default), armed ONLY by the
         # operator-declared ``finish_reason_optional`` capability: on a
@@ -472,8 +501,8 @@ class OpenAIChatCompletionsProvider:
             finish_seen=last_finish_reason is not None,
             delivered_output=bool(content_len or reasoning_len or tool_call_count),
         ):
-            last_finish_reason = "stop"
-            yield StreamChunk(finish_reason="stop")
+            last_finish_reason = "content_filter" if refusal_seen else "stop"
+            yield StreamChunk(finish_reason=last_finish_reason)
 
         log.debug(
             "openai.chat.response",

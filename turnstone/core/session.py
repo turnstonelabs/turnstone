@@ -171,6 +171,7 @@ from turnstone.core.model_turn import (
     create_provider,
     finalize_provider_blocks,
     folds_trailing_info,
+    is_empty_completion,
     lane_diagnostics,
     lane_error_is_retryable,
     lane_matches_explicit_handles,
@@ -385,6 +386,17 @@ class ConversationPersistenceError(Exception):
 
 class _MalformedToolBatchError(RuntimeError):
     """Provider tool calls cannot be executed without unambiguous identities."""
+
+
+class _EmptyCompletionError(RuntimeError):
+    """A completed response rejected by the conversation's structural policy."""
+
+    def __init__(self, result: ModelTurnResult) -> None:
+        self.result = result
+        message = "Model returned no answer or tool call. Retry the turn or choose another model."
+        if result.native_tools_enabled is not False:
+            message += " Automatic retry was skipped because the request may run server-side tools."
+        super().__init__(message)
 
 
 _CONVERSATION_PERSISTENCE_RETRY_BASE_SECONDS = 1.0
@@ -823,8 +835,9 @@ class _StreamTurnConsumer:
     def end_attempt(self) -> None:
         """Pronounce the current attempt dead: nothing about it may leak.
 
-        The re-issue ladder calls this once a mid-stream death's partial
-        is captured: from here until the next ``begin_attempt`` there is
+        The re-issue ladder calls this after capturing the partial and
+        emitting stream_end, as its call-site sequencing comment explains.
+        From here until the next ``begin_attempt`` there is
         NO live attempt, so ``attempt_armed`` reads False.  Otherwise a
         Stop or a walk-preamble failure landing in the re-create window
         reads the DEAD attempt's armed ref — re-finalizing discarded
@@ -14585,9 +14598,8 @@ class ChatSession:
         # (read off the frame's consumer, never a session slot), so an
         # orphaned generation cannot poison a live one's preservation.
         dead_partial = ""
-        # The armed death whose re-issue is in progress; when the RE-CREATE
-        # phase fails with an unarmed error, the original death is the one
-        # the operator needs to see, not the re-create's.
+        # The armed failure whose re-issue is in progress. A transport death
+        # can explain a later re-create failure; an empty completion cannot.
         last_stream_death: Exception | None = None
         # Provenance of the attempt whose text ``dead_partial`` carries.  A
         # zero-token re-death must not relabel preserved text from the prior
@@ -14617,16 +14629,21 @@ class ChatSession:
             """Hand send()'s cancel handler the retry window's partial.
 
             Runs on a same-generation Stop anywhere in the retry window.
-            Unconditional when no partial was recorded — empty content
-            still takes the cancel handler's marker-as-message branch,
-            preserving the invariant that a cancelled streaming turn
-            always persists the cancellation-marker row.  Backfills a
+            An armed attempt first flushes its display, emits stream_end,
+            records its cancellation partial, and disarms. Keeping it armed
+            until that finalization preserves even a zero-text Stop marker.
+            Once an attempt has streamed, empty content still takes the
+            cancel handler's marker-as-message branch. A Stop before any
+            attempt streams writes no assistant row. Backfills a
             recorded-but-EMPTY partial (a Stop in the re-create/TTFT
             window records the new attempt's empty content) with the
             previous attempt's text: cancel-in-retry preserves the latest
             text the user actually saw.  Never writes for a superseded
             generation — an orphan must not touch the successor's slot.
             """
+            if consumer.attempt_armed:
+                consumer.record_cancelled_partial()
+                consumer.end_attempt()
 
             def _publish_partial() -> None:
                 if (
@@ -14657,6 +14674,11 @@ class ChatSession:
                 allow_cancelled=True,
             )
 
+        def _discard_failed_stream() -> None:
+            """Finalize rejected display state while the caller owns its generation."""
+            self.ui.on_stream_end()
+            self._ui_stream_discarded()
+
         with self._recovered_serving_failures() as recovered_failures:
             while True:
                 try:
@@ -14672,6 +14694,8 @@ class ChatSession:
                     # commits as complete and its tool calls execute.
                     self._check_cancelled(my_generation)
                     consumer.finish_stream()
+                    if is_empty_completion(result):
+                        raise _EmptyCompletionError(result)
                     # Finalization emits terminal warnings/stream_end and may
                     # legalize a truncated result.  Keep that complete policy step
                     # on the same owner rail as the carry flush above so a force
@@ -14690,8 +14714,6 @@ class ChatSession:
                     # after a death) — finalize the streamed display if the
                     # attempt got a stream, then preserve the window's best
                     # partial.
-                    if consumer.attempt_armed:
-                        consumer.record_cancelled_partial()
                     _promote_dead_partial()
                     raise
                 except KeyboardInterrupt:
@@ -14723,13 +14745,39 @@ class ChatSession:
                     dead_partial = new_dead or dead_partial
                     if attempt_provenance is not None and (new_dead or dead_provenance is None):
                         dead_provenance = attempt_provenance
-                    if armed:
-                        # The partial is captured, so there is no live attempt
-                        # until the next ``begin_attempt``: without this, a
-                        # Stop or a walk-preamble failure landing in the
-                        # re-create window reads the DEAD attempt's armed
-                        # state (see ``end_attempt``).
-                        consumer.end_attempt()
+                    if isinstance(e, _EmptyCompletionError) and failed_lane is not None:
+                        # This call completed and was billed. A same-generation
+                        # Stop still accounts for it, like an accepted result;
+                        # supersession and shutdown remain fenced. Budget checks
+                        # do not calibrate or append the rejected answer.
+                        def _commit_usage(
+                            durable: list[Callable[[], None]],
+                            serving_model: str = failed_lane.model,
+                        ) -> None:
+                            self._update_token_budget()
+                            self._print_status_line(
+                                model=serving_model,
+                                deferred_persistence=durable,
+                            )
+
+                        try:
+                            usage_committed = self._commit_for_generation(
+                                my_generation, _commit_usage
+                            )
+                        except GenerationCancelled:
+                            _promote_dead_partial()
+                            raise
+                        except BaseException:
+                            # Usage storage already logs its own failures. A UI
+                            # callback failure or conversation-persistence poison
+                            # must finalize display and remain fatal, including
+                            # when Stop races the failed commit. Never publish
+                            # over a successor or turn this into a cancel marker.
+                            self._publish_for_generation(my_generation, _discard_failed_stream)
+                            raise
+                        if not usage_committed:
+                            _promote_dead_partial()
+                            raise GenerationCancelled() from None
                     if self._cancel_event.is_set():
                         _promote_dead_partial()
                         raise GenerationCancelled() from None
@@ -14747,7 +14795,9 @@ class ChatSession:
                         # ladder + fallbacks.  Mid re-issue it must not MASK
                         # the original stream death (a closed-client re-create
                         # surfaces as a retryable APIConnectionError and would
-                        # replace the operator-actionable wording) — EXCEPT
+                        # replace the operator-actionable wording). An empty
+                        # completion does not explain a failed re-create, so
+                        # its replacement error surfaces as itself. Also exempt
                         # the classes carrying their own remediation: an
                         # overflow surfaces as ITSELF so send()'s
                         # compact-and-retry arm can recover the turn, and an
@@ -14758,6 +14808,7 @@ class ChatSession:
                         # base_url verbatim.
                         if (
                             last_stream_death is None
+                            or isinstance(last_stream_death, _EmptyCompletionError)
                             or isinstance(e, _SELF_SURFACING_ERRORS)
                             or _is_ctx_overflow(e)
                         ):
@@ -14767,7 +14818,7 @@ class ChatSession:
                             error_type=type(e).__name__,
                         )
                         raise last_stream_death from None
-                    # The terminal predicate is the SHARED _stop_retrying,
+                    # Transport failures use the shared _stop_retrying,
                     # capped at _MID_STREAM_RETRIES, judged by the lane that
                     # ACTUALLY armed this stream (a fallback's retryable set
                     # can differ, e.g. ResponsesStreamFailedError).  The
@@ -14778,9 +14829,21 @@ class ChatSession:
                     serving_lane = consumer.lane
                     if serving_lane is None:
                         raise RuntimeError("armed stream has no serving model lane") from e
-                    if self._stop_retrying(
-                        e, attempt, serving_lane, max_retries=self._MID_STREAM_RETRIES
-                    ):
+                    if isinstance(e, _EmptyCompletionError):
+                        # Share the two-reissue budget with transport failures.
+                        # Each reissue resends the full context and can repeat
+                        # its latency/cost; this caps attempts, not wall time.
+                        # Reasoning followed by stop does not establish refusal.
+                        terminal = (
+                            attempt >= self._MID_STREAM_RETRIES
+                            or e.result.native_tools_enabled is not False
+                            or self._budget_exhausted
+                        )
+                    else:
+                        terminal = self._stop_retrying(
+                            e, attempt, serving_lane, max_retries=self._MID_STREAM_RETRIES
+                        )
+                    if terminal:
                         # Terminal: finalize AND discard, exactly like the
                         # retry arm.  Keeping the buffers bought nothing — the
                         # fatal path's _emit_state("error") drains and wipes
@@ -14797,8 +14860,7 @@ class ChatSession:
                             ):
                                 _promote_dead_partial()
                                 raise GenerationCancelled() from None
-                            self.ui.on_stream_end()
-                            self._ui_stream_discarded()
+                            _discard_failed_stream()
                         raise  # fatal path otherwise unchanged
                     # This death supersedes the previous one: drop the older
                     # snapshot here rather than at the ladder's exit, so a long
@@ -14850,10 +14912,19 @@ class ChatSession:
                             _promote_dead_partial()
                             raise GenerationCancelled() from None
                         self.ui.on_stream_end()
+                        notice = (
+                            "model returned no answer"
+                            if isinstance(e, _EmptyCompletionError)
+                            else f"stream died mid-response ({cause})"
+                        )
                         self.ui.on_info(
-                            f"[stream died mid-response ({cause}) — retrying in "
+                            f"[{notice} — retrying in "
                             f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
                         )
+                    # Keep the consumer armed until its stream_end is emitted:
+                    # Stop during rejection/usage publication must still flush
+                    # and finalize it. Backoff and re-creation have no live attempt.
+                    consumer.end_attempt()
                     try:
                         self._backoff_or_cancelled(delay, my_generation)
                         # Retry preparation is one generation publication.  A
@@ -15204,14 +15275,18 @@ class ChatSession:
         # _remaining_token_budget() can estimate only the delta.
         self._calibrated_msg_count = len(self.messages)
 
-        # Token budget tracking
-        if self._token_budget > 0:
-            total = prompt_tok + compl_tok
-            if not self._budget_warned and total >= self._token_budget * 0.8:
-                self._budget_warned = True
-                self.ui.on_info(f"Token budget 80% consumed ({total:,}/{self._token_budget:,})")
-            if total >= self._token_budget:
-                self._budget_exhausted = True
+        self._update_token_budget()
+
+    def _update_token_budget(self) -> None:
+        """Apply the per-completion budget to accepted and rejected responses."""
+        if not self._last_usage or self._token_budget <= 0:
+            return
+        total = self._last_usage["prompt_tokens"] + self._last_usage["completion_tokens"]
+        if not self._budget_warned and total >= self._token_budget * 0.8:
+            self._budget_warned = True
+            self.ui.on_info(f"Token budget 80% consumed ({total:,}/{self._token_budget:,})")
+        if total >= self._token_budget:
+            self._budget_exhausted = True
 
     def _print_status_line(
         self,

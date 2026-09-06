@@ -1,6 +1,6 @@
 """Offline pins of SDK boundary behaviors used by stream error handling.
 
-Five facts, each probed against the REAL SDKs over mock/loopback
+Six facts, each probed against the REAL SDKs over mock/loopback
 transports (no network, no live backend):
 
 1. OpenAI v3's ``max_retries`` covers request time only — a mid-BODY death
@@ -17,6 +17,8 @@ transports (no network, no live backend):
 5. OpenAI v3 raises real HTTP errors before returning a stream, while an HTTP
    200 ``application/json`` response becomes an empty iterator unless the
    adapter rejects it before arming the stream.
+6. Refusal text is visible without inventing an early terminal signal, and
+   neither structured-output judge interprets a filtered response as a verdict.
 
 If an SDK/httpx upgrade changes any of these, the provider boundary and
 ``transport_guarded`` conversion (including the retry gate consuming it) must
@@ -31,6 +33,7 @@ import socket
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import anthropic
 import httpx
@@ -78,6 +81,268 @@ ANTHROPIC_EVENTS = (
     + 'data: {"type":"content_block_delta","index":0,'
     '"delta":{"type":"text_delta","text":"hello"}}' + LF + LF
 )
+
+
+@pytest.mark.parametrize("parts", [["Cannot", " help."], ["", "Cannot", "", " help.", ""]])
+@pytest.mark.parametrize(
+    "ending", ["finish", "finishless", "pre_finish_death", "post_finish_death"]
+)
+@pytest.mark.parametrize("optional_finish", [False, True])
+def test_chat_refusal_is_visible_without_inventing_a_terminal(parts, ending, optional_finish):
+    from turnstone.core.providers import (
+        IncompleteStreamError,
+        ModelCapabilities,
+        create_provider,
+        drain_stream,
+        transport_guarded,
+    )
+
+    chunks = [{"delta": {"refusal": part}, "finish_reason": None} for part in parts]
+    if ending in ("finish", "post_finish_death"):
+        chunks.append({"delta": {}, "finish_reason": "stop"})
+    payload = "".join(
+        "data: "
+        + json.dumps(
+            {
+                "id": "refusal",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "test",
+                "choices": [{"index": 0, **choice}],
+            }
+        )
+        + "\n\n"
+        for choice in chunks
+    ).encode()
+    body = (
+        _Httpx2DyingStream(payload)
+        if "death" in ending
+        else httpx2.ByteStream(payload + b"data: [DONE]\n\n")
+    )
+    with openai.OpenAI(
+        api_key="test-only",
+        max_retries=0,
+        http_client=httpx2.Client(
+            transport=httpx2.MockTransport(
+                lambda request: httpx2.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=body,
+                )
+            )
+        ),
+    ) as client:
+        stream = create_provider("openai-compatible").create_streaming(
+            client=client,
+            model="test",
+            messages=[{"role": "user", "content": "test"}],
+            capabilities=ModelCapabilities(finish_reason_optional=optional_finish),
+        )
+        if ending == "pre_finish_death" or (ending == "finishless" and not optional_finish):
+            with pytest.raises(IncompleteStreamError):
+                drain_stream(transport_guarded(stream))
+        else:
+            result = drain_stream(transport_guarded(stream))
+            assert result.content == "[Refused: " + "".join(parts) + "]"
+            assert result.finish_reason == "content_filter"
+
+
+@pytest.mark.parametrize("refusal", [None, ""])
+@pytest.mark.parametrize("content", ["Hello world", ""])
+@pytest.mark.parametrize("finish", ["stop", "content_filter", None])
+def test_empty_chat_refusal_field_does_not_rewrite_content_or_finish(refusal, content, finish):
+    from turnstone.core.providers import (
+        IncompleteStreamError,
+        ModelCapabilities,
+        create_provider,
+        drain_stream,
+        transport_guarded,
+    )
+
+    chunks = [({"content": content, "refusal": refusal}, None)]
+    if finish is not None:
+        chunks.append(({}, finish))
+    payload = (
+        "".join(
+            "data: "
+            + json.dumps(
+                {
+                    "id": "empty-refusal",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": reason}],
+                }
+            )
+            + "\n\n"
+            for delta, reason in chunks
+        )
+        + "data: [DONE]\n\n"
+    )
+    with openai.OpenAI(
+        api_key="test-only",
+        max_retries=0,
+        http_client=httpx2.Client(
+            transport=httpx2.MockTransport(
+                lambda request: httpx2.Response(
+                    200, headers={"content-type": "text/event-stream"}, text=payload
+                )
+            )
+        ),
+    ) as client:
+        stream = create_provider("openai-compatible").create_streaming(
+            client=client,
+            model="test",
+            messages=[{"role": "user", "content": "test"}],
+            capabilities=ModelCapabilities(finish_reason_optional=finish is None),
+        )
+        if finish is None and not content:
+            # A metadata-only stream still has no evidence of completion;
+            # the compatibility shim requires an actual content chunk.
+            with pytest.raises(IncompleteStreamError):
+                drain_stream(transport_guarded(stream))
+            return
+        result = drain_stream(transport_guarded(stream))
+    assert result.content == content
+    assert result.finish_reason == (finish or "stop")
+
+
+def test_chat_refusal_after_unclosed_inline_reasoning_cannot_be_retried():
+    from turnstone.core.model_turn import ModelLane, is_empty_completion, model_turn
+    from turnstone.core.providers import create_provider
+    from turnstone.core.trajectory import Turn
+
+    deltas = [
+        ({"content": "<think>unfinished reasoning"}, None),
+        ({"refusal": "Cannot help."}, None),
+        ({}, "stop"),
+    ]
+    payload = (
+        "".join(
+            "data: "
+            + json.dumps(
+                {
+                    "id": "refusal",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                }
+            )
+            + "\n\n"
+            for delta, finish in deltas
+        )
+        + "data: [DONE]\n\n"
+    )
+    with openai.OpenAI(
+        api_key="test-only",
+        max_retries=0,
+        http_client=httpx2.Client(
+            transport=httpx2.MockTransport(
+                lambda request: httpx2.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    text=payload,
+                )
+            )
+        ),
+    ) as client:
+        result = model_turn(
+            ModelLane(provider=create_provider("openai-compatible"), client=client, model="test"),
+            [Turn.user("Continue.")],
+        )
+    assert not is_empty_completion(result)
+    assert result.finish_reason == "content_filter"
+
+
+@pytest.mark.parametrize("judge_kind", ["intent", "output"])
+@pytest.mark.parametrize("quoted_verdict", [False, True])
+@pytest.mark.parametrize("finish", ["stop", "length", "content_filter"])
+def test_judges_reject_chat_refusals_before_parsing_or_reprompting(
+    judge_kind, quoted_verdict, finish
+):
+    from turnstone.core.judge import IntentJudge, JudgeConfig
+    from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
+    from turnstone.core.output_guard_judge import OutputGuardJudge
+    from turnstone.core.providers import create_provider
+
+    refusal = "I cannot evaluate this request."
+    if quoted_verdict:
+        refusal += " I cannot return " + json.dumps(
+            {
+                "risk_level": "low" if judge_kind == "intent" else "none",
+                "recommendation": "approve",
+                "confidence": 0.99,
+                "reasoning": "Allowed.",
+                "flags": [],
+            }
+        )
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        chunks = [({"refusal": refusal}, None), ({}, finish)]
+        payload = "".join(
+            "data: "
+            + json.dumps(
+                {
+                    "id": "refusal",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                }
+            )
+            + "\n\n"
+            for delta, finish in chunks
+        )
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=payload + "data: [DONE]\n\n",
+        )
+
+    with openai.OpenAI(
+        api_key="test-only",
+        max_retries=0,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(respond)),
+    ) as client:
+        provider = create_provider("openai-compatible")
+        binding = ResolvedModelBinding(
+            lane=ModelLane(
+                provider=provider,
+                client=client,
+                model="test",
+                capabilities=provider.get_capabilities("test"),
+            ),
+            config=None,
+            registry_generation=0,
+        )
+        if judge_kind == "intent":
+            judge = IntentJudge(
+                config=JudgeConfig(enabled=True, read_only_tools=False),
+                session_binding=binding,
+            )
+            verdict = judge._evaluate_single(
+                {"func_name": "bash", "func_args": {"command": "ls"}, "call_id": "call"},
+                [{"role": "user", "content": "Inspect the directory."}],
+                None,
+                client,
+                lane=binding.lane,
+            )
+            assert verdict is None
+        else:
+            guard = OutputGuardJudge(
+                config=JudgeConfig(output_guard_llm=True), session_binding=binding
+            )
+            try:
+                with patch.object(guard, "_create_client", return_value=client):
+                    output = guard.evaluate("Untrusted tool output.", func_name="web_fetch")
+                assert not output.succeeded
+                assert output.error == ("length" if finish == "length" else "content_filter")
+            finally:
+                guard.close()
+    assert len(requests) == 1
 
 
 class _DyingStream(httpx.SyncByteStream):

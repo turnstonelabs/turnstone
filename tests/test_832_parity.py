@@ -90,6 +90,14 @@ def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
             [["thinking_stop", ""]] + retry_theater + [["stream_end", ""], ["stream_discarded", ""]]
         )
 
+    elif name == "finish_only_no_content":
+        # #1070: an ordinary completed response with no answer is rejected.
+        # This scripted adapter reports no prepared-request tool facts, so
+        # the conversation cannot safely reissue it and fails immediately.
+        expected["raised"] = "_EmptyCompletionError"
+        expected["result"] = None
+        expected["ui_events"] = [["stream_end", ""], ["stream_discarded", ""]]
+
     elif name == "think_tags_split_across_chunks":
         # RULED (#832): the COMMITTED content takes the drain's single
         # blank-edge trim when an inline think tag was consumed; the

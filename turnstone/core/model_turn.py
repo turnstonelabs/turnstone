@@ -65,6 +65,12 @@ from turnstone.core.lowering import (
 # registry — so the provider package stays a plant-layer-only import.
 from turnstone.core.providers import create_provider as create_provider
 from turnstone.core.providers._protocol import (
+    REASONING_BEARING_BLOCK_TYPES,
+    drain_stream,
+    has_reasoning_bearing_block,
+    thinking_off_template_kwargs,
+)
+from turnstone.core.providers._protocol import (
     TRAILING_INFO_SEPARATOR as TRAILING_INFO_SEPARATOR,
 )
 
@@ -88,11 +94,6 @@ from turnstone.core.providers._protocol import (
     UsageInfo as UsageInfo,
 )
 from turnstone.core.providers._protocol import (
-    drain_stream,
-    has_reasoning_bearing_block,
-    thinking_off_template_kwargs,
-)
-from turnstone.core.providers._protocol import (
     folds_trailing_info as folds_trailing_info,
 )
 from turnstone.core.providers._protocol import (
@@ -108,6 +109,7 @@ from turnstone.core.storage._utils import (
 from turnstone.core.trajectory import (
     PROVENANCE_META_KEY,
     ProviderNative,
+    TextBlock,
     ToolCall,
     Turn,
     TurnProvenance,
@@ -1006,11 +1008,48 @@ class ModelTurnResult:
     producer: str = ""
     serving_model: str = ""
     tool_def_chars: int | None = None
+    # None means the adapter did not report its final request's tool posture.
+    native_tools_enabled: bool | None = None
 
     @property
     def content(self) -> str:
         """The assistant text — convenience mirror of ``turn.text``."""
         return self.turn.text
+
+
+def is_empty_completion(result: ModelTurnResult) -> bool:
+    """An ordinary stop with no answer, tool proposal, or other known output.
+
+    Reasoning alone cannot answer the user. Unknown native blocks are preserved
+    as output; this is a structural check, never a judgment of task completion.
+    """
+    if result.finish_reason != "stop" or result.tool_calls or result.turn.tool_calls:
+        return False
+    if any(not isinstance(block, TextBlock) or block.text.strip() for block in result.turn.content):
+        return False
+
+    def reasoning_or_text(block: Any) -> bool:
+        if not isinstance(block, dict):
+            return False
+        kind = block.get("type")
+        if not isinstance(kind, str):
+            return False
+        if kind in REASONING_BEARING_BLOCK_TYPES:
+            return True
+        # Known text blocks are replay copies of the canonical answer checked
+        # above. They still contain any inline thinking tags the drain parsed
+        # out; treating those raw bytes as an answer would bypass recovery.
+        return kind in ("text", "output_text") and isinstance(block.get("text"), str)
+
+    for block in result.turn.native.blocks if result.turn.native else ():
+        if reasoning_or_text(block):
+            continue
+        if isinstance(block, dict) and block.get("type") == "message":
+            parts = block.get("content")
+            if isinstance(parts, list) and all(reasoning_or_text(part) for part in parts):
+                continue
+        return False
+    return True
 
 
 def cap_tool_calls(result: ModelTurnResult, max_calls: int) -> tuple[list[dict[str, Any]], Turn]:
@@ -1538,4 +1577,5 @@ def model_turn(
             if request_metrics
             else serialized_tool_chars(tools)
         ),
+        native_tools_enabled=request_metrics[-1].native_tools_enabled if request_metrics else None,
     )

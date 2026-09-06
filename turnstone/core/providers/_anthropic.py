@@ -25,6 +25,7 @@ from turnstone.core.providers._protocol import (
     finish_shim_due,
     merge_reasoning_template_kwargs,
     refuse_aborted_request,
+    request_uses_native_tools,
     serialized_tool_chars,
     snap_reasoning_effort,
 )
@@ -989,7 +990,12 @@ class AnthropicProvider:
         if request_metrics_ref is not None:
             request_metrics_ref.append(
                 ProviderRequestMetrics(
-                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools"))
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
+                    native_tools_enabled=request_uses_native_tools(
+                        # Anthropic client tools may omit type or use "custom".
+                        kwargs,
+                        client_tool_types=(None, "custom"),
+                    ),
                 )
             )
 
@@ -1369,9 +1375,6 @@ def _normalize_finish_reason(reason: str) -> str:
         return "tool_calls"
     if reason == "max_tokens":
         return "length"
-    if reason == "pause_turn":
-        # Server-side tool (web search) paused a long turn; treat as stop
-        return "stop"
     if reason == "refusal":
         # A safety classifier declined the request.  This arrives as a
         # SUCCESSFUL HTTP 200 with content empty (declined before any
