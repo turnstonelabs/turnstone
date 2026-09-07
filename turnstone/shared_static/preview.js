@@ -48,9 +48,17 @@ function make(tag, className, text) {
   return node;
 }
 
+function makeAction(tag, text, label) {
+  const node = make(tag, "preview-action", text);
+  if (tag === "button") node.type = "button";
+  node.title = label;
+  node.setAttribute("aria-label", label);
+  return node;
+}
+
 // The per-workstream serving route for a descriptor, through the originating
 // pane's transport base ("" local, "/node/{id}" console-proxied).
-function previewContentUrl(ctx, descriptor) {
+function previewContentUrl(ctx, descriptor, endpoint = "preview") {
   const base = (ctx && ctx.base) || "";
   const ws = (ctx && ctx.wsId) || "";
   return (
@@ -59,7 +67,8 @@ function previewContentUrl(ctx, descriptor) {
     encodeURIComponent(ws) +
     "/attachments/" +
     encodeURIComponent(descriptor.attachment_id || "") +
-    "/preview"
+    "/" +
+    endpoint
   );
 }
 
@@ -229,6 +238,19 @@ export function createPreviewPane(extra, hostApi) {
     pane._fwdBtn.disabled = pane._idx >= pane._stack.length - 1;
   };
 
+  const setDownloadUrl = (url) => {
+    const link = pane._downloadLink;
+    if (url) {
+      link.setAttribute("href", url);
+      link.removeAttribute("aria-disabled");
+      link.removeAttribute("tabindex");
+    } else {
+      link.removeAttribute("href");
+      link.setAttribute("aria-disabled", "true");
+      link.setAttribute("tabindex", "-1");
+    }
+  };
+
   const renderEmpty = () => {
     pane._contentEl.replaceChildren(
       make(
@@ -242,8 +264,7 @@ export function createPreviewPane(extra, hostApi) {
   const renderError = (message, entry) => {
     const wrap = make("div", "preview-error");
     wrap.append(make("div", "preview-error-msg", message));
-    const retry = make("button", "preview-retry", "Retry");
-    retry.type = "button";
+    const retry = makeAction("button", "Retry", "Retry preview");
     // A manual retry is a single deliberate attempt — no silent backoff run.
     retry.addEventListener("click", () => renderEntry(entry, MAX_AUTO_RETRIES));
     wrap.append(retry);
@@ -410,6 +431,10 @@ export function createPreviewPane(extra, hostApi) {
     const token = ++pane._loadToken;
     const d = entry.descriptor;
     const url = previewContentUrl(entry.ctx, d);
+    pane._downloadLink.hidden = false;
+    setDownloadUrl(null);
+    const ready = () =>
+      setDownloadUrl(previewContentUrl(entry.ctx, d, "content"));
     const failed = (why) => {
       if (token !== pane._loadToken) return;
       if (attempt < MAX_AUTO_RETRIES) {
@@ -427,8 +452,13 @@ export function createPreviewPane(extra, hostApi) {
     pane._kindEl.textContent = d.kind || "";
     // Display strings can be raw URLs — never print embedded credentials.
     // The ext link below keeps the RAW url (it must actually navigate).
-    pane._titleEl.textContent = redactCredentials(d.title || d.source || "");
-    pane._titleEl.title = redactCredentials(d.source || "");
+    const titleText = redactCredentials(d.title || d.source || "");
+    const sourceText = redactCredentials(d.source || "");
+    pane._titleEl.textContent = titleText;
+    pane._titleEl.title =
+      sourceText && sourceText !== titleText
+        ? titleText + "\n" + sourceText
+        : titleText;
     const isWeb = d.kind === "web" && /^https?:\/\//.test(d.source || "");
     pane._extLink.hidden = !isWeb;
     if (isWeb) pane._extLink.href = d.source;
@@ -462,6 +492,7 @@ export function createPreviewPane(extra, hostApi) {
           if (d.kind === "web") renderWeb(srcUrl);
           else if (d.kind === "pdf") renderPdf(srcUrl, d);
           else renderImage(srcUrl, d);
+          ready();
         })
         .catch(() => failed("Could not load the preview."));
       return;
@@ -485,6 +516,7 @@ export function createPreviewPane(extra, hostApi) {
         if (d.kind === "table") renderTable(text, d);
         else if (d.kind === "markdown") renderMarkdownDoc(text);
         else renderText(text);
+        ready();
       })
       .catch(() => failed("Could not load the preview."));
   };
@@ -508,10 +540,13 @@ export function createPreviewPane(extra, hostApi) {
     if (
       top &&
       top.descriptor.attachment_id === descriptor.attachment_id &&
-      top.descriptor.kind === descriptor.kind
+      top.descriptor.kind === descriptor.kind &&
+      (top.ctx?.base || "") === (ctx?.base || "") &&
+      (top.ctx?.wsId || "") === (ctx?.wsId || "")
     ) {
       // Same content re-requested — re-render in place (retry semantics),
-      // don't grow the history with duplicates.
+      // updating its title/source without growing duplicate history entries.
+      top.descriptor = descriptor;
       showAt(pane._idx);
       return;
     }
@@ -526,24 +561,32 @@ export function createPreviewPane(extra, hostApi) {
     const root = make("div", "preview-root");
 
     const bar = make("div", "preview-bar");
-    const back = make("button", "preview-nav", "◀");
-    back.type = "button";
+    const identity = make("div", "preview-identity");
+    const history = make("div", "preview-history");
+    const back = makeAction("button", "←", "Previous preview");
+    back.classList.add("preview-nav");
     back.title = "Previous preview (←)";
-    back.setAttribute("aria-label", "Previous preview");
     back.addEventListener("click", () => showAt(pane._idx - 1));
-    const fwd = make("button", "preview-nav", "▶");
-    fwd.type = "button";
+    const fwd = makeAction("button", "→", "Next preview");
+    fwd.classList.add("preview-nav");
     fwd.title = "Next preview (→)";
-    fwd.setAttribute("aria-label", "Next preview");
     fwd.addEventListener("click", () => showAt(pane._idx + 1));
+    history.append(back, fwd);
     const kind = make("span", "preview-kindchip", "");
     const title = make("span", "preview-titletext", "");
-    const ext = make("a", "preview-ext", "Open in browser ↗");
+    identity.append(history, kind, title);
+    const actions = make("div", "preview-actions");
+    const download = makeAction("a", "↓ Download", "Download preview file");
+    download.setAttribute("download", "");
+    download.hidden = true;
+    const ext = makeAction("a", "Open source ↗", "Open source in a new tab");
     ext.target = "_blank";
     ext.rel = "noopener noreferrer";
     ext.hidden = true;
-    // Remote-assets opt-in — web previews only.  Plain operator language; the
-    // tooltip states the default posture without naming the mechanism.
+    actions.append(download, ext);
+    bar.append(identity, actions);
+    // Web-only options get their own row so the title and actions retain
+    // room in narrow split panes.
     const assets = make("label", "preview-assets");
     assets.title = "Off keeps this preview from contacting the site";
     const assetsBox = make("input", "preview-assets-box");
@@ -561,8 +604,6 @@ export function createPreviewPane(extra, hostApi) {
       if (cur && cur.descriptor.kind === "web")
         renderEntry(cur, MAX_AUTO_RETRIES);
     });
-    bar.append(back, fwd, kind, title, ext, assets);
-
     const content = make("div", "preview-content");
 
     pane._backBtn = back;
@@ -570,11 +611,12 @@ export function createPreviewPane(extra, hostApi) {
     pane._kindEl = kind;
     pane._titleEl = title;
     pane._extLink = ext;
+    pane._downloadLink = download;
     pane._assetsLabel = assets;
     pane._assetsBox = assetsBox;
     pane._contentEl = content;
 
-    root.append(bar, content);
+    root.append(bar, assets, content);
     this.bodyEl.append(root);
 
     // ←/→ walk the preview history while the pane has focus.  The pane hosts

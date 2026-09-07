@@ -70,6 +70,10 @@ class FakeElement {
     return child;
   }
   append(...children) { children.forEach((child) => this.appendChild(child)); }
+  replaceChildren(...children) {
+    [...this.children].forEach((child) => child.remove());
+    this.append(...children);
+  }
   remove() {
     if (!this.parentNode) return;
     const i = this.parentNode.children.indexOf(this);

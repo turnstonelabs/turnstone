@@ -212,6 +212,7 @@ from turnstone.core.preview import (
     build_preview_descriptor,
     inject_base_href,
     page_title,
+    preview_filename,
     resolve_preview_kind,
     transcode_text,
 )
@@ -27908,12 +27909,12 @@ class ChatSession:
             content_type=stored_mime,
             size=len(body),
         )
-        filename = title if "." in title else f"preview-{kind}"
+        filename = preview_filename(name_hint, stored_mime, is_url=target_kind == "url")
         preview_record = (
             descriptor,
             Attachment(
                 attachment_id=blob_id,
-                filename=filename[:120],
+                filename=filename,
                 mime_type=stored_mime,
                 kind=PREVIEW_BLOB_KIND,
                 content=body,

@@ -1,15 +1,16 @@
-"""Static guards for the preview pane frontend (shared_static/preview.js and
-its wiring through conversation.js / interactive.js / shell.js).
+"""Download behavior and static guards for the shared preview pane frontend.
 
-Same posture as ``test_shell_js.py``: Python-side string-presence assertions
-that catch the silent one-line regression (a renamed export, a dropped
-sandbox attribute, a de-registered pane type).  Parse + sink + var guards for
-``preview.js`` itself live in ``test_shell_js.py``'s bundle sweeps.
+The node harness exercises asynchronous loading, transport context, and history.
+Static assertions cover wiring through conversation.js / interactive.js / shell.js;
+parse and HTML-sink guards live in ``test_shell_js.py``'s bundle sweeps.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+from tests._js_harness_helpers import FAKE_DOM, demodulize, node_skip, run_node_source
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SHARED = _ROOT / "turnstone/shared_static"
@@ -25,6 +26,110 @@ _CONSOLE_INDEX = _ROOT / "turnstone/console/static/index.html"
 
 def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
+
+
+def _run_preview(scenario: str) -> None:
+    source = (
+        FAKE_DOM
+        + f"\nconst {{ ShellPane }} = await import({json.dumps(_PANE_JS.as_uri())});\n"
+        + r"""
+const assert = (value, message) => { if (!value) throw new Error(message); };
+const requests = [];
+const timers = [];
+const authFetch = (url) => new Promise((resolve, reject) => requests.push({url, resolve, reject}));
+const redactCredentials = (text) => text;
+globalThis.setTimeout = (fn) => timers.push(fn);
+const flush = () => new Promise(setImmediate);
+const descriptor = (id, kind = "text") => ({attachment_id: id, kind, title: id, source: id});
+const mount = (extra = null) => {
+  const pane = createPreviewPane(extra, {});
+  pane.el = document.createElement("section");
+  pane.bodyEl = document.createElement("div");
+  pane.el.append(pane.bodyEl);
+  pane.onMount();
+  return pane;
+};
+const succeed = async (request, body = "saved bytes") => {
+  request.resolve(new Response(body));
+  await flush();
+};
+const href = (pane) => pane._downloadLink.getAttribute("href");
+"""
+        + demodulize(_PREVIEW_JS)
+        + "\n"
+        + scenario
+    )
+    proc = run_node_source(source)
+    assert proc.returncode == 0, f"preview harness failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+@node_skip
+def test_download_tracks_ready_content_history_and_rehydration() -> None:
+    _run_preview(r"""
+const pane = mount();
+assert(pane._downloadLink.hidden, "empty pane must not offer a download");
+const d = descriptor("same id");
+const a = {base: "/node/node-A", wsId: "ws/A"};
+const b = {base: "/node/node-B", wsId: "ws B"};
+pane.showPreview(d, a);
+assert(!href(pane), "pending file must not be downloadable");
+assert(pane._downloadLink.getAttribute("aria-disabled") === "true", "pending is disabled");
+await succeed(requests.shift());
+const urlA = "/node/node-A/v1/api/workstreams/ws%2FA/attachments/same%20id/content";
+assert(href(pane) === urlA, "download must use the originating transport and encoded path");
+assert(pane._downloadLink.hasAttribute("download"), "download must save rather than navigate");
+assert(!pane._downloadLink.hasAttribute("tabindex"), "ready link must be keyboard reachable");
+pane.showPreview({...d, title: "Updated title"}, a);
+await succeed(requests.shift());
+assert(pane._stack.length === 1, "reopening the same file must not duplicate history");
+assert(pane._titleEl.textContent === "Updated title", "reopening must refresh display metadata");
+pane.showPreview(d, b);
+assert(!href(pane), "changing workstreams must clear the previous download");
+await succeed(requests.shift());
+const urlB = "/node/node-B/v1/api/workstreams/ws%20B/attachments/same%20id/content";
+assert(href(pane) === urlB, "identical bytes on another workstream must use its own context");
+pane._backBtn.click();
+await succeed(requests.shift());
+assert(href(pane) === urlA, "back must restore the prior file and transport");
+pane._fwdBtn.click();
+await succeed(requests.shift());
+assert(href(pane) === urlB, "forward must restore the next file and transport");
+const restored = mount({descriptor: d, ctx: a});
+assert(!href(restored), "restored files must be checked before enabling download");
+await succeed(requests.shift());
+assert(href(restored) === urlA, "reload must restore the download context");
+""")
+
+
+@node_skip
+def test_stale_loads_errors_and_close_cannot_enable_download() -> None:
+    _run_preview(r"""
+const pane = mount();
+const ctx = {base: "", wsId: "ws"};
+pane.showPreview(descriptor("old"), ctx);
+const old = requests.shift();
+pane.showPreview(descriptor("current", "pdf"), ctx);
+await succeed(old);
+assert(!href(pane), "stale text must not enable a download for a pending preview");
+assert(requests[0].url.endsWith("/current/preview?probe=1"), "PDF must preflight");
+await succeed(requests.shift());
+assert(href(pane).endsWith("/current/content"), "probe success must enable the current file");
+pane.showPreview(descriptor("missing"), ctx);
+for (let attempt = 0; attempt < 5; attempt++) {
+  requests.shift().resolve(new Response("missing", {status: 404}));
+  await flush();
+  assert(!href(pane), "unavailable files must remain disabled throughout retries");
+  if (timers.length) timers.shift()();
+}
+assert(pane.bodyEl.querySelector(".preview-error"), "retry exhaustion must show an error");
+pane.bodyEl.querySelector(".preview-error").querySelector("button").click();
+await succeed(requests.shift());
+assert(href(pane).endsWith("/missing/content"), "manual retry must recover the download");
+pane.showPreview(descriptor("closing", "image"), ctx);
+pane.onClose();
+await succeed(requests.shift());
+assert(!href(pane), "a load completing after close must not enable its link");
+""")
 
 
 class TestPreviewPaneModule:

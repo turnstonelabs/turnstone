@@ -180,11 +180,29 @@ class TestExecOpenPreview:
         assert descriptor["source"] == "https://acme.com/pricing"
         assert descriptor["content_type"].startswith("text/html")
         assert att.kind == "preview"
+        assert att.filename == "pricing.html"
         # The stored bytes gained a base for relative-asset resolution.
         assert b'<base href="https://acme.com/pricing">' in att.content
         # The live event carried the descriptor.
         results = s.ui.tool_results
         assert results and results[-1][3].get("preview") == descriptor
+
+    def test_url_filename_strips_nul_before_persistence(self, _no_network_screen, monkeypatch):
+        s = _make_session()
+        url = "https://example.com/report%00.pdf"
+        body = b"%PDF-1.4 preview"
+        monkeypatch.setattr(
+            "turnstone.core.session.fetch_with_ssrf_guard",
+            lambda url, **kw: _fake_response(url, body, "application/pdf"),
+        )
+        item = s._prepare_open_preview("c1", {"target": url, "title": "Quarterly report"})
+        _, msg = s._exec_open_preview(item)
+        assert not msg.startswith("Error:")
+        descriptor, att = s._tool_previews["c1"]
+        assert att.filename == "report.pdf"
+        assert att.content == body
+        assert descriptor["source"] == url
+        assert descriptor["title"] == "Quarterly report"
 
     def test_url_userinfo_stripped_from_descriptor(self, _no_network_screen, monkeypatch):
         s = _make_session()
@@ -332,9 +350,10 @@ class TestExecOpenPreview:
         item = s._prepare_open_preview("c1", {"target": "attachment:deadbeef"})
         _, msg = s._exec_open_preview(item)
         assert not msg.startswith("Error:")
-        descriptor, _ = s._tool_previews["c1"]
+        descriptor, att = s._tool_previews["c1"]
         assert descriptor["kind"] == "markdown"
         assert descriptor["title"] == "d.md"
+        assert att.filename == "d.md"
 
     def test_legacy_charset_table_stored_as_utf8(self, monkeypatch):
         # A latin-1 CSV attachment previews as a table, and the executor
@@ -369,8 +388,9 @@ class TestExecOpenPreview:
         p.write_text("a,b\n")
         item = s._prepare_open_preview("c1", {"target": str(p), "title": "Q3 numbers"})
         s._exec_open_preview(item)
-        descriptor, _ = s._tool_previews["c1"]
+        descriptor, att = s._tool_previews["c1"]
         assert descriptor["title"] == "Q3 numbers"
+        assert att.filename == "x.csv"
 
 
 # ---------------------------------------------------------------------------

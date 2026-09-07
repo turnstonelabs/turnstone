@@ -22,6 +22,7 @@ from __future__ import annotations
 import html
 import re
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from turnstone.core.attachments import (
     ALLOWED_IMAGE_MIMES,
@@ -97,6 +98,36 @@ _KIND_MIMES: dict[str, str] = {
     "text": "text/plain; charset=utf-8",
     "markdown": "text/markdown; charset=utf-8",
 }
+
+
+def preview_filename(name: str, mime: str, *, is_url: bool = False) -> str:
+    """Keep the source basename, with a MIME extension for extensionless targets.
+
+    Display titles are independent of filenames. URL queries never become part
+    of a filename, and truncation preserves its extension. The serving routes
+    apply their usual header sanitization when the file is requested.
+    """
+    if is_url:
+        name = unquote(urlsplit(name).path)
+    # URL escapes can decode to NUL, which PostgreSQL text columns reject.
+    name = name.replace("\x00", "")
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    stem, dot, suffix = name.rpartition(".")
+    if not dot or not stem or not suffix or len(suffix) > 16:
+        stem = name.rstrip(".") or "preview"
+        suffix = {
+            "text/html": "html",
+            "application/pdf": "pdf",
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+            "text/csv": "csv",
+            "text/tab-separated-values": "tsv",
+            "application/json": "json",
+            "text/markdown": "md",
+        }.get(mime.split(";", 1)[0].strip().lower(), "txt")
+    return f"{stem[: 119 - len(suffix)]}.{suffix}"
 
 
 def _is_utf8_text(data: bytes) -> bool:

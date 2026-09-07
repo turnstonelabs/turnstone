@@ -9,6 +9,8 @@ attaches.  The tool executor and the HTTP route are covered separately
 
 from __future__ import annotations
 
+import pytest
+
 from turnstone.core.attachments import IMAGE_SIZE_CAP, PDF_SIZE_CAP, TEXT_DOC_SIZE_CAP
 from turnstone.core.preview import (
     PREVIEW_BLOB_KIND,
@@ -18,6 +20,7 @@ from turnstone.core.preview import (
     build_preview_descriptor,
     inject_base_href,
     page_title,
+    preview_filename,
     preview_response_headers,
     resolve_preview_kind,
     transcode_text,
@@ -30,6 +33,34 @@ PNG_1x1 = (
 )
 PDF_MIN = b"%PDF-1.4 fake body"
 HTML_DOC = b"<html><head><title>Acme Pricing</title></head><body>hi</body></html>"
+
+
+@pytest.mark.parametrize(
+    ("name", "mime", "is_url", "expected"),
+    [
+        ("/tmp/results.csv", "text/csv", False, "results.csv"),
+        ("C:\\reports\\notes.md", "text/markdown", False, "notes.md"),
+        ("/tmp/report#2?.txt", "text/plain", False, "report#2?.txt"),
+        (
+            "https://example.com/Q3%20report.pdf?token=x#page=2",
+            "application/pdf",
+            True,
+            "Q3 report.pdf",
+        ),
+        ("https://example.com/report", "application/pdf", True, "report.pdf"),
+        ("https://example.com/report%00.pdf", "application/pdf", True, "report.pdf"),
+        ("https://example.com/%00", "text/plain", True, "preview.txt"),
+        ("https://example.com/", "text/html", True, "preview.html"),
+        ("chart", "image/png", False, "chart.png"),
+        ("data", "application/json", False, "data.json"),
+        ("data", "text/tab-separated-values; charset=utf-8", False, "data.tsv"),
+        ("notes", "text/markdown", False, "notes.md"),
+        ("", "text/plain; charset=utf-8", False, "preview.txt"),
+        ("r" * 150 + ".csv", "text/csv", False, "r" * 116 + ".csv"),
+    ],
+)
+def test_preview_download_filename(name, mime, is_url, expected):
+    assert preview_filename(name, mime, is_url=is_url) == expected
 
 
 class TestResolvePreviewKind:
