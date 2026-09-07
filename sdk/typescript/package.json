@@ -33,6 +33,6 @@
   "license": "Apache-2.0",
   "devDependencies": {
     "typescript": "^7.0.0",
-    "vitest": "^4.1"
+    "vitest": "^5.0.0"
   }
 }
