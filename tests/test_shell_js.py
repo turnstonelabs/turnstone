@@ -1086,22 +1086,22 @@ def test_pane_manager_split_engine() -> None:
     assert "_restoreLayout(data)" in pane and "seen.has(d.paneId)" in pane
     # the visible-but-unfocused tab marker
     assert 'classList.toggle("shown"' in pane
-    # per-pane ✕: split mode hides ONE cell keeping the tab (closeCell), EXCEPT
+    # Tab dismissal: split mode hides ONE cell keeping the tab (closeCell), EXCEPT
     # an ephemeral pane which closes outright; single-pane it closes the pane
     # (withheld from non-closable) — the click decides at click time, the label
-    # tracks the mode.  Manager-injected into the pane SECTION (content
-    # untouched), removed via _clearCellStyle.  Ephemeral-dismiss behaviour has
-    # its own deep coverage in test_preview_js.py::TestEphemeralDismiss.
-    assert "closeCell(paneId)" in pane and "_refreshCellChips()" in pane
-    assert 'b.className = "cell-unsplit"' in pane
-    assert '"Close pane"' in pane, "the single-pane chip mode"
+    # tracks the mode.  Dismiss and select are sibling buttons in the tab.
+    # Lifecycle coverage lives in test_pane_js.py; ephemeral guards also live
+    # in test_preview_js.py::TestEphemeralDismiss.
+    assert "closeCell(paneId)" in pane and "_refreshTabDismiss(pane)" in pane
+    assert 'dismiss.className = "tab-dismiss"' in pane
+    assert "group.append(dismiss, tab)" in pane
+    assert '"Close pane"' in pane, "the single-pane dismiss mode"
     # mode-DISTINCT glyphs (designer P1: identical signifier + locus with a
     # reversible/destructive divergence is a mode-error trap) — a click that
     # cannot be a reversible cell-hide shows ✕, else −.
     assert "const destroys = !multi || pane.ephemeral;" in pane
     assert 'b.textContent = destroys ? "✕" : "−"' in pane
-    assert '"cell-unsplit--close"' in pane
-    assert "this._removeCellChip(pane)" in pane
+    assert '"tab-dismiss--close"' in pane
     # open-beside: the coordinator child-link placement (split right of the
     # focused cell, degrade to the plain swap on deny)
     assert "openPaneBeside(type, id, extra)" in pane
@@ -1117,17 +1117,11 @@ def test_pane_manager_split_engine() -> None:
     # section itself paints UNDER edge-touching children (the status-bar
     # occlusion bug); the ::before bar sits above the ring line
     assert ".panes--split > section.pane.split-focused::after" in css
-    assert ".cell-unsplit" in css, "the per-cell hide-from-split chip style"
-    assert ".cell-unsplit--close:hover" in css, "destructive mode telegraphs on hover"
-    # the pane is the chip's containing block in BOTH modes — unpositioned,
-    # the single-pane chip anchored to the VIEWPORT (offsetParent <body>)
+    assert ".tab-dismiss--close:hover" in css, "destructive mode telegraphs on hover"
+    assert ".tab-dismiss[hidden]" in css, "unavailable controls retain their tab slot"
+    assert ".panes > section.pane.tab-dismiss-target::after" in css
+    # The pane contains its target ring in both modes.
     assert ".panes > section.pane" in css
-    # pane-hosted coordinator sidebar drops below the chip's corner lane —
-    # the chip sat exactly on the Children refresh button (user report)
-    coord_chrome = (_ROOT / "turnstone/console/static/coordinator/coord-chrome.css").read_text(
-        encoding="utf-8"
-    )
-    assert ".pane-body.coord-chrome-root #coord-sidebar.sidebar" in coord_chrome
 
 
 def test_step7_auth_gated_open_pane() -> None:

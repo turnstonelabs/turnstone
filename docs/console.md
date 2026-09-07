@@ -395,11 +395,16 @@ The rail is fed by the cluster SSE snapshot and shows:
   coordinator parent and grouped by project when project metadata is visible;
 - permission-filtered Manage groups that open the singleton Admin pane.
 
-Coordinator and interactive conversations open as tabs inside the same shell.
-Interactive panes use the owning node's console proxy, so users do not need
-direct network access to compute-node ports. Split-right and split-down actions
-can display several panes at once. Closing a pane removes only that tab; use the
-pane menu's explicit close or delete action to change the workstream lifecycle.
+Coordinator and interactive conversations open as tabs inside the same shell. Interactive panes use
+the owning node's console proxy, so users do not need direct network access to compute-node ports.
+Split-right and split-down actions can display several panes at once. Each visible pane has a dismiss
+button at the left of its tab: `−` hides a regular split pane while keeping its tab open; `×` closes a
+single pane or a preview. Hovering or focusing the button draws a dashed outline around the affected
+pane, distinct from the active pane's solid accent. The Dashboard can be hidden from a split but cannot
+be closed. Closing a pane removes only that tab; use the pane menu's explicit close or delete action to
+change the workstream lifecycle. When tabs overflow, their strip scrolls horizontally; activating a
+tab or moving keyboard focus to it reveals its label and dismiss control together. When the strip or
+tab widths change, the tab with keyboard focus stays visible; otherwise, the active tab stays visible.
 
 ### Dashboard pane
 

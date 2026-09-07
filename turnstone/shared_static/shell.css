@@ -484,22 +484,26 @@
   position: relative;
   z-index: 20;
 }
-/* The tabs live in their own strip (the role=tablist element — the burger and
-   the [+] tail sit OUTSIDE it in .tabbar, see shell.js buildShell).  On mobile
-   the strip is the horizontal scroller, so those stay pinned. */
+/* Tabs and their dismiss buttons scroll together.  The burger and split
+   controls sit outside the strip in .tabbar and stay pinned. */
 .tabstrip {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
   min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
+/* The semantic tablist owns only tab-select buttons via aria-owns.  It adds
+   no layout box so each dismiss button stays beside its tab. */
+.tablist { display: contents; }
 .tab {
   position: relative;
   flex: none;
   display: inline-flex;
   align-items: center;
   white-space: nowrap;
-  padding: 6px 11px;
+  padding: 0;
   border-radius: var(--r-md);
   font-size: 12.5px;
   line-height: 1.2;
@@ -510,6 +514,21 @@
   font-family: var(--font-ui);
   /* long workstream names ellipsize (.tab-title) instead of growing the tab */
   max-width: 240px;
+}
+.tab-select {
+  flex: 1;
+  min-width: 0;
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 8px 6px 3px;
+  border: none;
+  border-radius: var(--r-md);
+  background: none;
+  color: inherit;
+  font: inherit;
+  white-space: inherit;
+  cursor: pointer;
 }
 .tab-title {
   flex: 0 1 auto;
@@ -563,7 +582,7 @@
   color: var(--ink-2);
 }
 .tab-caret:hover,
-.tab[aria-expanded="true"] .tab-caret {
+.tab-select[aria-expanded="true"] .tab-caret {
   color: var(--ink);
 }
 .tab-caret:hover {
@@ -791,10 +810,7 @@
 .panes--split {
   position: relative;
 }
-/* The pane is the containing block in BOTH modes: unpositioned, the per-pane
-   ✕ chip's absolute would resolve to the VIEWPORT (offsetParent <body>) and
-   only coincidentally land near the pane corner.  The split rule below wins
-   on specificity while split. */
+/* Contain the tab-dismiss target ring in single-pane mode too. */
 .panes > section.pane {
   position: relative;
 }
@@ -810,21 +826,30 @@
    inset shadow paints in the element's background layer, UNDER any opaque
    child touching the edge — the status bar / composer strip occluded it (the
    reported paint bug).  The overlay sits above pane content (a coordinator
-   overlay label uses z:10) and stays click-transparent. */
-.panes--split > section.pane.split-focused::after {
+   overlay label uses z:10) and stays click-transparent.  A separate dashed
+   outline identifies the tab-dismiss target on hover or keyboard focus;
+   the active split cell keeps its solid accent ring and top bar. */
+.panes--split > section.pane.split-focused::after,
+.panes > section.pane.tab-dismiss-target::after {
   content: "";
   position: absolute;
   inset: 0;
-  box-shadow: inset 0 0 0 1px
-    color-mix(in srgb, var(--accent) 55%, var(--hair-2));
   z-index: 12;
   pointer-events: none;
+}
+.panes--split > section.pane.split-focused::after {
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--accent) 55%, var(--hair-2));
 }
 /* light needs a hotter mix: 55% measured 2.60:1 there (sub-3:1); 75% clears.
    Dark stays 55% (3.75:1) — hotter reads as a heavy border on dark. */
 [data-theme="light"] .panes--split > section.pane.split-focused::after {
   box-shadow: inset 0 0 0 1px
     color-mix(in srgb, var(--accent) 75%, var(--hair-2));
+}
+.panes > section.pane.tab-dismiss-target::after {
+  outline: 1px dashed var(--ink-3);
+  outline-offset: -3px;
 }
 .panes--split > section.pane.split-focused::before {
   content: "";
@@ -837,57 +862,59 @@
   z-index: 13; /* above the ring overlay — a clean bar, not bar-plus-ring-line */
   pointer-events: none;
 }
-/* per-pane dismiss chip (.cell-unsplit) — on every visible pane.  Split mode:
+/* Leading tab dismiss button — available for every visible pane.  Split mode:
    "−" hides this cell (the TAB stays — closeCell), but an ephemeral pane (the
    preview) shows "✕" and closes outright; single-pane: "✕" closes the pane
    (withheld from the unclosable Dashboard).  The destructive "✕" modes wear
-   .cell-unsplit--close.  Shell chrome floating over pane content: elevated panel +
-   hairline so it reads as the shell's, not the conversation's; sits clear of
-   the 2px focus bar and the cell corner. */
-.cell-unsplit {
-  position: absolute;
-  top: 5px;
-  right: 14px; /* clear of the message scroller's scrollbar gutter */
-  z-index: 14;
+   .tab-dismiss--close.  The fixed slot keeps tab positions stable when a pane
+   is hidden or the Dashboard cannot be dismissed. */
+.tab-dismiss {
+  flex: none;
+  margin: 0 1px;
   /* 28px: WCAG 2.5.8's 24px floor + a hair (22px under-shot it) */
   width: 28px;
   height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
-  /* --hair-2 measured ~1.3:1 against the chip bg — an invisible boundary;
-     --ink-4 clears 3:1 in both themes */
-  border: 1px solid var(--ink-4);
+  /* The tab supplies the resting frame; show the button's own boundary on
+     hover/focus while retaining its full hit area in every state. */
+  border: 1px solid transparent;
   border-radius: var(--r-sm);
-  background: var(--panel-2);
+  background: none;
   color: var(--ink-3);
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
   opacity: 0.85;
 }
-.cell-unsplit:hover {
+.tab-dismiss[hidden] {
+  display: flex;
+  visibility: hidden;
+}
+.tab-dismiss:hover {
   opacity: 1;
   color: var(--ink);
   border-color: var(--accent-dim);
 }
 /* the destructive mode (single-pane "Close pane" ✕) telegraphs BEFORE the
    click lands — split-mode muscle memory must not fire it blind */
-.cell-unsplit--close:hover {
+.tab-dismiss--close:hover {
   color: var(--err);
   border-color: var(--err);
 }
-.cell-unsplit:focus-visible {
+.tab-select:focus-visible,
+.tab-dismiss:focus-visible {
   opacity: 1;
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
-.cell-unsplit--close:focus-visible {
+.tab-dismiss--close:focus-visible {
   outline-color: var(--err);
 }
 /* light resting glyph at .85 sat right at the 3:1 floor with --ink-3 — one
    ink step restores headroom (~4.5:1) without making the chip shout */
-[data-theme="light"] .cell-unsplit {
+[data-theme="light"] .tab-dismiss {
   color: var(--ink-2);
 }
 /* separator — a 7px hit area straddling the cell boundary with a 1px visual
@@ -957,6 +984,7 @@
 .tab.shown:not(.active)::after {
   content: "";
   position: absolute;
+  pointer-events: none;
   left: 8px;
   right: 8px;
   bottom: 2px;
@@ -1492,14 +1520,9 @@
   .app.rail-open .rail-scrim {
     display: block;
   }
-  /* the tab strip scrolls horizontally (burger + [+] stay pinned); tabs
-     tighten so 2-3 stay legible */
+  /* Tabs tighten on mobile so 2-3 stay legible. */
   .tabbar {
     padding: 8px 8px;
-  }
-  .tabstrip {
-    overflow-x: auto;
-    scrollbar-width: thin;
   }
   .tab {
     max-width: 48vw;

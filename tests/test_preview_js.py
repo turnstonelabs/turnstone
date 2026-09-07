@@ -281,27 +281,27 @@ class TestEphemeralDismiss:
             "ShellPane must accept and default the ephemeral flag"
         )
 
-    def test_cell_chip_closes_ephemeral_pane_outright(self) -> None:
-        """In a split the ✕ chip normally HIDES the cell (closeCell); for an
+    def test_tab_dismiss_closes_ephemeral_pane_outright(self) -> None:
+        """In a split the dismiss button normally HIDES the cell (closeCell); for an
         ephemeral pane it must fall through to close() — the `!pane.ephemeral`
         guard is what routes it there.  Pin BOTH the guard and where the
         skipped case lands (the else), or gutting the else regresses the fix
         while the guard string survives verbatim."""
         body = _read(_PANE_JS)
         assert "if (this._layout && this._leafFor(pane.id) && !pane.ephemeral)" in body, (
-            "the cell chip must skip closeCell for an ephemeral pane"
+            "tab dismissal must skip closeCell for an ephemeral pane"
         )
         assert "else this.close(pane.id);" in body, (
             "the skipped (ephemeral / single-pane) case must land on close()"
         )
 
-    def test_cell_chip_signals_destruction_for_ephemeral(self) -> None:
-        """The glyph/label must not lie: an ephemeral pane's split chip reads
+    def test_tab_dismiss_signals_destruction_for_ephemeral(self) -> None:
+        """The glyph/label must not lie: an ephemeral pane's dismiss button reads
         as a destructive close (✕ + danger hover + 'Close pane'), never the
         reversible '− / Hide from split'."""
         body = _read(_PANE_JS)
         assert "const destroys = !multi || pane.ephemeral;" in body, (
-            "chip mode must treat ephemeral panes as destructive even in a split"
+            "dismiss mode must treat ephemeral panes as destructive even in a split"
         )
 
     def test_unsplit_closes_ephemeral_non_survivors(self) -> None:

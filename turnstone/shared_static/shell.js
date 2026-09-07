@@ -104,11 +104,8 @@ function buildShell(caps) {
   burger.setAttribute("aria-label", "Open navigation");
   burger.setAttribute("aria-controls", "shell-rail");
   burger.setAttribute("aria-expanded", "false");
-  // The tab strip is its OWN element so PaneManager's role="tablist" wraps
-  // ONLY the tabs — the burger and the [+] tail are non-tab focusables and
-  // don't belong inside a tablist's accessibility tree.  It is also the
-  // horizontal scroller on mobile, so burger + [+] stay pinned while tabs
-  // scroll.
+  // Tabs and their dismiss buttons share a horizontal scroller, keeping the
+  // burger and [+] pinned.  PaneManager owns the tablist accessibility tree.
   const tabstrip = make("div", "tabstrip");
   const tail = make("div", "tabbar-right"); // right-floated tab-bar chrome (the [+])
   tabbar.append(burger, tabstrip, tail);
@@ -552,9 +549,7 @@ async function mountShell() {
   };
 
   // ----- PaneManager: one new spine -----
-  // It owns the tabstrip (role=tablist), NOT the whole tab bar: the burger and
-  // the [+] tail live outside the strip so the tablist holds only tabs.  No
-  // tailEl — the strip has no non-tab chrome to anchor before.
+  // It owns the tabstrip; the burger and [+] stay in the surrounding tab bar.
   const pm = new PaneManager({
     tabbarEl: shell.tabstrip,
     panesEl: shell.panes,

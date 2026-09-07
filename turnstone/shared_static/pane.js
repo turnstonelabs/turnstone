@@ -45,11 +45,10 @@ export class ShellPane {
     this.glyph = opts.glyph || null; // a single static char shown in the tab (e.g. "◇"); stateful panes use a live .ui-glyph-* instead
     this.stateful = opts.stateful || false; // conversational panes: tab glyph tracks live Tier-1 state (set via setTabGlyph)
     this.closable = opts.closable !== false; // dashboard is not closable
-    // Ephemeral: a pane with no standalone background-tab life.  Dismissing its
-    // split cell (the ✕ chip, or unsplit) CLOSES it — destroy, not the default
-    // hide-and-keep-the-tab — because there is no meaningful re-open-from-tab;
-    // its reopen affordance lives elsewhere (the transcript preview chip).  The
-    // preview singleton sets this; conversational panes do not.
+    // Ephemeral: a pane with no standalone background-tab life.  Dismissing its split cell
+    // (the tab's dismiss button, or unsplit) CLOSES it — destroy, not the default hide-and-keep-the-tab —
+    // because there is no meaningful re-open-from-tab; its reopen affordance lives elsewhere (the
+    // transcript preview chip).  The preview singleton sets this; conversational panes do not.
     this.ephemeral = opts.ephemeral || false;
     // DOM — created and owned by the PaneManager on mount:
     this.el = null; // <section class="pane">
@@ -226,9 +225,6 @@ export class PaneManager {
     opts = opts || {};
     this.tabbarEl = opts.tabbarEl;
     this.panesEl = opts.panesEl;
-    // managed tabs are inserted before this element (the right-floated region /
-    // add-tab affordance), so non-tab tabbar chrome keeps its position.
-    this.tailEl = opts.tailEl || null;
     this.caps = opts.caps || {};
     this.storageKey = opts.storageKey || "ts.shell.panes";
     this._types = new Map(); // type -> factory(id) => ShellPane
@@ -255,14 +251,29 @@ export class PaneManager {
         true,
       );
     }
-    // The tab bar is a WAI-ARIA tablist; arrow keys rove focus across the open
-    // tabs (delegated, so it survives tab reconciliation).
+    // Keep dismiss buttons outside the tablist's accessibility tree.  Its
+    // aria-owns follows tab order while the DOM pairs each tab with its dismiss
+    // button.  Key handling stays on the strip so both buttons can rove focus.
     if (this.tabbarEl) {
-      this.tabbarEl.setAttribute("role", "tablist");
-      this.tabbarEl.setAttribute("aria-label", "Open panes");
+      this._tablistEl = document.createElement("span");
+      this._tablistEl.className = "tablist";
+      this._tablistEl.setAttribute("role", "tablist");
+      this._tablistEl.setAttribute("aria-label", "Open panes");
+      this.tabbarEl.append(this._tablistEl);
       this.tabbarEl.addEventListener("keydown", (e) =>
         this._onTablistKeydown(e),
       );
+      this.tabbarEl.addEventListener("focusin", (e) => {
+        // Pointer focus precedes click: scrolling here can move the button
+        // out from under the pointer before mouseup, losing the click.
+        if (!e.target.matches(":focus-visible")) return;
+        const group = e.target.closest(".tab");
+        if (group) this._revealTab(this._panes.get(group.dataset.paneId));
+      });
+      // Observe the strip and its tabs: viewport/rail resizing changes the
+      // available width, while late titles and glyphs can move the focused tab.
+      this._tabResizeObserver = new ResizeObserver(() => this._revealTab());
+      this._tabResizeObserver.observe(this.tabbarEl);
     }
   }
 
@@ -345,6 +356,7 @@ export class PaneManager {
     if (!pane || text == null || text === "") return;
     pane.title = text;
     if (pane._titleNode) pane._titleNode.textContent = text;
+    if (pane.tabEl) this._refreshTabDismiss(pane);
   }
 
   /** Open panes whose tab shows live Tier-1 state — `{id, rawId}[]` (the shell
@@ -494,8 +506,8 @@ export class PaneManager {
       }
     }
     if (this._layout) this._applyLayout();
-    this._refreshCellChips();
     this._renderTabs();
+    this._revealTab(next);
     this._persist();
     this._notifyActive();
   }
@@ -648,7 +660,7 @@ export class PaneManager {
   }
 
   /** Remove ONE cell from the split — the pane stays open as a (now hidden)
-   *  tab and its sibling absorbs the space.  The per-cell ✕ chip calls this;
+   *  tab and its sibling absorbs the space.  The tab's − button calls this;
    *  distinct from close() (destroys the pane) and unsplit() (collapses every
    *  cell but the focused one). */
   closeCell(paneId) {
@@ -858,7 +870,6 @@ export class PaneManager {
       this._clearCellStyle(p);
       if (keepId) p.el.hidden = p.id !== keepId;
     }
-    this._refreshCellChips(); // the survivor's ✕ flips to close-pane mode
   }
 
   _clearCellStyle(pane) {
@@ -867,63 +878,7 @@ export class PaneManager {
     pane.el.style.width = "";
     pane.el.style.height = "";
     pane.el.classList.remove("split-focused");
-    this._removeCellChip(pane);
-  }
-
-  /** The per-pane ✕ chip, top-right of every VISIBLE pane.  Mode-dependent:
-   *  in a multi-cell split it hides that cell (closeCell — the tab stays);
-   *  single-pane it closes the pane outright (tab and all), so it is withheld
-   *  from non-closable panes (the Dashboard) there.  The click decides at
-   *  CLICK time, the label tracks the mode.  Injected by the MANAGER into the
-   *  pane's section (not bodyEl — pane content is never touched). */
-  _refreshCellChips() {
-    const multi = !!this._layout && this._leaves().length > 1;
-    for (const p of this._panes.values()) {
-      const want =
-        !p.el.hidden && (multi ? !!this._leafFor(p.id) : p.closable !== false);
-      if (want) this._ensureCellChip(p, multi);
-      else this._removeCellChip(p);
-    }
-  }
-
-  _ensureCellChip(pane, multi) {
-    let b = pane._cellChip;
-    if (!b || !b.isConnected) {
-      b = document.createElement("button");
-      b.type = "button";
-      b.className = "cell-unsplit";
-      b.addEventListener("click", () => {
-        // In a multi-cell split the chip HIDES this cell (the tab stays) —
-        // except an ephemeral pane (e.g. the preview), which has no background-
-        // tab life and so closes outright, exactly as it does single-pane.
-        if (this._layout && this._leafFor(pane.id) && !pane.ephemeral)
-          this.closeCell(pane.id);
-        else this.close(pane.id);
-      });
-      pane.el.append(b);
-      pane._cellChip = b;
-    }
-    // Mode-DISTINCT glyphs — an identical signifier at an identical locus with
-    // divergent outcomes is a mode-error trap (split-mode muscle memory would
-    // fire the destructive close): − hides the cell (reversible — the tab
-    // stays), ✕ closes the pane.  The chip DESTROYS whenever the click cannot be
-    // a reversible cell-hide: single-pane always, and an ephemeral pane even in
-    // a split.  Close mode also wears a danger hover (shell.css .cell-unsplit--close).
-    const destroys = !multi || pane.ephemeral;
-    b.textContent = destroys ? "✕" : "−";
-    b.classList.toggle("cell-unsplit--close", destroys);
-    const label = destroys
-      ? "Close pane"
-      : "Hide from split — the tab stays open";
-    b.title = label;
-    b.setAttribute("aria-label", label);
-  }
-
-  _removeCellChip(pane) {
-    if (pane._cellChip) {
-      pane._cellChip.remove();
-      pane._cellChip = null;
-    }
+    pane.el.classList.remove("tab-dismiss-target");
   }
 
   /** Focus follows the pointer between cells: a click anywhere inside a
@@ -931,9 +886,6 @@ export class PaneManager {
    *  stop propagation of bubbled events). */
   _onPanesPointerdown(e) {
     if (!this._layout) return;
-    // The ✕ chip collapses its cell — focusing that cell first would fire a
-    // spurious onActivate on the very pane about to leave the screen.
-    if (e.target.closest && e.target.closest(".cell-unsplit")) return;
     let el = e.target;
     // The ShellPane <section> is the DIRECT child of the host (the interactive
     // pane's inner <div> also carries .pane — walking to the direct child
@@ -1119,37 +1071,107 @@ export class PaneManager {
       const first = this._firstLeaf(tree);
       if (first) this.activate(first.paneId);
     }
-    this._refreshCellChips();
     this._renderTabs(); // pick up the .shown markers
   }
 
   _renderTabs() {
     // Reconcile the managed tabs IN PLACE — never destroy + recreate.  Keeps
     // keyboard focus and click/keydown listeners stable across activate / open /
-    // close, leaves the tail chrome untouched, and is the seam every later pane
-    // type renders its tab through.
-    const anchor =
-      this.tailEl && this.tailEl.parentNode === this.tabbarEl
-        ? this.tailEl
-        : null;
-    for (const paneId of this._order) {
+    // close, and is the seam every pane type renders its tab through.
+    let changed = false;
+    for (const group of this.tabbarEl.querySelectorAll(".tab")) {
+      if (!this._panes.has(group.dataset.paneId)) {
+        this._tabResizeObserver.unobserve(group);
+        group.remove();
+        changed = true;
+      }
+    }
+    let anchor = null;
+    for (const paneId of [...this._order].reverse()) {
       const pane = this._panes.get(paneId);
       const tab = pane.tabEl || this._buildTab(pane);
       this._refreshTab(tab, pane);
-      this.tabbarEl.insertBefore(tab, anchor); // idempotent reorder
+      const group = pane._tabGroup;
+      // Moving even an already-connected node drops native keyboard focus.
+      // Reconcile from the tail and leave correctly placed groups untouched.
+      if (group.parentNode !== this.tabbarEl || group.nextSibling !== anchor) {
+        this.tabbarEl.insertBefore(group, anchor);
+        changed = true;
+      }
+      anchor = group;
     }
-    // Drop tabs whose pane is gone.
-    for (const t of Array.from(
-      this.tabbarEl.querySelectorAll('[role="tab"]'),
-    )) {
-      if (!this._panes.has(t.dataset.paneId)) t.remove();
+    if (changed) {
+      this._tablistEl.setAttribute(
+        "aria-owns",
+        this._order.map((id) => this._panes.get(id).tabEl.id).join(" "),
+      );
+      this._revealTab();
     }
   }
 
+  /** Reveal the complete tab, including its leading dismiss button.  Adjust
+   *  only the strip's horizontal scroll; pane and page scrollers stay put.
+   *  Without an explicit target, preserve keyboard focus before selection. */
+  _revealTab(pane) {
+    if (!pane) {
+      const focused = document.activeElement;
+      const group =
+        this.tabbarEl.contains(focused) &&
+        focused.matches(":focus-visible") &&
+        focused.closest(".tab");
+      pane = this._panes.get(group ? group.dataset.paneId : this._activeId);
+    }
+    const width = this.tabbarEl.clientWidth;
+    if (!pane || !pane._tabGroup || !width) return;
+    const strip = this.tabbarEl.getBoundingClientRect();
+    const tab = pane._tabGroup.getBoundingClientRect();
+    const left = strip.left + this.tabbarEl.clientLeft;
+    const right = left + width;
+    // A tab wider than the strip keeps its leading control and title start.
+    if (tab.left < left || tab.width > width)
+      this.tabbarEl.scrollLeft += tab.left - left;
+    else if (tab.right > right)
+      this.tabbarEl.scrollLeft += tab.right - right;
+  }
+
   _buildTab(pane) {
+    // Dismiss and select are sibling buttons: nesting a dismiss button inside
+    // the role=tab button would create invalid, inaccessible controls.
+    const group = document.createElement("span");
+    group.className = "tab";
+    group.dataset.paneId = pane.id;
+    group.setAttribute("role", "presentation");
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "tab-dismiss";
+    dismiss.setAttribute("aria-controls", pane.el.id);
+    dismiss.addEventListener("click", () => {
+      const hadFocus = document.activeElement === dismiss;
+      // A regular split cell is hidden; ephemeral panes close outright.
+      if (this._layout && this._leafFor(pane.id) && !pane.ephemeral)
+        this.closeCell(pane.id);
+      else this.close(pane.id);
+      pane.el.classList.remove("tab-dismiss-target");
+      if (hadFocus) {
+        const next = pane.tabEl.isConnected
+          ? pane
+          : this._panes.get(this._activeId);
+        if (next) next.tabEl.focus({ preventScroll: true });
+      }
+    });
+    const highlight = () => {
+      pane.el.classList.toggle(
+        "tab-dismiss-target",
+        !pane.el.hidden && dismiss.matches(":hover, :focus-visible"),
+      );
+    };
+    for (const event of ["pointerenter", "pointerleave", "focus", "blur"])
+      dismiss.addEventListener(event, highlight);
+    pane._tabGroup = group;
+    pane._dismissBtn = dismiss;
     const tab = document.createElement("button");
     tab.type = "button";
-    tab.className = "tab";
+    tab.className = "tab-select";
     tab.id = "tab-" + cssId(pane.id);
     tab.dataset.paneId = pane.id;
     tab.setAttribute("role", "tab");
@@ -1198,6 +1220,8 @@ export class PaneManager {
       e.preventDefault();
       this._openTabMenu(tab, pane);
     });
+    group.append(dismiss, tab);
+    this._tabResizeObserver.observe(group);
     pane.tabEl = tab;
     return tab;
   }
@@ -1208,10 +1232,31 @@ export class PaneManager {
    *  one (aria-selected stays single — selection means focus). */
   _refreshTab(tab, pane) {
     const active = pane.id === this._activeId;
-    tab.classList.toggle("active", active);
-    tab.classList.toggle("shown", !active && !!this._leafFor(pane.id));
+    pane._tabGroup.classList.toggle("active", active);
+    pane._tabGroup.classList.toggle("shown", !active && !!this._leafFor(pane.id));
     tab.setAttribute("aria-selected", active ? "true" : "false");
     tab.tabIndex = active ? 0 : -1;
+    this._refreshTabDismiss(pane);
+  }
+
+  /** Only visible panes offer dismissal: − hides a regular split cell while
+   *  ✕ closes a single or ephemeral pane.  The leading slot stays reserved
+   *  when unavailable, so hiding a cell cannot move another tab under the pointer. */
+  _refreshTabDismiss(pane) {
+    const multi = !!this._layout && this._leaves().length > 1;
+    const want =
+      !pane.el.hidden && (multi ? !!this._leafFor(pane.id) : pane.closable !== false);
+    const b = pane._dismissBtn;
+    b.hidden = !want;
+    if (!want) pane.el.classList.remove("tab-dismiss-target");
+    const destroys = !multi || pane.ephemeral;
+    b.textContent = destroys ? "✕" : "−";
+    b.classList.toggle("tab-dismiss--close", destroys);
+    const label = destroys
+      ? "Close pane"
+      : "Hide from split — the tab stays open";
+    b.title = label;
+    b.setAttribute("aria-label", label + ": " + pane.title);
   }
 
   /** Roving arrow-key navigation across the open tabs.  Manual activation —
@@ -1219,7 +1264,8 @@ export class PaneManager {
    *  does, so arrow-scrubbing never thrashes a pane's Tier-2 stream. */
   _onTablistKeydown(e) {
     const tabs = Array.from(this.tabbarEl.querySelectorAll('[role="tab"]'));
-    const i = tabs.indexOf(document.activeElement);
+    const group = document.activeElement.closest(".tab");
+    const i = tabs.indexOf(group && group.querySelector('[role="tab"]'));
     if (i < 0) return;
     // ContextMenu key / Shift+F10 opens the focused tab's action menu — keyboard
     // parity with the caret click (the caret itself is a decorative span).
@@ -1242,7 +1288,7 @@ export class PaneManager {
     else if (e.key === "End") j = tabs.length - 1;
     else return;
     e.preventDefault();
-    tabs[j].focus();
+    tabs[j].focus({ preventScroll: true });
   }
 
   /** Open a pane's tab-action dropdown, anchored under its caret.  Generic: the
