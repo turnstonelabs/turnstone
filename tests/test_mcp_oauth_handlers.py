@@ -471,6 +471,9 @@ class TestCallback:
 
         assert resp.status_code == 302
         assert resp.headers["location"] == "/admin/mcp-servers"
+        assert http_client_mock.post.call_args.kwargs["data"]["resource"] == (
+            "https://mcp.example.com/sse"
+        )
         # Token row was persisted.
         plain = token_store.get_user_token("user-1", "srv-oauth")
         assert plain is not None
@@ -729,18 +732,22 @@ class TestNoTokenStore:
 
 
 class TestDCR:
+    @pytest.mark.parametrize("scopes", [None, "", "openid profile"])
     def test_registration_endpoint_hit_when_dcr_and_no_client_id(
-        self, storage: SQLiteBackend, http_client_mock: MagicMock
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, scopes: str | None
     ) -> None:
-        _seed_oauth_user_server(
+        server_id = _seed_oauth_user_server(
             storage,
             client_id=None,
             registration_mode="dcr",
         )
+        storage.update_mcp_server(server_id, oauth_scopes=scopes)
         token_store = _make_token_store(storage)
 
         async def _post(url, *args, **kwargs):
             if url.endswith("/register"):
+                if "resource" in kwargs["json"]:
+                    return _mk_response(400, {"error": "invalid_client_metadata"})
                 return _mk_response(
                     201, {"client_id": "dcr-client-xyz", "client_secret": "dcr-secret"}
                 )
@@ -756,6 +763,20 @@ class TestDCR:
             resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
 
         assert resp.status_code == 302
+        http_client_mock.post.assert_awaited_once()
+        body = http_client_mock.post.call_args.kwargs["json"]
+        expected: dict[str, Any] = {
+            "redirect_uris": ["https://testserver/v1/api/mcp/oauth/callback"],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        }
+        if scopes:
+            expected["scope"] = scopes
+        assert body == expected
+        params = urllib.parse.parse_qs(urllib.parse.urlsplit(resp.headers["location"]).query)
+        assert params["client_id"] == ["dcr-client-xyz"]
+        assert params["resource"] == ["https://mcp.example.com/sse"]
         # client_id was persisted on the row.
         row = storage.get_mcp_server_by_name("srv-oauth")
         assert row is not None

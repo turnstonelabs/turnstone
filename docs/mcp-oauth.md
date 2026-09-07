@@ -42,6 +42,11 @@ Switching `auth_type` away from `oauth_user` / `oauth_obo` **deletes** that serv
    - **Pre-registered** (most common): you create an OAuth client at the authorization server (manually, via admin console, or via Terraform), then paste the `client_id` / `client_secret` into the Turnstone admin form.
    - **Dynamic client registration** (RFC 7591): if the AS supports it and you select that mode in the admin form, Turnstone registers a client at first use and persists the `client_id` automatically.
 
+   For Keycloak dynamic registration, the configured scopes must be permitted by the realm's
+   **Allowed Client Scopes** registration policy. Even `openid` can cause a registration HTTP 400
+   when that policy does not allow it. Leave scopes empty to omit the registration `scope` and use
+   the realm's default client scopes, or configure the policy to permit the scopes you need.
+
 4. **Public callback origin**. Set `[oidc] redirect_base` to the dashboard's
    HTTPS origin, even when users log in with local usernames and passwords.
    Register exactly `https://your-turnstone-host/v1/api/mcp/oauth/callback` at

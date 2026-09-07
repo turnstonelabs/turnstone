@@ -1154,6 +1154,7 @@ async def discover_authorization_server(
                         server_name=server_name,
                         reason=sanitize_log_text(str(exc)),
                     )
+                    cached_issuer = None
                     if server_id:
                         try:
                             await asyncio.to_thread(
@@ -1185,32 +1186,32 @@ async def discover_authorization_server(
                     server_name=server_name,
                 )
 
-            if metadata_cache is not None:
-                cached = metadata_cache.get(issuer)
-                if cached is not None:
-                    metadata, fetched_at = cached
-                    if time.monotonic() - fetched_at < MCP_OAUTH_DISCOVERY_CACHE_TTL_SECONDS:
-                        return metadata
-
-            # Only an operator-typed issuer carries the opt-in. A cached
-            # issuer was resolved from a PRM document, never from the
-            # override, so it is remote-named and stays strict.
-            metadata = await _fetch_as_metadata(
-                issuer,
-                http_client=http_client,
-                trusted_hosts=trusted_hosts,
-                deadline=deadline,
-                allow_private=allow_private_network and bool(override_url),
-            )
+            cached = metadata_cache.get(issuer) if metadata_cache is not None else None
+            if (
+                cached is not None
+                and time.monotonic() - cached[1] < MCP_OAUTH_DISCOVERY_CACHE_TTL_SECONDS
+            ):
+                metadata = cached[0]
+            else:
+                # Only an operator-typed issuer carries the opt-in. A cached
+                # issuer was resolved from a PRM document, never from the
+                # override, so it is remote-named and stays strict.
+                metadata = await _fetch_as_metadata(
+                    issuer,
+                    http_client=http_client,
+                    trusted_hosts=trusted_hosts,
+                    deadline=deadline,
+                    allow_private=allow_private_network and bool(override_url),
+                )
+                if metadata_cache is not None:
+                    metadata_cache[issuer] = (metadata, time.monotonic())
     except TimeoutError as exc:
         raise MCPOAuthDiscoveryError("discovery exceeded its time budget") from exc
 
-    if metadata_cache is not None:
-        metadata_cache[issuer] = (metadata, time.monotonic())
-
-    # Persist the resolved issuer when the row had no cached value yet,
+    # Persist the resolved issuer when the row had no valid cached value,
+    # including when another row already warmed the AS metadata cache,
     # so subsequent calls skip PRM. We never overwrite an existing
-    # cached_issuer; the console clears it when the server URL or the AS
+    # valid cached_issuer; the console clears it when the server URL or the AS
     # override changes, which is when the cached value stops describing
     # the row.
     if not cached_issuer and not override_url and server_id:
@@ -1462,10 +1463,9 @@ async def register_dynamic_client(
     as_metadata: ASMetadata,
     redirect_uri: str,
     http_client: httpx.AsyncClient,
-    mcp_server_canonical_url: str,
     scopes: str = "",
 ) -> tuple[str, str | None]:
-    """Register a public client at the AS ``registration_endpoint``.
+    """Register a public client using RFC 7591 client metadata.
 
     Returns ``(client_id, client_secret_or_None)``. Empty ``client_secret``
     means the AS issued a public client (preferred for the per-user flow).
@@ -1487,10 +1487,6 @@ async def register_dynamic_client(
     }
     if scopes:
         body["scope"] = scopes
-    if mcp_server_canonical_url:
-        # RFC 8707 audience hint — many AS impls echo this back into
-        # token aud claims.
-        body["resource"] = mcp_server_canonical_url
 
     try:
         resp = await http_client.post(
@@ -4729,7 +4725,6 @@ async def _register_dynamic_client_if_needed(
     as_metadata: ASMetadata,
     server_row: dict[str, Any],
     server_id: str,
-    server_url: str,
     server_name: str,
     user_id: str,
     redirect_uri: str,
@@ -4768,7 +4763,6 @@ async def _register_dynamic_client_if_needed(
                 as_metadata=as_metadata,
                 redirect_uri=redirect_uri,
                 http_client=http_client,
-                mcp_server_canonical_url=server_url,
                 scopes=server_row.get("oauth_scopes") or "",
             )
         except MCPOAuthError as exc:
@@ -5002,7 +4996,6 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
         as_metadata=as_metadata,
         server_row=server_row,
         server_id=server_id,
-        server_url=server_url,
         server_name=server_name,
         user_id=user_id,
         redirect_uri=redirect_uri,

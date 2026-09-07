@@ -27,7 +27,11 @@ import pytest
 
 from tests.conftest import make_mcp_token_cipher
 from turnstone.core.mcp_crypto import MCPTokenStore
-from turnstone.core.mcp_oauth import get_user_access_token
+from turnstone.core.mcp_oauth import (
+    discover_authorization_server,
+    get_user_access_token,
+    get_user_access_token_classified,
+)
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 # Generous CI ceiling — cancel/drain is sub-millisecond on a healthy loop.
@@ -576,6 +580,120 @@ class TestObserveOnlyLookup:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("clear_metadata_cache", [False, True])
+@pytest.mark.parametrize("rejected_issuer", [None, "https://internal.corp.example.com"])
+def test_shared_issuer_refresh_survives_resource_metadata_outage(
+    storage: SQLiteBackend, clear_metadata_cache: bool, rejected_issuer: str | None
+) -> None:
+    """A second server reuses AS metadata, persists its issuer, then refreshes without PRM."""
+    issuer = "https://as.example.com"
+    requests: list[tuple[str, str]] = []
+    prm_available = True
+    servers = {
+        "srv-first": "https://first.example.com/sse",
+        "srv-oauth": "https://mcp.example.com/sse",
+    }
+    prm_urls = {
+        "https://first.example.com/.well-known/oauth-protected-resource/sse": servers["srv-first"],
+        "https://mcp.example.com/.well-known/oauth-protected-resource/sse": servers["srv-oauth"],
+    }
+    metadata_url = f"{issuer}/.well-known/oauth-authorization-server"
+    token_url = f"{issuer}/token"
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requests.append((request.method, url))
+        if request.method == "GET" and request.url.host != "as.example.com":
+            if not prm_available:
+                return httpx.Response(503)
+            return httpx.Response(
+                200, json={"resource": prm_urls[url], "authorization_servers": [issuer]}
+            )
+        if request.method == "GET" and url == metadata_url:
+            return httpx.Response(200, json=_good_as_metadata_doc())
+        if request.method == "POST" and url == token_url:
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "fresh-bbb",
+                    "refresh_token": "refresh-rotated",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {url}")
+
+    async def _run() -> None:
+        nonlocal prm_available
+        with patch(
+            "socket.getaddrinfo",
+            side_effect=lambda host, *a, **kw: [
+                (
+                    2,
+                    1,
+                    6,
+                    "",
+                    ("10.0.0.1" if host == "internal.corp.example.com" else "93.184.216.34", 0),
+                )
+            ],
+        ):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+                state = _make_app_state(storage, http_client=client)
+                for name, url in servers.items():
+                    storage.create_mcp_server(
+                        server_id=name,
+                        name=name,
+                        transport="streamable-http",
+                        url=url,
+                        auth_type="oauth_user",
+                        oauth_client_id="client-abc",
+                        oauth_scopes="openid profile",
+                        oauth_audience="https://mcp.example.com",
+                    )
+                    cached_issuer = rejected_issuer if name == "srv-oauth" else None
+                    if cached_issuer:
+                        storage.update_mcp_server(name, oauth_as_issuer_cached=cached_issuer)
+                    await discover_authorization_server(
+                        server_name=name,
+                        server_url=url,
+                        override_url=None,
+                        cached_issuer=cached_issuer,
+                        http_client=client,
+                        storage=storage,
+                        server_id=name,
+                        trusted_hosts=frozenset(),
+                        metadata_cache=state.mcp_oauth_metadata_cache,
+                    )
+                assert requests == [
+                    ("GET", "https://first.example.com/.well-known/oauth-protected-resource/sse"),
+                    ("GET", metadata_url),
+                    ("GET", "https://mcp.example.com/.well-known/oauth-protected-resource/sse"),
+                ]
+                _seed_token(state, expires_in_seconds=-1000)
+                if clear_metadata_cache:
+                    state.mcp_oauth_metadata_cache.clear()
+                requests.clear()
+                prm_available = False
+
+                result = await get_user_access_token_classified(
+                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                )
+
+                assert result.kind == "token", result
+                assert result.token == "fresh-bbb"
+                expected = [("GET", metadata_url)] if clear_metadata_cache else []
+                assert requests == [*expected, ("POST", token_url)]
+                for name in servers:
+                    row = storage.get_mcp_server_by_name(name)
+                    assert row is not None
+                    assert row["oauth_as_issuer_cached"] == issuer
+                token = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+                assert token is not None
+                assert token["refresh_token"] == "refresh-rotated"
+
+    asyncio.run(_run())
+
+
 class TestUnchangedToken:
     def test_returns_existing_token_when_not_expired(self, storage: SQLiteBackend) -> None:
         _seed_server(storage)
@@ -684,6 +802,7 @@ class TestRefresh:
         assert token == "access-NEW"
         # The refresh endpoint was hit exactly once.
         assert client.post.call_count == 1
+        assert client.post.call_args.kwargs["data"]["resource"] == "https://mcp.example.com/sse"
         # Verify the new tokens were persisted.
         plain = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
         assert plain is not None

@@ -625,10 +625,10 @@ async def _run(cfg: dict[str, str]) -> None:
                 if done2.status_code == 302
                 and "audience+mismatch" in done2.headers.get("location", "")
                 and not persisted
-                and ("POST", token_endpoint) in calls
+                and calls == [("POST", token_endpoint)]
                 else "FAILED",
                 f"N2 audience mismatch: HTTP {done2.status_code} location={done2.headers.get('location')} "
-                f"persisted={persisted} (want False) wire={calls}",
+                f"persisted={persisted} (want False) wire={calls} (want one token POST, no PRM)",
             )
 
         # D4 — the issuer is persisted on a row whose authorization server is

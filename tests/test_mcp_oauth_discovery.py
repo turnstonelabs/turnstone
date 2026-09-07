@@ -1083,23 +1083,27 @@ class TestMetadataCache:
                     trusted_hosts=frozenset(),
                     metadata_cache=cache,
                 )
+                cached_entry = (first, time.monotonic() - 60)
+                cache[first.issuer] = cached_entry
                 second = await discover_authorization_server(
                     server_name="srv-x",
                     server_url="https://mcp.example.com/sse",
                     override_url="https://as.example.com",
-                    cached_issuer="https://as.example.com",
+                    cached_issuer=None,
                     http_client=client,
                     storage=storage,
                     server_id="srv-id",
                     trusted_hosts=frozenset(),
                     metadata_cache=cache,
                 )
+                assert cache[first.issuer] == cached_entry
                 return first, second
 
         first, second = asyncio.run(_run())
         assert first.token_endpoint == second.token_endpoint
         # First call hit AS metadata; second call hit the cache.
         assert client.get.call_count == 1
+        storage.update_mcp_server.assert_not_called()
 
     def test_cache_expiry_refetches(self) -> None:
         client = MagicMock(spec=httpx.AsyncClient)
@@ -1136,6 +1140,47 @@ class TestMetadataCache:
         # Stale entry was bypassed -> we hit the network.
         assert client.get.call_count == 1
         assert meta.token_endpoint == "https://as.example.com/token"
+        assert meta is not stale_meta
+        assert cache[meta.issuer][0] is meta
+
+    @pytest.mark.parametrize("cached_issuer", [None, "https://internal.corp.example.com"])
+    def test_failed_metadata_fetch_does_not_persist_issuer(self, cached_issuer: str | None) -> None:
+        doc = _good_as_metadata_doc()
+        doc["code_challenge_methods_supported"] = []
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(
+            side_effect=_router(
+                {
+                    _PATH_PRM: _prm(_SERVER),
+                    _AS_META: _mk_response(200, doc),
+                    "https://as.example.com/.well-known/openid-configuration": _mk_response(404),
+                }
+            )
+        )
+        storage = _mk_storage_mock()
+        cache: dict[str, tuple[ASMetadata, float]] = {}
+
+        async def _run() -> None:
+            with _addr_map_patch({"internal.corp.example.com": ["10.0.0.1"]}):
+                await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=cached_issuer,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                    metadata_cache=cache,
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="S256"):
+            asyncio.run(_run())
+        if cached_issuer:
+            storage.update_mcp_server.assert_called_once_with("srv-id", oauth_as_issuer_cached=None)
+        else:
+            storage.update_mcp_server.assert_not_called()
+        assert cache == {}
 
     def test_persistent_cache_write_on_first_resolution(self) -> None:
         async def _get(url, *args, **kwargs):
@@ -1207,7 +1252,7 @@ class TestCachedIssuerSSRFRevalidation:
     bypass the guard just because the value was already in the row.
     """
 
-    def test_cached_issuer_rejected_clears_row_and_falls_through_to_prm(self) -> None:
+    def test_cached_issuer_rejected_clears_row_and_persists_replacement(self) -> None:
         async def _get(url: str, *args: Any, **kwargs: Any) -> MagicMock:
             if url.endswith("/oauth-protected-resource/sse"):
                 return _mk_response(
@@ -1256,6 +1301,9 @@ class TestCachedIssuerSSRFRevalidation:
             if c.kwargs.get("oauth_as_issuer_cached") is None
         ]
         assert clear_calls, "cached_issuer should have been cleared"
+        storage.update_mcp_server.assert_called_with(
+            "srv-id", oauth_as_issuer_cached="https://as.example.com"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -111,6 +111,13 @@ the obo harness).
 ./scripts/obo-e2e/oauth_user_e2e.sh
 ```
 
+Results — RUN 2026-09-06, 15 VERIFIED / 0 FAILED (exit 0) after the #1081 and #1082 fixes:
+D4 verifies that the second row persists its issuer when AS metadata is already cached. N2's callback
+makes exactly one token POST with no PRM fetch; the harness now asserts that request list. D3 registers
+a client and completes consent with a token whose audience carries the resource identifier. Discovery,
+consent, refresh, and revocation checks remain verified. The unchanged baseline reproduced both D4 and
+D3 failures before the fixes (13 VERIFIED / 2 FAILED, exit 1).
+
 Results — RUN 2026-09-03, 13 VERIFIED / 2 FAILED (exit 1), reproduced on
 `main` after the discovery rework merged; both failures are
 product findings, not harness defects, and are listed below. VERIFIED: D1
@@ -134,7 +141,7 @@ fallback probed and 404'd, no authorization-server traffic; N2 a real token
 whose `aud` omits the resource refused at the callback with nothing persisted;
 D2 the origin-level fallback accepted for a server that serves only there.
 
-FAILED — product findings:
+Product findings from the 2026-09-03 run:
 
 - **D4 issuer not persisted on a warm metadata cache** (#1081).
   `discover_authorization_server` returns from the in-process metadata-cache hit
