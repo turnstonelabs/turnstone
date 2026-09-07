@@ -121,7 +121,10 @@ def test_operation_failure_preserves_error_and_counts_once(dispatch_env, kind, p
     with pytest.raises(error_type) as caught:
         _call(mgr, kind, pooled)
 
-    assert caught.value is error
+    # Python 3.11/3.12 recreate TimeoutError when bridging asyncio and concurrent futures.
+    # Preserve the operation's type and arguments without requiring object identity.
+    assert caught.type is error_type
+    assert caught.value.args == error.args
     assert mgr._consecutive_failures["srv"] == 2
     state = entry if pooled else mgr._static_servers["srv"]
     # Static generic operation errors count without transport eviction; the
