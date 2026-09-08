@@ -1266,6 +1266,7 @@ class TestServerLogin:
             if uid == "uid_test"
             else None
         )
+        mock_storage.get_user_permissions.return_value = {"read", "write", "approve"}
         mock_storage.list_user_roles.return_value = [
             {"role_id": "builtin-admin", "scopes": "read,write,approve"}
         ]
@@ -1432,15 +1433,8 @@ class TestServerLogin:
         resp = self.test_client.post("/v1/api/auth/refresh")
         assert resp.status_code == 401
 
-    def test_refresh_storage_failure_falls_back(self):
-        """Transient storage error → fall back to in-token claims, not 403.
-
-        The earlier implementation called _load_user_permissions() which
-        swallows exceptions and returns set(); that path was
-        indistinguishable from a deleted user (legitimate 403).  The
-        handler now calls storage.get_user_permissions() directly so
-        DB hiccups fall through to in-token perms.
-        """
+    def test_refresh_storage_failure_does_not_renew(self):
+        """Permission lookup failure refuses renewal without clearing valid credentials."""
         # Re-arm the storage so login works first
         self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
             "read",
@@ -1459,10 +1453,10 @@ class TestServerLogin:
         )
         try:
             resp = self.test_client.post("/v1/api/auth/refresh")
-            assert resp.status_code == 200, resp.text
-            body = resp.json()
-            # Permissions should still be present (fell back to in-token claims)
-            assert body.get("permissions"), body
+            assert resp.status_code == 503, resp.text
+            assert "jwt" not in resp.json()
+            assert "set-cookie" not in resp.headers
+            assert self.test_client.get("/v1/api/workstreams").status_code == 200
         finally:
             # Restore for any subsequent tests
             self.test_client.app.state.auth_storage.get_user_permissions.side_effect = None
@@ -1542,6 +1536,7 @@ class TestConsoleLogin:
             if uid == "uid_test"
             else None
         )
+        mock_storage.get_user_permissions.return_value = {"read", "write", "approve"}
         mock_storage.list_user_roles.return_value = [
             {"role_id": "builtin-admin", "scopes": "read,write,approve"}
         ]

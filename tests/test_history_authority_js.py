@@ -45,8 +45,8 @@ const drain = async () => { for (let i = 0; i < 5; i++) await new Promise(setImm
 function reply(request, data, status = 200) {
   request.resolve(new Response(JSON.stringify(data), {status}));
 }
-const operator = {user_id:'operator', scopes:'read,write', permissions:'read,write'};
-const reader = {user_id:'admin', scopes:'read', permissions:'admin.coordinator'};
+const operator = {can_refresh:true, user_id:'operator', scopes:'read,write', permissions:'read,write'};
+const reader = {can_refresh:true, user_id:'admin', scopes:'read', permissions:'admin.coordinator'};
 function element(id) {
   const el = new FakeElement('div'); elements.set(id, el); return el;
 }
@@ -161,6 +161,7 @@ def test_startup_whoami_401_recovers_pending_requests(cached_identity, refresh_o
         f"const cachedIdentity = {str(cached_identity).lower()};\n"
         f"const refreshOK = {str(refresh_ok).lower()};\n"
         + r"""
+sessionStorage.setItem('turnstone_can_refresh', 'true');
 if (cachedIdentity) {
   sessionStorage.setItem('ts.user_id', operator.user_id);
   sessionStorage.setItem('turnstone_scopes', operator.scopes);

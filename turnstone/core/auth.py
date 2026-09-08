@@ -153,6 +153,25 @@ def _load_user_permissions(storage: Any, user_id: str) -> set[str]:
         return set()
 
 
+def _session_permissions(storage: Any, user_id: str) -> set[str] | JSONResponse:
+    """Resolve current role authority before issuing or renewing a human session."""
+    from starlette.responses import JSONResponse
+
+    try:
+        permissions = set(storage.get_user_permissions(user_id))
+    except Exception:
+        log.warning("Session permission storage unavailable for user %s", user_id, exc_info=True)
+        return JSONResponse({"error": "Permission storage unavailable"}, status_code=503)
+    if not permissions:
+        return JSONResponse({"error": "User has no active permissions"}, status_code=403)
+    return permissions
+
+
+def _can_refresh_session(source: str, scopes: frozenset[str]) -> bool:
+    """Only human role-derived credentials use the public session renewal path."""
+    return source in {"password", "oidc"} and "service" not in scopes
+
+
 def user_has_permission(user_id: str, permission: str, *, storage: Any = None) -> bool:
     """Return True if *user_id* holds *permission*.
 
@@ -615,8 +634,7 @@ def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:
     """Derive legacy scopes from a granular permission set."""
     scopes: set[str] = set()
     if not permissions:
-        scopes.add("read")
-        return frozenset(scopes)
+        return frozenset()
     for perm in permissions:
         if perm in VALID_SCOPES and perm != "service":
             scopes.update(SCOPE_HIERARCHY.get(perm, {perm}))
@@ -1671,7 +1689,7 @@ class AuthMiddleware:
 async def handle_auth_login(request: Request, audience: str, cookie_name: str) -> Response:
     """Shared ``POST /api/auth/login`` handler.
 
-    Authenticates via username:password or legacy token exchange, returning
+    Authenticates via username:password or a raw stored API token, returning
     a JWT and setting the auth cookie.  *audience* selects the JWT ``aud``
     claim (``JWT_AUD_SERVER`` or ``JWT_AUD_CONSOLE``).
     """
@@ -1721,7 +1739,9 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
         user = storage.get_user_by_username(username)
         if user and verify_password(password, user["password_hash"]):
             # Derive scopes and permissions from assigned roles
-            perms = _load_user_permissions(storage, user["user_id"])
+            perms = _session_permissions(storage, user["user_id"])
+            if isinstance(perms, JSONResponse):
+                return perms
             scopes = _permissions_to_scopes(perms)
             result = AuthResult(
                 user_id=user["user_id"],
@@ -1730,17 +1750,10 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
                 permissions=frozenset(perms),
             )
     elif body.get("token"):
-        result = _authenticate_token(
-            body["token"],
-            jwt_secret=jwt_secret,
-            jwt_audience=audience,
-            storage=storage,
-        )
-        # Enrollment JWTs are capabilities for the protected ACME responder,
-        # not general service credentials.  In particular, never let the
-        # legacy token-exchange path extend one into a fresh 24-hour session.
-        if result is not None and result.token_source == TLS_ACME_TOKEN_SOURCE:
-            result = None
+        # JWT exchange would bypass live-role renewal checks and reset expiry.
+        token = body["token"]
+        if isinstance(token, str) and token.startswith(TOKEN_PREFIX) and storage is not None:
+            result = _authenticate_api_token(token, storage)
 
     if result is None:
         # Record failed attempt for rate limiting
@@ -1764,7 +1777,12 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
 
     role = "full" if result.has_scope("write") else "read"
     scopes_str = ",".join(sorted(result.scopes))
-    resp_body: dict[str, str] = {"status": "ok", "role": role, "scopes": scopes_str}
+    resp_body: dict[str, Any] = {
+        "status": "ok",
+        "role": role,
+        "scopes": scopes_str,
+        "can_refresh": _can_refresh_session(result.token_source, result.scopes),
+    }
     if result.permissions:
         resp_body["permissions"] = ",".join(sorted(result.permissions))
     if jwt_token:
@@ -1879,8 +1897,8 @@ async def handle_auth_setup(request: Request, audience: str, cookie_name: str) -
         )
 
     # Derive permissions from roles
-    perms = _load_user_permissions(storage, user_id)
-    if not perms:
+    perms = _session_permissions(storage, user_id)
+    if isinstance(perms, JSONResponse):
         log.error(
             "First user %s has no permissions after role assignment — aborting setup", user_id
         )
@@ -1905,12 +1923,13 @@ async def handle_auth_setup(request: Request, audience: str, cookie_name: str) -
             version=jwt_version_slot(),
         )
 
-    resp_body: dict[str, str] = {
+    resp_body: dict[str, Any] = {
         "status": "ok",
         "user_id": user_id,
         "username": username,
         "role": "full",
         "scopes": ",".join(sorted(scopes)),
+        "can_refresh": _can_refresh_session("password", scopes),
     }
     if perms:
         resp_body["permissions"] = ",".join(sorted(perms))
@@ -1941,6 +1960,7 @@ async def handle_auth_whoami(request: Request, cookie_name: str) -> Response:
     resp: dict[str, Any] = {
         "user_id": auth_result.user_id,
         "scopes": ",".join(sorted(auth_result.scopes)),
+        "can_refresh": _can_refresh_session(auth_result.token_source, auth_result.scopes),
     }
     # Surface the human username / display name for the UI — ``user_id`` is an
     # opaque uuid, not something to show in the footer.  Best-effort: a storage
@@ -1978,7 +1998,7 @@ async def handle_auth_whoami(request: Request, cookie_name: str) -> Response:
 async def handle_auth_refresh(request: Request, audience: str, cookie_name: str) -> Response:
     """Shared ``POST /api/auth/refresh`` handler — re-mint the auth cookie.
 
-    Requires a currently-valid auth cookie (auth middleware enforces).
+    Requires a currently-valid, non-service password/OIDC session.
     Re-resolves the user's permissions from storage so a role change
     propagates within one refresh cycle (rather than persisting until
     the original token's natural expiry).  Returns the same JSON shape
@@ -1997,37 +2017,20 @@ async def handle_auth_refresh(request: Request, audience: str, cookie_name: str)
     auth_result: AuthResult | None = getattr(request.state, "auth_result", None)
     if not auth_result or not auth_result.user_id:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    if not _can_refresh_session(auth_result.token_source, auth_result.scopes):
+        return JSONResponse({"error": "Credential cannot renew a human session"}, status_code=403)
 
     jwt_secret = getattr(request.app.state, "jwt_secret", "")
     storage = getattr(request.app.state, "auth_storage", None)
 
-    # Re-resolve permissions so revoked / promoted users see the change
-    # within one refresh cycle.  Call storage.get_user_permissions
-    # directly (not _load_user_permissions) so we can distinguish a
-    # genuine empty result (user deleted / role-stripped → 403) from a
-    # transient storage failure (fall back to in-token claims, better
-    # than logging the session out mid-flight).
+    # An outage must not extend stale claims. The existing cookie remains valid
+    # until expiry, so the browser can retry a 503 without treating it as logout.
     user_id = auth_result.user_id
-    perms: frozenset[str] = auth_result.permissions
-    scopes: frozenset[str] = auth_result.scopes
-    if storage is not None:
-        try:
-            fresh_perms = storage.get_user_permissions(user_id)
-        except Exception:
-            log.warning(
-                "Refresh: storage unavailable for permission re-resolve; "
-                "falling back to in-token claims for %s",
-                user_id,
-                exc_info=True,
-            )
-        else:
-            if not fresh_perms and not auth_result.has_scope("service"):
-                return JSONResponse(
-                    {"error": "User has no active permissions"},
-                    status_code=403,
-                )
-            perms = frozenset(fresh_perms)
-            scopes = _permissions_to_scopes(set(perms))
+    resolved = _session_permissions(storage, user_id)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    perms = frozenset(resolved)
+    scopes = _permissions_to_scopes(resolved)
 
     if not jwt_secret:
         return JSONResponse({"error": "JWT signing not configured"}, status_code=503)
@@ -2035,7 +2038,7 @@ async def handle_auth_refresh(request: Request, audience: str, cookie_name: str)
     new_token = create_jwt(
         user_id=user_id,
         scopes=scopes,
-        source=auth_result.token_source or "refresh",
+        source=auth_result.token_source,
         secret=jwt_secret,
         audience=audience,
         permissions=perms,
@@ -2049,6 +2052,7 @@ async def handle_auth_refresh(request: Request, audience: str, cookie_name: str)
         "scopes": ",".join(sorted(scopes)),
         "user_id": user_id,
         "jwt": new_token,
+        "can_refresh": _can_refresh_session(auth_result.token_source, scopes),
     }
     if perms:
         resp_body["permissions"] = ",".join(sorted(perms))
@@ -2317,6 +2321,10 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
         _record_oidc_failure()
         return RedirectResponse("/?oidc_error=Authentication+failed", status_code=302)
 
+    perms = await asyncio.to_thread(_session_permissions, storage, user["user_id"])
+    if isinstance(perms, JSONResponse):
+        return perms
+
     # Capture the IdP refresh token as the user's single OBO credential
     # (issue #551).  Best-effort: capture failure must not block login —
     # the mint path surfaces a missing credential on the reconnect rail.
@@ -2363,8 +2371,7 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
                     context="oidc-capture",
                 )
 
-    # Load permissions and issue Turnstone JWT
-    perms = await asyncio.to_thread(_load_user_permissions, storage, user["user_id"])
+    # Issue the role-derived Turnstone JWT.
     scopes = _permissions_to_scopes(perms)
     jwt_token = ""
     if jwt_secret:

@@ -51,7 +51,7 @@ class AuthLoginRequest(BaseModel):
 
     username: str = Field(default="", description="Login username")
     password: str = Field(default="", description="Login password")
-    token: str = Field(default="", description="Legacy: bearer token to authenticate")
+    token: str = Field(default="", description="Raw stored ts_ API token; JWT exchange is refused")
 
 
 class AuthLoginResponse(BaseModel):
@@ -64,6 +64,13 @@ class AuthLoginResponse(BaseModel):
         default="", description="Comma-separated scopes", examples=["read,write,approve"]
     )
     jwt: str = Field(default="", description="JWT session token (if JWT auth is configured)")
+    can_refresh: bool = Field(default=False, description="Eligible for human-session renewal")
+
+
+class AuthRefreshResponse(AuthLoginResponse):
+    """POST /v1/api/auth/refresh success response."""
+
+    exp: int | None = Field(default=None, description="Session expiry in epoch seconds")
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +163,7 @@ class AuthSetupResponse(BaseModel):
     role: str = Field(default="full")
     scopes: str = Field(default="approve,read,write")
     jwt: str = Field(default="", description="JWT session token")
+    can_refresh: bool = Field(default=False, description="Eligible for human-session renewal")
 
 
 class AuthStatusResponse(BaseModel):
@@ -175,6 +183,7 @@ class AuthWhoamiResponse(BaseModel):
     user_id: str
     permissions: str = ""
     scopes: str = Field(default="", description="Comma-separated effective transport scopes")
+    can_refresh: bool = Field(default=False, description="Eligible for human-session renewal")
 
 
 # ---------------------------------------------------------------------------

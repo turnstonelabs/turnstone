@@ -318,7 +318,7 @@
     },
     "/v1/api/auth/login": {
       "post": {
-        "summary": "Authenticate with a token",
+        "summary": "Authenticate with a password or raw stored API token",
         "operationId": "v1_api_auth_login_post",
         "tags": [
           "Auth"
@@ -344,8 +344,48 @@
               }
             }
           },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Error 401",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -504,6 +544,57 @@
         "responses": {
           "302": {
             "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/auth/refresh": {
+      "post": {
+        "summary": "Renew a password/OIDC session from current role permissions",
+        "operationId": "v1_api_auth_refresh_post",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthRefreshResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error 401",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -7908,7 +7999,7 @@
           },
           "token": {
             "default": "",
-            "description": "Legacy: bearer token to authenticate",
+            "description": "Raw stored ts_ API token; JWT exchange is refused",
             "title": "Token",
             "type": "string"
           }
@@ -7953,12 +8044,82 @@
             "description": "JWT session token (if JWT auth is configured)",
             "title": "Jwt",
             "type": "string"
+          },
+          "can_refresh": {
+            "default": false,
+            "description": "Eligible for human-session renewal",
+            "title": "Can Refresh",
+            "type": "boolean"
           }
         },
         "required": [
           "role"
         ],
         "title": "AuthLoginResponse",
+        "type": "object"
+      },
+      "AuthRefreshResponse": {
+        "description": "POST /v1/api/auth/refresh success response.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "user_id": {
+            "default": "",
+            "description": "Authenticated user ID",
+            "title": "User Id",
+            "type": "string"
+          },
+          "role": {
+            "description": "Legacy role",
+            "examples": [
+              "full",
+              "read"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "scopes": {
+            "default": "",
+            "description": "Comma-separated scopes",
+            "examples": [
+              "read,write,approve"
+            ],
+            "title": "Scopes",
+            "type": "string"
+          },
+          "jwt": {
+            "default": "",
+            "description": "JWT session token (if JWT auth is configured)",
+            "title": "Jwt",
+            "type": "string"
+          },
+          "can_refresh": {
+            "default": false,
+            "description": "Eligible for human-session renewal",
+            "title": "Can Refresh",
+            "type": "boolean"
+          },
+          "exp": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Session expiry in epoch seconds",
+            "title": "Exp"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "AuthRefreshResponse",
         "type": "object"
       },
       "AuthSetupRequest": {
@@ -8019,6 +8180,12 @@
             "description": "JWT session token",
             "title": "Jwt",
             "type": "string"
+          },
+          "can_refresh": {
+            "default": false,
+            "description": "Eligible for human-session renewal",
+            "title": "Can Refresh",
+            "type": "boolean"
           }
         },
         "required": [
@@ -15657,6 +15824,12 @@
             "description": "Comma-separated effective transport scopes",
             "title": "Scopes",
             "type": "string"
+          },
+          "can_refresh": {
+            "default": false,
+            "description": "Eligible for human-session renewal",
+            "title": "Can Refresh",
+            "type": "boolean"
           }
         },
         "required": [

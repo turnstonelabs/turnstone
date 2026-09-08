@@ -50,6 +50,24 @@ console cannot be used to authenticate against a server node, and vice versa.
 Tokens without an `aud` claim are accepted during the rollout window when
 `audience` validation is not specified.
 
+Password and OIDC sessions require at least one current effective role permission. Login and
+renewal refuse an empty permission set with 403; a permission-store outage returns 503 without
+issuing a JWT or changing the existing cookie. Nonempty granular permissions retain the read
+transport floor, and write/approve keep their scope hierarchy.
+
+`POST /v1/api/auth/login` accepts a password or a raw stored `ts_` API token. It rejects JWT input.
+`POST /v1/api/auth/refresh` renews only non-service password/OIDC sessions, resolving their roles
+again. API-derived sessions keep their explicit token scopes and fixed expiry; exchange a
+still-valid raw API token to obtain another session. Proxy, coordinator, service, and other JWT
+sources use their existing credential managers instead of human-session renewal.
+
+Login, setup, refresh, and whoami expose `can_refresh`, derived from the same source/scope rule.
+The browser uses it to gate renewal. A temporary 503 preserves current authority and permits a
+retry before the original expiry; a refused renewal does not schedule that retry. Existing JWTs
+remain usable for their original lifetime. Removing roles does not revoke an explicit raw API
+token or a delegated credential. OIDC retains its explicit default-viewer provisioning, including
+for returning identities whose roles were all removed.
+
 ---
 
 ## Scope Model
@@ -100,10 +118,9 @@ enforcement, the governance layer adds named permissions checked
 per-endpoint by `require_permission()`. Permissions are bundled into
 roles; users are assigned roles via the `user_roles` join table.
 
-At login, `_load_user_permissions()` aggregates all permissions from
-the user's assigned roles. `_permissions_to_scopes()` derives legacy
-scopes for backward compatibility (e.g., any `admin.*` permission
-implies the `approve` scope). The JWT carries both `scopes` and
+At human login and renewal, current permissions are resolved strictly from the user's assigned
+roles. `_permissions_to_scopes()` derives transport scopes (for example, an `admin.*` permission
+implies `approve`). An empty permission set grants no scopes. The JWT carries both `scopes` and
 `permissions` claims.
 
 Three built-in roles are seeded by migration 008:
@@ -374,16 +391,19 @@ All admin endpoints require `approve` scope.
 The `turnstone-admin` command provides offline user and token management:
 
 ```
-turnstone-admin create-user --username admin --name "Admin" [--password] [--token]
+turnstone-admin create-admin --username admin --name "Admin" [--password]
+turnstone-admin create-user --username reader --name "Reader" [--password] [--token]
 turnstone-admin create-token --user <user_id> --scopes read,write --name "CI bot"
 turnstone-admin list-users
 turnstone-admin list-tokens
 turnstone-admin revoke-token <token_id>
 ```
 
-When `--password` is omitted, the CLI prompts interactively. When
-`--token` is passed to `create-user`, an API token is created alongside
-the user and printed to stdout.
+When `--password` is omitted, the CLI prompts interactively. `create-user` explicitly assigns the
+viewer role before reporting success or issuing an optional API token; failed role provisioning
+rolls back the new user. Historical accounts without roles receive no automatic grant and require
+an administrator to assign one. `create-admin` can create or promote an account. When `--token` is
+passed to `create-user`, the API token is printed to stdout.
 
 ---
 

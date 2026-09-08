@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 from turnstone.api.schemas import (
     AuthLoginRequest,
     AuthLoginResponse,
+    AuthRefreshResponse,
     AuthSetupRequest,
     AuthSetupResponse,
     AuthStatusResponse,
@@ -446,10 +447,10 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         "/v1/api/auth/login",
         "POST",
-        "Authenticate with a token",
+        "Authenticate with a password or raw stored API token",
         request_model=AuthLoginRequest,
         response_model=AuthLoginResponse,
-        error_codes=[401],
+        error_codes=[400, 401, 403, 429, 503],
         tags=["Auth"],
     ),
     EndpointSpec(
@@ -488,6 +489,14 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "GET",
         "OIDC callback — validates code, provisions user, sets JWT cookie, redirects to app",
         response_code=302,
+        tags=["Auth"],
+    ),
+    EndpointSpec(
+        "/v1/api/auth/refresh",
+        "POST",
+        "Renew a password/OIDC session from current role permissions",
+        response_model=AuthRefreshResponse,
+        error_codes=[401, 403, 503],
         tags=["Auth"],
     ),
     EndpointSpec(
@@ -605,6 +614,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     StatusResponse,
     AuthLoginRequest,
     AuthLoginResponse,
+    AuthRefreshResponse,
     AuthSetupRequest,
     AuthSetupResponse,
     AuthStatusResponse,

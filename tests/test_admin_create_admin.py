@@ -1,11 +1,8 @@
 """Tests for ``turnstone-admin create-admin`` (issue #824).
 
-``create-user`` creates a role-less user; the web UI derives a login's scopes
-purely from assigned roles, so that account logs in read-only and hits
-"Forbidden: token lacks 'approve' scope" on any admin action.  ``create-admin``
-assigns the built-in admin role — mirroring the web setup wizard
-(``POST /api/auth/setup``) — and promotes an existing role-less user, which is
-the recovery path for anyone already stuck.
+``create-user`` assigns the viewer role for read access. ``create-admin`` assigns the built-in
+admin role, mirroring the web setup wizard, and can promote either a viewer or a historical
+account without roles. Accounts without any effective permissions cannot log in with a password.
 
 Each test drives the real ``_cmd_create_admin`` handler against a real,
 fully-migrated SQLite DB: the ``builtin-admin`` role is seeded by migration
@@ -104,11 +101,11 @@ def test_create_admin_defaults_display_name_to_username(tmp_path: Path) -> None:
 def test_create_admin_promotes_existing_read_only_user(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Issue #824 recovery path: a role-less create-user account, then create-admin."""
+    """Issue #824 recovery path: a read-only create-user account, then create-admin."""
     db_path = str(tmp_path / "admin.db")
     storage = _migrated_storage(db_path)
 
-    # Reproduce the locked-out account exactly (role-less create-user).
+    # A viewer cannot administer the installation until explicitly promoted.
     _cmd_create_user(_db_args(db_path, username="admin", name="Admin", password="hunter2!pw"))
     user = storage.get_user_by_username("admin")
     assert user is not None
@@ -168,3 +165,50 @@ def test_create_admin_invalid_username_rejected(
 
     assert exc_info.value.code == 1
     assert "invalid username" in capsys.readouterr().err
+
+
+def test_create_user_assigns_explicit_viewer(tmp_path: Path) -> None:
+    db_path = str(tmp_path / "viewer.db")
+    storage = _migrated_storage(db_path)
+    _cmd_create_user(_db_args(db_path, username="reader", password="reader-password"))
+    user = storage.get_user_by_username("reader")
+    assert user is not None
+    assert [r["role_id"] for r in storage.list_user_roles(user["user_id"])] == ["builtin-viewer"]
+    assert storage.get_user_permissions(user["user_id"]) == {"read"}
+
+
+@pytest.mark.parametrize("failure", ["assignment", "empty_permissions"])
+def test_create_user_rolls_back_incomplete_viewer_provisioning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    db_path = str(tmp_path / "viewer.db")
+    storage = _migrated_storage(db_path)
+    if failure == "assignment":
+        monkeypatch.setattr("turnstone.admin._get_storage", lambda _args: storage)
+
+        def unavailable(*_args: Any) -> None:
+            raise RuntimeError("storage unavailable")
+
+        monkeypatch.setattr(storage, "assign_role", unavailable)
+    else:
+        storage.set_role_overrides("builtin-viewer", set(), {"read"})
+    with pytest.raises(SystemExit) as exc:
+        _cmd_create_user(
+            _db_args(db_path, username="reader", password="reader-password", token=True)
+        )
+    assert exc.value.code == 1
+    assert storage.get_user_by_username("reader") is None
+    assert "Created user" not in capsys.readouterr().out
+
+
+def test_create_admin_can_recover_historical_roleless_user(tmp_path: Path) -> None:
+    db_path = str(tmp_path / "historical.db")
+    storage = _migrated_storage(db_path)
+    storage.create_user("historical", "historical", "Historical", "unused-password-hash")
+    assert storage.get_user_permissions("historical") == set()
+    assert _login_scopes(storage, "historical") == frozenset()
+    _cmd_create_admin(_db_args(db_path, username="historical"))
+    assert _has_admin_role(storage, "historical")

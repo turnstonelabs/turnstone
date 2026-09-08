@@ -104,11 +104,14 @@ async function _recoverUnauthorized(r, isCurrent, allowRefresh = true) {
   if (!isCurrent()) throw new Error("auth changed");
   // Reactive refresh covers expired cookies when the proactive timer missed.
   const generation = authGeneration();
-  if (allowRefresh && (await _tryRefresh())) return;
+  const refreshed = allowRefresh ? await _tryRefresh() : false;
+  if (refreshed === true) return;
   // A concurrent whoami may supersede refresh for the same identity.
   // Its newly confirmed authority must survive this older request.
   if (!isCurrent() || generation !== authGeneration())
     throw new Error("auth changed");
+  if (refreshed === null)
+    throw new Error("Authentication temporarily unavailable. Try again.");
   showLogin();
   throw new Error("auth");
 }
@@ -128,6 +131,7 @@ const _REFRESH_AT_FRACTION = 0.9;
 const _REFRESH_MIN_DELAY_MS = 30 * 1000;
 const _REFRESH_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
 let _refreshTimer = null;
+let _refreshExpiry = 0;
 let _refreshInFlight = null;
 // Logout race guard: a refresh (or whoami) in flight when the user
 // clicks Logout can land AFTER /logout and re-populate state, silently
@@ -169,6 +173,7 @@ function _invalidateAuth() {
   _authEpoch++;
   _loggedOut = true;
   _cancelRefreshTimer();
+  _refreshExpiry = 0;
   _refreshSequence++;
   _whoamiSequence++;
   [_refreshAbort, _whoamiAbort].forEach(function (ctrl) {
@@ -241,7 +246,7 @@ export function whenPermissionsReady(cb) {
 
 async function _tryRefresh() {
   // Don't start a refresh if logout already won the race.
-  if (_loggedOut) return false;
+  if (_loggedOut || !_canRefresh()) return false;
   // De-dupe concurrent callers — many parallel authFetch'es hitting
   // 401 at once should still only fire one /refresh request.
   if (_refreshInFlight) {
@@ -263,6 +268,11 @@ async function _tryRefresh() {
         credentials: "same-origin",
         signal: _refreshAbort ? _refreshAbort.signal : undefined,
       });
+      if (_loggedOut || generation !== authGeneration()) return false;
+      if (r.status === 503) {
+        _scheduleRefreshRetry();
+        return null; // Unavailable, not an authoritative authentication refusal.
+      }
       if (!r.ok) return false;
       let data = null;
       try {
@@ -299,7 +309,9 @@ async function _tryRefresh() {
       if (_authChannel) _authChannel.postMessage("refresh");
       return true;
     } catch (_e) {
-      return false;
+      if (_loggedOut || generation !== authGeneration()) return false;
+      _scheduleRefreshRetry();
+      return null;
     } finally {
       if (sequence === _refreshSequence) {
         _refreshInFlight = null;
@@ -310,12 +322,33 @@ async function _tryRefresh() {
   return await _refreshInFlight;
 }
 
+function _canRefresh() {
+  return sessionStorage.getItem("turnstone_can_refresh") === "true";
+}
+
+function _scheduleRefreshRetry() {
+  const deadline = _refreshExpiry * 1000;
+  if (!_canRefresh() || deadline - Date.now() <= _REFRESH_MIN_DELAY_MS) return;
+  _cancelRefreshTimer();
+  _refreshTimer = setTimeout(function () {
+    _refreshTimer = null;
+    // A suspended tab must not keep retrying beyond the original session's life.
+    if (Date.now() < deadline) _tryRefresh();
+  }, _REFRESH_MIN_DELAY_MS);
+}
+
 function _scheduleRefreshAt(epochSeconds) {
   if (_refreshTimer) {
     clearTimeout(_refreshTimer);
     _refreshTimer = null;
   }
-  if (typeof epochSeconds !== "number" || !isFinite(epochSeconds)) return;
+  if (
+    !_canRefresh() ||
+    typeof epochSeconds !== "number" ||
+    !isFinite(epochSeconds)
+  )
+    return;
+  _refreshExpiry = epochSeconds;
   const nowMs = Date.now();
   const expMs = epochSeconds * 1000;
   const remaining = expMs - nowMs;
@@ -841,6 +874,7 @@ function _storePermissions(data) {
     "ts.user_id",
     "turnstone_permissions",
     "turnstone_scopes",
+    "turnstone_can_refresh",
   ].map(function (key) {
     return sessionStorage.getItem(key);
   });
@@ -853,6 +887,13 @@ function _storePermissions(data) {
     sessionStorage.setItem("turnstone_scopes", data.scopes);
   } else {
     sessionStorage.removeItem("turnstone_scopes");
+  }
+  if (data && data.can_refresh === true) {
+    sessionStorage.setItem("turnstone_can_refresh", "true");
+  } else {
+    sessionStorage.removeItem("turnstone_can_refresh");
+    _cancelRefreshTimer();
+    _refreshExpiry = 0;
   }
   // Surface the authenticated identity for the rail footer's user chip.  whoami
   // returns the human `username` (display name) alongside the opaque user_id;
@@ -873,11 +914,14 @@ function _storePermissions(data) {
   } else {
     sessionStorage.removeItem("ts.user_id");
   }
-  const after = ["ts.user_id", "turnstone_permissions", "turnstone_scopes"].map(
-    function (key) {
-      return sessionStorage.getItem(key);
-    },
-  );
+  const after = [
+    "ts.user_id",
+    "turnstone_permissions",
+    "turnstone_scopes",
+    "turnstone_can_refresh",
+  ].map(function (key) {
+    return sessionStorage.getItem(key);
+  });
   if (before[0] && before[0] !== after[0]) _authEpoch++;
   if (JSON.stringify(before) !== JSON.stringify(after)) _publishAuthChange();
 }

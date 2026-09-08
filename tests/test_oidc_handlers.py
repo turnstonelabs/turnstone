@@ -85,6 +85,9 @@ def storage(tmp_path: Any) -> SQLiteBackend:
     """Fresh SQLite backend with a seeded admin user."""
     backend = SQLiteBackend(str(tmp_path / "test.db"))
     backend.create_user("test-admin", "testadmin", "Test Admin", "hash")
+    for role, permissions in (("admin", "read,write,approve"), ("viewer", "read")):
+        backend.create_role("builtin-" + role, role, role, permissions, True)
+    backend.assign_role("test-admin", "builtin-admin")
     return backend
 
 
@@ -1239,3 +1242,51 @@ class TestAdminOIDCIdentities:
         # Missing both
         resp = admin_client.delete("/v1/api/admin/oidc-identities")
         assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("failure", [None, "empty", "unavailable"])
+def test_oidc_session_requires_current_permissions_after_explicit_provisioning(
+    authorize_client: TestClient,
+    storage: SQLiteBackend,
+    oidc_config: OIDCConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    if failure == "empty":
+        storage.set_role_overrides("builtin-viewer", set(), {"read"})
+    elif failure == "unavailable":
+
+        def unavailable(_user: str) -> set[str]:
+            raise RuntimeError("private permission database diagnostic")
+
+        monkeypatch.setattr(storage, "get_user_permissions", unavailable)
+    claims = {"sub": "session-authority-user", "email": "oidc@example.com", "name": "OIDC Reader"}
+    storage.create_oidc_pending_state("authority-state", "nonce", "verifier", "test-audience")
+    with (
+        patch(
+            "turnstone.core.auth.exchange_code", new=AsyncMock(return_value={"id_token": "test"})
+        ),
+        patch("turnstone.core.auth.validate_id_token", return_value=claims),
+    ):
+        response = authorize_client.get(
+            "/v1/api/auth/oidc/callback?code=test&state=authority-state", follow_redirects=False
+        )
+        if failure:
+            assert response.status_code == (403 if failure == "empty" else 503)
+            assert "set-cookie" not in response.headers
+            assert "private permission" not in response.text
+            return
+        assert response.status_code == 302
+        assert "oidc_success=1" in response.headers["location"]
+        identity = storage.get_oidc_identity(oidc_config.issuer, claims["sub"])
+        assert identity is not None
+        user_id = identity["user_id"]
+        assert storage.get_user_permissions(user_id) == {"read"}
+        # Existing OIDC policy explicitly re-provisions viewer when all roles are removed.
+        storage.unassign_role(user_id, "builtin-viewer")
+        storage.create_oidc_pending_state("return-state", "nonce", "verifier", "test-audience")
+        returning = authorize_client.get(
+            "/v1/api/auth/oidc/callback?code=test&state=return-state", follow_redirects=False
+        )
+        assert returning.status_code == 302
+        assert storage.get_user_permissions(user_id) == {"read"}

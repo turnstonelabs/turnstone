@@ -28,6 +28,7 @@ export interface AuthLoginRequest {
 }
 
 export interface AuthLoginResponse {
+  can_refresh?: boolean;
   status: string;
   role: string;
   scopes?: string;
@@ -42,6 +43,7 @@ export interface AuthStatusResponse {
 }
 
 export interface AuthSetupResponse {
+  can_refresh?: boolean;
   status: string;
   user_id: string;
   username: string;

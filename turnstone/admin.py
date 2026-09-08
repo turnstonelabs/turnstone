@@ -73,9 +73,23 @@ def _cmd_create_user(args: argparse.Namespace) -> None:
 
     pw_hash = hash_password(password)
     storage.create_user(user_id, args.username, args.name, pw_hash)
+    try:
+        storage.assign_role(user_id, "builtin-viewer", "")
+        if not storage.get_user_permissions(user_id):
+            raise RuntimeError("Viewer role has no active permissions")
+    except Exception:
+        try:
+            storage.delete_user(user_id)
+        except Exception:
+            print(f"Error: failed to roll back incomplete user {user_id}.", file=sys.stderr)
+        print(
+            "Error: failed to provision viewer access; check database migrations.", file=sys.stderr
+        )
+        sys.exit(1)
     print(f"Created user: {user_id}")
     print(f"  Username: {args.username}")
     print(f"  Name: {args.name}")
+    print("  Role: viewer (read access)")
 
     if args.token:
         from turnstone.core.auth import reject_unassignable_scopes
@@ -104,11 +118,9 @@ def _cmd_create_user(args: argparse.Namespace) -> None:
 def _cmd_create_admin(args: argparse.Namespace) -> None:
     """Create an admin user (or promote an existing one) with full access.
 
-    Unlike ``create-user`` — which creates a role-less user that logs into the
-    web UI read-only — this assigns the built-in admin role, mirroring the web
-    first-run setup wizard (``POST /api/auth/setup``).  Use it for headless
-    installs, or to unstick a ``create-user`` account that logs in only to hit
-    "Forbidden: token lacks 'approve' scope".
+    While ``create-user`` assigns viewer access, this assigns the built-in admin role, mirroring
+    the web first-run setup wizard (``POST /api/auth/setup``). Use it for headless installs or to
+    promote a reader who needs administrator access.
     """
     import getpass
 
@@ -129,7 +141,7 @@ def _cmd_create_admin(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    # Promote an existing user (recovery path: create-user assigns no role).
+    # Promote an existing viewer or historical account without assigned roles.
     existing = storage.get_user_by_username(args.username)
     if existing is not None:
         user_id = existing["user_id"]

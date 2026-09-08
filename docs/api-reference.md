@@ -79,7 +79,7 @@ JWTs are the recommended credential for browser sessions. API tokens are suitabl
 
 ### `POST /v1/api/auth/login`
 
-Authenticate with credentials and receive a JWT. Accepts two credential formats:
+Authenticate with a password or raw stored API token and receive a JWT. JWT input is refused.
 
 **Username + password:**
 
@@ -100,6 +100,7 @@ Authenticate with credentials and receive a JWT. Accepts two credential formats:
   "status": "ok",
   "role": "full",
   "scopes": "approve,read,write",
+  "can_refresh": true,
   "jwt": "eyJhbGciOiJIUzI1NiIs...",
   "user_id": "u_abc123"
 }
@@ -113,6 +114,29 @@ The response also sets a surface-scoped HttpOnly cookie containing the JWT
 ```json
 {"error": "Invalid credentials"}
 ```
+
+Password login requires at least one effective role permission. An empty set returns 403;
+permission-store failure returns 503 without minting a JWT. Raw API tokens retain their explicit
+scopes and return `can_refresh: false`.
+
+---
+
+### `POST /v1/api/auth/refresh`
+
+Renew a currently valid, non-service password/OIDC session using current role permissions. The
+success response includes the login fields, `can_refresh: true`, and `exp` in epoch seconds, and
+sets a fresh session cookie. An empty permission set or an ineligible credential source returns
+403. Permission-store failure returns 503 without replacing or clearing the existing cookie.
+
+API-derived JWTs have a fixed lifetime and cannot renew here; exchange a still-valid raw API token
+through login instead. Proxy, coordinator, service, and other JWT sources cannot use this endpoint.
+Ordinary use of existing JWTs continues until their original expiry.
+
+### `GET /v1/api/auth/whoami`
+
+Return the authenticated identity, named `permissions`, effective `scopes`, and `can_refresh`.
+Renewal eligibility uses the same credential source/scope rule as the refresh endpoint. Cookie
+sessions also include their `exp` when available.
 
 ---
 

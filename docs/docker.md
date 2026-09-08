@@ -30,7 +30,7 @@ docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
 Create your first admin user (any node works — they share one database):
 
 ```bash
-docker compose exec node-1 turnstone-admin create-user --username admin --name "Admin"
+docker compose exec node-1 turnstone-admin create-admin --username admin --name "Admin"
 ```
 
 ### Bring your own LLM
