@@ -2550,7 +2550,9 @@ class TestSharedStatic:
         assert "/shared/utils.js" in body
         assert "/shared/toast.js" in body
         assert "/shared/theme.js" in body
-        assert "/shared/auth.js" in body
+        # Auth is imported by the shell; a second script tag creates two modules.
+        assert "/shared/shell.js" in body
+        assert 'from "./auth.js"' in client.get("/shared/shell.js").text
         assert "/shared/kb.js" in body
 
     def test_shared_scripts_load_before_app_js(self, client):

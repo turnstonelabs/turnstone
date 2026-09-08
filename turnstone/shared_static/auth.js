@@ -66,32 +66,9 @@ export async function authFetch(url, opts) {
     const r = await fetch(url, opts);
     if (epoch !== _authEpoch) throw new Error("auth changed");
     if (r.status === 401) {
-      try {
-        const body = await r.clone().json();
-        if (epoch !== _authEpoch) throw new Error("auth changed");
-        if (body && body.code === "version_mismatch") {
-          _authUpgradeReload = true;
-          showLogin("upgrade");
-          throw new Error("auth");
-        }
-      } catch (e) {
-        if (e.message === "auth" || e.message === "auth changed") throw e;
-      }
-      // Reactive refresh — try once before falling through to login.
-      // Covers cases where the proactive refresh timer didn't fire
-      // (tab restored from disk-cache after expiry, system clock jump,
-      // page first-load with a stale cookie).
-      const generation = authGeneration();
-      if (attempt === 0 && (await _tryRefresh())) {
-        epoch = _authEpoch;
-        continue; // retry the original request with the new cookie
-      }
-      // A concurrent whoami may supersede refresh for the same identity.
-      // Its newly confirmed authority must survive this older request.
-      if (epoch !== _authEpoch || generation !== authGeneration())
-        throw new Error("auth changed");
-      showLogin();
-      throw new Error("auth");
+      await _recoverUnauthorized(r, () => epoch === _authEpoch, attempt === 0);
+      epoch = _authEpoch;
+      continue; // retry the original request with the new cookie
     }
     if (r.status === 429 && attempt < maxRetries) {
       const retryAfter = parseInt(r.headers.get("Retry-After") || "1", 10);
@@ -107,6 +84,33 @@ export async function authFetch(url, opts) {
     if (typeof _ensureSSE === "function") _ensureSSE();
     return r;
   }
+}
+
+// Both API requests and whoami must recover a rejected cookie. Clearing cached
+// identity first would invalidate the API requests that otherwise open login.
+async function _recoverUnauthorized(r, isCurrent, allowRefresh = true) {
+  if (!isCurrent()) throw new Error("auth changed");
+  try {
+    const body = await r.clone().json();
+    if (!isCurrent()) throw new Error("auth changed");
+    if (body && body.code === "version_mismatch") {
+      _authUpgradeReload = true;
+      showLogin("upgrade");
+      throw new Error("auth");
+    }
+  } catch (e) {
+    if (e.message === "auth" || e.message === "auth changed") throw e;
+  }
+  if (!isCurrent()) throw new Error("auth changed");
+  // Reactive refresh covers expired cookies when the proactive timer missed.
+  const generation = authGeneration();
+  if (allowRefresh && (await _tryRefresh())) return;
+  // A concurrent whoami may supersede refresh for the same identity.
+  // Its newly confirmed authority must survive this older request.
+  if (!isCurrent() || generation !== authGeneration())
+    throw new Error("auth changed");
+  showLogin();
+  throw new Error("auth");
 }
 
 // ---------------------------------------------------------------------------
@@ -326,9 +330,8 @@ function _scheduleRefreshAt(epochSeconds) {
 }
 
 function _scheduleRefreshFromWhoami() {
-  // Best-effort — failure here just means no proactive refresh; the
-  // reactive on-401 path still works.  Uses fetch (not authFetch) to
-  // avoid recursion through the on-401 trap.
+  // Network failure just means no proactive refresh. A confirmed 401 uses
+  // the same recovery as authFetch, so startup never depends on response order.
   //
   // Also rehydrates sessionStorage permissions when the cookie outlives
   // the tab session: an existing valid cookie means the user is still
@@ -366,20 +369,25 @@ function _scheduleRefreshFromWhoami() {
     typeof AbortController !== "undefined" ? new AbortController() : null;
   const sequence = ++_whoamiSequence;
   const generation = authGeneration();
+  const isCurrent = () =>
+    !_loggedOut &&
+    generation === authGeneration() &&
+    sequence === _whoamiSequence;
   _whoamiAbort = ctrl;
   fetch("/v1/api/auth/whoami", {
     credentials: "same-origin",
     signal: ctrl ? ctrl.signal : undefined,
   })
-    .then(function (r) {
-      return r.ok ? r.json() : null;
-    })
-    .then(function (data) {
-      if (_loggedOut || generation !== authGeneration()) return;
-      // Bail if a newer call has superseded us — its eventual effects
-      // are the authoritative ones; ours would only clobber.
-      if (sequence !== _whoamiSequence) return;
-      // Treat a non-OK whoami (data === null) as an explicit clear.
+    .then(async function (r) {
+      if (!isCurrent()) return;
+      if (r.status === 401) {
+        await _recoverUnauthorized(r, isCurrent);
+        return; // Refresh owns authority storage, including unchanged identity.
+      }
+      const data = r.ok ? await r.json() : null;
+      // A newer call's effects are authoritative, even if the identity is equal.
+      if (!isCurrent()) return;
+      // Treat another non-OK whoami (data === null) as an explicit clear.
       // _storePermissions(null) removes the key so stale UI gating
       // disappears when the server-side identity is gone (user
       // deleted, role stripped, token revoked between tab close and
@@ -443,6 +451,9 @@ export function initLogin() {
       .catch(function () {
         _onSuccess(); // Proceed even if permissions fetch fails
       });
+  } else if (_loggedOut) {
+    // Authentication can fail before the shell mounts this overlay.
+    showLogin(_authUpgradeReload ? "upgrade" : undefined);
   }
 }
 
@@ -916,10 +927,8 @@ export function logout() {
   });
 }
 
-// Schedule on initial load if already authenticated.  The whoami
-// request silently fails if the cookie is missing or expired, which
-// is the right behaviour — the first authFetch will trigger the
-// login overlay via the existing on-401 path.
+// Rehydrate authority and schedule refresh on initial load. A missing or expired
+// cookie uses the shared recovery path, even if whoami precedes all API responses.
 if (typeof window !== "undefined") {
   _scheduleRefreshFromWhoami();
 }

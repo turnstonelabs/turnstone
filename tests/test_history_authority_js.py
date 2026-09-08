@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from tests._js_harness_helpers import (
     FAKE_DOM,
     demodulize,
@@ -19,6 +21,7 @@ globalThis.BroadcastChannel = undefined;
 globalThis.AbortController = undefined;
 const elements = new Map();
 document.getElementById = id => elements.get(id) || null;
+document.addEventListener = document.removeEventListener = () => {};
 document.body = new FakeElement('body');
 document.createTextNode = text => Object.assign(new FakeElement('text'), {textContent: text});
 globalThis.Node = FakeElement;
@@ -149,6 +152,102 @@ assert.equal(await pending, 'auth changed');
 assert.equal(authGeneration(), generation);
 assert.equal(sessionStorage.getItem('ts.user_id'), 'operator');
 """)
+
+
+@pytest.mark.parametrize("cached_identity", [False, True])
+@pytest.mark.parametrize("refresh_ok", [False, True])
+def test_startup_whoami_401_recovers_pending_requests(cached_identity, refresh_ok):
+    _run(
+        f"const cachedIdentity = {str(cached_identity).lower()};\n"
+        f"const refreshOK = {str(refresh_ok).lower()};\n"
+        + r"""
+if (cachedIdentity) {
+  sessionStorage.setItem('ts.user_id', operator.user_id);
+  sessionStorage.setItem('turnstone_scopes', operator.scopes);
+  sessionStorage.setItem('turnstone_permissions', operator.permissions);
+}
+const overlay = element('login-overlay'); overlay.style.display = 'none';
+const whoami = requests.shift();
+const pending = authFetch('/saved').catch(e => e.message);
+const initial = requests.shift();
+reply(whoami, {error:'expired'}, 401); await drain();
+assert.equal(requests.length, 1, 'whoami must initiate authentication recovery');
+const refresh = requests.shift(); assert.equal(refresh.url, '/v1/api/auth/refresh');
+reply(initial, {error:'expired'}, 401); await drain();
+assert.equal(requests.length, 0, 'parallel 401s must share one refresh');
+reply(refresh, refreshOK ? {...operator, exp:0} : {error:'expired'}, refreshOK ? 200 : 401);
+await drain();
+if (refreshOK) {
+  assert.equal(overlay.style.display, 'none');
+  assert.equal(sessionStorage.getItem('ts.user_id'), 'operator');
+  assert.equal(hasScope('write'), true);
+  const retry = requests.shift(); assert.equal(retry.url, '/saved');
+  reply(retry, {workstreams:[]}); assert.equal((await pending).ok, true);
+} else {
+  assert.equal(overlay.style.display, 'flex');
+  assert.equal(sessionStorage.getItem('ts.user_id'), null);
+  assert.equal(hasScope('read'), false);
+  assert.match(await pending, /^auth( changed)?$/);
+  assert.equal(requests.shift().url, '/v1/api/auth/status');
+}
+assert.equal(requests.length, 0);
+"""
+    )
+
+
+def test_whoami_auth_loss_before_login_mount_preserves_upgrade_prompt():
+    _run(r"""
+function escapeHtml(text) { return text; }
+function setSafeHtml(el, html) { el.textContent = html; }
+document.querySelectorAll = () => [];
+const append = document.body.appendChild.bind(document.body);
+document.body.appendChild = el => { elements.set(el.id, el); return append(el); };
+window.location = {search:'', pathname:'/', reload:() => { reloads++; }};
+let reloads = 0;
+['login-box', 'toggle-token', 'setup-fields', 'login-fields', 'token-fields',
+ 'login-toggle', 'login-subtitle', 'login-submit'].forEach(element);
+sessionStorage.setItem('ts.user_id', 'operator');
+reply(requests.shift(), {code:'version_mismatch'}, 401); await drain();
+assert.equal(sessionStorage.getItem('ts.user_id'), null);
+assert.equal(requests.length, 0);
+initLogin();
+assert.equal(elements.get('login-overlay').style.display, 'flex');
+const status = requests.shift(); assert.equal(status.url, '/v1/api/auth/status');
+reply(status, {setup_required:false}); await drain();
+assert.match(elements.get('login-subtitle').textContent, /server was updated/);
+_onSuccess(); assert.equal(reloads, 1);
+""")
+
+
+@pytest.mark.parametrize("stage", ["body", "refresh"])
+def test_superseded_whoami_401_cannot_clear_unchanged_authority(stage):
+    _run(
+        f"const stage = '{stage}';\n"
+        + r"""
+reply(requests.shift(), operator); await drain();
+const overlay = element('login-overlay'); overlay.style.display = 'none';
+_scheduleRefreshFromWhoami(); const oldWhoami = requests.shift();
+let finishBody, oldRefresh;
+if (stage === 'body') {
+  oldWhoami.resolve({status:401, clone:() => ({json:() => new Promise(r => {finishBody = r;})})});
+  await drain();
+} else {
+  reply(oldWhoami, {error:'expired'}, 401); await drain();
+  oldRefresh = requests.shift(); assert.equal(oldRefresh.url, '/v1/api/auth/refresh');
+}
+const generation = authGeneration();
+_scheduleRefreshFromWhoami();
+reply(requests.shift(), operator); await drain();
+assert.equal(authGeneration(), generation, 'unchanged authority does not advance generation');
+if (finishBody) finishBody({code:'version_mismatch'});
+else reply(oldRefresh, {error:'expired'}, 401);
+await drain();
+assert.equal(overlay.style.display, 'none');
+assert.equal(sessionStorage.getItem('ts.user_id'), 'operator');
+assert.equal(hasScope('write'), true);
+assert.equal(requests.length, 0, 'superseded whoami must not refresh or open login');
+"""
+    )
 
 
 def test_saved_requests_cannot_cross_auth_generations():
