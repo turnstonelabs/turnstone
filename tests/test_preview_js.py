@@ -295,15 +295,6 @@ class TestEphemeralDismiss:
             "the skipped (ephemeral / single-pane) case must land on close()"
         )
 
-    def test_tab_dismiss_signals_destruction_for_ephemeral(self) -> None:
-        """The glyph/label must not lie: an ephemeral pane's dismiss button reads
-        as a destructive close (✕ + danger hover + 'Close pane'), never the
-        reversible '− / Hide from split'."""
-        body = _read(_PANE_JS)
-        assert "const destroys = !multi || pane.ephemeral;" in body, (
-            "dismiss mode must treat ephemeral panes as destructive even in a split"
-        )
-
     def test_unsplit_closes_ephemeral_non_survivors(self) -> None:
         """Collapsing the split from the OTHER pane must not orphan the preview
         either — unsplit closes ephemeral panes it isn't keeping."""

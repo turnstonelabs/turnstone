@@ -843,9 +843,9 @@ def test_step5d_rail_open_marker_tracks_active_pane() -> None:
 def test_step7_tab_dropdown_mechanism() -> None:
     """Step 7: PaneManager owns the GENERIC tab-action dropdown — a caret on any
     pane that exposes ``tabMenu()`` (the Dashboard home exposes none, so no
-    caret), opening a keyboard-navigable ``.tab-menu``.  The caret is a <span>,
-    NOT a nested <button> inside the tab <button> (invalid markup); the menu is
-    reachable by keyboard via ContextMenu / Shift+F10, and a single menu is open
+    caret), opening a keyboard-navigable ``.tab-menu``. The menu button is a sibling
+    of the selection button. The menu is also reachable through ContextMenu / Shift+F10,
+    and a single menu is open
     at a time (Escape / outside-click close it)."""
     body = _PANE_JS.read_text(encoding="utf-8")
     assert "_openTabMenu(" in body and "_closeTabMenu(" in body, (
@@ -1146,7 +1146,6 @@ def test_pane_manager_split_engine() -> None:
     # mode-DISTINCT glyphs (designer P1: identical signifier + locus with a
     # reversible/destructive divergence is a mode-error trap) — a click that
     # cannot be a reversible cell-hide shows ✕, else −.
-    assert "const destroys = !multi || pane.ephemeral;" in pane
     assert 'b.textContent = destroys ? "✕" : "−"' in pane
     assert '"tab-dismiss--close"' in pane
     # open-beside: the coordinator child-link placement (split right of the

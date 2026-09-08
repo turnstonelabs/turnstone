@@ -561,32 +561,42 @@
 .tab.active .glyph {
   color: var(--ink-2);
 }
-/* Tab-action caret — opens the pane's action dropdown (step 7).  A decorative
-   span inside the tab <button> (a nested <button> is invalid markup); the menu
-   it triggers is keyboard-reachable via ContextMenu / Shift+F10 on the focused
-   tab.  Dim by default, brightening on tab hover / active / open. */
+/* A divider and chevron identify the pane menu without another boxed control.
+   The trailing button keeps a 28px target beside the label and leading dismiss. */
 .tab-caret {
-  margin-left: 6px;
-  margin-right: -3px;
-  padding: 2px 3px;
-  color: var(--ink-4);
-  font-size: 10px;
-  line-height: 1;
-  border-radius: var(--r-sm);
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-right: 1px;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--hair-2);
+  border-radius: 0;
+  background: none;
+  color: var(--ink-3);
+  font: inherit;
+  cursor: pointer;
+  opacity: 0.85;
   transition:
     color 0.1s,
     background 0.1s;
 }
-.tab:hover .tab-caret,
-.tab.active .tab-caret {
-  color: var(--ink-2);
+.tab-caret::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
 }
 .tab-caret:hover,
-.tab-select[aria-expanded="true"] .tab-caret {
+.tab-caret[aria-expanded="true"] {
+  opacity: 1;
   color: var(--ink);
-}
-.tab-caret:hover {
-  background: var(--hair-2);
+  background: var(--panel-2);
 }
 /* Split controls in the tab-bar tail (they replaced the redundant [+] — the
    permanent Dashboard tab IS the launcher).  One ◫ glyph for both directions;
@@ -862,12 +872,9 @@
   z-index: 13; /* above the ring overlay — a clean bar, not bar-plus-ring-line */
   pointer-events: none;
 }
-/* Leading tab dismiss button — available for every visible pane.  Split mode:
-   "−" hides this cell (the TAB stays — closeCell), but an ephemeral pane (the
-   preview) shows "✕" and closes outright; single-pane: "✕" closes the pane
-   (withheld from the unclosable Dashboard).  The destructive "✕" modes wear
-   .tab-dismiss--close.  The fixed slot keeps tab positions stable when a pane
-   is hidden or the Dashboard cannot be dismissed. */
+/* Leading tab dismiss button: "−" hides a regular split cell (the tab stays);
+   "✕" closes a background tab, single pane, or preview. An unclosable Dashboard
+   outside the split has no action. The fixed slot keeps other tabs in place. */
 .tab-dismiss {
   flex: none;
   margin: 0 1px;
@@ -904,7 +911,8 @@
   border-color: var(--err);
 }
 .tab-select:focus-visible,
-.tab-dismiss:focus-visible {
+.tab-dismiss:focus-visible,
+.tab-caret:focus-visible {
   opacity: 1;
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -914,7 +922,8 @@
 }
 /* light resting glyph at .85 sat right at the 3:1 floor with --ink-3 — one
    ink step restores headroom (~4.5:1) without making the chip shout */
-[data-theme="light"] .tab-dismiss {
+[data-theme="light"] .tab-dismiss,
+[data-theme="light"] .tab-caret {
   color: var(--ink-2);
 }
 /* separator — a 7px hit area straddling the cell boundary with a 1px visual
@@ -973,15 +982,14 @@
   top: 2px;
   height: 3px;
 }
-/* a visible-but-unfocused pane's tab — the three tab states must each read:
-   rest (bare) → shown (accent UNDERLINE — a shape, not a fill delta; rhymes
-   with the focused cell's TOP bar) → active (panel fill).  Designer-measured:
-   a border/fill-only delta between shown and active was ≤1.1:1. */
+/* Visible panes keep a neutral tab frame. Only the active tab gets the accent
+   underline, matching its pane's solid accent border and top bar. A fill-only
+   difference is too subtle to distinguish selection from the other visible tabs. */
 .tab.shown:not(.active) {
   border-color: var(--hair-2);
   color: var(--ink-2);
 }
-.tab.shown:not(.active)::after {
+.tab.active::after {
   content: "";
   position: absolute;
   pointer-events: none;

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tests._js_harness_helpers import FAKE_DOM, node_skip, run_node_source
 
 _PANE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/pane.js"
@@ -38,9 +40,11 @@ FakeElement.prototype.insertBefore = function (child, anchor) {
 FakeElement.prototype.removeChild = function (child) { child.remove(); };
 let keyboardFocus = true;
 const emit = (target, type, props = {}, bubbles = true) => {
-  const event = {target, type, preventDefault() {}, ...props};
+  let stopped = false;
+  const event = {target, type, preventDefault() {}, stopPropagation() { stopped = true; }, ...props};
   for (let node = target; node; node = bubbles ? node.parentNode : null) {
     for (const {fn} of node._listeners.get(type) || []) fn(event);
+    if (stopped) break;
   }
 };
 FakeElement.prototype.matches = function (selector) {
@@ -113,7 +117,7 @@ const overflowTabs = () => {
 @node_skip
 def test_tab_dismiss_hides_without_activating_or_destroying_the_pane() -> None:
     _run_panes(r"""
-assert(dismiss(a).hidden && !dismiss(b).hidden, "only visible panes offer dismissal");
+assert(!dismiss(a).hidden && !dismiss(b).hidden, "closable tabs always offer dismissal");
 assert(dismiss(dashboard).hidden, "background Dashboard cannot be dismissed");
 assert(pm.splitFocused("right", a.id).ok, "split must succeed");
 assert(dismiss(a).textContent === "−" && dismiss(b).textContent === "−", "split hides cells");
@@ -126,19 +130,55 @@ dismiss(b).focus();
 dismiss(b).click();
 assert(b.el.hidden && b.el.isConnected && b.tabEl.isConnected, "hide must retain pane and tab");
 assert(!closed.length && activated.length === previousActivations, "hide must not activate target");
-assert(dismiss(b).hidden && dismiss(a).textContent === "✕", "survivor must enter close mode");
-assert(document.activeElement === b.tabEl, "hidden control must return focus to its tab");
+assert(!dismiss(b).hidden && dismiss(a).textContent === "✕", "background and survivor offer close");
+assert(document.activeElement === b.tabEl, "hiding must return focus to its tab");
 assert(b.tabEl.parentElement === group, "hiding must preserve the tab group");
 pm.activate(b.id);
-assert(!dismiss(b).hidden && dismiss(a).hidden, "tab switching must refresh availability");
+assert(!dismiss(b).hidden && !dismiss(a).hidden, "tab switching retains both close controls");
 pm.setTabTitle(b.id, "Renamed pane");
 assert(dismiss(b).getAttribute("aria-label").includes("Renamed pane"), "label follows title");
 pm._restoreLayout({type: "split", dir: "row", ratio: 0.5,
   children: [{type: "leaf", paneId: a.id}, {type: "leaf", paneId: b.id}]});
 assert(!dismiss(a).hidden && dismiss(b).textContent === "−", "restore refreshes dismiss modes");
 pm.unsplit();
-assert(dismiss(a).hidden && dismiss(b).textContent === "✕", "unsplit refreshes dismiss modes");
+assert(dismiss(a).textContent === "✕" && dismiss(b).textContent === "✕", "unsplit offers close on both tabs");
 """)
+
+
+@node_skip
+@pytest.mark.parametrize("split_remains", [False, True])
+@pytest.mark.parametrize("hide_active", [False, True])
+def test_hidden_tab_can_close_without_reactivation(split_remains: bool, hide_active: bool) -> None:
+    _run_panes(
+        f"const splitRemains = {json.dumps(split_remains)}, hideActive = {json.dumps(hide_active)};\n"
+        + r"""
+assert(pm.splitFocused("right", a.id).ok, "split must succeed");
+if (splitRemains)
+  assert(pm.splitFocused("down", dashboard.id).ok, "third cell must fit");
+pm.activate(hideActive ? b.id : a.id);
+assert(dismiss(b).textContent === "−", "visible split pane offers hide");
+dismiss(b).focus();
+dismiss(b).click();
+assert(b.el.hidden && b.tabEl.isConnected && !closed.length, "hide retains the background tab");
+assert(pm.isSplit() === splitRemains, "hiding changes only the intended split cell");
+assert(!dismiss(b).hidden, "hidden tab must immediately offer dismissal");
+assert(dismiss(b).textContent === "✕", "hidden tab must switch from hide to close");
+assert(dismiss(b).classList.contains("tab-dismiss--close"), "hidden tab uses destructive styling");
+assert(dismiss(b).title === "Close pane", "tooltip must describe close");
+assert(dismiss(b).getAttribute("aria-label") === "Close pane: b", "accessible name must describe close");
+const activeBeforeClose = pm.getActive().type;
+const activationsBeforeClose = activated.length;
+dismiss(b).focus();
+assert(!b.el.classList.contains("tab-dismiss-target"), "hidden tab must not highlight a pane");
+dismiss(b).click();
+assert(closed.join() === "b", "the second dismiss destroys only the hidden pane");
+assert(!b.el.isConnected && !b.tabEl.isConnected, "close removes the hidden pane and its tab");
+assert(pm.getActive().type === activeBeforeClose && activated.length === activationsBeforeClose,
+  "closing a hidden tab must not reactivate it or disturb the active pane");
+assert(!a.el.hidden && a.el.isConnected, "surviving pane content stays connected and visible");
+assert(document.activeElement === a.tabEl, "close returns keyboard focus to the active tab");
+"""
+    )
 
 
 @node_skip
@@ -146,6 +186,9 @@ def test_tab_dismiss_closes_preview_and_respects_dashboard() -> None:
     _run_panes(r"""
 const preview = pm.openPaneBeside("preview");
 assert(dismiss(preview).textContent === "✕", "split preview must advertise close");
+assert(dismiss(preview).classList.contains("tab-dismiss--close"), "preview has destructive styling");
+assert(dismiss(preview).title === "Close pane", "preview tooltip describes close");
+assert(dismiss(preview).getAttribute("aria-label") === "Close pane: preview", "preview has close name");
 const group = preview.tabEl.parentElement;
 dismiss(preview).focus();
 dismiss(preview).click();
@@ -159,6 +202,67 @@ dismiss(dashboard).click();
 assert(dashboard.el.isConnected && dashboard.el.hidden, "Dashboard hide must retain its tab");
 pm.activate(dashboard.id);
 assert(dismiss(dashboard).hidden, "single Dashboard must not offer close");
+""")
+
+
+@node_skip
+def test_tab_menu_button_is_separate_and_preserves_selection_and_focus() -> None:
+    _run_panes(r"""
+document.body = document.documentElement;
+document._listeners = new Map();
+document.addEventListener = FakeElement.prototype.addEventListener;
+document.removeEventListener = FakeElement.prototype.removeEventListener;
+FakeElement.prototype.getBoundingClientRect = () => ({left: 20, right: 60, top: 0, bottom: 28,
+  width: 40, height: 28});
+window.innerWidth = 1400;
+window.innerHeight = 900;
+let invoked = false;
+pm.registerType("menu", () => {
+  const pane = new ShellPane({type: "menu", title: "Menu pane"});
+  pane.tabMenu = () => [{label: "Inspect", action: () => { invoked = true; }},
+    {label: "Second", action: () => {}}];
+  return pane;
+});
+const pane = pm.openPane("menu");
+pm.activate(a.id);
+const button = pane._tabGroup.querySelector(".tab-caret");
+assert(button.tagName === "BUTTON" && button.type === "button", "menu has a real button");
+assert(button.parentElement === pane.tabEl.parentElement && !pane.tabEl.contains(button),
+  "menu and selection controls are siblings");
+assert(button.getAttribute("aria-haspopup") === "menu", "menu button announces its popup");
+assert(!button.hasAttribute("aria-hidden"), "menu button must be exposed to assistive technology");
+assert(!tabs.querySelector('[role="tablist"]').contains(button), "menu stays outside the tablist");
+pm.setTabTitle(pane.id, "Renamed menu");
+assert(button.getAttribute("aria-label") === "Pane actions: Renamed menu", "menu name follows title");
+const activationsBefore = activated.length;
+button.focus();
+emit(button, "click");
+assert(button.getAttribute("aria-expanded") === "true", "click opens the menu");
+assert(document.body.querySelector('[role="menu"]').getAttribute("aria-label") ===
+  "Renamed menu actions", "menu belongs to the requested background tab");
+button.focus();
+emit(button, "click");
+assert(button.getAttribute("aria-expanded") === "false", "second click closes the menu");
+pressKey("ArrowDown");
+assert(document.activeElement === document.body.querySelector('.tab-menu-item'),
+  "ArrowDown opens at the first menu item");
+emit(document, "keydown", {key: "Escape"});
+assert(document.activeElement === button && !document.body.querySelector('[role="menu"]'),
+  "Escape returns focus to the menu button");
+pane.tabEl.focus();
+emit(pane.tabEl, "keydown", {key: "F10", shiftKey: true});
+emit(document, "keydown", {key: "Escape"});
+assert(document.activeElement === pane.tabEl, "Shift+F10 returns focus to the tab label");
+emit(pane.tabEl, "contextmenu");
+document.body.querySelector('.tab-menu-item').click();
+assert(invoked && document.activeElement === pane.tabEl, "menu action returns focus to its opener");
+button.focus();
+emit(button, "click");
+await new Promise(resolve => setTimeout(resolve, 0));
+emit(document, "mousedown", {target: a.tabEl});
+assert(button.getAttribute("aria-expanded") === "false", "outside click clears menu state");
+assert(pm.getActive().type === "a" && activated.length === activationsBefore,
+  "menu interactions must not activate the background pane");
 """)
 
 

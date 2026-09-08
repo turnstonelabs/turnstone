@@ -356,7 +356,7 @@ export class PaneManager {
     if (!pane || text == null || text === "") return;
     pane.title = text;
     if (pane._titleNode) pane._titleNode.textContent = text;
-    if (pane.tabEl) this._refreshTabDismiss(pane);
+    if (pane.tabEl) this._refreshTab(pane.tabEl, pane);
   }
 
   /** Open panes whose tab shows live Tier-1 state — `{id, rawId}[]` (the shell
@@ -1195,25 +1195,23 @@ export class PaneManager {
     titleNode.textContent = pane.title;
     tab.append(titleNode);
     pane._titleNode = titleNode; // setTabTitle repaints this from Tier-1
-    // Tab-action menu (step 7): a pane that exposes `tabMenu()` gets a caret to
-    // the right of its label that opens the action dropdown (the three-verb close
-    // + per-persona verbs).  The Dashboard home tab exposes none, so it gets no
-    // caret.  The caret is a <span>, NOT a nested <button> (invalid inside the
-    // tab <button>); a click is routed to the menu vs activation by its target.
+    // Pane actions have their own trailing button, beside the selection button.
+    // The Dashboard exposes no menu. Keep all three controls as siblings so
+    // opening the menu cannot activate the pane or nest interactive elements.
     if (typeof pane.tabMenu === "function") {
-      const caret = document.createElement("span");
+      const caret = document.createElement("button");
+      caret.type = "button";
       caret.className = "tab-caret";
-      caret.setAttribute("aria-hidden", "true");
-      caret.textContent = "▾"; // down-caret menu affordance
-      tab.append(caret);
-      tab.setAttribute("aria-haspopup", "menu");
-      tab.setAttribute("aria-expanded", "false");
+      caret.title = "Pane actions";
+      caret.setAttribute("aria-haspopup", "menu");
+      caret.setAttribute("aria-expanded", "false");
+      caret.addEventListener("click", () => {
+        if (caret.getAttribute("aria-expanded") === "true") this._closeTabMenu();
+        else this._openTabMenu(caret, pane);
+      });
+      pane._menuBtn = caret;
     }
-    tab.addEventListener("click", (e) => {
-      if (typeof pane.tabMenu === "function" && e.target.closest(".tab-caret"))
-        this._openTabMenu(tab, pane);
-      else this.activate(pane.id);
-    });
+    tab.addEventListener("click", () => this.activate(pane.id));
     // Right-click / long-press parity with the caret.
     tab.addEventListener("contextmenu", (e) => {
       if (typeof pane.tabMenu !== "function") return;
@@ -1221,6 +1219,7 @@ export class PaneManager {
       this._openTabMenu(tab, pane);
     });
     group.append(dismiss, tab);
+    if (pane._menuBtn) group.append(pane._menuBtn);
     this._tabResizeObserver.observe(group);
     pane.tabEl = tab;
     return tab;
@@ -1237,19 +1236,19 @@ export class PaneManager {
     tab.setAttribute("aria-selected", active ? "true" : "false");
     tab.tabIndex = active ? 0 : -1;
     this._refreshTabDismiss(pane);
+    if (pane._menuBtn)
+      pane._menuBtn.setAttribute("aria-label", "Pane actions: " + pane.title);
   }
 
-  /** Only visible panes offer dismissal: − hides a regular split cell while
-   *  ✕ closes a single or ephemeral pane.  The leading slot stays reserved
-   *  when unavailable, so hiding a cell cannot move another tab under the pointer. */
+  /** A visible regular split pane offers −; background, single, and ephemeral
+   *  panes offer ✕. Only an unclosable pane outside the split has no action;
+   *  its leading slot stays reserved so other tabs cannot shift under the pointer. */
   _refreshTabDismiss(pane) {
-    const multi = !!this._layout && this._leaves().length > 1;
-    const want =
-      !pane.el.hidden && (multi ? !!this._leafFor(pane.id) : pane.closable !== false);
+    const destroys = !this._leafFor(pane.id) || pane.ephemeral;
+    const want = !destroys || pane.closable !== false;
     const b = pane._dismissBtn;
     b.hidden = !want;
-    if (!want) pane.el.classList.remove("tab-dismiss-target");
-    const destroys = !multi || pane.ephemeral;
+    if (!want || pane.el.hidden) pane.el.classList.remove("tab-dismiss-target");
     b.textContent = destroys ? "✕" : "−";
     b.classList.toggle("tab-dismiss--close", destroys);
     const label = destroys
@@ -1267,13 +1266,18 @@ export class PaneManager {
     const group = document.activeElement.closest(".tab");
     const i = tabs.indexOf(group && group.querySelector('[role="tab"]'));
     if (i < 0) return;
-    // ContextMenu key / Shift+F10 opens the focused tab's action menu — keyboard
-    // parity with the caret click (the caret itself is a decorative span).
-    if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
-      const pane = this._panes.get(tabs[i].dataset.paneId);
+    const pane = this._panes.get(tabs[i].dataset.paneId);
+    const onMenu = pane && document.activeElement === pane._menuBtn;
+    // The menu button accepts ArrowDown; tab labels retain ContextMenu / Shift+F10.
+    if (
+      e.key === "ContextMenu" ||
+      (e.shiftKey && e.key === "F10") ||
+      (onMenu && e.key === "ArrowDown")
+    ) {
       if (pane && typeof pane.tabMenu === "function") {
         e.preventDefault();
-        this._openTabMenu(tabs[i], pane);
+        e.stopPropagation(); // the new menu must not consume its opening ArrowDown
+        this._openTabMenu(onMenu ? pane._menuBtn : tabs[i], pane);
       }
       return;
     }
@@ -1296,7 +1300,7 @@ export class PaneManager {
    *  chrome + keyboard + positioning live in the shared openPopupMenu helper.
    *  Singleton menu — opening one closes any other.  Items are
    *  `{label, key?, cls?, separator?, action}`. */
-  _openTabMenu(tab, pane) {
+  _openTabMenu(trigger, pane) {
     this._closeTabMenu();
     let items;
     try {
@@ -1307,13 +1311,13 @@ export class PaneManager {
     }
     if (!items.length) return;
     const handle = openPopupMenu(
-      tab.querySelector(".tab-caret") || tab,
+      pane._menuBtn || trigger,
       items,
       {
         label: (pane.title || "Pane") + " actions",
-        expandEl: tab,
-        returnFocusEl: tab,
-        ignoreEl: tab, // a click elsewhere on the tab is menu-adjacent, not "outside"
+        expandEl: pane._menuBtn || trigger,
+        returnFocusEl: trigger,
+        ignoreEl: pane._menuBtn || trigger,
         onClose: () => {
           if (this._openMenu && this._openMenu.handle === handle)
             this._openMenu = null;
