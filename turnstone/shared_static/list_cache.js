@@ -52,7 +52,8 @@ import { authFetch } from "./auth.js";
  * in flight it chains ONE trailing refetch after it and awaits that, instead of
  * coalescing onto the in-flight response that may predate the change.
  * @returns {{refresh:Function, get:Function, getByKey:Function,
- *            loaded:Function, error:Function, extra:Function, onChange:Function}}
+ *            loaded:Function, error:Function, extra:Function, onChange:Function,
+ *            reset:Function}}
  */
 export function makeListCache(opts) {
   const url = opts.url;
@@ -81,6 +82,7 @@ export function makeListCache(opts) {
   let _fingerprint = null; // last fired signature, for change-detection
   let _extra = extraDefaults ? Object.assign({}, extraDefaults) : {};
   const _subs = []; // () => void, fired after each CHANGED refresh
+  let _generation = 0;
 
   function _fp() {
     // Cheap signature of what subscribers render, so a refresh returning
@@ -116,6 +118,7 @@ export function makeListCache(opts) {
   }
 
   function refresh(callOpts) {
+    const generation = _generation;
     // Coalesce concurrent callers (startup warm + a picker open can both fire
     // this) onto one in-flight request — they share the promise and _setCache
     // runs once.
@@ -139,6 +142,7 @@ export function makeListCache(opts) {
         _pending =
           _pending ||
           _inflight.then(function () {
+            if (generation !== _generation) return _cache;
             _pending = null;
             return refresh();
           });
@@ -148,6 +152,7 @@ export function makeListCache(opts) {
     }
     _inflight = authFetch(url)
       .then(function (r) {
+        if (generation !== _generation) return null;
         if (r.ok) return r.json();
         // A non-OK status (403 when a grant is missing, a 5xx, ...) is NOT "you
         // have zero rows": keep the prior cache rather than blanking it and
@@ -162,6 +167,7 @@ export function makeListCache(opts) {
         return null;
       })
       .then(function (data) {
+        if (generation !== _generation) return _cache;
         if (data) {
           _lastError = null;
           if (captureExtra) _extra = captureExtra(data);
@@ -170,6 +176,7 @@ export function makeListCache(opts) {
         return _cache;
       })
       .catch(function (e) {
+        if (generation !== _generation) return _cache;
         // Network drop or a non-JSON body — same policy as a non-OK status:
         // preserve the last-known cache, never reject (callers chain a bare
         // .then), surface the failure, fail-open the extra (when configured).
@@ -181,6 +188,7 @@ export function makeListCache(opts) {
         return _cache;
       })
       .finally(function () {
+        if (generation !== _generation) return;
         // One attempt has completed (ok or not) — lets a reader tell "still
         // loading" from "loaded, genuinely empty" / "load failed".
         _loaded = true;
@@ -191,6 +199,16 @@ export function makeListCache(opts) {
 
   return {
     refresh: refresh,
+    /** Forget the prior principal's rows and discard its pending responses. */
+    reset: function () {
+      _generation++;
+      _inflight = _pending = null;
+      _lastError = null;
+      _extra = extraDefaults ? Object.assign({}, extraDefaults) : {};
+      _setCache([]);
+      _loaded = false;
+      _fingerprint = null;
+    },
     /** Cached rows (empty array until the first refresh resolves). */
     get: function () {
       return _cache;

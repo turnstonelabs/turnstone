@@ -3257,6 +3257,7 @@ def _audit_workstream_created(
 async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/{ws_id}/delete — permanently delete a saved workstream."""
     from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
     from turnstone.core.log import get_logger
     from turnstone.core.storage._registry import get_storage
 
@@ -3282,6 +3283,14 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     owner_uid, err = _require_ws_access(request, ws_id, resolved_row=row)
     if err:
         return err
+    # Authorize kind from the same snapshot that fences the deletion.
+    # Both saved tables route here, including coordinator deletions.
+    if row.get("kind") == WorkstreamKind.COORDINATOR:
+        err = require_permission(request, "admin.coordinator")
+        if err is not None:
+            return err
+    elif row.get("kind") != WorkstreamKind.INTERACTIVE:
+        return JSONResponse({"error": "Unsupported workstream kind"}, status_code=403)
     kind: str = ""
     parent_ws_id: str | None = None
     name: str = ""

@@ -56,7 +56,7 @@ class _AuthMiddleware(BaseHTTPMiddleware):
         if perms or user_id:
             request.state.auth_result = AuthResult(
                 user_id=user_id,
-                scopes=frozenset({"approve"}),
+                scopes=frozenset({"read", "write", "approve"}),
                 token_source="test",
                 permissions=frozenset(p for p in perms.split(",") if p),
             )

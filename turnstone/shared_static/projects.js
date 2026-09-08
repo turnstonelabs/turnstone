@@ -17,7 +17,7 @@
  * app.js bundles.  All fetches ride the shared cookie-auth `authFetch`.
  */
 
-import { authFetch } from "./auth.js";
+import { authFetch, hasScope, onAuthChange } from "./auth.js";
 import { makeListCache } from "./list_cache.js";
 
 // The require_project advisory rides the same /v1/api/projects response as an
@@ -44,6 +44,11 @@ const _core = makeListCache({
   // a stale-true value hide options.  (Default, but explicit for the contrast
   // with models.js, whose cosmetic extra opts out of the reset.)
   resetExtraOnError: true,
+});
+
+onAuthChange(function () {
+  _core.reset();
+  if (hasScope("read")) _core.refresh();
 });
 
 /**

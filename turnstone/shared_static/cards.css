@@ -289,13 +289,12 @@
    near-zero --row-alt vanishes on a long list) and full-opacity muted text
    (AA-legible colours, no opacity hacks).  Idle-dimming is avoided at the
    source — renderSessionRow only sets data-state for `error`. */
-/* Saved rows are always interactive — resume on click, or toggle a checkbox
-   in delete mode — so they own the pointer cursor here rather than relying on
-   each app's `.dash-row` convention.  The server sets `cursor: pointer` on
-   every `.dash-row`; the console scopes it to `.dash-row.has-link` (a class
-   the shared row builder doesn't set), so without this the console's saved
-   rows fell back to the base `cursor: default`. */
+/* Metadata remains readable when the caller cannot resume or delete. */
 .saved-row {
+  cursor: default;
+}
+.saved-row[role="button"],
+.saved-row.ws-delete-mode {
   cursor: pointer;
 }
 .saved-row .dash-row-main {

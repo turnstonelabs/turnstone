@@ -16408,8 +16408,8 @@ def create_app(
     # (manager_lookup / tenant_check / labels) are required by the
     # dataclass but never consulted on the read-only saved path — the
     # console mounts no interactive verb handlers, only the merged saved
-    # list. ``permission_gate=None`` because the unified handler gates
-    # once with the operator's ``admin.coordinator`` check.
+    # list. Interactive discovery needs read scope and project visibility;
+    # coordinator admission retains its own named permission gate.
     interactive_saved_cfg = SessionEndpointConfig(
         permission_gate=None,
         manager_lookup=lambda request: (None, None),
@@ -16427,14 +16427,10 @@ def create_app(
         handlers=SharedSessionVerbHandlers(
             list_workstreams=make_list_handler(coord_endpoint_config),  # lifted: shared body
             # Unified saved list: coordinator + interactive in one
-            # response for the L-shell dashboard. Gated once by coord's
-            # existing operator check (``admin.coordinator``) — the
-            # operator already sees every kind, so the merge exposes
-            # nothing new. Each cfg keeps its own per-kind state filter
-            # / warm-pool exclusion.
+            # response for the L-shell dashboard. Each kind retains its
+            # permission, state filter, and warm-pool exclusion.
             list_saved=make_unified_saved_handler(
                 [coord_endpoint_config, interactive_saved_cfg],
-                permission_gate=coord_endpoint_config.permission_gate,
             ),
             create=make_create_handler(  # lifted: shared body
                 coord_endpoint_config,

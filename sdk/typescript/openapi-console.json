@@ -6004,7 +6004,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Returns the persisted coordinator's display fields.  If the session isn't currently in memory the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line.",
+        "description": "Returns the persisted coordinator's display fields.  If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line.",
         "parameters": [
           {
             "name": "ws_id",
@@ -6062,6 +6062,38 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/saved": {
+      "get": {
+        "summary": "List saved sessions visible to the caller",
+        "operationId": "v1_api_workstreams_saved_get",
+        "tags": [
+          "Workstreams"
+        ],
+        "description": "Requires read scope. Interactive rows use creator/project visibility; coordinator rows additionally require admin.coordinator. A caller without that permission receives only interactive rows.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSavedWorkstreamsResponse"
                 }
               }
             }
@@ -15619,6 +15651,12 @@
             "default": "",
             "title": "Permissions",
             "type": "string"
+          },
+          "scopes": {
+            "default": "",
+            "description": "Comma-separated effective transport scopes",
+            "title": "Scopes",
+            "type": "string"
           }
         },
         "required": [
@@ -15910,6 +15948,151 @@
           "state"
         ],
         "title": "WorkstreamInfo",
+        "type": "object"
+      },
+      "ListSavedWorkstreamsResponse": {
+        "properties": {
+          "workstreams": {
+            "items": {
+              "$ref": "#/components/schemas/SavedWorkstreamInfo"
+            },
+            "title": "Workstreams",
+            "type": "array"
+          }
+        },
+        "required": [
+          "workstreams"
+        ],
+        "title": "ListSavedWorkstreamsResponse",
+        "type": "object"
+      },
+      "SavedWorkstreamInfo": {
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "alias": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Alias"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "title": "Updated",
+            "type": "string"
+          },
+          "message_count": {
+            "title": "Message Count",
+            "type": "integer"
+          },
+          "state": {
+            "default": "idle",
+            "title": "State",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive"
+          },
+          "node_id": {
+            "default": "",
+            "title": "Node Id",
+            "type": "string"
+          },
+          "model_alias": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Alias"
+          },
+          "launch_skill": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Launch Skill"
+          },
+          "child_count": {
+            "default": 0,
+            "title": "Child Count",
+            "type": "integer"
+          },
+          "context_tokens": {
+            "default": 0,
+            "title": "Context Tokens",
+            "type": "integer"
+          },
+          "context_ratio": {
+            "default": 0.0,
+            "title": "Context Ratio",
+            "type": "number"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "persona": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Persona"
+          }
+        },
+        "required": [
+          "ws_id",
+          "created",
+          "updated",
+          "message_count"
+        ],
+        "title": "SavedWorkstreamInfo",
         "type": "object"
       },
       "UploadAttachmentResponse": {

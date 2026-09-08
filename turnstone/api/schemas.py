@@ -174,6 +174,7 @@ class AuthWhoamiResponse(BaseModel):
 
     user_id: str
     permissions: str = ""
+    scopes: str = Field(default="", description="Comma-separated effective transport scopes")
 
 
 # ---------------------------------------------------------------------------

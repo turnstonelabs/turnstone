@@ -1055,6 +1055,7 @@ function _setSavedWsMessage(text) {
 }
 
 function loadDashboard() {
+  const generation = authGeneration();
   const tableEl = document.getElementById("dash-ws-table");
   tableEl.replaceChildren(makeEmptyState("Loading\u2026"));
   _setSavedWsMessage("Loading\u2026");
@@ -1062,6 +1063,7 @@ function loadDashboard() {
     return r.json();
   });
   const sessP = authFetch("/v1/api/workstreams/saved").then(function (r) {
+    if (!r.ok) throw new Error("Saved sessions unavailable");
     return r.json();
   });
   // Refresh the projects cache alongside the table so the per-row project pills
@@ -1076,6 +1078,7 @@ function loadDashboard() {
     : Promise.resolve();
   Promise.all([dashP, sessP, projP, persP])
     .then(function (res) {
+      if (generation !== authGeneration()) return;
       const dashData = res[0];
       const wsList = dashData.workstreams || [];
       const agg = dashData.aggregate || {};
@@ -1090,6 +1093,7 @@ function loadDashboard() {
       _wsTable.setItems(savedList);
     })
     .catch(function () {
+      if (generation !== authGeneration()) return;
       tableEl.replaceChildren(makeEmptyState("Failed to load"));
       _setSavedWsMessage("Failed to load");
     });
@@ -1294,6 +1298,12 @@ function _initSavedWsTable() {
     columns: WS_COLUMNS,
     noun: "workstream",
     emptyText: "No saved workstreams",
+    canActivate: function () {
+      return hasScope("write");
+    },
+    canDelete: function () {
+      return hasScope("write");
+    },
     activateLabel: function (s) {
       return "Resume: " + (s.alias || s.title || s.ws_id);
     },
@@ -1326,6 +1336,10 @@ function _initSavedWsTable() {
       if (_wsTable) _wsTable.render();
     });
   }
+  onAuthChange(function () {
+    _wsTable.reset();
+    if (hasScope("read")) loadDashboard();
+  });
 }
 
 // HTML inline-onclick wrappers — keep the global names the existing markup

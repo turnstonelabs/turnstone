@@ -15,7 +15,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit
 
 import pytest
 
@@ -172,6 +174,51 @@ def test_console_index_loads_shell_module_and_caps() -> None:
     )
     assert "/shared/shell.css" in body, "console index must link shell.css"
     assert "TURNSTONE_SHELL_CAPS" in body, "console index must set the shell capability flags"
+
+
+@pytest.mark.parametrize("index", [_CONSOLE_INDEX, _UI_INDEX], ids=["console", "node"])
+def test_served_module_graph_has_one_auth_instance(index: Path) -> None:
+    """URL queries identify distinct ESM instances even when file contents match.
+
+    Two auth instances share sessionStorage but own separate change listeners;
+    the first writer can suppress the second instance's login notification.
+    Traverse the actual versioned entry points and static imports as the browser
+    resolves them, so either duplicating auth or losing it fails this guard.
+    """
+    from turnstone.core.web_helpers import version_html
+
+    class ModuleScripts(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.urls: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "script" and attrs.get("type") == "module" and attrs.get("src"):
+                self.urls.append(attrs["src"])
+
+    parser = ModuleScripts()
+    parser.feed(version_html(index.read_text()))
+    pending = [urljoin("https://console.test/", url) for url in parser.urls]
+    seen: set[str] = set()
+    while pending:
+        url = pending.pop()
+        if url in seen:
+            continue
+        seen.add(url)
+        path = urlsplit(url).path
+        source = (
+            _SHARED / path.removeprefix("/shared/")
+            if path.startswith("/shared/")
+            else index.parent / path.removeprefix("/static/")
+        )
+        body = strip_js_comments(source.read_text())
+        imports = re.findall(
+            r"^\s*import\s+(?:[^;]*?\bfrom\s+)?[\"']([^\"']+)[\"']", body, re.MULTILINE
+        )
+        pending.extend(urljoin(url, specifier) for specifier in imports)
+    auth_urls = {url for url in seen if urlsplit(url).path == "/shared/auth.js"}
+    assert len(auth_urls) == 1, auth_urls
 
 
 def test_persona_picker_surfaces_wired() -> None:

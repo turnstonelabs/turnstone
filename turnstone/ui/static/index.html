@@ -669,7 +669,8 @@
     <script type="module" src="/shared/composer_attachments.js"></script>
     <script type="module" src="/shared/composer_queue.js"></script>
     <script type="module" src="/shared/status_bar.js"></script>
-    <script type="module" src="/shared/auth.js"></script>
+    <!-- cards/shell import auth.js. A separate versioned script URL would
+         create a second auth instance with independent login state. -->
     <script type="module" src="/shared/hatch.js"></script>
     <script type="module" src="/shared/kb.js"></script>
     <script src="/shared/katex-0.18.4/katex.min.js"></script>

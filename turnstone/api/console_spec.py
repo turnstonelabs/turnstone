@@ -152,6 +152,7 @@ from turnstone.api.server_schemas import (
     CommandRequest,
     DequeueRequest,
     ListAttachmentsResponse,
+    ListSavedWorkstreamsResponse,
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
     RewindRequest,
@@ -1379,13 +1380,27 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Get coordinator detail (rehydrates lazily on miss)",
         description=(
             "Returns the persisted coordinator's display fields.  If the "
-            "session isn't currently in memory the manager rehydrates it "
+            "session isn't currently in memory, write scope is additionally "
+            "required before the manager rehydrates it "
             "before responding; ``500`` on rehydrate failure carries a "
             "correlation id matching the server log line."
         ),
         response_model=WorkstreamDetailResponse,
         error_codes=[400, 403, 404, 500, 503],
         tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/saved",
+        "GET",
+        "List saved sessions visible to the caller",
+        description=(
+            "Requires read scope. Interactive rows use creator/project visibility; "
+            "coordinator rows additionally require admin.coordinator. A caller without "
+            "that permission receives only interactive rows."
+        ),
+        response_model=ListSavedWorkstreamsResponse,
+        error_codes=[503],
+        tags=["Workstreams"],
     ),
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/open",

@@ -71,8 +71,13 @@ def _request_for(
     uid: str,
     scopes: tuple[str, ...] = (),
     permissions: tuple[str, ...] = (),
+    *,
+    storage: Any = None,
 ) -> Any:
-    return SimpleNamespace(state=SimpleNamespace(auth_result=_FakeAuth(uid, scopes, permissions)))
+    return SimpleNamespace(
+        state=SimpleNamespace(auth_result=_FakeAuth(uid, scopes, permissions)),
+        app=SimpleNamespace(state=SimpleNamespace(auth_storage=storage)),
+    )
 
 
 class TestWsVisiblePredicate:
@@ -393,7 +398,7 @@ class TestSavedListFilter:
             saved_loaded_lookup=None,
         )
 
-        rows = await _collect_saved_rows(cfg, _request_for("bob"))
+        rows = await _collect_saved_rows(cfg, _request_for("bob", storage=storage))
         ids = {r["ws_id"] for r in rows}
         # bob: no membership in p1 — alice's private ws is dropped; the
         # public-project ws, the project-less ws, and bob's own
@@ -403,7 +408,7 @@ class TestSavedListFilter:
         assert by_id["ws-pub"]["project_id"] == "p2"
         assert by_id["ws-plain"]["project_id"] is None
 
-        rows_alice = await _collect_saved_rows(cfg, _request_for("alice"))
+        rows_alice = await _collect_saved_rows(cfg, _request_for("alice", storage=storage))
         assert {r["ws_id"] for r in rows_alice} == {"ws-plain", "ws-priv", "ws-pub", "ws-own"}
 
 
@@ -642,17 +647,17 @@ class TestSavedListPagination:
             saved_loaded_lookup=None,
         )
 
-    def _patch(self, monkeypatch: pytest.MonkeyPatch, rows: list) -> None:
+    def _patch(self, monkeypatch: pytest.MonkeyPatch, rows: list) -> Any:
         def _fake(limit=20, *, kind=None, user_id=None, state=None, offset=0):
             return rows[offset : offset + limit]
 
-        monkeypatch.setattr("turnstone.core.memory.list_workstreams_with_history", _fake)
         vis = WorkstreamProjectVisibility("bob", storage=_fake_storage())  # denies any pid
         monkeypatch.setattr(
             WorkstreamProjectVisibility,
             "for_request",
             classmethod(lambda cls, request, storage=None: vis),
         )
+        return _request_for("bob", storage=SimpleNamespace(list_workstreams_with_history=_fake))
 
     async def test_pages_past_invisible_rows(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from turnstone.core.session_routes import _collect_saved_rows
@@ -660,8 +665,8 @@ class TestSavedListPagination:
         rows = [self._row(i, "ph") for i in range(60)] + [
             self._row(i, None) for i in range(60, 130)
         ]
-        self._patch(monkeypatch, rows)
-        result = await _collect_saved_rows(self._cfg(), MagicMock())
+        request = self._patch(monkeypatch, rows)
+        result = await _collect_saved_rows(self._cfg(), request)
         assert len(result) == 50
         assert result[0]["ws_id"] == "ws-060"
         assert result[-1]["ws_id"] == "ws-109"
@@ -670,6 +675,6 @@ class TestSavedListPagination:
         from turnstone.core.session_routes import _collect_saved_rows
 
         rows = [self._row(i, "ph") for i in range(5000)]
-        self._patch(monkeypatch, rows)
-        result = await _collect_saved_rows(self._cfg(), MagicMock())
+        request = self._patch(monkeypatch, rows)
+        result = await _collect_saved_rows(self._cfg(), request)
         assert result == []

@@ -138,7 +138,9 @@ export var SavedColumns = {
       width: "120px",
       hideBelow: true,
       cell: function (s) {
-        return _projectName(s.project_id) || "—";
+        return (
+          _projectName(s.project_id) || (s.project_id ? "Unavailable" : "—")
+        );
       },
       sort: function (s) {
         return (_projectName(s.project_id) || "").toLowerCase();
@@ -234,13 +236,16 @@ export function renderSessionRow(sess, opts) {
   row.className = "dash-row saved-row" + (opts.busy ? " is-busy" : "");
   row.dataset.wsId = sess.ws_id;
   if (sess.state === "error") row.dataset.state = "error";
-  row.setAttribute("role", "button");
-  row.setAttribute("tabindex", "0");
+  var canActivate = opts.canActivate !== false;
+  row.setAttribute("role", canActivate ? "button" : "group");
+  if (canActivate) row.setAttribute("tabindex", "0");
   row.setAttribute(
     "aria-label",
-    typeof opts.ariaLabel === "function"
-      ? opts.ariaLabel(sess)
-      : "Resume: " + (sess.alias || sess.title || sess.name || sess.ws_id),
+    !canActivate
+      ? sess.alias || sess.title || sess.name || sess.ws_id
+      : typeof opts.ariaLabel === "function"
+        ? opts.ariaLabel(sess)
+        : "Resume: " + (sess.alias || sess.title || sess.name || sess.ws_id),
   );
   var main = document.createElement("div");
   main.className = "dash-row-main";
@@ -255,6 +260,7 @@ export function renderSessionRow(sess, opts) {
   });
   row.appendChild(main);
   var activate = function () {
+    if (!canActivate) return;
     if (row.classList.contains("is-busy")) return;
     if (typeof opts.onActivate === "function") opts.onActivate(sess, row);
   };
@@ -284,6 +290,8 @@ export function renderSessionRow(sess, opts) {
      columns           — array from SavedColumns
      noun              — "workstream" / "coordinator"
      onActivate        — sess => void (resume); gated by delete mode
+     canActivate       — optional sess => boolean (default true)
+     canDelete         — optional sess => boolean (default true)
      activateLabel     — optional sess => string (aria when not deleting)
      emptyText         — empty-state copy
      delete            — {idPrefix, buttonId, buildDeleteRequest, onClose}
@@ -312,6 +320,7 @@ export function createSavedTable(opts) {
         return "Resume: " + (s.alias || s.title || s.name || s.ws_id);
       },
     buildDeleteRequest: opts.delete.buildDeleteRequest,
+    canDelete: opts.canDelete,
     render: function () {
       render();
     },
@@ -543,6 +552,14 @@ export function createSavedTable(opts) {
     var start = state.page * pageSize;
     var rows = all.slice(start, start + pageSize);
     controller.setItems(rows);
+    var deleteButton = document.getElementById(opts.delete.buttonId);
+    if (deleteButton) {
+      deleteButton.style.display = state.items.some(function (s) {
+        return !opts.canDelete || opts.canDelete(s);
+      })
+        ? ""
+        : "none";
+    }
     /* One grid write per render: rows read it from the inherited CSS var. */
     if (opts.bodyEl) {
       opts.bodyEl.style.setProperty("--saved-grid", gridTemplate(cols));
@@ -564,9 +581,11 @@ export function createSavedTable(opts) {
       rows.forEach(function (sess) {
         var row = renderSessionRow(sess, {
           columns: cols,
+          canActivate: !opts.canActivate || opts.canActivate(sess),
           ariaLabel: controller.ariaLabel,
           onActivate: function (s, el) {
             if (controller.blockActivate()) return;
+            if (opts.canActivate && !opts.canActivate(s)) return;
             if (typeof opts.onActivate === "function") opts.onActivate(s, el);
           },
         });
@@ -609,6 +628,13 @@ export function createSavedTable(opts) {
   }
 
   return {
+    reset: function () {
+      state.items = [];
+      state.filter = "";
+      state.page = 0;
+      if (opts.filterEl) opts.filterEl.value = "";
+      controller.reset();
+    },
     setItems: function (items) {
       state.items = items || [];
       render();
@@ -660,6 +686,11 @@ export function createSavedTable(opts) {
 */
 export function createSavedCardsController(opts) {
   var state = { mode: false, selected: {}, items: [] };
+  var generation = 0;
+
+  function canDelete(sess) {
+    return !opts.canDelete || opts.canDelete(sess);
+  }
 
   function $(id) {
     return document.getElementById(opts.idPrefix + "-" + id);
@@ -679,13 +710,13 @@ export function createSavedCardsController(opts) {
   }
 
   function setItems(items) {
-    state.items = items;
+    state.items = items.filter(canDelete);
     /* Drop any selections whose ws_id is no longer on the visible page —
        SSE-driven re-renders or pagination jumps shouldn't leave ghost
        entries inflating the count and 404-ing on confirm. */
     if (state.mode) {
       var byId = {};
-      items.forEach(function (s) {
+      state.items.forEach(function (s) {
         byId[s.ws_id] = true;
       });
       Object.keys(state.selected).forEach(function (id) {
@@ -718,7 +749,7 @@ export function createSavedCardsController(opts) {
      event overrides used in delete mode.  Idempotent guard: only acts
      when the controller is active. */
   function decorateCard(card, sess) {
-    if (!state.mode) return;
+    if (!state.mode || !canDelete(sess)) return;
     card.classList.add("ws-delete-mode");
     card.removeAttribute("role");
     var chk = document.createElement("input");
@@ -899,6 +930,7 @@ export function createSavedCardsController(opts) {
   }
 
   function confirm() {
+    var currentGeneration = generation;
     var selected = Object.keys(state.selected);
     if (!selected.length) return;
     var byId = _byId();
@@ -968,6 +1000,7 @@ export function createSavedCardsController(opts) {
     });
 
     Promise.all(promises).then(function () {
+      if (currentGeneration !== generation) return;
       window.TurnstoneHatch.setBusy(dlg, false);
       if (listEl) {
         listEl.replaceChildren();
@@ -1022,6 +1055,20 @@ export function createSavedCardsController(opts) {
   }
 
   return {
+    reset: function () {
+      generation++;
+      state.resultsShown = false;
+      var dlg = $("dialog");
+      if (dlg && dlg.open) {
+        window.TurnstoneHatch.setBusy(dlg, false);
+        dlg.close();
+      }
+      ["list", "count", "meta", "error"].forEach(function (id) {
+        var element = $(id);
+        if (element) element.textContent = "";
+      });
+      cancel();
+    },
     setItems: setItems,
     inMode: inMode,
     blockActivate: blockActivate,

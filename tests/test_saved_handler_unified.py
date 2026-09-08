@@ -16,6 +16,7 @@ path only reads ``request`` to pass it to ``saved_loaded_lookup`` /
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
@@ -77,9 +78,12 @@ def _row(
 
 
 def _request() -> Request:
-    """A request stub — the saved path only forwards it to the cfg
-    callables the tests supply, so a bare MagicMock suffices."""
-    return MagicMock()
+    """Request carrying the same store used by its visibility checks."""
+    from turnstone.core.storage import get_storage
+
+    request = MagicMock()
+    request.app.state.auth_storage = get_storage()
+    return request
 
 
 async def _body(resp: Response) -> dict[str, Any]:
@@ -151,11 +155,9 @@ def _patch_storage(
             return interactive_rows[offset : offset + limit]
         return []
 
-    # The handler imports the symbol from turnstone.core.memory at call
-    # time, so patch it on that module.
     monkeypatch.setattr(
-        "turnstone.core.memory.list_workstreams_with_history",
-        _fake,
+        "turnstone.core.storage.get_storage",
+        lambda: SimpleNamespace(list_workstreams_with_history=_fake),
     )
     return calls
 
@@ -272,6 +274,53 @@ async def test_unified_saved_passing_gate_returns_merged(monkeypatch: pytest.Mon
     resp = await handler(_request())
     rows = (await _body(resp))["workstreams"]
     assert [r["ws_id"] for r in rows] == ["c" * 32]
+
+
+@pytest.mark.parametrize("status", [401, 403, 503])
+async def test_per_kind_admission_queries_only_authorized_kinds(monkeypatch, status):
+    calls = _patch_storage(
+        monkeypatch,
+        coord_rows=[],
+        interactive_rows=[_row("interactive", kind="interactive", updated="2026-09-07")],
+    )
+    handler = make_unified_saved_handler(
+        [
+            _coord_cfg(permission_gate=lambda request: JSONResponse({}, status_code=status)),
+            _interactive_cfg(),
+        ]
+    )
+    response = await handler(_request())
+    if status == 403:
+        assert response.status_code == 200
+        assert [row["ws_id"] for row in (await _body(response))["workstreams"]] == ["interactive"]
+        assert [call["kind"] for call in calls] == [WorkstreamKind.INTERACTIVE]
+    else:
+        assert response.status_code == status
+        assert calls == []
+
+
+async def test_excluded_kind_still_validates_configuration(monkeypatch):
+    calls = _patch_storage(monkeypatch, coord_rows=[], interactive_rows=[])
+    bad = _coord_cfg(permission_gate=lambda request: JSONResponse({}, status_code=403))
+    object.__setattr__(bad, "list_kind", None)
+    response = await make_unified_saved_handler([bad, _interactive_cfg()])(_request())
+    assert response.status_code == 500
+    assert calls == []
+
+
+async def test_admitted_kind_failure_never_returns_partial_success(monkeypatch):
+    _patch_storage(monkeypatch, coord_rows=[], interactive_rows=[])
+    request = _request()
+
+    def query(**kwargs):
+        if kwargs["kind"] == WorkstreamKind.COORDINATOR:
+            raise RuntimeError("private storage details")
+        return [_row("interactive", kind="interactive", updated="2026-09-07")]
+
+    request.app.state.auth_storage.list_workstreams_with_history = query
+    response = await make_unified_saved_handler([_coord_cfg(), _interactive_cfg()])(request)
+    assert response.status_code == 503
+    assert await _body(response) == {"error": "Saved sessions unavailable"}
 
 
 async def test_unified_saved_500s_on_missing_list_kind(monkeypatch: pytest.MonkeyPatch) -> None:

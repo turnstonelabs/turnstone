@@ -67,11 +67,14 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 | Method | Path pattern | Required scope | Additional RBAC gate |
 |--------|-------------|----------------|----------------------|
 | GET | Any protected path | `read` | Endpoint-specific where documented |
+| GET | `/api/workstreams/saved` | `read` | Creator/project visibility; console coordinator rows additionally require `admin.coordinator` |
+| GET | `/api/workstreams/{ws_id}` (detail) | `read`; also `write` to reopen a cold session | Project tenancy and kind-specific permission |
 | POST | `/api/command` | `write` | Project tenancy on the target workstream |
 | POST | `/api/workstreams/new`, `/api/cluster/workstreams/new` | `write` | `workstreams.create` or `admin.coordinator` |
 | POST | `/api/workstreams/{ws_id}/close` | `write` | `workstreams.close` or `admin.coordinator` |
 | POST | `/api/workstreams/{ws_id}/approve` | `approve` | `tools.approve` or `admin.coordinator` |
 | POST | `/api/workstreams/{ws_id}/{rewind,retry}` | `write` | `conversation.modify` |
+| POST | `/api/workstreams/{ws_id}/delete` | `write` | Project tenancy; coordinator rows also require `admin.coordinator` |
 | POST | Other `/api/workstreams/{ws_id}/...` mutation endpoints | `write` | Project tenancy and endpoint-specific gates |
 | DELETE | `/api/workstreams/{ws_id}/send` (dequeue), `/api/workstreams/{ws_id}/attachments/{attachment_id}` | `write` | Project tenancy on the target workstream |
 | Any | `/api/admin/*` | `approve` | Matching `admin.*` permission |
@@ -80,6 +83,13 @@ Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,
 `/static/*`, `/shared/*`, `/docs`, `/openapi.json`, `/api/auth/login`,
 `/api/auth/logout`, `/api/auth/status`, `/api/auth/setup`,
 `/api/auth/oidc/authorize`, `/api/auth/oidc/callback`.
+
+Saved interactive history is available to project members without `admin.coordinator` or
+`project.read`. The `server.require_project` setting governs creation and does not restrict reads or
+reopening existing history. Read-only callers can inspect saved metadata and use history/export;
+reopening a saved session and deleting history require write scope. The browser uses the effective
+`scopes` returned by login, refresh, and whoami separately from named RBAC permissions when showing
+these actions.
 
 ### RBAC (Granular Permissions)
 

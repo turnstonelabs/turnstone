@@ -201,18 +201,29 @@
                 class="saved-filter"
                 type="search"
                 placeholder="Filter by name&#x2026;"
-                aria-label="Filter saved coordinators"
+                aria-label="Filter saved sessions"
                 autocomplete="off"
               />
               <button
                 id="coord-delete-btn"
                 class="ws-delete-btn"
                 onclick="startCoordDeleteMode()"
-                title="Delete coordinators"
+                title="Delete saved sessions"
               >
                 <span aria-hidden="true">&#x1f5d1;</span> Delete
               </button>
             </div>
+          </div>
+          <div
+            id="coord-saved-error"
+            class="dashboard-empty"
+            role="alert"
+            hidden
+          >
+            <span id="coord-saved-error-text"></span>
+            <button class="sh-btn" onclick="loadSavedCoordinators()">
+              Retry
+            </button>
           </div>
           <div class="dash-colheaders" id="coord-saved-colheaders"></div>
           <div
@@ -4176,7 +4187,8 @@
     <script type="module" src="/shared/utils.js"></script>
     <script type="module" src="/shared/cards.js"></script>
     <script type="module" src="/shared/toast.js"></script>
-    <script type="module" src="/shared/auth.js"></script>
+    <!-- cards/shell import auth.js. A separate versioned script URL would
+         create a second auth instance with independent login state. -->
     <script type="module" src="/shared/hatch.js"></script>
     <script type="module" src="/shared/kb.js"></script>
     <script type="module" src="/shared/projects.js"></script>
@@ -4332,7 +4344,7 @@
     >
       <header class="sh-head">
         <span class="sh-led" aria-hidden="true"></span>
-        <h2 class="sh-title" id="coord-delete-title">Delete coordinators</h2>
+        <h2 class="sh-title" id="coord-delete-title">Delete saved sessions</h2>
         <button class="sh-x" data-close aria-label="Close">✕</button>
       </header>
       <div class="sh-body">

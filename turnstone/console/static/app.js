@@ -2359,13 +2359,8 @@ document.addEventListener("keydown", function (e) {
 });
 
 // ---------------------------------------------------------------------------
-// Saved coordinators — closed sessions persisted on disk.  Mirrors the
-// interactive UI's "Saved Workstreams" table (same /shared/cards.js
-// createSavedTable + /shared/cards.css, same response item shape from
-// /v1/api/workstreams/saved), differing only in the CHILDREN column and
-// the body-keyed delete.  Click a row → POST /open then
-// /coordinator/{ws_id}; the lifted detail factory lazily rehydrates from
-// storage on the GET miss.
+// Saved sessions share the standalone table substrate. The server admits
+// each kind independently; activation follows the returned kind and node.
 // ---------------------------------------------------------------------------
 
 // In-flight de-dup for loadSavedCoordinators.  ws_closed events can
@@ -2377,11 +2372,7 @@ let _savedCoordsInFlight = false;
 let _savedCoordsRetry = false;
 
 function loadSavedCoordinators() {
-  // Saved sessions is an operator surface (admin.coordinator) — the unified
-  // list spans BOTH kinds for operators (who already have cluster-wide reach).
-  // Interactive-only users use the launcher, not this list, so the gate stays
-  // admin.coordinator (matching the server gate; a looser gate here would 403).
-  if (!_hasCoordPermission()) return;
+  if (!hasScope("read") || !_coordTable) return;
   // Freeze the list while the user is multi-selecting — re-rendering
   // mid-mode would shuffle the visible page out from under them.  The
   // delete-mode wrapper drains the retry flag on cancel/onClose.
@@ -2394,11 +2385,15 @@ function loadSavedCoordinators() {
     return;
   }
   _savedCoordsInFlight = true;
+  const generation = authGeneration();
   authFetch("/v1/api/workstreams/saved")
     .then(function (r) {
-      return r.ok ? r.json() : { workstreams: [] };
+      if (!r.ok)
+        throw new Error("Could not load saved sessions (" + r.status + ").");
+      return r.json();
     })
     .then(function (data) {
+      if (generation !== authGeneration()) return;
       // Belt-and-braces: if the user entered delete mode while this
       // fetch was already in flight, defer the render — re-rendering
       // mid-selection would shuffle visible cards and reshape selections.
@@ -2407,14 +2402,20 @@ function loadSavedCoordinators() {
         return;
       }
       const saved = data.workstreams || [];
+      _setSavedError("");
       const sec = document.getElementById("saved-coordinators");
       if (sec) sec.style.display = saved.length ? "" : "none";
       _coordTable.setItems(saved);
     })
-    .catch(function () {
-      /* silent — saved list is informational, not load-bearing */
+    .catch(function (error) {
+      if (generation !== authGeneration()) return;
+      _coordTable.setItems([]);
+      _setSavedError(error.message || "Could not load saved sessions.");
+      const sec = document.getElementById("saved-coordinators");
+      if (sec) sec.style.display = "";
     })
     .finally(function () {
+      if (generation !== authGeneration()) return;
       _savedCoordsInFlight = false;
       // If at least one call arrived while we were in flight, fire one
       // catch-up fetch (not N) so the UI reflects the latest state
@@ -2424,6 +2425,38 @@ function loadSavedCoordinators() {
         loadSavedCoordinators();
       }
     });
+}
+
+function _setSavedError(message) {
+  const error = document.getElementById("coord-saved-error");
+  if (error) error.hidden = !message;
+  const text = document.getElementById("coord-saved-error-text");
+  if (text) text.textContent = message;
+  ["saved-coord-cards", "coord-saved-footer"].forEach(function (id) {
+    const element = document.getElementById(id);
+    if (element) element.style.display = message ? "none" : "";
+  });
+}
+
+function _savedAuthChanged() {
+  _savedCoordsInFlight = _savedCoordsRetry = false;
+  _setSavedError("");
+  if (_coordTable) _coordTable.reset();
+  const sec = document.getElementById("saved-coordinators");
+  if (sec) sec.style.display = "none";
+  if (typeof _refreshHomeComposerVisibility === "function") {
+    _refreshHomeComposerVisibility();
+  }
+  loadSavedCoordinators();
+}
+
+function _canActOnSavedSession(session) {
+  return (
+    hasScope("write") &&
+    (session.kind !== "coordinator" ||
+      hasScope("service") ||
+      _hasCoordPermission())
+  );
 }
 
 // Saved Coordinators table — same shared createSavedTable as the server UI
@@ -2470,6 +2503,8 @@ function _initSavedCoordTable() {
     columns: COORD_COLUMNS,
     noun: "session",
     emptyText: "No saved sessions",
+    canActivate: _canActOnSavedSession,
+    canDelete: _canActOnSavedSession,
     activateLabel: function (s) {
       return (
         "Resume " +
@@ -2946,4 +2981,5 @@ window.TS_APP.boot = function () {
     _refreshHomeComposerVisibility();
     loadSavedCoordinators();
   });
+  onAuthChange(_savedAuthChanged);
 };

@@ -921,6 +921,10 @@ active, and `conflict` requires operator intervention.
 Returns a list of saved workstreams from the database, ordered by most recently
 updated.
 
+Requires `read` scope and applies creator/project visibility. On a node, this lists interactive
+workstreams. On the console, it includes interactive workstreams and also coordinator rows when the
+caller has `admin.coordinator`. A failed storage query returns 503 rather than an empty list.
+
 **Response:**
 
 ```json
@@ -1596,6 +1600,10 @@ masked as `404`.
 ### `POST /v1/api/workstreams/{ws_id}/delete`
 
 Permanently delete a saved workstream and all its messages from storage.
+
+Requires `write` scope and project access. Deleting a coordinator also requires `admin.coordinator`,
+including through the node endpoint or a console routing proxy. Authorization and deletion use the
+same persisted incarnation snapshot.
 
 **Path parameters:**
 

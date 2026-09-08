@@ -1940,6 +1940,7 @@ async def handle_auth_whoami(request: Request, cookie_name: str) -> Response:
 
     resp: dict[str, Any] = {
         "user_id": auth_result.user_id,
+        "scopes": ",".join(sorted(auth_result.scopes)),
     }
     # Surface the human username / display name for the UI — ``user_id`` is an
     # opaque uuid, not something to show in the footer.  Best-effort: a storage

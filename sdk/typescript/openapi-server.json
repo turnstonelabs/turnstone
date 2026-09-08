@@ -989,7 +989,7 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Returns the persisted workstream's display fields. If the session isn't currently in memory the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously had no detail endpoint.",
+        "description": "Returns the persisted workstream's display fields. If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously had no detail endpoint.",
         "parameters": [
           {
             "name": "ws_id",
@@ -1013,6 +1013,16 @@
           },
           "400": {
             "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
             "content": {
               "application/json": {
                 "schema": {
@@ -1587,6 +1597,7 @@
         "tags": [
           "Workstreams"
         ],
+        "description": "Lists interactive history visible through creator/project access; requires read scope.",
         "responses": {
           "200": {
             "description": "Success",
@@ -1594,6 +1605,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ListSavedWorkstreamsResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -4624,6 +4645,12 @@
           "permissions": {
             "default": "",
             "title": "Permissions",
+            "type": "string"
+          },
+          "scopes": {
+            "default": "",
+            "description": "Comma-separated effective transport scopes",
+            "title": "Scopes",
             "type": "string"
           }
         },

@@ -3750,6 +3750,10 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
     return list_workstreams_handler
 
 
+class _SavedQueryError(RuntimeError):
+    """The saved-list query failed, rather than returning an empty list."""
+
+
 async def _collect_saved_rows(
     cfg: SessionEndpointConfig,
     request: Request,
@@ -3765,16 +3769,18 @@ async def _collect_saved_rows(
 
     Caller-owned (NOT done here): ``cfg.permission_gate`` and the
     ``cfg.list_kind is None`` misconfig guard — both belong to the
-    handler wrapper so the unified handler can gate once and 500 per
-    cfg before fanning out. ``cfg.list_kind`` is therefore assumed
+    handler wrapper so the unified handler can admit kinds before
+    fanning out. ``cfg.list_kind`` is therefore assumed
     non-``None`` on entry.
     """
     import asyncio
 
     from turnstone.core.auth import WorkstreamProjectVisibility
-    from turnstone.core.memory import list_workstreams_with_history
 
-    visibility = WorkstreamProjectVisibility.for_request(request)
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        raise _SavedQueryError("Storage unavailable")
+    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
 
     def _fetch_visible_rows() -> list[Any]:
         """Page through storage until 50 visible rows (or exhaustion).
@@ -3793,7 +3799,7 @@ async def _collect_saved_rows(
         page = 50
         max_pages = 20
         for _ in range(max_pages):
-            batch = list_workstreams_with_history(
+            batch = storage.list_workstreams_with_history(
                 limit=page,
                 kind=cfg.list_kind,
                 user_id=None,
@@ -3818,7 +3824,11 @@ async def _collect_saved_rows(
         )
         return visible
 
-    rows = await asyncio.to_thread(_fetch_visible_rows)
+    try:
+        rows = await asyncio.to_thread(_fetch_visible_rows)
+    except Exception as exc:
+        log.warning("ws.saved.query_failed kind=%s", cfg.list_kind, exc_info=True)
+        raise _SavedQueryError("Saved sessions unavailable") from exc
 
     # Coord-only: exclude ws_ids currently in the warm pool.
     loaded: set[str] = set()
@@ -3917,8 +3927,8 @@ def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
       kind classifier.
     - ``cfg.saved_state_filter`` — coord wires ``"closed"`` so only
       explicitly-closed coordinators surface; interactive wires
-      ``None`` (any state except the tombstoned ``deleted`` rows the
-      storage layer already filters).
+      ``None`` (all persisted states except provisional ``creating``;
+      interactive deletion removes the row).
     - ``cfg.saved_loaded_lookup`` — coord-only defence-in-depth
       filter that excludes ws_ids currently in the in-memory pool
       (a row can be ``state='closed'`` briefly while the close-emit
@@ -3966,7 +3976,10 @@ def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
                 status_code=500,
             )
 
-        result = await _collect_saved_rows(cfg, request)
+        try:
+            result = await _collect_saved_rows(cfg, request)
+        except _SavedQueryError:
+            return JSONResponse({"error": "Saved sessions unavailable"}, status_code=503)
         return JSONResponse({"workstreams": result})
 
     return saved_workstreams_handler
@@ -4005,16 +4018,14 @@ def make_unified_saved_handler(
     so this fans :func:`_collect_saved_rows` over each ``cfg`` (preserving
     every kind's own ``list_kind`` / ``saved_state_filter`` /
     ``saved_loaded_lookup`` semantics — coord keeps its ``state='closed'``
-    + warm-pool exclusion, interactive keeps its all-non-deleted listing),
+    + warm-pool exclusion, interactive keeps its persisted non-creating rows),
     concatenates the rows, and re-sorts the union by ``updated`` descending
     (``updated``-less rows last).
 
-    Permission: a SINGLE ``permission_gate`` runs once up front (the
-    operator gate the console already applies to its coordinator saved
-    list). Per-``cfg`` ``permission_gate`` values are deliberately NOT
-    consulted here — the union is operator-gated as a whole, and the
-    operator already has cluster-wide visibility into every kind, so the
-    merge exposes nothing the per-kind lists didn't.
+    The optional outer gate applies to the whole list. Each kind's own
+    permission gate then controls its admission: a 403 omits that kind
+    before querying storage; authentication and other errors propagate.
+    Admitted rows retain their project visibility checks.
 
     Each ``cfg`` must wire ``list_kind`` (a missing value is a mount-time
     misconfiguration); the handler 500s loud rather than silently
@@ -4044,11 +4055,23 @@ def make_unified_saved_handler(
                     status_code=500,
                 )
 
+        admitted = []
+        for cfg in cfgs:
+            err = cfg.permission_gate(request) if cfg.permission_gate else None
+            if err is not None:
+                if err.status_code == 403:
+                    continue
+                return err
+            admitted.append(cfg)
+
         # The per-kind collections are independent (shared store, no data
         # dependency), so overlap their DB round-trips instead of summing them.
         import asyncio
 
-        parts = await asyncio.gather(*(_collect_saved_rows(cfg, request) for cfg in cfgs))
+        try:
+            parts = await asyncio.gather(*(_collect_saved_rows(cfg, request) for cfg in admitted))
+        except _SavedQueryError:
+            return JSONResponse({"error": "Saved sessions unavailable"}, status_code=503)
         merged: list[dict[str, Any]] = []
         for part in parts:
             merged.extend(part)
@@ -4869,11 +4892,10 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
     correlation-id'd 500 with the per-kind noun in the user-facing
     message.
 
-    Cross-kind isolation is enforced inside ``mgr.open()`` itself —
-    it returns ``None`` for missing rows, kind mismatches, and
-    tombstoned rows; all surface as 404 with ``cfg.not_found_label``.
-    No inline storage check needed (unlike :func:`make_history_handler`)
-    because rehydrate is the existence proof.
+    Loaded metadata needs only read scope. Cold rehydration also requires
+    write scope, just like POST /open. For a reader, a storage check
+    preserves missing/wrong-kind/tombstone 404s before denying rehydration.
+    Writers retain the manager's existence and kind checks.
 
     Per-kind divergence:
 
@@ -4908,17 +4930,8 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
         if not ws_id:
             return JSONResponse({"error": "ws_id is required"}, status_code=400)
 
-        # Cross-tenant gate.  PR 447 added the inline approval payload
-        # (now ``pending_approval_details``) to the response (tool
-        # previews, function arguments, LLM judge reasoning) — a
-        # richer payload than the pre-PR
-        # ``{ws_id, name, state, user_id, kind}`` tuple.  Coord wires
-        # ``tenant_check=None`` (the cluster-wide ``admin.coordinator``
-        # permission_gate covers it); interactive wires
-        # ``_interactive_tenant_check`` so any authenticated user that
-        # GETs another user's ``ws_id`` 404s here instead of reading
-        # the in-flight tool-call payload.  Brings detail in line with
-        # every other lifted session verb.
+        # Both kinds authorize project access before exposing metadata
+        # or the inline pending-approval payload.
         if cfg.tenant_check is not None:
             err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
@@ -4926,6 +4939,27 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
 
         ws = mgr.get(ws_id)
         if ws is None:
+            auth = getattr(request.state, "auth_result", None)
+            if auth is None:
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            if not auth.has_scope("write"):
+                storage = getattr(request.app.state, "auth_storage", None)
+                if storage is None or cfg.list_kind is None:
+                    return JSONResponse({"error": "Storage unavailable"}, status_code=503)
+                try:
+                    row = await asyncio.to_thread(storage.get_workstream, ws_id)
+                except Exception:
+                    log.warning("ws.detail.lookup_failed ws=%s", ws_id[:8], exc_info=True)
+                    return JSONResponse({"error": "Storage unavailable"}, status_code=503)
+                if (
+                    row is None
+                    or row.get("kind") != cfg.list_kind
+                    or row.get("state") in {"creating", "deleted"}
+                ):
+                    return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+                return JSONResponse(
+                    {"error": "Reopening a saved session requires write scope"}, status_code=403
+                )
             try:
                 ws = mgr.open(ws_id)
             except NodeAffinityError as exc:

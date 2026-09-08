@@ -61,7 +61,7 @@ class _InjectAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Any) -> Response:
         request.state.auth_result = AuthResult(
             user_id="test-user",
-            scopes=frozenset({"approve"}),
+            scopes=frozenset({"read", "write", "approve"}),
             token_source="config",
             permissions=frozenset({"read", "write", "approve"}),
         )
@@ -627,11 +627,13 @@ class TestDeleteWorkstream:
         assert r.status_code == 200
         assert r.json()["deleted"] == "ws-flaky"
 
+    @pytest.mark.parametrize("replacement_kind", ["interactive", "coordinator"])
     def test_stale_authorized_delete_leaves_same_id_replacement(
         self,
         delete_client,
         storage,
         monkeypatch,
+        replacement_kind,
     ):
         """An exact delete authorized for a predecessor cannot hit its replacement."""
         client, _ = delete_client
@@ -680,6 +682,7 @@ class TestDeleteWorkstream:
                     "node-2",
                     name="replacement",
                     user_id="other-user",
+                    kind=replacement_kind,
                     fork_reservation_token="replacement-incarnation",
                 )
                 is True
@@ -1290,9 +1293,8 @@ def _interactive_endpoint_cfg(
     """Interactive-shaped cfg wired the same way ``server.py`` does.
 
     Shared by both :func:`_build_history_app` and :func:`_build_detail_app`
-    — every field both factories actually read is present (the detail
-    factory ignores ``list_kind`` since it relies on ``mgr.open()`` for
-    cross-kind isolation, but the field is harmless to set).
+    — every field both factories read is present, including the kind
+    used to distinguish a reader's cold-detail 404 from a scope denial.
 
     The optional ``tenant_check`` lets a regression test wire the same
     cross-tenant gate ``server.py`` uses (``_interactive_tenant_check``)
@@ -2385,9 +2387,8 @@ class TestBuildHistoryToolContentCoercion:
 class TestDetailInteractive:
     """Interactive parity for the lifted ``GET /v1/api/workstreams/{ws_id}``.
 
-    The lifted ``make_detail_handler`` factory never reads storage —
-    cross-kind isolation is enforced inside ``mgr.open()`` and the
-    response is built from in-memory ``Workstream`` fields. The
+    These writer tests exercise cross-kind isolation inside ``mgr.open()``;
+    the response is built from in-memory ``Workstream`` fields. The
     ``mgr.open`` calls are mocked via ``MagicMock`` here, so the
     storage-registry side effect that ``_inject_storage`` would
     otherwise provide is irrelevant; the fixture is intentionally

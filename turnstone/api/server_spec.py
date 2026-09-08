@@ -286,14 +286,15 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Get workstream detail (rehydrates lazily on miss)",
         description=(
             "Returns the persisted workstream's display fields. If the "
-            "session isn't currently in memory the manager rehydrates it "
+            "session isn't currently in memory, write scope is additionally "
+            "required before the manager rehydrates it "
             "before responding; ``500`` on rehydrate failure carries a "
             "correlation id matching the server log line. Lifted from "
             "the coord-only surface in the Stage 2 history/detail verb "
             "lift — interactive previously had no detail endpoint."
         ),
         response_model=WorkstreamDetailResponse,
-        error_codes=[400, 404, 500, 503],
+        error_codes=[400, 403, 404, 500, 503],
         tags=["Workstreams"],
     ),
     EndpointSpec(
@@ -412,7 +413,9 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/saved",
         "GET",
         "List saved workstreams",
+        description="Lists interactive history visible through creator/project access; requires read scope.",
         response_model=ListSavedWorkstreamsResponse,
+        error_codes=[503],
         tags=["Workstreams"],
     ),
     # --- Skills ---
