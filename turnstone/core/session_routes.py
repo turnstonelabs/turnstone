@@ -36,7 +36,7 @@ import functools
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -4163,7 +4163,7 @@ def _resume_cursor_and_trim(
 # ``load_failed`` is True when the durable load or the canonical public
 # decoration/projection pipeline raised — never for a legitimately empty
 # workstream; see ``_reconstruct`` inside :func:`make_history_handler`.
-_HistoryFlightResult: TypeAlias = tuple[list[dict[str, Any]], int | None, bool, str | None, bool]
+type _HistoryFlightResult = tuple[list[dict[str, Any]], int | None, bool, str | None, bool]
 """``(messages, cursor, load_failed, handoff_token, storage_fallback)``.
 
 ``storage_fallback`` marks the cold storage-only read — the workstream is

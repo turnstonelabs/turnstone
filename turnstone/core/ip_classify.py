@@ -43,9 +43,8 @@ from __future__ import annotations
 import enum
 import ipaddress
 import socket
-from typing import TypeAlias
 
-IPAddress: TypeAlias = ipaddress.IPv4Address | ipaddress.IPv6Address
+type IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
 class AddressLane(enum.IntEnum):

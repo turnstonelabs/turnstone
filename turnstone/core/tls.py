@@ -111,9 +111,7 @@ class ACMEHTTPAuth(httpx2.Auth):
         self._bases = tuple(bases)
         self._token_provider = token_provider
 
-    def auth_flow(
-        self, request: httpx2.Request
-    ) -> Generator[httpx2.Request, httpx2.Response, None]:
+    def auth_flow(self, request: httpx2.Request) -> Generator[httpx2.Request, httpx2.Response]:
         if request.url.userinfo or request.url.query or request.url.fragment:
             raise RuntimeError(f"Refusing non-canonical ACME request URL: {request.url}")
         raw_path = request.url.raw_path

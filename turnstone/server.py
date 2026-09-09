@@ -1241,7 +1241,7 @@ async def global_events_sse(request: Request) -> Response:
             if client_queue in listeners:
                 listeners.remove(client_queue)
 
-    async def event_generator() -> AsyncGenerator[dict[str, Any], None]:
+    async def event_generator() -> AsyncGenerator[dict[str, Any]]:
         _metrics.record_sse_connect()
 
         def _format_event(event: dict[str, Any]) -> dict[str, str]:
@@ -1743,7 +1743,7 @@ async def speech_to_text_stream(request: Request) -> Response:
     # the upstream connection, handing deltas to the loop via a queue.  A client
     # disconnect sets ``stop`` so the thread releases the connection promptly
     # instead of being pinned mid-``next()`` (which can't be cancelled).
-    async def _body() -> AsyncGenerator[bytes, None]:
+    async def _body() -> AsyncGenerator[bytes]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         stop = threading.Event()
@@ -5254,7 +5254,7 @@ def _global_fanout_thread(
 
 
 @asynccontextmanager
-async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     """Start background threads and handle shutdown."""
     # Dedicated executor for SSE queue polling so it doesn't compete
     # with the default asyncio executor (which caps at ~32 workers).

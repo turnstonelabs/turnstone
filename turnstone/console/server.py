@@ -1454,7 +1454,7 @@ async def cluster_events_sse(request: Request) -> Response:
     # Per-connection private-project tenancy — see _ClusterTenancyFilter.
     tenancy = _ClusterTenancyFilter(WorkstreamProjectVisibility.for_request(request))
 
-    async def event_generator() -> AsyncGenerator[dict[str, str], None]:
+    async def event_generator() -> AsyncGenerator[dict[str, str]]:
         loop = asyncio.get_running_loop()
         try:
             # Atomic snapshot+register — no event gap possible.
@@ -3565,7 +3565,7 @@ async def _proxy_sse(
     if last_event_id_hdr is not None:
         upstream_headers["Last-Event-ID"] = last_event_id_hdr
 
-    async def raw_stream() -> AsyncGenerator[bytes, None]:
+    async def raw_stream() -> AsyncGenerator[bytes]:
         try:
             async with sse_client.stream(
                 "GET",
@@ -5774,7 +5774,7 @@ def _teardown_partial_coord_subsystem(app: Any) -> None:
 
 
 @asynccontextmanager
-async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     # Create async HTTP clients for proxy routes.  Auth headers are NOT baked
     # in — _proxy_auth_headers() injects a fresh token per-request so JWTs
     # auto-rotate via ServiceTokenManager instead of expiring after 1 hour.

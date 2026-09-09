@@ -421,18 +421,21 @@ def test_model_max_concurrency_schema_is_strict_non_nullable_integer() -> None:
     from turnstone.api.console_spec import build_console_spec
 
     schemas = build_console_spec()["components"]["schemas"]
+    concurrency_schema = schemas["ModelMaxConcurrency"]
+    assert concurrency_schema["type"] == "integer"
+    assert concurrency_schema["minimum"] == 0
+    assert concurrency_schema["maximum"] == 2_147_483_647
+    assert "anyOf" not in concurrency_schema
+    assert "default" not in concurrency_schema
+
     for name in ("ModelDefinitionInfo", "CreateModelDefinitionRequest"):
         prop = schemas[name]["properties"]["max_concurrency"]
-        assert prop["type"] == "integer"
+        assert prop["$ref"] == "#/components/schemas/ModelMaxConcurrency"
         assert prop["default"] == 0
-        assert prop["minimum"] == 0
-        assert prop["maximum"] == 2_147_483_647
         assert "anyOf" not in prop
 
     update_prop = schemas["UpdateModelDefinitionRequest"]["properties"]["max_concurrency"]
-    assert update_prop["type"] == "integer"
-    assert update_prop["minimum"] == 0
-    assert update_prop["maximum"] == 2_147_483_647
+    assert update_prop["$ref"] == "#/components/schemas/ModelMaxConcurrency"
     assert "anyOf" not in update_prop
     assert "default" not in update_prop
 

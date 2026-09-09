@@ -12443,12 +12443,8 @@
             "type": "integer"
           },
           "max_concurrency": {
-            "default": 0,
-            "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
-            "maximum": 2147483647,
-            "minimum": 0,
-            "title": "Max Concurrency",
-            "type": "integer"
+            "$ref": "#/components/schemas/ModelMaxConcurrency",
+            "default": 0
           },
           "capabilities": {
             "default": "{}",
@@ -12550,6 +12546,12 @@
         "title": "ModelDefinitionInfo",
         "type": "object"
       },
+      "ModelMaxConcurrency": {
+        "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
+        "maximum": 2147483647,
+        "minimum": 0,
+        "type": "integer"
+      },
       "ModelDefinitionWriteResponse": {
         "description": "Create/update response: the stored row plus an optional caveat.\n\n``registry_warning`` is present only when the DB write succeeded but\nTHIS console's live coordinator registry refused to adopt it (keyless\nhost with dynamic-auth rows): the row is saved, yet running sessions\nkeep the previous config until the deployment fault is remedied.\nClients should surface it as a warning beside the success, never as a\nfailure. Absent on a clean save (SkipJsonSchema: the server omits the\nkey rather than sending null).",
         "properties": {
@@ -12586,12 +12588,8 @@
             "type": "integer"
           },
           "max_concurrency": {
-            "default": 0,
-            "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
-            "maximum": 2147483647,
-            "minimum": 0,
-            "title": "Max Concurrency",
-            "type": "integer"
+            "$ref": "#/components/schemas/ModelMaxConcurrency",
+            "default": 0
           },
           "capabilities": {
             "default": "{}",
@@ -12730,12 +12728,8 @@
             "type": "integer"
           },
           "max_concurrency": {
-            "default": 0,
-            "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
-            "maximum": 2147483647,
-            "minimum": 0,
-            "title": "Max Concurrency",
-            "type": "integer"
+            "$ref": "#/components/schemas/ModelMaxConcurrency",
+            "default": 0
           },
           "capabilities": {
             "additionalProperties": true,
@@ -12891,11 +12885,8 @@
             "title": "Context Window"
           },
           "max_concurrency": {
-            "description": "Maximum concurrent model generations for this alias in one process; zero means unlimited.",
-            "maximum": 2147483647,
-            "minimum": 0,
-            "title": "Max Concurrency",
-            "type": "integer"
+            "$ref": "#/components/schemas/ModelMaxConcurrency",
+            "title": "Max Concurrency"
           },
           "capabilities": {
             "additionalProperties": true,

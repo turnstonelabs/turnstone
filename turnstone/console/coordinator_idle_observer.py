@@ -116,7 +116,7 @@ from __future__ import annotations
 import contextlib
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
 from turnstone.console.coordinator_client import TASK_OPEN_STATUSES, load_task_envelope
 from turnstone.core.log import get_logger
@@ -252,10 +252,7 @@ class _StorageReadError(Exception):
         self.read = read
 
 
-_ReadResultT = TypeVar("_ReadResultT")
-
-
-def _event_read(ws_id: str, read: str, fn: Callable[[], _ReadResultT]) -> _ReadResultT:
+def _event_read[ReadResultT](ws_id: str, read: str, fn: Callable[[], ReadResultT]) -> ReadResultT:
     """Run one storage-backed gate read under the event's fail-closed
     rule: a raise becomes :class:`_StorageReadError`, which ``_on_idle``
     turns into "neither nudge fires, neither cap is charged".

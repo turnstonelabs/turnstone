@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -1048,7 +1048,7 @@ class RegistryInstallRequest(BaseModel):
 # Admin: Model Definitions
 # ---------------------------------------------------------------------------
 
-ModelMaxConcurrency: TypeAlias = Annotated[
+type ModelMaxConcurrency = Annotated[
     int,
     Field(
         strict=True,

@@ -22,12 +22,10 @@ import contextlib
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-_T = TypeVar("_T")
 
 
 class DeadlineExceededError(Exception):
@@ -173,14 +171,14 @@ class StreamAbortRef(list[Any]):
         return self._aborted or bool(self._cancel_event is not None and self._cancel_event.is_set())
 
 
-def run_abortable_with_deadline(
-    fn: Callable[[StreamAbortRef], _T],
+def run_abortable_with_deadline[T](
+    fn: Callable[[StreamAbortRef], T],
     *,
     timeout: float,
     cancel_event: threading.Event | None = None,
     poll: float = 1.0,
     thread_name: str = "deadline-worker",
-) -> _T:
+) -> T:
     """:func:`run_with_deadline` with the stream-abort wiring built in.
 
     Mints a :class:`StreamAbortRef`, hands it to *fn* (thread it into the
@@ -205,8 +203,8 @@ def run_abortable_with_deadline(
     )
 
 
-def run_with_deadline(
-    fn: Callable[[], _T],
+def run_with_deadline[T](
+    fn: Callable[[], T],
     *,
     timeout: float,
     cancel_event: threading.Event | None = None,
@@ -214,7 +212,7 @@ def run_with_deadline(
     thread_name: str = "deadline-worker",
     on_abandon: Callable[[], None] | None = None,
     deadline_credit: Callable[[], float] | None = None,
-) -> _T:
+) -> T:
     """Run ``fn()`` on a daemon thread, bounded by ``timeout``/``cancel_event``.
 
     Returns ``fn()``'s result, or re-raises whatever ``fn`` raised.  Raises
@@ -266,7 +264,7 @@ def run_with_deadline(
             pass
         else:
             if ok:
-                return payload  # type: ignore[return-value]  # ok=True ⇒ payload is _T
+                return payload  # type: ignore[return-value]  # ok=True ⇒ payload is T
             raise payload  # type: ignore[misc]  # ok=False ⇒ payload is the raised exc
 
         if cancel_event is not None and cancel_event.is_set():

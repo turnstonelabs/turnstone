@@ -33,7 +33,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import httpx
 
@@ -3428,10 +3428,9 @@ _MODEL_OBO_MISSING_CRED_WARNED: set[tuple[str, str]] = set()
 _WARN_DEDUP_CAP = 512
 
 
-_DedupKey = TypeVar("_DedupKey", str, tuple[str, str])
-
-
-def _warn_dedup_once(warned: set[_DedupKey], key: _DedupKey, event: str, **fields: Any) -> None:
+def _warn_dedup_once[DedupKey: (str, tuple[str, str])](
+    warned: set[DedupKey], key: DedupKey, event: str, **fields: Any
+) -> None:
     """Emit ``log.warning(event, **fields)`` once per ``key`` in ``warned``.
 
     The shared mechanics of the module's once-per-key warn namespaces, in

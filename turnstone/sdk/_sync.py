@@ -9,17 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Coroutine, Iterator
 
-T = TypeVar("T")
-
 _STOP = object()
 
 
-async def _safe_anext(agen: AsyncIterator[T]) -> T | object:
+async def _safe_anext[T](agen: AsyncIterator[T]) -> T | object:
     """Advance *agen* without raising StopAsyncIteration across a thread boundary."""
     try:
         return await agen.__anext__()
@@ -43,13 +41,13 @@ class _SyncRunner:
                 self._thread.start()
             return self._loop
 
-    def run(self, coro: Coroutine[Any, Any, T]) -> T:
+    def run[T](self, coro: Coroutine[Any, Any, T]) -> T:
         """Submit *coro* to the background loop and block for the result."""
         loop = self._ensure_loop()
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         return future.result()
 
-    def run_iter(self, async_gen: AsyncIterator[T]) -> Iterator[T]:
+    def run_iter[T](self, async_gen: AsyncIterator[T]) -> Iterator[T]:
         """Synchronously iterate over an async generator."""
         loop = self._ensure_loop()
         while True:

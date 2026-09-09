@@ -11,15 +11,13 @@ import asyncio
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal
 
 from turnstone.channels._config import CREATE_LOCK_CAP
 from turnstone.core.log import get_logger
 from turnstone.sdk._types import TurnstoneAPIError
 from turnstone.sdk.console import AsyncTurnstoneConsole
 from turnstone.sdk.server import AsyncTurnstoneServer
-
-_V = TypeVar("_V")
 
 
 @dataclass
@@ -73,11 +71,11 @@ _STARTUP_PROBE_TIMEOUT = 10.0
 # ---------------------------------------------------------------------------
 
 
-def get_cycle_entry(
-    entries: Mapping[tuple[str, str], _V],
+def get_cycle_entry[V](
+    entries: Mapping[tuple[str, str], V],
     ws_id: str,
     cycle_id: str,
-) -> _V | None:
+) -> V | None:
     """Exact ``(ws_id, cycle_id)`` lookup with the pre-multi-cycle fallback.
 
     An empty *cycle_id* falls back to the workstream's single tracked
@@ -90,11 +88,11 @@ def get_cycle_entry(
     return entry
 
 
-def pop_cycle_entry(
-    entries: MutableMapping[tuple[str, str], _V],
+def pop_cycle_entry[V](
+    entries: MutableMapping[tuple[str, str], V],
     ws_id: str,
     cycle_id: str,
-) -> _V | None:
+) -> V | None:
     """Like :func:`get_cycle_entry`, but removes the matched entry."""
     entry = entries.pop((ws_id, cycle_id), None)
     if entry is None and not cycle_id:
@@ -104,7 +102,7 @@ def pop_cycle_entry(
     return entry
 
 
-def pop_ws_entries(entries: MutableMapping[tuple[str, str], _V], ws_id: str) -> None:
+def pop_ws_entries[V](entries: MutableMapping[tuple[str, str], V], ws_id: str) -> None:
     """Drop every entry tracked under *ws_id* (all cycles)."""
     for key in [k for k in entries if k[0] == ws_id]:
         entries.pop(key, None)
