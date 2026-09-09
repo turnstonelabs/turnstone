@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
 from turnstone.console.server import (
     _collect_mcp_status,
     _console_mcp_action_outcome,
@@ -41,7 +43,6 @@ from turnstone.console.server import (
     admin_update_mcp_server,
 )
 from turnstone.core.auth import AuthResult
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Auth middleware variants
@@ -193,8 +194,8 @@ def _routes_with_internal() -> list[Mount]:
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 def _install_token_store(app, storage) -> None:

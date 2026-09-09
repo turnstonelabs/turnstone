@@ -19,7 +19,8 @@ import pytest
 
 from turnstone.admin import _cmd_create_admin, _cmd_create_user
 from turnstone.core.auth import _load_user_permissions, _permissions_to_scopes
-from turnstone.core.storage import init_storage, reset_storage
+from turnstone.core.storage import reset_storage
+from turnstone.core.storage._migrate import run_migrations
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -60,9 +61,16 @@ def _db_args(db_path: str, **overrides: Any) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
-def _migrated_storage(db_path: str) -> Any:
-    """Return a fully-migrated storage singleton (seeds the ``builtin-admin`` role)."""
-    return init_storage("sqlite", path=db_path, run_migrations=True)
+@pytest.fixture
+def _migrated_storage(sqlite_backend_factory: Any) -> Any:
+    """Own seeded stores independently of the CLI's storage singleton."""
+
+    def create(db_path: str) -> Any:
+        storage = sqlite_backend_factory(db_path, create_tables=False)
+        run_migrations(storage, "sqlite")
+        return storage
+
+    return create
 
 
 def _has_admin_role(storage: Any, user_id: str) -> bool:
@@ -74,7 +82,7 @@ def _login_scopes(storage: Any, user_id: str) -> frozenset[str]:
     return _permissions_to_scopes(_load_user_permissions(storage, user_id))
 
 
-def test_create_admin_fresh_user_gets_approve_scope(tmp_path: Path) -> None:
+def test_create_admin_fresh_user_gets_approve_scope(tmp_path: Path, _migrated_storage) -> None:
     db_path = str(tmp_path / "admin.db")
     storage = _migrated_storage(db_path)
 
@@ -87,7 +95,7 @@ def test_create_admin_fresh_user_gets_approve_scope(tmp_path: Path) -> None:
     assert "approve" in _login_scopes(storage, user["user_id"])
 
 
-def test_create_admin_defaults_display_name_to_username(tmp_path: Path) -> None:
+def test_create_admin_defaults_display_name_to_username(tmp_path: Path, _migrated_storage) -> None:
     db_path = str(tmp_path / "admin.db")
     storage = _migrated_storage(db_path)
 
@@ -99,7 +107,7 @@ def test_create_admin_defaults_display_name_to_username(tmp_path: Path) -> None:
 
 
 def test_create_admin_promotes_existing_read_only_user(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _migrated_storage
 ) -> None:
     """Issue #824 recovery path: a read-only create-user account, then create-admin."""
     db_path = str(tmp_path / "admin.db")
@@ -113,6 +121,7 @@ def test_create_admin_promotes_existing_read_only_user(
     assert "approve" not in _login_scopes(storage, user["user_id"])  # locked out
 
     # Unstick without recreating the user.
+    reset_storage()  # Each CLI invocation owns a separate storage lifetime.
     _cmd_create_admin(_db_args(db_path, username="admin"))
 
     assert _has_admin_role(storage, user["user_id"])
@@ -121,7 +130,7 @@ def test_create_admin_promotes_existing_read_only_user(
 
 
 def test_create_admin_already_admin_is_idempotent(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _migrated_storage
 ) -> None:
     db_path = str(tmp_path / "admin.db")
     storage = _migrated_storage(db_path)
@@ -129,6 +138,7 @@ def test_create_admin_already_admin_is_idempotent(
     _cmd_create_admin(_db_args(db_path, username="admin", name="Admin", password="hunter2!pw"))
     capsys.readouterr()  # drop first-run output
 
+    reset_storage()
     _cmd_create_admin(_db_args(db_path, username="admin"))
 
     user = storage.get_user_by_username("admin")
@@ -141,7 +151,7 @@ def test_create_admin_already_admin_is_idempotent(
 
 
 def test_create_admin_short_password_rejected(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _migrated_storage
 ) -> None:
     db_path = str(tmp_path / "admin.db")
     storage = _migrated_storage(db_path)
@@ -155,7 +165,7 @@ def test_create_admin_short_password_rejected(
 
 
 def test_create_admin_invalid_username_rejected(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _migrated_storage
 ) -> None:
     db_path = str(tmp_path / "admin.db")
     _migrated_storage(db_path)
@@ -167,7 +177,7 @@ def test_create_admin_invalid_username_rejected(
     assert "invalid username" in capsys.readouterr().err
 
 
-def test_create_user_assigns_explicit_viewer(tmp_path: Path) -> None:
+def test_create_user_assigns_explicit_viewer(tmp_path: Path, _migrated_storage) -> None:
     db_path = str(tmp_path / "viewer.db")
     storage = _migrated_storage(db_path)
     _cmd_create_user(_db_args(db_path, username="reader", password="reader-password"))
@@ -183,6 +193,7 @@ def test_create_user_rolls_back_incomplete_viewer_provisioning(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     failure: str,
+    _migrated_storage,
 ) -> None:
     db_path = str(tmp_path / "viewer.db")
     storage = _migrated_storage(db_path)
@@ -204,7 +215,9 @@ def test_create_user_rolls_back_incomplete_viewer_provisioning(
     assert "Created user" not in capsys.readouterr().out
 
 
-def test_create_admin_can_recover_historical_roleless_user(tmp_path: Path) -> None:
+def test_create_admin_can_recover_historical_roleless_user(
+    tmp_path: Path, _migrated_storage
+) -> None:
     db_path = str(tmp_path / "historical.db")
     storage = _migrated_storage(db_path)
     storage.create_user("historical", "historical", "Historical", "unused-password-hash")

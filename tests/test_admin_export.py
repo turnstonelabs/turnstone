@@ -66,27 +66,33 @@ def _export_args(db_path: str, ws_id: str, *, children: bool, output: str) -> ar
 def _seed_interactive(db_path: str, ws_id: str) -> list[str]:
     """Seed one interactive workstream; return the seeded message roles in order."""
     st = init_storage("sqlite", path=db_path, run_migrations=False)
-    st.register_workstream(ws_id, user_id="u1", title="Solo", kind="interactive")
-    roles = ["user", "assistant", "user", "assistant"]
-    st.save_message(ws_id, "user", "first question")
-    st.save_message(ws_id, "assistant", "first answer")
-    st.save_message(ws_id, "user", "second question")
-    st.save_message(ws_id, "assistant", "second answer")
-    return roles
+    try:
+        st.register_workstream(ws_id, user_id="u1", title="Solo", kind="interactive")
+        roles = ["user", "assistant", "user", "assistant"]
+        st.save_message(ws_id, "user", "first question")
+        st.save_message(ws_id, "assistant", "first answer")
+        st.save_message(ws_id, "user", "second question")
+        st.save_message(ws_id, "assistant", "second answer")
+        return roles
+    finally:
+        reset_storage()
 
 
 def _seed_coordinator(db_path: str, parent: str, children: list[str]) -> None:
     """Seed a coordinator parent plus the given child workstreams."""
     st = init_storage("sqlite", path=db_path, run_migrations=False)
-    st.register_workstream(parent, user_id="u1", title="Coord", kind="coordinator")
-    st.save_message(parent, "user", "coordinate")
-    st.save_message(parent, "assistant", "spawning children")
-    for child in children:
-        st.register_workstream(
-            child, user_id="u1", title=f"Child {child}", kind="interactive", parent_ws_id=parent
-        )
-        st.save_message(child, "user", "do work")
-        st.save_message(child, "assistant", "work done")
+    try:
+        st.register_workstream(parent, user_id="u1", title="Coord", kind="coordinator")
+        st.save_message(parent, "user", "coordinate")
+        st.save_message(parent, "assistant", "spawning children")
+        for child in children:
+            st.register_workstream(
+                child, user_id="u1", title=f"Child {child}", kind="interactive", parent_ws_id=parent
+            )
+            st.save_message(child, "user", "do work")
+            st.save_message(child, "assistant", "work done")
+    finally:
+        reset_storage()
 
 
 def test_export_interactive_to_file(tmp_path: Path) -> None:

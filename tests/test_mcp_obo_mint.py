@@ -52,12 +52,12 @@ from tests._oidc_test_helpers import (
 from tests.conftest import make_mcp_token_cipher
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import get_obo_access_token_classified
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from turnstone.core.oidc import OIDCConfig
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 USER = "user-1"
 SERVER = "srv-obo"
@@ -79,8 +79,8 @@ def _reset_warn_dedup_state() -> Iterator[None]:
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 def _make_app_state(

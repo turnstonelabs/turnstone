@@ -53,12 +53,12 @@ from turnstone.core.model_registry import (
 )
 from turnstone.core.model_turn import ModelLane, resolve_model_binding
 from turnstone.core.session import BackendAuthUnavailableError, ChatSession
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from turnstone.core.oidc import OIDCConfig
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 USER = "user-1"
 AUDIENCE = "https://models.example.com"
@@ -207,8 +207,8 @@ class TestMigration069:
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 class TestModelDefinitionStorage:

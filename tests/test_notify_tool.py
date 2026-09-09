@@ -162,10 +162,9 @@ class TestPrepareNotify:
 
 
 class TestExecNotify:
-    def test_sends_http_to_channel_gateway(self, tmp_path):
-        from turnstone.core.storage._sqlite import SQLiteBackend
+    def test_sends_http_to_channel_gateway(self, tmp_path, sqlite_backend_factory):
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         storage.register_service("channel", "ch-1", "http://localhost:8091")
 
         session = _make_session()
@@ -201,10 +200,9 @@ class TestExecNotify:
         assert post_kwargs.kwargs["json"]["target"] == {"username": "admin"}
         assert post_kwargs.kwargs["json"]["message"] == "Hello!"
 
-    def test_no_services_available(self, tmp_path):
-        from turnstone.core.storage._sqlite import SQLiteBackend
+    def test_no_services_available(self, tmp_path, sqlite_backend_factory):
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         # No services registered
 
         session = _make_session()
@@ -228,10 +226,9 @@ class TestExecNotify:
 
         assert "no channel gateway" in msg.lower()
 
-    def test_rate_limit(self, tmp_path):
-        from turnstone.core.storage._sqlite import SQLiteBackend
+    def test_rate_limit(self, tmp_path, sqlite_backend_factory):
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         storage.register_service("channel", "ch-1", "http://localhost:8091")
 
         session = _make_session()
@@ -266,11 +263,10 @@ class TestExecNotify:
             call_id, msg = session._exec_notify(item)
             assert "rate limit" in msg.lower()
 
-    def test_rate_limit_not_consumed_on_failure(self, tmp_path):
+    def test_rate_limit_not_consumed_on_failure(self, tmp_path, sqlite_backend_factory):
         """Failed delivery should not consume rate limit slots."""
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         storage.register_service("channel", "ch-1", "http://localhost:8091")
 
         session = _make_session()
@@ -304,10 +300,9 @@ class TestExecNotify:
         session = _make_session()
         assert session._notify_count == 0
 
-    def test_http_failure_reported(self, tmp_path):
-        from turnstone.core.storage._sqlite import SQLiteBackend
+    def test_http_failure_reported(self, tmp_path, sqlite_backend_factory):
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         storage.register_service("channel", "ch-1", "http://localhost:8091")
 
         session = _make_session()
@@ -339,11 +334,10 @@ class TestExecNotify:
         assert "refused" not in msg
         assert "ch-1" not in msg
 
-    def test_first_healthy_only(self, tmp_path):
+    def test_first_healthy_only(self, tmp_path, sqlite_backend_factory):
         """Only the first healthy gateway should receive the request."""
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         storage.register_service("channel", "ch-1", "http://localhost:8091")
         storage.register_service("channel", "ch-2", "http://localhost:8092")
 
@@ -376,11 +370,10 @@ class TestExecNotify:
         # Should only have been called once (first healthy)
         assert mock_post.call_count == 1
 
-    def test_ssrf_protection(self, tmp_path):
+    def test_ssrf_protection(self, tmp_path, sqlite_backend_factory):
         """URLs with non-http(s) schemes should be skipped."""
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         # Register a service with an invalid scheme
         storage.register_service("channel", "ch-bad", "ftp://evil.example.com")
 
@@ -465,11 +458,10 @@ class TestExecNotify:
         # cancel-aware helper, not a Stop-blind time.sleep.
         assert mock_backoff.call_count == 2
 
-    def test_retry_on_all_gateways_failed(self, tmp_path):
+    def test_retry_on_all_gateways_failed(self, tmp_path, sqlite_backend_factory):
         """Retries when all gateways fail on first attempt but succeed on retry."""
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         storage.register_service("channel", "ch-1", "http://localhost:8091")
 
         session = _make_session()
@@ -510,11 +502,10 @@ class TestExecNotify:
         assert "sent successfully" in msg.lower()
         assert mock_backoff.call_count == 1
 
-    def test_no_services_logs_warning(self, tmp_path):
+    def test_no_services_logs_warning(self, tmp_path, sqlite_backend_factory):
         """Server-side warning is logged when no services are available."""
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
 
         session = _make_session()
         item = {
@@ -543,11 +534,10 @@ class TestExecNotify:
         assert "notify.no_services" in events
         assert "notify.no_services_exhausted" in events
 
-    def test_all_gateways_failed_logs_warning(self, tmp_path):
+    def test_all_gateways_failed_logs_warning(self, tmp_path, sqlite_backend_factory):
         """Server-side warning is logged when all gateways fail."""
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         storage.register_service("channel", "ch-1", "http://localhost:8091")
 
         session = _make_session()
@@ -581,11 +571,10 @@ class TestExecNotify:
         assert "notify.all_gateways_failed" in events
         assert "notify.delivery_failed" in events
 
-    def test_gateway_200_but_no_delivery(self, tmp_path):
+    def test_gateway_200_but_no_delivery(self, tmp_path, sqlite_backend_factory):
         """HTTP 200 with all results failed should not count as success."""
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "test.db"))
         storage.register_service("channel", "ch-1", "http://localhost:8091")
 
         session = _make_session()

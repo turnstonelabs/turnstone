@@ -23,10 +23,11 @@ from turnstone.console.coordinator_client import (
 )
 from turnstone.core.auth import JWT_AUD_CONSOLE, validate_jwt
 from turnstone.core.child_event_bus import ChildEventBus
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 _SECRET = "x" * 64
 
@@ -116,7 +117,7 @@ def test_token_manager_rejects_nonpositive_ttl():
 
 
 def _mock_client(
-    handler: Callable[[httpx.Request], httpx.Response],
+    handler: Callable[[httpx.Request], httpx.Response], sqlite_backend_factory
 ) -> tuple[CoordinatorClient, list[httpx.Request]]:
     """Build a CoordinatorClient with an httpx MockTransport recorder.
 
@@ -133,7 +134,7 @@ def _mock_client(
 
     transport = httpx.MockTransport(_trapping)
     http = httpx.Client(transport=transport)
-    storage = SQLiteBackend(":memory:")
+    storage = sqlite_backend_factory(":memory:")
     storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     storage.register_workstream(
         "ws-x", kind="interactive", parent_ws_id="coord-1", user_id="user-1"
@@ -229,8 +230,11 @@ def test_route_paths_match_actual_console_mounts():
         )
 
 
-def test_spawn_posts_to_routing_proxy_with_bearer_token():
-    client, captured = _mock_client(_ok_json({"ws_id": "child-1", "name": "c", "node_id": "n1"}))
+def test_spawn_posts_to_routing_proxy_with_bearer_token(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"ws_id": "child-1", "name": "c", "node_id": "n1"}),
+        sqlite_backend_factory=sqlite_backend_factory,
+    )
     result = client.spawn(
         initial_message="hi",
         parent_ws_id="coord-1",
@@ -253,8 +257,10 @@ def test_spawn_posts_to_routing_proxy_with_bearer_token():
     assert body["target_node"] == "n1"
 
 
-def test_spawn_omits_optional_empty_fields():
-    client, captured = _mock_client(_ok_json({"ws_id": "x"}))
+def test_spawn_omits_optional_empty_fields(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"ws_id": "x"}), sqlite_backend_factory=sqlite_backend_factory
+    )
     client.spawn(initial_message="hi", parent_ws_id="coord", user_id="u")
     body = json.loads(captured[0].content)
     # Optional fields should NOT be present when empty (keeps body lean
@@ -265,8 +271,10 @@ def test_spawn_omits_optional_empty_fields():
     assert "target_node" not in body
 
 
-def test_send_posts_to_send_route():
-    client, captured = _mock_client(_ok_json({"status": 200}))
+def test_send_posts_to_send_route(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
     client.send("ws-x", "hello")
     # Path-keyed shape post-#422: ws_id rides in the URL, not the body.
     assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/send"
@@ -274,23 +282,27 @@ def test_send_posts_to_send_route():
     assert body == {"message": "hello"}
 
 
-def test_close_workstream_posts_to_close_route():
-    client, captured = _mock_client(_ok_json({"status": 200}))
+def test_close_workstream_posts_to_close_route(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
     client.close_workstream("ws-x")
     assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/close"
     body = json.loads(captured[0].content)
     assert body == {}  # no reason → omitted; ws_id rides the path
 
 
-def test_close_workstream_includes_reason_when_provided():
-    client, captured = _mock_client(_ok_json({"status": 200}))
+def test_close_workstream_includes_reason_when_provided(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
     client.close_workstream("ws-x", reason="done")
     assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/close"
     body = json.loads(captured[0].content)
     assert body == {"reason": "done"}
 
 
-def test_close_all_children_posts_to_console_endpoint():
+def test_close_all_children_posts_to_console_endpoint(sqlite_backend_factory):
     """Targets the console directly (not the routing proxy).  The URL
     embeds the coord's own ws_id so the server can resolve the session.
     """
@@ -302,7 +314,8 @@ def test_close_all_children_posts_to_console_endpoint():
                 "failed": [],
                 "skipped": [],
             }
-        )
+        ),
+        sqlite_backend_factory=sqlite_backend_factory,
     )
     result = client.close_all_children(reason="batch done")
     assert result["closed"] == ["c-1", "c-2"]
@@ -312,43 +325,48 @@ def test_close_all_children_posts_to_console_endpoint():
     assert body == {"reason": "batch done"}
 
 
-def test_close_all_children_omits_empty_reason():
+def test_close_all_children_omits_empty_reason(sqlite_backend_factory):
     client, captured = _mock_client(
-        _ok_json({"status": "ok", "closed": [], "failed": [], "skipped": []})
+        _ok_json({"status": "ok", "closed": [], "failed": [], "skipped": []}),
+        sqlite_backend_factory=sqlite_backend_factory,
     )
     client.close_all_children()
     body = json.loads(captured[0].content)
     assert body == {}
 
 
-def test_close_all_children_surfaces_http_error():
+def test_close_all_children_surfaces_http_error(sqlite_backend_factory):
     def _boom(_req: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"error": "internal"})
 
-    client, _captured = _mock_client(_boom)
+    client, _captured = _mock_client(_boom, sqlite_backend_factory=sqlite_backend_factory)
     result = client.close_all_children()
     assert result["status"] == 500
     assert "error" in result
 
 
-def test_close_all_children_surfaces_transport_error():
+def test_close_all_children_surfaces_transport_error(sqlite_backend_factory):
     def _raise(_req: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
-    client, _captured = _mock_client(_raise)
+    client, _captured = _mock_client(_raise, sqlite_backend_factory=sqlite_backend_factory)
     result = client.close_all_children()
     assert result["status"] == 0
     assert "upstream unreachable" in result["error"]
 
 
-def test_delete_workstream_posts_to_delete_route():
-    client, captured = _mock_client(_ok_json({"status": 200}))
+def test_delete_workstream_posts_to_delete_route(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
     client.delete("ws-x")
     assert captured[0].url.path == "/v1/api/route/workstreams/delete"
 
 
-def test_approve_and_cancel_hit_their_routes():
-    client, captured = _mock_client(_ok_json({"status": 200}))
+def test_approve_and_cancel_hit_their_routes(sqlite_backend_factory):
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
     client.approve("ws-x", call_id="c-1", approved=True, feedback="ok", always=True)
     client.cancel("ws-x")
     # Path-keyed shape post-#422: ws_id rides the URL.
@@ -362,21 +380,21 @@ def test_approve_and_cancel_hit_their_routes():
     assert "ws_id" not in approve_body
 
 
-def test_http_error_returns_structured_failure():
+def test_http_error_returns_structured_failure(sqlite_backend_factory):
     def _boom(req: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("no route to host", request=req)
 
-    client, _captured = _mock_client(_boom)
+    client, _captured = _mock_client(_boom, sqlite_backend_factory=sqlite_backend_factory)
     result = client.send("ws-x", "hi")
     assert "error" in result
     assert result["status"] == 0
 
 
-def test_non_2xx_response_populates_error():
+def test_non_2xx_response_populates_error(sqlite_backend_factory):
     def _h(req: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"detail": "upstream down"})
 
-    client, _c = _mock_client(_h)
+    client, _c = _mock_client(_h, sqlite_backend_factory=sqlite_backend_factory)
     result = client.send("ws-x", "hi")
     assert result["status"] == 500
     assert "error" in result
@@ -387,7 +405,7 @@ def test_non_2xx_response_populates_error():
 # ---------------------------------------------------------------------------
 
 
-def test_mutating_ops_reject_foreign_ws_id_without_hitting_proxy():
+def test_mutating_ops_reject_foreign_ws_id_without_hitting_proxy(sqlite_backend_factory):
     """A coordinator must not be able to drive a foreign tenant's
     workstream even if the upstream node forgets to enforce ownership.
     Confirm that send / close / cancel / delete short-circuit before
@@ -395,7 +413,9 @@ def test_mutating_ops_reject_foreign_ws_id_without_hitting_proxy():
     subtree.  Same 404-shape that inspect / wait_for_workstream use, so
     the model can't distinguish 'foreign' from 'missing' (no oracle).
     """
-    client, captured = _mock_client(_ok_json({"status": 200}))
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
     # ``ws-foreign`` is not in the coordinator's subtree (the fixture
     # only registers ws-x and ws-y under coord-1).
     for call, kwargs in [
@@ -414,22 +434,26 @@ def test_mutating_ops_reject_foreign_ws_id_without_hitting_proxy():
     assert captured == []
 
 
-def test_mutating_ops_accept_self_ws_id():
+def test_mutating_ops_accept_self_ws_id(sqlite_backend_factory):
     """The coordinator's own ws_id is in its subtree (trivially true);
     operations against self should pass the guard.  Currently only send
     has a meaningful self-targeted use, but the contract should hold
     uniformly."""
-    client, captured = _mock_client(_ok_json({"status": 200}))
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
     client.send("coord-1", "hi")
     assert len(captured) == 1
     assert captured[0].url.path == "/v1/api/route/workstreams/coord-1/send"
 
 
-def test_mutating_ops_reject_foreign_hex_id_with_recovery_payload():
+def test_mutating_ops_reject_foreign_hex_id_with_recovery_payload(sqlite_backend_factory):
     """A well-formed 32-hex id that isn't ours passes format validation
     and dies on the ownership guard with the SAME recovery payload as a
     malformed ref — uniform shape, no existence oracle, no HTTP."""
-    client, captured = _mock_client(_ok_json({"status": 200}))
+    client, captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
     result = client.send("f" * 32, "hi")
     assert result["status"] == 404
     assert "no workstream matching" in result["error"]
@@ -437,12 +461,12 @@ def test_mutating_ops_reject_foreign_hex_id_with_recovery_payload():
     assert captured == []
 
 
-def test_mutating_ops_reject_child_name_with_id_pointer(tmp_path):
+def test_mutating_ops_reject_child_name_with_id_pointer(tmp_path, sqlite_backend_factory):
     """A model that pastes a child's display NAME instead of its id is
     pointed straight at the right ws_id — names are mutable, non-unique
     labels (the title generator can rewrite what the operator sees), so
     they are deliberately NOT addresses and nothing resolves silently."""
-    st = SQLiteBackend(str(tmp_path / "names.db"))
+    st = sqlite_backend_factory(str(tmp_path / "names.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     real = "7c61eafe470c54caaa89490a4b9c0f7d"
     st.register_workstream(
@@ -481,8 +505,8 @@ def test_mutating_ops_reject_child_name_with_id_pointer(tmp_path):
 
 
 @pytest.fixture
-def populated_storage(tmp_path):
-    st = SQLiteBackend(str(tmp_path / "coord.db"))
+def populated_storage(tmp_path, sqlite_backend_factory):
+    st = sqlite_backend_factory(str(tmp_path / "coord.db"))
     # Coord + 2 interactive children + 1 child coordinator (excluded) +
     # 1 unrelated ws + 1 cross-tenant child (excluded by the user_id SQL
     # filter: belongs to user-2 but forged parent_ws_id=coord-1).
@@ -650,9 +674,9 @@ def test_inspect_cross_tenant_returns_same_shape_as_missing(populated_storage):
     assert missing["ws_id"] == "missing-x"
 
 
-def test_creating_child_is_unobservable_to_point_and_batch_guards(tmp_path):
+def test_creating_child_is_unobservable_to_point_and_batch_guards(tmp_path, sqlite_backend_factory):
     """Matching parent and owner do not authorize an unpublished child."""
-    storage = SQLiteBackend(str(tmp_path / "creating-child.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "creating-child.db"))
     storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     ws_id = "a" * 32
     storage.register_workstream(
@@ -677,11 +701,11 @@ def test_creating_child_is_unobservable_to_point_and_batch_guards(tmp_path):
     assert ws_id in {item["ws_id"] for item in waited["not_found"]}
 
 
-def test_list_children_excludes_closed_by_default(tmp_path):
+def test_list_children_excludes_closed_by_default(tmp_path, sqlite_backend_factory):
     """Default ``list_children`` filters out closed / deleted rows —
     the common "what's still running?" query shouldn't have to
     post-hoc filter them.  An explicit state filter still wins."""
-    st = SQLiteBackend(str(tmp_path / "closed.db"))
+    st = sqlite_backend_factory(str(tmp_path / "closed.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.register_workstream(
         "child-active",
@@ -867,8 +891,8 @@ def _register_service(storage, node_id: str, url: str = "http://x:8080") -> None
 
 
 @pytest.fixture
-def storage_with_nodes(tmp_path):
-    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+def storage_with_nodes(tmp_path, sqlite_backend_factory):
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
     _set_meta(
         st,
         "node-a",
@@ -914,11 +938,11 @@ def test_list_nodes_no_filters_returns_all_rows_decoded(storage_with_nodes):
     assert node_b["metadata"]["capability"] == {"value": "gpu", "source": "user"}
 
 
-def test_list_nodes_strips_interfaces_by_default(tmp_path):
+def test_list_nodes_strips_interfaces_by_default(tmp_path, sqlite_backend_factory):
     """The auto-populated ``interfaces`` key carries internal RFC 1918
     addresses which trip the private_ip_disclosure output guard and
     aren't used for routing decisions.  Default response omits it."""
-    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
     _set_meta(
         st,
         "node-x",
@@ -938,9 +962,9 @@ def test_list_nodes_strips_interfaces_by_default(tmp_path):
     assert "region" in node["metadata"]
 
 
-def test_list_nodes_include_network_detail_opt_in(tmp_path):
+def test_list_nodes_include_network_detail_opt_in(tmp_path, sqlite_backend_factory):
     """Operators who need the IP map for debugging opt back in."""
-    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
     _set_meta(
         st,
         "node-x",
@@ -957,12 +981,12 @@ def test_list_nodes_include_network_detail_opt_in(tmp_path):
     assert node["metadata"]["interfaces"]["value"] == {"eth0": ["172.18.0.4"]}
 
 
-def test_list_nodes_filters_stale_registrations_by_default(tmp_path):
+def test_list_nodes_filters_stale_registrations_by_default(tmp_path, sqlite_backend_factory):
     """node_metadata rows persist across restarts but the services
     table heartbeats expire — list_nodes should intersect against
     active services so the model doesn't suggest a dead node for
     target_node pinning.  Regression for the stale-registration bug."""
-    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
     _set_meta(st, "node-live", [("arch", "x86_64", "auto")])
     _set_meta(st, "node-dead", [("arch", "x86_64", "auto")])
     # Only node-live has a fresh heartbeat; node-dead is metadata-only.
@@ -1047,7 +1071,7 @@ def test_list_nodes_empty_on_no_matching_filters(storage_with_nodes):
     assert result["truncated"] is False
 
 
-def test_list_nodes_surfaces_healthy_model_aliases(tmp_path):
+def test_list_nodes_surfaces_healthy_model_aliases(tmp_path, sqlite_backend_factory):
     """The node's heartbeat loop projects its registry into a ``models``
     metadata entry shaped like ``[{alias, provider, healthy}, ...]``.
     ``list_nodes`` flattens that to the healthy-alias list at the top
@@ -1056,7 +1080,7 @@ def test_list_nodes_surfaces_healthy_model_aliases(tmp_path):
     introspect the metadata blob.  The provider-side model identifier
     (``cfg.model``) is intentionally NOT in the payload — coords kept
     reaching for it when they should pass the local alias."""
-    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
     _set_meta(
         st,
         "node-x",
@@ -1089,13 +1113,13 @@ def test_list_nodes_surfaces_healthy_model_aliases(tmp_path):
         assert "model" not in row
 
 
-def test_list_nodes_model_aliases_distinct_from_metadata_models(tmp_path):
+def test_list_nodes_model_aliases_distinct_from_metadata_models(tmp_path, sqlite_backend_factory):
     """Pin the naming distinction explicitly: the top-level shortlist
     (``model_aliases``, list of strings) and the rich metadata blob
     (``metadata.models.value``, list of dicts) live under different
     keys so a caller that confuses them gets a clear KeyError rather
     than a silent shape mismatch."""
-    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
     _set_meta(
         st,
         "node-x",
@@ -1118,12 +1142,14 @@ def test_list_nodes_model_aliases_distinct_from_metadata_models(tmp_path):
     assert isinstance(node["metadata"]["models"]["value"][0], dict)
 
 
-def test_list_nodes_model_aliases_empty_when_node_has_not_published(tmp_path):
+def test_list_nodes_model_aliases_empty_when_node_has_not_published(
+    tmp_path, sqlite_backend_factory
+):
     """Nodes from older builds — or a node mid-startup before its first
     metadata write — won't have a ``models`` entry.  The top-level
     ``model_aliases`` field defaults to ``[]`` rather than being
     omitted so coordinators can rely on the key being present."""
-    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
     _set_meta(st, "node-y", [("arch", "x86_64", "auto")])
     _register_service(st, "node-y")
     client = _make_read_client(st)
@@ -1131,12 +1157,12 @@ def test_list_nodes_model_aliases_empty_when_node_has_not_published(tmp_path):
     assert result["nodes"][0]["model_aliases"] == []
 
 
-def test_list_nodes_models_tolerates_malformed_entries(tmp_path):
+def test_list_nodes_models_tolerates_malformed_entries(tmp_path, sqlite_backend_factory):
     """If a node ever stores a malformed ``models`` entry (wrong outer
     type, missing alias, non-bool healthy), the projection drops the
     bad rows rather than raising — the rest of the response should
     still be useful."""
-    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
     _set_meta(
         st,
         "node-z",
@@ -1161,10 +1187,10 @@ def test_list_nodes_models_tolerates_malformed_entries(tmp_path):
     assert result["nodes"][0]["model_aliases"] == ["ok"]
 
 
-def test_list_nodes_models_handles_non_list_payload(tmp_path):
+def test_list_nodes_models_handles_non_list_payload(tmp_path, sqlite_backend_factory):
     """A node with a corrupted models entry (dict, scalar, null) shouldn't
     blow up the whole list_nodes call.  ``model_aliases`` falls back to ``[]``."""
-    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
     _set_meta(
         st,
         "node-w",
@@ -1429,8 +1455,8 @@ FORGED_HEX = "d" * 32  # parent_ws_id forged to coord-1, foreign user_id
 
 
 @pytest.fixture
-def hex_storage(tmp_path):
-    st = SQLiteBackend(str(tmp_path / "coord-hex.db"))
+def hex_storage(tmp_path, sqlite_backend_factory):
+    st = sqlite_backend_factory(str(tmp_path / "coord-hex.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.register_workstream(
         REAL_CHILD_HEX,
@@ -2247,20 +2273,20 @@ def test_last_assistant_text_returns_none_on_storage_failure(populated_storage, 
 # ---------------------------------------------------------------------------
 
 
-def _task_client(tmp_path) -> CoordinatorClient:
-    st = SQLiteBackend(str(tmp_path / "tasks.db"))
+def _task_client(tmp_path, sqlite_backend_factory) -> CoordinatorClient:
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     return _make_read_client(st)
 
 
-def test_tasks_get_empty_envelope_on_fresh_ws(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_get_empty_envelope_on_fresh_ws(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     env = client.tasks_get("coord-1")
     assert env == {"version": 1, "tasks": []}
 
 
-def test_tasks_add_then_get_roundtrip(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_add_then_get_roundtrip(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="spawn worker")
     assert task["title"] == "spawn worker"
     assert task["status"] == "pending"
@@ -2269,22 +2295,22 @@ def test_tasks_add_then_get_roundtrip(tmp_path):
     assert env["tasks"][0]["id"] == task["id"]
 
 
-def test_tasks_add_rejects_empty_title(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_add_rejects_empty_title(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     result = client.tasks_add("coord-1", title="   ")
     assert "error" in result
 
 
-def test_tasks_add_rejects_invalid_status(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_add_rejects_invalid_status(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     result = client.tasks_add("coord-1", title="x", status="nonsense")
     assert "error" in result
 
 
-def test_tasks_add_rejects_title_over_200(tmp_path):
+def test_tasks_add_rejects_title_over_200(tmp_path, sqlite_backend_factory):
     """Silent truncation is a data-integrity footgun: the model may
     rely on the title it sent, not the one stored.  Reject instead."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     long_title = "a" * 201
     result = client.tasks_add("coord-1", title=long_title)
     assert "error" in result
@@ -2296,8 +2322,8 @@ def test_tasks_add_rejects_title_over_200(tmp_path):
     assert len(task["title"]) == 200
 
 
-def test_tasks_update_rejects_title_over_200(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_update_rejects_title_over_200(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     added = client.tasks_add("coord-1", title="original")
     result = client.tasks_update("coord-1", task_id=added["id"], title="b" * 201)
     assert "error" in result
@@ -2307,8 +2333,8 @@ def test_tasks_update_rejects_title_over_200(tmp_path):
     assert env["tasks"][0]["title"] == "original"
 
 
-def test_tasks_update_by_id(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_update_by_id(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     added = client.tasks_add("coord-1", title="plan")
     updated = client.tasks_update(
         "coord-1", task_id=added["id"], status="done", child_ws_id="ws-child"
@@ -2317,14 +2343,14 @@ def test_tasks_update_by_id(tmp_path):
     assert updated["child_ws_id"] == "ws-child"
 
 
-def test_tasks_update_missing_id(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_update_missing_id(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     result = client.tasks_update("coord-1", task_id="nope", status="done")
     assert "error" in result
 
 
-def test_tasks_remove(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_remove(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     added = client.tasks_add("coord-1", title="plan")
     first = client.tasks_remove("coord-1", task_id=added["id"])
     assert first.get("ok") is True
@@ -2337,8 +2363,8 @@ def test_tasks_remove(tmp_path):
     assert client.tasks_get("coord-1")["tasks"] == []
 
 
-def test_tasks_reorder_requires_permutation(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_reorder_requires_permutation(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     a = client.tasks_add("coord-1", title="a")
     b = client.tasks_add("coord-1", title="b")
     # Partial set — must reject.
@@ -2354,8 +2380,8 @@ def test_tasks_reorder_requires_permutation(tmp_path):
     assert [t["id"] for t in env["tasks"]] == [b["id"], a["id"]]
 
 
-def test_tasks_cross_ws_scope_violation_is_noop(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_cross_ws_scope_violation_is_noop(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     # Client is bound to coord-1; anything else returns an empty envelope
     # or an error without touching storage.
     assert client.tasks_get("other-ws") == {"version": 1, "tasks": []}
@@ -2366,9 +2392,9 @@ def test_tasks_cross_ws_scope_violation_is_noop(tmp_path):
     assert "scope violation" in res_remove["error"]
 
 
-def test_tasks_corrupt_json_returns_empty_envelope(tmp_path):
+def test_tasks_corrupt_json_returns_empty_envelope(tmp_path, sqlite_backend_factory):
     """A hand-edited / corrupt config row must not crash the tool."""
-    st = SQLiteBackend(str(tmp_path / "tasks.db"))
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.save_workstream_config("coord-1", {"tasks": "{not json"})
     client = _make_read_client(st)
@@ -2376,10 +2402,10 @@ def test_tasks_corrupt_json_returns_empty_envelope(tmp_path):
     assert env == {"version": 1, "tasks": []}
 
 
-def test_tasks_mutations_refuse_corrupt_envelope(tmp_path):
+def test_tasks_mutations_refuse_corrupt_envelope(tmp_path, sqlite_backend_factory):
     """When the envelope is corrupt on disk, mutators must error out
     (rather than silently overwrite — lost-data safety)."""
-    st = SQLiteBackend(str(tmp_path / "tasks.db"))
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.save_workstream_config("coord-1", {"tasks": "{not json"})
     client = _make_read_client(st)
@@ -2397,11 +2423,11 @@ def test_tasks_mutations_refuse_corrupt_envelope(tmp_path):
     assert "corrupt" in remove_result["error"]
 
 
-def test_tasks_add_enforces_capacity_cap(tmp_path, monkeypatch):
+def test_tasks_add_enforces_capacity_cap(tmp_path, monkeypatch, sqlite_backend_factory):
     from turnstone.console import coordinator_client as cc_module
 
     monkeypatch.setattr(cc_module, "_TASKS_MAX", 3)
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     for i in range(3):
         client.tasks_add("coord-1", title=f"t{i}")
     overflow = client.tasks_add("coord-1", title="no-room")
@@ -2414,9 +2440,9 @@ def test_tasks_add_enforces_capacity_cap(tmp_path, monkeypatch):
     assert "error" not in added
 
 
-def test_tasks_save_preserves_other_workstream_config_keys(tmp_path):
+def test_tasks_save_preserves_other_workstream_config_keys(tmp_path, sqlite_backend_factory):
     """_save_tasks writes only the 'tasks' key so other keys survive."""
-    st = SQLiteBackend(str(tmp_path / "tasks.db"))
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.save_workstream_config("coord-1", {"reasoning_effort": "high"})
     client = _make_read_client(st)
@@ -2426,11 +2452,11 @@ def test_tasks_save_preserves_other_workstream_config_keys(tmp_path):
     assert config.get("tasks")  # tasks wrote its key too
 
 
-def test_live_cache_lru_eviction_caps_memory(tmp_path):
+def test_live_cache_lru_eviction_caps_memory(tmp_path, sqlite_backend_factory):
     """_live_cache must evict the oldest entry when inserting past the
     cap — long-running coordinators that walk many children otherwise
     grow the cache monotonically."""
-    st = SQLiteBackend(str(tmp_path / "cache.db"))
+    st = sqlite_backend_factory(str(tmp_path / "cache.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     client = _make_read_client(st)
     # Use the internal store helper directly — the HTTP-driven path is
@@ -2447,10 +2473,10 @@ def test_live_cache_lru_eviction_caps_memory(tmp_path):
         assert f"ws-{i:04x}" in client._live_cache
 
 
-def test_live_cache_touch_on_hit_moves_to_end(tmp_path):
+def test_live_cache_touch_on_hit_moves_to_end(tmp_path, sqlite_backend_factory):
     """A cache hit must reset the entry's LRU position so it's not
     evicted just because it was old by insertion order."""
-    st = SQLiteBackend(str(tmp_path / "cache.db"))
+    st = sqlite_backend_factory(str(tmp_path / "cache.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     client = _make_read_client(st)
     cap = client._LIVE_CACHE_MAX
@@ -2945,41 +2971,41 @@ def test_format_inspect_tiered_full_tier_omits_tier_note():
 # ---------------------------------------------------------------------------
 
 
-def test_tasks_add_accepts_needs_user_status(tmp_path):
+def test_tasks_add_accepts_needs_user_status(tmp_path, sqlite_backend_factory):
     """The status that marks a task as parked on the operator — the one
     signal the idle-tasks nudge gates on."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="pick a backend", status="needs_user")
     assert "error" not in task
     assert task["status"] == "needs_user"
 
 
-def test_tasks_add_still_rejects_unknown_status(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_add_still_rejects_unknown_status(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     assert "error" in client.tasks_add("coord-1", title="t", status="needs-operator")
 
 
-def test_tasks_add_omits_note_key_when_unset(tmp_path):
+def test_tasks_add_omits_note_key_when_unset(tmp_path, sqlite_backend_factory):
     """Absent-by-default keeps the envelope small: it is read and
     re-serialised on every mutation and fed back to the model by
     ``tasks(action='list')``, where an always-present empty string would
     spend budget on nothing."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="plain")
     assert "note" not in task
 
 
-def test_tasks_add_stores_note_when_set(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_add_stores_note_when_set(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="ask", note="which backend is canonical?")
     assert task["note"] == "which backend is canonical?"
 
 
-def test_tasks_add_rejects_note_over_200(tmp_path):
+def test_tasks_add_rejects_note_over_200(tmp_path, sqlite_backend_factory):
     """Same reject-don't-truncate rule as the title, for the same reason:
     the note is the operator-facing ask, which is precisely the string
     where silent trimming loses what the field exists to carry."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     result = client.tasks_add("coord-1", title="t", note="a" * 201)
     assert "error" in result
     assert "too long" in result["error"]
@@ -2988,10 +3014,10 @@ def test_tasks_add_rejects_note_over_200(tmp_path):
     assert len(boundary["note"]) == 200
 
 
-def test_tasks_update_sets_and_clears_note(tmp_path):
+def test_tasks_update_sets_and_clears_note(tmp_path, sqlite_backend_factory):
     """``note`` follows ``child_ws_id``, not ``title``: it is optional, so
     an empty string is a CLEAR rather than an error."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="ask")
     updated = client.tasks_update("coord-1", task_id=task["id"], note="need a decision")
     assert updated["note"] == "need a decision"
@@ -2999,8 +3025,10 @@ def test_tasks_update_sets_and_clears_note(tmp_path):
     assert "note" not in cleared
 
 
-def test_tasks_update_rejects_note_over_200_and_leaves_task_intact(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_update_rejects_note_over_200_and_leaves_task_intact(
+    tmp_path, sqlite_backend_factory
+):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="ask", note="short")
     result = client.tasks_update("coord-1", task_id=task["id"], note="a" * 201)
     assert "error" in result
@@ -3008,8 +3036,8 @@ def test_tasks_update_rejects_note_over_200_and_leaves_task_intact(tmp_path):
     assert envelope["tasks"][0]["note"] == "short"
 
 
-def test_tasks_note_survives_reorder(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_note_survives_reorder(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     a = client.tasks_add("coord-1", title="a", note="keep me")
     b = client.tasks_add("coord-1", title="b")
     client.tasks_reorder("coord-1", task_ids=[b["id"], a["id"]])
@@ -3018,10 +3046,10 @@ def test_tasks_note_survives_reorder(tmp_path):
     assert by_id[a["id"]]["note"] == "keep me"
 
 
-def test_legacy_task_row_without_note_round_trips(tmp_path):
+def test_legacy_task_row_without_note_round_trips(tmp_path, sqlite_backend_factory):
     """There is no backfill — rows written before the field existed have
     no ``note`` key, and every reader must tolerate its absence."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="legacy")
     assert "note" not in task
     updated = client.tasks_update("coord-1", task_id=task["id"], status="in_progress")
@@ -3034,7 +3062,7 @@ def test_legacy_task_row_without_note_round_trips(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_tasks_stores_title_and_note_verbatim(tmp_path):
+def test_tasks_stores_title_and_note_verbatim(tmp_path, sqlite_backend_factory):
     """Storage is NOT sanitised.  The strict sanitiser strips angle
     brackets, so sanitising here would rewrite ordinary planning text —
     "cut p99 latency to <200ms" would store as "...to 200ms", inverting
@@ -3043,7 +3071,7 @@ def test_tasks_stores_title_and_note_verbatim(tmp_path):
     flavour that audience needs: ``sanitize_display`` (brackets kept) on
     the operator surfaces, ``sanitize_name`` (brackets deleted) in the
     model-facing nudge body."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add(
         "coord-1",
         title="cut p99 latency to <200ms",
@@ -3053,13 +3081,13 @@ def test_tasks_stores_title_and_note_verbatim(tmp_path):
     assert task["note"] == "which of <staging|prod> is canonical?"
 
 
-def test_tasks_length_check_measures_what_the_model_sent(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_length_check_measures_what_the_model_sent(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     result = client.tasks_add("coord-1", title="a" * 201)
     assert "error" in result and "201 chars" in result["error"]
 
 
-def test_tasks_add_rejects_unrenderable_title(tmp_path):
+def test_tasks_add_rejects_unrenderable_title(tmp_path, sqlite_backend_factory):
     """The one carve-out from verbatim storage: text that sanitises to
     NOTHING renders on no operator surface while ``tasks(list)`` feeds it
     back to the model every call — an operator-invisible, model-visible
@@ -3069,21 +3097,21 @@ def test_tasks_add_rejects_unrenderable_title(tmp_path):
     is the whole of the class now that the oracle is
     ``sanitize_display``; ``"<>"`` used to live here and is covered by
     the accept case below."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     result = client.tasks_add("coord-1", title=chr(0x200B) + chr(0x202E))
     assert "error" in result
     assert "no renderable characters" in result["error"]
     assert "retry" in result["error"]
 
 
-def test_tasks_add_accepts_bracket_only_title(tmp_path):
+def test_tasks_add_accepts_bracket_only_title(tmp_path, sqlite_backend_factory):
     """Angle brackets RENDER on every operator surface now, so a
     bracket-only title is ordinary text: stored verbatim and shown
     verbatim by the pane's display sanitiser.  Refusing it was the
     unreachable rejection the display fix removed."""
     from turnstone.console.server import _sanitize_task_envelope_for_display
 
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="<>")
     assert "error" not in task
     assert task["title"] == "<>"
@@ -3091,14 +3119,14 @@ def test_tasks_add_accepts_bracket_only_title(tmp_path):
     assert shown["tasks"][0]["title"] == "<>"
 
 
-def test_tasks_add_rejects_unrenderable_note(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_add_rejects_unrenderable_note(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     result = client.tasks_add("coord-1", title="t", note=chr(0x200B) * 2)
     assert "error" in result and "no renderable characters" in result["error"]
 
 
-def test_tasks_update_rejects_unrenderable_title_and_note(tmp_path):
-    client = _task_client(tmp_path)
+def test_tasks_update_rejects_unrenderable_title_and_note(tmp_path, sqlite_backend_factory):
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="keep", note="keep note")
     res_t = client.tasks_update("coord-1", task_id=task["id"], title=chr(0x202E) + chr(0x200B))
     assert "error" in res_t and "no renderable characters" in res_t["error"]
@@ -3109,12 +3137,12 @@ def test_tasks_update_rejects_unrenderable_title_and_note(tmp_path):
     assert row["title"] == "keep" and row["note"] == "keep note"
 
 
-def test_bracket_only_note_survives_update_and_renders(tmp_path):
+def test_bracket_only_note_survives_update_and_renders(tmp_path, sqlite_backend_factory):
     """The update branch's half of the accept case: brackets are not the
     unrenderable class any more, on either mutation path."""
     from turnstone.console.server import _sanitize_task_envelope_for_display
 
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="keep")
     updated = client.tasks_update("coord-1", task_id=task["id"], note="<>")
     assert "error" not in updated
@@ -3123,31 +3151,31 @@ def test_bracket_only_note_survives_update_and_renders(tmp_path):
     assert shown["tasks"][0]["note"] == "<>"
 
 
-def test_tasks_unrenderable_check_runs_after_length(tmp_path):
+def test_tasks_unrenderable_check_runs_after_length(tmp_path, sqlite_backend_factory):
     """Order ruling: length first (measured on what the model sent), then
     renderability — a 250-char zero-width run hears "too long", not
     "unrenderable", so the two hints cannot mask each other."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     result = client.tasks_add("coord-1", title=chr(0x200B) * 250)
     assert "error" in result and "too long" in result["error"]
 
 
-def test_tasks_update_empty_note_still_clears_after_the_reject(tmp_path):
+def test_tasks_update_empty_note_still_clears_after_the_reject(tmp_path, sqlite_backend_factory):
     """The reject must not eat the legal CLEAR: ``note=""`` stays a
     clear; only a NON-empty note that sanitises to nothing is rejected."""
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     task = client.tasks_add("coord-1", title="t", note="real")
     cleared = client.tasks_update("coord-1", task_id=task["id"], note="")
     assert "error" not in cleared
     assert "note" not in cleared
 
 
-def test_display_sanitiser_cleans_the_operator_facing_copy(tmp_path):
+def test_display_sanitiser_cleans_the_operator_facing_copy(tmp_path, sqlite_backend_factory):
     """The pane's copy IS sanitised — a bidi override must not make the
     operator read an ask in an order different from the stored one."""
     from turnstone.console.server import _sanitize_task_envelope_for_display
 
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     client.tasks_add("coord-1", title="plain", note="do not \u202eevorppa")
     envelope = client.tasks_get("coord-1")
     shown = _sanitize_task_envelope_for_display(envelope)
@@ -3156,7 +3184,7 @@ def test_display_sanitiser_cleans_the_operator_facing_copy(tmp_path):
     assert "\u202e" in client.tasks_get("coord-1")["tasks"][0]["note"]
 
 
-def test_display_sanitiser_preserves_angle_brackets(tmp_path):
+def test_display_sanitiser_preserves_angle_brackets(tmp_path, sqlite_backend_factory):
     """The direct regression pin.  A stored "hold p99 <200ms" reached
     the tasks pane as "hold p99 200ms" — the constraint inverted on the
     operator's surface — while ``tasks(action='list')`` handed the model
@@ -3164,7 +3192,7 @@ def test_display_sanitiser_preserves_angle_brackets(tmp_path):
     model-facing nudge body deletes them."""
     from turnstone.console.server import _sanitize_task_envelope_for_display
 
-    client = _task_client(tmp_path)
+    client = _task_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     client.tasks_add(
         "coord-1",
         title="hold p99 <200ms",

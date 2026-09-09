@@ -2563,7 +2563,7 @@ class TestSessionRegistryGenerationPropagation:
         assert str(replacement._lane.client.base_url) == "http://intent-b.example/v1/"
 
     def test_live_output_guard_alias_replaces_only_guard_and_resets_limiter(
-        self, tmp_db: Any
+        self, tmp_db: Any, sqlite_backend_factory
     ) -> None:
         """A live guard-route edit is selective and restores its budget.
 
@@ -2574,9 +2574,8 @@ class TestSessionRegistryGenerationPropagation:
         """
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.judge import JudgeConfig
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        storage = sqlite_backend_factory(str(tmp_db), create_tables=True)
         config_store = ConfigStore(storage)
         config_store.set("judge.output_guard_llm", True, changed_by="test")
         config_store.set("judge.output_guard_model", "guard-a", changed_by="test")
@@ -2654,13 +2653,14 @@ class TestSessionRegistryGenerationPropagation:
         assert cancel_event.is_set()
         assert session._output_guard_judge_cancel is not cancel_event
 
-    def test_live_output_guard_timeout_replaces_frozen_guard(self, tmp_db: Any) -> None:
+    def test_live_output_guard_timeout_replaces_frozen_guard(
+        self, tmp_db: Any, sqlite_backend_factory
+    ) -> None:
         """A timeout-only admin edit cannot leave the old JudgeConfig cached."""
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.judge import JudgeConfig
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        storage = sqlite_backend_factory(str(tmp_db), create_tables=True)
         config_store = ConfigStore(storage)
         config_store.set("judge.output_guard_llm", True, changed_by="test")
         config_store.set("judge.output_guard_llm_timeout", 12.0, changed_by="test")

@@ -21,10 +21,15 @@ need seed rows must run migrations or seed explicitly; that gap is by design.)
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _MIGRATIONS = str(Path(__file__).resolve().parent.parent / "turnstone/core/storage/migrations")
 _STRUCTURED_MEMORY_INDEXES = {
@@ -46,25 +51,29 @@ def _structured_memory_indexes(inspector: sa.Inspector) -> dict[str, tuple[str, 
     return indexes
 
 
-def _inspect_migrated(db_path: Path) -> sa.Inspector:
-    cfg = Config()
-    cfg.set_main_option("script_location", _MIGRATIONS)
-    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
-    command.upgrade(cfg, "head")
-    return sa.inspect(sa.create_engine(f"sqlite:///{db_path}"))
-
-
-def _inspect_create_all(db_path: Path) -> sa.Inspector:
+@pytest.fixture
+def sqlite_inspectors(tmp_path: Path) -> Iterator[tuple[sa.Inspector, sa.Inspector]]:
+    """Inspect both schema paths while owning their connection pools."""
     from turnstone.core.storage._schema import metadata
 
-    engine = sa.create_engine(f"sqlite:///{db_path}")
-    metadata.create_all(engine)
-    return sa.inspect(engine)
+    migrated = sa.create_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
+    create_all = sa.create_engine(f"sqlite:///{tmp_path / 'create_all.db'}")
+    try:
+        cfg = Config()
+        cfg.set_main_option("script_location", _MIGRATIONS)
+        cfg.set_main_option("sqlalchemy.url", str(migrated.url))
+        command.upgrade(cfg, "head")
+        metadata.create_all(create_all)
+        yield sa.inspect(migrated), sa.inspect(create_all)
+    finally:
+        create_all.dispose()
+        migrated.dispose()
 
 
-def test_create_all_matches_migrations(tmp_path: Path) -> None:
-    mig = _inspect_migrated(tmp_path / "migrated.db")
-    meta = _inspect_create_all(tmp_path / "create_all.db")
+def test_create_all_matches_migrations(
+    sqlite_inspectors: tuple[sa.Inspector, sa.Inspector],
+) -> None:
+    mig, meta = sqlite_inspectors
 
     mig_tables = set(mig.get_table_names()) - {"alembic_version"}
     meta_tables = set(meta.get_table_names())
@@ -124,11 +133,11 @@ def test_postgresql_structured_memory_indexes_match_both_paths(
     assert create_all_indexes == _STRUCTURED_MEMORY_INDEXES
 
 
-def test_personas_prompt_source_check_present_on_both_paths(tmp_path: Path) -> None:
+def test_personas_prompt_source_check_present_on_both_paths(
+    sqlite_inspectors: tuple[sa.Inspector, sa.Inspector],
+) -> None:
     # Guards the personas feature specifically: the base_prompt/base_prompt_file
     # source CHECK must exist on BOTH build paths, not just the one under test.
-    mig = _inspect_migrated(tmp_path / "m.db")
-    meta = _inspect_create_all(tmp_path / "c.db")
-    for insp in (mig, meta):
+    for insp in sqlite_inspectors:
         names = {c.get("name") for c in insp.get_check_constraints("personas")}
         assert "ck_personas_prompt_source" in names

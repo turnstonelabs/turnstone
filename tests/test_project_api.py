@@ -17,7 +17,6 @@ from starlette.routing import Mount, Route
 from starlette.testclient import TestClient
 
 from turnstone.core.auth import AuthResult
-from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.server import (
     add_project_member_endpoint,
     create_project,
@@ -36,6 +35,8 @@ if TYPE_CHECKING:
 
     from starlette.requests import Request
     from starlette.responses import Response
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 _PERMS = frozenset(
     {
@@ -63,8 +64,8 @@ class _InjectAuthMiddleware(BaseHTTPMiddleware):
 
 
 @pytest.fixture
-def storage(tmp_path: Path) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path: Path, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 @pytest.fixture

@@ -9,7 +9,6 @@ from starlette.testclient import TestClient
 
 from turnstone.channels._http import create_channel_app
 from turnstone.core.auth import JWT_AUD_CHANNEL, create_jwt
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 _JWT_SECRET = "a" * 32
 
@@ -30,8 +29,8 @@ def _auth_headers() -> dict[str, str]:
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 @pytest.fixture

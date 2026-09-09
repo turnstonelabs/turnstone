@@ -683,20 +683,20 @@ def _console_coord_client(tmp_path: Any, cs: Any) -> Any:
     from turnstone.core.storage._sqlite import SQLiteBackend
 
     _load_static()
-    storage = SQLiteBackend(str(tmp_path / "coord-gate.db"))
-    app = create_app(collector=MagicMock(spec=ClusterCollector), jwt_secret=_CONSOLE_JWT_SECRET)
-    mgr = _build_mgr(storage)
-    app.state.coord_mgr = mgr
-    app.state.coord_adapter = mgr._adapter
-    app.state.coord_registry = _fake_registry()
-    app.state.coord_registry_error = ""
-    app.state.config_store = cs
-    app.state.auth_storage = storage
-    client = TestClient(app, raise_server_exceptions=False, headers=_operator_headers())
-    try:
-        yield client
-    finally:
-        client.close()
+    with contextlib.closing(SQLiteBackend(str(tmp_path / "coord-gate.db"))) as storage:
+        app = create_app(collector=MagicMock(spec=ClusterCollector), jwt_secret=_CONSOLE_JWT_SECRET)
+        mgr = _build_mgr(storage)
+        app.state.coord_mgr = mgr
+        app.state.coord_adapter = mgr._adapter
+        app.state.coord_registry = _fake_registry()
+        app.state.coord_registry_error = ""
+        app.state.config_store = cs
+        app.state.auth_storage = storage
+        client = TestClient(app, raise_server_exceptions=False, headers=_operator_headers())
+        try:
+            yield client
+        finally:
+            client.close()
 
 
 class TestCoordMountWiring:

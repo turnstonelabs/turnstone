@@ -19,7 +19,7 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -32,7 +32,9 @@ from turnstone.core.mcp_oauth import (
     get_user_access_token,
     get_user_access_token_classified,
 )
-from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 # Generous CI ceiling — cancel/drain is sub-millisecond on a healthy loop.
 _CANCEL_WAIT_S = 5.0
@@ -143,8 +145,8 @@ def _seed_token(
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 def _good_as_metadata_doc() -> dict[str, Any]:

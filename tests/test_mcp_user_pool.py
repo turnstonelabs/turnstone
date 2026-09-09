@@ -34,10 +34,11 @@ from tests.conftest import (
 )
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState
 from turnstone.core.mcp_crypto import MCPTokenStore
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -45,9 +46,9 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
     """A fresh SQLite backend per test (not the shared singleton)."""
-    return SQLiteBackend(str(tmp_path / "test.db"))
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 def _seed_oauth_server(

@@ -28,7 +28,7 @@ import json
 import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -41,7 +41,9 @@ from turnstone.core.mcp_client import (
     _make_capturing_http_factory,
 )
 from turnstone.core.mcp_crypto import MCPTokenStore
-from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers (mirror conventions in test_mcp_user_pool.py)
@@ -49,8 +51,8 @@ from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 def _seed_oauth_server(

@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
 from turnstone.api.console_schemas import (
     ListOrgsResponse,
     ListRolesResponse,
@@ -42,7 +44,6 @@ from turnstone.console.server import (
     admin_update_role,
 )
 from turnstone.core.auth import AuthResult
-from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.sdk.console import AsyncTurnstoneConsole
 
 # ---------------------------------------------------------------------------
@@ -113,8 +114,8 @@ def _make_app() -> Starlette:
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 @pytest.fixture

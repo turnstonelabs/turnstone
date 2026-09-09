@@ -8,7 +8,6 @@ import pytest
 
 from turnstone.core.config_store import ConfigStore
 from turnstone.core.settings_registry import SETTINGS
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -16,8 +15,8 @@ from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 @pytest.fixture

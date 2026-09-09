@@ -261,7 +261,9 @@ def test_publish_skips_when_registry_missing():
 # ---------------------------------------------------------------------------
 
 
-def test_model_reload_endpoint_rewrites_models_metadata(monkeypatch, tmp_path):
+def test_model_reload_endpoint_rewrites_models_metadata(
+    monkeypatch, tmp_path, sqlite_backend_factory
+):
     """A successful ``internal_model_reload`` must refresh
     ``node_metadata.models`` so a coordinator sees the new alias on
     its next ``list_nodes`` without waiting up to 30s for the
@@ -272,10 +274,9 @@ def test_model_reload_endpoint_rewrites_models_metadata(monkeypatch, tmp_path):
     loader to return a registry with a different alias set so the
     publish-cache invalidation is exercised end-to-end.
     """
-    from turnstone.core.storage._sqlite import SQLiteBackend
     from turnstone.server import internal_model_reload
 
-    storage = SQLiteBackend(str(tmp_path / "reload.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "reload.db"))
 
     # Old registry — single alias "a".
     old_reg = _registry(("a", "http://x"))
@@ -372,13 +373,14 @@ def test_model_reload_cap_only_change_resizes_the_stable_gate(monkeypatch):
     assert old_reg.generation == 1
 
 
-def test_model_reload_refuses_dynamic_auth_without_key(monkeypatch, tmp_path, caplog):
+def test_model_reload_refuses_dynamic_auth_without_key(
+    monkeypatch, tmp_path, caplog, sqlite_backend_factory
+):
     """A keyless node cannot acquire a dynamic alias via model-reload: 503,
     a deployment fault, not the 422 bad-arguments exit."""
-    from turnstone.core.storage._sqlite import SQLiteBackend
     from turnstone.server import internal_model_reload
 
-    storage = SQLiteBackend(str(tmp_path / "reload.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "reload.db"))
 
     old_reg = _registry(("a", "http://x"))
     new_reg = ModelRegistry(
@@ -422,14 +424,13 @@ def test_model_reload_refuses_dynamic_auth_without_key(monkeypatch, tmp_path, ca
     assert any("model_auth_key_missing" in r.message for r in caplog.records)
 
 
-def test_model_reload_maps_auth_config_error_to_422(monkeypatch, tmp_path):
+def test_model_reload_maps_auth_config_error_to_422(monkeypatch, tmp_path, sqlite_backend_factory):
     """A row whose auth fields the loader rejects exits as the structured
     422 naming the problem, never a bare 500."""
     from turnstone.core.model_registry import ModelAuthConfigError
-    from turnstone.core.storage._sqlite import SQLiteBackend
     from turnstone.server import internal_model_reload
 
-    storage = SQLiteBackend(str(tmp_path / "reload.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "reload.db"))
     old_reg = _registry(("a", "http://x"))
     app_state = SimpleNamespace(
         registry=old_reg,
@@ -452,13 +453,14 @@ def test_model_reload_maps_auth_config_error_to_422(monkeypatch, tmp_path):
     assert old_reg.has_alias("a")
 
 
-def test_model_reload_maps_concurrency_config_error_to_422(monkeypatch, tmp_path):
+def test_model_reload_maps_concurrency_config_error_to_422(
+    monkeypatch, tmp_path, sqlite_backend_factory
+):
     """A corrupt persisted cap uses the same structured config-error exit."""
     from turnstone.core.model_registry import ModelConcurrencyConfigError
-    from turnstone.core.storage._sqlite import SQLiteBackend
     from turnstone.server import internal_model_reload
 
-    storage = SQLiteBackend(str(tmp_path / "reload.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "reload.db"))
     old_reg = _registry(("a", "http://x"))
     app_state = SimpleNamespace(
         registry=old_reg,
@@ -570,14 +572,15 @@ def test_heartbeat_write_awaits_before_shutdown_delete():
     )
 
 
-def test_model_reload_tolerates_the_last_definition_going_away(monkeypatch, tmp_path):
+def test_model_reload_tolerates_the_last_definition_going_away(
+    monkeypatch, tmp_path, sqlite_backend_factory
+):
     """Deleting the last enabled definition and syncing must reload to an
     empty registry, not 500 and leave the stale one serving. The endpoint
     passes ``allow_empty=True`` — the same posture as boot."""
-    from turnstone.core.storage._sqlite import SQLiteBackend
     from turnstone.server import internal_model_reload
 
-    storage = SQLiteBackend(str(tmp_path / "reload-empty.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "reload-empty.db"))
     old_reg = _registry(("a", "http://x"))
     seen: dict[str, object] = {}
 
@@ -604,14 +607,15 @@ def test_model_reload_tolerates_the_last_definition_going_away(monkeypatch, tmp_
     assert old_reg.list_aliases() == []
 
 
-def test_model_reload_keeps_running_registry_when_the_load_fails(monkeypatch, tmp_path):
+def test_model_reload_keeps_running_registry_when_the_load_fails(
+    monkeypatch, tmp_path, sqlite_backend_factory
+):
     """A storage read failure during a hot-reload (strict load) must answer
     503 and leave the running registry untouched — never swap in an empty
     or config-only registry over live aliases."""
-    from turnstone.core.storage._sqlite import SQLiteBackend
     from turnstone.server import internal_model_reload
 
-    storage = SQLiteBackend(str(tmp_path / "reload-fail.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "reload-fail.db"))
     old_reg = _registry(("a", "http://x"))
 
     def failing_loader(**_kw):

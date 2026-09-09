@@ -20,7 +20,7 @@ Mirrors the TestClient wiring in test_admin_model_registry_refresh.py.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,12 +36,14 @@ from turnstone.console.server import (
 )
 from turnstone.core.model_registry import ModelConfig, ModelRegistry
 from turnstone.core.rerank_calibrate import CalibrationResult
-from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "models.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "models.db"))
 
 
 def _seed_reranker(

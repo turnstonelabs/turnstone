@@ -65,14 +65,15 @@ class TestResetStorage:
 class TestConnUnavailableLogging:
     """Test that _conn() deduplicates DB unavailable/restored logging."""
 
-    def _make_backend(self, tmp_path):
+    def _make_backend(self, tmp_path, sqlite_backend_factory):
         """Create a minimal SQLite backend for testing _conn()."""
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        return SQLiteBackend(str(tmp_path / "test.db"), create_tables=True)
+        return sqlite_backend_factory(str(tmp_path / "test.db"), create_tables=True)
 
-    def test_logs_unavailable_once(self, tmp_path, caplog: pytest.LogCaptureFixture) -> None:
-        backend = self._make_backend(tmp_path)
+    def test_logs_unavailable_once(
+        self, tmp_path, caplog: pytest.LogCaptureFixture, sqlite_backend_factory
+    ) -> None:
+        backend = self._make_backend(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
         with patch.object(backend, "_engine") as mock_engine:
             mock_engine.connect.side_effect = sa.exc.OperationalError(
                 "conn", {}, Exception("refused")
@@ -83,11 +84,13 @@ class TestConnUnavailableLogging:
         unavailable_msgs = [r for r in caplog.records if "database.unavailable" in r.message]
         assert len(unavailable_msgs) == 1
 
-    def test_logs_restored_on_recovery(self, tmp_path, caplog: pytest.LogCaptureFixture) -> None:
+    def test_logs_restored_on_recovery(
+        self, tmp_path, caplog: pytest.LogCaptureFixture, sqlite_backend_factory
+    ) -> None:
         import logging
 
         caplog.set_level(logging.INFO)
-        backend = self._make_backend(tmp_path)
+        backend = self._make_backend(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
         # Simulate outage
         with patch.object(backend, "_engine") as mock_engine:
             mock_engine.connect.side_effect = sa.exc.OperationalError(

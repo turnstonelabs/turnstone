@@ -15,7 +15,7 @@ MagicMock-backed stubs.  All four tests run in < 2 s total.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import httpx
@@ -49,7 +49,9 @@ from turnstone.core.session_routes import (
     make_detail_handler,
     make_list_handler,
 )
-from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 # Per-kind config the lifted handler factories capture by closure.
 _coord_endpoint_config = SessionEndpointConfig(
@@ -188,9 +190,9 @@ def _make_client(
 _COORD_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}
 
 
-def test_create_list_detail_lifecycle(tmp_path):
+def test_create_list_detail_lifecycle(tmp_path, sqlite_backend_factory):
     """POST /new → appears in GET / → GET /{ws_id} returns correct detail."""
-    storage = SQLiteBackend(str(tmp_path / "coord.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "coord.db"))
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
@@ -252,10 +254,10 @@ def test_create_list_detail_lifecycle(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_coordinator_client_spawn_close_delete(tmp_path):
+def test_coordinator_client_spawn_close_delete(tmp_path, sqlite_backend_factory):
     """CoordinatorClient.spawn / close_workstream / delete produce correct
     upstream HTTP requests to the mocked server node."""
-    storage = SQLiteBackend(str(tmp_path / "client.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "client.db"))
     # Register the coordinator + the soon-to-be-spawned child so the
     # client-side tenant guard on close/delete passes.  In production
     # the spawn route adds the child row before the model can call
@@ -342,9 +344,9 @@ def test_coordinator_client_spawn_close_delete(tmp_path):
 
 
 @pytest.fixture()
-def seeded_storage(tmp_path):
+def seeded_storage(tmp_path, sqlite_backend_factory):
     """SQLiteBackend with a coordinator + 2 interactive children + extras."""
-    st = SQLiteBackend(str(tmp_path / "seed.db"))
+    st = sqlite_backend_factory(str(tmp_path / "seed.db"))
     # Parent coordinator.
     st.register_workstream("coord-root", kind="coordinator", user_id="user-1")
     # Two interactive children — one idle, one running.  Children inherit
@@ -434,7 +436,7 @@ def test_list_children_skill_filter(seeded_storage):
 # ---------------------------------------------------------------------------
 
 
-def test_lazy_rehydration_on_detail_get(tmp_path):
+def test_lazy_rehydration_on_detail_get(tmp_path, sqlite_backend_factory):
     """A persisted coordinator row rehydrates into the manager on GET /{ws_id}.
 
     Sequence:
@@ -444,7 +446,7 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
     4. Manager now tracks the rehydrated session.
     5. The response body carries the correct kind / user_id metadata.
     """
-    storage = SQLiteBackend(str(tmp_path / "rehydrate.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "rehydrate.db"))
 
     # Seed the row directly — the manager has never seen it.
     storage.register_workstream(

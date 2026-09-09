@@ -28,7 +28,6 @@ from turnstone.console.server import (
     admin_update_schedule,
 )
 from turnstone.core.auth import AuthResult
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 class _InjectAuthMiddleware(BaseHTTPMiddleware):
@@ -43,9 +42,9 @@ class _InjectAuthMiddleware(BaseHTTPMiddleware):
 
 
 @pytest.fixture
-def storage(tmp_path):
+def storage(tmp_path, sqlite_backend_factory):
     """Fresh SQLite backend for each test."""
-    return SQLiteBackend(str(tmp_path / "test.db"))
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 @pytest.fixture

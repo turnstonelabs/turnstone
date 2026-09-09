@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import threading
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -46,7 +46,9 @@ from turnstone.core.model_registry import (
     ModelConfig,
     ModelRegistry,
 )
-from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 def _bootstrap_app(**overrides: Any) -> Any:
@@ -107,8 +109,8 @@ def test_console_lifespan_shuts_coord_registry_after_adapter() -> None:
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "models.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "models.db"))
 
 
 def _seed_model_def(

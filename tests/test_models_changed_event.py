@@ -18,7 +18,7 @@ These tests pin two contracts:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -37,12 +37,14 @@ from turnstone.console.server import (
     admin_update_model_definition,
     admin_update_setting,
 )
-from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "models_changed.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "models_changed.db"))
 
 
 def _seed(storage: SQLiteBackend, *, definition_id: str, alias: str) -> None:

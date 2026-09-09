@@ -32,12 +32,11 @@ from turnstone.console.server import (
     coordinator_trust,
 )
 from turnstone.core.auth import AuthResult
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "coord.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "coord.db"))
 
 
 def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> TestClient:

@@ -23,12 +23,11 @@ from tests._coord_test_helpers import (
     _seed_children,
 )
 from turnstone.console.server import coordinator_close_all_children
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "coord.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "coord.db"))
 
 
 _COORD_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}

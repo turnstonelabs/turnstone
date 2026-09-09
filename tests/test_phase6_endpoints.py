@@ -13,6 +13,8 @@ upstream node fetches.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -29,12 +31,14 @@ from turnstone.console.server import (
     cluster_ws_live_bulk,
     coordinator_metrics,
 )
-from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "phase6.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "phase6.db"))
 
 
 def _make_client(storage, *, coord_mgr=None) -> TestClient:

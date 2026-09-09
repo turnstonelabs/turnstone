@@ -3288,12 +3288,11 @@ class TestTitleRetry:
 class TestLiveConfigUpdate:
     """ConfigStore-backed sessions pick up settings changes at point-of-use."""
 
-    def test_memory_config_reads_from_config_store(self, tmp_db):
+    def test_memory_config_reads_from_config_store(self, tmp_db, sqlite_backend_factory):
         """_mem_cfg returns live values from ConfigStore when present."""
         from turnstone.core.config_store import ConfigStore
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        storage = sqlite_backend_factory(str(tmp_db), create_tables=True)
         cs = ConfigStore(storage)
         session = _make_session(config_store=cs)
 
@@ -3307,13 +3306,12 @@ class TestLiveConfigUpdate:
         cs.set("memory.model_index_over_budget_notice", True, changed_by="test")
         assert session._mem_cfg.model_index_over_budget_notice is True
 
-    def test_judge_config_reads_from_config_store(self, tmp_db):
+    def test_judge_config_reads_from_config_store(self, tmp_db, sqlite_backend_factory):
         """_judge_cfg returns live behavioral flags from ConfigStore."""
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.judge import JudgeConfig
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        storage = sqlite_backend_factory(str(tmp_db), create_tables=True)
         cs = ConfigStore(storage)
         session = _make_session(
             judge_config=JudgeConfig(),
@@ -3370,13 +3368,12 @@ class TestLiveConfigUpdate:
         ) == (True, 0.4, 5)
         assert version == 7
 
-    def test_judge_client_config_stays_frozen(self, tmp_db):
+    def test_judge_client_config_stays_frozen(self, tmp_db, sqlite_backend_factory):
         """LLM client fields (model, provider) are frozen from creation time."""
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.judge import JudgeConfig
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        storage = sqlite_backend_factory(str(tmp_db), create_tables=True)
         cs = ConfigStore(storage)
         session = _make_session(
             judge_config=JudgeConfig(model="original-model"),
@@ -3387,13 +3384,12 @@ class TestLiveConfigUpdate:
         cs.set("judge.model", "new-model", changed_by="test")
         assert session._judge_cfg.model == "original-model"
 
-    def test_judge_disable_after_init_stops_future_use(self, tmp_db):
+    def test_judge_disable_after_init_stops_future_use(self, tmp_db, sqlite_backend_factory):
         """Disabling judge.enabled after IntentJudge is created returns None."""
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.judge import JudgeConfig
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        storage = sqlite_backend_factory(str(tmp_db), create_tables=True)
         cs = ConfigStore(storage)
         session = _make_session(
             judge_config=JudgeConfig(),

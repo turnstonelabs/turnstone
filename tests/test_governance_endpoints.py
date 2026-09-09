@@ -37,7 +37,6 @@ from turnstone.console.server import (
     admin_usage,
 )
 from turnstone.core.auth import AuthResult
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Auth bypass middleware — injects a full-access AuthResult on every request.
@@ -80,9 +79,9 @@ class _InjectAuthMiddleware(BaseHTTPMiddleware):
 
 
 @pytest.fixture
-def storage(tmp_path):
+def storage(tmp_path, sqlite_backend_factory):
     """Fresh SQLite backend for each test, seeded with test users."""
-    backend = SQLiteBackend(str(tmp_path / "test.db"))
+    backend = sqlite_backend_factory(str(tmp_path / "test.db"))
     # Seed users required by role assignment tests
     backend.create_user("test-admin", "testadmin", "Test Admin", "hash")
     backend.create_user("user-1", "user1", "User One", "hash")

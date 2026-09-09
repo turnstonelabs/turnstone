@@ -32,11 +32,12 @@ from turnstone.core.mcp_oauth import (
     handle_mcp_oauth_callback,
 )
 from turnstone.core.oidc import OIDCConfig
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +168,8 @@ def _public_addr_patch():
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    backend = SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    backend = sqlite_backend_factory(str(tmp_path / "test.db"))
     backend.create_user("user-1", "user1", "User One", "hash")
     return backend
 

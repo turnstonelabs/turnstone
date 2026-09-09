@@ -33,11 +33,12 @@ from turnstone.core.auth import (
     handle_oidc_callback,
 )
 from turnstone.core.oidc import OIDCConfig, OIDCError, OIDCKeyNotFoundError
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Thin handler wrappers — match the pattern used in server.py / console
@@ -81,9 +82,9 @@ class _InjectAuthMiddleware(BaseHTTPMiddleware):
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
     """Fresh SQLite backend with a seeded admin user."""
-    backend = SQLiteBackend(str(tmp_path / "test.db"))
+    backend = sqlite_backend_factory(str(tmp_path / "test.db"))
     backend.create_user("test-admin", "testadmin", "Test Admin", "hash")
     for role, permissions in (("admin", "read,write,approve"), ("viewer", "read")):
         backend.create_role("builtin-" + role, role, role, permissions, True)
@@ -222,8 +223,8 @@ class TestOIDCAuthorize:
         resp = client.get("/v1/api/auth/oidc/authorize")
         assert resp.status_code == 503
 
-    def test_no_users_returns_403(self, tmp_path: Any) -> None:
-        backend = SQLiteBackend(str(tmp_path / "empty.db"))
+    def test_no_users_returns_403(self, tmp_path: Any, sqlite_backend_factory) -> None:
+        backend = sqlite_backend_factory(str(tmp_path / "empty.db"))
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/authorize", _oidc_authorize)])]
         )
@@ -510,10 +511,11 @@ class TestOIDCCallback:
         mock_validate: Any,
         mock_provision: Any,
         tmp_path: Any,
+        sqlite_backend_factory,
     ) -> None:
         """When OIDC succeeds but no users exist (edge case), redirect with setup error."""
         # Use a fresh empty-user storage
-        backend = SQLiteBackend(str(tmp_path / "empty.db"))
+        backend = sqlite_backend_factory(str(tmp_path / "empty.db"))
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/callback", _oidc_callback)])]
         )

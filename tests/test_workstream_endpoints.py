@@ -43,7 +43,6 @@ from turnstone.core.session_routes import (
     make_rewind_handler,
     make_set_title_handler,
 )
-from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.workstream import Workstream, WorkstreamKind
 from turnstone.server import (
     _interactive_tenant_check,
@@ -74,8 +73,8 @@ class _InjectAuthMiddleware(BaseHTTPMiddleware):
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 @pytest.fixture

@@ -28,7 +28,6 @@ from turnstone.console.server import (
     admin_update_schedule,
 )
 from turnstone.core.auth import AuthResult
-from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.trajectory import final_assistant_text, turns_from_dicts
 from turnstone.server import (
     _deliver_notification,
@@ -53,8 +52,8 @@ class _InjectAuthMiddleware(BaseHTTPMiddleware):
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 @pytest.fixture

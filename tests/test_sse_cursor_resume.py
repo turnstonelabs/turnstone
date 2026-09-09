@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import collections
 import os
-import tempfile
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import pytest
 
 os.environ.setdefault("TURNSTONE_JWT_SECRET", "x" * 32)
 
@@ -29,7 +30,9 @@ from tests._session_helpers import make_session
 from turnstone.core.session_routes import _resume_cursor_and_trim
 from turnstone.core.session_ui_base import SessionUIBase
 from turnstone.core.storage import get_storage
-from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 class _ConcreteUI(SessionUIBase):
@@ -266,20 +269,21 @@ def test_system_turn_bool_hook_return_falls_back_to_counter(
 # ---------------------------------------------------------------------------
 
 
-def _backend() -> SQLiteBackend:
-    return SQLiteBackend(os.path.join(tempfile.mkdtemp(), "t.db"))
+@pytest.fixture
+def _backend(tmp_path: Any, sqlite_backend_factory: Any) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "t.db"))
 
 
-def test_event_id_round_trip_and_null() -> None:
-    s = _backend()
+def test_event_id_round_trip_and_null(_backend: SQLiteBackend) -> None:
+    s = _backend
     s.save_message("ws1", "assistant", "hi", tool_calls='[{"id":"A"}]', event_id=46)
     s.save_message("ws1", "user", "next")  # no event_id → NULL
     msgs = s.load_messages("ws1", repair=False)
     assert [m.get("_event_id") for m in msgs] == [46, None]
 
 
-def test_get_max_event_id() -> None:
-    s = _backend()
+def test_get_max_event_id(_backend: SQLiteBackend) -> None:
+    s = _backend
     assert s.get_max_event_id("ws1") is None  # no rows
     s.save_message("ws1", "user", "a", event_id=5)
     s.save_message("ws1", "assistant", "b", event_id=9)

@@ -23,11 +23,12 @@ from turnstone.core.mcp_oauth import (
     handle_mcp_oauth_clear_pending,
     handle_mcp_oauth_list_pending,
 )
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 class _InjectAuthMiddleware(BaseHTTPMiddleware):
@@ -78,8 +79,8 @@ def _build_app(storage: SQLiteBackend, *, user_id: str = "user-1") -> Starlette:
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    backend = SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    backend = sqlite_backend_factory(str(tmp_path / "test.db"))
     backend.create_user("user-1", "user1", "User One", "hash")
     backend.create_user("user-2", "user2", "User Two", "hash")
     return backend

@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
 from turnstone.console.server import (
     _get_registry_url,
     admin_registry_install,
@@ -33,7 +35,6 @@ from turnstone.core.mcp_registry import (
     RegistryServer,
     RegistryServerMeta,
 )
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Auth middleware
@@ -86,8 +87,8 @@ _ROUTES = [
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 @pytest.fixture

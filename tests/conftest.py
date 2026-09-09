@@ -145,6 +145,7 @@ if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager, StaticServerState
     from turnstone.core.mcp_crypto import MCPTokenCipher
     from turnstone.core.oidc import OIDCConfig
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 # A background daemon (e.g. title generation) can log into pytest's per-test
@@ -432,6 +433,23 @@ def sqlite_migrated_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture
+def sqlite_backend_factory(request: pytest.FixtureRequest) -> Callable[..., SQLiteBackend]:
+    """Create explicitly SQLite-backed stores and close each after the test.
+
+    Register cleanup before callers seed data or build dependent fixtures so
+    failures during their setup still dispose every pool they opened.
+    """
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    def create(path: str, *, create_tables: bool = True) -> SQLiteBackend:
+        backend = SQLiteBackend(path, create_tables=create_tables)
+        request.addfinalizer(backend.close)
+        return backend
+
+    return create
+
+
+@pytest.fixture
 def tmp_db(tmp_path, sqlite_schema_template):
     """Provide a temporary SQLite storage backend (singleton registry)."""
     from turnstone.core.storage import init_storage, reset_storage
@@ -440,8 +458,9 @@ def tmp_db(tmp_path, sqlite_schema_template):
     reset_storage()
     if not os.path.exists(db_path):
         shutil.copyfile(sqlite_schema_template, db_path)
-    init_storage("sqlite", path=db_path, run_migrations=False)
-    yield db_path
+    # Own the instance even when a test replaces the registry with a mock.
+    with contextlib.closing(init_storage("sqlite", path=db_path, run_migrations=False)):
+        yield db_path
     reset_storage()
 
 
@@ -481,13 +500,15 @@ def storage_backend(request, tmp_path):
         except Exception:
             pass  # best-effort cleanup; reset_storage disposes engine
         finally:
+            backend.close()
             reset_storage()
     else:
         db_path = str(tmp_path / "test.db")
         if not os.path.exists(db_path):
             shutil.copyfile(request.getfixturevalue("sqlite_schema_template"), db_path)
         backend = init_storage("sqlite", path=db_path, run_migrations=False)
-        yield backend
+        with contextlib.closing(backend):
+            yield backend
         reset_storage()
 
 

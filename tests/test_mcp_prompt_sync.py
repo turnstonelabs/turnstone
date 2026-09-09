@@ -225,11 +225,10 @@ class TestReadonlyAPIGuards:
     """Test that the console server API guards reject edits to readonly templates."""
 
     @pytest.fixture()
-    def db(self, tmp_path):
+    def db(self, tmp_path, sqlite_backend_factory):
         """Create a fresh SQLite backend for each test."""
-        from turnstone.core.storage._sqlite import SQLiteBackend
 
-        return SQLiteBackend(str(tmp_path / "test.db"))
+        return sqlite_backend_factory(str(tmp_path / "test.db"))
 
     def test_readonly_guard_update(self, db) -> None:
         """Readonly templates cannot be updated via storage guard logic."""

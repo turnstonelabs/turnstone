@@ -23,7 +23,7 @@ placeholder stays correct as the precedence rules evolve.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from starlette.applications import Starlette
@@ -33,12 +33,14 @@ from starlette.testclient import TestClient
 
 from tests._coord_test_helpers import _AuthMiddleware, _FakeConfigStore
 from turnstone.console.server import list_available_models
-from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "available_models.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "available_models.db"))
 
 
 def _seed_model(

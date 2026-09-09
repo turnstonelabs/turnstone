@@ -24,7 +24,6 @@ if TYPE_CHECKING:
 from turnstone.core.auth import AuthResult
 from turnstone.core.session import ChatSession
 from turnstone.core.skill_search import SkillSearchManager
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -164,9 +163,9 @@ def _create_template(db, template_id, name, content, **kwargs):
 
 
 @pytest.fixture()
-def db(tmp_path):
+def db(tmp_path, sqlite_backend_factory):
     """Create a fresh SQLite backend for each test."""
-    return SQLiteBackend(str(tmp_path / "test.db"))
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 # ---------------------------------------------------------------------------
@@ -717,8 +716,8 @@ class _InjectAuthMiddleware(BaseHTTPMiddleware):
 
 
 @pytest.fixture()
-def api_storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "api_test.db"))
+def api_storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "api_test.db"))
 
 
 @pytest.fixture()
@@ -1737,8 +1736,8 @@ class TestSkillMigrationBehaviors:
 
 
 @pytest.fixture()
-def full_api_storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "full_api_test.db"))
+def full_api_storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "full_api_test.db"))
 
 
 @pytest.fixture()
@@ -2029,7 +2028,7 @@ class TestSkillConfigAppliedToWorkstream:
     """
 
     @pytest.fixture()
-    def _ws_app(self, tmp_path):
+    def _ws_app(self, tmp_path, sqlite_backend_factory):
         """Build a minimal Starlette app with the real ``create_workstream``
         handler, a real ``SessionManager``, and a temp SQLite storage
         backend.  Returns ``(TestClient, SessionManager, storage)``.
@@ -2055,7 +2054,7 @@ class TestSkillConfigAppliedToWorkstream:
             _interactive_tenant_check,
         )
 
-        storage = SQLiteBackend(str(tmp_path / "ws_test.db"))
+        storage = sqlite_backend_factory(str(tmp_path / "ws_test.db"))
 
         # Inject the test storage as the global singleton so that
         # get_storage() / get_skill_by_name() resolve against it.

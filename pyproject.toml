@@ -122,6 +122,12 @@ markers = [
     "e2e_recovery: opt-in end-to-end SSE recovery harness (real server + real SSE consumers, scripted provider — NOT live, no LLM backend needed); tens of seconds each. CI lanes run ``-m 'not live and not e2e_recovery'``; select with ``-m e2e_recovery``.",
 ]
 filterwarnings = [
+    # Catch SQLite (Python 3.13+) and psycopg connections left open at collection.
+    # Finalizer warnings become unraisable exceptions when promoted to errors;
+    # fail on both so leaked database pools cannot quietly return to the suite.
+    "error:unclosed database in:ResourceWarning",
+    "error:.*was deleted while still open:ResourceWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
     # The MCP v1 FastMCP integration fixture rebuilds its incomplete generic
     # Settings model before construction. Keep the new pydantic-settings 2.15
     # diagnostic fatal so removing that compatibility step cannot regress

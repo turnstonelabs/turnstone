@@ -65,18 +65,22 @@ def _result(*, separated: bool, threshold: float | None) -> CalibrationResult:
 
 def _seed_reranker(db_path: str, *, base_url: str = "http://localhost:9999/rerank") -> str:
     """Create a reranker model definition; return its db_path-backed alias."""
+    reset_storage()
     storage = init_storage("sqlite", path=db_path)
-    storage.create_model_definition(
-        definition_id="def-reranker",
-        alias=_ALIAS,
-        model="bge-reranker",
-        provider="openai-compatible",
-        base_url=base_url,
-        api_key="",
-        context_window=0,
-        capabilities=json.dumps({"supports_rerank": True}),
-    )
-    return _ALIAS
+    try:
+        storage.create_model_definition(
+            definition_id="def-reranker",
+            alias=_ALIAS,
+            model="bge-reranker",
+            provider="openai-compatible",
+            base_url=base_url,
+            api_key="",
+            context_window=0,
+            capabilities=json.dumps({"supports_rerank": True}),
+        )
+        return _ALIAS
+    finally:
+        reset_storage()
 
 
 def _stub_calibrate(monkeypatch, result: CalibrationResult) -> None:
@@ -87,10 +91,14 @@ def _stub_calibrate(monkeypatch, result: CalibrationResult) -> None:
 
 
 def _read_caps(db_path: str) -> dict:
+    reset_storage()
     storage = init_storage("sqlite", path=db_path)
-    row = storage.get_model_definition_by_alias(_ALIAS)
-    assert row is not None
-    return json.loads(row["capabilities"] or "{}")
+    try:
+        row = storage.get_model_definition_by_alias(_ALIAS)
+        assert row is not None
+        return json.loads(row["capabilities"] or "{}")
+    finally:
+        reset_storage()
 
 
 def test_apply_writes_model_caps(tmp_path, monkeypatch, capsys):
@@ -136,6 +144,7 @@ def test_no_separation_persists_marker_on_apply(tmp_path, monkeypatch, capsys):
 def test_unknown_model_errors(tmp_path, monkeypatch):
     db = str(tmp_path / "t.db")
     init_storage("sqlite", path=db)  # schema only, no model definition
+    reset_storage()
     with pytest.raises(SystemExit) as ei:
         _cmd_rerank_calibrate(_args(db, apply=False, model="nope"))
     assert ei.value.code == 1

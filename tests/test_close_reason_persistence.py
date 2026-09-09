@@ -17,7 +17,6 @@ import turnstone.server as srv_mod
 from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
 from turnstone.core.metrics import MetricsCollector
 from turnstone.core.session_manager import CloseOutcome
-from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.workstream import WorkstreamState
 
 _JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
@@ -86,8 +85,8 @@ def _make_app(storage: Any) -> TestClient:
 
 
 @pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "close.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "close.db"))
 
 
 def test_close_with_reason_persists_to_workstream_config(storage):

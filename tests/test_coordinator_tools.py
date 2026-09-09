@@ -17,7 +17,6 @@ import pytest
 
 from turnstone.core.metacognition import TASK_NOTE_MAX, TASK_TITLE_MAX
 from turnstone.core.session import ChatSession
-from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.prompts import ClientType
 
 
@@ -1846,11 +1845,13 @@ def test_notify_prepare_on_coord_session_dispatches_cleanly(coord_session):
     assert item["needs_approval"] is False
 
 
-def test_notify_exec_on_coord_session_sends_via_channel_gateway(coord_session, tmp_path):
+def test_notify_exec_on_coord_session_sends_via_channel_gateway(
+    coord_session, tmp_path, sqlite_backend_factory
+):
     """End-to-end: coord-session notify reaches the channel gateway path
     with the same payload shape an interactive session would emit."""
     sess, _coord, _ui = coord_session
-    storage = SQLiteBackend(str(tmp_path / "test.db"))
+    storage = sqlite_backend_factory(str(tmp_path / "test.db"))
     storage.register_service("channel", "ch-1", "http://localhost:8091")
 
     item = sess._prepare_tool(
@@ -2090,7 +2091,7 @@ def test_prepare_rejects_over_cap_fields_before_approval(coord_session):
         assert "execute" not in item, "an unlandable call must not reach the approval surface"
 
 
-def _write_path_client(tmp_path, name="oracle.db"):
+def _write_path_client(tmp_path, name="oracle.db", *, sqlite_backend_factory):
     """A real ``CoordinatorClient`` over a real SQLite backend.
 
     The write path is the authoritative half of every prepare-versus-write
@@ -2102,7 +2103,7 @@ def _write_path_client(tmp_path, name="oracle.db"):
     from turnstone.console.coordinator_client import CoordinatorClient
     from turnstone.core.child_event_bus import ChildEventBus
 
-    storage = SQLiteBackend(str(tmp_path / name))
+    storage = sqlite_backend_factory(str(tmp_path / name))
     storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     return CoordinatorClient(
         console_base_url="http://x",
@@ -2115,7 +2116,9 @@ def _write_path_client(tmp_path, name="oracle.db"):
     )
 
 
-def test_prepare_and_write_path_agree_on_renderability_and_length(coord_session, tmp_path):
+def test_prepare_and_write_path_agree_on_renderability_and_length(
+    coord_session, tmp_path, sqlite_backend_factory
+):
     """ONE ORACLE, for both admission rules.  ``_prepare_tasks`` carries
     an early copy of the unrenderable reject AND of the length caps;
     ``tasks_add``/``tasks_update`` carry the authoritative ones.  If the
@@ -2126,7 +2129,7 @@ def test_prepare_and_write_path_agree_on_renderability_and_length(coord_session,
     checked, because switching ``add`` alone just relocates the
     divergence to ``update``."""
     sess, _coord, _ui = coord_session
-    client = _write_path_client(tmp_path)
+    client = _write_path_client(tmp_path, sqlite_backend_factory=sqlite_backend_factory)
     seed = client.tasks_add("coord-1", title="seed")
     assert "error" not in seed
 
@@ -2176,14 +2179,18 @@ def test_prepare_and_write_path_agree_on_renderability_and_length(coord_session,
             assert verdicts == [fits] * 4, (field, len(value), fits)
 
 
-def test_too_long_wins_over_unrenderable_at_both_layers(coord_session, tmp_path):
+def test_too_long_wins_over_unrenderable_at_both_layers(
+    coord_session, tmp_path, sqlite_backend_factory
+):
     """MASKING ORDER.  Length is measured before renderability at every
     gate, so a long run of zero-widths hears "too long" rather than
     "unrenderable".  The write path documents that order; the prepare
     copy has to keep it, or one value draws two different hints depending
     on which layer the model happens to reach first."""
     sess, _coord, _ui = coord_session
-    client = _write_path_client(tmp_path, name="masking.db")
+    client = _write_path_client(
+        tmp_path, name="masking.db", sqlite_backend_factory=sqlite_backend_factory
+    )
     seed = client.tasks_add("coord-1", title="seed")
     assert "error" not in seed
 

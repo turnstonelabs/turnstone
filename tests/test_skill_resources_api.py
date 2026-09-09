@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
 from turnstone.console.server import (
     admin_create_skill_resource,
     admin_delete_skill_resource,
@@ -25,7 +27,6 @@ from turnstone.console.server import (
     admin_list_skills,
 )
 from turnstone.core.auth import AuthResult
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
 # Auth middleware
@@ -79,8 +80,8 @@ _ROUTES = [
 
 
 @pytest.fixture()
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path, sqlite_backend_factory):
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 @pytest.fixture()

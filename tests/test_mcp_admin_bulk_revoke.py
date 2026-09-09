@@ -28,11 +28,12 @@ from starlette.testclient import TestClient
 
 from turnstone.console.server import admin_mcp_bulk_revoke
 from turnstone.core.auth import AuthResult
-from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
+
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 class _InjectAdminMcp(BaseHTTPMiddleware):
@@ -79,8 +80,8 @@ def _build_app(storage: SQLiteBackend, *, with_admin_mcp: bool = True) -> Starle
 
 
 @pytest.fixture
-def storage(tmp_path: Any) -> SQLiteBackend:
-    return SQLiteBackend(str(tmp_path / "test.db"))
+def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
+    return sqlite_backend_factory(str(tmp_path / "test.db"))
 
 
 def _seed_oauth_server(
