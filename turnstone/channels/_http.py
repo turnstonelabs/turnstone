@@ -42,13 +42,19 @@ async def _handle_health(request: Request) -> JSONResponse:
 def _check_auth(request: Request) -> JSONResponse | None:
     """Validate the request's Authorization header.  Returns an error response or None."""
     jwt_secret: str = getattr(request.app.state, "jwt_secret", "")
+    client_host = request.client.host if request.client else ""
 
     if not jwt_secret:
-        log.warning("notify.auth_not_configured")
+        log.warning("notify.auth_not_configured", client_host=client_host)
         return JSONResponse({"error": "authentication not configured"}, status_code=401)
 
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
+        log.warning(
+            "notify.auth_rejected",
+            reason="missing_authorization" if not header else "invalid_auth_scheme",
+            client_host=client_host,
+        )
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     token = header[7:]
@@ -67,10 +73,16 @@ def _check_auth(request: Request) -> JSONResponse | None:
                     "notify.auth_insufficient_scope",
                     user_id=result.user_id,
                     scopes=sorted(result.scopes),
+                    client_host=client_host,
                 )
                 return JSONResponse({"error": "insufficient scope"}, status_code=403)
             return None
 
+    log.warning(
+        "notify.auth_rejected",
+        reason="invalid_jwt" if "." in token else "invalid_token_format",
+        client_host=client_host,
+    )
     return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
 
@@ -105,7 +117,7 @@ async def _handle_notify(request: Request) -> JSONResponse:
     if "username" in target:
         user = await asyncio.to_thread(storage.get_user_by_username, target["username"])
         if user is None:
-            log.warning("notify.user_not_found", username=target["username"])
+            log.warning("notify.user_not_found", username=target["username"], ws_id=ws_id)
             return JSONResponse(
                 {"error": "target not found or has no linked channels"},
                 status_code=404,
@@ -114,7 +126,7 @@ async def _handle_notify(request: Request) -> JSONResponse:
         for link in links:
             targets.append((link["channel_type"], link["channel_user_id"]))
         if not targets:
-            log.warning("notify.user_no_linked_channels", username=target["username"])
+            log.warning("notify.user_no_linked_channels", username=target["username"], ws_id=ws_id)
             return JSONResponse(
                 {"error": "target not found or has no linked channels"},
                 status_code=404,
@@ -159,6 +171,7 @@ async def _handle_notify(request: Request) -> JSONResponse:
                 "notify.no_adapter",
                 channel_type=channel_type,
                 channel_id=channel_id,
+                ws_id=ws_id,
             )
             continue
         try:
@@ -181,12 +194,14 @@ async def _handle_notify(request: Request) -> JSONResponse:
                 channel_type=channel_type,
                 channel_id=channel_id,
                 message_id=msg_id,
+                ws_id=ws_id,
             )
         except TimeoutError:
             log.warning(
                 "notify.timeout",
                 channel_type=channel_type,
                 channel_id=channel_id,
+                ws_id=ws_id,
             )
             results.append(
                 {
@@ -200,6 +215,7 @@ async def _handle_notify(request: Request) -> JSONResponse:
                 "notify.delivery_failed",
                 channel_type=channel_type,
                 channel_id=channel_id,
+                ws_id=ws_id,
             )
             results.append(
                 {

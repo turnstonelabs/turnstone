@@ -410,22 +410,44 @@ The `services` table schema:
 
 ### Security
 
-- **Authentication** — the gateway's `POST /v1/api/notify` endpoint
-  requires authentication. Configure `TURNSTONE_JWT_SECRET` so the
-  server can mint JWTs with `aud: turnstone-channel` automatically.
-  If the secret is not set, the gateway fails closed and rejects all
-  requests with 401. Server JWTs (`aud: turnstone-server`) are
-  rejected.
+- **Authentication** — the gateway's `POST /v1/api/notify` endpoint requires authentication.
+  Configure the server's signing secret with `TURNSTONE_JWT_SECRET` or `[auth].jwt_secret` in
+  `config.toml`; the environment variable takes precedence. The gateway reads
+  `TURNSTONE_JWT_SECRET`, which must match the server's secret. The server automatically mints JWTs
+  with `aud: turnstone-channel`. If the gateway's secret is not set, it fails closed and rejects all
+  requests with 401. Server JWTs (`aud: turnstone-server`) are rejected.
 - **Rate limit** — maximum 5 notifications per turn. The counter only
   increments on successful delivery, so failures don't consume the
   budget.
-- **SSRF protection** — only `http://` and `https://` service URLs
-  are allowed. Other schemes are silently skipped.
+- **SSRF protection** — only `http://` and `https://` service URLs are allowed. Other schemes are
+  skipped with a warning.
 - **Mention sanitization** — `discord.utils.escape_mentions()` is
   applied before sending, preventing `@everyone` / `@here` abuse.
 - **Error redaction** — generic error messages are returned to the
   LLM. Internal details (service IDs, URLs, exception messages) are
   logged server-side only.
+
+### Troubleshooting notifications
+
+Check both the originating server and the channel gateway logs. Each `notify.gateway_failed` event
+identifies the gateway, its URL, the attempt, the workstream (`ws_id`), and the tool call (`call_id`).
+The event records whether an Authorization header was present, plus the HTTP status, request exception
+type, or delivery statuses such as `no_adapter`, `failed`, and `timeout`. Completion notifications log
+the same gateway and workstream details under `notify_completion.*`. Gateway URLs omit credentials,
+query parameters, and fragments; outbound diagnostics omit tokens, message content, and response
+bodies.
+
+A 401 from the gateway occurs before Discord or Slack delivery. `notify.auth_missing` on the server
+means it could not find notification credentials. On the gateway, `notify.auth_not_configured` means
+its signing secret is missing; `notify.auth_rejected` distinguishes a missing Authorization header,
+an invalid scheme or token format, and an invalid JWT. For `invalid_jwt`, check the shared secret, the
+`turnstone-channel` audience, token expiry, and host clocks. `notify.auth_insufficient_scope` indicates
+a valid JWT without the required `write` scope and returns 403.
+
+With debug logging enabled before credentials are first used, `notify.auth_configured` records the
+credential source without its value. A configured `TURNSTONE_CHANNEL_AUTH_TOKEN` overrides automatic
+JWT minting and must itself be a valid JWT for the channel audience with `write` scope. Working Discord
+or Slack conversations do not verify this outbound notification authentication path.
 
 ---
 

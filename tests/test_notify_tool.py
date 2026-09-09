@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
+import pytest
+
 if TYPE_CHECKING:
     from turnstone.core.session import ChatSession
 
@@ -30,6 +32,216 @@ def _make_session() -> ChatSession:
             tool_timeout=30,
         )
     return session
+
+
+class TestNotifyAuthHeaders:
+    @pytest.fixture(autouse=True)
+    def auth_config(self, tmp_path, monkeypatch):
+        import turnstone.core.config as config
+        import turnstone.core.session as session
+
+        config_path = tmp_path / "config.toml"
+        config_path.touch(mode=0o600)
+        monkeypatch.setattr(config, "_config_path", config_path)
+        monkeypatch.setattr(config, "_cache", None)
+        monkeypatch.setattr(session, "_notify_token_manager", None)
+        monkeypatch.delenv("TURNSTONE_JWT_SECRET", raising=False)
+        monkeypatch.delenv("TURNSTONE_CHANNEL_AUTH_TOKEN", raising=False)
+        return config_path
+
+    def test_config_only_secret_authenticates_with_gateway(self, auth_config):
+        """The documented bare-metal config must authenticate outbound notifications."""
+        from unittest.mock import AsyncMock
+
+        from starlette.testclient import TestClient
+
+        from turnstone.channels._http import create_channel_app
+        from turnstone.core.session import _notify_auth_headers
+
+        secret = "a" * 32
+        auth_config.write_text(f'[auth]\njwt_secret = "  {secret}  "\n')
+        adapter = AsyncMock()
+        adapter.send.return_value = "message-1"
+        app = create_channel_app({"discord": adapter}, MagicMock(), jwt_secret=secret)
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/api/notify",
+                json={
+                    "target": {"channel_type": "discord", "channel_id": "123"},
+                    "message": "Hello!",
+                },
+                headers=_notify_auth_headers(),
+            )
+
+        assert response.status_code == 200
+        assert response.json()["results"][0]["status"] == "sent"
+        adapter.send.assert_awaited_once_with("123", "Hello!")
+
+    def test_environment_secret_takes_precedence(self, auth_config, monkeypatch):
+        from turnstone.core.auth import JWT_AUD_CHANNEL, validate_jwt
+        from turnstone.core.session import _notify_auth_headers
+
+        config_secret = "a" * 32
+        auth_config.write_text(f'[auth]\njwt_secret = "{config_secret}"\n')
+        secret = "b" * 32
+        monkeypatch.setenv("TURNSTONE_JWT_SECRET", f"  {secret}  ")
+
+        token = _notify_auth_headers()["Authorization"].removeprefix("Bearer ")
+        auth = validate_jwt(token, secret, audience=JWT_AUD_CHANNEL)
+        assert auth is not None
+        assert "write" in auth.scopes
+
+    def test_static_token_takes_precedence(self, auth_config, monkeypatch):
+        from turnstone.core.session import _notify_auth_headers
+
+        config_secret = "a" * 32
+        auth_config.write_text(f'[auth]\njwt_secret = "{config_secret}"\n')
+        monkeypatch.setenv("TURNSTONE_JWT_SECRET", "b" * 32)
+        monkeypatch.setenv("TURNSTONE_CHANNEL_AUTH_TOKEN", "  static-token  ")
+        assert _notify_auth_headers() == {"Authorization": "Bearer static-token"}
+
+    def test_missing_secret_returns_no_headers(self):
+        from turnstone.core.session import _notify_auth_headers
+
+        assert _notify_auth_headers() == {}
+
+
+class TestNotifyDiagnostics:
+    @pytest.fixture(params=["tool", "completion"])
+    def notify_caller(self, request, monkeypatch):
+        """Exercise both outbound paths with the same gateway failures."""
+        import turnstone.core.session as session_module
+        import turnstone.server as server_module
+
+        session = _make_session()
+        session._ws_id = "abcdef1234567890"
+        monkeypatch.setattr(session, "_backoff_or_cancelled", MagicMock())
+        monkeypatch.setattr(server_module.time, "sleep", MagicMock())
+        monkeypatch.setattr(
+            session_module,
+            "_notify_auth_headers",
+            lambda: {"Authorization": "Bearer private-auth-token"},
+        )
+        storage = MagicMock()
+        monkeypatch.setattr(session_module, "get_storage", lambda: storage)
+        caller_module = session_module if request.param == "tool" else server_module
+        logger = MagicMock()
+        monkeypatch.setattr(caller_module, "log", logger)
+        post = MagicMock()
+        monkeypatch.setattr(session_module.httpx, "post", post)
+
+        def deliver():
+            if request.param == "tool":
+                _, result = session._exec_notify(
+                    {
+                        "call_id": "call-1",
+                        "channel_type": "discord",
+                        "channel_id": "123",
+                        "message": "private-message-content",
+                    }
+                )
+                assert result == "Error: notification delivery failed"
+                assert session._notify_count == 0
+            else:
+                server_module._deliver_notification(
+                    storage,
+                    {"ws_id": session._ws_id, "message": "private-message-content"},
+                    {"Authorization": "Bearer private-auth-token"},
+                )
+
+        return storage, post, logger, deliver, request.param
+
+    def test_preserves_each_gateway_failure_without_secrets(self, notify_caller):
+        storage, post, logger, deliver, caller = notify_caller
+        storage.list_services.return_value = [
+            {"service_id": "gateway-1", "url": "http://user:private-password@gw.example.com:8091"},
+            {"service_id": "gateway-2", "url": "http://gw2.example.com:8091"},
+        ]
+        post.side_effect = [
+            MagicMock(status_code=401),
+            ConnectionError("private-exception-content"),
+        ] * 3
+
+        deliver()
+
+        failures = [c.kwargs for c in logger.warning.call_args_list if "gateway_id" in c.kwargs]
+        assert len(failures) == 6
+        for attempt in range(1, 4):
+            rejected, unreachable = failures[(attempt - 1) * 2 : attempt * 2]
+            assert rejected["gateway_id"] == "gateway-1"
+            assert rejected["gateway_url"] == "http://gw.example.com:8091/v1/api/notify"
+            assert rejected.get("status_code", rejected.get("status")) == 401
+            assert unreachable["gateway_id"] == "gateway-2"
+            assert unreachable["error_type"] == "ConnectionError"
+            for failure in (rejected, unreachable):
+                assert failure["attempt"] == attempt
+                assert failure["ws_id"] == "abcdef1234567890"
+                assert failure["auth_present"] is True
+                if caller == "tool":
+                    assert failure["call_id"] == "call-1"
+        assert "private-" not in repr(logger.mock_calls)
+
+    @pytest.mark.parametrize(
+        "response_kind", ["failed_deliveries", "invalid_json", "invalid_results"]
+    )
+    def test_unsuccessful_response_logs_safe_details(self, notify_caller, response_kind):
+        storage, post, logger, deliver, _ = notify_caller
+        storage.list_services.return_value = [
+            {"service_id": "gateway-1", "url": "http://gw.example.com:8091"},
+        ]
+        response = MagicMock(status_code=200)
+        if response_kind == "invalid_json":
+            response.json.side_effect = ValueError("private-response-content")
+        elif response_kind == "invalid_results":
+            response.json.return_value = {"results": "private-response-content"}
+        else:
+            response.json.return_value = {
+                "results": [
+                    {"status": "no_adapter", "channel_id": "private-target"},
+                    {"status": "private-response-content"},
+                    {"status": ["private-response-content"]},
+                ]
+            }
+        post.return_value = response
+
+        deliver()
+
+        failures = [c for c in logger.warning.call_args_list if "gateway_id" in c.kwargs]
+        assert len(failures) == 3
+        for failure in failures:
+            if response_kind == "invalid_json":
+                assert (
+                    failure.kwargs.get("reason") == "invalid_response"
+                    or failure.args[0] == "notify_completion.response_parse_error"
+                )
+            else:
+                expected = (
+                    ["invalid_response"]
+                    if response_kind == "invalid_results"
+                    else ["no_adapter", "unknown"]
+                )
+                assert failure.kwargs["delivery_statuses"] == expected
+        assert "private-" not in repr(logger.mock_calls)
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            (
+                "https://user:password@gw.example.com/prefix?token=secret#fragment",
+                "https://gw.example.com/prefix",
+            ),
+            (
+                "http://user:password@[2001:db8::1]:8091/v1/api/notify",
+                "http://[2001:db8::1]:8091/v1/api/notify",
+            ),
+            ("http://[invalid", "<invalid URL>"),
+            ("file:///private-credential", "<invalid URL>"),
+        ],
+    )
+    def test_gateway_url_redaction(self, url, expected):
+        from turnstone.core.session import _notify_log_url
+
+        assert _notify_log_url(url) == expected
 
 
 class TestPrepareNotify:

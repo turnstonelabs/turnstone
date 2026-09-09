@@ -264,6 +264,32 @@ class TestNotifyEndpoint:
 class TestNotifyAuth:
     """Tests for authentication on the /v1/api/notify endpoint."""
 
+    @pytest.mark.parametrize(
+        ("header", "reason"),
+        [
+            ("", "missing_authorization"),
+            ("Basic private-credentials", "invalid_auth_scheme"),
+            ("Bearer private-token", "invalid_token_format"),
+            ("Bearer private-token.invalid.jwt", "invalid_jwt"),
+        ],
+    )
+    def test_auth_rejection_logs_reason_without_credentials(self, authed_client, header, reason):
+        from unittest.mock import patch
+
+        with patch("turnstone.channels._http.log") as logger:
+            response = authed_client.post(
+                "/v1/api/notify",
+                json={"message": "private-message"},
+                headers={"Authorization": header} if header else {},
+            )
+
+        assert response.status_code == 401
+        assert response.json() == {"error": "Unauthorized"}
+        logger.warning.assert_called_once_with(
+            "notify.auth_rejected", reason=reason, client_host="testclient"
+        )
+        assert "private-" not in repr(logger.mock_calls)
+
     def test_reject_when_unconfigured(self, no_auth_client):
         """Requests are rejected (fail closed) when no auth is configured."""
         resp = no_auth_client.post(

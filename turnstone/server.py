@@ -2464,18 +2464,32 @@ def _deliver_notification(
     """POST to channel gateway /v1/api/notify with retry."""
     import httpx
 
+    from turnstone.core.session import _notify_delivery_statuses, _notify_log_url
+
+    log_fields = {
+        "ws_id": payload.get("ws_id", ""),
+        "auth_present": bool(auth_headers.get("Authorization")),
+    }
     for attempt in range(3):
         services = storage.list_services("channel", max_age_seconds=120)
         if not services:
             if attempt < 2:
+                log.warning("notify_completion.no_services", attempt=attempt + 1, **log_fields)
                 time.sleep(1.0 if attempt == 0 else 3.0)
                 continue
-            log.warning("notify_completion.no_services")
+            log.warning("notify_completion.no_services", attempt=attempt + 1, **log_fields)
             return
 
         for svc in services:
             url = svc["url"].rstrip("/") + "/v1/api/notify"
+            gateway_fields = {
+                **log_fields,
+                "gateway_id": svc.get("service_id", ""),
+                "gateway_url": _notify_log_url(url),
+                "attempt": attempt + 1,
+            }
             if not url.startswith(("http://", "https://")):
+                log.warning("notify_completion.invalid_url", **gateway_fields)
                 continue
             try:
                 resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
@@ -2487,23 +2501,36 @@ def _deliver_notification(
                         if isinstance(results, list) and any(
                             isinstance(r, dict) and r.get("status") == "sent" for r in results
                         ):
-                            log.info("notify_completion.delivered", ws_id=payload.get("ws_id"))
+                            log.info("notify_completion.delivered", **gateway_fields)
                             return
                     except Exception:
-                        log.debug("notify_completion.response_parse_error", url=url, exc_info=True)
-                    log.warning("notify_completion.no_successful_delivery", url=url)
+                        log.warning(
+                            "notify_completion.response_parse_error",
+                            status=resp.status_code,
+                            **gateway_fields,
+                        )
+                        continue
+                    log.warning(
+                        "notify_completion.no_successful_delivery",
+                        delivery_statuses=_notify_delivery_statuses(results),
+                        **gateway_fields,
+                    )
                     continue
                 log.warning(
                     "notify_completion.failed",
                     status=resp.status_code,
-                    url=url,
+                    **gateway_fields,
                 )
-            except Exception:
-                log.exception("notify_completion.error", url=url)
+            except Exception as exc:
+                log.warning(
+                    "notify_completion.error", error_type=type(exc).__name__, **gateway_fields
+                )
                 continue
 
         if attempt < 2:
             time.sleep(1.0 if attempt == 0 else 3.0)
+
+    log.warning("notify_completion.delivery_failed", attempts=3, **log_fields)
 
 
 async def _interactive_create_validate_request(

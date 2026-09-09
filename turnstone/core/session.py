@@ -2791,7 +2791,7 @@ def _format_mcp_dispatch_error(prefix: str, exc: Exception) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Notify auth helper (module-level, lazy-init)
+# Notify helpers
 # ---------------------------------------------------------------------------
 
 _notify_token_manager: Any = None
@@ -2805,11 +2805,22 @@ def _notify_auth_headers() -> dict[str, str]:
     # Static token from env takes precedence
     static_token = os.environ.get("TURNSTONE_CHANNEL_AUTH_TOKEN", "").strip()
     if static_token:
+        log.debug("notify.auth_configured", source="TURNSTONE_CHANNEL_AUTH_TOKEN")
         return {"Authorization": f"Bearer {static_token}"}
 
     # JWT via ServiceTokenManager
     jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    secret_source = "TURNSTONE_JWT_SECRET"
     if not jwt_secret:
+        from turnstone.core.config import load_config
+
+        jwt_secret = str(load_config("auth").get("jwt_secret", "")).strip()
+        secret_source = "config.toml [auth].jwt_secret"
+    if not jwt_secret:
+        log.warning(
+            "notify.auth_missing",
+            hint="Set TURNSTONE_JWT_SECRET or [auth].jwt_secret in config.toml",
+        )
         return {}
 
     with _notify_token_lock:
@@ -2823,8 +2834,33 @@ def _notify_auth_headers() -> dict[str, str]:
                 secret=jwt_secret,
                 audience=JWT_AUD_CHANNEL,
             )
+            log.debug("notify.auth_configured", source=secret_source)
     header: dict[str, str] = _notify_token_manager.bearer_header
     return header
+
+
+def _notify_log_url(url: str) -> str:
+    """Strip URL credentials, query parameters, and fragments from gateway diagnostics."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return "<invalid URL>"
+        return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, "", ""))
+    except ValueError:
+        return "<invalid URL>"
+
+
+def _notify_delivery_statuses(results: Any) -> list[str]:
+    """Summarize gateway outcomes without logging response content or target details."""
+    if not isinstance(results, list):
+        return ["invalid_response"]
+    statuses: set[str] = set()
+    for result in results:
+        status = result.get("status") if isinstance(result, dict) else None
+        statuses.add(status if status in ("sent", "failed", "timeout", "no_adapter") else "unknown")
+    return sorted(statuses)
 
 
 def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None, bool, bool]:
@@ -26988,6 +27024,11 @@ class ChatSession:
 
         # Build auth headers for service-to-service call
         auth_headers = _notify_auth_headers()
+        log_fields = {
+            "ws_id": self._ws_id,
+            "call_id": call_id,
+            "auth_present": bool(auth_headers.get("Authorization")),
+        }
 
         # Retry loop: attempt delivery, re-query services on each retry
         # in case a gateway comes back online between attempts.
@@ -27002,13 +27043,14 @@ class ChatSession:
                         attempt=attempt + 1,
                         max_retries=self._NOTIFY_MAX_RETRIES,
                         retry_delay=delay,
+                        **log_fields,
                     )
                     # Cancel-aware: notify runs as an in-turn tool, so a
                     # Stop aborts pending delivery retries with the turn
                     # (the batch synthesizes the cancelled tool_result).
                     self._backoff_or_cancelled(delay)
                     continue
-                log.warning("notify.no_services_exhausted")
+                log.warning("notify.no_services_exhausted", **log_fields)
                 msg = "Error: no channel gateway services available"
                 self._report_tool_result(call_id, "notify", msg, is_error=True)
                 return call_id, msg
@@ -27017,8 +27059,16 @@ class ChatSession:
             last_error: str = ""
             for svc in services:
                 url = svc["url"].rstrip("/") + "/v1/api/notify"
+                gateway_fields = {
+                    **log_fields,
+                    "gateway_id": svc.get("service_id", ""),
+                    "gateway_url": _notify_log_url(url),
+                    "attempt": attempt + 1,
+                }
                 # SSRF guard: only allow http(s) URLs
                 if not url.startswith(("http://", "https://")):
+                    last_error = "invalid gateway URL"
+                    log.warning("notify.gateway_failed", reason="invalid_url", **gateway_fields)
                     continue
                 try:
                     resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
@@ -27028,20 +27078,46 @@ class ChatSession:
                             data = resp.json()
                         except Exception:
                             last_error = "invalid gateway response"
+                            log.warning(
+                                "notify.gateway_failed",
+                                reason="invalid_response",
+                                status_code=resp.status_code,
+                                **gateway_fields,
+                            )
                             continue
                         results = data.get("results") if isinstance(data, dict) else None
                         if isinstance(results, list) and any(
                             isinstance(r, dict) and r.get("status") == "sent" for r in results
                         ):
                             self._notify_count += 1
+                            log.info("notify.delivered", **gateway_fields)
                             msg = "Notification sent successfully"
                             self._report_tool_result(call_id, "notify", msg)
                             return call_id, msg
                         last_error = "no successful deliveries"
+                        log.warning(
+                            "notify.gateway_failed",
+                            reason="no_successful_deliveries",
+                            status_code=resp.status_code,
+                            delivery_statuses=_notify_delivery_statuses(results),
+                            **gateway_fields,
+                        )
                         continue
                     last_error = f"HTTP {resp.status_code}"
+                    log.warning(
+                        "notify.gateway_failed",
+                        reason="http_error",
+                        status_code=resp.status_code,
+                        **gateway_fields,
+                    )
                 except Exception as exc:
                     last_error = type(exc).__name__
+                    log.warning(
+                        "notify.gateway_failed",
+                        reason="request_error",
+                        error_type=last_error,
+                        **gateway_fields,
+                    )
                     continue  # try next gateway
 
             # All gateways failed this attempt — retry if we have attempts left
@@ -27054,6 +27130,7 @@ class ChatSession:
                     last_error=last_error,
                     gateway_count=len(services),
                     retry_delay=delay,
+                    **log_fields,
                 )
                 # Same cancel-aware backoff as the no-services arm above.
                 self._backoff_or_cancelled(delay)
@@ -27062,6 +27139,7 @@ class ChatSession:
                     "notify.delivery_failed",
                     last_error=last_error,
                     gateway_count=len(services),
+                    **log_fields,
                 )
 
         msg = "Error: notification delivery failed"
