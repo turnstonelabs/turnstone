@@ -8,7 +8,10 @@ Typed HTTP client libraries for programmatic access to the turnstone server and 
 
 ## Python SDK
 
-The Python SDK is included in the `turnstone` package — no extra install required. It wraps the REST and SSE endpoints with typed methods that return Pydantic models directly.
+The Python SDK is included in the `turnstone` package and requires Python 3.13 or newer starting
+with Turnstone 1.9. It wraps the REST and SSE endpoints with typed methods that return Pydantic
+models directly. See the [installation instructions](../README.md#quickstart) to set up a compatible
+virtual environment.
 
 ### Quick Start
 

@@ -32,7 +32,7 @@ TURNSTONE_ACME_EXTERNAL_URL=http://<compose-host-ip>:8090/acme \
 useradd --system --no-create-home --shell /usr/sbin/nologin turnstone
 
 # 2. Install turnstone into a venv at /opt/turnstone-venv (lacme/mTLS is a core dep).
-uv venv /opt/turnstone-venv --python 3.12
+uv venv /opt/turnstone-venv --python 3.13
 uv pip install --python /opt/turnstone-venv 'turnstone @ git+https://github.com/turnstonelabs/turnstone'
 #   …or from a local checkout:  uv pip install --python /opt/turnstone-venv /path/to/turnstone
 

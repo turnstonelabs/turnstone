@@ -61,7 +61,7 @@ Multi-node dispatches run in parallel via `asyncio.gather`, so total wall time i
 ## Prerequisites
 
 - A running Turnstone cluster with at least one `turnstone-server` and a `turnstone-console`
-- Python 3.11+
+- Python 3.13+
 
 ## Installation
 

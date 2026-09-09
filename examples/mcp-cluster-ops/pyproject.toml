@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "mcp-cluster-ops"
 version = "0.1.0"
 description = "MCP server for Turnstone cluster operations — reference implementation."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = "Apache-2.0"
 dependencies = [
     "turnstone",
@@ -24,7 +24,7 @@ dev = ["ruff>=0.9", "mypy>=1.14"]
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 100
 
 [tool.ruff.lint]
@@ -35,7 +35,7 @@ ignore = ["E501"]
 quote-style = "double"
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

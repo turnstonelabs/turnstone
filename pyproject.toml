@@ -9,7 +9,7 @@ description = "Multi-node AI orchestration platform with tool use, agent routing
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "THIRD-PARTY-NOTICES"]
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 authors = [{name = "Patrick Buckley", email = "buckleypm@gmail.com"}]
 keywords = ["ai", "chat", "llm", "agent", "tools", "openai"]
 classifiers = [
@@ -17,9 +17,8 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
@@ -138,18 +137,19 @@ filterwarnings = [
 ]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
-ignore = ["E501"]
+# Keep assignment-based aliases, shared TypeVars, and explicit generator type arguments.
+ignore = ["E501", "UP040", "UP043", "UP047"]
 
 [tool.ruff.format]
 quote-style = "double"
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

@@ -66,6 +66,9 @@ machine — for example to use a local GPU — can join the same cluster (enroll
 its mTLS cert and running `web_search`) and show up in the console alongside the
 containerized nodes.
 
+For Turnstone 1.9, install the native server in a Python 3.13 or newer virtual environment using
+the [quickstart](../README.md#quickstart). The Docker images include their own Python runtime.
+
 Put the secret and connection settings in `~/.config/turnstone/config.toml`
 (secrets belong in this file, not the process environment — keep it `0600`,
 the loader warns otherwise):

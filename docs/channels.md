@@ -126,11 +126,12 @@ An admin can also force-link or unlink users via the console admin panel
 
 ## Slack Setup
 
-Slack uses **Socket Mode**, so no public URL or API Gateway is required — Slack
-connects outbound to the bot via a WebSocket. Install with:
+Slack uses **Socket Mode**: the bot opens an outbound WebSocket connection to Slack, so no public
+URL or API Gateway is required. Install the Slack extra in your Python 3.13 or newer Turnstone
+virtual environment (see the [quickstart](../README.md#quickstart)):
 
 ```bash
-pip install 'turnstone[slack]'
+python -m pip install 'turnstone[slack]'
 ```
 
 ### 1. Create a Slack App

@@ -82,8 +82,12 @@ reasoning duration.
 
 ## Quickstart
 
+Use Python 3.13 or 3.14; the commands below use 3.13.
+
 ```bash
-pip install turnstone
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install turnstone
 
 # Terminal REPL
 turnstone --base-url http://localhost:8000/v1
@@ -210,10 +214,14 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.13+
 - An OpenAI-compatible API endpoint, Anthropic API key, or Google Gemini API key
 - Optional: Discord / Slack channel integrations (`pip install turnstone[discord,slack]`)
 - [Git LFS](https://git-lfs.com/) for cloning (diagram PNGs)
+
+Turnstone 1.9 requires Python 3.13 or newer; 1.8 is the last series supporting Python 3.11 and 3.12.
+To upgrade a native installation, recreate its virtual environment with Python 3.13 or 3.14 and
+reinstall Turnstone. Docker installations include the required Python runtime.
 
 ## Support
 

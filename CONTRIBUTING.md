@@ -33,8 +33,10 @@ synchronization policy.
 
 ## Development Setup
 
+Use Python 3.13 or 3.14. CI tests both versions.
+
 ```
-python -m venv .venv
+python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[test,dev]"
 ```

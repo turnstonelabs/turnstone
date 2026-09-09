@@ -76,12 +76,12 @@ A run is a little RPG loop, played a bit each day:
 
 ## Installation
 
-This example uses [`uv`](https://docs.astral.sh/uv/). From the example
-directory:
+This example requires Python 3.13 or newer and uses [`uv`](https://docs.astral.sh/uv/). From the
+example directory:
 
 ```bash
 cd examples/door-game
-uv venv
+uv venv --python 3.13
 uv pip install -e .
 ```
 

@@ -35,14 +35,12 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # Cap a hung run at 45 min instead of riding GitHub's 6-hour default
-    # (a flaky-hang run otherwise streams -v output for hours).  Was 20;
-    # the suite's growth (~12.3k tests, coverage-instrumented, 3-version
-    # matrix) started brushing the 30-minute cap on healthy runs.
+    # Stop hung test runs after 45 minutes. Keep the suite within this budget
+    # as it grows; the matrix covers the minimum and newest tested Python versions.
     timeout-minutes: 45
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7

@@ -12,6 +12,15 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
+## [Unreleased]
+
+### Changed
+
+- **Python 3.13 minimum for Turnstone 1.9.** Python 3.11 and 3.12 are no longer supported; 1.8 is
+  the last series that accepts them. Native installations must recreate their virtual environment
+  with Python 3.13 or newer before upgrading. CI tests Python 3.13 and 3.14, and Docker images
+  already include Python 3.14.
+
 ## [1.8.3]
 
 Turnstone 1.8.3 makes scheduled work easier to launch, keeps conversations and node placement intact
