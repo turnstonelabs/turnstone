@@ -620,14 +620,11 @@ def test_per_token_hot_path_avoids_container_scans() -> None:
     )
     assert "this._reasoningActivity" in body
     near = body.index("isNearBottom() {")
-    assert "return this._nearBottom;" in body[near : near + 700]
-    assert "passive: true" in body
-    # The rAF pin re-checks the flag AT FIRE TIME (a user scroll landing in
-    # the schedule→rAF window must win over a stale pin), with force
-    # requests latched across the coalescing window; resizes re-derive the
-    # flag via ResizeObserver since they move the bottom without a scroll.
-    assert "this._scrollPinForce = false;" in body
-    assert "ResizeObserver" in body
+    assert "return this._scrollFollow.isFollowing();" in body[near : near + 700]
+    scroll = (_ROOT / "turnstone/shared_static/conversation_scroll.js").read_text()
+    assert "passive: true" in scroll
+    assert "requestAnimationFrame" in scroll
+    assert "ResizeObserver" in scroll
     for helper in ("_toolRow(callId) {", "_streamEl(callId) {"):
         assert helper in body, f"missing lookup-cache helper: {helper!r}"
 
@@ -888,8 +885,7 @@ def test_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
     assert "if (this.wsId !== wsId) this._truncatedFromCursor = null;" in load_seg, (
         "a ws switch must drop the old ws's truncation record"
     )
-    replay_fn = body.index("replayHistory(messages) {")
-    replay_head = body[replay_fn : replay_fn + 1200]
+    replay_head = _extract_braced(body, "replayHistory(messages) {")
     assert "this._truncatedFromCursor = null;" in replay_head, (
         "a successful full-history render must clear the truncation record"
     )

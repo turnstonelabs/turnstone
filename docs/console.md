@@ -410,6 +410,11 @@ scrolls horizontally; activating a tab or moving keyboard focus to one of its co
 complete tab. When the strip or tab widths change, the tab with keyboard focus stays visible;
 otherwise, the active tab stays visible.
 
+Both conversation views follow new output while you are at the bottom. Scrolling up pauses
+autoscroll, including during tool updates and when a response finishes. Scroll down to within 48
+pixels of the bottom, or select **Jump to latest**, to resume following. Sending or queuing a message
+also brings your new message into view. Each pane keeps its own follow state when you switch tabs.
+
 ### Dashboard pane
 
 The home view is coordinator-first. It contains the persistent workstream

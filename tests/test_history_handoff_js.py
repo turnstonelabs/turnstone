@@ -617,6 +617,7 @@ function getTranscriptPresentation() { return "default"; }
 function convBatchSummaryText() { return "tool batch"; }
 
 const toolRows = new Map();
+const scrollFollow = { isFollowing: () => true };
 const latestToolRowElements = new Map();
 const toolResultNodes = new Map();
 const renderedToolEventIds = new Set();

@@ -54,12 +54,14 @@ import {
   setToolOutputReviewState,
 } from "/shared/conversation.js";
 import {
+  canAutoFoldTranscriptBatch,
   getTranscriptPresentation,
   mountTranscriptPresentationToggle,
   preserveTranscriptBottomPin,
   registerTranscriptScroller,
 } from "/shared/transcript_presentation.js";
 import { redactCredentials } from "/shared/redact_credentials.js";
+import { mountConversationScroll } from "/shared/conversation_scroll.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "/shared/mcp_error.js";
 import {
   acceptUserTurnEvent,
@@ -474,7 +476,11 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   const messagesEl = root.querySelector("#coord-messages");
-  const unregisterTranscriptScroller = registerTranscriptScroller(messagesEl);
+  const scrollFollow = mountConversationScroll(messagesEl);
+  const unregisterTranscriptScroller = registerTranscriptScroller(messagesEl, {
+    isFollowing: scrollFollow.isFollowing,
+    scrollToBottom: scrollFollow.schedule,
+  });
   const coordMain = root.querySelector("#coord-main");
   const composerMount = root.querySelector("#coord-composer-mount");
   const composer = new Composer(composerMount, {
@@ -512,6 +518,7 @@ function createCoordinatorPane(root, wsId, opts) {
   });
   const queue = createQueueController({
     messagesEl: messagesEl,
+    scroll: () => _scheduleScroll(),
     getWsId: function () {
       return wsId;
     },
@@ -1083,19 +1090,8 @@ function createCoordinatorPane(root, wsId, opts) {
   // Message append helpers
   // ------------------------------------------------------------------
 
-  // Coalesce scrollTop writes through requestAnimationFrame so the
-  // bulk history-replay loop doesn't fire one synchronous reflow per
-  // appended message — for histories with hundreds of turns the
-  // un-coalesced version visibly stalls the page.  Live SSE streaming
-  // also benefits: token-rate scrolls collapse into one paint.
-  let _scrollPending = false;
   function _scheduleScroll() {
-    if (_scrollPending) return;
-    _scrollPending = true;
-    requestAnimationFrame(() => {
-      _scrollPending = false;
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-    });
+    scrollFollow.schedule();
   }
 
   // Map raw role → .msg variant (DS primitives/message.css).  "error"
@@ -1662,6 +1658,7 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function appendToolResult(name, callId, output, isError, opts) {
+    const atBottom = scrollFollow.isFollowing();
     if (callId && toolRows.has(callId)) {
       const entry = toolRows.get(callId);
       const prior = toolResultNodes.get(callId);
@@ -1677,9 +1674,12 @@ function createCoordinatorPane(root, wsId, opts) {
       // state.  Per-row check (not a counter) keeps the logic
       // resilient to out-of-order replay + late SSE deliveries.
       _unsetBatchRunningIfAllResults(entry.batch);
+      const allowAutoFold =
+        getTranscriptPresentation() !== "compact" ||
+        canAutoFoldTranscriptBatch(messagesEl, entry.batch, { atBottom });
       const settlement =
         opts && opts.accepted
-          ? markConvRowResultSettled(entry.row, { autoFold: true })
+          ? markConvRowResultSettled(entry.row, { autoFold: allowAutoFold })
           : null;
       if (
         getTranscriptPresentation() === "compact" &&
@@ -2690,6 +2690,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // Move the retry affordance onto the just-completed last assistant turn
     // (#549). No-op when the turn ended tool-only (see _refreshRetryButton).
     _refreshRetryButton();
+    _scheduleScroll();
   }
 
   // ------------------------------------------------------------------
@@ -2902,6 +2903,7 @@ function createCoordinatorPane(root, wsId, opts) {
         },
       );
     }
+    scrollFollow.jumpToLatest();
     composer.clear();
 
     // Bound the send POST with an AbortController + ~15s timeout (mirrors
@@ -4502,6 +4504,7 @@ function createCoordinatorPane(root, wsId, opts) {
               label: "you",
               clientSendId: editClientSendId,
             });
+            scrollFollow.jumpToLatest();
             postAndSettleSend(
               queue,
               authFetch(
@@ -6832,6 +6835,7 @@ function createCoordinatorPane(root, wsId, opts) {
         evtSource.readyState !== EventSource.OPEN)
     )
       return;
+    const scrollTop = messagesEl.scrollTop;
     messagesEl.replaceChildren();
     _syncApprovalChip();
     // A full committed-history render repairs any recorded truncation gap —
@@ -7245,6 +7249,8 @@ function createCoordinatorPane(root, wsId, opts) {
           ? hist.handoff_token
           : null;
     }
+    messagesEl.scrollTop = scrollTop;
+    _scheduleScroll();
     // The outcome tells the repair settle whether a TOKENLESS response was a
     // completed render (the server's deliberate cold storage-only read —
     // downgrade to the tokenless bootstrap) or a failure (fail closed).
@@ -7311,6 +7317,7 @@ function createCoordinatorPane(root, wsId, opts) {
     if (_childObserver && _childObserver.disconnect)
       _childObserver.disconnect();
     unregisterTranscriptScroller();
+    scrollFollow.destroy();
     if (unmountTranscriptPresentation) {
       unmountTranscriptPresentation();
       unmountTranscriptPresentation = null;

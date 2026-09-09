@@ -31,6 +31,46 @@
    element and let the caller append + scroll (pane- and transport-agnostic).
    ========================================================================== */
 
+/* A zero-height sibling anchors the control above the bottom of each log. */
+.conv-scroll-control {
+  position: relative;
+  flex: 0 0 0;
+  height: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+.conv-scroll-latest {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  max-width: calc(100% - 24px);
+  padding: 6px 12px;
+  border: 1px solid var(--hair);
+  border-radius: 18px;
+  background: var(--panel-2);
+  color: var(--ink);
+  box-shadow: var(--shadow-sm);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.conv-scroll-latest[hidden] {
+  display: none;
+}
+.conv-scroll-latest:hover {
+  border-color: var(--ink-3);
+}
+.conv-scroll-latest:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* ==========================================================================
    Card shell — pairs tool calls with their verdicts + results and embeds
    the approval gate.  One construct per dispatch turn:

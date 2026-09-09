@@ -76,6 +76,7 @@ import {
   viewerUserId,
 } from "./composer_queue.js";
 import { StatusBar } from "./status_bar.js";
+import { mountConversationScroll } from "./conversation_scroll.js";
 import { streamingRender, streamingRenderFinalize } from "./renderer.js";
 import {
   buildMsgCopyButton,
@@ -313,7 +314,7 @@ class Pane {
       },
       placePrompt: (prompt) => {
         this.messagesEl.appendChild(prompt);
-        this.scrollToBottom(true);
+        this.scrollToBottom();
       },
     });
     // Monotonic STREAM-generation counter (#900), bumped only in
@@ -390,12 +391,8 @@ class Pane {
     // block.
     this._staleRetryTimer = null;
     // Hot-path caches — all invalidated by _clearAgentTracking/replayHistory.
-    // _nearBottom mirrors the scroller position via a passive scroll listener
-    // (no per-token geometry reads); the two Maps make per-event row/stream
-    // lookups O(1) instead of whole-transcript attribute-selector scans.
-    this._nearBottom = true;
-    this._scrollPinPending = false;
-    this._scrollPinForce = false;
+    // The Maps make per-event row/stream lookups O(1) instead of
+    // whole-transcript attribute-selector scans.
     this._reasoningActivity = createReasoningActivity();
     // Compaction lifecycle holder for the shared reducer
     // (conversation.applyCompactionEvent); `card` is the in-progress card
@@ -425,7 +422,6 @@ class Pane {
     // compaction progress. Parallel task agents compact independently, so one
     // foreground holder cannot represent them.
     this._agentCompactions = new Map();
-    this._resizeObs = null;
     // Set when replay_truncated arrives mid-stream (refetching then would
     // detach the live bubble); consumed on the next idle edge.  Cleared by
     // _loadHistoryThenConnect at load start AND by replayHistory's
@@ -718,19 +714,19 @@ class Pane {
     if (source === "compaction") {
       const card = buildCompactionCard(meta, content || "");
       this.messagesEl.appendChild(card);
-      this.scrollToBottom(true);
+      this.scrollToBottom();
       return card;
     }
     if (source === "watch_triggered" && meta && typeof meta === "object") {
       const card = buildWatchResultCard(meta, content || "");
       this.messagesEl.appendChild(card);
-      this.scrollToBottom(true);
+      this.scrollToBottom();
       return card;
     }
     if (source === "output_guard" && meta && typeof meta === "object") {
       const card = _buildGuardFindingBubble(meta);
       this.messagesEl.appendChild(card);
-      this.scrollToBottom(true);
+      this.scrollToBottom();
       return card;
     }
     // user_interjection renders as a "queued message" bubble showing the user's
@@ -759,7 +755,7 @@ class Pane {
     body.appendChild(textEl);
     el.appendChild(body);
     this.messagesEl.appendChild(el);
-    this.scrollToBottom(true);
+    this.scrollToBottom();
     return el;
   }
 
@@ -779,7 +775,7 @@ class Pane {
       container: this.messagesEl,
       renderedIds: this._renderedSystemEventIds,
       onNotice: (msg) => this.addInfoMessage(msg),
-      scroll: (force) => this.scrollToBottom(force),
+      scroll: () => this.scrollToBottom(),
     });
     // Manual compaction's busy state can start reasoning before this card.
     if (this._compaction.card) this._reasoningActivity.finish();
@@ -856,7 +852,7 @@ class Pane {
     }
     this._addUserMsgActions(el, text);
     this.messagesEl.appendChild(el);
-    this.scrollToBottom(true);
+    this.scrollToBottom();
     // Returned so the send flow can retro-convert the optimistic bubble
     // into a queued chip when the server answers queued+deferred.
     return el;
@@ -975,10 +971,6 @@ class Pane {
     if (!chunk) return;
     const stripped = stripAnsi(chunk);
     if (!stripped) return;
-    // Capture pin before the chunk grows the stream block — see
-    // announceToolBlock.
-    const stick = this.isNearBottom();
-
     let el = this._streamEl(callId);
     if (!el) {
       let target = this._toolRow(callId);
@@ -1023,7 +1015,7 @@ class Pane {
         el.scrollTop = el.scrollHeight;
       });
     }
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
   }
 
   showOutputWarning(evt) {
@@ -1192,40 +1184,12 @@ class Pane {
   }
 
   isNearBottom() {
-    // Cached from the passive scroll listener (_createDOM) instead of read
-    // from geometry: the old scrollHeight/scrollTop/clientHeight triplet
-    // forced a synchronous layout of the whole transcript, and this runs on
-    // every streamed token and every tool chunk.  Content growth without a
-    // scroll leaves the cache untouched — which is the DESIRED semantics:
-    // "pinned" is a statement about where the user last scrolled to, not
-    // about the current pixel distance (the old post-append measurement is
-    // exactly what used to silently disengage auto-follow at tool time).
-    return this._nearBottom;
+    return this._scrollFollow.isFollowing();
   }
 
   scrollToBottom(force) {
-    if (force) this._scrollPinForce = true;
-    else if (!this._nearBottom) return;
-    // rAF-coalesced pin: at most one scrollHeight read + scrollTop write per
-    // frame no matter how many deltas arrived.  The pin re-checks
-    // _nearBottom AT FIRE TIME: a user wheel-scroll can land between the
-    // schedule (when the cached flag was still true) and the rAF — pinning
-    // anyway would yank them back to the bottom, and the programmatic
-    // scroll's own event would re-mark the flag true, trapping them there
-    // for the rest of the stream.  Scroll events fire before rAF callbacks
-    // within a frame, so the re-check sees the user's disengage.  Force
-    // requests latch across the coalescing window (a forced pin must win
-    // even if a non-forced schedule got there first).
-    if (this._scrollPinPending) return;
-    this._scrollPinPending = true;
-    requestAnimationFrame(() => {
-      this._scrollPinPending = false;
-      const forced = this._scrollPinForce;
-      this._scrollPinForce = false;
-      if (forced || this._nearBottom) {
-        this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
-      }
-    });
+    if (force) this._scrollFollow.jumpToLatest();
+    else this._scrollFollow.schedule();
   }
 
   _createDOM() {
@@ -1356,39 +1320,15 @@ class Pane {
     this.messagesEl.setAttribute("role", "log");
     this.messagesEl.setAttribute("aria-live", "polite");
     this.messagesEl.setAttribute("aria-label", "Chat messages");
+    this.el.appendChild(this.messagesEl);
+    this._scrollFollow = mountConversationScroll(this.messagesEl);
     this._unregisterTranscriptScroller = registerTranscriptScroller(
       this.messagesEl,
-    );
-    // Track "pinned to bottom" from actual scrolls (user or programmatic)
-    // instead of reading scroller geometry per event — see isNearBottom().
-    // Passive: never blocks the compositor thread.
-    this.messagesEl.addEventListener(
-      "scroll",
-      () => {
-        this._nearBottom =
-          this.messagesEl.scrollHeight -
-            this.messagesEl.scrollTop -
-            this.messagesEl.clientHeight <
-          80;
+      {
+        isFollowing: () => this.isNearBottom(),
+        scrollToBottom: () => this.scrollToBottom(),
       },
-      { passive: true },
     );
-    // Layout changes that move the bottom WITHOUT a scroll event (window
-    // resize, split-drag, orientation change) would leave the cached flag
-    // stale — a user visually back at the bottom after growing the pane
-    // stayed disengaged until they nudged the scroller.  Resizes are rare,
-    // so the geometry read here is off the hot path by construction.
-    if (typeof ResizeObserver === "function") {
-      this._resizeObs = new ResizeObserver(() => {
-        this._nearBottom =
-          this.messagesEl.scrollHeight -
-            this.messagesEl.scrollTop -
-            this.messagesEl.clientHeight <
-          80;
-      });
-      this._resizeObs.observe(this.messagesEl);
-    }
-    this.el.appendChild(this.messagesEl);
 
     // Per-workstream status bar (above input)
     this.statusBarEl = document.createElement("div");
@@ -1478,6 +1418,7 @@ class Pane {
     });
     this.queue = createQueueController({
       messagesEl: this.messagesEl,
+      scroll: () => this.scrollToBottom(),
       getWsId: () => {
         return this.wsId;
       },
@@ -2455,7 +2396,7 @@ class Pane {
             doneBodyEl.textContent = doneBuffer;
           }
         }
-        this.scrollToBottom(true);
+        this.scrollToBottom();
         break;
       }
 
@@ -2815,7 +2756,7 @@ class Pane {
         this.stopBtn.disabled = true;
         this.stopBtn.textContent = "Cancelling\u2026";
         this.stopBtn.setAttribute("aria-label", "Cancelling generation");
-        this.scrollToBottom(true);
+        this.scrollToBottom();
         // After 2s, offer "Force Stop" for a harder cancel that abandons
         // the stuck worker thread.  Safety timeout at 10s auto-recovers
         // if state_change never arrives (connection drop).
@@ -2990,6 +2931,7 @@ class Pane {
             const editEl = this.addUserMessage(editText, null, {
               clientSendId: editClientSendId,
             });
+            this.scrollToBottom(true);
             postAndSettleSend(
               this.queue,
               authFetch(
@@ -3759,6 +3701,7 @@ class Pane {
   }
 
   replayHistory(messages) {
+    const scrollTop = this.messagesEl.scrollTop;
     this.messagesEl.replaceChildren();
     // A full committed-history render repairs any recorded truncation
     // gap — from the resync itself or an unrelated clear_ui rebuild — so
@@ -4136,6 +4079,7 @@ class Pane {
       }
     }
     this._attachRetryToLastAssistant();
+    this.messagesEl.scrollTop = scrollTop;
     this.scrollToBottom();
     // Focus the input so keyboard users land on the next-action target
     // after replay finishes — but only when this is the focused pane,
@@ -4221,13 +4165,6 @@ class Pane {
   announceToolBlock(items) {
     const list = (items || []).filter(Boolean);
     if (!list.length) return;
-    // Re-pin to the bottom only if we were already there — captured BEFORE the
-    // block grows scrollHeight.  A tool batch is a tall one-shot append; if
-    // isNearBottom() were measured after appendChild (as scrollToBottom does on
-    // its own) the freshly-added height would read >80px from the new bottom,
-    // so auto-follow would silently disengage at exactly tool-call time.  Token
-    // streaming stays pinned without this because each append is sub-threshold.
-    const stick = this.isNearBottom();
     // Key the shell by its call_id set.  A re-announce of the SAME batch
     // replaces its own shell; shells of OTHER batches stay — parallel
     // task agents announce concurrently and must not discard each other.
@@ -4270,7 +4207,7 @@ class Pane {
     this.messagesEl.appendChild(block);
     this._indexToolRows(block);
     this._relinkAgentCards(list);
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
     toolAnnounce(_toolAnnounceText(list));
   }
 
@@ -4297,9 +4234,6 @@ class Pane {
   }
 
   showInlineToolBlock(items, autoApproved, judgePending, cycleId) {
-    // Capture pin before _takeAnnouncedBlock/append change scrollHeight — see
-    // announceToolBlock for why post-append measurement breaks here.
-    const stick = this.isNearBottom();
     // Reuse the early-paint announce shell if it's for this batch (upgrade in
     // place); else build fresh.
     const announced = this._takeAnnouncedBlock(items);
@@ -4413,7 +4347,7 @@ class Pane {
       }
     }
     this._relinkAgentCards(items);
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
   }
 
   resolveApproval(approved, always, feedback, skipPost, cycleId) {
@@ -4425,10 +4359,6 @@ class Pane {
     const entry = this.approvalCycles.get(id);
     if (!entry) return; // already resolved (peer tab / server race) — idempotent
     this.approvalCycles.delete(id);
-
-    // Capture pin before the status badge reflows the block — see
-    // announceToolBlock.
-    const stick = this.isNearBottom();
 
     entry.blockEls.forEach((el) => {
       const actions = el.querySelector(".conv-actions");
@@ -4478,7 +4408,7 @@ class Pane {
       });
     }
 
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
   }
 
   // --- Task-agent card: nest a sub-agent's sub-tool steps under its row -----
@@ -4587,7 +4517,7 @@ class Pane {
         }
         notice.textContent = stripAnsi(message);
       },
-      scroll: (force) => this.scrollToBottom(force),
+      scroll: () => this.scrollToBottom(),
     });
   }
 
@@ -4628,7 +4558,6 @@ class Pane {
       const toggle = card.wrap.querySelector(".conv-agent-toggle");
       if (toggle) toggle.setAttribute("aria-expanded", "true");
     }
-    const stick = this.isNearBottom();
     const approveRows = [];
     items.forEach((item) => {
       if (!item || !item.parent_call_id) return;
@@ -4692,7 +4621,7 @@ class Pane {
       this._registerApprovalCycle(cycleId, approveRows, items);
     }
     this._updateAgentLabel(card);
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
     return true;
   }
 
@@ -4997,9 +4926,8 @@ class Pane {
 
   appendToolOutput(callId, name, output, isError, preview, opts = {}) {
     const accepted = opts.accepted === true;
-    // Capture pin before the streamEl removal + result insertion change
-    // scrollHeight — see announceToolBlock.  The result block is the other
-    // tall one-shot append in the tool flow (up to 10 lines before collapse).
+    // Folding uses the pre-mutation follow state; the deferred scroll also
+    // checks for a newer user scroll before it moves the viewport.
     const stick = this.isNearBottom();
     // A task_agent's OWN result completing flips its card running -> done/error
     // (child sub-tool results carry namespaced ids, never keys of _agentCards).
@@ -5195,7 +5123,7 @@ class Pane {
       }
     }
     if (resultNodes.length || (settlement && settlement.autoFolded)) {
-      this.scrollToBottom(stick);
+      this.scrollToBottom();
     }
     return true;
   }
@@ -5340,6 +5268,7 @@ class Pane {
         clientSendId,
       });
     }
+    this.scrollToBottom(true);
     this.composer.clear();
 
     // Bound the send POST with an AbortController + ~15s timeout (mirrors
@@ -6209,10 +6138,7 @@ function createInteractivePane(root, wsId, opts) {
       // card maps, and stop observing the detached scroller.
       pane._clearAgentTracking();
       pane._replayQueue = null;
-      if (pane._resizeObs) {
-        pane._resizeObs.disconnect();
-        pane._resizeObs = null;
-      }
+      pane._scrollFollow.destroy();
       if (pane._unregisterTranscriptScroller) {
         pane._unregisterTranscriptScroller();
         pane._unregisterTranscriptScroller = null;

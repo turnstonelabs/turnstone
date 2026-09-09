@@ -65,6 +65,20 @@ function scrollerIsAtBottom(scroller) {
   return distance <= BOTTOM_THRESHOLD_PX;
 }
 
+function scrollerIsFollowing(state) {
+  return state.isFollowing
+    ? state.isFollowing()
+    : scrollerIsAtBottom(state.scroller);
+}
+
+function restoreScrollerBottom(state) {
+  // Let the pane account for its own scroll writes, including the browser's
+  // delayed scroll event after more streamed content has arrived.
+  if (state.scrollToBottom) state.scrollToBottom();
+  else state.scroller.scrollTop = state.scroller.scrollHeight;
+  state.atBottom = true;
+}
+
 function releaseScroller(scroller, state, removeMarker) {
   if (scrollers.get(scroller) !== state) return;
   scrollers.delete(scroller);
@@ -80,14 +94,13 @@ function refreshScrollerFollowState(state) {
     const restoreRevision = state.pendingBottomRestoreRevision;
     state.pendingBottomRestoreRevision = null;
     if (restoreRevision !== state.scrollRevision) {
-      state.atBottom = scrollerIsAtBottom(scroller);
+      state.atBottom = scrollerIsFollowing(state);
       return;
     }
-    scroller.scrollTop = scroller.scrollHeight;
-    state.atBottom = true;
+    restoreScrollerBottom(state);
     return;
   }
-  state.atBottom = scrollerIsAtBottom(scroller);
+  state.atBottom = scrollerIsFollowing(state);
 }
 
 function isPlaying(media) {
@@ -154,7 +167,7 @@ function captureScrollers() {
       continue;
     }
     if (isVisibleScroller(scroller)) {
-      state.atBottom = scrollerIsAtBottom(scroller);
+      state.atBottom = scrollerIsFollowing(state);
     }
     snapshots.push({
       scroller,
@@ -186,8 +199,7 @@ function restoreBottomPins(snapshots) {
         continue;
       }
       snapshot.state.pendingBottomRestoreRevision = null;
-      snapshot.scroller.scrollTop = snapshot.scroller.scrollHeight;
-      snapshot.state.atBottom = true;
+      restoreScrollerBottom(snapshot.state);
     }
   });
 }
@@ -282,16 +294,16 @@ export function mountTranscriptPresentationToggle(container, options) {
 
 // Preserve follow state across a synchronous transcript reflow (for example,
 // reopening a folded batch when a late exceptional verdict lands). The
-// registered scroller owns the cached hidden-pane state; visible panes are
-// remeasured immediately before mutation so users who scrolled away are never
-// pulled back. Restoration is deferred until layout reflects the mutation.
+// registered scroller uses the pane's follow choice when supplied, otherwise
+// visible geometry and cached hidden-pane state. Restoration is deferred until
+// layout reflects the mutation and yields to newer user scrolling.
 export function preserveTranscriptBottomPin(element, mutate) {
   if (typeof mutate !== "function") return undefined;
   const state = scrollers.get(element);
   let snapshot = null;
   if (state && element.isConnected) {
     if (isVisibleScroller(element)) {
-      state.atBottom = scrollerIsAtBottom(element);
+      state.atBottom = scrollerIsFollowing(state);
     }
     snapshot = {
       scroller: element,
@@ -307,16 +319,18 @@ export function preserveTranscriptBottomPin(element, mutate) {
   }
 }
 
-export function registerTranscriptScroller(element) {
+export function registerTranscriptScroller(element, options = {}) {
   if (!element) return () => {};
   const prior = scrollers.get(element);
   if (prior) releaseScroller(element, prior, false);
   element.setAttribute(TRANSCRIPT_ROOT_ATTRIBUTE, "");
   const state = {
     scroller: element,
-    atBottom: isVisibleScroller(element)
-      ? scrollerIsAtBottom(element)
-      : true,
+    isFollowing: options.isFollowing,
+    scrollToBottom: options.scrollToBottom,
+    atBottom: options.isFollowing
+      ? options.isFollowing()
+      : !isVisibleScroller(element) || scrollerIsAtBottom(element),
     pendingBottomRestoreRevision: null,
     scrollRevision: 0,
     onScroll: null,
@@ -326,7 +340,7 @@ export function registerTranscriptScroller(element) {
     state.scrollRevision += 1;
     state.pendingBottomRestoreRevision = null;
     if (isVisibleScroller(element)) {
-      state.atBottom = scrollerIsAtBottom(element);
+      state.atBottom = scrollerIsFollowing(state);
     }
   };
   element.addEventListener("scroll", state.onScroll, { passive: true });

@@ -28,6 +28,8 @@
  *
  * Caller options:
  *   messagesEl: HTMLElement — chat log container.
+ *   scroll:     optional () => void — called after appending a queued bubble;
+ *               the caller owns whether to follow output or retain the reading position.
  *   getWsId:    () => string — current ws id (function so the
  *               interactive pane can swap tabs without re-instantiating).
  *   getBase:    optional () => string — node-proxy URL prefix ("" local,
@@ -144,7 +146,7 @@ export function createQueueController(opts) {
   }
 
   function _scrollIntoView() {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (opts.scroll) opts.scroll();
   }
 
   function _deleteRequest(msgId) {

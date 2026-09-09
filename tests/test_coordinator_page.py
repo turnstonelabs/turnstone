@@ -1251,7 +1251,7 @@ def test_compact_presentation_coordinator_wiring_and_ordering():
     """Coordinator retains its own result lifecycle but shares presentation.
 
     The running-state cleanup must precede settlement, which must precede the
-    coordinator's existing forced scroll. Replay stages the same fold without
+    coordinator's scheduled follow. Replay stages the same fold without
     a completion announcement, and only the rail-less page mounts a control.
     """
     from pathlib import Path
@@ -1288,7 +1288,7 @@ def test_compact_presentation_coordinator_wiring_and_ordering():
     assert 'querySelector("#coord-status-bar")' in create
     status_mount = create.index('querySelector("#coord-status-bar")')
     assert mount < status_mount, "the presentation control must not enter the live status region"
-    assert "registerTranscriptScroller(messagesEl)" in create
+    assert "registerTranscriptScroller(messagesEl," in create
 
     live = _extract_braced(
         body,
@@ -1297,8 +1297,8 @@ def test_compact_presentation_coordinator_wiring_and_ordering():
     append = live.index("_appendResultToRow(")
     running_cleanup = live.index("_unsetBatchRunningIfAllResults(", append)
     settlement = live.index("markConvRowResultSettled(", running_cleanup)
-    forced_scroll = live.index("_scheduleScroll()", settlement)
-    assert append < running_cleanup < settlement < forced_scroll
+    scheduled_scroll = live.index("_scheduleScroll()", settlement)
+    assert append < running_cleanup < settlement < scheduled_scroll
     assert "settlement.autoFolded" in live
     assert 'getTranscriptPresentation() === "compact"' in live
     assert '_announcePolite("Completed: "' in live
