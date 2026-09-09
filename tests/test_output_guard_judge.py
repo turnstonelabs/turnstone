@@ -44,7 +44,11 @@ class _VersionedConfigStore:
 
 
 def _make_provider(
-    content: str = "", *, delay: float = 0.0, raises: Exception | None = None
+    content: str = "",
+    *,
+    release: threading.Event | None = None,
+    started: threading.Event | None = None,
+    raises: Exception | None = None,
 ) -> Any:
     """Build a mock LLMProvider whose create_streaming returns the given content."""
     provider = MagicMock()
@@ -57,8 +61,11 @@ def _make_provider(
     provider.get_capabilities = MagicMock(return_value=ModelCapabilities(context_window=200_000))
 
     def _create_streaming(**_kwargs: Any) -> Any:
-        if delay:
-            time.sleep(delay)
+        if started is not None:
+            started.set()
+        if release is not None:
+            # Only a failure backstop: healthy tests release their worker in finally.
+            release.wait(5.0)
         if raises is not None:
             raise raises
         return as_stream(_mock_result(content))
@@ -101,7 +108,8 @@ def _make_judge(
     *,
     content: str = "",
     timeout: float = 5.0,
-    delay: float = 0.0,
+    release: threading.Event | None = None,
+    started: threading.Event | None = None,
     raises: Exception | None = None,
 ) -> OutputGuardJudge:
     """Construct an OutputGuardJudge wired to a mock provider.
@@ -109,7 +117,7 @@ def _make_judge(
     Patches ``_create_client`` on the instance so the lazy-init path
     returns the in-memory mock without hitting the real client factory.
     """
-    provider = _make_provider(content, delay=delay, raises=raises)
+    provider = _make_provider(content, release=release, started=started, raises=raises)
     config = JudgeConfig(output_guard_llm=True, output_guard_llm_timeout=timeout)
     client = MagicMock()
     client.base_url = "http://test"
@@ -317,41 +325,44 @@ class TestEvaluateFailurePaths:
         assert v.error.startswith("provider_error:")
 
     def test_timeout_returns_within_budget(self) -> None:
-        # Provider sleeps 5s but timeout is 1s.  Verify the function
-        # actually returns within ~1s wall-clock — the previous
-        # `with ThreadPoolExecutor` exit blocked until the worker
-        # drained, so this test would have hung waiting for the 5s
-        # sleep before the executor's shutdown(wait=True) on exit.
+        # Keep the provider blocked until after the early-return assertion. The
+        # old executor shutdown(wait=True) would wait for the 5s failure backstop.
+        release = threading.Event()
+        started = threading.Event()
         judge = _make_judge(
             content='{"risk_level":"medium","flags":[],"reasoning":""}',
             timeout=1.0,
-            delay=5.0,
+            release=release,
+            started=started,
         )
-        start = time.monotonic()
-        v = judge.evaluate("payload", call_id="c1")
-        elapsed = time.monotonic() - start
-        assert not v.succeeded
-        assert v.error == "timeout"
-        # Allow generous slack — 2x the configured timeout is plenty.
-        assert elapsed < 2.5, f"timeout returned in {elapsed:.2f}s, expected < 2.5s"
+        try:
+            start = time.monotonic()
+            v = judge.evaluate("payload", call_id="c1")
+            elapsed = time.monotonic() - start
+            assert started.is_set()
+            assert not v.succeeded
+            assert v.error == "timeout"
+            assert elapsed < 2.5, f"timeout returned in {elapsed:.2f}s, expected < 2.5s"
+        finally:
+            release.set()
 
     def test_cancel_event(self) -> None:
-        judge = _make_judge(content='{"risk_level":"medium"}', delay=5.0, timeout=10.0)
+        release = threading.Event()
         cancel = threading.Event()
-        # Fire the cancel from a side thread shortly after evaluate starts.
-
-        def _trigger() -> None:
-            time.sleep(0.2)
-            cancel.set()
-
-        threading.Thread(target=_trigger, daemon=True).start()
-        start = time.monotonic()
-        v = judge.evaluate("payload", call_id="c1", cancel_event=cancel)
-        elapsed = time.monotonic() - start
-        assert not v.succeeded
-        assert v.error == "cancelled"
-        # Cancel should return promptly, well below the 10s timeout.
-        assert elapsed < 2.0, f"cancel returned in {elapsed:.2f}s, expected < 2.0s"
+        # Signal cancellation only once the provider is actually running.
+        judge = _make_judge(
+            content='{"risk_level":"medium"}', timeout=10.0, release=release, started=cancel
+        )
+        try:
+            start = time.monotonic()
+            v = judge.evaluate("payload", call_id="c1", cancel_event=cancel)
+            elapsed = time.monotonic() - start
+            assert cancel.is_set()
+            assert not v.succeeded
+            assert v.error == "cancelled"
+            assert elapsed < 2.0, f"cancel returned in {elapsed:.2f}s, expected < 2.0s"
+        finally:
+            release.set()
 
     def test_pre_set_cancel_skips_client_auth_and_provider(self) -> None:
         """An already-abandoned evaluation spends no connection or credential work."""
@@ -380,19 +391,25 @@ class TestEvaluateFailurePaths:
         # The old ThreadPoolExecutor worker was non-daemon and got joined by
         # concurrent.futures' atexit hook, hanging the whole test run at
         # shutdown.  See turnstone/core/deadline.py.
+        release = threading.Event()
+        started = threading.Event()
         judge = _make_judge(
             content='{"risk_level":"medium","flags":[],"reasoning":""}',
             timeout=1.0,
-            delay=5.0,
+            release=release,
+            started=started,
         )
-        v = judge.evaluate("payload", call_id="c1")
-        assert v.error == "timeout"
-        stragglers = [
-            t
-            for t in threading.enumerate()
-            if t.name.startswith("output-guard-judge") and not t.daemon
-        ]
-        assert stragglers == [], f"non-daemon worker survived evaluate(): {stragglers}"
+        try:
+            v = judge.evaluate("payload", call_id="c1")
+            assert started.is_set()
+            assert v.error == "timeout"
+            workers = [t for t in threading.enumerate() if t.name.startswith("output-guard-judge")]
+            assert workers, "provider worker must still be blocked when its daemon flag is checked"
+            assert all(t.daemon for t in workers), (
+                f"non-daemon worker survived evaluate(): {workers}"
+            )
+        finally:
+            release.set()
 
 
 class TestOversizeGuard:

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -139,6 +140,7 @@ def resolve_when_pending(ui: Any, *args: Any, **kwargs: Any) -> _PendingResolver
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from pathlib import Path
 
     from turnstone.core.mcp_client import MCPClientManager, StaticServerState
     from turnstone.core.mcp_crypto import MCPTokenCipher
@@ -405,13 +407,39 @@ def fresh_pg_url(request: pytest.FixtureRequest) -> Iterator[Any]:
         admin.dispose()
 
 
+@pytest.fixture(scope="session")
+def sqlite_schema_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Prepare an empty schema once; tests copy it into their own temporary paths."""
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    path = tmp_path_factory.mktemp("sqlite-schema") / "template.db"
+    # Closing the last connection checkpoints WAL before any file is copied.
+    with contextlib.closing(SQLiteBackend(str(path))):
+        pass
+    return path
+
+
+@pytest.fixture(scope="session")
+def sqlite_migrated_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Prepare migration seed data without changing the storage singleton."""
+    from turnstone.core.storage._migrate import run_migrations
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    path = tmp_path_factory.mktemp("sqlite-migrated") / "template.db"
+    with contextlib.closing(SQLiteBackend(str(path), create_tables=False)) as storage:
+        run_migrations(storage, "sqlite")
+    return path
+
+
 @pytest.fixture
-def tmp_db(tmp_path):
+def tmp_db(tmp_path, sqlite_schema_template):
     """Provide a temporary SQLite storage backend (singleton registry)."""
     from turnstone.core.storage import init_storage, reset_storage
 
     db_path = str(tmp_path / "test.db")
     reset_storage()
+    if not os.path.exists(db_path):
+        shutil.copyfile(sqlite_schema_template, db_path)
     init_storage("sqlite", path=db_path, run_migrations=False)
     yield db_path
     reset_storage()
@@ -456,6 +484,8 @@ def storage_backend(request, tmp_path):
             reset_storage()
     else:
         db_path = str(tmp_path / "test.db")
+        if not os.path.exists(db_path):
+            shutil.copyfile(request.getfixturevalue("sqlite_schema_template"), db_path)
         backend = init_storage("sqlite", path=db_path, run_migrations=False)
         yield backend
         reset_storage()

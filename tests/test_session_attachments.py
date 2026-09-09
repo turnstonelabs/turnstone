@@ -40,6 +40,8 @@ def _make_session(mock_client, user_id: str = "u1") -> ChatSession:
         user_id=user_id,
     )
     register_workstream(s._ws_id)
+    # Message-shape tests do not exercise the background title request.
+    s._title_generated = True
     # Short-circuit the response loop: patch out the methods send() will call
     # after appending the user message so the test can focus on message shape.
     s._refresh_model_from_registry = lambda: None  # type: ignore[method-assign]

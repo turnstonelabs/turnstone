@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import queue
+import shutil
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import bcrypt
 import httpx
 import pytest
 
@@ -14,7 +16,7 @@ from tests.test_server_authz import _FakeSession, _FakeUI
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.server import create_app as create_console
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
-from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, create_jwt, hash_password
+from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, create_jwt
 from turnstone.core.config_store import ConfigStore
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.storage import init_storage, reset_storage
@@ -25,11 +27,15 @@ _SECRET = "history-rbac-test-secret-at-least-32-characters"
 
 
 @pytest.fixture
-async def history_apps(tmp_path):
+async def history_apps(tmp_path, sqlite_migrated_template):
     reset_storage()
-    storage = init_storage("sqlite", path=str(tmp_path / "history.db"))
+    db_path = tmp_path / "history.db"
+    shutil.copyfile(sqlite_migrated_template, db_path)
+    storage = init_storage("sqlite", path=str(db_path))
     password = "history-test-password"
-    password_hash = hash_password(password)
+    # Exercise real password verification without paying production hashing cost
+    # in every auth-policy case. Hashing policy has its own test_auth_identity coverage.
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=4)).decode()
     for user, role in (("operator", "operator"), ("admin", "admin"), ("viewer", "viewer")):
         storage.create_user(user, user, user, password_hash)
         storage.assign_role(user, "builtin-" + role)
