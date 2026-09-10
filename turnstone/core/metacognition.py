@@ -79,13 +79,15 @@ NUDGE_DENIAL = (
     "Note: The user just rejected a tool action. Their feedback may "
     "explain why — pay attention to whether this reflects a persistent "
     "preference (e.g. 'never use force-push', 'don't modify that file'). "
-    "If so, save it as a feedback memory for future sessions."
+    "If so, save it as a feedback memory "
+    "(memory action='save', type='feedback') for future sessions."
 )
 
 NUDGE_COMPLETION = (
     "The task may be wrapping up. Consider whether there are learnings, "
     "decisions, or user preferences from this session worth persisting "
-    "as memories (memory action='save') so future sessions can benefit."
+    "as memories (memory action='save' with an explicit appropriate type) "
+    "so future sessions can benefit."
 )
 
 NUDGE_TOOL_ERROR = (

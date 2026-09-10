@@ -23824,15 +23824,21 @@ class ChatSession:
                     "✗ memory save: invalid description",
                     f"Error: {exc}",
                 )
-            mem_type = args.get("type")
-            if mem_type is not None:
-                mem_type = str(mem_type).strip().lower()
-                if mem_type not in ("user", "general", "feedback", "reference"):
-                    return self._memory_prepare_error(
-                        call_id,
-                        "✗ memory save: invalid type",
-                        f"Error: invalid memory type '{mem_type}'",
-                    )
+            raw_mem_type = args.get("type")
+            if raw_mem_type is None or not str(raw_mem_type).strip():
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory save: missing type",
+                    "Error: 'type' must be explicit for save. Valid: user, general, "
+                    "feedback, reference",
+                )
+            mem_type = str(raw_mem_type).strip().lower()
+            if mem_type not in ("user", "general", "feedback", "reference"):
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory save: invalid type",
+                    f"Error: invalid memory type '{mem_type}'",
+                )
             default_scope = self._inherited_memory_scope(access)
             scope = str(args.get("scope") or default_scope).strip().lower()
             if scope not in _VALID_MEMORY_SCOPES:

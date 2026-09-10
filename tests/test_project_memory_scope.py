@@ -255,6 +255,7 @@ class TestProjectWriteGate:
                 "name": "k",
                 "content": "v",
                 "description": "Test memory",
+                "type": "general",
             },
         )
         assert "read-only access to the attached project" in out.get("error", "")
@@ -269,6 +270,7 @@ class TestProjectWriteGate:
                 "name": "k",
                 "content": "v",
                 "description": "Test memory",
+                "type": "general",
             },
         )
         assert "error" not in out
@@ -318,6 +320,7 @@ class TestActingPrincipalProjectAuthority:
             if action == "save":
                 arguments["content"] = "guest write"
                 arguments["description"] = "Guest write attempt"
+                arguments["type"] = "general"
             item = session._prepare_tool(self._tool_call(action, **arguments))
             assert item["_principal_id"] == "guest"
             assert "error" in item
@@ -483,6 +486,7 @@ class TestProjectDefaultSaveScope:
                 "name": "k",
                 "content": "v",
                 "description": "Test memory",
+                "type": "general",
             },
         )
         assert out.get("scope") == "project"
@@ -520,6 +524,7 @@ class TestProjectDefaultSaveScope:
                 "name": "probe",
                 "content": "body",
                 "description": "Probe memory",
+                "type": "general",
             },
         )
         assert get_item["scopes_to_try"] == [("project", "p1")]

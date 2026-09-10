@@ -190,7 +190,8 @@ Store or update a memory.
 
 Every save is a complete write for the index hook: `description` must be
 supplied on both creation and update, normalize to one non-empty line, and be
-at most 512 characters. Content-only updates are rejected.
+at most 512 characters. `type` must also be explicit so the model cannot
+silently misclassify a memory. Content-only updates are rejected.
 
 ```json
 {
@@ -208,7 +209,7 @@ at most 512 characters. Content-only updates are rejected.
 | `name`        | yes      | --          | Canonical snake_case identifier (max 256 chars) |
 | `content`     | yes      | --          | Memory content (max `max_content` chars) |
 | `description` | yes      | --          | Authored index hook (1-512 normalized characters), required on every write |
-| `type`        | no       | `"general"` | One of: user, general, feedback, reference |
+| `type`        | yes      | --          | One of: user, general, feedback, reference |
 | `scope`       | no       | inherited   | Kind-valid scope; see inherited target above |
 
 ### get

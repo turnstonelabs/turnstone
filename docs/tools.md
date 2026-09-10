@@ -506,7 +506,7 @@ Structured persistent memory across sessions with typed, scoped entries.
 | `name`        | string  | save/get/delete | Short snake_case identifier for the memory. |
 | `content`     | string  | save     | Memory content to store. |
 | `description` | string  | save     | Authored one-line index hook (1-512 characters); required on every create or update. |
-| `type`        | string  | no       | Memory type: `user`, `general`, `feedback`, or `reference`. Default: `general`. |
+| `type`        | string  | save     | Memory type: `user`, `general`, `feedback`, or `reference`. Model-tool saves fail closed when omitted. |
 | `scope`       | string  | no       | Memory scope: `global`, `workstream`, `user`, `coordinator`, or `project`. See defaults below. |
 | `query`       | string  | search   | Search query for finding memories. |
 | `limit`       | integer | no       | Max results for `search` or `list`. Default: 20. |
